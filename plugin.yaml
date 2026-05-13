@@ -12,6 +12,7 @@ provides_tools:
   - quant_status
   - quant_show_signals
   - quant_show_views
+  - quant_recommend
   - quant_doctor
 
 provides_hooks:

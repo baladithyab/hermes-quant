@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — chat-mode advisor surface (ADR-0014, advisor MVP)
+
+Per user directive 2026-05-13 ("this is going to be a plugin that anyone using
+Hermes could install and have hermes work on quant level stuff"), shipped the
+**advisor surface** — a synchronous, in-process `quant_recommend` tool that
+lets any Hermes user ask "what does the system say about AAPL?" without a
+running daemon, without a broker API, without a portfolio.
+
+**ADR-0013 — dual-surface integration stance** (`docs/adr/ADR-0013-…`):
+- Locks the no-monkeypatch position for v0.1.2 (zero patches; every Hermes
+  touchpoint via the public `register_tool` / `register_command` /
+  `register_cli_command` / `register_hook` / `register_skill` contract).
+- Documents the 5 LEVERAGE adoptions (profiles, credential pools, cron for
+  ops tasks, MEMORY.md scope-separated from journal, CLI seams already
+  correct) and 4 explicit rejections with rationale (cron for daemon,
+  delegate_task for analysts, session_search for journal, filesystem
+  checkpoints for daemon).
+
+**ADR-0014 — chat-mode advisor surface** (`docs/adr/ADR-0014-…`):
+- Specifies the `quant_recommend(symbol, …)` contract: read-only,
+  synchronous, deterministic, safe under no-data, `as_of`-aware, no LLM
+  in the chain (locked to v0.3.0 per ADR-0012), single-symbol in v0.1.2
+  (multi-symbol post-portfolio rewrite).
+- Full return-shape table with v0.1.2-populated vs reserved field markers.
+
+**Implementation:**
+- `hermes_quant/advisor.py` — synchronous `recommend(symbol, …) -> dict`
+  orchestrator. Builds a synthetic flat Portfolio and conservative
+  bootstrap MarketState (per ADR-0009 §P1-12 cold-start defaults), runs
+  the same Analyst → BMAAggregator → DefaultRiskGate pipeline the
+  daemon uses, returns structured dict. Handles RateLimitError /
+  DataProviderError / DataQualityError as gated dicts (never raises
+  to caller). Empty-bars guard prevents `.dt.tz` crash on degenerate
+  fixtures.
+- `hermes_quant/tools.py::quant_recommend` — tool handler wrapping
+  `advisor.recommend()`, lazy-imports advisor to keep `register()` ≤50ms.
+- `hermes_quant/schemas.py::QUANT_RECOMMEND` — JSON Schema with full
+  parameter description (the description field is load-bearing for
+  the model's tool-selection prompt).
+- `hermes_quant/cli/__init__.py` — `hermes quant recommend SYMBOL`
+  CLI subcommand with rich-formatted output (`_pretty_print_recommend`)
+  and `--json` raw mode.
+- `hermes_quant/__init__.py::register(ctx)` — registers `quant_recommend`
+  as the 5th tool and updates `/quant` slash description.
+- `hermes_quant/tools.py::handle_quant_slash` — `/quant recommend SYMBOL`
+  + aliases `/quant rec` / `/quant advise`.
+- `plugin.yaml` — `quant_recommend` declared in `provides_tools`.
+
+**Tests** (14 new in `tests/integration/test_advisor_e2e.py`):
+- `test_recommend_returns_structurally_valid_dict` — full return shape
+- `test_recommend_with_empty_bars_returns_gated_no_exception` — safety
+- `test_recommend_handles_provider_rate_limit` — rate-limit -> gated
+- `test_recommend_handles_provider_data_error` — DataProviderError -> gated
+- `test_recommend_does_not_call_calibrator_update` — read-only invariant
+- `test_recommend_no_lessons_returns_empty_lessons_no_journal_io` — token saver
+- `test_recommend_with_lessons_calls_journal` — opt-in works
+- `test_recommend_deterministic_given_same_inputs` — replay-safe
+- `test_recommend_unsupported_asset_class_returns_gated` — graceful crypto/fx
+- `test_recommend_missing_symbol_handled_at_tool_layer` — empty string
+- `test_recommend_emits_view_when_data_supports` — happy path
+- `test_advisor_caveats_always_include_disclaimers` — caveats mandatory
+- `test_quant_recommend_tool_handler_returns_json_string` — JSON convention
+- `test_quant_recommend_tool_handler_parses_args` — arg forwarding
+
+**Test count progression: 273 → 287 (+14).**
+
+### v0.1.2 prep
+
+- `docs/reviews/2026-05-13-v0.1.2-architecture/build-vs-leverage-vs-monkeypatch.md` —
+  full BUILD vs LEVERAGE vs MONKEYPATCH analysis of all 19 v0.1.2 work items
+  against Hermes-core surface area. Net: zero monkeypatches, plan stands.
+
 ## [0.1.1] — 2026-05-13
 
 ### Added — first executable vertical slice

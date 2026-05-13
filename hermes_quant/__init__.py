@@ -105,6 +105,12 @@ def register(ctx: Any) -> None:
         handler=quant_tools.quant_show_views,
     )
     ctx.register_tool(
+        name="quant_recommend",
+        toolset="quant",
+        schema=schemas.QUANT_RECOMMEND,
+        handler=quant_tools.quant_recommend,
+    )
+    ctx.register_tool(
         name="quant_doctor",
         toolset="quant",
         schema=schemas.QUANT_DOCTOR,
@@ -115,7 +121,7 @@ def register(ctx: Any) -> None:
     ctx.register_command(
         "quant",
         handler=quant_tools.handle_quant_slash,
-        description="hermes-quant: /quant status | /quant signals [N] | /quant doctor",
+        description="hermes-quant: /quant status | /quant signals [N] | /quant recommend <SYMBOL> | /quant doctor",
     )
 
     # CLI subcommand tree — control plane (ADR-0007 §canonical CLI)

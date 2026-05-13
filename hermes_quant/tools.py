@@ -162,6 +162,55 @@ def quant_show_views(args: dict, **_kwargs) -> str:
     }, default=str)
 
 
+def quant_recommend(args: dict, **_kwargs) -> str:
+    """Synchronous advisor surface — runs analysts/aggregator/gate on a single
+    symbol and returns a structured recommendation. Per ADR-0014.
+
+    Read-only: does NOT mutate state.db, signals.jsonl, calibrators, or the
+    journal write-side. Safe under no-data scenarios — returns a gated dict
+    rather than raising.
+    """
+    symbol = args.get("symbol")
+    if not symbol:
+        return json.dumps({
+            "success": False,
+            "error": "symbol is required",
+        })
+
+    # Lazy import — advisor pulls in pandas + yfinance, which are heavy.
+    # Keeping the import inside the handler means register-time cost stays
+    # at ~50ms per the ADR-0007 budget.
+    try:
+        from hermes_quant.advisor import recommend
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("quant_recommend: advisor import failed: %s", exc, exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": f"advisor module unavailable: {exc}",
+        })
+
+    try:
+        result = recommend(
+            symbol=symbol,
+            asset_class=args.get("asset_class", "equity"),
+            timeframe=args.get("timeframe"),
+            lookback_bars=args.get("lookback_bars"),
+            include_lessons=bool(args.get("include_lessons", True)),
+            as_of=args.get("as_of"),
+        )
+    except Exception as exc:  # noqa: BLE001 — advisor is best-effort
+        logger.warning(
+            "quant_recommend: advisor.recommend raised: %s", exc, exc_info=True
+        )
+        return json.dumps({
+            "success": False,
+            "error": f"advisor failed: {exc}",
+            "symbol": symbol,
+        })
+
+    return json.dumps({"success": True, **result}, default=str)
+
+
 def quant_doctor(args: dict, **_kwargs) -> str:
     """Comprehensive health check. Read-only."""
     include_calibration = args.get("calibration", False)
@@ -226,7 +275,19 @@ def handle_quant_slash(args: list, **kwargs) -> str:
         return quant_show_views({"asset": args[1]}, **kwargs)
     if sub == "doctor":
         return quant_doctor({}, **kwargs)
+    if sub in ("recommend", "rec", "advise"):
+        if len(args) < 2:
+            return json.dumps({
+                "success": False,
+                "error": "/quant recommend <SYMBOL> [asset_class] [timeframe]",
+            })
+        rec_args = {"symbol": args[1]}
+        if len(args) > 2:
+            rec_args["asset_class"] = args[2]
+        if len(args) > 3:
+            rec_args["timeframe"] = args[3]
+        return quant_recommend(rec_args, **kwargs)
     return json.dumps({
         "success": False,
-        "error": f"unknown subcommand '{sub}'. Use: status | signals [N] | views <asset> | doctor",
+        "error": f"unknown subcommand '{sub}'. Use: status | signals [N] | views <asset> | recommend <SYMBOL> | doctor",
     })

@@ -1,0 +1,612 @@
+"""hermes_quant.advisor — Synchronous chat-mode advisor surface (ADR-0014).
+
+This is the second of hermes-quant's two operator surfaces (per ADR-0013):
+
+  Surface 1 — Autopilot:  daemon -> JSONL bus -> freqtrade. Long-running.
+  Surface 2 — Advisor:    `quant_recommend(symbol)` synchronous tool. <- THIS FILE
+
+The advisor is the on-ramp for "anyone using Hermes" — install the plugin,
+`pip install -e .[yfinance]`, ask Hermes "what does the system say about
+AAPL?" and get a structured analyst+aggregator+risk-gated answer with
+journal lessons. No daemon, no broker API, no portfolio state.
+
+Contract (per ADR-0014):
+- READ-ONLY: must not write state.db, signals.jsonl, or update calibrators.
+- SYNCHRONOUS: returns within ~10s on default lookback. No async.
+- DETERMINISTIC: same (symbol, as_of, indicators) -> same dict.
+- SAFE on no-data: returns gated dict, never raises to caller.
+- as_of-aware: optional timestamp filter for replay-mode queries.
+- Single-symbol in v0.1.2 (multi-symbol post-portfolio rewrite, ADR-0011).
+- No LLM in the chain (ADR-0012; LLMAnalyst lands v0.3.0).
+
+Importantly, the advisor builds a SYNTHETIC FLAT PORTFOLIO for the risk
+gate's evaluation. It is NOT reading any real broker state. The Kelly
+fraction returned is the position size daemon-mode would HAVE TARGETED
+given a clean slate; consumers must not interpret it as an order.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+import pandas as pd
+
+from hermes_quant.protocol import (
+    Action,
+    AggregatedSignal,
+    AnalystView,
+    DataProviderError,
+    DataQualityError,
+    HaltRecord,
+    HaltState,
+    MarketContext,
+    MarketState,
+    Portfolio,
+    Position,
+    RateLimitError,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lookback defaults per timeframe (bars)
+# Conservative — must be large enough for SMA(50) + warm-up + stable ATR.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_LOOKBACK_BY_TF = {
+    "1m": 240,    # 4h
+    "5m": 288,    # 1d
+    "15m": 192,   # 2d
+    "30m": 168,   # ~3.5d
+    "1h": 200,    # ~8d
+    "1d": 200,    # ~10mo
+}
+
+_DEFAULT_TF_BY_ASSET_CLASS = {
+    "equity": "1d",
+    "etf": "1d",
+    "crypto": "1h",
+    "fx": "1h",
+}
+
+
+# ---------------------------------------------------------------------------
+# Conservative MarketState for advisor (per ADR-0014 §D2 "must not diverge
+# from daemon"). When we don't have rolling fill stats yet, fall back to
+# ADR-0009 §P1-12 conservative defaults. These match what the daemon uses
+# in cold-start mode.
+# ---------------------------------------------------------------------------
+
+_BOOTSTRAP_VOL_BY_ASSET_CLASS = {
+    "equity": 0.012,    # ~1.2% per-day stdev on equities
+    "etf": 0.008,
+    "crypto": 0.030,
+    "fx": 0.005,
+}
+
+_BOOTSTRAP_COSTS_BY_ASSET_CLASS = {
+    # (commission, spread, slippage) per side; round-trip = 2x
+    "equity": (0.0005, 0.0003, 0.0005),
+    "etf": (0.0003, 0.0002, 0.0003),
+    "crypto": (0.0010, 0.0005, 0.0012),
+    "fx": (0.0001, 0.0001, 0.0002),
+}
+
+
+# ---------------------------------------------------------------------------
+# Empty halt state for the advisor (no real halt registry consulted)
+# ---------------------------------------------------------------------------
+
+class _EmptyHaltState:
+    """No-op halt state — advisor has no awareness of real halt registry.
+
+    The advisor surface deliberately operates on "as if no halts exist"
+    semantics; if the operator wants halt-aware advice, they should consult
+    `quant_status` separately. This keeps the advisor a pure stateless
+    function of (symbol, as_of, lookback).
+    """
+
+    def is_halted(
+        self, account_id: str, asset_class: str, asset: str | None = None
+    ) -> bool:
+        return False
+
+    def active_halts(self) -> list[HaltRecord]:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Synthetic flat portfolio for the risk gate
+# ---------------------------------------------------------------------------
+
+def _synthetic_portfolio(
+    asset: str, asset_class: str, asof: pd.Timestamp, equity: float = 100_000.0
+) -> Portfolio:
+    """Build a fresh flat portfolio so the risk gate has something to evaluate.
+
+    The advisor explicitly does NOT read real broker state. The gate's
+    `target_position_pct` output is informational — the position size that
+    daemon-mode would target on a clean slate.
+    """
+    return Portfolio(
+        account_id="advisor-synthetic",
+        asset_class=asset_class,
+        asof=asof,
+        positions={},
+        cash=equity,
+        equity_total=equity,
+        realized_pnl_total=0.0,
+        realized_fees_total=0.0,
+        peak_equity=equity,
+        daily_open_equity=equity,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Result builders
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _AdvisorResult:
+    """Internal accumulator. Converted to dict at end of recommend()."""
+
+    symbol: str
+    asset_class: str
+    timeframe: str
+    as_of: pd.Timestamp | None = None
+    bars_received: int = 0
+    gaps: list[str] = field(default_factory=list)
+    last_bar_age_minutes: float | None = None
+    analyst_views: list[dict[str, Any]] = field(default_factory=list)
+    aggregated_signal: dict[str, Any] | None = None
+    risk_gate: dict[str, Any] | None = None
+    lessons: list[dict[str, Any]] = field(default_factory=list)
+    caveats: list[str] = field(default_factory=list)
+    analyst_errors: list[str] = field(default_factory=list)
+    data_provider_alive: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "asset_class": self.asset_class,
+            "timeframe": self.timeframe,
+            "as_of": self.as_of.isoformat() if self.as_of is not None else None,
+            "data_quality": {
+                "bars_received": self.bars_received,
+                "gaps": self.gaps,
+                "last_bar_age_minutes": self.last_bar_age_minutes,
+            },
+            "analyst_views": self.analyst_views,
+            "aggregated_signal": self.aggregated_signal,
+            "risk_gate": self.risk_gate,
+            "lessons": self.lessons,
+            "caveats": self.caveats,
+            "doctor": {
+                "data_provider_alive": self.data_provider_alive,
+                "analyst_errors": self.analyst_errors,
+            },
+        }
+
+
+def _gated_no_data(result: _AdvisorResult, reason: str) -> dict[str, Any]:
+    """Return shape per ADR-0014 §D3.4 "Safe under no-data scenarios."""
+    result.aggregated_signal = None
+    result.risk_gate = {
+        "pass": False,
+        "gated_reason": reason,
+        "kelly_fraction": 0.0,
+        "recommended_action": "gated",
+    }
+    if "Insufficient data for recommendation" not in result.caveats:
+        result.caveats.append("Insufficient data for recommendation")
+    return result.to_dict()
+
+
+def _view_to_dict(view: AnalystView) -> dict[str, Any]:
+    return {
+        "analyst": view.analyst,
+        "direction": int(view.direction),
+        "magnitude": float(view.magnitude),
+        "confidence": float(view.confidence),
+        "confidence_raw": float(view.confidence_raw),
+        "horizon": view.horizon,
+        "rationale": view.rationale,
+        "metadata": dict(view.metadata) if view.metadata else None,
+    }
+
+
+def _signal_to_dict(sig: AggregatedSignal) -> dict[str, Any]:
+    return {
+        "asset": sig.asset,
+        "timeframe": sig.timeframe,
+        "direction": int(sig.direction),
+        "magnitude": float(sig.magnitude),
+        "confidence": float(sig.confidence),
+        "confidence_raw": float(sig.confidence_raw),
+        "horizon": sig.horizon,
+        "aggregator": sig.aggregator,
+        "n_components": len(sig.components),
+    }
+
+
+def _action_to_gate_dict(
+    action: Action | None, signal: AggregatedSignal
+) -> dict[str, Any]:
+    """Convert an Action (or silence) to the advisor's risk_gate sub-dict.
+
+    Per ADR-0014 §D1: pass=True iff the gate emitted an Action with a
+    non-zero target_position_pct (i.e., the signal would actually trade
+    in daemon mode). Silence (None) and zero-target Actions both gate.
+    """
+    if action is None:
+        return {
+            "pass": False,
+            "gated_reason": "silenced_by_gate",
+            "kelly_fraction": 0.0,
+            "recommended_action": "gated",
+        }
+    if action.target_position_pct == 0.0:
+        # halt or flatten emit; treat as gated for advisor purposes
+        return {
+            "pass": False,
+            "gated_reason": action.reason,
+            "kelly_fraction": 0.0,
+            "recommended_action": "gated_flatten",
+        }
+    direction_word = "long" if signal.direction > 0 else "short"
+    return {
+        "pass": True,
+        "gated_reason": None,
+        "kelly_fraction": float(action.target_position_pct),
+        "recommended_action": f"{direction_word}_with_stop",
+        "reason": action.reason,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Lazy provider construction
+# ---------------------------------------------------------------------------
+
+def _get_default_provider(asset_class: str):
+    """Return a DataProvider for the asset class.
+
+    v0.1.2: only yfinance for equity/etf is wired. Crypto/fx will arrive
+    when ccxt provider lands (ADR-0005).
+    """
+    if asset_class in ("equity", "etf"):
+        from hermes_quant.data.yfinance_provider import YFinanceProvider
+        return YFinanceProvider()
+    raise NotImplementedError(
+        f"asset_class={asset_class!r} not supported in v0.1.2 advisor "
+        f"(crypto/fx require ccxt provider — ADR-0005)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lazy lessons retrieval (ADR-0010 settlement journal — read path)
+# ---------------------------------------------------------------------------
+
+def _get_recent_lessons(
+    symbol: str, n_same: int, n_cross: int
+) -> list[dict[str, Any]]:
+    """Read recent journal lessons.
+
+    v0.1.2 stub: ADR-0010 journal writer + reader are scheduled for the
+    same release as this advisor. Until journal/reader.py lands, returns
+    an empty list (advisor stays functional, lessons just unavailable).
+
+    When journal.reader.get_recent_lessons exists, this delegates to it.
+    """
+    try:
+        from hermes_quant.journal.reader import (  # type: ignore[import-not-found]
+            get_recent_lessons,
+        )
+    except ImportError:
+        return []
+    try:
+        return get_recent_lessons(symbol, n_same=n_same, n_cross=n_cross)
+    except Exception as exc:
+        logger.warning(
+            "advisor: journal lesson retrieval failed (%s); "
+            "returning empty lessons",
+            exc,
+            exc_info=True,
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def recommend(
+    symbol: str,
+    *,
+    asset_class: str = "equity",
+    timeframe: str | None = None,
+    lookback_bars: int | None = None,
+    include_lessons: bool = True,
+    n_lessons_same: int = 3,
+    n_lessons_cross: int = 2,
+    as_of: str | pd.Timestamp | None = None,
+    provider: Any = None,
+    analysts: list[Any] | None = None,
+    aggregator: Any = None,
+    risk_gate: Any = None,
+) -> dict[str, Any]:
+    """Synchronous recommendation for a single symbol. Read-only (ADR-0014).
+
+    Args:
+        symbol: ticker / pair (e.g., "AAPL", "SPY").
+        asset_class: one of {"equity","etf","crypto","fx"}. Default "equity".
+        timeframe: bar timeframe; defaults per asset_class (equity/etf=1d,
+            crypto/fx=1h).
+        lookback_bars: how many bars of history to fetch; defaults per
+            timeframe.
+        include_lessons: pull recent journal entries for this symbol +
+            cross-symbol context. Default True. ADR-0014 §D7 advisor MAY
+            be invoked with lessons disabled to save tokens.
+        n_lessons_same / n_lessons_cross: lesson budget if include_lessons.
+        as_of: optional ISO timestamp or pd.Timestamp to anchor "now".
+            When set, bars are filtered to `<= as_of` (lookahead enforcement
+            per ADR-0005 amendment). For backtest-mode replay queries.
+        provider / analysts / aggregator / risk_gate: dependency injection
+            for tests. All default to canonical implementations when None.
+
+    Returns:
+        Structured dict per ADR-0014 §D1 return-shape table. Never raises
+        for caller-visible errors — exceptions are caught and surfaced via
+        the `doctor.analyst_errors` and `caveats` fields.
+
+    Raises:
+        Nothing user-visible. Internally, DataProviderError on hard
+        provider failure becomes a gated dict with caveat; same for
+        DataQualityError. Programming bugs (TypeError, etc.) propagate.
+    """
+    timeframe = timeframe or _DEFAULT_TF_BY_ASSET_CLASS.get(asset_class, "1d")
+    lookback_bars = lookback_bars or _DEFAULT_LOOKBACK_BY_TF.get(timeframe, 200)
+
+    # Normalize as_of
+    asof_ts: pd.Timestamp | None
+    if as_of is None:
+        asof_ts = pd.Timestamp.now(tz="UTC")
+    elif isinstance(as_of, str):
+        asof_ts = pd.Timestamp(as_of)
+        if asof_ts.tzinfo is None:
+            asof_ts = asof_ts.tz_localize("UTC")
+    else:
+        asof_ts = as_of
+        if asof_ts.tzinfo is None:
+            asof_ts = asof_ts.tz_localize("UTC")
+
+    result = _AdvisorResult(
+        symbol=symbol,
+        asset_class=asset_class,
+        timeframe=timeframe,
+    )
+    result.caveats.append(
+        "Snapshot-in-time view; not a guaranteed forecast"
+    )
+    result.caveats.append(
+        "No portfolio risk context (single-symbol view, ADR-0014 v0.1.2)"
+    )
+    result.caveats.append(
+        "Calibration not updated from this read"
+    )
+
+    # ---- Step 1: fetch bars ----
+    if provider is None:
+        try:
+            provider = _get_default_provider(asset_class)
+        except NotImplementedError as exc:
+            result.caveats.append(str(exc))
+            result.data_provider_alive = False
+            return _gated_no_data(result, "asset_class_unsupported")
+
+    # Lookback window (provider's start/end semantics; the per-tf delta
+    # is conservative — extra bars are fine, validate_bars trims to the
+    # requested window if needed).
+    end = asof_ts
+    if timeframe == "1d":
+        start = end - pd.Timedelta(days=lookback_bars * 2)
+    elif timeframe == "1h":
+        start = end - pd.Timedelta(hours=lookback_bars * 3)
+    else:
+        # intraday — yfinance has tight lookback windows; widen by 2x
+        start = end - pd.Timedelta(minutes=lookback_bars * 2 * _tf_minutes(timeframe))
+
+    try:
+        bars = provider.fetch_bars(symbol, timeframe, start, end)
+    except RateLimitError as exc:
+        result.caveats.append(f"Provider rate-limited: {exc}")
+        result.data_provider_alive = False
+        return _gated_no_data(result, "rate_limited")
+    except DataProviderError as exc:
+        result.caveats.append(f"Data provider error: {exc}")
+        result.data_provider_alive = False
+        return _gated_no_data(result, "data_provider_error")
+    except DataQualityError as exc:
+        result.caveats.append(f"Data quality error: {exc}")
+        return _gated_no_data(result, "data_quality_error")
+    except Exception as exc:  # noqa: BLE001 — advisor degrades gracefully
+        result.caveats.append(f"Unexpected provider error: {exc}")
+        result.data_provider_alive = False
+        logger.warning(
+            "advisor: unexpected provider failure for %s: %s",
+            symbol, exc, exc_info=True,
+        )
+        return _gated_no_data(result, "unexpected_provider_error")
+
+    # ---- Step 2: as_of filter (lookahead enforcement) ----
+    # Cheap empty-check first — empty-bars DataFrame from a test fixture
+    # may have no datetime dtype on the timestamp column, which would
+    # crash the `.dt.tz` access below.
+    if len(bars) == 0:
+        return _gated_no_data(result, "no_bars_returned")
+
+    if asof_ts is not None and "timestamp" in bars.columns:
+        # Compare-safe even when bars timestamps are tz-naive
+        bar_ts = bars["timestamp"]
+        if bar_ts.dt.tz is None:
+            cutoff = asof_ts.tz_convert(None) if asof_ts.tzinfo else asof_ts
+        else:
+            cutoff = asof_ts
+        bars = bars[bar_ts <= cutoff].copy()
+
+    result.bars_received = len(bars)
+    if result.bars_received == 0:
+        return _gated_no_data(result, "no_bars_returned")
+
+    # ---- Step 3: data-quality probe ----
+    last_bar_ts = bars["timestamp"].iloc[-1]
+    if hasattr(last_bar_ts, "tz_convert"):
+        last_bar_ts_utc = (
+            last_bar_ts.tz_convert("UTC") if last_bar_ts.tzinfo else last_bar_ts
+        )
+    else:
+        last_bar_ts_utc = pd.Timestamp(last_bar_ts, tz="UTC")
+    age_seconds = (asof_ts - last_bar_ts_utc).total_seconds()
+    result.last_bar_age_minutes = max(0.0, age_seconds / 60.0)
+    result.as_of = last_bar_ts_utc  # actual data anchor, not wall clock
+
+    # ---- Step 4: build MarketContext ----
+    ctx = MarketContext(
+        asset=symbol,
+        timeframe=timeframe,
+        asset_class=asset_class,
+        exchange=None,  # yfinance equity has no notion of exchange
+        bars=bars,
+        last_close=float(bars["close"].iloc[-1]),
+        last_volume=float(bars["volume"].iloc[-1]),
+        asof=last_bar_ts_utc,
+        extras={},
+    )
+
+    # ---- Step 5: run analysts ----
+    if analysts is None:
+        from hermes_quant.analysts.classical_ta import ClassicalTAAnalyst
+        analysts = [ClassicalTAAnalyst()]
+
+    views: list[AnalystView] = []
+    for analyst in analysts:
+        analyst_name = getattr(analyst, "name", type(analyst).__name__)
+        try:
+            # Per ADR-0002, the canonical method is `analyze`. Some
+            # analysts may expose `observe` as an alias — try analyze first.
+            if hasattr(analyst, "analyze"):
+                view = analyst.analyze(ctx)
+            elif hasattr(analyst, "observe"):
+                view = analyst.observe(ctx)
+            else:
+                result.analyst_errors.append(
+                    f"{analyst_name}: no analyze/observe method"
+                )
+                continue
+        except Exception as exc:  # noqa: BLE001 — one bad analyst can't kill advisor
+            result.analyst_errors.append(f"{analyst_name}: {exc}")
+            logger.warning(
+                "advisor: analyst %s raised: %s",
+                analyst_name, exc, exc_info=True,
+            )
+            continue
+        if view is None:
+            continue
+        views.append(view)
+        result.analyst_views.append(_view_to_dict(view))
+
+    if not views:
+        # Either every analyst declined to emit (cold-start, insufficient
+        # bars) or every analyst raised. Either way, no signal to gate.
+        return _gated_no_data(
+            result,
+            "no_analyst_views" if not result.analyst_errors else "all_analysts_errored",
+        )
+
+    # ---- Step 6: aggregate ----
+    if aggregator is None:
+        from hermes_quant.aggregators.bma import BMAAggregator
+        aggregator = BMAAggregator()
+
+    try:
+        agg_signal = aggregator.aggregate(views, ctx)
+    except Exception as exc:  # noqa: BLE001
+        result.analyst_errors.append(f"aggregator: {exc}")
+        logger.warning(
+            "advisor: aggregator raised: %s", exc, exc_info=True
+        )
+        return _gated_no_data(result, "aggregator_error")
+
+    result.aggregated_signal = _signal_to_dict(agg_signal)
+
+    # ---- Step 7: risk gate ----
+    if risk_gate is None:
+        from hermes_quant.risk.gate import DefaultRiskGate
+        risk_gate = DefaultRiskGate()
+
+    market = _bootstrap_market_state(symbol, asset_class, last_bar_ts_utc)
+    portfolio = _synthetic_portfolio(symbol, asset_class, last_bar_ts_utc)
+    halt_state: HaltState = _EmptyHaltState()  # type: ignore[assignment]
+
+    try:
+        action = risk_gate.gate(agg_signal, market, portfolio, halt_state)
+    except Exception as exc:  # noqa: BLE001
+        result.analyst_errors.append(f"risk_gate: {exc}")
+        logger.warning(
+            "advisor: risk gate raised: %s", exc, exc_info=True
+        )
+        return _gated_no_data(result, "risk_gate_error")
+
+    result.risk_gate = _action_to_gate_dict(action, agg_signal)
+
+    # ---- Step 8: lessons (optional) ----
+    if include_lessons:
+        try:
+            result.lessons = _get_recent_lessons(
+                symbol, n_lessons_same, n_lessons_cross
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "advisor: lesson retrieval failed: %s", exc, exc_info=True
+            )
+
+    return result.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _tf_minutes(timeframe: str) -> int:
+    return {
+        "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "4h": 240, "1d": 24 * 60,
+    }.get(timeframe, 60)
+
+
+def _bootstrap_market_state(
+    symbol: str, asset_class: str, asof: pd.Timestamp
+) -> MarketState:
+    """Conservative MarketState for advisor mode (no rolling fill stats yet).
+
+    Per ADR-0009 §P1-12 cold-start: use safe defaults until the daemon has
+    accumulated 30 days of real fills. The advisor never accumulates fills,
+    so it always uses bootstrap.
+    """
+    vol = _BOOTSTRAP_VOL_BY_ASSET_CLASS.get(asset_class, 0.015)
+    commission, spread, slippage = _BOOTSTRAP_COSTS_BY_ASSET_CLASS.get(
+        asset_class, (0.0005, 0.0003, 0.0007)
+    )
+    return MarketState(
+        asset=symbol,
+        asof=asof,
+        volatility=vol,
+        commission=commission * 2,  # round-trip
+        spread=spread * 2,
+        slippage_estimate=slippage * 2,
+        funding_cost=0.0,
+        borrow_cost=0.0,
+        tz="UTC",
+    )

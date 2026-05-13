@@ -109,6 +109,25 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_logs.add_argument("--follow", action="store_true")
     p_logs.add_argument("-n", type=int, default=100)
 
+    # Advisor (chat-mode synchronous recommend, ADR-0014). No daemon required.
+    p_rec = sub.add_parser(
+        "recommend",
+        help="Get a snapshot recommendation for a symbol (no daemon, ADR-0014)",
+    )
+    p_rec.add_argument("symbol")
+    p_rec.add_argument("--asset-class", default="equity",
+                       choices=["equity", "etf", "crypto", "fx"])
+    p_rec.add_argument("--timeframe", default=None,
+                       choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
+    p_rec.add_argument("--lookback", type=int, default=None,
+                       help="Bars of history to fetch (default per timeframe)")
+    p_rec.add_argument("--no-lessons", action="store_true",
+                       help="Skip recent journal lesson retrieval (saves tokens)")
+    p_rec.add_argument("--as-of", default=None,
+                       help="ISO timestamp anchor for replay-mode (default: now)")
+    p_rec.add_argument("--json", action="store_true",
+                       help="Print raw JSON instead of rich-formatted output")
+
     # Backtest
     p_bt = sub.add_parser("backtest", help="Run hermes-quant against historical bars")
     p_bt.add_argument("asset")
@@ -175,6 +194,22 @@ def dispatch(args: argparse.Namespace) -> int:
         result = json.loads(quant_doctor({"calibration": args.calibration}))
         _pretty_print_doctor(result)
         return 0
+
+    if cmd == "recommend":
+        from hermes_quant.tools import quant_recommend
+        result = json.loads(quant_recommend({
+            "symbol": args.symbol,
+            "asset_class": args.asset_class,
+            "timeframe": args.timeframe,
+            "lookback_bars": args.lookback,
+            "include_lessons": not args.no_lessons,
+            "as_of": args.as_of,
+        }))
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            _pretty_print_recommend(result)
+        return 0 if result.get("success") else 1
 
     if cmd == "config" and args.config_action == "show":
         _show_config()
@@ -271,6 +306,82 @@ def _pretty_print_doctor(result: dict) -> None:
         print("Next steps:")
         for line in result["next_step"].splitlines():
             print(f"  {line}")
+
+
+def _pretty_print_recommend(result: dict) -> None:
+    """Rich-formatted output for `hermes quant recommend SYMBOL`."""
+    if not result.get("success"):
+        print(json.dumps(result, indent=2))
+        return
+    print(f"hermes-quant recommend — {result.get('symbol', '?')} "
+          f"({result.get('asset_class', '?')}, {result.get('timeframe', '?')})")
+    print("=" * 60)
+    dq = result.get("data_quality", {})
+    print(f"  as_of:       {result.get('as_of', '?')}")
+    print(f"  bars:        {dq.get('bars_received', 0)}")
+    age = dq.get("last_bar_age_minutes")
+    if age is not None:
+        print(f"  bar age:     {age:.1f} min")
+    print()
+
+    views = result.get("analyst_views") or []
+    if views:
+        print("Analyst views:")
+        for v in views:
+            d = {-1: "SHORT", 0: "FLAT", 1: "LONG"}.get(v.get("direction"), "?")
+            print(f"  {v.get('analyst', '?'):20} {d:5}  "
+                  f"conf={v.get('confidence', 0):.2f}  "
+                  f"mag={v.get('magnitude', 0):+.4f}  "
+                  f"horizon={v.get('horizon', '?')}")
+        print()
+
+    sig = result.get("aggregated_signal")
+    if sig:
+        d = {-1: "SHORT", 0: "FLAT", 1: "LONG"}.get(sig.get("direction"), "?")
+        print(f"Aggregated:    {d:5}  "
+              f"conf={sig.get('confidence', 0):.2f}  "
+              f"mag={sig.get('magnitude', 0):+.4f}  "
+              f"({sig.get('aggregator', '?')}, "
+              f"{sig.get('n_components', 0)} components)")
+    else:
+        print("Aggregated:    (none — no analyst views)")
+    print()
+
+    gate = result.get("risk_gate") or {}
+    if gate.get("pass"):
+        print(f"Risk gate:     PASS  →  {gate.get('recommended_action', '?')}  "
+              f"(kelly={gate.get('kelly_fraction', 0):+.4f})")
+        if gate.get("reason"):
+            print(f"  reason:      {gate['reason']}")
+    else:
+        print(f"Risk gate:     GATED — {gate.get('gated_reason', 'unknown')}")
+    print()
+
+    lessons = result.get("lessons") or []
+    if lessons:
+        print(f"Recent lessons ({len(lessons)}):")
+        for lesson in lessons[:5]:
+            when = lesson.get("when", "?")
+            sym = lesson.get("symbol", "?")
+            ref = (lesson.get("reflection") or "")[:80]
+            print(f"  {when}  {sym}  {ref}")
+        print()
+
+    caveats = result.get("caveats") or []
+    if caveats:
+        print("Caveats:")
+        for c in caveats:
+            print(f"  • {c}")
+        print()
+
+    doctor = result.get("doctor") or {}
+    if not doctor.get("data_provider_alive", True):
+        print("⚠ data provider unavailable")
+    errors = doctor.get("analyst_errors") or []
+    if errors:
+        print("Analyst errors:")
+        for e in errors:
+            print(f"  ! {e}")
 
 
 def _show_config() -> None:
