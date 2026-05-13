@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — HITL React surface (ADR-0015, PDR loop closes the loop)
+
+Per user directive 2026-05-13 ("the trading guidance is HITL or automated,
+not just guidance — this is part of the PDR pattern"), shipped Wave A of
+the PDR React layer: chat-mode propose-approve-react that turns the
+advisor surface into a real (paper-)trading loop with human in the loop.
+
+**Architectural framing locked**: hermes-quant implements
+**Perceive-Decide-React** (PDR), the same pattern used in the user's
+Eidolon project (`/mnt/e/CS/HF/eidolon/pdr_lwm/environment.py`). We do
+NOT fork Eidolon — we use the shape. The three modes are:
+- **advise** — Perceive→Decide, no React (ADR-0014 advisor; one-shot guidance)
+- **hitl** — Perceive→Decide→**human approves**→React (THIS RELEASE)
+- **autonomous** — Perceive→Decide→silence-bias gate→React (v0.2)
+
+**ADR-0015 — HITL propose-decide-react** (~32 KB):
+- 12 decisions covering proposal lifecycle, dual-write storage
+  (proposals.jsonl + SQLite index), proposal_id format, five new tools,
+  Reactor Protocol contract, ExecutionRecord schema, mode resolution,
+  calibrator-learn-from-rejections (the LEARNING property — config-gated
+  via `quant.calibration.learn_from_rejections`), TTL handling with lazy
+  expiration, paper-vs-live boundary (live gated to v0.2 with `--live`
+  opt-in plus broker creds plus second confirm), full CLI + slash surface.
+- Cites the founding charter (`docs/charter/2026-05-13-hermes-quant-charter.md`)
+  for the silence-by-default principle and "rewarded for correct inaction"
+  invariant.
+
+**Founding charter saved** to repo:
+- `docs/charter/2026-05-13-hermes-quant-charter.md` (~15 KB) — the
+  architectural brief authored by the user that bootstrapped the entire
+  project. Provenance for every PDR decision in the repo.
+
+**Implementation:**
+- `hermes_quant/proposals.py` — `ProposalStore` with JSONL+SQLite dual-write,
+  three-state lifecycle (pending → approved/rejected/expired), thread-safe
+  via RLock, cross-process via flock on JSONL. Lazy expiration on every
+  read. Includes the canonical bug fix (ON CONFLICT clause was missing
+  `expires_at` update — caught by audit trail test).
+- `hermes_quant/react/{base.py,paper.py,__init__.py}` — Reactor Protocol +
+  ExecutionRecord schema + concrete `PaperReactor` writing to the SAME
+  executions.jsonl bus the daemon's settlement loop consumes (so HITL
+  paper fills feed the same calibrator the autonomous mode will).
+- `hermes_quant/tools.py` — five new handlers: `quant_propose`,
+  `quant_approve`, `quant_reject`, `quant_pending`, `quant_proposal`.
+  Mode gate (`_read_pdr_mode`) + calibrator-rejection-learning gate
+  (`_read_learn_from_rejections`) read live config every call (no
+  cache → operator can edit config + retry without restart).
+- `hermes_quant/schemas.py` — `QUANT_PROPOSE`, `QUANT_APPROVE`,
+  `QUANT_REJECT`, `QUANT_PENDING`, `QUANT_PROPOSAL` JSON schemas.
+- `hermes_quant/cli/__init__.py` — `hermes quant {propose,approve,reject,
+  pending,proposal}` subcommands with rich-formatted output and `--json`
+  raw mode.
+- `hermes_quant/__init__.py::register(ctx)` — registers all 5 new tools.
+- `hermes_quant/tools.py::handle_quant_slash` — `/quant propose`,
+  `/quant approve`, `/quant reject`, `/quant pending`, `/quant proposal`
+  multiplexer entries.
+- `plugin.yaml` — 5 new tools declared in `provides_tools` (now 10 total).
+
+**Mode-mismatch UX:** `quant_propose` in advise-mode (default) returns a
+clear `mode_mismatch` error with config snippet showing how to enable
+HITL. CLI rich-output prints the YAML to add. Operators don't get
+silently surprised.
+
+**Advisor-gated guard:** `quant_propose` refuses to register a proposal
+that the advisor itself gated (e.g. `no_bars_returned`,
+`asset_class_unsupported`). Operators can still inspect via
+`quant_recommend`; the proposal store stays clean.
+
+**Tests** (14 new in `tests/integration/test_hitl_e2e.py`, 301 total):
+1. propose → approve → execution written to bus
+2. propose → reject with reason → rejection persisted
+3. mode_mismatch error in advise mode (no proposal stored)
+4. advisor_gated proposals refused (no bus pollution)
+5. approve non-existent → not_found
+6. approve already-approved → state_mismatch
+7. reject without reason → reason_required
+8. reject already-rejected → state_mismatch
+9. TTL elapsed → pending auto-expires on read (lazy expiration)
+10. approve expired → state_mismatch
+11. list_pending filters by symbol + sweeps expired
+12. audit trail — every transition appends a JSONL line with `_event`
++2 bonus: PaperReactor record shape; proposal_id format conformance
+
+**Test count progression: 287 → 301 (+14). All pass. Zero regressions.**
+
 ### Added — chat-mode advisor surface (ADR-0014, advisor MVP)
 
 Per user directive 2026-05-13 ("this is going to be a plugin that anyone using

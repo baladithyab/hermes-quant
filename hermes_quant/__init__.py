@@ -110,6 +110,37 @@ def register(ctx: Any) -> None:
         schema=schemas.QUANT_RECOMMEND,
         handler=quant_tools.quant_recommend,
     )
+    # HITL React surface (ADR-0015) — propose / approve / reject / list / lookup
+    ctx.register_tool(
+        name="quant_propose",
+        toolset="quant",
+        schema=schemas.QUANT_PROPOSE,
+        handler=quant_tools.quant_propose,
+    )
+    ctx.register_tool(
+        name="quant_approve",
+        toolset="quant",
+        schema=schemas.QUANT_APPROVE,
+        handler=quant_tools.quant_approve,
+    )
+    ctx.register_tool(
+        name="quant_reject",
+        toolset="quant",
+        schema=schemas.QUANT_REJECT,
+        handler=quant_tools.quant_reject,
+    )
+    ctx.register_tool(
+        name="quant_pending",
+        toolset="quant",
+        schema=schemas.QUANT_PENDING,
+        handler=quant_tools.quant_pending,
+    )
+    ctx.register_tool(
+        name="quant_proposal",
+        toolset="quant",
+        schema=schemas.QUANT_PROPOSAL,
+        handler=quant_tools.quant_proposal,
+    )
     ctx.register_tool(
         name="quant_doctor",
         toolset="quant",
@@ -121,7 +152,7 @@ def register(ctx: Any) -> None:
     ctx.register_command(
         "quant",
         handler=quant_tools.handle_quant_slash,
-        description="hermes-quant: /quant status | /quant signals [N] | /quant recommend <SYMBOL> | /quant doctor",
+        description="hermes-quant: /quant status | recommend <SYM> | propose <SYM> | approve <ID> | reject <ID> <reason> | pending | doctor",
     )
 
     # CLI subcommand tree — control plane (ADR-0007 §canonical CLI)

@@ -110,6 +110,125 @@ QUANT_RECOMMEND = {
 }
 
 
+# ---------------------------------------------------------------------------
+# HITL React surface (ADR-0015)
+# ---------------------------------------------------------------------------
+
+QUANT_PROPOSE = {
+    "name": "quant_propose",
+    "description": "Propose a trade for human-in-the-loop approval (ADR-0015). "
+                   "Runs the same advisor pipeline as quant_recommend, then "
+                   "registers a PENDING proposal with a TTL (default 15 min) "
+                   "that the operator must approve via quant_approve or reject "
+                   "via quant_reject. Returns proposal_id + the full advisor "
+                   "result. Requires config quant.pdr.mode=hitl (returns a "
+                   "mode_mismatch error otherwise). The proposal is stored "
+                   "durably; approval triggers a paper-mode React (executions "
+                   "bus write) that the calibrator learns from.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string",
+                       "description": "Ticker or pair (e.g., 'AAPL', 'BTC/USDT')"},
+            "asset_class": {"type": "string",
+                            "enum": ["equity", "etf", "crypto", "fx"],
+                            "default": "equity"},
+            "timeframe": {"type": "string",
+                          "enum": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]},
+            "lookback_bars": {"type": "integer", "minimum": 50, "maximum": 2000},
+            "ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 1440,
+                            "default": 15,
+                            "description": "Proposal expires this many minutes from creation. "
+                                           "Expiration = automatic rejection with "
+                                           "reason='ttl_elapsed'."},
+            "as_of": {"type": "string",
+                      "description": "Optional ISO timestamp anchor (replay mode)"},
+        },
+        "required": ["symbol"],
+    },
+}
+
+
+QUANT_APPROVE = {
+    "name": "quant_approve",
+    "description": "Approve a pending proposal — fires the React adapter to "
+                   "execute the trade in paper mode (writes to executions.jsonl "
+                   "for the daemon's calibrator to consume). Per ADR-0015, "
+                   "v0.1.2 only supports paper mode; live brokers gated to "
+                   "v0.2 with explicit --live opt-in. Approval advances "
+                   "pending → approved one-way; expired or already-approved "
+                   "proposals return an error.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "proposal_id": {"type": "string",
+                            "description": "The proposal_id returned by quant_propose"},
+            "size_override_pct": {
+                "type": "number",
+                "description": "Optional signed override of the advisor's "
+                               "Kelly fraction (e.g. -0.03 for 3% short, "
+                               "0.025 for 2.5% long). Omit to use the "
+                               "advisor's recommendation.",
+            },
+        },
+        "required": ["proposal_id"],
+    },
+}
+
+
+QUANT_REJECT = {
+    "name": "quant_reject",
+    "description": "Reject a pending proposal with a reason (required). The "
+                   "rejection persists to the settlement journal as a 'human "
+                   "override' lesson; if quant.calibration.learn_from_rejections "
+                   "is true (default), the calibrator updates as if the trade's "
+                   "outcome were the opposite of its predicted direction "
+                   "(per ADR-0015 §D8). Rejecting an expired proposal returns "
+                   "an error.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "proposal_id": {"type": "string"},
+            "reason": {"type": "string",
+                       "description": "Why are you rejecting? Becomes a journal entry. "
+                                      "Required, non-empty."},
+        },
+        "required": ["proposal_id", "reason"],
+    },
+}
+
+
+QUANT_PENDING = {
+    "name": "quant_pending",
+    "description": "List currently-pending proposals (sweeps expired ones first). "
+                   "Read-only.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+            "symbol": {"type": "string",
+                       "description": "Optional filter by symbol"},
+        },
+        "required": [],
+    },
+}
+
+
+QUANT_PROPOSAL = {
+    "name": "quant_proposal",
+    "description": "Look up a single proposal's full record by proposal_id, "
+                   "including state, advisor result, and approval/rejection "
+                   "metadata. Read-only.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "proposal_id": {"type": "string"},
+        },
+        "required": ["proposal_id"],
+    },
+}
+
+
 QUANT_DOCTOR = {
     "name": "quant_doctor",
     "description": "Run a comprehensive health check on the hermes-quant daemon, "

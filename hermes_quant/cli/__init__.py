@@ -128,6 +128,45 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_rec.add_argument("--json", action="store_true",
                        help="Print raw JSON instead of rich-formatted output")
 
+    # HITL React subcommands (ADR-0015)
+    p_propose = sub.add_parser(
+        "propose",
+        help="Propose a trade for human approval (HITL mode, ADR-0015)",
+    )
+    p_propose.add_argument("symbol")
+    p_propose.add_argument("--asset-class", default="equity",
+                           choices=["equity", "etf", "crypto", "fx"])
+    p_propose.add_argument("--timeframe", default=None,
+                           choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
+    p_propose.add_argument("--ttl-minutes", type=int, default=15)
+    p_propose.add_argument("--lookback", type=int, default=None)
+    p_propose.add_argument("--as-of", default=None)
+    p_propose.add_argument("--json", action="store_true")
+
+    p_approve = sub.add_parser("approve",
+                               help="Approve a pending proposal (paper React)")
+    p_approve.add_argument("proposal_id")
+    p_approve.add_argument("--size-override", type=float, default=None,
+                           dest="size_override_pct",
+                           help="Override the advisor's Kelly fraction "
+                                "(signed; e.g. -0.03 = 3% short)")
+    p_approve.add_argument("--json", action="store_true")
+
+    p_reject = sub.add_parser("reject", help="Reject a pending proposal")
+    p_reject.add_argument("proposal_id")
+    p_reject.add_argument("--reason", required=True,
+                          help="Why are you rejecting? Becomes a journal entry.")
+    p_reject.add_argument("--json", action="store_true")
+
+    p_pend = sub.add_parser("pending", help="List pending proposals")
+    p_pend.add_argument("-n", type=int, default=20)
+    p_pend.add_argument("--symbol", default=None)
+    p_pend.add_argument("--json", action="store_true")
+
+    p_lookup = sub.add_parser("proposal", help="Look up a proposal by id")
+    p_lookup.add_argument("proposal_id")
+    p_lookup.add_argument("--json", action="store_true")
+
     # Backtest
     p_bt = sub.add_parser("backtest", help="Run hermes-quant against historical bars")
     p_bt.add_argument("asset")
@@ -209,6 +248,66 @@ def dispatch(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2, default=str))
         else:
             _pretty_print_recommend(result)
+        return 0 if result.get("success") else 1
+
+    if cmd == "propose":
+        from hermes_quant.tools import quant_propose
+        result = json.loads(quant_propose({
+            "symbol": args.symbol,
+            "asset_class": args.asset_class,
+            "timeframe": args.timeframe,
+            "lookback_bars": args.lookback,
+            "ttl_minutes": args.ttl_minutes,
+            "as_of": args.as_of,
+        }))
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            _pretty_print_propose(result)
+        return 0 if result.get("success") else 1
+
+    if cmd == "approve":
+        from hermes_quant.tools import quant_approve
+        result = json.loads(quant_approve({
+            "proposal_id": args.proposal_id,
+            "size_override_pct": args.size_override_pct,
+        }))
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            _pretty_print_approve(result)
+        return 0 if result.get("success") else 1
+
+    if cmd == "reject":
+        from hermes_quant.tools import quant_reject
+        result = json.loads(quant_reject({
+            "proposal_id": args.proposal_id,
+            "reason": args.reason,
+        }))
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            _pretty_print_reject(result)
+        return 0 if result.get("success") else 1
+
+    if cmd == "pending":
+        from hermes_quant.tools import quant_pending
+        result = json.loads(quant_pending({
+            "limit": args.n, "symbol": args.symbol,
+        }))
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            _pretty_print_pending(result)
+        return 0 if result.get("success") else 1
+
+    if cmd == "proposal":
+        from hermes_quant.tools import quant_proposal
+        result = json.loads(quant_proposal({
+            "proposal_id": args.proposal_id,
+        }))
+        # always pretty-print as JSON for now (rich form deferred)
+        print(json.dumps(result, indent=2, default=str))
         return 0 if result.get("success") else 1
 
     if cmd == "config" and args.config_action == "show":
@@ -306,6 +405,82 @@ def _pretty_print_doctor(result: dict) -> None:
         print("Next steps:")
         for line in result["next_step"].splitlines():
             print(f"  {line}")
+
+
+def _pretty_print_propose(result: dict) -> None:
+    if not result.get("success"):
+        print(f"hermes-quant propose: {result.get('error', 'unknown error')}")
+        if result.get("message"):
+            print(f"  {result['message']}")
+        if result.get("error") == "mode_mismatch":
+            print()
+            print("To enable HITL mode, add to ~/.hermes/config.yaml:")
+            print("  quant:")
+            print("    pdr:")
+            print("      mode: hitl")
+        return
+    pid = result.get("proposal_id")
+    print(f"hermes-quant propose — proposal_id: {pid}")
+    print(f"  state:       {result.get('state')}")
+    print(f"  expires_at:  {result.get('expires_at')}")
+    print()
+    advisor = result.get("advisor_result") or {}
+    if advisor:
+        _pretty_print_recommend({"success": True, **advisor})
+    print(f"\nNext: hermes quant approve {pid}")
+    print(f"      hermes quant reject  {pid} --reason '...'")
+
+
+def _pretty_print_approve(result: dict) -> None:
+    if not result.get("success"):
+        print(f"hermes-quant approve: {result.get('error')}")
+        if result.get("message"):
+            print(f"  {result['message']}")
+        return
+    print(f"hermes-quant approve — APPROVED")
+    print(f"  proposal_id: {result.get('proposal_id')}")
+    print(f"  state:       {result.get('state')}")
+    print(f"  fill_size:   {result.get('fill_size_pct'):+.4f}")
+    exe = result.get("execution") or {}
+    print(f"  decision_price: {exe.get('decision_price', 0):.4f}")
+    print(f"  fill_price:     {exe.get('fill_price', 0):.4f}  (paper)")
+    print(f"  reactor:        {exe.get('reactor_name')}")
+
+
+def _pretty_print_reject(result: dict) -> None:
+    if not result.get("success"):
+        print(f"hermes-quant reject: {result.get('error')}")
+        if result.get("message"):
+            print(f"  {result['message']}")
+        return
+    print(f"hermes-quant reject — REJECTED")
+    print(f"  proposal_id: {result.get('proposal_id')}")
+    print(f"  reason:      {result.get('rejection_reason')}")
+    if result.get("calibrator_will_learn"):
+        print(f"  → calibrator update queued (learn_from_rejections=true)")
+
+
+def _pretty_print_pending(result: dict) -> None:
+    if not result.get("success"):
+        print(f"hermes-quant pending: {result.get('error')}")
+        return
+    proposals = result.get("proposals", [])
+    if not proposals:
+        print("(no pending proposals)")
+        return
+    print(f"hermes-quant pending — {result.get('count')} proposal(s)")
+    print()
+    for p in proposals:
+        print(f"  {p['proposal_id']}")
+        print(f"    {p['symbol']:12} {p['asset_class']:8} {p['timeframe']:5}  "
+              f"expires {p['expires_at']}")
+        rg = (p.get("advisor_result") or {}).get("risk_gate") or {}
+        if rg.get("pass"):
+            print(f"    {rg.get('recommended_action', '?')}, "
+                  f"kelly={rg.get('kelly_fraction', 0):+.4f}")
+        else:
+            print(f"    GATED — {rg.get('gated_reason', 'unknown')}")
+        print()
 
 
 def _pretty_print_recommend(result: dict) -> None:

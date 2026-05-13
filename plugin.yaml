@@ -13,6 +13,11 @@ provides_tools:
   - quant_show_signals
   - quant_show_views
   - quant_recommend
+  - quant_propose
+  - quant_approve
+  - quant_reject
+  - quant_pending
+  - quant_proposal
   - quant_doctor
 
 provides_hooks:
