@@ -445,6 +445,22 @@ def quant_approve(args: dict, **_kwargs) -> str:
             "message": str(exc),
         })
 
+    # Append journal entry for the approval — completes the operator audit
+    # trail. ADR-0010 §Wave-A integration; degrades silently if journal
+    # writer not available (e.g. older deploy without the journal/ pkg).
+    try:
+        from hermes_quant.journal.writer import append_human_override
+        append_human_override(approved, kind="approve",
+                              reason=_kwargs.get("approval_note"))
+    except ImportError:
+        logger.debug("quant_approve: journal writer not available; "
+                     "approval not journaled")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "quant_approve: journal append failed: %s",
+            exc, exc_info=True,
+        )
+
     return json.dumps({
         "success": True,
         "proposal_id": proposal_id,

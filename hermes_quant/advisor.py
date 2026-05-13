@@ -488,7 +488,11 @@ def recommend(
     # ---- Step 5: run analysts ----
     if analysts is None:
         from hermes_quant.analysts.classical_ta import ClassicalTAAnalyst
-        analysts = [ClassicalTAAnalyst()]
+        try:
+            from hermes_quant.analysts.microstructure import MicrostructureLite
+            analysts = [ClassicalTAAnalyst(), MicrostructureLite()]
+        except ImportError:
+            analysts = [ClassicalTAAnalyst()]
 
     views: list[AnalystView] = []
     for analyst in analysts:
@@ -572,7 +576,16 @@ def recommend(
                 "advisor: lesson retrieval failed: %s", exc, exc_info=True
             )
 
-    return result.to_dict()
+    # Top-level decision_price + signal_id for downstream consumers
+    # (Reactor adapters need decision_price; settlement loop needs signal_id).
+    # Per ADR-0014 amendment 2026-05-13 (Wave B.1), advisor exposes these
+    # as top-level fields rather than burying them in analyst_views[0].metadata.
+    final = result.to_dict()
+    final["decision_price"] = float(ctx.last_close)
+    # signal_id is the proposal_id-equivalent for the daemon side; advisor
+    # itself doesn't emit one, so this stays None until daemon-mode integrates.
+    final["signal_id"] = None
+    return final
 
 
 # ---------------------------------------------------------------------------

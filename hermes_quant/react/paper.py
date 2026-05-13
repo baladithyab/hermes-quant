@@ -113,17 +113,22 @@ class PaperReactor:
     def _extract_decision_price(proposal: Any) -> float:
         """Pull the decision-time price from the embedded advisor_result.
 
-        Advisor stores the last close as `aggregated_signal` doesn't have it,
-        but data_quality.last_bar_age_minutes confirms the bar; we fall back
-        to advisor's metadata if available. If everything's missing (e.g.
-        gated proposal that somehow got approved), use 0.0 as a sentinel —
-        the calibrator will gate on data_quality anyway.
+        Per ADR-0014 amendment Wave B.1 (2026-05-13): advisor exposes
+        `decision_price` as a top-level field. Older proposals (pre-fix)
+        may have it buried in analyst_views[0].metadata.last_close — we
+        fall back through that for forward-compat with already-stored
+        proposals.
         """
         ar = proposal.advisor_result or {}
-        # Prefer explicit decision_price if the advisor populates it
-        # (placeholder for v0.1.2 — currently advisor doesn't expose this
-        # at top level; we extract from the analyst views' metadata if
-        # ClassicalTA included it).
+        # Preferred: top-level decision_price (advisor Wave B.1+)
+        top_dp = ar.get("decision_price")
+        if top_dp is not None:
+            try:
+                return float(top_dp)
+            except (TypeError, ValueError):
+                pass
+        # Fallback for pre-Wave-B.1 advisor_results stored before the fix:
+        # ClassicalTA's metadata happens to carry last_close.
         for view in (ar.get("analyst_views") or []):
             md = view.get("metadata") or {}
             if "last_close" in md:
@@ -131,16 +136,23 @@ class PaperReactor:
                     return float(md["last_close"])
                 except (TypeError, ValueError):
                     pass
-        # Fall back to a price encoded by the advisor at as_of time, if any.
-        # (v0.1.3 should add `decision_price` as a top-level advisor field;
-        # ADR-0014 amendment can lock this.)
+        # Worst case: gated proposals approved-anyway (operator override)
+        # land here. 0.0 is the sentinel; the daemon's settlement loop
+        # gates on data_quality at calibration time.
         return 0.0
 
     @staticmethod
     def _extract_signal_id(proposal: Any) -> str | None:
+        """Pull signal_id from advisor_result. None for advisor-only proposals
+        (the advisor surface doesn't emit signals; daemon-integration will)."""
         ar = proposal.advisor_result or {}
+        # Top-level (Wave B.1+ advisor)
+        sid = ar.get("signal_id")
+        if sid:
+            return sid
+        # Fallback: aggregated_signal sub-dict
         sig = ar.get("aggregated_signal") or {}
-        return sig.get("signal_id")  # advisor doesn't currently emit this; will when daemon-mode is integrated
+        return sig.get("signal_id")
 
 
 def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:

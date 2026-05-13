@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — PDR feedback loop closes (settlement journal + microstructure analyst)
+
+Continuation of the HITL Wave A work. This batch lands the LEARNING side
+of the PDR loop: every approve/reject now persists to a markdown ledger
+that the advisor reads back on the next call. The committee gets a second
+voice (microstructure-lite). The advisor exposes `decision_price` as a
+top-level field so the Reactor doesn't have to dig through analyst metadata.
+
+**Wave B.1 — decision_price contract fix** (ADR-0014 amendment 2026-05-13):
+- Advisor now exposes `decision_price` and `signal_id` at the top level
+  of the result dict, sourced from `MarketContext.last_close`.
+- `PaperReactor._extract_decision_price` reads top-level first, falls
+  back to the old `analyst_views[0].metadata.last_close` path for
+  forward-compat with already-stored proposals.
+
+**Wave B.2 — settlement journal (ADR-0010)**:
+- `hermes_quant/journal/{__init__.py, models.py, render.py, writer.py, reader.py}`
+- `SettlementEntry` Pydantic model (with dataclass shim for installs
+  without pydantic). HITL extension fields: `hitl_kind` ∈
+  {approve, reject, expire}, `hitl_reason`, `hitl_approver`.
+- `append_pending(entry)` — writes Phase-A entry via atomic rename
+  (`.tmp` → fsync → rename). Crash-safe.
+- `resolve(entry_id, ...)` — patches a pending entry with realized P&L
+  + `Reflection(thesis_held, magnitude_error)` per ADR-0010 deterministic-v1.
+- `append_human_override(proposal, kind, reason)` — Wave A integration:
+  HITL approve/reject events render as journal entries even with no
+  daemon running. Idempotent on `proposal_id` (re-render rather than
+  duplicate).
+- `get_recent_lessons(symbol, n_same, n_cross)` — recency-tail retrieval
+  per ADR-0010 §7. NO embeddings, NO vector store (the explicit
+  divergence from TradingAgents' removed `FinancialSituationMemory`).
+- HTML-comment delimiters (`<!-- ENTRY_END -->` / `<!-- META_BEGIN -->`)
+  so narrative bodies can use any markdown construct without colliding
+  with separators.
+- Cross-process serialization via flock on `.lock` sidecar; in-process
+  via per-path RLock. Same pattern signal_bus uses.
+- Pydantic-only writer surface — markdown is a render derivative.
+  Hand-edits to the meta block silently lose entries (per ADR-0010 §8,
+  this is a feature).
+
+**Wave B.2b — quant_approve and quant_reject wire the journal**:
+- `quant_reject` already routed through `append_human_override` (Wave A);
+  with the writer now landed, rejections persist to disk.
+- `quant_approve` ALSO appends to the journal, completing the operator
+  audit trail. Both events go to the same file with `hitl_kind` tagged.
+- Both paths degrade silently (`logger.debug` only) if the journal
+  module isn't importable, so older deploys without the package keep
+  working.
+
+**Wave B.3 — MicrostructureLite analyst** (charter §"Layer 1 Analyst Pool"):
+- `hermes_quant/analysts/microstructure.py` — second voice for BMA. Real
+  microstructure (L2 imbalance, queue position, VPIN) requires a tick
+  feed which v0.1.2 providers don't expose, so this is the OHLCV-derivable
+  subset:
+  - **Bollinger %B** mean-reversion (close < 5%/>95% bands)
+  - **Trend quality** (Wilder's-ADX-lite: net move / sum of bar ranges)
+    + bar imbalance for direction
+  - **Order-flow toxicity proxy** (ATR regime + persistent bar-direction
+    imbalance — VPIN approximation from bars alone)
+- Composite vote with disagreement → silence (charter's "rewarded for
+  correct inaction"). Cold-start calibration via `ColdStartCalibrator`.
+- Advisor now auto-loads ClassicalTA + MicrostructureLite — BMA finally
+  has multiple voices to aggregate.
+- Per ADR-0002 + ADR-0009 §P0-2: confidence_raw preserved on AnalystView
+  for calibrator training.
+
+**Wave B.4 — PDR feedback loop closes** (advisor reads journal):
+- `hermes_quant/advisor.py::_get_recent_lessons` already routed through
+  `journal.reader.get_recent_lessons` (Wave A stub); with the reader now
+  landed, the advisor surfaces real journal entries when called with
+  `include_lessons=True` (the default).
+- The full loop: HITL approve → journal entry → next `quant_recommend`
+  query for that symbol pulls the entry into the `lessons[]` field for
+  operator context. The same entries will feed v0.3.0 LLMAnalyst RAG
+  per ADR-0012.
+
+**Tests** (29 new, 330 total):
+- `tests/unit/test_journal.py` (16 tests):
+  - append_pending writes Phase-A; resolve patches Phase-B
+  - Phase-B-on-resolved raises JournalEntryAlreadyResolved
+  - missing entry raises JournalEntryNotFound
+  - duplicate entry_id raises ValueError
+  - render → parse round-trip preserves entries
+  - empty / unparseable file edge cases
+  - HTML-comment delimiter robustness (body markdown can include `---`/`##`)
+  - corrupt file backup-and-recover
+  - HITL append_human_override: approve / reject / idempotent on same id
+  - get_recent_lessons: n_same + n_cross, newest-first, empty-journal,
+    resolved-entry reflection
+- `tests/unit/test_microstructure.py` (13 tests):
+  - indicator math sanity (percent_b, atr_relative, trend_quality,
+    bar_imbalance NaN/short-data behavior)
+  - returns None on insufficient history
+  - silence on pure chop (charter principle)
+  - emits long on strong uptrend with bullish bar imbalance
+  - metadata includes all sub-signal indicators
+  - AnalystView shape conforms to Protocol (ADR-0002)
+  - end-to-end: advisor.recommend uses MicrostructureLite + decision_price
+    is top-level (Wave B.1 fix)
+
+**Test count: 301 → 330 (+29). All pass. Zero regressions.**
+
+The full PDR loop now closes: HITL approve → paper React → journal
+entry → advisor reads journal on next query → operator sees prior
+decisions and outcomes inline with new recommendations. The committee
+has two voices. The settlement story is operator-readable. Everything
+the v0.3.0 LLMAnalyst will RAG over already exists on disk in the
+v0.1.2 ship.
+
 ### Added — HITL React surface (ADR-0015, PDR loop closes the loop)
 
 Per user directive 2026-05-13 ("the trading guidance is HITL or automated,
