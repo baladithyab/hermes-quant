@@ -22,17 +22,15 @@ between cancel and the next daemon tick can't resume entries.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import threading
-import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
 import pandas as pd
 
-from hermes_quant.protocol import HaltRecord, HaltState
+from hermes_quant.protocol import HaltRecord
 
 # Wildcard sentinel — used instead of NULL for ANY-scope halts.
 WILDCARD = "*"

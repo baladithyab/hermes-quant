@@ -7,7 +7,6 @@ import pandas as pd
 import pytest
 
 from hermes_quant.data.base import (
-    MIN_VALID_BARS,
     REQUIRED_COLUMNS,
     fetch_with_chain,
     validate_bars,

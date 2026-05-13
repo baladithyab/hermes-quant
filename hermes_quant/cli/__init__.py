@@ -206,7 +206,7 @@ def dispatch(args: argparse.Namespace) -> int:
     print("  - yfinance + ccxt + alpaca data providers")
     print("  - The freqtrade consumer strategy")
     print()
-    print(f"Track GitHub: https://github.com/baladithyab/hermes-quant")
+    print("Track GitHub: https://github.com/baladithyab/hermes-quant")
     return 0
 
 
@@ -275,6 +275,7 @@ def _pretty_print_doctor(result: dict) -> None:
 
 def _show_config() -> None:
     from pathlib import Path
+
     import yaml
     cfg_path = Path.home() / ".hermes" / "config.yaml"
     if not cfg_path.exists():

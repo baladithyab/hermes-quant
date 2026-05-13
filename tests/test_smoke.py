@@ -45,25 +45,8 @@ def test_protocol_contracts_importable():
     from hermes_quant import (
         Action,
         AggregatedSignal,
-        Aggregator,
-        Analyst,
         AnalystView,
-        Calibrator,
-        DataProvider,
-        DataQualityError,
-        EpisodeOutcome,
-        HaltRecord,
-        HaltState,
-        HermesQuantError,
         MarketContext,
-        MarketState,
-        Portfolio,
-        Position,
-        RateLimitError,
-        RealizedOutcome,
-        RiskGate,
-        SignalTooLarge,
-        StatefulAnalyst,
     )
     # Just verify they're real classes
     assert hasattr(MarketContext, "__dataclass_fields__")
@@ -97,8 +80,9 @@ def test_no_eager_heavy_imports():
         if mod.startswith("hermes_quant") or mod in ("torch", "sklearn"):
             sys.modules.pop(mod, None)
 
-    import hermes_quant
     from unittest.mock import MagicMock
+
+    import hermes_quant
     ctx = MagicMock()
     hermes_quant.register(ctx)
 
@@ -110,6 +94,7 @@ def test_no_eager_heavy_imports():
 def test_canonical_cli_surface():
     """All canonical CLI subcommands per ADR-0009 §P1-11 must be parseable."""
     import argparse
+
     from hermes_quant.cli import setup_argparse
 
     parser = argparse.ArgumentParser()
@@ -151,7 +136,8 @@ def test_canonical_cli_surface():
 def test_tools_are_safe_when_daemon_absent():
     """All read-only tools must produce graceful output when daemon hasn't started."""
     import json
-    from hermes_quant.tools import quant_status, quant_show_signals, quant_doctor
+
+    from hermes_quant.tools import quant_doctor, quant_show_signals, quant_status
 
     # These shouldn't raise even if the bus doesn't exist
     s = json.loads(quant_status({}))

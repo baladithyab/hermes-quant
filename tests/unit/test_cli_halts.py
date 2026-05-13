@@ -2,11 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
-from unittest.mock import patch
 
-import pandas as pd
 import pytest
 
 from hermes_quant.cli.halts import (

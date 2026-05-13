@@ -14,7 +14,6 @@ from hermes_quant.analysts.classical_ta import (
 )
 from hermes_quant.protocol import (
     Analyst,
-    AnalystView,
     MarketContext,
 )
 

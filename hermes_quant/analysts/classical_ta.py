@@ -26,8 +26,7 @@ the composite raw is the agreement fraction (4 sub-signals: 4/4 = 1.0,
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd

@@ -14,17 +14,14 @@ Anchor: synthesis-v2 §P0-D + §P1-β. Verifies:
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from hermes_quant.daemon.halt_state import (
-    DEFAULT_HALT_JSON_MIRROR,
-    DEFAULT_STATE_DB,
-    HaltStateSQLite,
     WILDCARD,
+    HaltStateSQLite,
     read_halt_mirror,
 )
 from hermes_quant.protocol import HaltState

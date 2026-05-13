@@ -39,7 +39,7 @@ from .protocol import (
     Timeframe,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "Action",
@@ -82,7 +82,8 @@ def register(ctx: Any) -> None:
 
     Heavy imports are lazy. register() should run in <50ms.
     """
-    from . import schemas, tools as quant_tools
+    from . import schemas
+    from . import tools as quant_tools
 
     # Tools — read-only views into daemon state (ADR-0007)
     ctx.register_tool(

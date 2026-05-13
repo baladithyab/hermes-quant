@@ -22,7 +22,6 @@ exist (per ADR-0004 implementation notes).
 """
 from __future__ import annotations
 
-import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Literal

@@ -32,8 +32,7 @@ Per ADR-0009 §P1-10:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -41,7 +40,6 @@ import pandas as pd
 from hermes_quant.calibrators import ColdStartCalibrator
 from hermes_quant.protocol import (
     AggregatedSignal,
-    Aggregator,
     AnalystView,
     CalibratorNotReady,
     Direction,

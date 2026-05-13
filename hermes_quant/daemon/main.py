@@ -36,8 +36,6 @@ import signal
 import sys
 import time
 
-import pandas as pd
-
 from hermes_quant.daemon.discovery import (
     instantiate_aggregator,
     instantiate_analysts,
@@ -63,7 +61,7 @@ from hermes_quant.daemon.tick_loop import (
     run_one_tick,
 )
 from hermes_quant.protocol import DaemonAlreadyRunning
-from hermes_quant.risk.gate import DefaultRiskGate, PROFILES
+from hermes_quant.risk.gate import PROFILES, DefaultRiskGate
 
 logger = logging.getLogger(__name__)
 

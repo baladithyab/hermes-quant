@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Iterable
+from collections.abc import Iterable
 
 import pandas as pd
 

@@ -5,7 +5,6 @@ spawn the daemon, change config, or place trades.
 """
 from __future__ import annotations
 
-
 QUANT_STATUS = {
     "name": "quant_status",
     "description": "Read the current status of the hermes-quant daemon: running/stopped, "

@@ -6,7 +6,6 @@ import pytest
 
 from hermes_quant.aggregators.bma import BMAAggregator
 from hermes_quant.protocol import (
-    AggregatedSignal,
     Aggregator,
     AnalystView,
     EpisodeOutcome,

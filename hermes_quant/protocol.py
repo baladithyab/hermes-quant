@@ -17,8 +17,9 @@ version bump. New fields have sensible defaults. Consumers ignore unknown fields
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import pandas as pd
 

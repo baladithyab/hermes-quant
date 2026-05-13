@@ -9,7 +9,7 @@ from hermes_quant.calibrators import (
     IdentityCalibrator,
     IsotonicCalibrator,
 )
-from hermes_quant.protocol import Calibrator, CalibratorNotReady
+from hermes_quant.protocol import CalibratorNotReady
 
 
 class TestProtocolContract:

@@ -57,7 +57,7 @@ class DaemonLock:
         self.lock_path = lock_dir / f"daemon-{account_id}.lock"
         self._fd: int | None = None
 
-    def __enter__(self) -> "DaemonLock":
+    def __enter__(self) -> DaemonLock:
         self.acquire()
         return self
 

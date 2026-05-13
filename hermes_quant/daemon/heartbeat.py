@@ -29,18 +29,15 @@ Heartbeat record schema (in signals.jsonl):
 """
 from __future__ import annotations
 
-import json
 import os
 import threading
-import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import pandas as pd
 
 from hermes_quant.daemon.signal_bus import SIGNAL_BUS_PATH, emit_signal_record
-
 
 # ---------------------------------------------------------------------------
 # Heartbeat emitter (daemon side)

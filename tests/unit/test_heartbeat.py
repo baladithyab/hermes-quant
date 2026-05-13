@@ -21,7 +21,6 @@ from hermes_quant.daemon.heartbeat import (
     is_heartbeat_record,
 )
 
-
 # ---------------------------------------------------------------------------
 # HeartbeatChecker — synthesis-v2 §P0-C bootstrap fix
 # ---------------------------------------------------------------------------

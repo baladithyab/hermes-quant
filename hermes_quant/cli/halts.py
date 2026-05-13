@@ -23,10 +23,8 @@ hermes_quant.daemon.halt_state.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
-from typing import Any
 
 import pandas as pd
 
@@ -158,7 +156,7 @@ def cmd_emergency_stop(args: argparse.Namespace) -> int:
         # Resolve path at call time (not import time) so test monkeypatch works
         from hermes_quant.daemon import signal_bus as _bus_module
         emit_signal_record(halt_signal, path=_bus_module.SIGNAL_BUS_PATH)
-        print(f"halt signal emitted to bus")
+        print("halt signal emitted to bus")
     except Exception as e:  # noqa: BLE001
         print(f"halt signal emission failed (halt is still durable in SQLite): {e}",
               file=sys.stderr)
@@ -170,6 +168,6 @@ def cmd_emergency_stop(args: argparse.Namespace) -> int:
     print("  1. In your freqtrade UI, force-exit all positions.")
     print("  2. (For ccxt/alpaca consumers in v0.2: this will auto-cancel.)")
     print()
-    print(f"To resume after the underlying issue is resolved:")
+    print("To resume after the underlying issue is resolved:")
     print(f"  hermes quant resume {halt_account} --reason \"<why are you resuming?>\"")
     return 0
