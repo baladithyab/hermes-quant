@@ -18,6 +18,11 @@ provides_tools:
   - quant_reject
   - quant_pending
   - quant_proposal
+  - quant_autonomous_tick
+  - quant_autonomous_status
+  - quant_watchlist_add
+  - quant_watchlist_remove
+  - quant_watchlist_list
   - quant_doctor
 
 provides_hooks:

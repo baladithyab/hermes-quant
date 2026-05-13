@@ -39,7 +39,7 @@ from .protocol import (
     Timeframe,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 __all__ = [
     "Action",
@@ -140,6 +140,37 @@ def register(ctx: Any) -> None:
         toolset="quant",
         schema=schemas.QUANT_PROPOSAL,
         handler=quant_tools.quant_proposal,
+    )
+    # Autonomous-mode surface (ADR-0016) — silence-bias-gated paper trading
+    ctx.register_tool(
+        name="quant_autonomous_tick",
+        toolset="quant",
+        schema=schemas.QUANT_AUTONOMOUS_TICK,
+        handler=quant_tools.quant_autonomous_tick,
+    )
+    ctx.register_tool(
+        name="quant_autonomous_status",
+        toolset="quant",
+        schema=schemas.QUANT_AUTONOMOUS_STATUS,
+        handler=quant_tools.quant_autonomous_status,
+    )
+    ctx.register_tool(
+        name="quant_watchlist_add",
+        toolset="quant",
+        schema=schemas.QUANT_WATCHLIST_ADD,
+        handler=quant_tools.quant_watchlist_add,
+    )
+    ctx.register_tool(
+        name="quant_watchlist_remove",
+        toolset="quant",
+        schema=schemas.QUANT_WATCHLIST_REMOVE,
+        handler=quant_tools.quant_watchlist_remove,
+    )
+    ctx.register_tool(
+        name="quant_watchlist_list",
+        toolset="quant",
+        schema=schemas.QUANT_WATCHLIST_LIST,
+        handler=quant_tools.quant_watchlist_list,
     )
     ctx.register_tool(
         name="quant_doctor",

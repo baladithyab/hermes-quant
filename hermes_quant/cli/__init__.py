@@ -167,6 +167,69 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_lookup.add_argument("proposal_id")
     p_lookup.add_argument("--json", action="store_true")
 
+    # Autonomous-mode subcommands (ADR-0016)
+    p_auto = sub.add_parser(
+        "autonomous",
+        help="Autonomous mode: silence-bias-gated paper trading on a watchlist (ADR-0016)",
+    )
+    auto_sub = p_auto.add_subparsers(dest="autonomous_cmd", required=True)
+
+    p_auto_tick = auto_sub.add_parser(
+        "tick", help="Run a single autonomous tick (default: dry-run)",
+    )
+    p_auto_tick.add_argument("--no-dry-run", action="store_true",
+                              help="ACTUALLY fire paper trades on FIRE. "
+                                   "Default is dry-run for safety; this flag "
+                                   "is what cron uses.")
+    p_auto_tick.add_argument("--json", action="store_true")
+
+    p_auto_status = auto_sub.add_parser(
+        "status", help="Show autonomous-mode state",
+    )
+    p_auto_status.add_argument("--json", action="store_true")
+
+    p_auto_start = auto_sub.add_parser(
+        "start",
+        help="Enable autonomous mode + create a Hermes cron job for the tick cadence",
+    )
+    p_auto_start.add_argument("--cadence", default="15m",
+                              help="Cron schedule expression (default: 15m)")
+    p_auto_start.add_argument("--watchlist", default=None,
+                              help="Comma-separated SYMBOL[:asset_class[:timeframe]] "
+                                   "entries; sets the watchlist and overrides existing")
+
+    auto_sub.add_parser(
+        "stop",
+        help="Disable autonomous mode (set quant.pdr.mode=advise)",
+    )
+
+    p_auto_reset = auto_sub.add_parser(
+        "reset",
+        help="Reset the kill switch (re-enable autonomous mode after a trip)",
+    )
+    p_auto_reset.add_argument("--confirm", action="store_true", required=False,
+                               help="Required to actually reset")
+
+    p_auto_wl = auto_sub.add_parser(
+        "watchlist", help="Manage the autonomous-mode watchlist",
+    )
+    wl_sub = p_auto_wl.add_subparsers(dest="watchlist_cmd", required=True)
+
+    wl_add = wl_sub.add_parser("add", help="Add or update a watchlist entry")
+    wl_add.add_argument("symbol")
+    wl_add.add_argument("--asset-class", default="equity",
+                        choices=["equity", "etf", "crypto", "fx"])
+    wl_add.add_argument("--timeframe", default=None,
+                        choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
+
+    wl_rm = wl_sub.add_parser("remove", help="Remove a watchlist entry")
+    wl_rm.add_argument("symbol")
+    wl_rm.add_argument("--asset-class", default=None,
+                       choices=["equity", "etf", "crypto", "fx"])
+
+    wl_list = wl_sub.add_parser("list", help="List watchlist entries")
+    wl_list.add_argument("--json", action="store_true")
+
     # Backtest
     p_bt = sub.add_parser("backtest", help="Run hermes-quant against historical bars")
     p_bt.add_argument("asset")
@@ -310,6 +373,9 @@ def dispatch(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, default=str))
         return 0 if result.get("success") else 1
 
+    if cmd == "autonomous":
+        return _dispatch_autonomous(args)
+
     if cmd == "config" and args.config_action == "show":
         _show_config()
         return 0
@@ -437,7 +503,7 @@ def _pretty_print_approve(result: dict) -> None:
         if result.get("message"):
             print(f"  {result['message']}")
         return
-    print(f"hermes-quant approve — APPROVED")
+    print("hermes-quant approve — APPROVED")
     print(f"  proposal_id: {result.get('proposal_id')}")
     print(f"  state:       {result.get('state')}")
     print(f"  fill_size:   {result.get('fill_size_pct'):+.4f}")
@@ -453,11 +519,11 @@ def _pretty_print_reject(result: dict) -> None:
         if result.get("message"):
             print(f"  {result['message']}")
         return
-    print(f"hermes-quant reject — REJECTED")
+    print("hermes-quant reject — REJECTED")
     print(f"  proposal_id: {result.get('proposal_id')}")
     print(f"  reason:      {result.get('rejection_reason')}")
     if result.get("calibrator_will_learn"):
-        print(f"  → calibrator update queued (learn_from_rejections=true)")
+        print("  → calibrator update queued (learn_from_rejections=true)")
 
 
 def _pretty_print_pending(result: dict) -> None:
@@ -481,6 +547,301 @@ def _pretty_print_pending(result: dict) -> None:
         else:
             print(f"    GATED — {rg.get('gated_reason', 'unknown')}")
         print()
+
+
+def _dispatch_autonomous(args) -> int:
+    """Dispatch `hermes quant autonomous <subcommand>` (ADR-0016)."""
+    sub = getattr(args, "autonomous_cmd", None)
+    if sub is None:
+        print("hermes quant autonomous: missing subcommand. "
+              "Try `hermes quant autonomous --help`.")
+        return 2
+
+    if sub == "tick":
+        from hermes_quant.tools import quant_autonomous_tick
+        result = json.loads(quant_autonomous_tick({
+            "dry_run": not args.no_dry_run,
+        }))
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            _pretty_print_autonomous_tick(result)
+        return 0 if result.get("success") else 1
+
+    if sub == "status":
+        from hermes_quant.tools import quant_autonomous_status
+        result = json.loads(quant_autonomous_status({}))
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            _pretty_print_autonomous_status(result)
+        return 0 if result.get("success") else 1
+
+    if sub == "start":
+        return _autonomous_start(
+            cadence=args.cadence, watchlist_str=args.watchlist,
+        )
+
+    if sub == "stop":
+        return _autonomous_stop()
+
+    if sub == "reset":
+        if not args.confirm:
+            print("hermes quant autonomous reset: --confirm is required.")
+            print("This re-enables autonomous mode after a kill-switch trip.")
+            return 2
+        from hermes_quant.autonomous import reset_kill_switch
+        cleared = reset_kill_switch()
+        print(f"kill switch reset: {cleared}")
+        print("Run `hermes quant autonomous status` to verify.")
+        return 0
+
+    if sub == "watchlist":
+        return _dispatch_watchlist(args)
+
+    print(f"hermes quant autonomous: unknown subcommand {sub!r}")
+    return 2
+
+
+def _dispatch_watchlist(args) -> int:
+    sub = getattr(args, "watchlist_cmd", None)
+    if sub == "add":
+        from hermes_quant.tools import quant_watchlist_add
+        result = json.loads(quant_watchlist_add({
+            "symbol": args.symbol,
+            "asset_class": args.asset_class,
+            "timeframe": args.timeframe,
+        }))
+        if result.get("success"):
+            entry = result["added"]
+            print(f"added: {entry['symbol']} ({entry['asset_class']}, "
+                  f"{entry['timeframe']})")
+            return 0
+        print(f"watchlist add failed: {result.get('error')}: "
+              f"{result.get('message', '')}")
+        return 1
+
+    if sub == "remove":
+        from hermes_quant.tools import quant_watchlist_remove
+        result = json.loads(quant_watchlist_remove({
+            "symbol": args.symbol,
+            "asset_class": args.asset_class,
+        }))
+        if result.get("success"):
+            if result["removed"]:
+                print(f"removed: {args.symbol}")
+            else:
+                print(f"no entries matched: {args.symbol}")
+            return 0
+        print(f"watchlist remove failed: {result.get('error')}")
+        return 1
+
+    if sub == "list":
+        from hermes_quant.tools import quant_watchlist_list
+        result = json.loads(quant_watchlist_list({}))
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+            return 0
+        if not result.get("success"):
+            print(f"watchlist list failed: {result.get('error')}")
+            return 1
+        entries = result.get("watchlist", [])
+        if not entries:
+            print("(watchlist empty)")
+            return 0
+        for e in entries:
+            print(f"  {e['symbol']:14}  {e['asset_class']:8}  {e['timeframe']}")
+        return 0
+
+    print(f"watchlist: unknown subcommand {sub!r}")
+    return 2
+
+
+def _autonomous_start(*, cadence: str, watchlist_str: str | None) -> int:
+    """Set quant.pdr.mode=autonomous and (optionally) overwrite the
+    watchlist from a comma-separated string. Per ADR-0016 §D4 also
+    creates a Hermes cron job, but the user is responsible for
+    `hermes cron create` invocation — we print the command to run.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+    try:
+        import yaml as _yaml
+    except ImportError:
+        print("hermes quant autonomous start: pyyaml is required")
+        return 2
+
+    cfg_path = _Path.home() / ".hermes" / "config.yaml"
+    if cfg_path.exists():
+        cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    else:
+        cfg = {}
+    quant = cfg.setdefault("quant", {})
+    pdr = quant.setdefault("pdr", {})
+    pdr["mode"] = "autonomous"
+    auto = quant.setdefault("autonomous", {})
+    auto["cadence"] = cadence
+
+    if watchlist_str:
+        # Format: SYMBOL[:asset_class[:timeframe]],SYMBOL[:asset_class[:timeframe]],...
+        entries: list[dict] = []
+        for raw in watchlist_str.split(","):
+            parts = raw.strip().split(":")
+            if not parts or not parts[0]:
+                continue
+            entry = {
+                "symbol": parts[0],
+                "asset_class": parts[1] if len(parts) > 1 else "equity",
+            }
+            if len(parts) > 2:
+                entry["timeframe"] = parts[2]
+            entries.append(entry)
+        if entries:
+            auto["watchlist"] = entries
+
+    # Atomic-rename write
+    tmp = cfg_path.with_suffix(cfg_path.suffix + ".tmp")
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(_yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False))
+        f.flush()
+        _os.fsync(f.fileno())
+    _os.replace(tmp, cfg_path)
+
+    print(f"autonomous mode ENABLED (cadence={cadence})")
+    if watchlist_str:
+        print(f"  watchlist set: {watchlist_str}")
+    else:
+        print("  watchlist preserved from previous config")
+
+    print()
+    print("To create the cron tick job, run:")
+    print(f'  hermes cron create "{cadence}" \\\n'
+          '    --script "$(which hermes) quant autonomous tick --no-dry-run --json" \\\n'
+          '    --no-agent')
+    print()
+    print("Verify with: hermes quant autonomous status")
+    return 0
+
+
+def _autonomous_stop() -> int:
+    """Set quant.pdr.mode=advise — autonomous tick will refuse to fire."""
+    import os as _os
+    from pathlib import Path as _Path
+    try:
+        import yaml as _yaml
+    except ImportError:
+        print("hermes quant autonomous stop: pyyaml is required")
+        return 2
+
+    cfg_path = _Path.home() / ".hermes" / "config.yaml"
+    if not cfg_path.exists():
+        print("(no config.yaml — nothing to stop)")
+        return 0
+    cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    cfg.setdefault("quant", {}).setdefault("pdr", {})["mode"] = "advise"
+
+    tmp = cfg_path.with_suffix(cfg_path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(_yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False))
+        f.flush()
+        _os.fsync(f.fileno())
+    _os.replace(tmp, cfg_path)
+
+    print("autonomous mode DISABLED (mode set to 'advise')")
+    print("Existing cron tick job (if any) is NOT deleted automatically; ")
+    print("the tick will return mode_mismatch and no-op until you re-enable.")
+    print("To remove the cron job: hermes cron list, then hermes cron remove <id>")
+    return 0
+
+
+def _pretty_print_autonomous_tick(result: dict) -> None:
+    if not result.get("success"):
+        print(f"autonomous tick: {result.get('error')}")
+        if result.get("message"):
+            print(f"  {result['message']}")
+        if result.get("error") == "mode_mismatch":
+            print()
+            print("Enable autonomous mode with:")
+            print("  hermes quant autonomous start --cadence 15m \\")
+            print("    --watchlist AAPL:equity,BTC/USDT:crypto:1h")
+        return
+    if result.get("kill_switch_tripped"):
+        print(f"⚠ KILL SWITCH TRIPPED — {result.get('message')}")
+        ks = result.get("kill_switch", {})
+        print(f"  pnl: {ks.get('cumulative_pnl_pct'):+.2%}")
+        print(f"  threshold: -{ks.get('threshold_pct'):.0%}")
+        print(f"  tripped_at: {ks.get('tripped_at')}")
+        return
+    asof = result.get("asof", "?")
+    fires = result.get("fires", 0)
+    silences = result.get("silences", 0)
+    errors = result.get("errors", 0)
+    n = result.get("watchlist_size", 0)
+    dry = " (DRY RUN)" if result.get("dry_run") else ""
+    print(f"autonomous tick @ {asof}{dry}")
+    print(f"  watchlist: {n} symbols  →  fires: {fires}, silences: {silences}, errors: {errors}")
+    print()
+    for d in result.get("decisions", []):
+        gate = d.get("gate", "?")
+        sym = d.get("symbol", "?")
+        if gate == "FIRE":
+            action = d.get("action", {})
+            tgt = action.get("target_position_pct", 0.0)
+            dir_word = {1: "LONG", -1: "SHORT", 0: "FLAT"}.get(
+                action.get("direction"), "?")
+            exec_id = d.get("execution_id", "(dry-run)")
+            print(f"  ✓ {sym:14}  FIRE  {dir_word:5}  size={tgt:+.4f}  exec={exec_id}")
+        elif gate == "ERROR":
+            print(f"  ✗ {sym:14}  ERROR  {d.get('error', '')}")
+        else:
+            details = d.get("details", {})
+            tag = gate.replace("SILENCE_", "")
+            extra = ""
+            if "confidence" in details and "min_required" in details:
+                extra = f" (conf={details['confidence']:.2f} < {details['min_required']:.2f})"
+            elif "urgency" in details:
+                extra = f" (urgency={details['urgency']:.2f})"
+            elif "emitted" in details:
+                extra = f" ({details['emitted']}/{details['min_required']} voices)"
+            print(f"  · {sym:14}  silence  {tag}{extra}")
+
+
+def _pretty_print_autonomous_status(result: dict) -> None:
+    if not result.get("success"):
+        print(f"autonomous status: {result.get('error')}")
+        return
+    print(f"autonomous mode: {result.get('mode')}")
+    print()
+    wl = result.get("watchlist", [])
+    print(f"watchlist ({len(wl)} symbols):")
+    for e in wl:
+        print(f"  {e['symbol']:14}  {e['asset_class']:8}  {e['timeframe']}")
+    print()
+    cfg = result.get("silence_bias_config", {})
+    print("silence-bias gate config:")
+    print(f"  min_confidence:        {cfg.get('min_confidence', 0):.2f}")
+    print(f"  min_urgency:           {cfg.get('min_urgency', 0):.2f}")
+    print(f"  min_analysts_emitted:  {cfg.get('min_analysts_emitted', 0)}")
+    print(f"  max_recent_rejections: {cfg.get('max_recent_rejections', 0)}")
+    print(f"  salience_window:       {cfg.get('salience_window_hours', 0)}h")
+    print()
+    rails = result.get("safety_rails", {})
+    print("safety rails:")
+    print(f"  max_per_tick_opens:        {rails.get('max_per_tick_opens')}")
+    print(f"  max_concurrent_positions:  {rails.get('max_concurrent_positions')}")
+    print(f"  kill_switch_pct:           {rails.get('kill_switch_pct')}")
+    print(f"  log_silences:              {rails.get('log_silences')}")
+    print(f"  allow_live:                {rails.get('allow_live')}")
+    print()
+    ks = result.get("kill_switch", {})
+    if ks.get("tripped"):
+        print(f"⚠ KILL SWITCH TRIPPED at {ks.get('tripped_at')}")
+        print(f"  pnl: {ks.get('cumulative_pnl_pct'):+.2%}")
+        print(f"  reason: {ks.get('reason', '?')}")
+        print("  reset with: hermes quant autonomous reset --confirm")
+    else:
+        print("kill switch: armed (not tripped)")
 
 
 def _pretty_print_recommend(result: dict) -> None:

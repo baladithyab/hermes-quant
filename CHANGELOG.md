@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-13
+
+### Summary
+
+v0.2.0 ships **autonomous mode** — the third PDR surface. Hermes now
+watches the watchlist on a cadence; when the 4-dim silence-bias gate
+(charter §"REACT" three-bullet codification) fires, paper trades go
+through automatically. Per the founding charter's "rewarded for correct
+inaction" invariant, ALL FOUR gate dimensions must pass — silence is
+the default. Live autonomous deferred to v0.3 behind three independent
+locks (config flag + creds + per-startup arm-live ceremony).
+
+The autonomous tick reuses the existing advisor pipeline (BMA over
+ClassicalTA + MicrostructureLite) and the existing PaperReactor; new
+code is the orchestrator, the silence-bias gate, the watchlist module,
+and the safety rails (per-tick open cap, kill switch).
+
+### Added
+
+- **ADR-0016**: autonomous mode contract (silence-bias-gated paper
+  trading on a config-driven watchlist, cron-cadence ticks per ADR-0013
+  §D4, paper-only in v0.2). 17 KB; cites the founding charter verbatim.
+- **`hermes_quant.gates.silence_bias`** — pure-function 4-dim gate:
+  - Confidence (default `min_confidence=0.65`, stricter than HITL)
+  - Urgency = expected_signed_edge / volatility (default `min=0.5`)
+  - Compute Budget = number of analyst voices (default `min=2`)
+  - Salience = recent-rejections veto (default 3 rejections in 168h)
+  Structured silence reasons (`SILENCE_LOW_CONFIDENCE`,
+  `SILENCE_LOW_URGENCY`, `SILENCE_INSUFFICIENT_VOICES`,
+  `SILENCE_SALIENCE_VETO`, `SILENCE_GATED_BY_ADVISOR`) make tuning a
+  data exercise rather than guesswork.
+- **`hermes_quant.watchlist`** — config-driven watchlist module
+  (`add_to_watchlist`, `remove_from_watchlist`, `list_watchlist`,
+  `clear_watchlist`). Persists to
+  `~/.hermes/config.yaml::quant.autonomous.watchlist`. Profile-aware,
+  flock+RLock-serialized, atomic-rename writes, validation rejects
+  bad asset_class / timeframe / empty symbol.
+- **`hermes_quant.autonomous`** — `tick(symbols, *, dry_run)` orchestrator.
+  Mode-gated (`quant.pdr.mode=autonomous` required), kill-switch-gated,
+  per-symbol error isolation (one bad symbol doesn't break the tick),
+  structured operator-readable output. `_react()` helper synthesizes a
+  Proposal stand-in to reuse PaperReactor without HITL state.
+- **`hermes_quant.autonomous.trip_kill_switch` /`reset_kill_switch`** —
+  durable JSON file at `~/.hermes/quant/autonomous_kill_switch.json`
+  with atomic-rename writes. Trips disable autonomous tick until
+  `hermes quant autonomous reset --confirm`.
+- **5 new tools** registered with the plugin:
+  - `quant_autonomous_tick(dry_run=true)` — tool surface defaults to
+    DRY-RUN (ADR-0016 §D11) for agent safety; the cron-script path
+    sets `dry_run=False` to fire real paper trades
+  - `quant_autonomous_status()`
+  - `quant_watchlist_add(symbol, asset_class, timeframe?)`
+  - `quant_watchlist_remove(symbol, asset_class?)`
+  - `quant_watchlist_list()`
+- **CLI subcommand tree**: `hermes quant autonomous {tick,status,start,stop,reset,watchlist}`
+  with rich-text + `--json` output, `start --watchlist SYM:asset:tf,...`
+  shorthand, prints the Hermes-cron command to wire up cadence.
+- **Slash-command extensions**: `/quant auto tick|status` and
+  `/quant watchlist list|add|remove`.
+- **Tests** (61 new):
+  - `tests/unit/test_silence_bias_gate.py` — 26 tests covering all
+    four dims, dim ordering, salience-window edge cases, configurability,
+    bad input
+  - `tests/unit/test_watchlist.py` — 18 tests covering CRUD, validation,
+    idempotency, atomic-rename simulated crash, 8-thread concurrent-add
+  - `tests/integration/test_autonomous_e2e.py` — 17 tests covering
+    mode gate, dry-run safety, paper-react happy path, max_per_tick_opens
+    cap, kill-switch trip+reset, per-symbol error isolation, all 4
+    silence reasons, output shape
+
+### Changed
+
+- **`plugin.yaml::provides_tools`**: 10 → 15 (new autonomous tools listed)
+- **Total registered tools**: 10 → 15
+
+### Safety posture
+
+- Tool surface `quant_autonomous_tick` defaults to `dry_run=True`. LLM
+  agent generating tool calls cannot accidentally fire trades — only
+  the cron-script path with `--no-dry-run` does.
+- Mode gating read on EVERY tool call (no caching). Operators flip
+  `quant.pdr.mode=advise|hitl|autonomous` without restart.
+- `max_per_tick_opens` (default 1) caps new positions per tick.
+- `kill_switch_pct` (default 0.10) auto-disables autonomous on
+  cumulative paper P&L breach.
+- v0.2 ships paper-only. Live autonomous deferred to v0.3 behind
+  three independent locks per ADR-0016 §D6.
+
+### Test status
+
+- 426 passed, 1 skipped (was 365 → +61, zero regressions).
+
 ## [0.1.2] — 2026-05-13
 
 ### Summary

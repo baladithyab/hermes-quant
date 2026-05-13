@@ -592,6 +592,172 @@ def quant_proposal(args: dict, **_kwargs) -> str:
     }, default=str)
 
 
+# ---------------------------------------------------------------------------
+# Autonomous-mode tool handlers (ADR-0016)
+# ---------------------------------------------------------------------------
+
+def quant_autonomous_tick(args: dict, **_kwargs) -> str:
+    """Run an autonomous-mode tick (ADR-0016 §D11). Defaults to dry-run."""
+    dry_run = bool(args.get("dry_run", True))   # ADR-0016 §D11 safe default
+
+    try:
+        from hermes_quant.autonomous import tick
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({
+            "success": False,
+            "error": f"hermes-quant autonomous import failed: {exc}",
+        })
+
+    try:
+        result = tick(dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("quant_autonomous_tick: tick failed: %s", exc, exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": f"tick failed: {exc}",
+        })
+
+    out = result.to_dict()
+    # Surface mode-mismatch + kill-switch as errors so agent sees them
+    if out["mode"] != "autonomous":
+        return json.dumps({
+            "success": False,
+            "error": "mode_mismatch",
+            "message": f"autonomous tick requires quant.pdr.mode=autonomous; "
+                       f"current mode={out['mode']!r}. Set in ~/.hermes/config.yaml.",
+            "current_mode": out["mode"],
+        })
+
+    ks = out.get("kill_switch")
+    if ks and ks.get("tripped"):
+        return json.dumps({
+            "success": True,
+            "kill_switch_tripped": True,
+            "message": (
+                "autonomous mode is DISABLED — kill switch tripped. "
+                "Run `hermes quant autonomous reset --confirm` to re-enable."
+            ),
+            **out,
+        }, default=str)
+
+    return json.dumps({"success": True, **out}, default=str)
+
+
+def quant_autonomous_status(args: dict, **_kwargs) -> str:
+    """Show autonomous-mode status: mode, watchlist, gate config, kill-switch."""
+    try:
+        from hermes_quant.autonomous import (
+            _read_kill_switch,
+            _read_pdr_mode,
+            _read_safety_rails,
+            _read_silence_bias_config,
+        )
+        from hermes_quant.watchlist import list_watchlist
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({
+            "success": False,
+            "error": f"hermes-quant import failed: {exc}",
+        })
+
+    mode = _read_pdr_mode()
+    watchlist = list_watchlist()
+    config = _read_silence_bias_config()
+    rails = _read_safety_rails()
+    ks = _read_kill_switch()
+
+    return json.dumps({
+        "success": True,
+        "mode": mode,
+        "watchlist": [e.to_dict() for e in watchlist],
+        "watchlist_size": len(watchlist),
+        "silence_bias_config": {
+            "min_confidence": config.min_confidence,
+            "min_urgency": config.min_urgency,
+            "min_analysts_emitted": config.min_analysts_emitted,
+            "max_recent_rejections": config.max_recent_rejections,
+            "salience_window_hours": config.salience_window_hours,
+        },
+        "safety_rails": rails,
+        "kill_switch": {
+            "tripped": ks.tripped,
+            "tripped_at": ks.tripped_at,
+            "cumulative_pnl_pct": ks.cumulative_pnl_pct,
+            "threshold_pct": ks.threshold_pct,
+            "reason": ks.reason,
+        },
+    }, default=str)
+
+
+def quant_watchlist_add(args: dict, **_kwargs) -> str:
+    """Add or update a watchlist entry (ADR-0016 §D11)."""
+    symbol = args.get("symbol")
+    asset_class = args.get("asset_class")
+    timeframe = args.get("timeframe")
+    if not symbol or not asset_class:
+        return json.dumps({
+            "success": False,
+            "error": "symbol and asset_class are required",
+        })
+
+    try:
+        from hermes_quant.watchlist import add_to_watchlist
+        entry = add_to_watchlist(
+            symbol=symbol, asset_class=asset_class, timeframe=timeframe,
+        )
+    except ValueError as exc:
+        return json.dumps({
+            "success": False, "error": "validation", "message": str(exc),
+        })
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({
+            "success": False, "error": f"add failed: {exc}",
+        })
+
+    return json.dumps({
+        "success": True,
+        "added": entry.to_dict(),
+    }, default=str)
+
+
+def quant_watchlist_remove(args: dict, **_kwargs) -> str:
+    """Remove a watchlist entry."""
+    symbol = args.get("symbol")
+    asset_class = args.get("asset_class")
+    if not symbol:
+        return json.dumps({"success": False, "error": "symbol is required"})
+
+    try:
+        from hermes_quant.watchlist import remove_from_watchlist
+        removed = remove_from_watchlist(symbol=symbol, asset_class=asset_class)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({
+            "success": False, "error": f"remove failed: {exc}",
+        })
+
+    return json.dumps({
+        "success": True,
+        "removed": removed,
+        "symbol": symbol,
+    }, default=str)
+
+
+def quant_watchlist_list(args: dict, **_kwargs) -> str:
+    """List watchlist entries."""
+    try:
+        from hermes_quant.watchlist import list_watchlist
+        entries = list_watchlist()
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({
+            "success": False, "error": f"list failed: {exc}",
+        })
+
+    return json.dumps({
+        "success": True,
+        "count": len(entries),
+        "watchlist": [e.to_dict() for e in entries],
+    }, default=str)
+
+
 def quant_doctor(args: dict, **_kwargs) -> str:
     """Comprehensive health check. Read-only."""
     include_calibration = args.get("calibration", False)
@@ -711,7 +877,51 @@ def handle_quant_slash(args: list, **kwargs) -> str:
                 "error": "/quant proposal <PROPOSAL_ID>",
             })
         return quant_proposal({"proposal_id": args[1]}, **kwargs)
+    if sub == "auto" or sub == "autonomous":
+        # /quant auto <subcommand>
+        if len(args) < 2:
+            return quant_autonomous_status({}, **kwargs)
+        sub2 = args[1]
+        if sub2 == "tick":
+            # Default dry-run from slash to avoid surprise; use CLI for real fires
+            return quant_autonomous_tick({"dry_run": True}, **kwargs)
+        if sub2 == "status":
+            return quant_autonomous_status({}, **kwargs)
+        return json.dumps({
+            "success": False,
+            "error": f"unknown /quant auto subcommand {sub2!r}. "
+                     "Use: tick | status",
+        })
+    if sub == "watchlist" or sub == "wl":
+        if len(args) < 2:
+            return quant_watchlist_list({}, **kwargs)
+        sub2 = args[1]
+        if sub2 == "list":
+            return quant_watchlist_list({}, **kwargs)
+        if sub2 == "add":
+            if len(args) < 3:
+                return json.dumps({
+                    "success": False,
+                    "error": "/quant watchlist add <SYMBOL> [asset_class] [timeframe]",
+                })
+            wl_args = {"symbol": args[2],
+                       "asset_class": args[3] if len(args) > 3 else "equity"}
+            if len(args) > 4:
+                wl_args["timeframe"] = args[4]
+            return quant_watchlist_add(wl_args, **kwargs)
+        if sub2 == "remove":
+            if len(args) < 3:
+                return json.dumps({
+                    "success": False,
+                    "error": "/quant watchlist remove <SYMBOL>",
+                })
+            return quant_watchlist_remove({"symbol": args[2]}, **kwargs)
+        return json.dumps({
+            "success": False,
+            "error": f"unknown /quant watchlist subcommand {sub2!r}. "
+                     "Use: list | add | remove",
+        })
     return json.dumps({
         "success": False,
-        "error": f"unknown subcommand '{sub}'. Use: status | signals [N] | views <asset> | recommend <SYMBOL> | propose <SYMBOL> | approve <ID> | reject <ID> <reason> | pending | proposal <ID> | doctor",
+        "error": f"unknown subcommand '{sub}'. Use: status | signals [N] | views <asset> | recommend <SYMBOL> | propose <SYMBOL> | approve <ID> | reject <ID> <reason> | pending | proposal <ID> | auto tick|status | watchlist list|add|remove | doctor",
     })

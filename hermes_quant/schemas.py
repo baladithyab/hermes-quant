@@ -229,6 +229,105 @@ QUANT_PROPOSAL = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Autonomous-mode surface (ADR-0016)
+# ---------------------------------------------------------------------------
+
+QUANT_AUTONOMOUS_TICK = {
+    "name": "quant_autonomous_tick",
+    "description": "Run a single autonomous-mode tick (ADR-0016) over the "
+                   "configured watchlist. The orchestrator: Perceive (advisor) "
+                   "-> Decide (BMA + risk gate inside advisor) -> Gate "
+                   "(4-dim silence-bias) -> React (PaperReactor on FIRE). "
+                   "Per ADR-0016 §D11, this tool DEFAULTS TO DRY RUN — the "
+                   "tool surface is agent-callable and dry-run is the safe "
+                   "default. Real (paper) trades fire when invoked from the "
+                   "Hermes cron-script path with dry_run=False. Requires "
+                   "config quant.pdr.mode=autonomous (returns mode_mismatch "
+                   "otherwise). Returns structured per-symbol decisions + "
+                   "fire/silence/error counts + kill-switch state.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dry_run": {
+                "type": "boolean",
+                "default": True,
+                "description": "When True (default for the tool surface), "
+                               "report what would happen without firing the "
+                               "React adapter. The cron-script path sets "
+                               "dry_run=False to fire real paper trades.",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+QUANT_AUTONOMOUS_STATUS = {
+    "name": "quant_autonomous_status",
+    "description": "Show current autonomous-mode state: PDR mode, watchlist, "
+                   "silence-bias config, kill-switch state, recent tick "
+                   "summary. Read-only.",
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+
+QUANT_WATCHLIST_ADD = {
+    "name": "quant_watchlist_add",
+    "description": "Add a symbol to the autonomous-mode watchlist (ADR-0016). "
+                   "Idempotent on (symbol, asset_class) — duplicates are "
+                   "replaced, not appended. Persists to "
+                   "~/.hermes/config.yaml::quant.autonomous.watchlist.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string",
+                       "description": "Ticker or pair (e.g. 'AAPL', 'BTC/USDT')"},
+            "asset_class": {"type": "string",
+                            "enum": ["equity", "etf", "crypto", "fx"],
+                            "default": "equity"},
+            "timeframe": {"type": "string",
+                          "enum": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
+                          "description": "Bar timeframe; defaults per asset class"},
+        },
+        "required": ["symbol", "asset_class"],
+    },
+}
+
+
+QUANT_WATCHLIST_REMOVE = {
+    "name": "quant_watchlist_remove",
+    "description": "Remove a symbol from the autonomous-mode watchlist. "
+                   "Returns whether anything was removed.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string"},
+            "asset_class": {"type": "string",
+                            "enum": ["equity", "etf", "crypto", "fx"],
+                            "description": "Optional; if set, only remove "
+                                           "entries matching this asset_class"},
+        },
+        "required": ["symbol"],
+    },
+}
+
+
+QUANT_WATCHLIST_LIST = {
+    "name": "quant_watchlist_list",
+    "description": "List current autonomous-mode watchlist entries. Read-only.",
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+
 QUANT_DOCTOR = {
     "name": "quant_doctor",
     "description": "Run a comprehensive health check on the hermes-quant daemon, "
