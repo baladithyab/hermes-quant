@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-13
+
+### Summary
+
+v0.1.2 reframes hermes-quant as a **Perceive-Decide-React (PDR)** plugin
+with three operator surfaces — `advise` (one-shot guidance), `hitl`
+(propose-approve-react with paper trading), and `autonomous` (deferred
+to v0.2). Same Analyst → BMAAggregator → DefaultRiskGate pipeline drives
+all three. Two analysts now (ClassicalTA + MicrostructureLite — BMA has
+voices to actually aggregate). Settlement journal closes the feedback
+loop: every approve/reject persists to a markdown ledger that the
+advisor reads back on the next call. Lookahead is enforced at the leaf
+data layer. Monotonic-clock heartbeat. Path-safety guard for
+user-supplied symbols.
+
+Founding architectural charter saved verbatim to the repo at
+`docs/charter/2026-05-13-hermes-quant-charter.md`.
+
+**Test count: v0.1.1 273 → v0.1.2 365 (+92 tests across HITL e2e,
+journal, microstructure, no-lookahead invariant, monotonic heartbeat,
+symbol safety, and advisor contract).**
+
 ### Added — Wave C: lookahead enforcement + path safety + monotonic heartbeat
 
 Closes the bulk of v0.1.2 P0 items from the architecture review and the
