@@ -147,3 +147,91 @@ quant:
 - `docs/research/01-rl-for-trading.md` §2, §5 — failure modes and counter-rules
 - `docs/research/03-plugin-architecture.md` §5 — risk-gate sketch (this ADR formalizes it)
 - Eidolon `AGENTS.md` — silence-by-default principle and 7-dim gate architecture (reference, not direct port)
+
+---
+
+## Amendment 2026-05-13: Edge-sign alignment + session-aware halt_until
+
+**Status**: Part A accepted (shipped v0.1.1); Part B proposed (planned v0.1.2)
+**Date**: 2026-05-13
+
+### Context
+
+Phase-8 review of v0.1.1 surfaced two related defects in the rule sequence above. Both touch the silence-by-default invariant — one was a live correctness bug (Part A, fixed in v0.1.1), the other is a semantic-precision gap that becomes visible once asset-tz coverage broadens beyond UTC crypto (Part B, slated for v0.1.2). Bundled here because they evolve the same canonical rule list and the v0.1.2 diff is small.
+
+Both reviewers (Claude P2, DeepSeek P0) flagged Part A as the same root cause from different traces. Part B was raised under §P1-δ as a follow-on once the durable halt ordering (ADR-0009 §P0-D, extended in Phase-8 P0-C) made the `halt_until` value observable to the tick loop rather than ephemeral.
+
+### Part A — Rule 5a edge-sign alignment guard (v0.1.1, shipped)
+
+**The bug.** Under cold-start calibration shrinkage (λ=0.20 default per ADR-0002), an analyst's raw confidence is shrunk toward 0.50. A signal with raw `confidence=0.55` and `direction=+1` emits effective `confidence=0.35` — `expected_signed_edge` becomes **negative** in the requested direction. Rule 5's original `abs(edge) < threshold` check tests magnitude, not sign, so the signal passed. Rule 6's Kelly sizer then computed `target_size = direction * |kelly|` and produced a long target driven by a negative edge — or, equivalently, a SHORT action emitted while the analyst had aggregated to LONG.
+
+This is a silent silence-by-default violation: the gate emitted the wrong-direction action instead of holding cash, and the persisted `actions` row was indistinguishable from a genuine reversal signal.
+
+**The fix.** A new intermediate rule between Rule 5 (cost-gate threshold) and Rule 6 (Kelly sizer):
+
+```python
+# Rule 5a: edge-sign alignment guard
+if expected_signed_edge * signal.direction <= 0:
+    return None  # calibrated edge does not support the requested direction
+```
+
+The condition is `<= 0` (not `< 0`): a zero-edge signal in either direction also silences, consistent with the Rule 3 zero-confidence guard.
+
+**Implementation**: `hermes_quant/risk/gate.py:229-231`.
+
+**Tests**: `tests/unit/test_risk_gate.py::TestRule5CostGate::{test_negatively_edged_long_signal_silenced, test_negatively_edged_short_signal_silenced, test_positively_edged_signal_still_passes}`.
+
+### Part B — `trading_calendars` for `halt_until` (v0.1.2, planned)
+
+**The current naive code.** Rule 2 (daily-loss circuit breaker) sets `halt_until` via `_next_session_open(market.tz, portfolio.asof)`. v0.1.1 ships a coarse two-branch approximation (`hermes_quant/risk/gate.py:300-310`):
+- `tz == UTC` → next UTC midnight (correct for 24/7 crypto)
+- otherwise → `now + 24h` (conservative wall-clock fallback)
+
+This is correct enough to ship — the fallback is never *less* than 24h, so the breaker cannot under-halt — but it is not session-aware. An equity breaker tripped at 14:00 ET auto-clears at 14:00 ET next day (mid-session, acceptable); the same trip at 16:00 ET (EOD) auto-clears at 16:00 ET next day, which is 6.5h post-open of the following session. The halt-until semantics are not predictable across asset classes.
+
+**The v0.1.2 plan.** Adopt `trading-calendars` (or its successor `exchange-calendars`) for proper session boundaries:
+
+```python
+# Rule 2 halt_until — v0.1.2 implementation sketch
+def _next_session_open(tz: str, asof: datetime) -> datetime:
+    try:
+        cal = get_calendar(_TZ_TO_CALENDAR[tz])  # America/New_York → XNYS, Europe/London → XLON, ...
+        return cal.next_open(asof)               # strictly after asof
+    except (KeyError, ImportError, CalendarError):
+        return asof + timedelta(hours=24)        # v0.1.1 conservative fallback preserved
+```
+
+Mapping table lives in `hermes_quant/risk/_calendars.py`. Crypto (`tz=UTC` with `asset_class=crypto`) bypasses the calendar lookup and keeps the next-UTC-midnight behavior — markets are 24/7, but the daily-loss reset still respects the configured session boundary.
+
+**Fallback discipline.** Any failure path (calendar missing, tz unmapped, library import failure, `next_open` raises) falls through to `now + 24h`. This preserves the v0.1.1 invariant: `halt_until` is **never less than 24h from the trip**. We do not narrow halts under uncertainty.
+
+**Dependency.** Adds `trading-calendars >= 4.0` (or `exchange-calendars >= 4.5`, TBD during v0.1.2 spike) to `pyproject.toml [project.optional-dependencies] risk` extras group. The `risk` extra is already required for live trading; backtest-only installs still resolve.
+
+**Backward compat.** Rule 2's emit signature is unchanged — `Action(target_position=0, reason="daily_loss_circuit_breaker", halt=True, halt_until=<datetime>)`. Only the `halt_until` value differs. Existing consumers (notably the tick loop's durable-halt installer per Phase-8 P0-C) work unchanged.
+
+### Updated rule sequence
+
+The canonical sequence after both amendments. This supersedes the six-rule list in the original Decision section:
+
+- **Rule 0** — halt check (silence if scope is halted; reads `state.json`)
+- **Rule 1** — drawdown circuit breaker (`drawdown_pct > max_drawdown_pct` → flatten + `Action(halt=True)`)
+- **Rule 2** — daily-loss circuit breaker (`daily_loss_pct > max_daily_loss_pct` → flatten + `Action(halt=True, halt_until=…)`; `halt_until` from `trading_calendars` next session open in v0.1.2, `now + 24h` fallback)
+- **Rule 3** — silence on flat or zero-confidence (`direction == 0 or confidence < 1e-6`)
+- **Rule 4** — post-loss cooldown (`last_loss_minutes_ago < cooldown_after_loss_minutes` → silence)
+- **Rule 5** — cost-gate threshold (`|expected_signed_edge| < cost_multiple × round_trip_cost` → silence)
+- **Rule 5a** — *NEW* edge-sign alignment guard (`expected_signed_edge * signal.direction <= 0` → silence)
+- **Rule 6** — position size from quarter-Kelly (with `max_position_pct` cap and `action_step` rounding)
+- **Rule 7** — minimum trade-size guard (`|delta_pct| < min_trade_size` → silence)
+
+Numbering preserved across the amendment to keep test names and log breadcrumbs stable. Rule 5a is intentionally a sub-numbered insertion rather than a renumber.
+
+### Cross-cuts
+
+- **ADR-0002 (Analyst Protocol)** — cold-start calibration shrinkage is the *cause* of the negative-signed-edge case Rule 5a defends against. The ADR-0002 shrinkage default (λ=0.20) is unchanged; Rule 5a is its consequence at the gate boundary.
+- **ADR-0003 amendment (calibration_quality lifecycle)** — once v0.1.2 lifts the calibrator readiness gate, calibrated edges become more accurate and Rule 5a should fire less often in steady state. It still fires defensively; do not remove it on accuracy improvements.
+- **ADR-0009 §P0-D (durable halt ordering)** — unchanged in scope, but Phase-8 P0-C extends the ordering rule to the tick loop's circuit-breaker halt installer (the consumer of Rule 2's `halt_until`). Cross-link maintained.
+- **ADR-0011 (portfolio reconstruction)** — Rule 1's drawdown computation depends on accurate equity reconstruction. This amendment does not modify equity inputs; ADR-0011 invariants stand.
+
+### Provenance
+
+Phase-8 synthesis: `docs/reviews/2026-05-13-v0.1.1-phase8/synthesis.md` §P0-B (Part A — Claude P2 and DeepSeek P0 converged on the same root cause from different traces) and §P1-δ (Part B). Implementations: `hermes_quant/risk/gate.py:229-231` (Part A, shipped) and `hermes_quant/risk/gate.py:300-310` (Part B's current naive `_next_session_open`, to be replaced in v0.1.2).

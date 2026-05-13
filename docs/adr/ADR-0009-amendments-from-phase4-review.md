@@ -615,3 +615,32 @@ Replacement criteria for v0.2 RL aggregator graduation:
 Once the same 3 reviewers (or equivalent cross-family slate) PASS this amendments doc + the original 8 ADRs, all 9 ADRs are promoted to `accepted`.
 
 Until then, all 8 originals stay `proposed` and this ADR-0009 stays `proposed`.
+
+
+---
+
+## Cross-link 2026-05-13: §P0-D ordering extends to tick loop (Phase-8 P0-C)
+
+§P0-D ("durable halt ordering") was originally specified for the
+`cmd_emergency_stop` CLI path: when the operator triggers emergency stop,
+install the durable SQLite halt FIRST, then emit the bus signal, then
+announce broker intent. Phase-8 review (2026-05-13) caught that the ordering
+rule must ALSO apply at the tick loop's circuit-breaker emit point: when
+the gate's drawdown or daily-loss circuit breaker returns
+`Action(halt=True, halt_scope=...)`, `tick_loop.run_one_tick` MUST call
+`halt_state.add_halt(...)` BEFORE `emit_signal_record(...)`.
+
+Without this, the halt action is announced on the bus but not committed to
+durable storage. On daemon restart the halt history is lost; on the next
+tick the same circuit-breaker reading would re-fire; other assets in the
+same scope wouldn't observe the halt.
+
+**Implementation**: `hermes_quant/daemon/tick_loop.py:231-252` (shipped in
+v0.1.1). Idempotency: existing-active-halt -> swallow `ValueError` (the
+gate's halt action is idempotent in that case).
+
+**Tests**: `tests/unit/test_tick_settlement.py::TestRunOneTick::{test_drawdown_circuit_breaker_installs_durable_halt, test_drawdown_halt_install_is_idempotent_across_ticks}`.
+
+**Cross-link forward**: ADR-0008 amendment 2026-05-13 Part A (mirror
+staleness fallback) is the consumer-side enforcement of this producer-side
+ordering rule.

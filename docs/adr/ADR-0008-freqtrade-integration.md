@@ -194,3 +194,78 @@ For users who don't want freqtrade or NautilusTrader weight, a lightweight `herm
 - ADR-0005 — data layer (the daemon's input side)
 - freqtrade docs: https://www.freqtrade.io/
 - freqtrade-strategies repo for reference patterns
+
+
+---
+
+## Amendment 2026-05-13: Mirror staleness fallback + monotonic-clock heartbeat
+
+**Status**: planned (v0.1.2)
+**Date**: 2026-05-13
+
+### Context
+
+Phase-8 review of the v0.1.1 daemon surfaced two narrow but real correctness gaps that touch the consumer-side contract specified by this ADR. Both fixes are PLANNED for v0.1.2. Neither changes the signal-bus wire format or the freqtrade strategy's semantic contract; both harden the cross-process state surface that this ADR depends on.
+
+- **Part A** (P1-ε): the `~/.hermes/quant/halt_state.json` mirror that the strategy reads can lag the SQLite-of-record across a daemon crash, opening a window where the strategy trades through an installed halt.
+- **Part B** (P1-β): `HeartbeatChecker` computes elapsed time from wall-clock pandas Timestamps and is fooled by backward clock jumps (NTP correction, VM resume, container migration).
+
+Money-software discipline (per `AGENTS.md`): "plausible" is not "safe". A halt that fails to apply is a missed circuit-breaker, and a heartbeat check that reports `daemon_alive=True` when the daemon is in fact dead is a missed dead-man-switch. Both cost capital.
+
+### Part A — Halt mirror staleness fallback (v0.1.2)
+
+This ADR establishes `~/.hermes/quant/halt_state.json` as the freqtrade strategy's fast-path read for halts, written by the daemon via atomic-rename so the strategy avoids SQLite lock contention. Phase-8 caught a small staleness window in the producer:
+
+`HaltStateSQLite._write_mirror` (`hermes_quant/daemon/halt_state.py`) runs **after** the SQLite commit. If the daemon crashes between the commit and the atomic-rename, SQLite is correct (halt installed) but the mirror is stale (missing the new halt). On daemon restart, the freqtrade strategy reads the stale mirror and trades through the halt until the daemon next writes — which, in the worst case, is the next halt event.
+
+Window size is typically <1ms. But a halt is a circuit-breaker; the cost of missing one is asymmetric, so v0.1.2 closes this consumer-side.
+
+**v0.1.2 fix.** The strategy MUST cross-check `mirror.mtime` against `sqlite.mtime`. If `sqlite.mtime > mirror.mtime + STALENESS_TOLERANCE_S` (default 5s), the strategy falls back to a read-only SQLite open. SQLite WAL mode (already enabled per ADR-0005) allows concurrent readers without contending with the daemon's writer.
+
+```python
+STALENESS_TOLERANCE_S = 5.0  # generous; mirror writes are sub-ms but allow clock jitter
+
+def get_halts_for_strategy() -> list[Halt]:
+    mirror_path = QUANT_DIR / "halt_state.json"
+    db_path = QUANT_DIR / "halts.db"
+    try:
+        mirror_mtime = mirror_path.stat().st_mtime
+        db_mtime = db_path.stat().st_mtime
+    except FileNotFoundError:
+        return []  # neither exists -> no halts
+
+    if db_mtime > mirror_mtime + STALENESS_TOLERANCE_S:
+        # Mirror is stale beyond tolerance - read SQLite directly
+        logger.warning("halt mirror stale by %.1fs, falling back to SQLite",
+                       db_mtime - mirror_mtime)
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            return _read_halts_from_sqlite(conn)
+
+    return _read_halts_from_mirror(mirror_path)
+```
+
+**Why mtime, not sequence numbers.** Cross-process coordination via shared filesystem mtime is the simplest robust signal available without adding a coordination primitive. Any halt write touches both files; the atomic-rename guarantees ordering on POSIX. Clock jitter on virtualized environments can cause sub-second mtime skew between two `stat()` calls on different inodes — hence the 5s tolerance, which is wide enough to swallow jitter and narrow enough that a real producer crash is detected on the next strategy poll. Sequence numbers would require a third coordination file and a write fence; not worth the complexity for a fallback path.
+
+**Tests.** `tests/integration/test_halt_mirror_staleness.py` simulates the crash window: write SQLite, do **not** update the mirror (or write a stale mirror with backdated mtime), assert the strategy picks up the halt via the SQLite fallback path and that the warning fires.
+
+### Part B — Monotonic-clock heartbeat (v0.1.2)
+
+`HeartbeatChecker.check` (`hermes_quant/daemon/heartbeat.py:208-261`) computes elapsed time as `(now - last_heartbeat).total_seconds()` on wall-clock `pd.Timestamp` values. If the system clock jumps backward (NTP correction, VM resume, container migration), `now < last_heartbeat` → negative ages → `daemon_alive=True` indefinitely, even when the daemon is in fact dead.
+
+**v0.1.2 fix.** Track elapsed time using `time.monotonic()`. Wall-clock `pd.Timestamp` is retained for log/audit `asof` fields (those need real-time stamps for correlation with bar data and signal logs).
+
+**Implementation note.** Mechanical: swap `(now - last).total_seconds()` for `time.monotonic() - last_monotonic` in the elapsed-time math. Keep wall-clock for `asof`. No semantic contract change — bootstrap grace, dead-man-switch threshold, and the backtest synthetic-time path all stay identical.
+
+**Tests.** `tests/unit/test_heartbeat_clock_skew.py` mocks `time.monotonic` to return increasing values while wall-clock walks backward; asserts `daemon_alive=False` once monotonic ages exceed threshold regardless of wall-clock direction.
+
+### Cross-cuts
+
+- **ADR-0001 (sidecar architecture).** Both fixes preserve the daemon ↔ strategy decoupling; no new IPC, no new shared state. Strategy still reads files; daemon still writes files.
+- **ADR-0009 §P0-D (durable halt ordering).** Part A is the **consumer-side** enforcement of the producer-side ordering ADR-0009 specifies. The producer writes SQLite-then-mirror; the consumer trusts SQLite when the mirror is stale. The two halves close the loop.
+- **Phase-8 P0-C (tick loop installs durable halt on `Action(halt=True)`).** Part A makes the strategy correctly observe those halts even across the producer crash window that P0-C alone does not cover.
+- **Signal-bus contract (this ADR §"Signal bus format").** Unchanged. The `halt` flag on signals remains the inline mechanism; the mirror+SQLite path is the out-of-band durable mechanism for halts that outlive a single signal.
+
+### Provenance
+
+- Phase-8 synthesis: `docs/reviews/2026-05-13-v0.1.1-phase8/synthesis.md` §P1-ε (Claude P1) and §P1-β (Claude P1).
+- Current implementations referenced: `hermes_quant/daemon/halt_state.py::_write_mirror` (Part A), `hermes_quant/daemon/heartbeat.py:208-261` (Part B).

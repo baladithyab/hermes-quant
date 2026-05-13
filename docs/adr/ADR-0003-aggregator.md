@@ -118,3 +118,77 @@ Anything else is overfitting.
 - `docs/research/01-rl-for-trading.md` §1, §3, §4 — aggregator landscape, ensemble vs end-to-end RL, success criteria
 - `docs/research/03-plugin-architecture.md` §4 — aggregator design space
 - Bailey & López de Prado 2014, "The Deflated Sharpe Ratio"
+
+---
+
+## Amendment 2026-05-13: Calibration-quality lifecycle (Phase-8 P0-A.3 + v0.1.2 transition)
+
+### Context
+
+Phase-8 cross-family review (synthesis 2026-05-13 §P0-A) caught a soundness defect in the v0.1.0 settlement path: the per-fill formula `(fill_price - decision_price) / decision_price` was being stored on `RealizedOutcome.realized_return` and fed into `analyst.update()` / `aggregator.update()`. That value is **per-fill slippage**, not the directional return over `signal.horizon`. Three reviewers independently flagged that running the daemon as-shipped would zero out `direction_correct` for nearly every fill (slippage is dominated by microstructure noise, not the multi-bar drift the signal is forecasting), corrupting every Beta posterior in the analyst stack and the BMA weights in the aggregator. The honest fix is to refuse posterior updates until we have the entry+exit pair joined.
+
+This amendment pins the two-step lifecycle: (1) what shipped in v0.1.1 to gate the bad path off, (2) what lands in v0.1.2 to turn the gate green.
+
+### What changed in v0.1.1 (shipped)
+
+The `realized_return` field on `RealizedOutcome` and `EpisodeOutcome.realized_returns[horizon]` is now **polymorphic**. It carries either per-fill slippage *or* true horizon return; consumers MUST gate on a quality tag before treating the value as directional.
+
+The tag lives on `view.metadata['_calibration_quality']` (per-analyst outcomes) and on `AggregatedSignal.metadata['_calibration_quality']` (episode outcomes). Two values are defined in `hermes_quant/daemon/settlement_loop.py:76-77` as the source of truth:
+
+```python
+CALIBRATION_QUALITY_SLIPPAGE_ONLY = "slippage_only"     # v0.1.1: single-fill slippage
+CALIBRATION_QUALITY_HORIZON_RETURN = "horizon_return"   # v0.1.2+: true horizon return
+```
+
+`construct_realized_outcomes` (`settlement_loop.py:111-194`) and `construct_episode_outcomes` (`settlement_loop.py:197-288`) tag every outcome they emit as `slippage_only`. `dispatch_settlement` (`settlement_loop.py:291+`) reads the tag and SKIPS `analyst.update()` and `aggregator.update()` when it equals `slippage_only`, incrementing `stats["n_skipped_slippage_only"]`. The `RollingSlippageEstimator` is unaffected — it explicitly wants per-fill adverse-bps, so it consumes the same records by a different code path.
+
+Net effect: v0.1.1 settles fills, logs them, refines the slippage estimator, but does NOT mutate Beta posteriors or BMA weights. Calibration state is frozen at prior until v0.1.2.
+
+### What changes in v0.1.2 (planned)
+
+Entry+exit fill joining lands in the settlement loop, and tags flip from `slippage_only` to `horizon_return`. The transition is:
+
+1. **Entry markers** — `tick_loop` persists an `entry_record` on the signal bus (`entry_signal_id`, `decision_price`, `asof`, `direction`) whenever an `Action` with non-zero `target_position_pct` is emitted. Per ADR-0011 the marker chains via `exec_id`.
+2. **Join** — `settlement_loop` joins ENTRY exec records (side aligns with `signal.direction`) with EXIT exec records (opposite side closing the position) through the `portfolio_loader` exec_id chain. This piggybacks on the new portfolio loader's case (c) full-close handling (ADR-0011).
+3. **Compute** — `horizon_return = (exit_close_price − decision_price) / decision_price * sign(direction)`. Time elapsed `exit.asof − entry.asof` MUST be `>= signal.horizon`; positions closed early do not count as horizon outcomes.
+4. **Tag** — the resulting `RealizedOutcome` and its `AggregatedSignal` carry `_calibration_quality = "horizon_return"`. `dispatch_settlement` then dispatches to `analyst.update()` + `aggregator.update()` normally; BMA posteriors begin evolving.
+5. **Alpha** — `alpha_return = horizon_return − benchmark_return_over_same_window` (BTC for crypto, SPY for equities; per TradingAgents-comparison round-2 pattern #9a). Stored alongside `horizon_return` on the outcome; the calibrator uses `alpha_return` for direction-correct, not raw return.
+6. **Drop slippage tag where possible** — `construct_realized_outcomes` removes the `slippage_only` tag for any case where the exit-fill join succeeded. **Orphan fills** (entry with no matching exit yet, or exit that cannot be matched to an entry) STILL get `slippage_only` and STILL get skipped by `dispatch_settlement`. Orphans are not a bug — they reflect open positions and partial-fill races and are expected.
+
+**Partial-exit attribution.** When an exit closes only part of a position, attribution uses **average-cost basis**, matching ADR-0011 and freqtrade's default. FIFO lot accounting is deferred to v0.2+ and explicitly out of scope for this amendment; revisit when tax-lot reporting becomes a deliverable.
+
+### Schema diff
+
+```
+RealizedOutcome:
+  realized_return: float
+-   # v0.1.0: assumed to be horizon return; was actually per-fill slippage
++   # v0.1.1+: POLYMORPHIC — slippage OR horizon return
++   # gate on view.metadata['_calibration_quality'] before use
+  view: AnalystView
++   metadata['_calibration_quality']: 'slippage_only' | 'horizon_return'
+
+EpisodeOutcome.aggregated_signal: AggregatedSignal
++   metadata['_calibration_quality']: 'slippage_only' | 'horizon_return'
+
+# v0.1.2 only:
+RealizedOutcome:
++   alpha_return: float | None        # horizon_return − benchmark, see step 5
++   benchmark_symbol: str | None      # 'BTC-USD' | 'SPY' | None for slippage_only
+```
+
+The field name `realized_return` is preserved for wire compatibility with v0.1.0 signal logs; renaming was considered and rejected (breaks replay). The polymorphism is loadbearing.
+
+### Test fence
+
+- `test_no_slippage_only_outcomes_reach_analyst_update` — assertion (CI-blocking): `analyst.update` is never called with `view.metadata['_calibration_quality'] == 'slippage_only'`. Symmetric assertion for `aggregator.update`. Already in v0.1.1.
+- `test_horizon_return_outcomes_dispatch` — positive-path coverage that `horizon_return`-tagged outcomes DO reach `update()`. Already in v0.1.1 (synthetic outcomes).
+- `test_v0_1_2_entry_exit_join_produces_horizon_return` — NEW in v0.1.2: feed paired entry+exit exec records, assert the produced outcome is tagged `horizon_return` with the correct sign and magnitude.
+- `test_orphan_exit_falls_back_to_slippage_only` — NEW in v0.1.2 (defensive): exit with no joinable entry → outcome stays `slippage_only` and stays skipped.
+
+### Cross-cuts
+
+- **ADR-0009 §P1-10 (EpisodeOutcome)**: the schema is now polymorphic via `aggregated_signal.metadata['_calibration_quality']`. Cross-link this amendment from §P1-10.
+- **ADR-0011 (portfolio reconstruction)**: the v0.1.2 exit-fill join is not a parallel implementation — it consumes case (c) full-close and case (b) partial-close from the portfolio loader. Average-cost basis is shared between this ADR and ADR-0011; do not diverge.
+- **ADR-0010 (settlement journal)**: Phase B journal entries resolve with `horizon_return` once v0.1.2 lands. Until then, Phase B records the `slippage_only` tag and stays in lockstep with the calibrator (no posterior update, no journal "settled" transition for calibration purposes).
+- **ADR-0006 (RL deferred)**: graduation criteria require `horizon_return`-quality outcomes. v0.1.1 `slippage_only` data does NOT count toward the ≥12 walk-forward folds or the DSR p<0.05 gate. The graduation clock effectively starts on the v0.1.2 release.

@@ -107,3 +107,69 @@ This means v0.2 is wiring + training, not refactoring. The hard interface decisi
 - López de Prado 2018, "Advances in Financial Machine Learning" — purged walk-forward
 - Bailey & López de Prado 2014 — DeFlated Sharpe Ratio test
 - AI4Finance-Foundation/FinRL — reference implementation patterns
+
+---
+
+## Amendment 2026-05-13: tests/test_no_lookahead.py is a release blocker
+
+**Status**: accepted
+**Date**: 2026-05-13
+**Amends**: §Graduation criteria item 5; §Implementation notes bullet 2
+
+### Context
+
+ADR-0006 §Graduation criteria item 5 lists shuffle-timestamp lookahead-freedom as a precondition for the RL aggregator graduating from `deferred`. AGENTS.md §"No look-ahead bias" repeats it for every shipped analyst and aggregator. Both documents are aspirational. As of v0.1.1, neither is enforced: a maintainer can ship an analyst that depends on future bars and CI will not catch it. The lookahead test has been promised for two minor releases (v0.1.0, v0.1.1) and has not landed. Audit item #13.
+
+This is the failure mode the original ADR §Negative consequences hand-waved past. We ship an analyst with a 1.4 backtest Sharpe, the user enables it on real capital, and the Sharpe was achieved because `feature_engineering.py` accidentally computes a rolling z-score over the *full* series instead of a left-truncated one. The data layer is innocent (no future bars were fetched); the analyst leaked information statistically. ADR-0005's amendment Part B (`as_of` parameter at the data leaf) cannot catch this — it enforces no-future-data-leak at the *source*, not no-future-info-leak at the *consumer*. The two are complementary, not redundant.
+
+This amendment promotes `tests/test_no_lookahead.py` from "planned" to "release blocker."
+
+### Decision
+
+As of v0.1.2, `tests/test_no_lookahead.py` is a CI-blocking gate. **An analyst that fails it cannot be released, regardless of backtest Sharpe.** Out: "we'll fix it in v0.x+1." In: failing analyst stays in `experiments/` until fixed.
+
+The override path is explicit and high-friction: the offending class carries a `# noqa: lookahead-bias` marker AND ships with an ADR amendment justifying the exception. Default = blocking. Drift to "we'll just suppress it" is prevented by requiring the ADR amendment in the same PR as the marker.
+
+This pairs with — does not replace — ADR-0005 amendment Part B. Data layer enforces no-future-data-leak via the `as_of` parameter; this test enforces no-future-info-leak via statistical detection on shuffled timestamps. Round-2 TradingAgents pattern #1 (look-ahead filter at data leaf) is COMPLEMENTARY but NOT a substitute.
+
+### Implementation contract
+
+`tests/test_no_lookahead.py`:
+
+1. **Discovery**: enumerates every Analyst registered under the `hermes_quant.analysts` entry-point group in `pyproject.toml`, and every Aggregator under `hermes_quant.aggregators`. No hand-maintained allowlist.
+2. **Instantiation**: each component instantiated with its default config (the same path the daemon uses).
+3. **Test harness**: for every (component, fixture) pair, run `hermes_quant.evaluation.lookahead.shuffle_timestamps_test(component, bars, n_trials=1000, seed=42)`. Returns `(n_correct_after_shuffle, n_total)`.
+4. **Statistical assertion**: compute the binomial p-value against the uniform-random null (p=0.5). Assert `p > 0.05`. Beating chance on shuffled timestamps means information from future bars leaked into past predictions; we cannot reject the null and the build fails.
+5. **Fixtures**: `tests/fixtures/bars/btc_1h.parquet` (already present per AGENTS.md). Add `tests/fixtures/bars/aapl_1d.parquet` for an equities lookahead surface — daily-bar artifacts (split adjustment, dividend timing) don't appear in 1-hour crypto.
+6. **Determinism**: seed=42, n_trials=1000 fixed. Flake budget = zero. If the test is flaky, the test is wrong, not the threshold.
+
+### What graduates and what doesn't
+
+**Required to pass on first run**:
+
+- `ClassicalTAAnalyst` (v0.1.1, shipped). If it fails, that's a real bug — the analyst is leaking. Emergency fix, not a relaxation of the test.
+- `KronosAnalyst` (v0.1.2, planned). Must pass before merge.
+- `LLMAnalyst` (v0.3.0, deferred per ADR-0012). Passes by construction — the LLM at decision time has no access to future bars in `MarketContext`. The test is still required; it is expected to be trivial.
+
+**Does NOT graduate without this test**:
+
+- The RL aggregator — the actual subject of this ADR. ADR-0006 §Graduation criteria item 5 cannot be satisfied by a test that exists only in `docs/`. The RL aggregator stays `deferred` until (a) `tests/test_no_lookahead.py` exists and is CI-green for ALL shipped analysts AND aggregators, AND (b) items 1–4 and 6 of §Graduation are independently met. The lookahead test is necessary but not sufficient.
+
+If `ClassicalTAAnalyst` fails the test on the v0.1.1 codebase, v0.1.2 ships a fix to `ClassicalTAAnalyst`, not a softening of the assertion.
+
+### Cross-cuts
+
+- **ADR-0002 (Analyst Protocol)**: the Protocol gets no new method. The test exercises every implementation through the existing `analyze(ctx) -> AnalystView` surface. `tests/test_no_lookahead.py` becomes the de-facto compliance test for any class claiming to implement the Analyst Protocol.
+- **ADR-0005 amendment Part B (`as_of` at the data leaf)**: complementary. Data layer enforces no future-bar fetch at the source; this test enforces no future-info leak at the consumer via statistical detection. Both are required; neither subsumes the other.
+- **AGENTS.md §"No look-ahead bias"**: previously aspirational, now operational. AGENTS.md is updated in the same PR to point at this amendment as the enforcement mechanism rather than as a standalone promise.
+- **CHANGELOG.md**: if v0.1.1 passes the test on first run against its existing analyst set, it is retroactively marked "lookahead-fenced" in the v0.1.1 entry. If it fails, v0.1.2 carries the fix and v0.1.1 is marked "known lookahead defect — upgrade to v0.1.2."
+- **PR template**: from v0.1.2 forward, includes a checkbox "lookahead test passes for all touched analysts and aggregators." Blocks merge alongside the existing test/lint gates.
+
+### Provenance
+
+- AGENTS.md §"No look-ahead bias" — existing text, unfenced for two minor releases (v0.1.0, v0.1.1)
+- Audit item #13 (2026-05-13)
+- `hermes_quant/evaluation/lookahead.py` — the test helper already exists; this amendment turns it into a gate
+- ADR-0006 §Graduation criteria item 5 — promoted from "implemented" to "implemented AND blocking"
+- ADR-0005 amendment Part B — complementary surface (data leaf vs. consumer)
+- Round-2 TradingAgents pattern #1 — look-ahead filter at the data leaf; reinforces that source-side and consumer-side enforcement are not substitutes
