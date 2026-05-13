@@ -1,0 +1,50 @@
+name: hermes-quant
+version: "0.1.0"
+description: ARIA-powered multi-analyst algorithmic trading framework — sidecar daemon emits signals to a JSONL bus that freqtrade (or NautilusTrader) consumes for execution.
+author: Codeseys
+license: Apache-2.0
+homepage: https://github.com/baladithyab/hermes-quant
+manifest_version: 1
+kind: standalone
+platforms: [linux, macos, windows]
+
+provides_tools:
+  - quant_status
+  - quant_show_signals
+  - quant_show_views
+  - quant_doctor
+
+provides_hooks:
+  - on_session_start
+  - pre_gateway_dispatch
+
+# Optional API keys — plugin still works without all of these set.
+# yfinance bootstrap requires ZERO credentials; users opt in to Alpaca/exchange APIs.
+optional_env:
+  - name: ALPACA_API_KEY
+    description: Required for Alpaca paper/live equity trading and SIP data feed
+    url: https://alpaca.markets/
+    secret: true
+  - name: ALPACA_API_SECRET
+    description: Required for Alpaca paper/live equity trading
+    url: https://alpaca.markets/
+    secret: true
+  - name: BINANCE_API_KEY
+    description: Optional — increases ccxt rate limits for crypto data
+    url: https://www.binance.com/en/my/settings/api-management
+    secret: true
+  - name: BINANCE_API_SECRET
+    description: Optional — required for higher Binance rate limits
+    url: https://www.binance.com/en/my/settings/api-management
+    secret: true
+  - name: HF_TOKEN
+    description: Optional — used to download Kronos foundation model weights from HuggingFace Hub
+    url: https://huggingface.co/settings/tokens
+    secret: true
+  - name: OPENROUTER_API_KEY
+    description: Optional — required only for the news-LLM analyst (deferred to v0.2)
+    url: https://openrouter.ai/keys
+    secret: true
+  - name: MLFLOW_TRACKING_URI
+    description: Optional — point the daemon at an MLflow tracking server; defaults to file backend at ~/.hermes/quant/mlruns
+    secret: false

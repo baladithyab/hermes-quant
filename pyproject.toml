@@ -1,0 +1,128 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-quant"
+version = "0.1.0"
+description = "ARIA-powered multi-analyst algorithmic trading framework, distributed as a Hermes Agent plugin."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Codeseys" }]
+keywords = [
+    "hermes-agent",
+    "trading",
+    "algorithmic-trading",
+    "quant",
+    "kronos",
+    "freqtrade",
+    "alpaca",
+    "rl",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "httpx>=0.25",
+    "click>=8.1",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+# Default data: yfinance for free bootstrap
+yfinance = ["yfinance>=0.2.40"]
+# Crypto data + execution
+ccxt = ["ccxt>=4.2"]
+# US equities data + execution
+alpaca = ["alpaca-py>=0.30"]
+# Kronos foundation-model analyst (heavy: torch + HF)
+kronos = [
+    "torch>=2.0",
+    "transformers>=4.35",
+    "huggingface_hub>=0.20",
+    "einops>=0.7",
+    "safetensors>=0.4",
+]
+# Bayesian / stacking aggregator extras
+stacking = ["scikit-learn>=1.3", "scipy>=1.11"]
+# Backtest reporting + visualization
+backtest = ["matplotlib>=3.7", "seaborn>=0.13"]
+# MLflow integration (optional — defaults to file backend)
+mlflow = ["mlflow>=2.10"]
+# Convenience: full feature set excluding GPU-only torch builds
+all = [
+    "hermes-quant[yfinance,ccxt,alpaca,kronos,stacking,backtest,mlflow]",
+]
+# Dev / testing
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.12",
+    "pytest-xdist>=3.5",
+    "ruff>=0.1",
+    "mypy>=1.7",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+hermes-quant = "hermes_quant"
+
+[project.entry-points."hermes_quant.analysts"]
+classical_ta = "hermes_quant.analysts.classical_ta:ClassicalTAAnalyst"
+microstructure_lite = "hermes_quant.analysts.microstructure:MicrostructureLite"
+kronos_small = "hermes_quant.analysts.kronos:KronosAnalyst"
+kairos_btc = "hermes_quant.analysts.kronos:KairosAnalyst"
+
+[project.entry-points."hermes_quant.aggregators"]
+bma = "hermes_quant.aggregators.bma:BMAAggregator"
+stacking = "hermes_quant.aggregators.stacking:StackingAggregator"
+
+[project.entry-points."hermes_quant.data_providers"]
+yfinance = "hermes_quant.data.yfinance_provider:YFinanceProvider"
+ccxt = "hermes_quant.data.ccxt_provider:CCXTProvider"
+alpaca = "hermes_quant.data.alpaca_provider:AlpacaProvider"
+
+[project.scripts]
+hermes-quant-daemon = "hermes_quant.daemon.main:main"
+hermes-quant-trainer = "hermes_quant.training.main:main"
+
+[tool.setuptools]
+packages = [
+    "hermes_quant",
+    "hermes_quant.analysts",
+    "hermes_quant.aggregators",
+    "hermes_quant.cli",
+    "hermes_quant.consumers",
+    "hermes_quant.consumers.freqtrade",
+    "hermes_quant.daemon",
+    "hermes_quant.data",
+    "hermes_quant.evaluation",
+    "hermes_quant.risk",
+    "hermes_quant.skills",
+    "hermes_quant.tools",
+    "hermes_quant.training",
+]
+
+[tool.setuptools.package-data]
+hermes_quant = ["plugin.yaml", "skills/**/*", "consumers/freqtrade/*.py", "consumers/freqtrade/*.json.example"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "W"]
+ignore = ["E501"]   # long lines OK in docstrings and ADR-derived comments
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
