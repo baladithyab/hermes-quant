@@ -186,27 +186,60 @@ class HeartbeatChecker:
         config: HeartbeatCheckerConfig | None = None,
         *,
         start_time: pd.Timestamp | None = None,
+        monotonic_clock_ns: "Callable[[], int] | None" = None,
     ):
         self.config = config or HeartbeatCheckerConfig()
         self._start_time = start_time if start_time is not None else pd.Timestamp.utcnow()
         self._last_heartbeat: pd.Timestamp | None = None
         self._last_synthetic_heartbeat: pd.Timestamp | None = None
 
+        # Wave C.4 (Phase-8 P1-ε): monotonic-clock liveness tracking.
+        # Wall-clock can go backward (NTP sync, manual `date`, leap second
+        # smearing) which makes the dead-man-switch unreliable. We track
+        # monotonic_ns AT EACH mark_observed/mark_synthetic_heartbeat call;
+        # the dead-man-switch decision uses monotonic age while the JSONL
+        # records keep wall-clock asof (operators read those).
+        import time as _time
+        self._monotonic_clock_ns = monotonic_clock_ns or _time.monotonic_ns
+        self._start_monotonic_ns = self._monotonic_clock_ns()
+        self._last_heartbeat_monotonic_ns: int | None = None
+        self._last_synthetic_monotonic_ns: int | None = None
+
     def mark_observed(self, asof: pd.Timestamp) -> None:
-        """Update the last-heartbeat timestamp from a real heartbeat record."""
+        """Update the last-heartbeat timestamp from a real heartbeat record.
+
+        Wave C.4: we ALSO snapshot monotonic_ns at the moment of mark, so
+        the dead-man-switch can decide via wall-clock-immune duration.
+        """
         if self._last_heartbeat is None or asof > self._last_heartbeat:
             self._last_heartbeat = asof
+            self._last_heartbeat_monotonic_ns = self._monotonic_clock_ns()
 
     def mark_synthetic_heartbeat(self, asof: pd.Timestamp) -> None:
         """In backtest mode, the consumer synthesizes per-bar heartbeats.
 
         Per synthesis-v2 §P0-C: backtests get a synthesized heartbeat per bar
         so the dead-man-switch doesn't trigger spuriously in offline replay.
+
+        Wave C.4: monotonic snapshot too, for the same reason as
+        mark_observed.
         """
         self._last_synthetic_heartbeat = asof
+        self._last_synthetic_monotonic_ns = self._monotonic_clock_ns()
 
     def check(self, now: pd.Timestamp) -> HeartbeatCheckResult:
-        bootstrap_age = (now - self._start_time).total_seconds()
+        # Wave C.4 (Phase-8 P1-ε): bootstrap_age and last-heartbeat age
+        # both compute from monotonic_ns when the corresponding monotonic
+        # snapshot exists. Wall-clock `now` is preserved for the
+        # bootstrap/last fallback (legacy behavior + readability of result).
+        now_mono_ns = self._monotonic_clock_ns()
+        bootstrap_age_mono = (now_mono_ns - self._start_monotonic_ns) / 1e9
+        bootstrap_age_wall = (now - self._start_time).total_seconds()
+        # Use the LARGER of the two — this is conservative (a shorter
+        # answer would let a wall-clock jump-backward extend the grace
+        # window indefinitely; we want the dead-man-switch to fire as
+        # soon as ANY clock confirms staleness).
+        bootstrap_age = max(bootstrap_age_mono, bootstrap_age_wall)
 
         # Backtest mode: rely on synthetic heartbeats only
         if self.config.backtest_synthesize:
@@ -217,7 +250,13 @@ class HeartbeatChecker:
                     last_heartbeat_age_seconds=None,
                     bootstrap_age_seconds=bootstrap_age,
                 )
-            age = (now - self._last_synthetic_heartbeat).total_seconds()
+            age_wall = (now - self._last_synthetic_heartbeat).total_seconds()
+            age_mono = (
+                (now_mono_ns - self._last_synthetic_monotonic_ns) / 1e9
+                if self._last_synthetic_monotonic_ns is not None
+                else age_wall
+            )
+            age = max(age_wall, age_mono)
             return HeartbeatCheckResult(
                 daemon_alive=True,
                 reason="backtest_synthesized",
@@ -243,8 +282,14 @@ class HeartbeatChecker:
                 bootstrap_age_seconds=bootstrap_age,
             )
 
-        # Steady-state path
-        age = (now - self._last_heartbeat).total_seconds()
+        # Steady-state path — wall + monotonic, take max for safety.
+        age_wall = (now - self._last_heartbeat).total_seconds()
+        age_mono = (
+            (now_mono_ns - self._last_heartbeat_monotonic_ns) / 1e9
+            if self._last_heartbeat_monotonic_ns is not None
+            else age_wall
+        )
+        age = max(age_wall, age_mono)
         if age > self.config.dead_man_switch_seconds:
             return HeartbeatCheckResult(
                 daemon_alive=False,

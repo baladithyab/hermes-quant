@@ -418,8 +418,27 @@ def recommend(
         # intraday — yfinance has tight lookback windows; widen by 2x
         start = end - pd.Timedelta(minutes=lookback_bars * 2 * _tf_minutes(timeframe))
 
+    # Pass `as_of` to the provider for leaf-level lookahead enforcement
+    # (ADR-0005 amendment, Wave C.1). The provider filters bars before
+    # returning; the redundant filter below is kept for fallback safety
+    # in case a custom provider doesn't honor as_of.
+    def _fetch_with_as_of():
+        try:
+            return provider.fetch_bars(
+                symbol, timeframe, start, end, as_of=asof_ts
+            )
+        except TypeError as exc:
+            # Backwards-compat: older providers (or test doubles) without
+            # the as_of kwarg. Only swallow TypeError when the message
+            # matches a kwarg-related signature mismatch — otherwise
+            # propagate (a provider that genuinely raises TypeError from
+            # its body should not be silently retried).
+            if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+                return provider.fetch_bars(symbol, timeframe, start, end)
+            raise
+
     try:
-        bars = provider.fetch_bars(symbol, timeframe, start, end)
+        bars = _fetch_with_as_of()
     except RateLimitError as exc:
         result.caveats.append(f"Provider rate-limited: {exc}")
         result.data_provider_alive = False

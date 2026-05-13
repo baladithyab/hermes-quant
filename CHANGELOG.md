@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Wave C: lookahead enforcement + path safety + monotonic heartbeat
+
+Closes the bulk of v0.1.2 P0 items from the architecture review and the
+TradingAgents round-2 mining doc. All four were ADRified in earlier
+amendments; this batch lands the implementation.
+
+**Wave C.1 — `as_of` plumbed through DataProvider** (ADR-0005 amendment):
+- `DataProvider` Protocol signature gains `as_of: pd.Timestamp | None = None`
+  kwarg per pattern stolen from TauricResearch/TradingAgents §"as_of_date"
+  filter at the data leaf.
+- `YFinanceProvider.fetch_bars` honors it: bars with
+  `timestamp > as_of` are filtered AFTER `validate_bars` so the cutoff
+  applies to the same canonical (UTC, ascending) frame an analyst would
+  otherwise see.
+- `advisor.recommend()` forwards `as_of` to the provider with TypeError
+  fallback for older providers / test doubles. Belt-and-suspenders: the
+  advisor's downstream filter is preserved as fallback safety in case a
+  third-party provider doesn't honor the kwarg.
+- The "leaf-level enforcement" property: even if a future analyst forgets
+  to filter bars manually, the data layer has already pruned the future.
+
+**Wave C.2 — `safe_symbol_component` utility** (ADR-0005 amendment):
+- New `hermes_quant/utils/symbol_safety.py` with whitelist-based
+  sanitizer (ASCII alphanumerics + `.`, `_`, `-`).
+- Refuses empty / pure-traversal (`.`, `..`) inputs with ValueError.
+- Replaces non-safe chars with `_`; caps length at 32; strips leading
+  dots (prevents `.htaccess`-style hidden-file traps).
+- Pattern stolen from TauricResearch/TradingAgents §"safe_symbol_component";
+  prevents path-traversal attacks via user-supplied tickers like
+  `"../../etc/passwd"` or BOM/RTL-mark injection.
+- v0.1.2 wires it into the journal entry path next; v0.2 will wire into
+  the OHLCV cache + log paths.
+
+**Wave C.3 — `tests/test_no_lookahead.py` CI gate** (ADR-0006 amendment):
+- Release-blocker test fence per the founding charter "No look-ahead bias"
+  invariant. Three invariants pinned:
+  1. **Analyst output at time T independent of future bars** — both
+     ClassicalTAAnalyst and MicrostructureLite verified by the
+     "polluted-but-sliced" pattern (replace future rows with extreme
+     values, slice the input, verify analyst output unchanged).
+  2. **Provider receives + honors `as_of`** — `_RecordingProvider`
+     captures the kwarg and verifies cutoff applied.
+  3. **Advisor deterministic under as_of replay** — same `(symbol, as_of)`
+     against a short-history provider AND a full-history provider produces
+     the SAME aggregated_signal / risk_gate / decision_price.
+
+**Wave C.4 — Monotonic-clock heartbeat** (Phase-8 P1-ε):
+- `HeartbeatChecker` now tracks `monotonic_ns` at every
+  `mark_observed` / `mark_synthetic_heartbeat` call.
+- `check()` computes `bootstrap_age` and `last_heartbeat_age` from BOTH
+  wall-clock and monotonic, then takes the MAX (conservative — fail
+  toward dead-man-switch firing rather than away from it).
+- Wall-clock jump-backward (NTP sync, manual `date`, leap-second
+  smearing) no longer extends the grace window. Wall-clock jump-forward
+  no longer trips the switch when monotonic agrees the heartbeat is
+  fresh.
+- JSONL records keep wall-clock `asof` (operators read those); the
+  monotonic axis is internal-only.
+- `monotonic_clock_ns` constructor kwarg is injectable for tests.
+
+**Tests** (35 new in three files, 365 total):
+- `tests/unit/test_symbol_safety.py` (15 tests): happy-path tickers,
+  crypto pairs, path-traversal attack class (`../../`, `..`, `.`,
+  absolute paths, Windows paths), dot-only and empty input refused,
+  non-string refused, length cap, special chars replaced, Unicode
+  neutralized, idempotent.
+- `tests/test_no_lookahead.py` (5 tests): analyst-output-invariant
+  (parametrized over both shipped analysts), advisor passes as_of,
+  advisor as_of filters future bars from result, advisor deterministic
+  under replay against two providers with different history depths.
+- `tests/unit/test_heartbeat_monotonic.py` (6 tests): dead-man-switch
+  fires on monotonic-only staleness, wall jump-backward doesn't extend
+  grace, normal-case both clocks alive, synthetic heartbeat tracks
+  monotonic, default-no-mock uses real `time.monotonic_ns`, age uses
+  max(wall, monotonic).
+
+**Test count: 330 → 365 (+35). All pass. Zero regressions.**
+
 ### Added — PDR feedback loop closes (settlement journal + microstructure analyst)
 
 Continuation of the HITL Wave A work. This batch lands the LEARNING side

@@ -387,7 +387,13 @@ class DataProvider(Protocol):
 
     def fetch_bars(self, asset: str, timeframe: str,
                    start: pd.Timestamp, end: pd.Timestamp,
-                   *, use_cache: bool = True) -> pd.DataFrame: ...
+                   *, use_cache: bool = True,
+                   as_of: pd.Timestamp | None = None) -> pd.DataFrame: ...
+    """Per ADR-0005 amendment 2026-05-13 (Wave C.1): `as_of` enforces
+    point-in-time semantics at the LEAF (data layer), preventing
+    lookahead bias from any caller that forgets to filter. When set,
+    bars with `timestamp > as_of` MUST be filtered out before return.
+    Default None = current behavior (no filter)."""
 
     def fetch_latest(self, asset: str, timeframe: str,
                      lookback: int = 500) -> pd.DataFrame: ...

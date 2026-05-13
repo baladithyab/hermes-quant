@@ -148,6 +148,7 @@ class YFinanceProvider:
         end: pd.Timestamp,
         *,
         use_cache: bool = True,
+        as_of: pd.Timestamp | None = None,
     ) -> pd.DataFrame:
         """Fetch OHLCV bars in [start, end] for `asset` at `timeframe`.
 
@@ -160,6 +161,14 @@ class YFinanceProvider:
             use_cache: yfinance has its own caching via session=requests-cache,
                 but we don't wire it for v0.1.1; the param is forwarded for
                 interface symmetry.
+            as_of: ADR-0005 amendment 2026-05-13 (Wave C.1) — leaf-level
+                lookahead enforcement. When set, bars with
+                `timestamp > as_of` are filtered out before return. This
+                pushes the no-lookahead invariant DOWN to the data layer
+                so analysts that use the canonical fetch path can't see
+                future bars even if they forget to filter. Pattern stolen
+                from TauricResearch/TradingAgents §"as_of_date" filter at
+                the data leaf.
 
         Returns:
             Validated DataFrame with REQUIRED_COLUMNS, ascending UTC timestamps.
@@ -245,7 +254,20 @@ class YFinanceProvider:
             }
         )
         # validate_bars handles tz normalization, NaN drops, zero-volume drops
-        return validate_bars(out)
+        validated = validate_bars(out)
+
+        # ADR-0005 amendment 2026-05-13 (Wave C.1) — leaf-level lookahead
+        # enforcement. Filter to as_of AFTER validation so the cutoff is
+        # applied to the same canonical (UTC, ascending) dataframe an
+        # analyst would otherwise see. Comparison-safe regardless of
+        # input bars timezone (validate_bars normalizes to UTC).
+        if as_of is not None:
+            cutoff = as_of
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.tz_localize("UTC")
+            validated = validated[validated["timestamp"] <= cutoff].reset_index(drop=True)
+
+        return validated
 
     def fetch_latest(
         self,
