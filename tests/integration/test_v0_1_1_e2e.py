@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import multiprocessing
-import os
 import sys
 import time
 from pathlib import Path
@@ -28,8 +27,6 @@ from hermes_quant.aggregators.bma import BMAAggregator
 from hermes_quant.daemon.halt_state import HaltStateSQLite
 from hermes_quant.daemon.heartbeat import HeartbeatEmitter
 from hermes_quant.daemon.signal_bus import (
-    emit_execution_record,
-    emit_signal_record,
     read_jsonl_tail,
 )
 from hermes_quant.daemon.tick_loop import (
@@ -133,6 +130,18 @@ class TestE2ETickEmits:
         assert sig["direction"] in (-1, 1)
         assert "target_position_pct" in sig
         assert "components" in sig
+        # Phase-8 P0-A.1: decision_price MUST be on the bus record so the
+        # freqtrade strategy + settlement loop can compute realized_return
+        # correctly. A `decision_price=fill_price` artifact would make the
+        # entire calibration loop train on noise.
+        assert "decision_price" in sig, (
+            "decision_price missing from bus record — Phase-8 P0-A.1 regression"
+        )
+        assert sig["decision_price"] > 0
+        # Decision price comes from MarketContext.last_close (the most
+        # recent bar close at signal.asof), so it should equal the test
+        # bars' last close
+        assert abs(sig["decision_price"] - float(bars["close"].iloc[-1])) < 1e-6
 
     def test_halt_blocks_emission(self, tmp_path):
         bus = tmp_path / "signals.jsonl"

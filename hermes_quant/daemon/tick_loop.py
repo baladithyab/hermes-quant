@@ -24,16 +24,18 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 import numpy as np
 import pandas as pd
 
+from hermes_quant.daemon.halt_state import HaltStateSQLite
 from hermes_quant.daemon.signal_bus import (
     SIGNAL_BUS_PATH,
     emit_signal_record,
 )
+from hermes_quant.data.base import fetch_with_chain
 from hermes_quant.protocol import (
     Action,
     Aggregator,
@@ -46,8 +48,6 @@ from hermes_quant.protocol import (
     Portfolio,
     RiskGate,
 )
-from hermes_quant.daemon.halt_state import HaltStateSQLite
-from hermes_quant.data.base import fetch_with_chain
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +219,7 @@ def run_one_tick(
                 continue  # silent
 
             # Emit signal record
-            record = _build_signal_record(signal, action, task, asof)
+            record = _build_signal_record(signal, action, task, asof, ctx)
             emit_signal_record(record, path=bus_path)
             n_emitted += 1
             logger.info(
@@ -250,8 +250,15 @@ def _build_signal_record(
     action: Action,
     task: AssetTask,
     asof: pd.Timestamp,
+    ctx: "MarketContext",
 ) -> dict:
-    """Construct the JSONL record per ADR-0008 schema."""
+    """Construct the JSONL record per ADR-0008 schema.
+
+    Per Phase-8 synthesis P0-A.1 (2026-05-13): persist `decision_price` so
+    consumers can correctly attribute slippage and the settlement loop can
+    compute the realized return formula correctly. `decision_price` is the
+    signal's bar-close at signal.asof — that is, `ctx.last_close`.
+    """
     sig_id = f"sig-{asof.strftime('%Y%m%dT%H%M%SZ')}-{task.asset.replace('/', '-')}-{uuid.uuid4().hex[:6]}"
     return {
         "schema_version": 1,
@@ -266,6 +273,7 @@ def _build_signal_record(
         "confidence": float(signal.confidence),
         "confidence_raw": float(signal.confidence_raw),
         "horizon": signal.horizon,
+        "decision_price": float(ctx.last_close),  # P0-A.1
         "target_position_pct": float(action.target_position_pct),
         "reason": action.reason,
         "halt": bool(action.halt),

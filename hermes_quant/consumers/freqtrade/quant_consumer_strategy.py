@@ -31,11 +31,9 @@ import fcntl
 import json
 import logging
 import os
-import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
 
 import pandas as pd
 
@@ -149,7 +147,7 @@ class HermesQuantConsumer(IStrategy):
         if IStrategy is not object:
             super().__init__(config or {}, **kwargs)
         self._strategy_start_time = pd.Timestamp.utcnow()
-        self._last_heartbeat: Optional[pd.Timestamp] = None
+        self._last_heartbeat: pd.Timestamp | None = None
         self._safe_stop_active = False
         self._safe_stop_reason = ""
         self._signal_cache: dict[str, dict] = {}  # latest signal per pair
@@ -218,16 +216,25 @@ class HermesQuantConsumer(IStrategy):
         return True
 
     def order_filled(self, pair, trade, order, current_time, **kwargs) -> None:
-        """Emit execution record on every fill (entry or exit)."""
+        """Emit execution record on every fill (entry or exit).
+
+        Per Phase-8 synthesis P0-A.2 (2026-05-13): decision_price is read
+        from the cached signal record's `decision_price` field (which the
+        daemon now persists per P0-A.1). Falls back to `rate` only if no
+        matching signal is found — this fallback yields realized_return=0
+        for orphan fills, which is correct (we have no decision context).
+        """
         try:
             signal = self._latest_signal_for(pair, current_time)
             signal_id = signal.get("id") if signal else None
-            decision_price = (
-                float(signal.get("magnitude", 0.0)) if signal else 0.0
-            )
-            # Better: fetch the signal's bar close at signal asof; fallback
-            # to fill price if signal not found.
-            decision_price = float(rate) if not signal else float(rate)  # v0.1.1 simplification
+            if signal is not None and "decision_price" in signal:
+                # P0-A.2: real decision-time bar close from the bus record
+                decision_price = float(signal["decision_price"])
+            else:
+                # Orphan fill or pre-fix bus record. Fall back to fill price
+                # so realized_return = 0 (settlement loop will skip this for
+                # calibrator updates per P0-A.3).
+                decision_price = float(rate)
 
             record = {
                 "schema_version": 1,
