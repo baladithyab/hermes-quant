@@ -125,3 +125,7 @@ ignore = ["E501"]   # long lines OK in docstrings and ADR-derived comments
 testpaths = ["tests"]
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "requires_network: tests that hit live network (skipped in CI; manually run before release)",
+    "timeout(N): per-test timeout in seconds (pytest-timeout)",
+]

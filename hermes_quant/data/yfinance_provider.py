@@ -1,0 +1,200 @@
+"""hermes_quant.data.yfinance_provider — yfinance equity OHLCV provider.
+
+Per ADR-0005: yfinance for v0.1 equities (broad coverage, no key required,
+delayed data ~15min for free tier). Heavy import — lazy-loaded on first use.
+
+Asset class: 'equity' or 'etf'. Timeframes: 1m, 5m, 15m, 30m, 1h, 1d.
+Note: yfinance limits intraday lookback (1m: 7 days; 5m-30m: 60 days; 1h: 730
+days; 1d: full history). The provider returns whatever the source allows.
+
+For backtesting we use only the day/hour range available; for live we use
+fetch_latest with the appropriate lookback window.
+
+Note on rate limiting: yfinance is unofficial. Yahoo throttles aggressively
+on bursts. We add a 100ms inter-call sleep and retry with backoff inside
+the provider chain (see data.base.fetch_with_chain).
+"""
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any
+
+import pandas as pd
+
+from hermes_quant.data.base import REQUIRED_COLUMNS, validate_bars
+from hermes_quant.protocol import (
+    DataProviderError,
+    DataQualityError,
+    RateLimitError,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# yfinance period/interval translation
+_TF_TO_YF_INTERVAL = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "60m",  # yfinance uses '60m' for hourly
+    "4h": None,   # not directly supported; skip for v0.1.1
+    "1d": "1d",
+}
+
+
+class YFinanceProvider:
+    """yfinance-backed equity / ETF data provider.
+
+    Implements DataProvider Protocol from hermes_quant.protocol.
+
+    Per ADR-0005:
+    - asset_classes = ['equity', 'etf']
+    - timeframes from _TF_TO_YF_INTERVAL
+    - requires_credentials = False (yfinance is unofficial Yahoo scrape)
+    """
+
+    name = "yfinance"
+    asset_classes = ["equity", "etf"]
+    timeframes = ["1m", "5m", "15m", "30m", "1h", "1d"]
+    requires_credentials = False
+
+    def __init__(self, *, inter_call_sleep_s: float = 0.1):
+        self._yf: Any = None  # lazy
+        self._inter_call_sleep = inter_call_sleep_s
+        self._n_fetches = 0
+        self._n_errors = 0
+        self._last_fetch_at: pd.Timestamp | None = None
+
+    @property
+    def yf(self) -> Any:
+        """Lazy-import yfinance so plugin install doesn't hard-require it."""
+        if self._yf is None:
+            try:
+                import yfinance as yf
+            except ImportError as e:
+                raise DataProviderError(
+                    "yfinance not installed; install hermes-quant[yfinance]"
+                ) from e
+            self._yf = yf
+        return self._yf
+
+    def fetch_bars(
+        self,
+        asset: str,
+        timeframe: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        *,
+        use_cache: bool = True,
+    ) -> pd.DataFrame:
+        """Fetch OHLCV bars in [start, end] for `asset` at `timeframe`.
+
+        Args:
+            asset: ticker symbol (e.g., 'AAPL', 'SPY'). yfinance accepts the
+                bare ticker for US equities; for ETFs same.
+            timeframe: one of self.timeframes.
+            start, end: UTC timestamps. yfinance treats start as inclusive,
+                end as exclusive (caller convention).
+            use_cache: yfinance has its own caching via session=requests-cache,
+                but we don't wire it for v0.1.1; the param is forwarded for
+                interface symmetry.
+
+        Returns:
+            Validated DataFrame with REQUIRED_COLUMNS, ascending UTC timestamps.
+
+        Raises:
+            DataProviderError: if yfinance not installed or unrecoverable network error.
+            RateLimitError: if Yahoo signals throttling.
+            DataQualityError: if bars fail validation gates.
+        """
+        if timeframe not in self.timeframes:
+            raise DataProviderError(
+                f"timeframe {timeframe!r} not supported by yfinance; "
+                f"options: {self.timeframes}"
+            )
+        yf_interval = _TF_TO_YF_INTERVAL[timeframe]
+        if yf_interval is None:
+            raise DataProviderError(
+                f"timeframe {timeframe!r} not supported in v0.1.1"
+            )
+
+        # Inter-call sleep to avoid burst throttling
+        if self._last_fetch_at is not None:
+            elapsed = (pd.Timestamp.utcnow() - self._last_fetch_at).total_seconds()
+            if elapsed < self._inter_call_sleep:
+                time.sleep(self._inter_call_sleep - elapsed)
+
+        try:
+            ticker = self.yf.Ticker(asset)
+            raw = ticker.history(
+                start=start.to_pydatetime() if hasattr(start, "to_pydatetime") else start,
+                end=end.to_pydatetime() if hasattr(end, "to_pydatetime") else end,
+                interval=yf_interval,
+                auto_adjust=False,  # we want raw OHLC (back-adjustment is for analysis-side)
+                actions=False,
+                prepost=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            self._n_errors += 1
+            msg = str(e).lower()
+            if "rate" in msg or "429" in msg or "too many" in msg:
+                raise RateLimitError(f"yfinance throttled: {e}") from e
+            raise DataProviderError(f"yfinance fetch failed: {e}") from e
+
+        self._last_fetch_at = pd.Timestamp.utcnow()
+        self._n_fetches += 1
+
+        if raw is None or len(raw) == 0:
+            raise DataQualityError(
+                f"yfinance returned empty bars for {asset} {timeframe} {start}..{end}"
+            )
+
+        # yfinance returns:
+        #   index: DatetimeIndex (tz-aware America/New_York for US equities)
+        #   columns: ['Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits']
+        out = pd.DataFrame(
+            {
+                "timestamp": raw.index,
+                "open": raw["Open"].values,
+                "high": raw["High"].values,
+                "low": raw["Low"].values,
+                "close": raw["Close"].values,
+                "volume": raw["Volume"].values,
+            }
+        )
+        # validate_bars handles tz normalization, NaN drops, zero-volume drops
+        return validate_bars(out)
+
+    def fetch_latest(
+        self,
+        asset: str,
+        timeframe: str,
+        lookback: int = 500,
+    ) -> pd.DataFrame:
+        """Fetch the most recent N bars at `timeframe`."""
+        end = pd.Timestamp.utcnow()
+        # Estimate the start range conservatively
+        tf_to_seconds = {
+            "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+            "1h": 3600, "4h": 14400, "1d": 86400,
+        }
+        secs = tf_to_seconds.get(timeframe)
+        if secs is None:
+            raise DataProviderError(f"unknown timeframe {timeframe!r}")
+        # 2× lookback for slack (markets close, weekends, etc.)
+        start = end - pd.Timedelta(seconds=secs * lookback * 2)
+        bars = self.fetch_bars(asset, timeframe, start, end, use_cache=False)
+        return bars.tail(lookback).reset_index(drop=True)
+
+    def health(self) -> dict:
+        return {
+            "provider": self.name,
+            "n_fetches": self._n_fetches,
+            "n_errors": self._n_errors,
+            "last_fetch_at": (
+                self._last_fetch_at.isoformat() if self._last_fetch_at else None
+            ),
+            "yfinance_loaded": self._yf is not None,
+        }

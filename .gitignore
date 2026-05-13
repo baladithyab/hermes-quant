@@ -11,7 +11,7 @@ venv/
 *.db-journal
 *.db-shm
 *.db-wal
-data/
+/data/
 checkpoints/
 mlruns/
 logs/
