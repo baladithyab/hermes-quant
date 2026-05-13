@@ -14,9 +14,9 @@ import pytest
 
 from hermes_quant.data.yfinance_provider import YFinanceProvider
 from hermes_quant.protocol import (
+    DataProvider,
     DataProviderError,
     DataQualityError,
-    DataProvider,
     RateLimitError,
 )
 
@@ -90,7 +90,9 @@ class TestFetchBarsWithMockedYf:
             )
 
     def test_rate_limit_error_translated(self):
-        p = YFinanceProvider(inter_call_sleep_s=0.0)
+        # Phase-9e: zero retry delay so this test stays fast (default
+        # backoff would add ~6s).
+        p = YFinanceProvider(inter_call_sleep_s=0.0, retry_base_delay_s=0.0)
         mock_ticker = MagicMock()
         mock_ticker.history.side_effect = Exception("HTTP 429: Too Many Requests")
         mock_yf = MagicMock()
@@ -103,9 +105,12 @@ class TestFetchBarsWithMockedYf:
                 pd.Timestamp("2026-05-12T00:00:00Z"),
                 pd.Timestamp("2026-05-13T00:00:00Z"),
             )
+        # Phase-9e: verify the retry actually fired all 3 attempts before
+        # giving up. Without the retry wrapper the count would be 1.
+        assert mock_ticker.history.call_count == 3
 
     def test_other_exception_translated_to_data_provider_error(self):
-        p = YFinanceProvider(inter_call_sleep_s=0.0)
+        p = YFinanceProvider(inter_call_sleep_s=0.0, retry_base_delay_s=0.0)
         mock_ticker = MagicMock()
         mock_ticker.history.side_effect = Exception("connection reset")
         mock_yf = MagicMock()
@@ -118,6 +123,86 @@ class TestFetchBarsWithMockedYf:
                 pd.Timestamp("2026-05-12T00:00:00Z"),
                 pd.Timestamp("2026-05-13T00:00:00Z"),
             )
+        # DataProviderError is NOT a transient — should fail on first
+        # attempt, no retry.
+        assert mock_ticker.history.call_count == 1
+
+    # Phase-9e regression (synthesis 2026-05-13 + TradingAgents
+    # comparison): rate-limit retries succeed if Yahoo recovers within
+    # the budget. This is the main reason for stealing the yf_retry
+    # pattern — a 2s transient 429 should NOT cascade to the chain
+    # fallback.
+    def test_transient_rate_limit_recovers_within_retry_budget(self):
+        p = YFinanceProvider(inter_call_sleep_s=0.0, retry_base_delay_s=0.0)
+        mock_ticker = MagicMock()
+        # First attempt fails with throttle, second attempt succeeds.
+        good_df = pd.DataFrame(
+            {
+                "Open": [100.0],
+                "High": [101.0],
+                "Low": [99.0],
+                "Close": [100.5],
+                "Volume": [1000],
+            },
+            index=pd.DatetimeIndex(
+                [pd.Timestamp("2026-05-12T14:00:00Z")], tz="UTC"
+            ),
+        )
+        mock_ticker.history.side_effect = [
+            Exception("HTTP 429: Too Many Requests"),  # transient
+            good_df,  # recovered
+        ]
+        # validate_bars requires ≥ 2 bars; let's just make 2 rows
+        good_df_2 = pd.DataFrame(
+            {
+                "Open": [100.0, 100.5],
+                "High": [101.0, 101.5],
+                "Low": [99.0, 99.5],
+                "Close": [100.5, 101.0],
+                "Volume": [1000, 1100],
+            },
+            index=pd.DatetimeIndex(
+                [pd.Timestamp("2026-05-12T14:00:00Z"),
+                 pd.Timestamp("2026-05-12T15:00:00Z")], tz="UTC"
+            ),
+        )
+        mock_ticker.history.side_effect = [
+            Exception("HTTP 429: Too Many Requests"),
+            good_df_2,
+        ]
+        mock_yf = MagicMock()
+        mock_yf.Ticker.return_value = mock_ticker
+        p._yf = mock_yf
+
+        bars = p.fetch_bars(
+            "AAPL", "1h",
+            pd.Timestamp("2026-05-12T00:00:00Z"),
+            pd.Timestamp("2026-05-13T00:00:00Z"),
+        )
+        # Recovered: bars returned, retry attempted twice (1 fail + 1 ok)
+        assert len(bars) == 2
+        assert mock_ticker.history.call_count == 2
+
+    def test_persistent_rate_limit_exhausts_retry_budget(self):
+        p = YFinanceProvider(
+            inter_call_sleep_s=0.0,
+            retry_max_attempts=2,
+            retry_base_delay_s=0.0,
+        )
+        mock_ticker = MagicMock()
+        mock_ticker.history.side_effect = Exception("rate limited")
+        mock_yf = MagicMock()
+        mock_yf.Ticker.return_value = mock_ticker
+        p._yf = mock_yf
+
+        with pytest.raises(RateLimitError):
+            p.fetch_bars(
+                "AAPL", "1h",
+                pd.Timestamp("2026-05-12T00:00:00Z"),
+                pd.Timestamp("2026-05-13T00:00:00Z"),
+            )
+        # max_attempts=2: should call exactly 2 times
+        assert mock_ticker.history.call_count == 2
 
     def test_empty_response_raises_data_quality(self):
         p = YFinanceProvider(inter_call_sleep_s=0.0)

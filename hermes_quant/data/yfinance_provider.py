@@ -22,7 +22,7 @@ from typing import Any
 
 import pandas as pd
 
-from hermes_quant.data.base import REQUIRED_COLUMNS, validate_bars
+from hermes_quant.data.base import validate_bars
 from hermes_quant.protocol import (
     DataProviderError,
     DataQualityError,
@@ -44,6 +44,56 @@ _TF_TO_YF_INTERVAL = {
 }
 
 
+# Phase-9e (synthesis 2026-05-13): exponential-backoff retry pattern adapted
+# from TauricResearch/TradingAgents (TradingAgents/dataflows/utils.py).
+# Yahoo throttles aggressively on bursts; the previous 100ms inter-call
+# sleep alone wasn't enough — a single transient 429 would propagate up
+# and force the chain to fall back to a slower provider when the issue
+# would resolve in 2-4 seconds.
+#
+# Adapted (NOT copied verbatim):
+#   - Their function takes a callable and retries on YFRateLimitError.
+#   - We retry on our RateLimitError + transient OSError/ConnectionError.
+#   - 3 max attempts, 2s base, exponential factor 2 → delays {2s, 4s}.
+#   - Final attempt raises whatever the underlying call raises.
+#
+# Cited: docs/research/04-tradingagents-comparison.md §"P0 — yf_retry()"
+def _retry_with_backoff(
+    fn,
+    *args,
+    max_attempts: int = 3,
+    base_delay_s: float = 2.0,
+    factor: float = 2.0,
+    **kwargs,
+):
+    """Call fn(*args, **kwargs) with exponential-backoff retry on
+    transient failures (RateLimitError, ConnectionError).
+
+    Adapted from TauricResearch/TradingAgents yf_retry pattern. Our
+    RateLimitError replaces their YFRateLimitError; we additionally
+    retry on ConnectionError (and OSError parent class) since DNS
+    flaps / brief network blips are also transient.
+    """
+    import time as _time
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return fn(*args, **kwargs)
+        except (RateLimitError, ConnectionError) as e:
+            last_exc = e
+            if attempt + 1 >= max_attempts:
+                break  # exhausted; re-raise outside loop
+            delay = base_delay_s * (factor ** attempt)
+            logger.warning(
+                "yfinance transient failure (attempt %d/%d): %s — "
+                "retrying in %.1fs",
+                attempt + 1, max_attempts, e, delay,
+            )
+            _time.sleep(delay)
+    assert last_exc is not None  # mypy
+    raise last_exc
+
+
 class YFinanceProvider:
     """yfinance-backed equity / ETF data provider.
 
@@ -60,9 +110,19 @@ class YFinanceProvider:
     timeframes = ["1m", "5m", "15m", "30m", "1h", "1d"]
     requires_credentials = False
 
-    def __init__(self, *, inter_call_sleep_s: float = 0.1):
+    def __init__(
+        self,
+        *,
+        inter_call_sleep_s: float = 0.1,
+        retry_max_attempts: int = 3,
+        retry_base_delay_s: float = 2.0,
+        retry_factor: float = 2.0,
+    ):
         self._yf: Any = None  # lazy
         self._inter_call_sleep = inter_call_sleep_s
+        self._retry_max_attempts = retry_max_attempts
+        self._retry_base_delay_s = retry_base_delay_s
+        self._retry_factor = retry_factor
         self._n_fetches = 0
         self._n_errors = 0
         self._last_fetch_at: pd.Timestamp | None = None
@@ -126,22 +186,42 @@ class YFinanceProvider:
             if elapsed < self._inter_call_sleep:
                 time.sleep(self._inter_call_sleep - elapsed)
 
+        # Phase-9e: wrap the actual yfinance API call with exponential-
+        # backoff retry on transient throttle/network errors. The retry
+        # is bounded (3 attempts × 2s/4s) so the caller's overall budget
+        # is at most ~6s before falling through to the chain's next
+        # provider.
+        def _do_fetch():
+            try:
+                ticker = self.yf.Ticker(asset)
+                return ticker.history(
+                    start=start.to_pydatetime() if hasattr(start, "to_pydatetime") else start,
+                    end=end.to_pydatetime() if hasattr(end, "to_pydatetime") else end,
+                    interval=yf_interval,
+                    auto_adjust=False,  # we want raw OHLC (back-adjustment is for analysis-side)
+                    actions=False,
+                    prepost=False,
+                )
+            except Exception as e:  # noqa: BLE001
+                self._n_errors += 1
+                msg = str(e).lower()
+                if "rate" in msg or "429" in msg or "too many" in msg:
+                    raise RateLimitError(f"yfinance throttled: {e}") from e
+                raise DataProviderError(f"yfinance fetch failed: {e}") from e
+
         try:
-            ticker = self.yf.Ticker(asset)
-            raw = ticker.history(
-                start=start.to_pydatetime() if hasattr(start, "to_pydatetime") else start,
-                end=end.to_pydatetime() if hasattr(end, "to_pydatetime") else end,
-                interval=yf_interval,
-                auto_adjust=False,  # we want raw OHLC (back-adjustment is for analysis-side)
-                actions=False,
-                prepost=False,
+            raw = _retry_with_backoff(
+                _do_fetch,
+                max_attempts=self._retry_max_attempts,
+                base_delay_s=self._retry_base_delay_s,
+                factor=self._retry_factor,
             )
-        except Exception as e:  # noqa: BLE001
-            self._n_errors += 1
-            msg = str(e).lower()
-            if "rate" in msg or "429" in msg or "too many" in msg:
-                raise RateLimitError(f"yfinance throttled: {e}") from e
-            raise DataProviderError(f"yfinance fetch failed: {e}") from e
+        except RateLimitError:
+            # Exhausted retry budget on rate-limit. Re-raise so the chain
+            # can fall to the next provider.
+            raise
+        except DataProviderError:
+            raise
 
         self._last_fetch_at = pd.Timestamp.utcnow()
         self._n_fetches += 1
