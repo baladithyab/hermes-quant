@@ -149,13 +149,13 @@ def dispatch(args: argparse.Namespace) -> int:
 
     # v0.1.0 SCAFFOLD — three commands work; rest are stubs
     if cmd == "status":
-        from .tools import quant_status
+        from hermes_quant.tools import quant_status
         result = json.loads(quant_status({"account": args.account}))
         _pretty_print_status(result)
         return 0
 
     if cmd == "signals":
-        from .tools import quant_show_signals
+        from hermes_quant.tools import quant_show_signals
         result = json.loads(quant_show_signals({
             "n": args.n, "asset": args.asset,
         }))
@@ -163,7 +163,7 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if cmd == "show-views":
-        from .tools import quant_show_views
+        from hermes_quant.tools import quant_show_views
         result = json.loads(quant_show_views({
             "asset": args.asset, "analyst": args.analyst, "n": args.n,
         }))
@@ -171,7 +171,7 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if cmd == "doctor":
-        from .tools import quant_doctor
+        from hermes_quant.tools import quant_doctor
         result = json.loads(quant_doctor({"calibration": args.calibration}))
         _pretty_print_doctor(result)
         return 0
@@ -179,6 +179,17 @@ def dispatch(args: argparse.Namespace) -> int:
     if cmd == "config" and args.config_action == "show":
         _show_config()
         return 0
+
+    # v0.1.1: halt / resume / emergency-stop are wired
+    if cmd == "halt":
+        from hermes_quant.cli.halts import cmd_halt
+        return cmd_halt(args)
+    if cmd == "resume":
+        from hermes_quant.cli.halts import cmd_resume
+        return cmd_resume(args)
+    if cmd == "emergency-stop":
+        from hermes_quant.cli.halts import cmd_emergency_stop
+        return cmd_emergency_stop(args)
 
     # Everything else: scaffold notice
     print(f"hermes quant {cmd}: NOT YET IMPLEMENTED in v0.1.0 scaffold.")
