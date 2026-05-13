@@ -23,8 +23,7 @@ Per ADR-0004 §Configuration profiles: ships three named profiles
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 import pandas as pd
 
@@ -34,13 +33,11 @@ from hermes_quant.protocol import (
     HaltState,
     MarketState,
     Portfolio,
-    RiskGate,
 )
 from hermes_quant.risk.kelly import (
     cost_gate_threshold,
     expected_signed_edge,
     quarter_kelly_size,
-    round_to_step,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,7 +77,7 @@ class RiskConfig:
     config-default-off)."""
 
     @classmethod
-    def conservative(cls) -> "RiskConfig":
+    def conservative(cls) -> RiskConfig:
         return cls(
             max_position_pct=0.10,
             action_step=0.05,
@@ -90,11 +87,11 @@ class RiskConfig:
         )
 
     @classmethod
-    def moderate(cls) -> "RiskConfig":
+    def moderate(cls) -> RiskConfig:
         return cls()  # all defaults
 
     @classmethod
-    def aggressive(cls) -> "RiskConfig":
+    def aggressive(cls) -> RiskConfig:
         return cls(
             max_position_pct=0.40,
             action_step=0.10,
@@ -118,7 +115,7 @@ PROFILES = {
 @dataclass
 class _AssetCooldownState:
     """Cooldown timers per (account, asset_class, asset)."""
-    last_loss_at: Optional[pd.Timestamp] = None
+    last_loss_at: pd.Timestamp | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +210,25 @@ class DefaultRiskGate:
             market_slippage=market.slippage_estimate,
             cost_multiple=self.config.cost_multiple,
         )
+        # Phase-8 P0-B (synthesis 2026-05-13): edge-sign alignment guard.
+        # `expected_signed_edge` returns positive when the signal's
+        # direction-weighted expected return is favorable, negative when
+        # adverse. With cold-start calibration shrinkage of 0.20, raw
+        # confidence 0.55 emits effective confidence 0.35 → for a
+        # signal.direction=+1, expected_signed_edge becomes NEGATIVE. Without
+        # this guard, the threshold check `abs(edge) < threshold` allows
+        # negatively-edged signals to pass when |edge| is large enough, and
+        # the Kelly sizer then multiplies the negative edge through to
+        # produce a target_size with the WRONG sign — emitting an action
+        # opposite to the requested direction.
+        #
+        # Silence whenever the signed edge does not agree with the requested
+        # direction. This is the silence-by-default discipline: if the
+        # calibrated probability says we don't actually have a positive
+        # expected return in the requested direction, we hold cash.
+        if edge * signal.direction <= 0:
+            self._n_silenced_cost_gate += 1
+            return None
         if abs(edge) < threshold:
             self._n_silenced_cost_gate += 1
             return None

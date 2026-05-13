@@ -23,18 +23,16 @@ import pytest
 from hermes_quant.daemon.halt_state import HaltStateSQLite
 from hermes_quant.protocol import (
     AggregatedSignal,
-    AnalystView,
     MarketState,
     Portfolio,
     Position,
     RiskGate,
 )
 from hermes_quant.risk.gate import (
-    DefaultRiskGate,
     PROFILES,
+    DefaultRiskGate,
     RiskConfig,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -308,6 +306,77 @@ class TestRule5CostGate:
         )
         assert action is not None
         assert action.target_position_pct > 0
+
+    # Phase-8 P0-B regression (synthesis 2026-05-13): a signal whose
+    # calibrated probability gives a NEGATIVE expected_signed_edge in the
+    # signal's requested direction MUST be silenced. Without the alignment
+    # guard, the cost gate would pass the signal (since |edge| > threshold)
+    # and the Kelly sizer would emit an action OPPOSITE to the requested
+    # direction.
+    def test_negatively_edged_long_signal_silenced(self, halt_state):
+        """A long signal with cold-start-shrunk confidence < 0.5 → negative
+        edge → MUST silence (not flip to short)."""
+        g = DefaultRiskGate(RiskConfig(
+            cost_multiple=0.5,  # low threshold so |edge| > threshold
+            min_trade_size=0.0,
+            max_position_pct=0.20,
+        ))
+        # confidence 0.40 with magnitude 0.10:
+        #   expected_signed_edge ≈ 0.40 * log(1.10) + 0.60 * log(0.90)
+        #                        ≈ 0.40 * 0.0953 + 0.60 * (-0.1054)
+        #                        ≈ -0.0251  (negative for direction=+1)
+        action = g.gate(
+            _signal(direction=1, magnitude=0.10, confidence=0.40),
+            _market(volatility=0.02, commission=0.00005, spread=0.00005,
+                    slippage=0.00005),
+            _portfolio(),
+            halt_state,
+        )
+        assert action is None, (
+            "negatively-edged long must silence, not emit a short — "
+            "Phase-8 P0-B regression"
+        )
+
+    def test_negatively_edged_short_signal_silenced(self, halt_state):
+        """A short signal with cold-start-shrunk confidence < 0.5 → negative
+        edge in the short direction → MUST silence (not flip to long)."""
+        g = DefaultRiskGate(RiskConfig(
+            cost_multiple=0.5,
+            min_trade_size=0.0,
+            max_position_pct=0.20,
+        ))
+        # For direction=-1, expected_signed_edge has its sign flipped from
+        # the long-equivalent formula. With confidence 0.40 + magnitude 0.10
+        # for a SHORT, edge ≈ +0.0251 — but expected_signed_edge negates for
+        # shorts so the *signed* edge is -0.0251 in the short direction.
+        action = g.gate(
+            _signal(direction=-1, magnitude=0.10, confidence=0.40),
+            _market(volatility=0.02, commission=0.00005, spread=0.00005,
+                    slippage=0.00005),
+            _portfolio(),
+            halt_state,
+        )
+        assert action is None, (
+            "negatively-edged short must silence, not emit a long — "
+            "Phase-8 P0-B regression"
+        )
+
+    def test_positively_edged_signal_still_passes(self, halt_state):
+        """Sanity check: the alignment guard does NOT block legitimate
+        positively-edged signals."""
+        g = DefaultRiskGate(RiskConfig(
+            cost_multiple=0.5, min_trade_size=0.0, max_position_pct=0.20
+        ))
+        # confidence 0.65 + magnitude 0.10 + direction +1 gives edge > 0
+        action = g.gate(
+            _signal(direction=1, magnitude=0.10, confidence=0.65),
+            _market(volatility=0.02, commission=0.00005, spread=0.00005,
+                    slippage=0.00005),
+            _portfolio(),
+            halt_state,
+        )
+        assert action is not None
+        assert action.target_position_pct > 0  # long size, not flipped
 
 
 # ---------------------------------------------------------------------------
