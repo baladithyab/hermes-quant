@@ -107,7 +107,6 @@ packages = [
     "hermes_quant.evaluation",
     "hermes_quant.risk",
     "hermes_quant.skills",
-    "hermes_quant.tools",
     "hermes_quant.training",
 ]
 
