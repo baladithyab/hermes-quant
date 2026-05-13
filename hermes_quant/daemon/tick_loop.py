@@ -218,6 +218,39 @@ def run_one_tick(
             if action is None:
                 continue  # silent
 
+            # Phase-8 P0-C (synthesis 2026-05-13): when the gate's circuit
+            # breakers (drawdown / daily-loss) emit a halt action, the tick
+            # loop MUST install the durable halt in the SQLite registry
+            # BEFORE emitting the bus signal. Without this, the halt action
+            # is announced to the bus but not committed to durable storage —
+            # on next tick the same circuit-breaker reading would re-fire,
+            # on daemon restart the halt history is lost, and other assets
+            # in the same scope wouldn't observe the halt. This violates
+            # synthesis-v2 §P0-D ordering ("durable halt FIRST, then any
+            # other action").
+            if action.halt and action.halt_scope is not None:
+                try:
+                    scope_account, scope_class, scope_asset = action.halt_scope
+                    halt_state.add_halt(
+                        account_id=scope_account if scope_account != "*" else None,
+                        asset_class=scope_class if scope_class != "*" else None,
+                        asset=scope_asset if scope_asset != "*" else None,
+                        reason=action.reason,
+                        halted_until=action.halt_until,
+                    )
+                except ValueError:
+                    # Active halt already exists for this scope — fine; the
+                    # gate's halt action is idempotent in that case.
+                    pass
+                except Exception as e:  # noqa: BLE001
+                    # Don't let halt-install failure crash the tick;
+                    # the bus emission below still tells consumers, and
+                    # the gate will re-emit on the next tick.
+                    logger.exception(
+                        "halt installation failed for scope=%s: %s",
+                        action.halt_scope, e,
+                    )
+
             # Emit signal record
             record = _build_signal_record(signal, action, task, asof, ctx)
             emit_signal_record(record, path=bus_path)

@@ -6,7 +6,6 @@ without requiring network or real entry points.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -22,7 +21,6 @@ from hermes_quant.daemon.settlement_loop import (
     find_signals_for_executions,
 )
 from hermes_quant.daemon.signal_bus import (
-    emit_execution_record,
     emit_signal_record,
 )
 from hermes_quant.daemon.tick_loop import (
@@ -32,7 +30,6 @@ from hermes_quant.daemon.tick_loop import (
     run_one_tick,
 )
 from hermes_quant.protocol import (
-    Action,
     AggregatedSignal,
     AnalystView,
     Portfolio,
@@ -216,6 +213,137 @@ class TestRunOneTick:
         )
         assert n == 0
         assert state.n_errors >= 1
+
+    # Phase-8 P0-C regression (synthesis 2026-05-13): when the gate's
+    # circuit breakers emit an Action(halt=True), the tick loop MUST install
+    # the durable halt in the SQLite registry. Without this, the halt is
+    # only announced on the bus and lost on daemon restart / next tick.
+    def test_drawdown_circuit_breaker_installs_durable_halt(self, tmp_path):
+        bus = tmp_path / "signals.jsonl"
+        bars = _make_bars(100, drift=0.002)
+        provider = _make_provider(bars)
+        analysts = [_make_analyst(1)]
+        agg = BMAAggregator()
+        # Tight drawdown limit: 5% drawdown will trip
+        gate = DefaultRiskGate(RiskConfig(
+            max_drawdown_pct=0.05,
+            cost_multiple=0.5,
+            min_trade_size=0.0,
+            cooldown_after_loss_minutes=0,
+        ))
+        halt_state = HaltStateSQLite(
+            db_path=tmp_path / "halts.db",
+            mirror_path=tmp_path / "halt.json",
+        )
+
+        # Build a portfolio with peak=100k, equity=90k → 10% drawdown.
+        def portfolio_for_in_drawdown(account_id: str, asset_class: str):
+            return Portfolio(
+                account_id=account_id,
+                asset_class=asset_class,
+                asof=pd.Timestamp.utcnow(),
+                positions={},
+                cash=90_000.0,
+                equity_total=90_000.0,
+                realized_pnl_total=-10_000.0,
+                realized_fees_total=0.0,
+                peak_equity=100_000.0,  # 10% drawdown
+                daily_open_equity=100_000.0,
+            )
+
+        state = TickLoopState()
+        n = run_one_tick(
+            tasks=[AssetTask("BTC/USDT", "crypto", "1h", exchange="binance")],
+            data_providers=[provider],
+            analysts=analysts,
+            aggregator=agg,
+            risk_gate=gate,
+            halt_state=halt_state,
+            portfolio_for=portfolio_for_in_drawdown,
+            state=state,
+            bus_path=bus,
+        )
+
+        # The bus should have a halt-flagged signal record
+        assert n >= 1
+        lines = bus.read_text().splitlines()
+        rec = json.loads(lines[-1])
+        assert rec["halt"] is True
+        # Phase-8 P0-C: the halt MUST also be in the durable registry now.
+        # Without this fix, halt_state.is_halted() would return False even
+        # though the bus carries halt=True.
+        assert halt_state.is_halted(
+            account_id="default",
+            asset_class="crypto",
+            asset="BTC/USDT",
+        ), (
+            "drawdown circuit breaker emitted Action(halt=True) but "
+            "halt_state.add_halt was never called — Phase-8 P0-C regression"
+        )
+
+    def test_drawdown_halt_install_is_idempotent_across_ticks(self, tmp_path):
+        """Re-running a tick that re-trips the same drawdown circuit breaker
+        must NOT crash on the duplicate-halt ValueError."""
+        bus = tmp_path / "signals.jsonl"
+        bars = _make_bars(100, drift=0.002)
+        provider = _make_provider(bars)
+        analysts = [_make_analyst(1)]
+        agg = BMAAggregator()
+        gate = DefaultRiskGate(RiskConfig(
+            max_drawdown_pct=0.05,
+            cost_multiple=0.5,
+            min_trade_size=0.0,
+            cooldown_after_loss_minutes=0,
+        ))
+        halt_state = HaltStateSQLite(
+            db_path=tmp_path / "halts.db",
+            mirror_path=tmp_path / "halt.json",
+        )
+
+        def portfolio_in_drawdown(account_id: str, asset_class: str):
+            return Portfolio(
+                account_id=account_id,
+                asset_class=asset_class,
+                asof=pd.Timestamp.utcnow(),
+                positions={},
+                cash=90_000.0,
+                equity_total=90_000.0,
+                realized_pnl_total=-10_000.0,
+                realized_fees_total=0.0,
+                peak_equity=100_000.0,
+                daily_open_equity=100_000.0,
+            )
+
+        state = TickLoopState()
+        # First tick: installs halt
+        run_one_tick(
+            tasks=[AssetTask("BTC/USDT", "crypto", "1h")],
+            data_providers=[provider],
+            analysts=analysts,
+            aggregator=agg,
+            risk_gate=gate,
+            halt_state=halt_state,
+            portfolio_for=portfolio_in_drawdown,
+            state=state,
+            bus_path=bus,
+        )
+        # Second tick: gate re-fires (drawdown still > limit), but the
+        # halt is already installed. The catch-ValueError-and-pass guard
+        # in tick_loop must absorb the duplicate.
+        n_errors_before = state.n_errors
+        run_one_tick(
+            tasks=[AssetTask("BTC/USDT", "crypto", "1h")],
+            data_providers=[provider],
+            analysts=analysts,
+            aggregator=agg,
+            risk_gate=gate,
+            halt_state=halt_state,
+            portfolio_for=portfolio_in_drawdown,
+            state=state,
+            bus_path=bus,
+        )
+        # No new errors: idempotent
+        assert state.n_errors == n_errors_before
 
 
 # ---------------------------------------------------------------------------
