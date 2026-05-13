@@ -221,6 +221,7 @@ class HaltRecord:
     halt_epoch: int                   # monotonic per (account, asset_class, asset)
 
 
+@runtime_checkable
 class HaltState(Protocol):
     """Read-only access to the halt registry. Backed by SQLite.
 
