@@ -80,7 +80,20 @@ def _emit_execution(record: dict) -> None:
     line = json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
     encoded = line.encode("utf-8")
     if len(encoded) > RECORD_BYTE_CAP:
-        logger.warning("execution record too large (%d bytes); skipping", len(encoded))
+        # Phase-8 P1-γ (synthesis 2026-05-13): elevate to ERROR and surface
+        # the signal_id so an operator can trace which fill was dropped.
+        # The strategy can't easily raise into freqtrade without crashing
+        # the strategy thread, so we log loudly and drop. The dropped
+        # record is a money-software defect (settlement loop won't see
+        # this fill) but is still less catastrophic than crashing the
+        # strategy.
+        logger.error(
+            "execution record too large (%d bytes > %d cap); DROPPED — "
+            "signal_id=%s exec_id=%s asset=%s side=%s qty=%s",
+            len(encoded), RECORD_BYTE_CAP,
+            record.get("signal_id"), record.get("exec_id"),
+            record.get("asset"), record.get("side"), record.get("qty"),
+        )
         return
     try:
         with append_locked(EXECUTION_BUS_PATH) as fd:

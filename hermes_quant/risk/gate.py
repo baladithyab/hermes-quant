@@ -292,14 +292,21 @@ class DefaultRiskGate:
 def _next_session_open(tz: str, now: pd.Timestamp) -> pd.Timestamp:
     """Next session open per asset's tz. UTC (24/7 crypto) → 0000 next day.
 
-    For equities, tz='America/New_York' would give 09:30 next session day;
-    v0.1.1 simplification: just next-UTC-day for any non-UTC tz too.
+    For non-UTC tz (e.g. equities at 'America/New_York'), v0.1.1 returns
+    `now + 24h` rather than `next-UTC-day midnight`. Per Phase-8 P1-δ
+    (synthesis 2026-05-13): the previous next-UTC-day-normalize approach
+    had a bug where a circuit breaker tripped at 14:00 ET would resolve
+    to next-UTC-day 00:00 = 19:00 ET SAME day, and `auto_clear_expired`
+    would lift the halt during after-hours. Returning `now + 24h` bounds
+    the halt by ~one full session regardless of trip time, eliminating
+    that re-trip risk window. v0.1.2 will use `trading_calendars` for
+    proper session boundaries (next 09:30 ET / 09:00 LSE / etc.).
     """
-    # Crypto: next UTC day 0000
+    # Crypto: next UTC day 0000 (sessionless 24/7 → midnight is fine)
     if tz.upper() == "UTC":
         next_day = (now + pd.Timedelta(days=1)).normalize()
         return next_day
-    # Equities (etc.): bump to next calendar day (simplification for v0.1.1;
-    # v0.1.2 will use trading_calendars for proper session boundaries)
-    next_day = (now + pd.Timedelta(days=1)).normalize()
-    return next_day
+    # Non-UTC tz (equities, futures with sessions): + 24 hours, NOT
+    # normalize-to-midnight. This guarantees at least one full elapsed
+    # session before the auto-clear-expired path can fire.
+    return now + pd.Timedelta(days=1)
