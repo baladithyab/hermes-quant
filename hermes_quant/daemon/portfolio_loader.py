@@ -102,25 +102,41 @@ def reconstruct_portfolio(
         old_cost = positions_cost[asset]
         new_qty = old_qty + signed_qty
 
-        if old_qty * new_qty < 0:
-            # Direction flipped — close out at old cost, then re-open
-            closed_qty = -old_qty  # quantity needed to close
-            avg_old = (old_cost / old_qty) if old_qty != 0 else 0.0
-            realized = (fill - avg_old) * closed_qty * (-1 if side == "sell" else 1)
-            realized_pnl_total += realized
-            # Reset to remaining direction
-            remaining = signed_qty + old_qty  # net new direction
-            positions_qty[asset] = remaining
-            positions_cost[asset] = remaining * fill
-        elif (old_qty != 0 and (signed_qty * old_qty < 0)) or new_qty == 0:
-            # Fully closing position
+        # Phase-8 P1-α (synthesis 2026-05-13): the direction-flip and
+        # partial-close branches below have known sign-convention bugs
+        # caught by Claude (P1) and DeepSeek (P0). v0.1.1 GATES OFF the
+        # bug-prone codepaths and only supports two clean cases:
+        #   (1) opening / adding to position (same direction)
+        #   (2) full close (new_qty exactly 0)
+        # Any partial close, partial reduction, or direction flip raises
+        # NotImplementedError so the daemon refuses to silently corrupt
+        # equity/drawdown computations. v0.1.2 will rewrite this with
+        # explicit case handling + 8+ unit tests covering all
+        # buy/sell × long/short × partial/full × flip combinations.
+        is_full_close = abs(new_qty) < 1e-12
+        is_same_direction = (old_qty == 0) or (old_qty * signed_qty > 0)
+        if not (is_full_close or is_same_direction):
+            raise NotImplementedError(
+                "portfolio_loader.reconstruct_portfolio v0.1.1 does not "
+                "support partial closes or direction flips. Phase-8 P1-α "
+                f"caught sign-convention bugs in those branches. "
+                f"Got old_qty={old_qty} signed_qty={signed_qty} "
+                f"new_qty={new_qty} for asset={asset}. v0.1.2 will land "
+                f"the rewrite. To unblock for now: configure freqtrade "
+                f"with at most one open position per pair, no scale-out, "
+                f"no shorts after longs (or vice versa) without a flat "
+                f"transition."
+            )
+
+        if is_full_close:
+            # Fully closing position (clean path)
             avg_old = (old_cost / old_qty) if old_qty != 0 else 0.0
             realized = (fill - avg_old) * (-signed_qty) * (1 if old_qty > 0 else -1)
             realized_pnl_total += realized
             positions_qty[asset] = 0.0
             positions_cost[asset] = 0.0
         else:
-            # Adding to position (or opening new)
+            # Adding to position (or opening new) — clean path
             positions_qty[asset] = new_qty
             positions_cost[asset] = old_cost + notional
 

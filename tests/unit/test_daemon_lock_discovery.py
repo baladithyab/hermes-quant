@@ -1,17 +1,13 @@
 """Tests for daemon/lock.py + daemon/discovery.py + daemon/portfolio_loader.py."""
 from __future__ import annotations
 
-import json
 import multiprocessing
 import os
-import sys
 import time
-from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from hermes_quant.daemon.lock import DaemonLock
 from hermes_quant.daemon.discovery import (
     discover_aggregators,
     discover_analysts,
@@ -20,10 +16,10 @@ from hermes_quant.daemon.discovery import (
     instantiate_analysts,
     instantiate_data_provider,
 )
+from hermes_quant.daemon.lock import DaemonLock
 from hermes_quant.daemon.portfolio_loader import reconstruct_portfolio
 from hermes_quant.daemon.signal_bus import emit_execution_record
 from hermes_quant.protocol import DaemonAlreadyRunning
-
 
 # ---------------------------------------------------------------------------
 # DaemonLock
@@ -246,3 +242,66 @@ class TestPortfolioReconstruction:
         )
         # Good record processed
         assert "BTC/USDT" in p.positions
+
+    # Phase-8 P1-α regression (synthesis 2026-05-13): the v0.1.1 portfolio
+    # reconstruction GATES OFF partial closes and direction flips because
+    # the existing branch logic has known sign-convention bugs (caught by
+    # both Claude P1 and DeepSeek P0). The gate raises NotImplementedError
+    # rather than silently corrupting equity/drawdown computations.
+    # v0.1.2 will land the rewrite + 8 explicit case tests.
+
+    def test_partial_close_raises_not_implemented(self, tmp_path):
+        """Selling 0.5 BTC of a 1 BTC long must raise (gate active)."""
+        import pytest as _pytest
+
+        bus = tmp_path / "execs.jsonl"
+        emit_execution_record(self._exec("buy", 1.0, 60_000.0), path=bus)
+        emit_execution_record(self._exec("sell", 0.5, 62_000.0), path=bus)
+
+        with _pytest.raises(NotImplementedError, match="Phase-8 P1-α"):
+            reconstruct_portfolio(
+                "alpaca-paper", "crypto",
+                initial_cash=100_000.0, bus_path=bus,
+            )
+
+    def test_direction_flip_raises_not_implemented(self, tmp_path):
+        """Selling 1.5 BTC of a 1 BTC long (long → short flip) must raise."""
+        import pytest as _pytest
+
+        bus = tmp_path / "execs.jsonl"
+        emit_execution_record(self._exec("buy", 1.0, 60_000.0), path=bus)
+        emit_execution_record(self._exec("sell", 1.5, 62_000.0), path=bus)
+
+        with _pytest.raises(NotImplementedError, match="Phase-8 P1-α"):
+            reconstruct_portfolio(
+                "alpaca-paper", "crypto",
+                initial_cash=100_000.0, bus_path=bus,
+            )
+
+    def test_buy_then_full_close_still_works(self, tmp_path):
+        """Sanity: clean full-close path NOT affected by the gate."""
+        bus = tmp_path / "execs.jsonl"
+        emit_execution_record(self._exec("buy", 1.0, 60_000.0), path=bus)
+        emit_execution_record(self._exec("sell", 1.0, 62_000.0), path=bus)
+
+        p = reconstruct_portfolio(
+            "alpaca-paper", "crypto",
+            initial_cash=100_000.0, bus_path=bus,
+        )
+        assert "BTC/USDT" not in p.positions
+        assert p.realized_pnl_total == pytest.approx(2_000.0)
+
+    def test_scale_in_same_direction_still_works(self, tmp_path):
+        """Sanity: scaling into a long (buy + buy) is the same-direction
+        path, NOT gated."""
+        bus = tmp_path / "execs.jsonl"
+        emit_execution_record(self._exec("buy", 1.0, 60_000.0), path=bus)
+        emit_execution_record(self._exec("buy", 0.5, 61_000.0), path=bus)
+
+        p = reconstruct_portfolio(
+            "alpaca-paper", "crypto",
+            initial_cash=200_000.0, bus_path=bus,
+            mark_prices={"BTC/USDT": 62_000.0},
+        )
+        assert "BTC/USDT" in p.positions
+        assert p.positions["BTC/USDT"].qty == pytest.approx(1.5)
