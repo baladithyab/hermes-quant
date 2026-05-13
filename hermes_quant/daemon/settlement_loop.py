@@ -17,6 +17,35 @@ the originating signal record (via signal_id), and computes:
 For v0.1.1 we ship the SHELL of the settlement loop with the join logic
 and outcome construction; the actual aggregator/analyst.update() dispatch
 happens but ablation/refit logic is deferred to v0.1.2.
+
+## v0.1.1 limitation — calibrator updates gated off (Phase-8 P0-A.3)
+
+Phase-8 cross-family review (synthesis 2026-05-13 §P0-A) caught that the
+single-fill realized_return formula:
+
+    buy fill : (fill_price - decision_price) / decision_price
+    sell fill: (decision_price - fill_price) / decision_price
+
+is the SLIPPAGE per fill, not the directional return over signal.horizon.
+A correct calibrator update needs the entry+exit pair joined together to
+compute "did the price move in the signal's predicted direction over the
+signal's horizon." v0.1.1 does not have exit-fill joining (executions
+arrive one at a time without entry/exit metadata).
+
+Until v0.1.2 lands proper join logic, calibrator updates are GATED OFF:
+- construct_realized_outcomes still produces RealizedOutcome objects with
+  the slippage value as `realized_return` (legacy field name; see v0.1.2
+  for the rename).
+- direction_correct is computed but flagged as PRELIMINARY by
+  `_calibration_quality = "slippage_only"` on the outcome's view.metadata.
+- dispatch_settlement reads `_calibration_quality` and SKIPS analyst.update()
+  + aggregator.update() when it equals "slippage_only".
+
+This means v0.1.1 settles fills (logs them, computes slippage) but does
+NOT corrupt analyst Beta posteriors with noisy single-fill data. The
+RollingSlippageEstimator can still be wired up correctly because it
+explicitly wants the per-fill adverse-bps value, not the directional
+return.
 """
 from __future__ import annotations
 
@@ -40,6 +69,12 @@ from hermes_quant.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Phase-8 P0-A.3 (2026-05-13): until v0.1.2 ships entry+exit fill joining,
+# tag outcomes computed from a single fill's slippage as low-quality so
+# downstream calibrator updates skip them.
+CALIBRATION_QUALITY_SLIPPAGE_ONLY = "slippage_only"
+CALIBRATION_QUALITY_HORIZON_RETURN = "horizon_return"  # v0.1.2+
 
 
 def find_signals_for_executions(
@@ -86,6 +121,13 @@ def construct_realized_outcomes(
     Note: the signal record stores `components` as a list of dicts (post
     JSONL roundtrip), not AnalystView dataclasses. We reconstruct the
     minimal AnalystView for the outcome dataclass.
+
+    Per Phase-8 P0-A.3: the value computed and stored as `realized_return`
+    on each outcome is actually the per-fill SLIPPAGE, not the directional
+    return over the signal's horizon. We tag every outcome's view metadata
+    with `_calibration_quality = CALIBRATION_QUALITY_SLIPPAGE_ONLY` so
+    `dispatch_settlement` skips analyst/aggregator update calls until
+    v0.1.2 ships entry+exit fill joining.
     """
     outcomes: list[RealizedOutcome] = []
     for exec_rec in execution_records:
@@ -102,6 +144,10 @@ def construct_realized_outcomes(
             continue
 
         side = exec_rec.get("side")
+        # Per Phase-8 P0-A.3: this is per-fill SLIPPAGE, not horizon return.
+        # Stored on `realized_return` for legacy field-name compatibility;
+        # downstream consumers MUST check view.metadata['_calibration_quality']
+        # before treating this as a directional outcome.
         if side == "buy":
             realized_return = (fill_price - decision_price) / decision_price
         elif side == "sell":
@@ -110,6 +156,9 @@ def construct_realized_outcomes(
             continue
 
         sig_direction = sig.get("direction", 0)
+        # Direction-correct as a heuristic ONLY (since realized_return is
+        # slippage, not horizon return). Preserved for v0.1.2 schema
+        # continuity but consumers must gate on _calibration_quality.
         direction_correct = (sig_direction > 0 and realized_return > 0) or (
             sig_direction < 0 and realized_return < 0
         )
@@ -123,6 +172,9 @@ def construct_realized_outcomes(
                     confidence=float(comp.get("confidence", 0.0)),
                     confidence_raw=float(comp.get("confidence_raw", comp.get("confidence", 0.0))),
                     horizon=comp.get("horizon", sig.get("horizon", "1h")),
+                    metadata={
+                        "_calibration_quality": CALIBRATION_QUALITY_SLIPPAGE_ONLY,
+                    },
                 )
             except (KeyError, ValueError, TypeError):
                 continue
@@ -214,6 +266,13 @@ def construct_episode_outcomes(
             horizon=sig.get("horizon", "1h"),
             components=tuple(components),
             aggregator=sig.get("aggregator", "bma"),
+            # Phase-8 P0-A.3: tag this AggregatedSignal as derived from
+            # single-fill slippage so dispatch_settlement skips its
+            # aggregator.update() call. v0.1.2 will lift the gate when
+            # entry+exit fill joining lands.
+            metadata={
+                "_calibration_quality": CALIBRATION_QUALITY_SLIPPAGE_ONLY,
+            },
         )
 
         episode = EpisodeOutcome(
@@ -238,17 +297,33 @@ def dispatch_settlement(
 ) -> dict:
     """Dispatch outcomes to analyst.update() and aggregator.update().
 
+    Per Phase-8 P0-A.3: outcomes tagged
+    `view.metadata['_calibration_quality'] == CALIBRATION_QUALITY_SLIPPAGE_ONLY`
+    are SKIPPED (not dispatched to analyst.update / aggregator.update). The
+    underlying realized_return value on these outcomes is per-fill slippage,
+    not horizon return — feeding it into Beta posteriors would corrupt
+    calibration. v0.1.2 will lift this gate when entry+exit fill joining
+    lands.
+
     Returns a stats dict for logging:
-      {n_realized, n_episodes, n_analyst_updates, n_aggregator_updates}
+      {n_realized, n_episodes, n_analyst_updates, n_aggregator_updates,
+       n_skipped_slippage_only}
     """
     stats = {
         "n_realized": len(realized_outcomes),
         "n_episodes": len(episode_outcomes),
         "n_analyst_updates": 0,
         "n_aggregator_updates": 0,
+        "n_skipped_slippage_only": 0,
     }
 
     for outcome in realized_outcomes:
+        # Phase-8 P0-A.3 gate: skip slippage-only outcomes
+        meta = outcome.view.metadata or {}
+        if meta.get("_calibration_quality") == CALIBRATION_QUALITY_SLIPPAGE_ONLY:
+            stats["n_skipped_slippage_only"] += 1
+            continue
+
         analyst = analysts_by_name.get(outcome.view.analyst)
         if analyst is None:
             continue
@@ -260,7 +335,15 @@ def dispatch_settlement(
                 logger.warning("analyst %s update failed: %s",
                                outcome.view.analyst, e)
 
+    # Episode outcomes: also skip if their aggregated_signal carries the
+    # slippage-only quality tag on its components (which they will in v0.1.1
+    # because construct_episode_outcomes inherits the single-fill slippage
+    # formula).
     for sig_id, episode in episode_outcomes:
+        sig_meta = (episode.aggregated_signal.metadata or {})
+        if sig_meta.get("_calibration_quality") == CALIBRATION_QUALITY_SLIPPAGE_ONLY:
+            stats["n_skipped_slippage_only"] += 1
+            continue
         try:
             aggregator.update(episode)
             stats["n_aggregator_updates"] += 1
