@@ -40,30 +40,32 @@ class BacktestResult:
     n_bars: int
     n_decisions: int
     n_fires: int
+    n_settlements: int = 0       # episodes settled back into the aggregator (V03-5)
 
-    initial_equity: float
-    final_equity: float
-    total_return_pct: float
-    annualized_return_pct: float
-    sharpe: float
-    deflated_sharpe: float
-    max_drawdown_pct: float
-    n_trades: int
+    initial_equity: float = 10_000.0
+    final_equity: float = 10_000.0
+    total_return_pct: float = 0.0
+    annualized_return_pct: float = 0.0
+    sharpe: float = 0.0
+    deflated_sharpe: float = float("nan")
+    max_drawdown_pct: float = 0.0
+    n_trades: int = 0
 
     # Buy-and-hold baseline (the charter-gating comparison)
-    buy_hold_total_return_pct: float
-    buy_hold_sharpe: float
-    excess_return_vs_buy_hold_pct: float
+    buy_hold_total_return_pct: float = 0.0
+    buy_hold_sharpe: float = 0.0
+    excess_return_vs_buy_hold_pct: float = 0.0
 
     # Per-bar series (for plotting / further analysis)
-    equity_curve: pd.Series
-    bh_equity_curve: pd.Series
-    positions: pd.Series
-    decisions_summary: list[dict]    # per-bar advisor result snapshot (light)
+    equity_curve: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    bh_equity_curve: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    positions: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    decisions_summary: list[dict] = field(default_factory=list)
 
-    # Reproducibility
-    run_at: str
-    config_hash: str
+    # Reproducibility + posterior diagnostics
+    run_at: str = ""
+    config_hash: str = ""
+    aggregator_posteriors: dict | None = None    # snapshot of BMA per-analyst stats at end of run
 
     def to_dict(self) -> dict:
         """JSON-serializable view (excludes pd.Series; saves them as lists)."""
@@ -74,6 +76,7 @@ class BacktestResult:
             "n_bars": self.n_bars,
             "n_decisions": self.n_decisions,
             "n_fires": self.n_fires,
+            "n_settlements": self.n_settlements,
             "initial_equity": self.initial_equity,
             "final_equity": self.final_equity,
             "total_return_pct": self.total_return_pct,
@@ -87,6 +90,7 @@ class BacktestResult:
             "excess_return_vs_buy_hold_pct": self.excess_return_vs_buy_hold_pct,
             "run_at": self.run_at,
             "config_hash": self.config_hash,
+            "aggregator_posteriors": self.aggregator_posteriors,
         }
 
     def to_markdown_report(self) -> str:
@@ -110,6 +114,7 @@ class BacktestResult:
             f"- Decisions emitted: {self.n_decisions}",
             f"- Trades executed: {self.n_trades}",
             f"- FIRE actions: {self.n_fires}",
+            f"- Episodes settled into aggregator: {self.n_settlements}",
             f"- Initial equity: ${self.initial_equity:,.2f}",
             f"- Final equity: ${self.final_equity:,.2f}",
             f"- Annualized return: {self.annualized_return_pct:+.2%}",
@@ -124,6 +129,23 @@ class BacktestResult:
                   "(NEGATIVE — fix analysts/aggregator before RL aggregator work, per charter)"),
             "",
         ]
+        # Aggregator posterior table (Wave G observability surface)
+        if self.aggregator_posteriors:
+            stats = self.aggregator_posteriors.get("analyst_stats") or {}
+            if stats:
+                lines.extend([
+                    "## Per-analyst empirical accuracy (BMA posteriors)",
+                    "",
+                    "| Analyst | n_obs | α | β | posterior_accuracy |",
+                    "|---|---|---|---|---|",
+                ])
+                for name, s in sorted(stats.items()):
+                    lines.append(
+                        f"| `{name}` | {s.get('n_observations', 0)} | "
+                        f"{s.get('alpha', 0):.2f} | {s.get('beta', 0):.2f} | "
+                        f"{s.get('posterior_accuracy', 0.0):.3f} |"
+                    )
+                lines.append("")
         return "\n".join(lines)
 
 
@@ -204,10 +226,31 @@ def replay(
     warmup_bars: int = 60,
     commission: float = 0.001,
     slippage: float = 0.0005,
+    settlement_horizon_bars: int = 1,
+    learn_from_fills: bool = True,
     advisor_recommend=None,        # inject for testing
+    aggregator=None,               # inject for testing or to seed posteriors
 ) -> BacktestResult:
     """Walk bars[warmup_bars:] forward chronologically, replaying through
     the advisor pipeline.
+
+    Args:
+        bars: OHLCV DataFrame (timestamp, open, high, low, close, volume)
+        symbol, asset_class, timeframe: identifiers passed through to advisor
+        initial_equity: starting NAV (default $10k)
+        warmup_bars: bars consumed before first decision
+        commission, slippage: applied to every PaperPortfolio fill
+        settlement_horizon_bars: how many bars forward to look when constructing
+            the EpisodeOutcome that feeds back into the aggregator's posteriors.
+            1 = next-bar return (default, suitable for momentum/mean-reversion);
+            for daily-bar swing strategies, 5 (one trading week) is more honest.
+        learn_from_fills: if True, settle each decision back into the aggregator
+            after `settlement_horizon_bars` bars elapse. Closes the calibrator
+            feedback loop within the backtest. Default True per charter
+            "continual learning loop".
+        advisor_recommend: inject for testing
+        aggregator: inject a pre-seeded BMAAggregator (e.g., from a prior
+            backtest's posteriors) to test out-of-sample generalization.
 
     Returns BacktestResult with strategy + buy-and-hold metrics + per-bar
     equity curve.
@@ -224,6 +267,14 @@ def replay(
     # Lazy advisor import (avoid heavy deps for backtest-config tests)
     if advisor_recommend is None:
         from hermes_quant.advisor import recommend as advisor_recommend
+
+    # Long-lived aggregator across the entire backtest: this is what makes
+    # `learn_from_fills` actually work — fresh per-call aggregators from
+    # the production advisor would lose their posterior updates between
+    # bars. Per ADR-0020 §D8 + ADR-0009 §P1-10.
+    if aggregator is None and learn_from_fills:
+        from hermes_quant.aggregators.bma import BMAAggregator
+        aggregator = BMAAggregator()
 
     # Normalize bars
     bars = bars.copy()
@@ -245,15 +296,38 @@ def replay(
 
     n_decisions = 0
     n_fires = 0
+    n_settlements = 0
+
+    # Pending settlements: list of (settle_at_idx, decision_idx, agg_signal_dict, decision_close)
+    # When bar `i` advances past `settle_at_idx`, we construct an EpisodeOutcome
+    # and feed it back to the long-lived aggregator. This is how the
+    # calibrator-from-fills loop (V03-5) actually closes during a backtest —
+    # in production the daemon's settlement_loop does it from the journal,
+    # but inside replay we have full fwd-lookahead so we can settle inline.
+    pending_settlements: list[dict] = []
 
     for i in range(warmup_bars, len(bars)):
         bar = bars.iloc[i]
         as_of = bar["timestamp"]
         bar_close = float(bar["close"])
 
+        # First, settle any pending outcomes whose horizon has elapsed
+        if learn_from_fills and aggregator is not None:
+            still_pending = []
+            for entry in pending_settlements:
+                if i >= entry["settle_at_idx"]:
+                    n_settlements += _settle_episode(
+                        aggregator=aggregator,
+                        entry=entry,
+                        future_close=bar_close,
+                    )
+                else:
+                    still_pending.append(entry)
+            pending_settlements = still_pending
+
         # Advisor call
         try:
-            result = advisor_recommend(
+            kwargs = dict(
                 symbol=symbol,
                 asset_class=asset_class,
                 timeframe=timeframe,
@@ -261,6 +335,10 @@ def replay(
                 provider=provider,
                 include_lessons=False,
             )
+            # Long-lived aggregator — pass through if we have one
+            if aggregator is not None:
+                kwargs["aggregator"] = aggregator
+            result = advisor_recommend(**kwargs)
         except (DataProviderError, DataQualityError) as exc:
             logger.warning("backtest: advisor failed at %s: %s; skipping bar", as_of, exc)
             # Mark-to-market with no action
@@ -288,6 +366,18 @@ def replay(
 
         if rg_pass and abs(signed_target) > 1e-9:
             n_decisions += 1
+            # Schedule settlement for `settlement_horizon_bars` bars from now
+            if learn_from_fills and aggregator is not None:
+                settle_at = i + settlement_horizon_bars
+                if settle_at < len(bars):
+                    pending_settlements.append({
+                        "settle_at_idx": settle_at,
+                        "decision_idx": i,
+                        "decision_close": bar_close,
+                        "as_of": as_of,
+                        "agg_signal_dict": sig,
+                        "components": result.get("analyst_views", []),
+                    })
 
         # Apply to portfolio
         trade = portfolio.apply_target(
@@ -375,8 +465,20 @@ def replay(
     config_hash = _compute_config_hash(
         symbol=symbol, timeframe=timeframe, asset_class=asset_class,
         warmup_bars=warmup_bars, commission=commission, slippage=slippage,
+        settlement_horizon_bars=settlement_horizon_bars,
+        learn_from_fills=learn_from_fills,
         n_bars=len(bars),
     )
+
+    # Snapshot final aggregator posteriors (closes Wave G observability loop —
+    # operators can see how each analyst's empirical accuracy evolved during
+    # the backtest window).
+    aggregator_posteriors = None
+    if aggregator is not None and hasattr(aggregator, "status"):
+        try:
+            aggregator_posteriors = aggregator.status()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("aggregator.status() failed: %s", exc)
 
     return BacktestResult(
         symbol=symbol,
@@ -385,6 +487,7 @@ def replay(
         n_bars=len(bars) - warmup_bars,
         n_decisions=n_decisions,
         n_fires=n_fires,
+        n_settlements=n_settlements,
         initial_equity=initial_equity,
         final_equity=final_equity,
         total_return_pct=total_return_pct,
@@ -402,6 +505,7 @@ def replay(
         decisions_summary=decisions_summary,
         run_at=pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
         config_hash=config_hash,
+        aggregator_posteriors=aggregator_posteriors,
     )
 
 
@@ -439,3 +543,99 @@ def _compute_config_hash(**kwargs) -> str:
     """
     raw = json.dumps(kwargs, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _settle_episode(
+    *,
+    aggregator,
+    entry: dict,
+    future_close: float,
+) -> int:
+    """Construct an EpisodeOutcome from a pending settlement and feed it
+    back to the aggregator. Returns 1 on successful update, 0 if skipped.
+
+    The realized return is (future_close - decision_close) / decision_close.
+    For each component analyst, direction_correct = (sign(realized_return)
+    == component.direction).
+    """
+    try:
+        from hermes_quant.protocol import (
+            AggregatedSignal,
+            AnalystView,
+            EpisodeOutcome,
+        )
+    except ImportError:
+        return 0
+
+    decision_close = entry["decision_close"]
+    if decision_close <= 0:
+        return 0
+    realized_return = (future_close - decision_close) / decision_close
+
+    # The components passed in are dicts (from advisor's analyst_views list);
+    # we reconstruct AnalystView objects for the EpisodeOutcome.
+    components_dicts = entry.get("components") or []
+    components: list = []
+    direction_correct: dict[str, bool] = {}
+    for c in components_dicts:
+        try:
+            view = AnalystView(
+                analyst=c.get("analyst", "unknown"),
+                direction=int(c.get("direction", 0)),
+                magnitude=float(c.get("magnitude", 0.0)),
+                confidence=float(c.get("confidence", 0.0)),
+                confidence_raw=float(c.get("confidence_raw", c.get("confidence", 0.0))),
+                horizon=str(c.get("horizon", "1h")),
+            )
+        except (TypeError, ValueError):
+            continue
+        components.append(view)
+        # direction_correct: did the analyst's direction match the realized?
+        if view.direction == 0:
+            # Flat call — only "correct" if realized was also (approximately) flat
+            direction_correct[view.analyst] = abs(realized_return) < 1e-6
+        else:
+            direction_correct[view.analyst] = (
+                (view.direction > 0 and realized_return > 0)
+                or (view.direction < 0 and realized_return < 0)
+            )
+
+    if not components:
+        return 0
+
+    sig = entry["agg_signal_dict"]
+    try:
+        agg_sig = AggregatedSignal(
+            asset=sig.get("asset", "unknown"),
+            timeframe=sig.get("timeframe", "1h"),
+            asset_class=sig.get("asset_class", "unknown"),
+            asof=pd.Timestamp(entry["as_of"]),
+            direction=int(sig.get("direction", 0)),
+            magnitude=float(sig.get("magnitude", 0.0)),
+            confidence=float(sig.get("confidence", 0.0)),
+            confidence_raw=float(sig.get("confidence_raw", sig.get("confidence", 0.0))),
+            horizon=str(sig.get("horizon", "1h")),
+            components=tuple(components),
+            aggregator=sig.get("aggregator", "bma"),
+        )
+        outcome = EpisodeOutcome(
+            asset=agg_sig.asset,
+            timeframe=agg_sig.timeframe,
+            asof=agg_sig.asof,
+            aggregated_signal=agg_sig,
+            realized_returns={agg_sig.horizon: realized_return},
+            direction_correct=direction_correct,
+            realized_net_pnl=None,   # paper backtest; per-trade P&L handled by PaperPortfolio
+        )
+    except (TypeError, ValueError) as exc:
+        logger.debug("settle_episode: failed to build EpisodeOutcome: %s", exc)
+        return 0
+
+    try:
+        aggregator.update(outcome)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "settle_episode: aggregator.update raised: %s", exc, exc_info=True,
+        )
+        return 0

@@ -43,14 +43,17 @@ def _read_jsonl_tail(path: Path, n: int) -> list[dict]:
     # Memory-budget cap: read up to 1 MB from the tail
     size = path.stat().st_size
     chunk_size = min(size, 1_048_576)
+    start_offset = max(0, size - chunk_size)
     with open(path, "rb") as f:
-        f.seek(max(0, size - chunk_size))
+        f.seek(start_offset)
         chunk = f.read()
-    # Find first complete line
-    first_nl = chunk.find(b"\n")
-    if first_nl < 0:
-        return []
-    chunk = chunk[first_nl + 1:]
+    # If we started mid-file, the first line is potentially partial — drop it.
+    # If we read from offset 0, the first line is real and must be kept.
+    if start_offset > 0:
+        first_nl = chunk.find(b"\n")
+        if first_nl < 0:
+            return []
+        chunk = chunk[first_nl + 1:]
     records = []
     for line in chunk.split(b"\n"):
         if not line:
@@ -759,15 +762,38 @@ def quant_watchlist_list(args: dict, **_kwargs) -> str:
 
 
 def quant_doctor(args: dict, **_kwargs) -> str:
-    """Comprehensive health check. Read-only."""
+    """Comprehensive health check. Read-only.
+
+    Args:
+        calibration: include legacy calibration block (default False).
+        drift: include analyst confidence-drift surface (V03-6, default True).
+        drift_recent_n: how many recent signals to use as the "recent"
+            window for drift comparison (default 50).
+        drift_threshold: absolute confidence delta to flag (default 0.15).
+    """
+    # Re-read module attrs from the LIVE module dict via sys.modules — pytest's
+    # import system can produce duplicate module-dict instances under certain
+    # collection orderings, so the function's __globals__ may be stale relative
+    # to monkeypatched module attrs. Going through sys.modules guarantees
+    # the live attribute.
+    import sys
+    _t = sys.modules.get("hermes_quant.tools")
+    _SIGNAL_BUS_PATH = getattr(_t, "SIGNAL_BUS_PATH", SIGNAL_BUS_PATH)
+    _EXECUTION_BUS_PATH = getattr(_t, "EXECUTION_BUS_PATH", EXECUTION_BUS_PATH)
+    _STATE_DB_PATH = getattr(_t, "STATE_DB_PATH", STATE_DB_PATH)
+    _QUANT_HOME = getattr(_t, "QUANT_HOME", QUANT_HOME)
+
     include_calibration = args.get("calibration", False)
+    include_drift = args.get("drift", True)
+    drift_recent_n = int(args.get("drift_recent_n", 50))
+    drift_threshold = float(args.get("drift_threshold", 0.15))
     pid = _daemon_pid()
 
     checks = {
-        "quant_home_exists": QUANT_HOME.exists(),
-        "signal_bus_exists": SIGNAL_BUS_PATH.exists(),
-        "execution_bus_exists": EXECUTION_BUS_PATH.exists(),
-        "state_db_exists": STATE_DB_PATH.exists(),
+        "quant_home_exists": _QUANT_HOME.exists(),
+        "signal_bus_exists": _SIGNAL_BUS_PATH.exists(),
+        "execution_bus_exists": _EXECUTION_BUS_PATH.exists(),
+        "state_db_exists": _STATE_DB_PATH.exists(),
         "daemon_running": pid is not None,
         "daemon_pid": pid,
     }
@@ -791,18 +817,163 @@ def quant_doctor(args: dict, **_kwargs) -> str:
     except ImportError:
         pass
 
+    # V03-6: analyst confidence-drift surface
+    drift_block = None
+    if include_drift and _SIGNAL_BUS_PATH.exists():
+        drift_block = _compute_drift_surface(
+            recent_n=drift_recent_n,
+            threshold=drift_threshold,
+            signal_bus_path=_SIGNAL_BUS_PATH,
+        )
+
     return json.dumps({
         "success": True,
         "v0.1.0_state": "scaffold — protocol locked, daemon not yet implemented",
         "checks": checks,
         "optional_libs": optional_libs,
         "include_calibration": include_calibration,
+        "drift": drift_block,
         "next_step": (
             "1. `hermes quant setup` to write config\n"
             "2. `hermes quant start` to launch daemon (NOT YET IMPLEMENTED in v0.1.0 scaffold)\n"
             "3. Track GitHub for v0.1.1 implementation drop"
         ),
     }, default=str)
+
+
+def _compute_drift_surface(
+    *,
+    recent_n: int = 50,
+    threshold: float = 0.15,
+    signal_bus_path: Path | None = None,
+) -> dict:
+    """V03-6 drift detection: per-analyst confidence-distribution shift.
+
+    Args:
+        recent_n: how many of the most recent signal-bus records define the
+            "recent" window.
+        threshold: absolute confidence delta to flag as drift.
+        signal_bus_path: explicit path to the signal bus. Defaults to the
+            module-level SIGNAL_BUS_PATH; passing explicitly enables tests
+            to use temp paths even if pytest's import-mode creates duplicate
+            module dicts (which would shadow monkeypatch'd module-globals).
+
+    For each analyst with views in the signal bus:
+      lifetime_mean_confidence = mean over ALL its emitted views
+      recent_mean_confidence   = mean over the last `recent_n` signals
+      delta                    = recent - lifetime
+      flagged                  = abs(delta) >= threshold
+
+    A flagged analyst means its confidence distribution has shifted recently
+    — possibly a regime change, a calibrator break, or a feature-pipeline
+    issue. The operator should investigate before trusting current views.
+
+    Returns:
+      {
+        "n_signals_total": int,
+        "n_signals_recent": int,
+        "threshold": float,
+        "per_analyst": {
+          "<analyst>": {
+            "n_lifetime": int,
+            "n_recent": int,
+            "lifetime_mean_confidence": float,
+            "recent_mean_confidence": float,
+            "delta": float,
+            "flagged": bool,
+            "reason": str | None,
+          },
+          ...
+        },
+        "any_flagged": bool,
+      }
+    """
+    # Read the full bus (capped to a reasonable max for safety)
+    MAX_LIFETIME = 5000
+    bus_path = signal_bus_path if signal_bus_path is not None else SIGNAL_BUS_PATH
+    all_records = _read_jsonl_tail(bus_path, MAX_LIFETIME)
+    if not all_records:
+        return {
+            "n_signals_total": 0,
+            "n_signals_recent": 0,
+            "threshold": threshold,
+            "per_analyst": {},
+            "any_flagged": False,
+            "note": "signal bus is empty — no drift surface available yet",
+        }
+
+    recent_records = all_records[-recent_n:] if len(all_records) > recent_n else all_records
+
+    def _accumulate(records: list[dict]) -> dict[str, list[float]]:
+        """Returns {analyst_name: [confidence, confidence, ...]}."""
+        per_analyst: dict[str, list[float]] = {}
+        for rec in records:
+            views = rec.get("analyst_views") or []
+            for v in views:
+                name = v.get("analyst")
+                conf = v.get("confidence")
+                if name is None or conf is None:
+                    continue
+                try:
+                    per_analyst.setdefault(name, []).append(float(conf))
+                except (TypeError, ValueError):
+                    continue
+        return per_analyst
+
+    lifetime = _accumulate(all_records)
+    recent = _accumulate(recent_records)
+
+    per_analyst: dict[str, dict] = {}
+    any_flagged = False
+    for name, lifetime_confs in lifetime.items():
+        if not lifetime_confs:
+            continue
+        n_life = len(lifetime_confs)
+        life_mean = sum(lifetime_confs) / n_life
+        recent_confs = recent.get(name, [])
+        n_rec = len(recent_confs)
+        rec_mean = (sum(recent_confs) / n_rec) if n_rec else float("nan")
+
+        if n_rec == 0:
+            entry = {
+                "n_lifetime": n_life,
+                "n_recent": 0,
+                "lifetime_mean_confidence": round(life_mean, 4),
+                "recent_mean_confidence": None,
+                "delta": None,
+                "flagged": True,
+                "reason": "no_recent_views",
+            }
+            any_flagged = True
+        else:
+            delta = rec_mean - life_mean
+            flagged = abs(delta) >= threshold
+            reason = None
+            if flagged:
+                reason = (
+                    f"recent confidence shifted by {delta:+.3f} "
+                    f"(threshold ±{threshold})"
+                )
+            entry = {
+                "n_lifetime": n_life,
+                "n_recent": n_rec,
+                "lifetime_mean_confidence": round(life_mean, 4),
+                "recent_mean_confidence": round(rec_mean, 4),
+                "delta": round(delta, 4),
+                "flagged": flagged,
+                "reason": reason,
+            }
+            if flagged:
+                any_flagged = True
+        per_analyst[name] = entry
+
+    return {
+        "n_signals_total": len(all_records),
+        "n_signals_recent": len(recent_records),
+        "threshold": threshold,
+        "per_analyst": per_analyst,
+        "any_flagged": any_flagged,
+    }
 
 
 def handle_quant_slash(args: list, **kwargs) -> str:
