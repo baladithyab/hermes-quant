@@ -50,6 +50,14 @@ from hermes_quant.protocol import (
 logger = logging.getLogger(__name__)
 
 
+# Per ADR-0018 §D4: views with confidence below this threshold are
+# treated as abstains and dropped from aggregation. KronosAnalyst (and
+# any future foundation-model analyst) emits zero-confidence views on
+# weight-load failure; the threshold is positive (not zero) to handle
+# floating-point noise from calibrators.
+ABSTAIN_THRESHOLD = 0.10
+
+
 @dataclass
 class _AnalystStats:
     """Per-analyst Beta-binomial posterior."""
@@ -131,7 +139,21 @@ class BMAAggregator:
         - Magnitude = weighted mean of contributing magnitudes
         - confidence_raw = vote share (|net| / |total|), bumped by agreement_bonus
         - confidence = calibrator(confidence_raw)
+
+        Per ADR-0018 §D4 (abstain filter):
+        - Views with confidence < ABSTAIN_THRESHOLD are dropped BEFORE
+          aggregation. This is the structural pruning that prevents
+          KronosAnalyst's zero-confidence abstain (or any analyst's
+          'I have no view' signal) from polluting:
+            (a) the silence-bias gate's `min_analysts_emitted` count
+                (which uses len(analyst_views))
+            (b) the BMA vote share itself
+          Without this filter, an abstaining analyst still counts as a
+          'voice' even though it provided no signal.
         """
+        # ADR-0018 §D4 abstain filter
+        views = [v for v in (views or []) if v.confidence >= ABSTAIN_THRESHOLD]
+
         if not views:
             return self._flat_signal(context)
 
