@@ -197,6 +197,11 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_auto_start.add_argument("--watchlist", default=None,
                               help="Comma-separated SYMBOL[:asset_class[:timeframe]] "
                                    "entries; sets the watchlist and overrides existing")
+    p_auto_start.add_argument(
+        "--no-cron", action="store_true",
+        help="Skip creating the Hermes cron job; just enable autonomous mode "
+             "in config (the operator can run ticks manually or wire cron later)",
+    )
 
     auto_sub.add_parser(
         "stop",
@@ -580,6 +585,7 @@ def _dispatch_autonomous(args) -> int:
     if sub == "start":
         return _autonomous_start(
             cadence=args.cadence, watchlist_str=args.watchlist,
+            no_cron=args.no_cron,
         )
 
     if sub == "stop":
@@ -657,11 +663,16 @@ def _dispatch_watchlist(args) -> int:
     return 2
 
 
-def _autonomous_start(*, cadence: str, watchlist_str: str | None) -> int:
-    """Set quant.pdr.mode=autonomous and (optionally) overwrite the
-    watchlist from a comma-separated string. Per ADR-0016 §D4 also
-    creates a Hermes cron job, but the user is responsible for
-    `hermes cron create` invocation — we print the command to run.
+def _autonomous_start(
+    *, cadence: str, watchlist_str: str | None, no_cron: bool = False,
+) -> int:
+    """Set quant.pdr.mode=autonomous + (optionally) write the watchlist
+    + (optionally) create a Hermes cron job for the tick cadence (per
+    ADR-0016 §D4 + V03-4).
+
+    The cron job runs `hermes quant autonomous tick --no-dry-run --json`
+    on the operator's chosen cadence. The tick stdout becomes the cron
+    job's output, delivered via the operator's configured cron destination.
     """
     import os as _os
     from pathlib import Path as _Path
@@ -714,14 +725,101 @@ def _autonomous_start(*, cadence: str, watchlist_str: str | None) -> int:
     else:
         print("  watchlist preserved from previous config")
 
+    if no_cron:
+        print()
+        print("(skipped cron job creation per --no-cron)")
+        print()
+        print("To create the cron tick job manually, run:")
+        print(f'  hermes cron create "{cadence}" \\\n'
+              '    --script "$(which hermes) quant autonomous tick --no-dry-run --json" \\\n'
+              '    --no-agent')
+        print()
+        print("Verify with: hermes quant autonomous status")
+        return 0
+
+    # Actually create the cron job
+    cron_result = _create_autonomous_cron_job(cadence=cadence)
     print()
-    print("To create the cron tick job, run:")
-    print(f'  hermes cron create "{cadence}" \\\n'
-          '    --script "$(which hermes) quant autonomous tick --no-dry-run --json" \\\n'
-          '    --no-agent')
+    if cron_result["created"]:
+        print(f"✓ cron job created: {cron_result['summary']}")
+        if cron_result.get("job_id"):
+            print(f"  job_id: {cron_result['job_id']}")
+    else:
+        print(f"⚠ cron job creation skipped: {cron_result['reason']}")
+        print()
+        print("To create the cron tick job manually, run:")
+        print(f'  hermes cron create "{cadence}" \\\n'
+              '    --script "$(which hermes) quant autonomous tick --no-dry-run --json" \\\n'
+              '    --no-agent')
+
     print()
     print("Verify with: hermes quant autonomous status")
     return 0
+
+
+def _create_autonomous_cron_job(*, cadence: str) -> dict:
+    """Shell out to `hermes cron create` to wire the autonomous tick job.
+
+    Returns a dict with:
+      created: bool
+      reason: str (when created=False)
+      summary: str (when created=True; one-line description)
+      job_id: str | None (cron-system-assigned ID, when extractable)
+    """
+    import shutil
+    import subprocess
+
+    hermes_bin = shutil.which("hermes")
+    if hermes_bin is None:
+        return {
+            "created": False,
+            "reason": "`hermes` CLI not found on PATH",
+        }
+
+    script = (f"{hermes_bin} quant autonomous tick "
+              f"--no-dry-run --json")
+
+    cmd = [
+        hermes_bin, "cron", "create", cadence,
+        "--script", script,
+        "--no-agent",
+        "--name", f"hermes-quant-autonomous-{cadence}",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {
+            "created": False,
+            "reason": f"hermes cron create failed: {exc}",
+        }
+
+    if result.returncode != 0:
+        return {
+            "created": False,
+            "reason": (
+                f"`hermes cron create` exited {result.returncode}. "
+                f"stderr: {result.stderr.strip()[:200]}"
+            ),
+        }
+
+    # Parse "Created cron job <id>" from stdout if present
+    job_id = None
+    for line in result.stdout.splitlines():
+        if "job_id" in line.lower() or "created" in line.lower():
+            # Extract anything that looks like an ID
+            import re
+            m = re.search(r"\b([a-f0-9]{6,}|[A-Z0-9_-]{4,})\b", line)
+            if m:
+                job_id = m.group(1)
+                break
+
+    return {
+        "created": True,
+        "summary": f"every {cadence} -> hermes quant autonomous tick",
+        "job_id": job_id,
+    }
 
 
 def _autonomous_stop() -> int:

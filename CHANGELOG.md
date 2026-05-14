@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-13
+
+### Summary
+
+v0.3.0 ships the **MVP recipe from the founding charter** — *"three-analyst
+committee on liquid crypto (BTC/USDT) before any RL aggregator work."* The
+two charter-gating modules land: `CcxtProvider` (Binance OHLCV with leaf-
+level lookahead-safe as_of filter) and `KronosAnalyst` (foundation-model
+forecaster as the third BMA voice with [0.30, 0.85] overconfidence clip).
+The `evaluation/` module promotion gives v0.4 RL training the scaffolding
+it needs — `PurgedWalkForward`, `shuffle_timestamps_test`, and the
+Deflated Sharpe Ratio. The autonomous-tick cron writer is now actually
+wired (was print-only in v0.2).
+
+This release is the LAST scaffolding release before charter-mandated paper
+trading: per the charter, *"if your three-analyst committee on BTC can't
+beat buy-and-hold risk-adjusted on paper, more analysts won't fix it."*
+v0.3 is the recipe; v0.4 is the empirical answer.
+
+### Added
+
+- **ADR-0017**: `CcxtProvider` for crypto OHLCV. Critical lookahead bug
+  class identified at the leaf — Binance returns bar OPEN time, so we
+  filter `open_ts + tf_seconds <= as_of` (the in-flight bar at as_of
+  is dropped). Default exchange Binance; multi-exchange via constructor.
+- **ADR-0018**: `KronosAnalyst` as the third BMA voice. Lazy-load (no HF
+  download at gateway startup). Distributional inference via subclass
+  (Kronos's `predict()` averages internally; we expose pre-mean paths).
+  Path-agreement confidence with `[0.30, 0.85]` HARD CLIP — direct
+  mitigation for the Kairos A-shares neg-IC failure mode the charter
+  explicitly warns about. Zero-confidence abstain on missing kronos
+  package or weight-load failure.
+- **ADR-0019**: `evaluation/` module promotion. `cv.py::PurgedWalkForward`
+  with embargo (López de Prado). `lookahead.py::shuffle_timestamps_test`
+  promoted from inline test scaffolding. `dsr.py::deflated_sharpe`
+  (Bailey & López de Prado 2014) for paper-book Sharpe reporting hedged
+  against multiple-comparisons bias.
+- **`hermes_quant/data/ccxt_provider.py`** (366 loc) — `CcxtProvider`
+  implementation. `_exchange_factory` test seam for FakeCcxtExchange
+  unit tests; no live network in CI.
+- **`hermes_quant/analysts/kronos.py`** (348 loc) — `KronosAnalyst`,
+  `KronosConfig`, `_DistributionalKronosPredictor`. `_predictor_factory`
+  test seam; no torch needed for unit tests.
+- **`hermes_quant/evaluation/`** package — `cv.py` + `lookahead.py` +
+  `dsr.py` + `__init__.py` re-exports.
+- **`hermes quant autonomous start --no-cron`** flag; default behavior
+  now actually creates the Hermes cron job via `hermes cron create`
+  (V03-4) instead of just printing the command. Graceful fallback when
+  `hermes` isn't on PATH or cron creation fails.
+- **3 research notes** (Phase-3 research outputs, on disk):
+  - `docs/research/05-kronos-integration.md` (288 lines, deepwiki-grounded)
+  - `docs/research/06-ccxt-provider-patterns.md` (250 lines, ccxt v4 + issue #21783)
+  - `docs/research/07-paper-book-pnl-attribution.md` (188 lines)
+- **Charter-vs-shipped audit doc** at
+  `docs/audits/2026-05-13-charter-vs-shipped-v020.md` — Phase-2 backlog
+  enumeration that motivated v0.3.
+
+### Changed
+
+- **`pyproject.toml`** optional-dependencies cleaned up:
+  - Fixed pre-existing duplicate `yfinance` key (toml parser was tolerant)
+  - Fixed entry-point `ccxt` -> `CcxtProvider` (was pointing to non-existent
+    `CCXTProvider` capitalization)
+
+### Tests
+
+- **+68 tests** across 4 waves:
+  - Wave A (ccxt provider): 21 tests — as_of filter at all 3 boundary
+    cases, error taxonomy mapping, pagination, missing-ccxt graceful
+  - Wave B (Kronos analyst): 17 tests — lazy-load, factory-failure abstain,
+    inference-exception per-call abstain, path-agreement clip, calibrator
+    shrinkage, config overrides
+  - Wave C (evaluation): 21 tests — PurgedWalkForward folds + invariants,
+    shuffle_timestamps_test pass/fail/edge cases, DSR n_trials scaling +
+    skew/kurtosis, validation rejection
+  - Wave D (cron writer): 9 tests — happy path, missing PATH, nonzero
+    exit, timeout, OSError, no-cron skip, config persistence
+- **Total: 494 passed, 1 skipped** (was 426 → +68, zero regressions).
+
+### Charter audit (post-v0.3)
+
+| Charter clause | Status |
+|---|---|
+| MVP — three-analyst BTC/USDT committee | ✅ ALL THREE shipped (TA + Microstructure + Kronos); ccxt unblocks BTC/USDT |
+| Walk-forward CV + lookahead + DSR | ✅ scaffolded |
+| Money-software discipline | ✅ leaf-level lookahead filter, foundation-model overconfidence clip |
+| AAAI 2026 acceptance ≠ alpha | ✅ Kronos clip [0.30, 0.85] + abstain-on-failure + zero RL training |
+
+### Deferred to v0.4+
+
+- Paper-trade BTC/USDT for 4-8 weeks (the charter's empirical gate)
+- KronosAnalyst calibrator wired to a re-training cron (V03-5 P0 deferred)
+- News-LLM analyst per ADR-0012
+- Options analyst + Greeks-aware sizer
+- Live reactors (`AlpacaReactor`, `CcxtReactor`) gated by ADR-0016 §D6 three-lock
+- RL aggregator (PPO/SAC) — charter explicitly defers until paper-trade Sharpe is measured
+
 ## [0.2.0] — 2026-05-13
 
 ### Summary
