@@ -119,7 +119,9 @@ def test_canonical_cli_surface():
             elif sub == "show-views":
                 parser.parse_args([sub, "--asset", "BTC/USDT"])
             elif sub == "backtest":
-                parser.parse_args([sub, "BTC/USDT", "--from", "2024-01-01", "--to", "2024-12-31"])
+                parser.parse_args([sub, "--symbol", "BTC/USDT",
+                                   "--asset-class", "crypto",
+                                   "--bars-file", "/dev/null"])
             elif sub == "backtest-replay":
                 parser.parse_args([sub, "test-run-id"])
             elif sub == "freqtrade-backtest":

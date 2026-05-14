@@ -236,12 +236,29 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     wl_list.add_argument("--json", action="store_true")
 
     # Backtest
-    p_bt = sub.add_parser("backtest", help="Run hermes-quant against historical bars")
-    p_bt.add_argument("asset")
-    p_bt.add_argument("--from", dest="date_from", required=True)
-    p_bt.add_argument("--to", dest="date_to", required=True)
-    p_bt.add_argument("--timeframe", default="1h")
-    p_bt.add_argument("--analyst-set", default="default")
+    p_bt = sub.add_parser("backtest", help="Run hermes-quant against historical bars (ADR-0020)")
+    p_bt.add_argument("--symbol", required=True,
+                      help="Trading symbol (e.g. AAPL, BTC/USDT)")
+    p_bt.add_argument("--asset-class", default="equity",
+                      choices=["equity", "etf", "crypto", "fx"])
+    p_bt.add_argument("--timeframe", default="1h",
+                      choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
+    p_bt.add_argument("--bars-file",
+                      help="Path to CSV/parquet with OHLCV bars (timestamp, open, high, low, close, volume)")
+    p_bt.add_argument("--start", default=None,
+                      help="Start date (ISO 8601); used when fetching via configured provider")
+    p_bt.add_argument("--end", default=None,
+                      help="End date (ISO 8601); used when fetching via configured provider")
+    p_bt.add_argument("--initial-equity", type=float, default=10_000.0)
+    p_bt.add_argument("--warmup-bars", type=int, default=60,
+                      help="Bars consumed for analyst warmup before any decisions")
+    p_bt.add_argument("--commission", type=float, default=0.001,
+                      help="Per-trade commission as fraction (default 10bps)")
+    p_bt.add_argument("--slippage", type=float, default=0.0005,
+                      help="Per-trade slippage as fraction (default 5bps)")
+    p_bt.add_argument("--output-dir", default=None,
+                      help="Directory to write report.md + result.json (default: ~/.hermes/quant/backtests/<run-id>/)")
+    p_bt.add_argument("--json", action="store_true", help="Print JSON to stdout instead of report")
 
     p_btr = sub.add_parser("backtest-replay",
                             help="Replay a signal log through freqtrade backtester")
@@ -380,6 +397,9 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if cmd == "autonomous":
         return _dispatch_autonomous(args)
+
+    if cmd == "backtest":
+        return _dispatch_backtest(args)
 
     if cmd == "config" and args.config_action == "show":
         _show_config()
@@ -552,6 +572,167 @@ def _pretty_print_pending(result: dict) -> None:
         else:
             print(f"    GATED — {rg.get('gated_reason', 'unknown')}")
         print()
+
+
+def _dispatch_backtest(args) -> int:
+    """Dispatch `hermes quant backtest --symbol X ...` (ADR-0020)."""
+    import json as _json
+    import os as _os
+    import uuid as _uuid
+    from pathlib import Path as _Path
+
+    import pandas as _pd
+
+    from hermes_quant.backtest import replay
+
+    # Load bars
+    if args.bars_file:
+        bars = _load_bars_file(args.bars_file)
+    else:
+        bars = _fetch_bars_via_provider(
+            symbol=args.symbol,
+            asset_class=args.asset_class,
+            timeframe=args.timeframe,
+            start=args.start,
+            end=args.end,
+        )
+        if bars is None:
+            print("backtest: --bars-file is required when no provider available")
+            return 2
+
+    # Run replay
+    try:
+        result = replay(
+            bars,
+            symbol=args.symbol,
+            asset_class=args.asset_class,
+            timeframe=args.timeframe,
+            initial_equity=args.initial_equity,
+            warmup_bars=args.warmup_bars,
+            commission=args.commission,
+            slippage=args.slippage,
+        )
+    except ValueError as exc:
+        print(f"backtest: {exc}")
+        return 2
+
+    # Determine output dir
+    out_dir = (
+        _Path(args.output_dir).expanduser()
+        if args.output_dir else
+        _Path.home() / ".hermes" / "quant" / "backtests"
+        / f"{args.symbol.replace('/', '_')}-{args.timeframe}-{_uuid.uuid4().hex[:8]}"
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write artifacts
+    (out_dir / "result.json").write_text(
+        _json.dumps(result.to_dict(), indent=2, default=str), encoding="utf-8",
+    )
+    (out_dir / "report.md").write_text(
+        result.to_markdown_report(), encoding="utf-8",
+    )
+    # Equity curve as CSV
+    eq_df = _pd.DataFrame({
+        "equity": result.equity_curve.values,
+        "buy_hold_equity": result.bh_equity_curve.values,
+        "position": result.positions.values,
+    }, index=result.equity_curve.index)
+    eq_df.to_csv(out_dir / "equity_curve.csv")
+
+    # Decisions JSONL
+    with open(out_dir / "decisions.jsonl", "w", encoding="utf-8") as f:
+        for d in result.decisions_summary:
+            f.write(_json.dumps(d, default=str) + "\n")
+
+    # Output
+    if args.json:
+        print(_json.dumps(result.to_dict(), indent=2, default=str))
+    else:
+        print(result.to_markdown_report())
+        print()
+        print(f"Artifacts written to: {out_dir}")
+        print("  result.json      — machine-readable BacktestResult")
+        print("  report.md        — operator-readable summary")
+        print("  equity_curve.csv — per-bar equity / buy-hold / position")
+        print("  decisions.jsonl  — per-bar advisor result snapshots")
+
+    return 0
+
+
+def _load_bars_file(path: str):
+    """Load bars from CSV or parquet."""
+    import pandas as _pd
+    from pathlib import Path as _Path
+
+    p = _Path(path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"bars file not found: {p}")
+    suffix = p.suffix.lower()
+    if suffix == ".parquet":
+        bars = _pd.read_parquet(p)
+    elif suffix == ".csv":
+        bars = _pd.read_csv(p)
+    else:
+        raise ValueError(f"unsupported bars file extension: {suffix} (use .csv or .parquet)")
+
+    # Validate required columns
+    required = {"timestamp", "open", "high", "low", "close", "volume"}
+    missing = required - set(bars.columns)
+    if missing:
+        raise ValueError(
+            f"bars file missing required columns: {missing}; "
+            f"required: {required}"
+        )
+    return bars
+
+
+def _fetch_bars_via_provider(*, symbol, asset_class, timeframe, start, end):
+    """Fetch bars via the configured provider (yfinance or ccxt).
+
+    Returns None if no compatible provider is available; the caller should
+    fall back to requiring --bars-file.
+    """
+    import pandas as _pd
+
+    if asset_class == "crypto":
+        try:
+            from hermes_quant.data.ccxt_provider import CcxtProvider
+        except Exception:   # noqa: BLE001
+            return None
+        provider = CcxtProvider()
+    elif asset_class in {"equity", "etf"}:
+        try:
+            from hermes_quant.data.yfinance_provider import YFinanceProvider
+        except Exception:   # noqa: BLE001
+            return None
+        provider = YFinanceProvider()
+    else:
+        return None
+
+    # Use as_of=end if specified, else None (= now)
+    as_of = _pd.Timestamp(end) if end else None
+    if as_of is not None and as_of.tzinfo is None:
+        as_of = as_of.tz_localize("UTC")
+
+    # Compute lookback_bars from start/end if provided
+    lookback = 1000   # default
+    if start and end:
+        # Rough estimate based on timeframe
+        from datetime import timedelta as _td
+        s = _pd.Timestamp(start)
+        e = _pd.Timestamp(end)
+        delta_seconds = (e - s).total_seconds()
+        tf_seconds = {
+            "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+            "1h": 3600, "4h": 14400, "1d": 86400,
+        }.get(timeframe, 3600)
+        lookback = max(int(delta_seconds / tf_seconds) + 50, 100)
+
+    return provider.fetch_bars(
+        symbol=symbol, asset_class=asset_class, timeframe=timeframe,
+        lookback_bars=lookback, as_of=as_of,
+    )
 
 
 def _dispatch_autonomous(args) -> int:

@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-13
+
+### Summary
+
+The **empirical gate** the charter requires for any RL aggregator
+work: `hermes_quant.backtest`. Operators can now run
+`hermes quant backtest --symbol BTC/USDT --bars-file <path>` and get
+a buy-and-hold-excess number in seconds rather than waiting 4-8 weeks
+of wall-clock paper trading. The replay uses the production advisor
+pipeline exactly (charter "Reproducibility" honored — every backtest
+decision is bit-identical to what the live advisor would emit).
+
+This is the release the charter was waiting for: *"if your three-analyst
+committee on BTC can't beat buy-and-hold risk-adjusted on paper, more
+analysts won't fix it."* v0.3.2 makes that question computable.
+
+### Added
+
+- **ADR-0020**: backtest harness contract. Charter "REPLAY, not
+  simulation" — uses production code paths verbatim, with PaperPortfolio
+  for mark-to-market accounting + buy-and-hold baseline + Sharpe + DSR
+  + max drawdown computed inside `replay()`.
+- **`hermes_quant.backtest.PaperPortfolio`** (143 loc) — single-symbol
+  mark-to-market book with slippage, commission, lot-matching realized
+  P&L, and position flips. Deliberately simpler than `portfolio_loader`
+  (production lot matching) — single book, single symbol, no
+  withdrawals, no funding. v0.4 will unify with `portfolio_loader`.
+- **`hermes_quant.backtest.replay()`** (380 loc impl) — chronological
+  bar-by-bar walk through the advisor pipeline. Lookahead-safe via
+  `_ReplayProvider` honoring `as_of`. Per-bar equity curve + buy-hold
+  baseline + decisions log. Deflated Sharpe Ratio integrated when
+  n_observations >= 30 (ADR-0019 consumer).
+- **`BacktestResult`** dataclass — symbol/timeframe/asset_class +
+  total_return + Sharpe + DSR + max_drawdown + buy_hold baseline +
+  excess_return_vs_buy_hold (the charter-gating headline) + per-bar
+  equity_curve / positions / decisions_summary + run_at + config_hash.
+- **`hermes quant backtest`** CLI subcommand — load bars from
+  CSV/parquet (or fetch via configured yfinance/ccxt provider when
+  `--start --end` provided). Writes 4 artifacts to output-dir:
+  `result.json` + `report.md` + `equity_curve.csv` + `decisions.jsonl`.
+- **24 backtest tests** at `tests/integration/test_backtest_replay.py`:
+  PaperPortfolio mark-to-market correctness (8), replay shape +
+  buy-hold baseline (10), reproducibility via config_hash (3), markdown
+  report generation (2), DSR conditional computation (2), advisor
+  exception isolation (1).
+
+### Changed
+
+- **`hermes quant backtest` CLI signature**: positional `asset` +
+  `--from`/`--to` replaced with `--symbol` + `--asset-class` +
+  `--bars-file` / `--start`/`--end`. The old shape was a v0.1.0
+  scaffold stub that never had a handler.
+- **`tests/test_smoke.py`** updated to probe the new backtest CLI shape.
+
+### Test sweep
+
+- 530 passed, 1 skipped (was 506 → +24, zero regressions).
+
+### Quick start
+
+```bash
+# Backtest from a local CSV
+hermes quant backtest --symbol AAPL --asset-class equity \
+  --timeframe 1d --bars-file ~/.hermes/quant/cache/aapl-2024.csv \
+  --output-dir ~/.hermes/quant/backtests/aapl-2024/
+
+# Or via configured provider
+hermes quant backtest --symbol BTC/USDT --asset-class crypto \
+  --timeframe 1h --start 2024-01-01 --end 2024-06-01
+
+# Read the headline
+cat ~/.hermes/quant/backtests/<run-id>/report.md
+```
+
+The single line that matters per charter:
+*"Excess return vs buy-and-hold: +X.XX%"*
+
+If that's negative over a multi-month backtest, the charter says fix the
+analysts/aggregator before any RL aggregator work — which is exactly what
+v0.3.2's gating is for.
+
 ## [0.3.1] — 2026-05-13
 
 ### Summary
