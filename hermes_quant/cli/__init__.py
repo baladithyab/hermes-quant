@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 
 PROFILES = ["conservative", "moderate", "aggressive"]
 
@@ -125,8 +124,69 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
                        help="Skip recent journal lesson retrieval (saves tokens)")
     p_rec.add_argument("--as-of", default=None,
                        help="ISO timestamp anchor for replay-mode (default: now)")
+    p_rec.add_argument("--recipe-id", default=None,
+                       help="PDR recipe id (e.g. btc-usdt-deliberative)")
+    p_rec.add_argument("--semantic-packet-file", action="append", default=[],
+                       help="Semantic packet artifact JSON to inject (repeatable)")
+    p_rec.add_argument("--committee-turns-file", action="append", default=[],
+                       help="Committee-turn artifact JSON to inject (repeatable)")
     p_rec.add_argument("--json", action="store_true",
                        help="Print raw JSON instead of rich-formatted output")
+
+    # Semantic perception artifacts
+    p_sem = sub.add_parser("semantic-packet", help="Write/validate/list semantic perception artifacts")
+    sem_sub = p_sem.add_subparsers(dest="semantic_cmd", required=True)
+    sem_write = sem_sub.add_parser("write", help="Write a hashed semantic packet artifact")
+    sem_write.add_argument("--asset", required=True)
+    sem_write.add_argument("--horizon", default="1h")
+    sem_write.add_argument("--stance", required=True, choices=["bullish", "bearish", "neutral"])
+    sem_write.add_argument("--confidence", required=True, type=float)
+    sem_write.add_argument("--magnitude", required=True, type=float)
+    sem_write.add_argument("--summary", required=True)
+    sem_write.add_argument("--source", action="append", default=[],
+                           help="Source ref as type:ref or type:ref|title, repeatable")
+    sem_write.add_argument("--model", default="hermes:manual")
+    sem_write.add_argument("--as-of", default=None)
+    sem_write.add_argument("--output-root", default=None)
+    sem_write.add_argument("--json", action="store_true")
+    sem_validate = sem_sub.add_parser("validate", help="Validate one semantic packet artifact")
+    sem_validate.add_argument("path")
+    sem_validate.add_argument("--asset", default=None)
+    sem_validate.add_argument("--as-of", default=None)
+    sem_validate.add_argument("--horizon", default=None)
+    sem_validate.add_argument("--max-age-minutes", type=float, default=24 * 60)
+    sem_validate.add_argument("--json", action="store_true")
+    sem_list = sem_sub.add_parser("list", help="List semantic packet artifacts")
+    sem_list.add_argument("--asset", default=None)
+    sem_list.add_argument("--limit", type=int, default=20)
+    sem_list.add_argument("--json", action="store_true")
+
+    # Committee-turn artifacts
+    p_committee = sub.add_parser("committee", help="Build/list deliberative committee-turn artifacts")
+    committee_sub = p_committee.add_subparsers(dest="committee_cmd", required=True)
+    committee_run = committee_sub.add_parser("run", help="Build committee_turns from semantic packet artifacts")
+    committee_run.add_argument("--asset", required=True)
+    committee_run.add_argument("--semantic-packet-file", action="append", required=True)
+    committee_run.add_argument("--model", default="deterministic:semantic_packets")
+    committee_run.add_argument("--as-of", default=None)
+    committee_run.add_argument("--output-root", default=None)
+    committee_run.add_argument("--json", action="store_true")
+    committee_list = committee_sub.add_parser("list", help="List committee-turn artifacts")
+    committee_list.add_argument("--asset", default=None)
+    committee_list.add_argument("--limit", type=int, default=20)
+    committee_list.add_argument("--json", action="store_true")
+
+    # Perception cron helper
+    p_perception = sub.add_parser("perception", help="Autonomous semantic perception setup")
+    perception_sub = p_perception.add_subparsers(dest="perception_cmd", required=True)
+    perception_start = perception_sub.add_parser("start", help="Create a Hermes cron job that generates semantic packets")
+    perception_start.add_argument("--asset", required=True)
+    perception_start.add_argument("--horizon", default="1h")
+    perception_start.add_argument("--cadence", default="1h")
+    perception_start.add_argument("--sources", default="operator notes, major market news, exchange status, macro regime")
+    perception_start.add_argument("--recipe-id", default="btc-usdt-deliberative")
+    perception_start.add_argument("--dry-run", action="store_true")
+    perception_start.add_argument("--json", action="store_true")
 
     # HITL React subcommands (ADR-0015)
     p_propose = sub.add_parser(
@@ -247,6 +307,10 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
                       help="Path to CSV/parquet with OHLCV bars (timestamp, open, high, low, close, volume)")
     p_bt.add_argument("--recipe-id", default=None,
                       help="PDR recipe id to select analyst/aggregator/risk-gate composition")
+    p_bt.add_argument("--semantic-packet-file", action="append", default=[],
+                      help="Semantic packet artifact JSON to inject into replay (repeatable)")
+    p_bt.add_argument("--committee-turns-file", action="append", default=[],
+                      help="Committee-turn artifact JSON to inject into replay (repeatable)")
     p_bt.add_argument("--provider", default=None,
                       help="Fetch provider when --bars-file omitted (e.g. ccxt:kraken, ccxt:coinbase, yfinance)")
     p_bt.add_argument("--no-cache", action="store_true",
@@ -343,6 +407,10 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if cmd == "recommend":
         from hermes_quant.tools import quant_recommend
+        semantic_packets, committee_turns = _load_perception_artifacts(
+            getattr(args, "semantic_packet_file", []),
+            getattr(args, "committee_turns_file", []),
+        )
         result = json.loads(quant_recommend({
             "symbol": args.symbol,
             "asset_class": args.asset_class,
@@ -350,12 +418,24 @@ def dispatch(args: argparse.Namespace) -> int:
             "lookback_bars": args.lookback,
             "include_lessons": not args.no_lessons,
             "as_of": args.as_of,
+            "recipe_id": args.recipe_id,
+            "semantic_packets": semantic_packets,
+            "committee_turns": committee_turns,
         }))
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
             _pretty_print_recommend(result)
         return 0 if result.get("success") else 1
+
+    if cmd == "semantic-packet":
+        return _dispatch_semantic_packet(args)
+
+    if cmd == "committee":
+        return _dispatch_committee(args)
+
+    if cmd == "perception":
+        return _dispatch_perception(args)
 
     if cmd == "propose":
         from hermes_quant.tools import quant_propose
@@ -596,10 +676,215 @@ def _pretty_print_pending(result: dict) -> None:
         print()
 
 
+def _parse_source_arg(raw: str) -> dict:
+    """Parse source strings as type:ref or type:ref|title.
+
+    The `|title` separator avoids breaking URLs, which naturally contain
+    additional colons.
+    """
+    if ":" not in raw:
+        ref, _, title = raw.partition("|")
+        out = {"type": "note", "ref": ref}
+    else:
+        source_type, rest = raw.split(":", 1)
+        ref, _, title = rest.partition("|")
+        out = {"type": source_type, "ref": ref}
+    if title:
+        out["title"] = title
+    return out
+
+
+def _load_perception_artifacts(
+    semantic_packet_files: list[str] | None,
+    committee_turns_files: list[str] | None,
+) -> tuple[list[dict], list[dict]]:
+    semantic_packets = []
+    committee_turns = []
+    if semantic_packet_files:
+        from hermes_quant.artifacts import load_semantic_packet
+        for path in semantic_packet_files:
+            semantic_packets.append(load_semantic_packet(path).to_dict())
+    if committee_turns_files:
+        from hermes_quant.artifacts import load_committee_turns
+        for path in committee_turns_files:
+            payload = load_committee_turns(path)
+            committee_turns.extend(payload.get("turns") or [])
+    return semantic_packets, committee_turns
+
+
+def _dispatch_semantic_packet(args) -> int:
+    from pathlib import Path
+
+    import pandas as _pd
+
+    from hermes_quant.artifacts import (
+        list_semantic_packets,
+        validate_semantic_packet_file,
+        write_semantic_packet,
+    )
+
+    if args.semantic_cmd == "write":
+        asof = args.as_of or _pd.Timestamp.now(tz="UTC").isoformat()
+        payload = {
+            "schema_version": 1,
+            "asset": args.asset,
+            "asof": asof,
+            "horizon": args.horizon,
+            "stance": args.stance,
+            "confidence": args.confidence,
+            "magnitude": args.magnitude,
+            "summary": args.summary,
+            "sources": [_parse_source_arg(src) for src in args.source],
+            "model": args.model,
+        }
+        root = Path(args.output_root).expanduser() if args.output_root else None
+        path, packet = write_semantic_packet(payload, root=root)
+        result = {"success": True, "path": str(path), "packet": packet}
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            print(f"semantic packet written: {path}")
+            print(f"  hash: {packet.get('packet_hash')}")
+            print(f"  {packet.get('asset')} {packet.get('horizon')} {packet.get('stance')} conf={packet.get('confidence')}")
+        return 0
+
+    if args.semantic_cmd == "validate":
+        result = validate_semantic_packet_file(
+            args.path,
+            asset=args.asset,
+            asof=args.as_of,
+            horizon=args.horizon,
+            max_age_minutes=args.max_age_minutes,
+        )
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            marker = "✓" if result.get("success") else "✗"
+            print(f"{marker} {args.path}: {result.get('reason')}")
+            print(f"  hash: {result.get('packet_hash')}")
+        return 0 if result.get("success") else 1
+
+    if args.semantic_cmd == "list":
+        packets = list_semantic_packets(asset=args.asset, limit=args.limit)
+        result = {"success": True, "packets": packets, "count": len(packets)}
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            for pkt in packets:
+                print(f"{pkt['asof']} {pkt['asset']:14} {pkt['stance']:7} conf={pkt['confidence']:.2f} {pkt['path']}")
+        return 0
+
+    return 2
+
+
+def _dispatch_committee(args) -> int:
+    from pathlib import Path
+
+    from hermes_quant.artifacts import (
+        list_committee_turn_artifacts,
+        load_semantic_packet,
+    )
+    from hermes_quant.committee_runner import run_committee_from_packets
+
+    if args.committee_cmd == "run":
+        packets = [load_semantic_packet(path).to_dict() for path in args.semantic_packet_file]
+        root = Path(args.output_root).expanduser() if args.output_root else None
+        path, payload = run_committee_from_packets(
+            packets,
+            asset=args.asset,
+            asof=args.as_of,
+            model=args.model,
+            root=root,
+        )
+        result = {"success": True, "path": str(path), "artifact": payload}
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            print(f"committee turns written: {path}")
+            print(f"  hash: {payload.get('turns_hash')}")
+            print(f"  turns: {len(payload.get('turns', []))}")
+        return 0
+
+    if args.committee_cmd == "list":
+        artifacts = list_committee_turn_artifacts(asset=args.asset, limit=args.limit)
+        result = {"success": True, "artifacts": artifacts, "count": len(artifacts)}
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            for artifact in artifacts:
+                print(f"{artifact['asof']} {artifact['asset']:14} turns={artifact['n_turns']} {artifact['path']}")
+        return 0
+
+    return 2
+
+
+def _dispatch_perception(args) -> int:
+    if args.perception_cmd == "start":
+        return _perception_start(args)
+    return 2
+
+
+def _perception_start(args) -> int:
+    import shutil
+    import subprocess
+
+    hermes_bin = shutil.which("hermes") or "hermes"
+    prompt = (
+        "You are running as an autonomous semantic-perception cron job for the "
+        "Hermes Agent plugin hermes-quant. Research the requested market context, "
+        "then write exactly one semantic packet using the CLI. Do not place trades. "
+        "Use only public/non-secret sources. If evidence is mixed, choose neutral "
+        "with low confidence.\n\n"
+        f"Asset: {args.asset}\n"
+        f"Horizon: {args.horizon}\n"
+        f"Recipe: {args.recipe_id}\n"
+        f"Sources to consult/summarize: {args.sources}\n\n"
+        "After research, run a command like:\n"
+        f"{hermes_bin} quant semantic-packet write --asset {args.asset!r} --horizon {args.horizon!r} "
+        "--stance neutral --confidence 0.35 --magnitude 0.0 --summary '...' "
+        "--source 'url:https://example.com|source title' --model hermes:cron\n"
+        "Return the artifact path and hash."
+    )
+    if args.dry_run:
+        result = {"success": True, "dry_run": True, "cadence": args.cadence, "prompt": prompt}
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(prompt)
+        return 0
+
+    cmd = [
+        hermes_bin,
+        "cron",
+        "create",
+        args.cadence,
+        prompt,
+        "--name",
+        f"hermes-quant-perception-{args.asset.replace('/', '_')}-{args.horizon}",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result = {"success": False, "error": str(exc), "prompt": prompt}
+        print(json.dumps(result, indent=2) if args.json else f"perception cron failed: {exc}")
+        return 1
+    result = {
+        "success": proc.returncode == 0,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "prompt": prompt,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(proc.stdout.strip() or proc.stderr.strip())
+    return 0 if proc.returncode == 0 else 1
+
+
 def _dispatch_backtest(args) -> int:
     """Dispatch `hermes quant backtest --symbol X ...` (ADR-0020)."""
     import json as _json
-    import os as _os
     import uuid as _uuid
     from pathlib import Path as _Path
 
@@ -627,6 +912,10 @@ def _dispatch_backtest(args) -> int:
 
     # Run replay (single contiguous run or purged walk-forward folds)
     try:
+        semantic_packets, committee_turns = _load_perception_artifacts(
+            getattr(args, "semantic_packet_file", []),
+            getattr(args, "committee_turns_file", []),
+        )
         common_kwargs = dict(
             symbol=args.symbol,
             asset_class=args.asset_class,
@@ -638,6 +927,8 @@ def _dispatch_backtest(args) -> int:
             settlement_horizon_bars=args.settlement_horizon_bars,
             learn_from_fills=not args.no_learn_from_fills,
             recipe_id=args.recipe_id,
+            semantic_packets=semantic_packets,
+            committee_turns=committee_turns,
         )
         if args.walk_forward:
             result = walk_forward_replay(
@@ -718,8 +1009,9 @@ def _dispatch_backtest(args) -> int:
 
 def _load_bars_file(path: str):
     """Load bars from CSV or parquet."""
-    import pandas as _pd
     from pathlib import Path as _Path
+
+    import pandas as _pd
 
     p = _Path(path).expanduser()
     if not p.exists():
@@ -761,8 +1053,9 @@ def _fetch_bars_via_provider(
       - "ccxt:kraken" / "ccxt:coinbase"
       - "yfinance"
     """
-    import pandas as _pd
     from pathlib import Path as _Path
+
+    import pandas as _pd
 
     # Use as_of=end if specified, else None (= now)
     as_of = _pd.Timestamp(end) if end else None
@@ -798,13 +1091,15 @@ def _fetch_bars_via_provider(
         exchange_id = parts[1] if len(parts) == 2 and parts[1] else "binance"
         provider = CcxtProvider(exchange_id=exchange_id)
         provider_name = f"ccxt:{exchange_id}"
-        fetch = lambda: provider.fetch_bars(
-            symbol=symbol,
-            asset_class=asset_class,
-            timeframe=timeframe,
-            lookback_bars=lookback,
-            as_of=as_of,
-        )
+
+        def fetch():
+            return provider.fetch_bars(
+                symbol=symbol,
+                asset_class=asset_class,
+                timeframe=timeframe,
+                lookback_bars=lookback,
+                as_of=as_of,
+            )
     elif provider_spec == "yfinance":
         if asset_class not in {"equity", "etf"}:
             return None
@@ -814,13 +1109,15 @@ def _fetch_bars_via_provider(
             return None
         provider = YFinanceProvider()
         provider_name = "yfinance"
-        fetch = lambda: provider.fetch_bars(
-            symbol=symbol,
-            asset_class=asset_class,
-            timeframe=timeframe,
-            lookback_bars=lookback,
-            as_of=as_of,
-        )
+
+        def fetch():
+            return provider.fetch_bars(
+                symbol=symbol,
+                asset_class=asset_class,
+                timeframe=timeframe,
+                lookback_bars=lookback,
+                as_of=as_of,
+            )
     else:
         raise ValueError(
             f"unsupported --provider {provider_spec!r}; use ccxt:<exchange> or yfinance"

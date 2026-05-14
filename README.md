@@ -2,7 +2,7 @@
 
 > ARIA-powered multi-analyst algorithmic trading framework.
 > Distributed as a [Hermes Agent](https://hermes-agent.nousresearch.com/) plugin.
-> **v0.1.0 — alpha. Paper-trade only. Do not run live with real money.**
+> **v0.4.3 — alpha. Paper/backtest/HITL scaffolding only. Do not run live with real money.**
 
 ```
                     ┌─────────────────────────┐
@@ -93,6 +93,27 @@ Kronos can run on CPU (acceptable latency for 5m+ ticks) or GPU. For CUDA 12.1:
 ```
 
 `hermes quant doctor` reports the resolved torch + CUDA availability.
+
+## Quickstart — install, inspect, and run safely
+
+```bash
+# List named PDR recipes
+hermes quant recommend BTC/USDT --asset-class crypto --recipe-id btc-usdt-mvp --json
+
+# Write a replayable Hermes semantic packet
+hermes quant semantic-packet write \
+  --asset BTC/USDT --horizon 1h --stance neutral \
+  --confidence 0.35 --magnitude 0.0 \
+  --summary 'Mixed regime; prefer low conviction until quantitative agreement improves.' \
+  --source 'note:operator-thesis|manual thesis' \
+  --model hermes:manual
+
+# Create a deterministic committee-turn artifact from packets
+hermes quant committee run --asset BTC/USDT --semantic-packet-file <packet.json>
+
+# Optional: set up autonomous semantic perception via Hermes cron
+hermes quant perception start --asset BTC/USDT --horizon 1h --cadence 1h --dry-run
+```
 
 ## Quickstart — paper trade BTC on yfinance in 5 minutes
 

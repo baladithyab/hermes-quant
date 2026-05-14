@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-05-14
+
+### Summary
+
+v0.4.3 makes the semantic/deliberative PDR layer usable by normal Hermes plugin operators: semantic packets and committee turns are now filesystem artifacts with CLI write/validate/list/run surfaces, autonomous semantic perception can be installed as a Hermes cron job, and advisor/backtest/signal artifacts persist semantic provenance hashes.
+
+### Added
+
+- **ADR-0024**: autonomous semantic perception as an artifact pipeline rather than live model calls in trading ticks.
+- **`hermes_quant.artifacts`**: atomic JSON stores for semantic packets and committee-turn artifacts under `~/.hermes/quant/`.
+- **`hermes quant semantic-packet write|validate|list`** for operator-authored or Hermes-authored semantic perception artifacts.
+- **`hermes quant committee run|list`** for deterministic committee-turn artifacts derived from semantic packet archives.
+- **`hermes quant perception start`** to create/dry-run a Hermes cron job that autonomously researches sources and writes semantic packets.
+- **Backtest artifact injection flags**: `--semantic-packet-file` and `--committee-turns-file` for `hermes quant backtest`.
+- **Advisor CLI artifact injection flags** for `hermes quant recommend`.
+- **Dogfood audit**: `docs/audits/2026-05-14-v043-btc-usdt-dogfood.md` comparing MVP vs deliberative recipes.
+
+### Changed
+
+- Backtest replay now instantiates the recipe-selected aggregator for learning loops instead of always forcing BMA; this preserves the deliberative recipe during replay.
+- Backtest decision snapshots now record recipe metadata, semantic packet hashes, committee decision metadata, and aggregator name.
+- Daemon signal records now include component metadata, signal metadata, semantic packet hashes, and committee-turn hashes for downstream attribution.
+- README and plugin manifest now reflect the current install/customization surfaces.
+
+### Dogfood summary
+
+7-day BTC/USDT Kraken smoke, 1h bars, warmup 24:
+
+| variant | decisions | fires | return | buy_hold | excess |
+|---|---:|---:|---:|---:|---:|
+| `btc-usdt-mvp` | 1 | 2 | -0.07% | +0.12% | -0.19% |
+| `btc-usdt-deliberative` no packets | 0 | 0 | +0.00% | +0.12% | -0.12% |
+| `btc-usdt-deliberative` curated packet | 0 | 0 | +0.00% | +0.12% | -0.12% |
+
+Interpretation: this is a smoke test, not a promotion gate. The deliberative path currently fails closed under insufficient semantic coverage, which is the desired safety behavior. Next dogfood needs autonomous packet coverage across the full window.
+
+### Test sweep
+
+- 599 passed, 1 skipped (was 593 → +6, zero regressions).
+
 ## [0.4.2] — 2026-05-14
 
 ### Summary

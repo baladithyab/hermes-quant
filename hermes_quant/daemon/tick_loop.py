@@ -283,7 +283,7 @@ def _build_signal_record(
     action: Action,
     task: AssetTask,
     asof: pd.Timestamp,
-    ctx: "MarketContext",
+    ctx: MarketContext,
 ) -> dict:
     """Construct the JSONL record per ADR-0008 schema.
 
@@ -322,9 +322,22 @@ def _build_signal_record(
                 "direction": v.direction,
                 "magnitude": float(v.magnitude),
                 "confidence": float(v.confidence),
+                "confidence_raw": float(v.confidence_raw),
                 "horizon": v.horizon,
+                "metadata": dict(v.metadata) if v.metadata else None,
             }
             for v in signal.components
         ],
         "aggregator": signal.aggregator,
+        "metadata": dict(signal.metadata) if signal.metadata else None,
+        "semantic_packet_hashes": [
+            (dict(v.metadata).get("packet_hash") if v.metadata else None)
+            for v in signal.components
+            if v.metadata and dict(v.metadata).get("packet_hash")
+        ],
+        "committee_turns_hashes": [
+            turn.get("input_hash")
+            for turn in ((dict(signal.metadata).get("committee") or {}).get("model_backed_turns", []) if signal.metadata else [])
+            if turn.get("input_hash")
+        ],
     }

@@ -23,3 +23,4 @@
 - [ADR-0021-pdr-recipe-runtime.md](ADR-0021-pdr-recipe-runtime.md) — ---
 - [ADR-0022-hermes-semantic-perception.md](ADR-0022-hermes-semantic-perception.md) — ADR-0022: Hermes semantic perception layer
 - [ADR-0023-deliberative-committee-decision-layer.md](ADR-0023-deliberative-committee-decision-layer.md) — ADR-0023: Deliberative committee decision layer
+- [ADR-0024-autonomous-semantic-perception.md](ADR-0024-autonomous-semantic-perception.md) — ADR-0024: Autonomous semantic perception artifacts

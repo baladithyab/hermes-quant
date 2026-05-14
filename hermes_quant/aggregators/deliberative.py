@@ -126,6 +126,16 @@ class DeliberativeCommitteeAggregator:
     def update(self, outcome: EpisodeOutcome) -> None:
         self.baseline.update(outcome)
 
+    def status(self) -> dict[str, Any]:
+        base_status = self.baseline.status() if hasattr(self.baseline, "status") else {}
+        return {
+            "name": self.name,
+            "baseline": base_status,
+            "min_effective_views": self.min_effective_views,
+            "disagreement_penalty": self.disagreement_penalty,
+            "semantic_bonus_cap": self.semantic_bonus_cap,
+        }
+
     def _build_turns(
         self,
         views: list[AnalystView],

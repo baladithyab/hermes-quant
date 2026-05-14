@@ -15,7 +15,6 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -229,6 +228,8 @@ def replay(
     settlement_horizon_bars: int = 1,
     learn_from_fills: bool = True,
     recipe_id: str | None = None,
+    semantic_packets: list[dict] | None = None,
+    committee_turns: list[dict] | None = None,
     advisor_recommend=None,        # inject for testing
     aggregator=None,               # inject for testing or to seed posteriors
 ) -> BacktestResult:
@@ -274,8 +275,12 @@ def replay(
     # the production advisor would lose their posterior updates between
     # bars. Per ADR-0020 §D8 + ADR-0009 §P1-10.
     if aggregator is None and learn_from_fills:
-        from hermes_quant.aggregators.bma import BMAAggregator
-        aggregator = BMAAggregator()
+        if recipe_id:
+            from hermes_quant.recipes import get_recipe, instantiate_recipe_aggregator
+            aggregator = instantiate_recipe_aggregator(get_recipe(recipe_id))
+        else:
+            from hermes_quant.aggregators.bma import BMAAggregator
+            aggregator = BMAAggregator()
 
     # Normalize bars
     bars = bars.copy()
@@ -336,6 +341,10 @@ def replay(
                 provider=provider,
                 include_lessons=False,
                 recipe_id=recipe_id,
+                market_extras={
+                    "semantic_packets": semantic_packets or [],
+                    "committee_turns": committee_turns or [],
+                },
             )
             # Long-lived aggregator — pass through if we have one
             if aggregator is not None:
@@ -395,6 +404,13 @@ def replay(
         equity_records.append((as_of, portfolio.equity(bar_close)))
         bh_equity_records.append((as_of, bh_qty * bar_close))
         position_records.append((as_of, portfolio.position_qty))
+        signal_metadata = sig.get("metadata") or {}
+        committee = signal_metadata.get("committee") or {}
+        semantic_hashes = [
+            ((view.get("metadata") or {}).get("packet_hash"))
+            for view in result.get("analyst_views", [])
+            if ((view.get("metadata") or {}).get("packet_hash"))
+        ]
         decisions_summary.append({
             "asof": as_of.isoformat(),
             "bar_close": bar_close,
@@ -402,6 +418,14 @@ def replay(
             "kelly_fraction": float(rg.get("kelly_fraction", 0.0)),
             "rg_pass": rg_pass,
             "trade": trade if not trade.get("skipped") else None,
+            "recipe": result.get("recipe"),
+            "semantic_packet_hashes": semantic_hashes,
+            "committee_turns_hashes": [
+                turn.get("input_hash") for turn in committee.get("model_backed_turns", [])
+                if turn.get("input_hash")
+            ],
+            "committee_decision": committee.get("decision"),
+            "aggregator": sig.get("aggregator"),
         })
 
     # ---- Compute metrics ----
@@ -470,6 +494,8 @@ def replay(
         settlement_horizon_bars=settlement_horizon_bars,
         learn_from_fills=learn_from_fills,
         recipe_id=recipe_id,
+        semantic_packet_hashes=[p.get("packet_hash") for p in (semantic_packets or []) if p.get("packet_hash")],
+        committee_turn_hashes=[t.get("input_hash") for t in (committee_turns or []) if t.get("input_hash")],
         n_bars=len(bars),
     )
 

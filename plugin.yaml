@@ -1,5 +1,5 @@
 name: hermes-quant
-version: "0.1.0"
+version: "0.4.3"
 description: ARIA-powered multi-analyst algorithmic trading framework — sidecar daemon emits signals to a JSONL bus that freqtrade (or NautilusTrader) consumes for execution.
 author: Codeseys
 license: Apache-2.0

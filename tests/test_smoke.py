@@ -104,8 +104,8 @@ def test_canonical_cli_surface():
     expected_subcommands = {
         "setup", "start", "stop", "restart", "uninstall", "status",
         "resume", "halt", "emergency-stop",
-        "signals", "show-views", "doctor", "logs",
-        "backtest", "backtest-replay",
+        "signals", "show-views", "doctor", "logs", "semantic-packet",
+        "committee", "perception", "backtest", "backtest-replay",
         "freqtrade-setup", "freqtrade-backtest",
         "config",
     }
@@ -119,6 +119,12 @@ def test_canonical_cli_surface():
                 parser.parse_args([sub, "alpaca-paper", "--reason", "test"])
             elif sub == "show-views":
                 parser.parse_args([sub, "--asset", "BTC/USDT"])
+            elif sub == "semantic-packet":
+                parser.parse_args([sub, "list"])
+            elif sub == "committee":
+                parser.parse_args([sub, "list"])
+            elif sub == "perception":
+                parser.parse_args([sub, "start", "--asset", "BTC/USDT", "--dry-run"])
             elif sub == "backtest":
                 parser.parse_args([sub, "--symbol", "BTC/USDT",
                                    "--asset-class", "crypto",
@@ -133,7 +139,7 @@ def test_canonical_cli_surface():
                 parser.parse_args([sub])
         except SystemExit as e:
             # argparse exits on error — that's a parse failure
-            raise AssertionError(f"subcommand {sub!r} failed to parse: SystemExit({e.code})")
+            raise AssertionError(f"subcommand {sub!r} failed to parse: SystemExit({e.code})") from e
 
 
 def test_tools_are_safe_when_daemon_absent():
