@@ -245,6 +245,12 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
                       choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
     p_bt.add_argument("--bars-file",
                       help="Path to CSV/parquet with OHLCV bars (timestamp, open, high, low, close, volume)")
+    p_bt.add_argument("--provider", default=None,
+                      help="Fetch provider when --bars-file omitted (e.g. ccxt:kraken, ccxt:coinbase, yfinance)")
+    p_bt.add_argument("--no-cache", action="store_true",
+                      help="Disable OHLCV file cache for provider fetches")
+    p_bt.add_argument("--cache-root", default=None,
+                      help="OHLCV cache root (default ~/.hermes/quant/cache)")
     p_bt.add_argument("--start", default=None,
                       help="Start date (ISO 8601); used when fetching via configured provider")
     p_bt.add_argument("--end", default=None,
@@ -609,6 +615,9 @@ def _dispatch_backtest(args) -> int:
             timeframe=args.timeframe,
             start=args.start,
             end=args.end,
+            provider_spec=args.provider,
+            use_cache=not args.no_cache,
+            cache_root=args.cache_root,
         )
         if bars is None:
             print("backtest: --bars-file is required when no provider available")
@@ -731,28 +740,26 @@ def _load_bars_file(path: str):
     return bars
 
 
-def _fetch_bars_via_provider(*, symbol, asset_class, timeframe, start, end):
-    """Fetch bars via the configured provider (yfinance or ccxt).
+def _fetch_bars_via_provider(
+    *,
+    symbol,
+    asset_class,
+    timeframe,
+    start,
+    end,
+    provider_spec=None,
+    use_cache=True,
+    cache_root=None,
+):
+    """Fetch bars via yfinance/ccxt with optional read-through OHLCV cache.
 
-    Returns None if no compatible provider is available; the caller should
-    fall back to requiring --bars-file.
+    provider_spec examples:
+      - None: default provider for asset class (ccxt default exchange for crypto)
+      - "ccxt:kraken" / "ccxt:coinbase"
+      - "yfinance"
     """
     import pandas as _pd
-
-    if asset_class == "crypto":
-        try:
-            from hermes_quant.data.ccxt_provider import CcxtProvider
-        except Exception:   # noqa: BLE001
-            return None
-        provider = CcxtProvider()
-    elif asset_class in {"equity", "etf"}:
-        try:
-            from hermes_quant.data.yfinance_provider import YFinanceProvider
-        except Exception:   # noqa: BLE001
-            return None
-        provider = YFinanceProvider()
-    else:
-        return None
+    from pathlib import Path as _Path
 
     # Use as_of=end if specified, else None (= now)
     as_of = _pd.Timestamp(end) if end else None
@@ -762,8 +769,6 @@ def _fetch_bars_via_provider(*, symbol, asset_class, timeframe, start, end):
     # Compute lookback_bars from start/end if provided
     lookback = 1000   # default
     if start and end:
-        # Rough estimate based on timeframe
-        from datetime import timedelta as _td
         s = _pd.Timestamp(start)
         e = _pd.Timestamp(end)
         delta_seconds = (e - s).total_seconds()
@@ -771,12 +776,72 @@ def _fetch_bars_via_provider(*, symbol, asset_class, timeframe, start, end):
             "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
             "1h": 3600, "4h": 14400, "1d": 86400,
         }.get(timeframe, 3600)
-        lookback = max(int(delta_seconds / tf_seconds) + 50, 100)
+        # Small buffer only: provider implementations add their own pagination
+        # / closed-bar slack. A large CLI buffer makes caches miss forever when
+        # venues return slightly fewer bars than requested.
+        lookback = max(int(delta_seconds / tf_seconds) + 5, 100)
 
-    return provider.fetch_bars(
-        symbol=symbol, asset_class=asset_class, timeframe=timeframe,
-        lookback_bars=lookback, as_of=as_of,
+    provider_spec = provider_spec or ("ccxt" if asset_class == "crypto" else "yfinance")
+    provider_name = provider_spec
+
+    if provider_spec.startswith("ccxt"):
+        if asset_class != "crypto":
+            return None
+        try:
+            from hermes_quant.data.ccxt_provider import CcxtProvider
+        except Exception:   # noqa: BLE001
+            return None
+        parts = provider_spec.split(":", 1)
+        exchange_id = parts[1] if len(parts) == 2 and parts[1] else "binance"
+        provider = CcxtProvider(exchange_id=exchange_id)
+        provider_name = f"ccxt:{exchange_id}"
+        fetch = lambda: provider.fetch_bars(
+            symbol=symbol,
+            asset_class=asset_class,
+            timeframe=timeframe,
+            lookback_bars=lookback,
+            as_of=as_of,
+        )
+    elif provider_spec == "yfinance":
+        if asset_class not in {"equity", "etf"}:
+            return None
+        try:
+            from hermes_quant.data.yfinance_provider import YFinanceProvider
+        except Exception:   # noqa: BLE001
+            return None
+        provider = YFinanceProvider()
+        provider_name = "yfinance"
+        fetch = lambda: provider.fetch_bars(
+            symbol=symbol,
+            asset_class=asset_class,
+            timeframe=timeframe,
+            lookback_bars=lookback,
+            as_of=as_of,
+        )
+    else:
+        raise ValueError(
+            f"unsupported --provider {provider_spec!r}; use ccxt:<exchange> or yfinance"
+        )
+
+    if not use_cache:
+        return fetch()
+
+    from hermes_quant.data.cache import cached_fetch
+    root = _Path(cache_root).expanduser() if cache_root else None
+    bars, meta = cached_fetch(
+        fetch,
+        provider=provider_name,
+        symbol=symbol,
+        timeframe=timeframe,
+        lookback_bars=lookback,
+        cache_root=root if root is not None else _Path.home() / ".hermes" / "quant" / "cache",
     )
+    print(
+        "backtest: OHLCV cache "
+        f"{'hit' if meta.get('cache_hit') else 'miss'} "
+        f"({meta.get('cache', {}).get('n_bars', len(bars))} cached bars)",
+    )
+    return bars
 
 
 def _dispatch_autonomous(args) -> int:
