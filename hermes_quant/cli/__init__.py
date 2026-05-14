@@ -256,6 +256,20 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
                       help="Per-trade commission as fraction (default 10bps)")
     p_bt.add_argument("--slippage", type=float, default=0.0005,
                       help="Per-trade slippage as fraction (default 5bps)")
+    p_bt.add_argument("--settlement-horizon-bars", type=int, default=1,
+                      help="Bars forward used to settle decisions into aggregator posteriors")
+    p_bt.add_argument("--no-learn-from-fills", action="store_true",
+                      help="Disable in-replay calibrator updates")
+    p_bt.add_argument("--walk-forward", action="store_true",
+                      help="Run purged walk-forward replay folds instead of one contiguous backtest")
+    p_bt.add_argument("--n-splits", type=int, default=5,
+                      help="Number of walk-forward folds (default 5)")
+    p_bt.add_argument("--embargo-pct", type=float, default=0.01,
+                      help="Train/validation embargo fraction for walk-forward")
+    p_bt.add_argument("--train-pct", type=float, default=0.6,
+                      help="Train fraction inside each walk-forward fold")
+    p_bt.add_argument("--val-pct", type=float, default=0.2,
+                      help="Validation fraction inside each walk-forward fold")
     p_bt.add_argument("--output-dir", default=None,
                       help="Directory to write report.md + result.json (default: ~/.hermes/quant/backtests/<run-id>/)")
     p_bt.add_argument("--json", action="store_true", help="Print JSON to stdout instead of report")
@@ -583,7 +597,7 @@ def _dispatch_backtest(args) -> int:
 
     import pandas as _pd
 
-    from hermes_quant.backtest import replay
+    from hermes_quant.backtest import replay, walk_forward_replay
 
     # Load bars
     if args.bars_file:
@@ -600,10 +614,9 @@ def _dispatch_backtest(args) -> int:
             print("backtest: --bars-file is required when no provider available")
             return 2
 
-    # Run replay
+    # Run replay (single contiguous run or purged walk-forward folds)
     try:
-        result = replay(
-            bars,
+        common_kwargs = dict(
             symbol=args.symbol,
             asset_class=args.asset_class,
             timeframe=args.timeframe,
@@ -611,7 +624,20 @@ def _dispatch_backtest(args) -> int:
             warmup_bars=args.warmup_bars,
             commission=args.commission,
             slippage=args.slippage,
+            settlement_horizon_bars=args.settlement_horizon_bars,
+            learn_from_fills=not args.no_learn_from_fills,
         )
+        if args.walk_forward:
+            result = walk_forward_replay(
+                bars,
+                n_splits=args.n_splits,
+                embargo_pct=args.embargo_pct,
+                train_pct=args.train_pct,
+                val_pct=args.val_pct,
+                **common_kwargs,
+            )
+        else:
+            result = replay(bars, **common_kwargs)
     except ValueError as exc:
         print(f"backtest: {exc}")
         return 2
@@ -632,18 +658,32 @@ def _dispatch_backtest(args) -> int:
     (out_dir / "report.md").write_text(
         result.to_markdown_report(), encoding="utf-8",
     )
-    # Equity curve as CSV
-    eq_df = _pd.DataFrame({
-        "equity": result.equity_curve.values,
-        "buy_hold_equity": result.bh_equity_curve.values,
-        "position": result.positions.values,
-    }, index=result.equity_curve.index)
-    eq_df.to_csv(out_dir / "equity_curve.csv")
 
-    # Decisions JSONL
-    with open(out_dir / "decisions.jsonl", "w", encoding="utf-8") as f:
-        for d in result.decisions_summary:
-            f.write(_json.dumps(d, default=str) + "\n")
+    if args.walk_forward:
+        # One decisions file per fold; fold summaries are already in result.json.
+        for fold in result.folds:
+            with open(out_dir / f"fold-{fold.fold}-decisions.jsonl", "w", encoding="utf-8") as f:
+                for d in fold.result.decisions_summary:
+                    f.write(_json.dumps(d, default=str) + "\n")
+            eq_df = _pd.DataFrame({
+                "equity": fold.result.equity_curve.values,
+                "buy_hold_equity": fold.result.bh_equity_curve.values,
+                "position": fold.result.positions.values,
+            }, index=fold.result.equity_curve.index)
+            eq_df.to_csv(out_dir / f"fold-{fold.fold}-equity_curve.csv")
+    else:
+        # Equity curve as CSV
+        eq_df = _pd.DataFrame({
+            "equity": result.equity_curve.values,
+            "buy_hold_equity": result.bh_equity_curve.values,
+            "position": result.positions.values,
+        }, index=result.equity_curve.index)
+        eq_df.to_csv(out_dir / "equity_curve.csv")
+
+        # Decisions JSONL
+        with open(out_dir / "decisions.jsonl", "w", encoding="utf-8") as f:
+            for d in result.decisions_summary:
+                f.write(_json.dumps(d, default=str) + "\n")
 
     # Output
     if args.json:
@@ -652,10 +692,14 @@ def _dispatch_backtest(args) -> int:
         print(result.to_markdown_report())
         print()
         print(f"Artifacts written to: {out_dir}")
-        print("  result.json      — machine-readable BacktestResult")
+        print("  result.json      — machine-readable BacktestResult/WalkForwardBacktestResult")
         print("  report.md        — operator-readable summary")
-        print("  equity_curve.csv — per-bar equity / buy-hold / position")
-        print("  decisions.jsonl  — per-bar advisor result snapshots")
+        if args.walk_forward:
+            print("  fold-*-equity_curve.csv — per-fold equity / buy-hold / position")
+            print("  fold-*-decisions.jsonl  — per-fold advisor result snapshots")
+        else:
+            print("  equity_curve.csv — per-bar equity / buy-hold / position")
+            print("  decisions.jsonl  — per-bar advisor result snapshots")
 
     return 0
 
