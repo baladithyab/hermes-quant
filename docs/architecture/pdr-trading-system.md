@@ -5,8 +5,10 @@
 > - `hermes_quant/advisor.py` — Advise hot path; accepts `recipe_id` / recipe-selected components
 > - `hermes_quant/backtest/replay.py` — production replay harness; forwards recipe ID into advisor calls
 > - `hermes_quant/backtest/walk_forward.py` — purged out-of-sample recipe replay folds
-> - `hermes_quant/tools.py` / `hermes_quant/schemas.py` — Hermes tool surface (`quant_recipes`, `quant_recommend`)
-> - `hermes_quant/cli/__init__.py` — backtest CLI, provider/cache, walk-forward flags
+- `hermes_quant/tools.py` / `hermes_quant/schemas.py` — Hermes tool surface (`quant_recipes`, `quant_recommend`)
+- `hermes_quant/semantic.py` / `hermes_quant/analysts/semantic.py` — semantic-packet perception contract
+- `hermes_quant/aggregators/deliberative.py` — TradingAgents-style deterministic deliberation scaffold
+- `hermes_quant/cli/__init__.py` — backtest CLI, provider/cache, walk-forward flags
 
 # PDR trading system architecture
 
@@ -76,6 +78,8 @@ Recipes live in `hermes_quant/recipes.py`. The built-in default is `btc-usdt-mvp
 - reactor: `paper`
 - live allowed: `false`
 
+The second built-in recipe is `btc-usdt-deliberative`, which adds `hermes_semantic` and swaps the aggregator to `deliberative_committee` while remaining paper/backtest-only (`live_allowed=false`).
+
 The `config_hash` is a stable 16-character SHA-256 prefix of the recipe dictionary. Backtest/advisor artifacts can carry this hash as the reproducibility boundary.
 
 ### 2. Hermes exposes recipe inventory
@@ -95,7 +99,26 @@ The `config_hash` is a stable 16-character SHA-256 prefix of the recipe dictiona
 
 Existing callers still work: if no recipe is passed, the advisor falls back to its historical defaults.
 
-### 4. Backtests replay recipes
+### 4. Hermes can feed semantic perception packets
+
+`HermesSemanticAnalyst` makes Hermes a first-class semantic analyzer without putting live model calls in the trading tick. Hermes, cron, or an operator can produce semantic packets from news, filings, research notes, session memory, or human theses and pass them through `quant_recommend(..., semantic_packets=[...])` or replay artifacts. The analyst validates freshness, asset, horizon, and packet hash, then emits a normal `AnalystView` with packet provenance in metadata. If no valid packet exists, it emits a zero-confidence abstain that BMA/committee aggregators filter out.
+
+The built-in `btc-usdt-deliberative` recipe includes this analyst alongside the quantitative voices.
+
+### 5. Deliberative committee models TradingAgents-style decision collaboration
+
+`DeliberativeCommitteeAggregator` preserves the existing `Aggregator` protocol but adds a structured committee trace:
+
+1. bull researcher,
+2. bear researcher,
+3. neutral researcher,
+4. trader synthesis,
+5. aggressive/conservative/neutral risk debate,
+6. portfolio-manager synthesis.
+
+The current implementation is deterministic and replayable. Future Hermes model-mixture turns can be provided as explicit `committee_turns` artifacts in `MarketContext.extras`; the aggregator never hides network/model calls inside `aggregate()`. Disagreement reduces confidence or forces flat, and the deterministic risk gate still has final authority.
+
+### 6. Backtests replay recipes
 
 `replay(..., recipe_id=...)` forwards the ID into every advisor call. `walk_forward_replay(..., recipe_id=...)` does the same per fold. This keeps the production replay invariant: a backtest calls the same advisor pipeline the operator would call live, only with a replay provider.
 

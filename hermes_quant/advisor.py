@@ -27,8 +27,8 @@ given a clean slate; consumers must not interpret it as an order.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -44,7 +44,6 @@ from hermes_quant.protocol import (
     MarketContext,
     MarketState,
     Portfolio,
-    Position,
     RateLimitError,
 )
 
@@ -235,6 +234,7 @@ def _signal_to_dict(sig: AggregatedSignal) -> dict[str, Any]:
         "horizon": sig.horizon,
         "aggregator": sig.aggregator,
         "n_components": len(sig.components),
+        "metadata": dict(sig.metadata) if sig.metadata else None,
     }
 
 
@@ -344,6 +344,7 @@ def recommend(
     risk_gate: Any = None,
     recipe: Any = None,
     recipe_id: str | None = None,
+    market_extras: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Synchronous recommendation for a single symbol. Read-only (ADR-0014).
 
@@ -534,7 +535,7 @@ def recommend(
         last_close=float(bars["close"].iloc[-1]),
         last_volume=float(bars["volume"].iloc[-1]),
         asof=last_bar_ts_utc,
-        extras={},
+        extras=dict(market_extras or {}),
     )
 
     # ---- Step 5: run analysts ----

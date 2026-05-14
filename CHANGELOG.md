@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-05-14
+
+### Summary
+
+v0.4.2 makes Hermes itself part of the PDR trading architecture: semantic analysis can enter the Perceive layer as replayable packets, and the Decide layer now has a TradingAgents-style deliberative committee scaffold for bull/bear/risk/portfolio-manager collaboration.
+
+### Added
+
+- **ADR-0022**: Hermes semantic perception layer. Semantic packets are precomputed Hermes/model/human research artifacts consumed by analysts; no hidden model/web calls happen inside a trading tick.
+- **ADR-0023**: Deliberative committee decision layer. The committee records research debate, trader synthesis, risk debate, and portfolio-manager synthesis while preserving the `Aggregator` protocol.
+- **`hermes_quant.semantic`**: `SemanticPacket`, source provenance, canonical packet hashing, parsing, and validation helpers.
+- **`HermesSemanticAnalyst`** (`hermes_quant.analysts.semantic`): consumes semantic packets from `MarketContext.extras`, emits normal `AnalystView`s, and abstains with zero confidence when packets are missing/stale/future/tampered.
+- **`DeliberativeCommitteeAggregator`** (`hermes_quant.aggregators.deliberative`): deterministic TradingAgents-style committee scaffold with bull/bear/neutral research turns, trader synthesis, aggressive/conservative/neutral risk perspectives, and portfolio-manager metadata.
+- **`btc-usdt-deliberative` recipe**: BTC/USDT recipe using quantitative analysts + `hermes_semantic` + `deliberative_committee`, paper/backtest-only.
+- `quant_recommend` schema/tool path accepts optional `semantic_packets` and `committee_turns` artifacts for replayable semantic/model-mixture inputs.
+
+### Changed
+
+- `advisor.recommend()` accepts `market_extras` so replay/tool callers can inject semantic packets and committee turns without changing the analyst protocol.
+- Advisor aggregated-signal JSON now carries `metadata`, exposing committee deliberation traces to Hermes/tool callers.
+- Architecture docs now document semantic packets and model-mixture deliberation as first-class PDR extension seams.
+
+### Safety posture
+
+- Model-backed debate is artifact-driven, not live-call-driven: future Hermes model mixtures should write explicit `committee_turns` with model IDs/input hashes before aggregation.
+- Deliberation can reduce confidence or force flat on disagreement; it cannot bypass the deterministic risk gate.
+- Semantic packets are hash-verified and freshness-checked; invalid packets produce abstain views, not trades.
+
+### Test sweep
+
+- 593 passed, 1 skipped (was 580 → +13, zero regressions).
+
 ## [0.4.1] — 2026-05-14
 
 ### Summary

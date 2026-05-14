@@ -9,6 +9,7 @@ import pytest
 from hermes_quant.advisor import recommend
 from hermes_quant.recipes import (
     DEFAULT_RECIPE,
+    DELIBERATIVE_RECIPE,
     PDRRecipe,
     get_recipe,
     instantiate_recipe_aggregator,
@@ -72,9 +73,16 @@ def test_live_autonomous_recipe_rejected_until_gates():
         ).validate()
 
 
-def test_list_recipes_surfaces_default():
+def test_list_recipes_surfaces_builtins():
     recipes = list_recipes()
-    assert [r.id for r in recipes] == ["btc-usdt-mvp"]
+    assert [r.id for r in recipes] == ["btc-usdt-deliberative", "btc-usdt-mvp"]
+
+
+def test_deliberative_recipe_validates_and_hashes():
+    DELIBERATIVE_RECIPE.validate()
+    assert DELIBERATIVE_RECIPE.aggregator == "deliberative_committee"
+    assert "hermes_semantic" in DELIBERATIVE_RECIPE.analysts
+    assert get_recipe("btc-usdt-deliberative").config_hash == DELIBERATIVE_RECIPE.config_hash
 
 
 def test_builtin_recipe_components_instantiate():
@@ -90,9 +98,10 @@ def test_builtin_recipe_components_instantiate():
 def test_quant_recipes_tool_lists_hashes():
     out = json.loads(quant_recipes({}))
     assert out["success"] is True
-    assert out["count"] == 1
-    assert out["recipes"][0]["id"] == "btc-usdt-mvp"
-    assert len(out["recipes"][0]["config_hash"]) == 16
+    assert out["count"] == 2
+    ids = [r["id"] for r in out["recipes"]]
+    assert ids == ["btc-usdt-deliberative", "btc-usdt-mvp"]
+    assert all(len(r["config_hash"]) == 16 for r in out["recipes"])
 
 
 def test_advisor_accepts_recipe_id_and_records_metadata():
@@ -106,3 +115,31 @@ def test_advisor_accepts_recipe_id_and_records_metadata():
     assert len(result["recipe"]["config_hash"]) == 16
     assert result["asset_class"] == "crypto"
     assert result["timeframe"] == "1h"
+
+
+def test_advisor_deliberative_recipe_accepts_semantic_packet():
+    packet = {
+        "schema_version": 1,
+        "asset": "BTC/USDT",
+        "asof": "2024-01-05T22:00:00Z",
+        "horizon": "1h",
+        "stance": "bullish",
+        "confidence": 0.8,
+        "magnitude": 0.01,
+        "summary": "Hermes semantic packet sees constructive regime.",
+        "sources": [{"type": "note", "ref": "test"}],
+        "model": "hermes:test",
+    }
+    from hermes_quant.semantic import semantic_packet_from_dict
+    packet = semantic_packet_from_dict(packet).to_dict()
+    result = recommend(
+        "BTC/USDT",
+        provider=_Provider(),
+        include_lessons=False,
+        recipe_id="btc-usdt-deliberative",
+        market_extras={"semantic_packets": [packet]},
+    )
+    assert result["recipe"]["id"] == "btc-usdt-deliberative"
+    assert any(v["analyst"] == "hermes_semantic" for v in result["analyst_views"])
+    assert result["aggregated_signal"]["aggregator"] == "deliberative_committee"
+    assert result["aggregated_signal"]["metadata"]["committee"]["safety"]["risk_gate_still_required"] is True

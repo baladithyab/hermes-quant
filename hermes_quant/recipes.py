@@ -8,12 +8,11 @@ and eventually run in HITL/autonomous modes.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import re
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
-
 
 PDRMode = Literal["advise", "hitl", "autonomous", "backtest"]
 
@@ -94,8 +93,40 @@ DEFAULT_RECIPE = PDRRecipe(
     min_settlements_for_charter_gate=30,
 )
 
+DELIBERATIVE_RECIPE = PDRRecipe(
+    id="btc-usdt-deliberative",
+    description=(
+        "Hermes-native deliberative BTC/USDT recipe: quantitative analysts + "
+        "Hermes semantic packets feed a TradingAgents-style deterministic "
+        "committee aggregator."
+    ),
+    symbols=("BTC/USDT",),
+    asset_class="crypto",
+    timeframe="1h",
+    data_provider="ccxt:kraken",
+    analysts=("classical_ta", "microstructure_lite", "kronos", "hermes_semantic"),
+    analyst_config={
+        "hermes_semantic": {
+            "max_age_minutes": 24 * 60,
+            "require_horizon_match": False,
+        }
+    },
+    aggregator="deliberative_committee",
+    risk_gate="default",
+    reactor="paper",
+    supported_modes=("advise", "hitl", "backtest"),
+    live_allowed=False,
+    min_decisions_for_charter_gate=30,
+    min_settlements_for_charter_gate=30,
+    notes=(
+        "Model-backed debate turns are intentionally external artifacts for now; "
+        "the aggregator's hot path remains deterministic and replayable."
+    ),
+)
+
 _BUILTIN_RECIPES: dict[str, PDRRecipe] = {
     DEFAULT_RECIPE.id: DEFAULT_RECIPE,
+    DELIBERATIVE_RECIPE.id: DELIBERATIVE_RECIPE,
 }
 
 
@@ -132,6 +163,9 @@ def instantiate_recipe_analysts(recipe: PDRRecipe):
         elif name == "kronos":
             from hermes_quant.analysts.kronos import KronosAnalyst
             out.append(KronosAnalyst(**kwargs))
+        elif name == "hermes_semantic":
+            from hermes_quant.analysts.semantic import HermesSemanticAnalyst
+            out.append(HermesSemanticAnalyst(**kwargs))
         else:
             from hermes_quant.daemon.discovery import instantiate_analysts
             found = instantiate_analysts([name], overrides={name: kwargs})
@@ -145,6 +179,9 @@ def instantiate_recipe_aggregator(recipe: PDRRecipe):
     if recipe.aggregator == "bma":
         from hermes_quant.aggregators.bma import BMAAggregator
         return BMAAggregator(**recipe.aggregator_config)
+    if recipe.aggregator == "deliberative_committee":
+        from hermes_quant.aggregators.deliberative import DeliberativeCommitteeAggregator
+        return DeliberativeCommitteeAggregator(**recipe.aggregator_config)
     from hermes_quant.daemon.discovery import instantiate_aggregator
     agg = instantiate_aggregator(recipe.aggregator, **recipe.aggregator_config)
     if agg is None:

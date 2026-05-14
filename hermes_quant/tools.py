@@ -201,6 +201,10 @@ def quant_recommend(args: dict, **_kwargs) -> str:
             include_lessons=bool(args.get("include_lessons", True)),
             as_of=args.get("as_of"),
             recipe_id=args.get("recipe_id"),
+            market_extras={
+                "semantic_packets": args.get("semantic_packets", []),
+                "committee_turns": args.get("committee_turns", []),
+            },
         )
     except Exception as exc:  # noqa: BLE001 — advisor is best-effort
         logger.warning(

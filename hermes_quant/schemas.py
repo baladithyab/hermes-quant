@@ -108,6 +108,16 @@ QUANT_RECOMMEND = {
                                "bars filtered to <= as_of (lookahead enforcement). "
                                "Omit for live snapshot.",
             },
+            "semantic_packets": {
+                "type": "array",
+                "description": "Optional precomputed Hermes semantic packets for HermesSemanticAnalyst. Read-only input artifacts; the tool does not call models.",
+                "items": {"type": "object"},
+            },
+            "committee_turns": {
+                "type": "array",
+                "description": "Optional model-backed deliberation turns for DeliberativeCommitteeAggregator. Must be replayable artifacts, not live calls.",
+                "items": {"type": "object"},
+            },
         },
         "required": ["symbol"],
     },
