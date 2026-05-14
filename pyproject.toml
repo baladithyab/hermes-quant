@@ -38,8 +38,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Default data: yfinance for free bootstrap
-yfinance = ["yfinance>=0.2.40"]
+yfinance = ["yfinance>=0.2.40", "pyyaml>=6.0"]
 # Crypto data + execution
 ccxt = ["ccxt>=4.2"]
 # US equities data + execution
@@ -87,7 +86,7 @@ stacking = "hermes_quant.aggregators.stacking:StackingAggregator"
 
 [project.entry-points."hermes_quant.data_providers"]
 yfinance = "hermes_quant.data.yfinance_provider:YFinanceProvider"
-ccxt = "hermes_quant.data.ccxt_provider:CCXTProvider"
+ccxt = "hermes_quant.data.ccxt_provider:CcxtProvider"
 alpaca = "hermes_quant.data.alpaca_provider:AlpacaProvider"
 
 [project.scripts]
