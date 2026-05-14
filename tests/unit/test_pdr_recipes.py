@@ -11,11 +11,14 @@ from hermes_quant.recipes import (
     DEFAULT_RECIPE,
     DELIBERATIVE_RECIPE,
     PDRRecipe,
+    example_user_recipe,
     get_recipe,
     instantiate_recipe_aggregator,
     instantiate_recipe_analysts,
     instantiate_recipe_risk_gate,
     list_recipes,
+    load_user_recipes,
+    recipe_from_mapping,
 )
 from hermes_quant.tools import quant_recipes
 
@@ -93,6 +96,34 @@ def test_builtin_recipe_components_instantiate():
     assert hasattr(agg, "aggregate")
     gate = instantiate_recipe_risk_gate(recipe)
     assert hasattr(gate, "gate")
+
+
+def test_user_recipe_yaml_loads_from_custom_root(tmp_path):
+    import yaml
+    data = example_user_recipe()
+    data["id"] = "custom-yaml-recipe"
+    path = tmp_path / "custom-yaml-recipe.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    recipes = load_user_recipes(root=tmp_path)
+    assert recipes["custom-yaml-recipe"].id == "custom-yaml-recipe"
+    assert get_recipe("custom-yaml-recipe", user_root=tmp_path).config_hash == recipes["custom-yaml-recipe"].config_hash
+    listed = list_recipes(user_root=tmp_path)
+    assert "custom-yaml-recipe" in [r.id for r in listed]
+
+
+def test_recipe_from_mapping_normalizes_lists():
+    recipe = recipe_from_mapping(example_user_recipe())
+    assert isinstance(recipe.symbols, tuple)
+    assert isinstance(recipe.analysts, tuple)
+
+
+def test_user_recipe_cannot_shadow_builtin(tmp_path):
+    import yaml
+    data = example_user_recipe()
+    data["id"] = "btc-usdt-mvp"
+    (tmp_path / "shadow.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_user_recipes(root=tmp_path)
 
 
 def test_quant_recipes_tool_lists_hashes():

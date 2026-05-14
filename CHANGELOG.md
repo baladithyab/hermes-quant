@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.4] — 2026-05-14
+
+### Summary
+
+v0.4.4 makes hermes-quant meaningfully customizable for non-contributors: PDR recipes can now be authored as YAML under `~/.hermes/quant/recipes/`, perception freshness can be checked per recipe, and the committee runner exposes a safe model-mixture prompt surface without adding hidden model calls to trading ticks.
+
+### Added
+
+- **ADR-0025**: user-editable recipes and perception status.
+- **User recipe YAML loader**: built-ins plus `~/.hermes/quant/recipes/*.yaml` are loaded by the recipe registry.
+- **`hermes quant recipes list|validate|example`**: list all recipes, validate a recipe YAML, or write/print a starter template.
+- **`hermes quant perception status`**: report fresh/stale/missing/future semantic packets for every symbol in a recipe using its configured `hermes_semantic.max_age_minutes`.
+- **`hermes quant committee prompt`**: emit a self-contained Hermes prompt for a future multi-model committee job, including packet hashes and required roles.
+
+### Changed
+
+- User recipes cannot shadow built-in recipe IDs; this prevents accidental override of known templates.
+- Recipe listing now includes user recipes by default, while preserving deterministic ordering.
+- README quickstart now shows recipe customization and perception status commands.
+
+### Safety posture
+
+- Recipe validation keeps live autonomous recipes rejected until live-reactor gates are explicitly implemented.
+- Perception status is read-only.
+- The model-mixture surface is prompt/artifact-driven; no trading tick performs hidden model calls.
+
+### Test sweep
+
+- 604 passed, 1 skipped (was 599 → +5, zero regressions).
+
 ## [0.4.3] — 2026-05-14
 
 ### Summary

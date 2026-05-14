@@ -171,6 +171,44 @@ def load_committee_turns(path: str | Path) -> dict[str, Any]:
     return payload
 
 
+def semantic_status_for_recipe(recipe, *, root: Path | None = None, now: pd.Timestamp | None = None) -> dict[str, Any]:
+    """Summarize semantic packet freshness for each symbol in a recipe."""
+    now_ts = now or pd.Timestamp.now(tz="UTC")
+    sem_cfg = (recipe.analyst_config or {}).get("hermes_semantic", {})
+    max_age = float(sem_cfg.get("max_age_minutes", 24 * 60))
+    symbols = list(recipe.symbols)
+    rows = []
+    for symbol in symbols:
+        packets = list_semantic_packets(asset=symbol, root=root, limit=10)
+        latest = packets[0] if packets else None
+        status = "missing"
+        age_minutes = None
+        if latest:
+            pkt_asof = pd.Timestamp(latest["asof"])
+            pkt_asof = pkt_asof.tz_localize("UTC") if pkt_asof.tzinfo is None else pkt_asof.tz_convert("UTC")
+            ctx_now = now_ts.tz_localize("UTC") if now_ts.tzinfo is None else now_ts.tz_convert("UTC")
+            age_minutes = (ctx_now - pkt_asof).total_seconds() / 60.0
+            if age_minutes < 0:
+                status = "future"
+            elif age_minutes <= max_age:
+                status = "fresh"
+            else:
+                status = "stale"
+        rows.append({
+            "symbol": symbol,
+            "status": status,
+            "max_age_minutes": max_age,
+            "age_minutes": age_minutes,
+            "latest_packet": latest,
+        })
+    return {
+        "recipe_id": recipe.id,
+        "recipe_hash": recipe.config_hash,
+        "symbols": rows,
+        "all_fresh": all(r["status"] == "fresh" for r in rows) if rows else False,
+    }
+
+
 def list_committee_turn_artifacts(
     *,
     asset: str | None = None,

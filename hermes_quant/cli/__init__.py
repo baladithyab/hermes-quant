@@ -133,6 +133,17 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_rec.add_argument("--json", action="store_true",
                        help="Print raw JSON instead of rich-formatted output")
 
+    # Recipes
+    p_recipes = sub.add_parser("recipes", help="List/validate/example PDR recipes")
+    recipes_sub = p_recipes.add_subparsers(dest="recipes_cmd", required=True)
+    recipes_list = recipes_sub.add_parser("list", help="List built-in and user recipes")
+    recipes_list.add_argument("--json", action="store_true")
+    recipes_validate = recipes_sub.add_parser("validate", help="Validate one user recipe YAML")
+    recipes_validate.add_argument("path")
+    recipes_validate.add_argument("--json", action="store_true")
+    recipes_example = recipes_sub.add_parser("example", help="Print an example user recipe YAML")
+    recipes_example.add_argument("--output", default=None, help="Optional path to write YAML template")
+
     # Semantic perception artifacts
     p_sem = sub.add_parser("semantic-packet", help="Write/validate/list semantic perception artifacts")
     sem_sub = p_sem.add_subparsers(dest="semantic_cmd", required=True)
@@ -175,6 +186,11 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     committee_list.add_argument("--asset", default=None)
     committee_list.add_argument("--limit", type=int, default=20)
     committee_list.add_argument("--json", action="store_true")
+    committee_prompt = committee_sub.add_parser("prompt", help="Print a safe Hermes prompt for model-mixture committee turns")
+    committee_prompt.add_argument("--asset", required=True)
+    committee_prompt.add_argument("--semantic-packet-file", action="append", required=True)
+    committee_prompt.add_argument("--models", default="", help="Comma-separated provider/model ids to use or simulate")
+    committee_prompt.add_argument("--json", action="store_true")
 
     # Perception cron helper
     p_perception = sub.add_parser("perception", help="Autonomous semantic perception setup")
@@ -187,6 +203,10 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     perception_start.add_argument("--recipe-id", default="btc-usdt-deliberative")
     perception_start.add_argument("--dry-run", action="store_true")
     perception_start.add_argument("--json", action="store_true")
+    perception_status = perception_sub.add_parser("status", help="Show semantic packet freshness for a recipe")
+    perception_status.add_argument("--recipe-id", default="btc-usdt-deliberative")
+    perception_status.add_argument("--packet-root", default=None)
+    perception_status.add_argument("--json", action="store_true")
 
     # HITL React subcommands (ADR-0015)
     p_propose = sub.add_parser(
@@ -427,6 +447,9 @@ def dispatch(args: argparse.Namespace) -> int:
         else:
             _pretty_print_recommend(result)
         return 0 if result.get("success") else 1
+
+    if cmd == "recipes":
+        return _dispatch_recipes(args)
 
     if cmd == "semantic-packet":
         return _dispatch_semantic_packet(args)
@@ -676,6 +699,61 @@ def _pretty_print_pending(result: dict) -> None:
         print()
 
 
+def _dispatch_recipes(args) -> int:
+    from pathlib import Path
+
+    from hermes_quant.recipes import example_user_recipe, list_recipes, recipe_from_mapping
+
+    if args.recipes_cmd == "list":
+        recipes = list_recipes()
+        result = {
+            "success": True,
+            "count": len(recipes),
+            "recipes": [{**r.to_dict(), "config_hash": r.config_hash} for r in recipes],
+        }
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            for r in recipes:
+                print(f"{r.id:24} {r.asset_class:7} {r.timeframe:4} {r.aggregator:24} {r.config_hash}")
+        return 0
+
+    if args.recipes_cmd == "validate":
+        try:
+            import yaml
+            data = yaml.safe_load(Path(args.path).expanduser().read_text(encoding="utf-8")) or {}
+            recipe = recipe_from_mapping(data)
+            result = {"success": True, "recipe": recipe.to_dict(), "config_hash": recipe.config_hash}
+        except Exception as exc:  # noqa: BLE001
+            result = {"success": False, "error": str(exc)}
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            if result["success"]:
+                print(f"✓ recipe valid: {result['recipe']['id']} ({result['config_hash']})")
+            else:
+                print(f"✗ recipe invalid: {result['error']}")
+        return 0 if result["success"] else 1
+
+    if args.recipes_cmd == "example":
+        try:
+            import yaml
+        except ImportError:
+            print("pyyaml is required")
+            return 2
+        text = yaml.safe_dump(example_user_recipe(), sort_keys=False)
+        if args.output:
+            out = Path(args.output).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(text, encoding="utf-8")
+            print(f"example recipe written: {out}")
+        else:
+            print(text)
+        return 0
+
+    return 2
+
+
 def _parse_source_arg(raw: str) -> dict:
     """Parse source strings as type:ref or type:ref|title.
 
@@ -815,13 +893,51 @@ def _dispatch_committee(args) -> int:
                 print(f"{artifact['asof']} {artifact['asset']:14} turns={artifact['n_turns']} {artifact['path']}")
         return 0
 
+    if args.committee_cmd == "prompt":
+        from hermes_quant.committee_runner import build_model_mixture_prompt
+        packets = [load_semantic_packet(path).to_dict() for path in args.semantic_packet_file]
+        models = [m.strip() for m in args.models.split(",") if m.strip()]
+        prompt = build_model_mixture_prompt(packets, asset=args.asset, models=models)
+        result = {"success": True, "prompt": prompt, "models": models}
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            print(prompt)
+        return 0
+
     return 2
 
 
 def _dispatch_perception(args) -> int:
     if args.perception_cmd == "start":
         return _perception_start(args)
+    if args.perception_cmd == "status":
+        return _perception_status(args)
     return 2
+
+
+def _perception_status(args) -> int:
+    from pathlib import Path
+
+    from hermes_quant.artifacts import semantic_status_for_recipe
+    from hermes_quant.recipes import get_recipe
+
+    root = Path(args.packet_root).expanduser() if args.packet_root else None
+    recipe = get_recipe(args.recipe_id)
+    status = semantic_status_for_recipe(recipe, root=root)
+    result = {"success": True, "status": status}
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        print(f"perception status — recipe={status['recipe_id']} hash={status['recipe_hash']}")
+        for row in status["symbols"]:
+            age = row["age_minutes"]
+            age_s = "n/a" if age is None else f"{age:.1f}m"
+            print(f"  {row['symbol']:14} {row['status']:7} age={age_s} max={row['max_age_minutes']:.0f}m")
+            latest = row.get("latest_packet") or {}
+            if latest:
+                print(f"    {latest.get('stance')} conf={latest.get('confidence')} hash={latest.get('packet_hash')}")
+    return 0
 
 
 def _perception_start(args) -> int:

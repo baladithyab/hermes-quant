@@ -12,9 +12,12 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 PDRMode = Literal["advise", "hitl", "autonomous", "backtest"]
+QUANT_HOME = Path.home() / ".hermes" / "quant"
+USER_RECIPE_DIR = QUANT_HOME / "recipes"
 
 
 @dataclass(frozen=True)
@@ -130,18 +133,96 @@ _BUILTIN_RECIPES: dict[str, PDRRecipe] = {
 }
 
 
-def list_recipes() -> list[PDRRecipe]:
-    """Return built-in recipes in deterministic order."""
-    return [_BUILTIN_RECIPES[k] for k in sorted(_BUILTIN_RECIPES)]
+def recipe_from_mapping(data: dict[str, Any]) -> PDRRecipe:
+    """Create a PDRRecipe from YAML/JSON mapping data.
 
-
-def get_recipe(recipe_id: str | None = None) -> PDRRecipe:
-    rid = recipe_id or DEFAULT_RECIPE.id
-    recipe = _BUILTIN_RECIPES.get(rid)
-    if recipe is None:
-        raise KeyError(f"unknown PDR recipe {rid!r}; available: {sorted(_BUILTIN_RECIPES)}")
+    Lists are normalized to tuples for hash stability. Unknown keys are rejected
+    by the dataclass constructor so typos fail early.
+    """
+    normalized = dict(data)
+    for key in ("symbols", "analysts", "supported_modes"):
+        if key in normalized and isinstance(normalized[key], list):
+            normalized[key] = tuple(normalized[key])
+    recipe = PDRRecipe(**normalized)
     recipe.validate()
     return recipe
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - pyyaml is a project dep
+        raise RuntimeError("pyyaml is required to load recipe YAML") from exc
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"recipe file {path} must contain a mapping")
+    return data
+
+
+def load_user_recipes(*, root: Path | None = None) -> dict[str, PDRRecipe]:
+    """Load user-editable recipes from ~/.hermes/quant/recipes/*.yaml."""
+    base = root or USER_RECIPE_DIR
+    if not base.exists():
+        return {}
+    out: dict[str, PDRRecipe] = {}
+    for path in sorted([*base.glob("*.yaml"), *base.glob("*.yml")]):
+        recipe = recipe_from_mapping(_load_yaml(path))
+        if recipe.id in _BUILTIN_RECIPES:
+            raise ValueError(
+                f"user recipe {path} uses built-in id {recipe.id!r}; choose a custom id"
+            )
+        if recipe.id in out:
+            raise ValueError(f"duplicate user recipe id {recipe.id!r} under {base}")
+        out[recipe.id] = recipe
+    return out
+
+
+def list_recipes(*, include_user: bool = True, user_root: Path | None = None) -> list[PDRRecipe]:
+    """Return built-in plus user recipes in deterministic order."""
+    recipes = {**_BUILTIN_RECIPES}
+    if include_user:
+        recipes.update(load_user_recipes(root=user_root))
+    return [recipes[k] for k in sorted(recipes)]
+
+
+def get_recipe(
+    recipe_id: str | None = None,
+    *,
+    include_user: bool = True,
+    user_root: Path | None = None,
+) -> PDRRecipe:
+    rid = recipe_id or DEFAULT_RECIPE.id
+    recipes = {**_BUILTIN_RECIPES}
+    if include_user:
+        recipes.update(load_user_recipes(root=user_root))
+    recipe = recipes.get(rid)
+    if recipe is None:
+        raise KeyError(f"unknown PDR recipe {rid!r}; available: {sorted(recipes)}")
+    recipe.validate()
+    return recipe
+
+
+def example_user_recipe() -> dict[str, Any]:
+    """Minimal YAML-serializable custom recipe template."""
+    return {
+        "id": "my-btc-usdt-recipe",
+        "description": "Custom BTC/USDT recipe derived from the deliberative template.",
+        "symbols": ["BTC/USDT"],
+        "asset_class": "crypto",
+        "timeframe": "1h",
+        "data_provider": "ccxt:kraken",
+        "analysts": ["classical_ta", "microstructure_lite", "hermes_semantic"],
+        "analyst_config": {
+            "hermes_semantic": {"max_age_minutes": 1440, "require_horizon_match": False}
+        },
+        "aggregator": "deliberative_committee",
+        "risk_gate": "default",
+        "reactor": "paper",
+        "supported_modes": ["advise", "hitl", "backtest"],
+        "live_allowed": False,
+        "min_decisions_for_charter_gate": 30,
+        "min_settlements_for_charter_gate": 30,
+    }
 
 
 def instantiate_recipe_analysts(recipe: PDRRecipe):

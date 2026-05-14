@@ -79,6 +79,12 @@ def test_cli_parses_new_perception_subcommands():
     assert args.committee_cmd == "run"
     args = parser.parse_args(["perception", "start", "--asset", "BTC/USDT", "--dry-run"])
     assert args.perception_cmd == "start"
+    args = parser.parse_args(["recipes", "list"])
+    assert args.recipes_cmd == "list"
+    args = parser.parse_args([
+        "committee", "prompt", "--asset", "BTC/USDT", "--semantic-packet-file", "x.json",
+    ])
+    assert args.committee_cmd == "prompt"
 
 
 def test_cli_semantic_packet_write_and_validate(tmp_path: Path, capsys):
@@ -122,6 +128,37 @@ def test_perception_start_dry_run_contains_cli_writer(capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["success"] is True
     assert "quant semantic-packet write" in out["prompt"]
+
+
+def test_perception_status_reports_fresh_packet(tmp_path: Path, capsys):
+    from hermes_quant.artifacts import write_semantic_packet
+    _, packet = write_semantic_packet(
+        _packet_payload(asof=pd.Timestamp.now(tz="UTC").isoformat()),
+        root=tmp_path,
+    )
+    parser = argparse.ArgumentParser()
+    setup_argparse(parser)
+    args = parser.parse_args([
+        "perception", "status", "--recipe-id", "btc-usdt-deliberative", "--packet-root", str(tmp_path), "--json",
+    ])
+    assert dispatch(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    row = out["status"]["symbols"][0]
+    assert row["status"] == "fresh"
+    assert row["latest_packet"]["packet_hash"] == packet["packet_hash"]
+
+
+def test_committee_prompt_contains_model_ids(tmp_path: Path, capsys):
+    _, packet = write_semantic_packet(_packet_payload(), root=tmp_path)
+    parser = argparse.ArgumentParser()
+    setup_argparse(parser)
+    args = parser.parse_args([
+        "committee", "prompt", "--asset", "BTC/USDT", "--semantic-packet-file", str(tmp_path / "BTC_USDT" / f"{packet['packet_hash']}.json"), "--models", "openrouter/a,openrouter/b", "--json",
+    ])
+    assert dispatch(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "openrouter/a" in out["prompt"]
+    assert packet["packet_hash"] in out["prompt"]
 
 
 def test_backtest_replay_records_semantic_hashes_in_decisions(tmp_path: Path):

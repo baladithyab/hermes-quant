@@ -104,7 +104,7 @@ def test_canonical_cli_surface():
     expected_subcommands = {
         "setup", "start", "stop", "restart", "uninstall", "status",
         "resume", "halt", "emergency-stop",
-        "signals", "show-views", "doctor", "logs", "semantic-packet",
+        "signals", "show-views", "doctor", "logs", "recipes", "semantic-packet",
         "committee", "perception", "backtest", "backtest-replay",
         "freqtrade-setup", "freqtrade-backtest",
         "config",
@@ -119,6 +119,8 @@ def test_canonical_cli_surface():
                 parser.parse_args([sub, "alpaca-paper", "--reason", "test"])
             elif sub == "show-views":
                 parser.parse_args([sub, "--asset", "BTC/USDT"])
+            elif sub == "recipes":
+                parser.parse_args([sub, "list"])
             elif sub == "semantic-packet":
                 parser.parse_args([sub, "list"])
             elif sub == "committee":

@@ -92,6 +92,37 @@ def build_committee_turns_from_packets(
     ]
 
 
+def build_model_mixture_prompt(
+    packets: list[dict[str, Any]],
+    *,
+    asset: str,
+    models: list[str],
+) -> str:
+    """Self-contained prompt for a Hermes multi-model committee job.
+
+    The prompt asks the agent to produce replayable CommitteeTurn JSON only;
+    it does not grant any trading authority.
+    """
+    packet_hashes = [parse_semantic_packet(p).packet_hash or parse_semantic_packet(p).computed_hash for p in packets]
+    models_text = ", ".join(models) if models else "current Hermes model"
+    return (
+        "You are running a hermes-quant model-mixture committee job. Do NOT trade. "
+        "Read the semantic packet evidence and produce committee_turns artifacts only.\n\n"
+        f"Asset: {asset}\n"
+        f"Models/roles to use or simulate: {models_text}\n"
+        f"Semantic packet hashes: {packet_hashes}\n\n"
+        "Required roles: bull_researcher, bear_researcher, risk_conservative, portfolio_manager. "
+        "Each turn must include role, stance, direction (-1/0/1), confidence [0,1], rationale, "
+        "model, input_hash, and metadata.packet_hashes. If using multiple real models, record the "
+        "exact provider/model in the model field and hash each model input into input_hash.\n\n"
+        "After deliberation, write the artifact with:\n"
+        f"hermes quant committee run --asset {asset!r} "
+        + " ".join(f"--semantic-packet-file <packet-{h}.json>" for h in packet_hashes)
+        + " --model '<provider/model-or-mixture-id>'\n\n"
+        "Return only the artifact path/hash and a short safety summary."
+    )
+
+
 def run_committee_from_packets(
     packets: list[dict[str, Any]],
     *,

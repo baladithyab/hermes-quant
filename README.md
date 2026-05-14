@@ -2,7 +2,7 @@
 
 > ARIA-powered multi-analyst algorithmic trading framework.
 > Distributed as a [Hermes Agent](https://hermes-agent.nousresearch.com/) plugin.
-> **v0.4.3 — alpha. Paper/backtest/HITL scaffolding only. Do not run live with real money.**
+> **v0.4.4 — alpha. Paper/backtest/HITL scaffolding only. Do not run live with real money.**
 
 ```
                     ┌─────────────────────────┐
@@ -113,6 +113,14 @@ hermes quant committee run --asset BTC/USDT --semantic-packet-file <packet.json>
 
 # Optional: set up autonomous semantic perception via Hermes cron
 hermes quant perception start --asset BTC/USDT --horizon 1h --cadence 1h --dry-run
+
+# Customize a PDR recipe without editing Python
+hermes quant recipes example --output ~/.hermes/quant/recipes/my-btc.yaml
+hermes quant recipes validate ~/.hermes/quant/recipes/my-btc.yaml
+hermes quant recipes list
+
+# Check whether semantic perception is fresh enough for a recipe
+hermes quant perception status --recipe-id btc-usdt-deliberative
 ```
 
 ## Quickstart — paper trade BTC on yfinance in 5 minutes
