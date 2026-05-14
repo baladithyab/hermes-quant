@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-14
+
+### Summary
+
+v0.4.0 closes the charter MVP loop from **data → replay → empirical decision**:
+
+- the BMA aggregator now learns from replay settlements (`EpisodeOutcome`)
+  during backtests;
+- `quant_doctor` surfaces analyst confidence drift from the signal bus;
+- purged walk-forward replay composes ADR-0019 cross-validation with the
+  production ADR-0020 replay harness;
+- OHLCV provider fetches are cached on disk so repeated BTC/USDT dogfood runs
+  are deterministic and cheap;
+- the first real BTC/USDT ccxt smoke is documented.
+
+Charter decision from the real-data smoke: **do not proceed to RL aggregator
+or live reactors yet**. A 30-day Kraken BTC/USDT contiguous replay failed
+buy-and-hold by -6.56%; 3-fold walk-forward was slightly positive but only
+emitted two decisions, which is not enough evidence.
+
+### Added
+
+- **Backtest calibrator loop (V03-5)** — `replay()` now uses a long-lived
+  aggregator across bars and settles pending decisions into `EpisodeOutcome`
+  updates after `settlement_horizon_bars`. `BacktestResult` exposes
+  `n_settlements` and final `aggregator_posteriors`; markdown reports include
+  a per-analyst BMA posterior table.
+- **Doctor drift surface (V03-6)** — `quant_doctor` reports per-analyst
+  lifetime vs recent-window confidence drift, flags vanished analysts, and
+  tolerates malformed signal-bus records.
+- **Purged walk-forward backtest (Wave I)** —
+  `hermes_quant.backtest.walk_forward_replay()` runs independent
+  out-of-sample replay folds and aggregates mean excess return, Sharpe delta,
+  positive-excess fold rate, total decisions, and settlements.
+- **CLI walk-forward mode** — `hermes quant backtest --walk-forward --n-splits N`
+  writes per-fold equity/decision artifacts plus an aggregate `result.json`.
+- **OHLCV file cache (V03-7)** — `hermes_quant.data.cache.OhlcvCache` stores
+  provider/symbol/timeframe bars under `~/.hermes/quant/cache/<provider>/`,
+  with append/dedupe/sort and atomic writes. Parquet preferred, CSV fallback.
+- **Provider-selectable CLI fetch** — `--provider ccxt:kraken` /
+  `ccxt:coinbase` / `yfinance`, plus `--cache-root` and `--no-cache`.
+- **Real-data audit** — `docs/audits/2026-05-14-btc-usdt-realdata-smoke.md`
+  records Binance geoblock evidence, Kraken fetch details, single-run and
+  walk-forward results, and the charter decision.
+
+### Fixed
+
+- `_read_jsonl_tail()` no longer drops the first JSONL record when the whole
+  file fits in the read window.
+- Backtest CLI provider lookback buffer reduced so caches don't miss forever
+  when exchanges return slightly fewer closed bars than requested.
+- `quant_doctor` uses live module-attribute lookup for path globals to avoid
+  stale `__globals__` under pytest import-order/module-dict duplication.
+
+### Test sweep
+
+- 572 passed, 1 skipped (was 530 → +42, zero regressions).
+
+### Quick start
+
+```bash
+# Fetch via Kraken ccxt with cache and run walk-forward replay
+hermes quant backtest --symbol BTC/USDT --asset-class crypto \
+  --timeframe 1h --provider ccxt:kraken \
+  --start 2026-04-14T00:00:00Z --end 2026-05-14T00:00:00Z \
+  --walk-forward --n-splits 3 \
+  --output-dir ~/.hermes/quant/backtests/btc-kraken-wf/
+```
+
 ## [0.3.2] — 2026-05-13
 
 ### Summary
