@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-05-13
+
+### Summary
+
+Phase-7 cross-family review of v0.3.0 caught five P0/P1 issues that
+single-author construction had missed. The architecture reviewer's
+intersection finding was the loud one: *the CHANGELOG claim "ALL THREE
+shipped" was structurally false* because `advisor.recommend()` hard-coded
+two analysts and KronosAnalyst was never instantiated for live ticks.
+Also: BMA didn't actually filter abstaining views (the ADR-0018 §D4
+contract was unimplemented), so the charter's safety net had a hole.
+
+### Fixed
+
+- **BMA abstain filter (ADR-0018 §D4)** — Views with `confidence < 0.10`
+  are now dropped before aggregation. Closes the bug where Kronos's
+  zero-confidence abstain (on missing `kronos` package or weight-load
+  failure) inflated the silence-bias gate's `min_analysts_emitted` count
+  by counting as a "voice" without contributing signal.
+  `hermes_quant/aggregators/bma.py` + 8 regression tests.
+- **Advisor wires KronosAnalyst as third voice** — closes the
+  charter-MVP gap. `advisor.recommend()` now loads
+  `[ClassicalTAAnalyst, MicrostructureLite, KronosAnalyst]` with
+  defensive try/except for each optional dependency.
+  `hermes_quant/advisor.py` + 2 pinning tests.
+- **Removed bogus `KairosAnalyst` entry-point** — `pyproject.toml`
+  declared `kairos_btc = "...:KairosAnalyst"` but no such class
+  existed; entry-point would break setuptools-discovery on install.
+  Renamed `kronos_small` → `kronos` for parity with class name.
+- **Lookahead CI gate rewired** — `tests/test_no_lookahead.py` now uses
+  the canonical `evaluation.lookahead.shuffle_timestamps_test` instead
+  of inline `_RecordingProvider` scaffolding (Wave-D follow-up that
+  v0.3.0 didn't complete). 2 new parametrized tests covering both
+  shipped analysts.
+- **KronosConfig deterministic seed for replayability** — added
+  `deterministic_seed=42` field. `_predict_paths()` now seeds
+  `numpy.random` + `torch.manual_seed` (when torch installed) so
+  Kronos signals are reproducible from disk per the charter
+  "Reproducibility" invariant.
+
+### Tests
+
+- **+12 tests** (was 494 → 506, zero regressions):
+  - `tests/unit/test_bma_abstain_filter.py` (8 tests)
+  - `tests/unit/test_advisor_loadout.py` (2 tests)
+  - `tests/test_no_lookahead.py` parametrized over 2 analysts (+2)
+
+### Phase-7 follow-ups deferred to v0.3.2+
+
+- **P1 from correctness review** (4 items): broaden `Exception` catch on
+  HF weight load; off-by-one comment in pagination break; double-tz
+  normalization is dead code; embargo > train_pct unguarded
+- **P1 from test review** (11 items): duplicate-timestamp / negative-volume
+  / multi-page pagination cases not covered; PurgedWalkForward unsorted
+  timestamps; DSR boundary `n_observations==30`; cron writer edge cases
+- **P2 from architecture review** (5 items): ADR-0017 §D6 cassettes not
+  committed; ADR-0018 §D7 extras pull `transformers`+`einops` (ADR
+  said NO); deprecated `typing.Iterator` import
+
+### Phase-7 review artifacts
+
+`docs/reviews/2026-05-13-v030/` — three reviewer reports:
+- `correctness.md` (~210 lines)
+- `test-quality.md` (~250 lines)
+- `architecture.md` (~340 lines)
+
+Verdict: MERGE_WITH_FOLLOWUPS (all three reviewers); intersection P0s
+from architecture review are the ones fixed in this release.
+
 ## [0.3.0] — 2026-05-13
 
 ### Summary

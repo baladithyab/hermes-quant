@@ -77,6 +77,15 @@ class KronosConfig:
     horizon_label: str = "1d"
     """The horizon string written to AnalystView (consumed by aggregator)."""
 
+    deterministic_seed: int | None = 42
+    """RNG seed for path sampling. The charter requires every signal
+    to be replayable from disk (AGENTS.md "Reproducibility"). Without
+    seeding, Kronos's stochastic sampling makes signals non-replayable.
+    Set to None for production runs where stochastic exploration is
+    desired and replayability is sacrificed; otherwise leave at 42 (or
+    set per-tick to the bar timestamp for deterministic-yet-evolving
+    behavior)."""
+
 
 # ---------------------------------------------------------------------------
 # KronosAnalyst — main class
@@ -273,7 +282,21 @@ class KronosAnalyst:
         [sample_count, pred_len, n_features].
 
         Per ADR-0018 §D2 we use a subclass to expose pre-mean paths.
+        Per Phase-7 follow-up: seed torch + numpy with config's
+        deterministic_seed so signals are replayable from disk
+        (charter "Reproducibility" invariant).
         """
+        # Seed for replayability (charter invariant)
+        if self.config.deterministic_seed is not None:
+            np.random.seed(self.config.deterministic_seed)
+            try:
+                import torch  # type: ignore
+                torch.manual_seed(self.config.deterministic_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(self.config.deterministic_seed)
+            except ImportError:
+                pass
+
         # Truncate to max_context most recent bars
         recent = bars.tail(self.config.max_context).reset_index(drop=True)
         return self._predictor.predict_distributional(

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-quant"
-version = "0.3.0"
+version = "0.3.1"
 description = "ARIA-powered multi-analyst algorithmic trading framework, distributed as a Hermes Agent plugin."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -77,8 +77,7 @@ hermes-quant = "hermes_quant"
 [project.entry-points."hermes_quant.analysts"]
 classical_ta = "hermes_quant.analysts.classical_ta:ClassicalTAAnalyst"
 microstructure_lite = "hermes_quant.analysts.microstructure:MicrostructureLite"
-kronos_small = "hermes_quant.analysts.kronos:KronosAnalyst"
-kairos_btc = "hermes_quant.analysts.kronos:KairosAnalyst"
+kronos = "hermes_quant.analysts.kronos:KronosAnalyst"
 
 [project.entry-points."hermes_quant.aggregators"]
 bma = "hermes_quant.aggregators.bma:BMAAggregator"

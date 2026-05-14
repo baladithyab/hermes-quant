@@ -506,12 +506,29 @@ def recommend(
 
     # ---- Step 5: run analysts ----
     if analysts is None:
+        # Per charter §"What I'd build first" + ADR-0018:
+        # The canonical hermes-quant committee is THREE analysts:
+        #   1. ClassicalTAAnalyst (always available)
+        #   2. MicrostructureLite (always available; OHLCV-only proxies)
+        #   3. KronosAnalyst (lazy-load gated; abstains if `kronos`
+        #      package not installed — BMA filters abstainers per
+        #      ADR-0018 §D4)
+        # Each import is wrapped so a missing optional dependency
+        # degrades gracefully rather than crashing the advisor.
         from hermes_quant.analysts.classical_ta import ClassicalTAAnalyst
+        analysts = [ClassicalTAAnalyst()]
         try:
             from hermes_quant.analysts.microstructure import MicrostructureLite
-            analysts = [ClassicalTAAnalyst(), MicrostructureLite()]
+            analysts.append(MicrostructureLite())
         except ImportError:
-            analysts = [ClassicalTAAnalyst()]
+            pass
+        try:
+            from hermes_quant.analysts.kronos import KronosAnalyst
+            analysts.append(KronosAnalyst())
+        except ImportError:
+            # KronosAnalyst class import failed (shouldn't happen since
+            # the module is in our own package), but defensive fallback
+            pass
 
     views: list[AnalystView] = []
     for analyst in analysts:
