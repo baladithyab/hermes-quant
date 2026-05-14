@@ -245,6 +245,8 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
                       choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
     p_bt.add_argument("--bars-file",
                       help="Path to CSV/parquet with OHLCV bars (timestamp, open, high, low, close, volume)")
+    p_bt.add_argument("--recipe-id", default=None,
+                      help="PDR recipe id to select analyst/aggregator/risk-gate composition")
     p_bt.add_argument("--provider", default=None,
                       help="Fetch provider when --bars-file omitted (e.g. ccxt:kraken, ccxt:coinbase, yfinance)")
     p_bt.add_argument("--no-cache", action="store_true",
@@ -635,6 +637,7 @@ def _dispatch_backtest(args) -> int:
             slippage=args.slippage,
             settlement_horizon_bars=args.settlement_horizon_bars,
             learn_from_fills=not args.no_learn_from_fills,
+            recipe_id=args.recipe_id,
         )
         if args.walk_forward:
             result = walk_forward_replay(

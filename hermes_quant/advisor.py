@@ -167,6 +167,8 @@ class _AdvisorResult:
     caveats: list[str] = field(default_factory=list)
     analyst_errors: list[str] = field(default_factory=list)
     data_provider_alive: bool = True
+    recipe_id: str | None = None
+    recipe_hash: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -174,6 +176,10 @@ class _AdvisorResult:
             "asset_class": self.asset_class,
             "timeframe": self.timeframe,
             "as_of": self.as_of.isoformat() if self.as_of is not None else None,
+            "recipe": {
+                "id": self.recipe_id,
+                "config_hash": self.recipe_hash,
+            } if self.recipe_id else None,
             "data_quality": {
                 "bars_received": self.bars_received,
                 "gaps": self.gaps,
@@ -325,7 +331,7 @@ def _get_recent_lessons(
 def recommend(
     symbol: str,
     *,
-    asset_class: str = "equity",
+    asset_class: str | None = None,
     timeframe: str | None = None,
     lookback_bars: int | None = None,
     include_lessons: bool = True,
@@ -336,6 +342,8 @@ def recommend(
     analysts: list[Any] | None = None,
     aggregator: Any = None,
     risk_gate: Any = None,
+    recipe: Any = None,
+    recipe_id: str | None = None,
 ) -> dict[str, Any]:
     """Synchronous recommendation for a single symbol. Read-only (ADR-0014).
 
@@ -366,6 +374,29 @@ def recommend(
         provider failure becomes a gated dict with caveat; same for
         DataQualityError. Programming bugs (TypeError, etc.) propagate.
     """
+    # Recipe selection happens before defaults so recipe timeframe/asset_class
+    # can drive the hot path. Existing callers that pass explicit arguments keep
+    # precedence. Dependency-injected analysts/aggregator/risk_gate also keep
+    # precedence for tests and backtest seeded posteriors.
+    active_recipe = recipe
+    if active_recipe is None and recipe_id is not None:
+        from hermes_quant.recipes import get_recipe
+        active_recipe = get_recipe(recipe_id)
+    if active_recipe is not None:
+        active_recipe.validate()
+        asset_class = asset_class or active_recipe.asset_class
+        timeframe = timeframe or active_recipe.timeframe
+        if analysts is None:
+            from hermes_quant.recipes import instantiate_recipe_analysts
+            analysts = instantiate_recipe_analysts(active_recipe)
+        if aggregator is None:
+            from hermes_quant.recipes import instantiate_recipe_aggregator
+            aggregator = instantiate_recipe_aggregator(active_recipe)
+        if risk_gate is None:
+            from hermes_quant.recipes import instantiate_recipe_risk_gate
+            risk_gate = instantiate_recipe_risk_gate(active_recipe)
+
+    asset_class = asset_class or "equity"
     timeframe = timeframe or _DEFAULT_TF_BY_ASSET_CLASS.get(asset_class, "1d")
     lookback_bars = lookback_bars or _DEFAULT_LOOKBACK_BY_TF.get(timeframe, 200)
 
@@ -386,6 +417,8 @@ def recommend(
         symbol=symbol,
         asset_class=asset_class,
         timeframe=timeframe,
+        recipe_id=getattr(active_recipe, "id", None),
+        recipe_hash=getattr(active_recipe, "config_hash", None),
     )
     result.caveats.append(
         "Snapshot-in-time view; not a guaranteed forecast"

@@ -39,7 +39,7 @@ from .protocol import (
     Timeframe,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "Action",
@@ -109,6 +109,12 @@ def register(ctx: Any) -> None:
         toolset="quant",
         schema=schemas.QUANT_RECOMMEND,
         handler=quant_tools.quant_recommend,
+    )
+    ctx.register_tool(
+        name="quant_recipes",
+        toolset="quant",
+        schema=schemas.QUANT_RECIPES,
+        handler=quant_tools.quant_recipes,
     )
     # HITL React surface (ADR-0015) — propose / approve / reject / list / lookup
     ctx.register_tool(

@@ -155,6 +155,7 @@ def walk_forward_replay(
     slippage: float = 0.0005,
     settlement_horizon_bars: int = 1,
     learn_from_fills: bool = True,
+    recipe_id: str | None = None,
     advisor_recommend=None,
 ) -> WalkForwardBacktestResult:
     """Run replay() independently on each out-of-sample test fold.
@@ -198,6 +199,7 @@ def walk_forward_replay(
             slippage=slippage,
             settlement_horizon_bars=settlement_horizon_bars,
             learn_from_fills=learn_from_fills,
+            recipe_id=recipe_id,
             advisor_recommend=advisor_recommend,
         )
         fold_results.append(WalkForwardFoldResult(

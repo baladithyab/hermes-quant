@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-05-14
+
+### Summary
+
+v0.4.1 turns hermes-quant from a hard-coded MVP committee into a **Hermes-native PDR recipe platform**. A recipe is now the named, inspectable, replayable unit of a trading system: it declares Perceive components (provider + analysts), Decide components (aggregator + risk gate), React policy (paper/live mode constraints), and evaluation gates.
+
+### Added
+
+- **ADR-0021**: PDR recipes as the runtime contract above component entry-points.
+- **`hermes_quant.recipes.PDRRecipe`** with stable config hashing, validation, built-in `btc-usdt-mvp` recipe, and component instantiation helpers.
+- **`quant_recipes` Hermes tool** and `/quant recipes` slash path for read-only recipe discovery.
+- **Advisor recipe metadata**: `quant_recommend` / `advisor.recommend` accept `recipe_id` and return `{id, config_hash}` in result JSON.
+- **Backtest recipe passthrough**: `replay()` and `walk_forward_replay()` forward `recipe_id` into the production advisor path.
+- **Architecture documentation**: `docs/architecture/pdr-trading-system.md` plus architecture index.
+- **ADR index**: `docs/adr/README.md` generated for the full ADR set.
+
+### Fixed / Changed
+
+- The advisor no longer has to be the only place where the canonical analyst loadout is encoded; default behavior remains compatible, but recipes are now the extensibility seam.
+- `quant_recommend` no longer forces `asset_class="equity"` when a recipe should supply crypto/equity defaults.
+
+### Test sweep
+
+- 580 passed, 1 skipped (was 572 → +8, zero regressions).
+
 ## [0.4.0] — 2026-05-14
 
 ### Summary

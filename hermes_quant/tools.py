@@ -195,11 +195,12 @@ def quant_recommend(args: dict, **_kwargs) -> str:
     try:
         result = recommend(
             symbol=symbol,
-            asset_class=args.get("asset_class", "equity"),
+            asset_class=args.get("asset_class"),
             timeframe=args.get("timeframe"),
             lookback_bars=args.get("lookback_bars"),
             include_lessons=bool(args.get("include_lessons", True)),
             as_of=args.get("as_of"),
+            recipe_id=args.get("recipe_id"),
         )
     except Exception as exc:  # noqa: BLE001 — advisor is best-effort
         logger.warning(
@@ -212,6 +213,23 @@ def quant_recommend(args: dict, **_kwargs) -> str:
         })
 
     return json.dumps({"success": True, **result}, default=str)
+
+
+def quant_recipes(args: dict, **_kwargs) -> str:
+    """List available PDR recipes. Read-only."""
+    try:
+        from hermes_quant.recipes import list_recipes
+        recipes = list_recipes()
+        return json.dumps({
+            "success": True,
+            "count": len(recipes),
+            "recipes": [
+                {**r.to_dict(), "config_hash": r.config_hash}
+                for r in recipes
+            ],
+        }, default=str)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"success": False, "error": f"recipe listing failed: {exc}"})
 
 
 def _read_pdr_mode() -> str:
@@ -993,6 +1011,8 @@ def handle_quant_slash(args: list, **kwargs) -> str:
         return quant_show_views({"asset": args[1]}, **kwargs)
     if sub == "doctor":
         return quant_doctor({}, **kwargs)
+    if sub == "recipes":
+        return quant_recipes({}, **kwargs)
     if sub in ("recommend", "rec", "advise"):
         if len(args) < 2:
             return json.dumps({

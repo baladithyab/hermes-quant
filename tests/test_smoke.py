@@ -25,6 +25,7 @@ def test_register_runs_clean():
     assert "quant_status" in tool_names
     assert "quant_show_signals" in tool_names
     assert "quant_show_views" in tool_names
+    assert "quant_recipes" in tool_names
     assert "quant_doctor" in tool_names
 
     # Slash command

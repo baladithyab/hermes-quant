@@ -228,6 +228,7 @@ def replay(
     slippage: float = 0.0005,
     settlement_horizon_bars: int = 1,
     learn_from_fills: bool = True,
+    recipe_id: str | None = None,
     advisor_recommend=None,        # inject for testing
     aggregator=None,               # inject for testing or to seed posteriors
 ) -> BacktestResult:
@@ -334,6 +335,7 @@ def replay(
                 as_of=as_of,
                 provider=provider,
                 include_lessons=False,
+                recipe_id=recipe_id,
             )
             # Long-lived aggregator — pass through if we have one
             if aggregator is not None:
@@ -467,6 +469,7 @@ def replay(
         warmup_bars=warmup_bars, commission=commission, slippage=slippage,
         settlement_horizon_bars=settlement_horizon_bars,
         learn_from_fills=learn_from_fills,
+        recipe_id=recipe_id,
         n_bars=len(bars),
     )
 

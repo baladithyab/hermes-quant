@@ -80,7 +80,7 @@ QUANT_RECOMMEND = {
             "asset_class": {
                 "type": "string",
                 "enum": ["equity", "etf", "crypto", "fx"],
-                "default": "equity",
+                "description": "Asset class. Defaults to recipe asset_class when recipe_id is provided, else equity.",
             },
             "timeframe": {
                 "type": "string",
@@ -92,6 +92,10 @@ QUANT_RECOMMEND = {
                 "minimum": 50,
                 "maximum": 2000,
                 "description": "How many bars of history to fetch; default per timeframe",
+            },
+            "recipe_id": {
+                "type": "string",
+                "description": "Optional PDR recipe id (default: btc-usdt-mvp). Selects analyst/aggregator/risk-gate composition.",
             },
             "include_lessons": {
                 "type": "boolean",
@@ -106,6 +110,16 @@ QUANT_RECOMMEND = {
             },
         },
         "required": ["symbol"],
+    },
+}
+
+
+QUANT_RECIPES = {
+    "name": "quant_recipes",
+    "description": "List available PDR recipes — named Perceive-Decide-React trading-system compositions. Read-only.",
+    "parameters": {
+        "type": "object",
+        "properties": {},
     },
 }
 
