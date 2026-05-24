@@ -30,6 +30,17 @@ import pandas as pd
 Direction = Literal[-1, 0, 1]
 """-1 = short, 0 = flat, +1 = long."""
 
+# AI-Trader pattern: explicit channel separation. Operation = actionable order
+# intent. Strategy = high-level thesis (what we believe will happen).
+# Discussion = analyst debate prose (no action implied, just context).
+# Forbidden = a sentinel for messages that fail static security scan.
+MessageKind = Literal['operation', 'strategy', 'discussion', 'forbidden']
+"""Channel discriminator for routing messages between thesis vs execution paths."""
+
+_MESSAGE_KIND_VALUES = frozenset({'operation', 'strategy', 'discussion', 'forbidden'})
+"""Runtime mirror of MessageKind for __post_init__ validation. Tests assert
+this stays in sync with MessageKind.__args__ (catches drift)."""
+
 Timeframe = Literal["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 """Bar timeframe. Sub-minute timeframes deferred to v0.2."""
 
@@ -83,6 +94,9 @@ class AnalystView:
       - Until a fitted calibrator exists with N >= 200 samples, confidence = max(0, raw - 0.20)
       - evidence_ids is a tuple of EvidenceRecord IDs (per ADR-0033) cited by this view.
         Default empty for backward-compat (Phase 1).
+      - message_kind tags the channel per the AI-Trader discriminator pattern.
+        Default 'discussion' — analyst views are analytical commentary; only the
+        aggregator + risk-gate pipeline turns them into 'operation' Proposals.
     """
 
     analyst: str                     # name of the emitting analyst
@@ -98,6 +112,16 @@ class AnalystView:
     evidence_ids: tuple[str, ...] = ()
     """ADR-0033 D4: per-row provenance linkage. Phase 1 = optional. UUIDs as strings
     (not UUID objects) to keep dataclass JSON-serializable for signal_bus."""
+    message_kind: MessageKind = 'discussion'
+    """AI-Trader pattern: channel discriminator. Default 'discussion' — analyst
+    views are analytical commentary unless explicitly upgraded to 'strategy'."""
+
+    def __post_init__(self) -> None:
+        if self.message_kind not in _MESSAGE_KIND_VALUES:
+            raise ValueError(
+                f"AnalystView.message_kind must be one of {sorted(_MESSAGE_KIND_VALUES)}, "
+                f"got {self.message_kind!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +138,9 @@ class AggregatedSignal:
         (per ADR-0009 §P1-10 EpisodeOutcome)
       - evidence_ids is a tuple of EvidenceRecord IDs (per ADR-0033) cited by this view.
         Default empty for backward-compat (Phase 1).
+      - message_kind tags the channel per the AI-Trader discriminator pattern.
+        Default 'discussion' — an aggregated signal becomes 'strategy' or
+        'operation' only when downstream pipeline stages explicitly promote it.
     """
 
     asset: str
@@ -131,6 +158,57 @@ class AggregatedSignal:
     evidence_ids: tuple[str, ...] = ()
     """ADR-0033 D4: per-row provenance linkage. Phase 1 = optional. UUIDs as strings
     (not UUID objects) to keep dataclass JSON-serializable for signal_bus."""
+    message_kind: MessageKind = 'discussion'
+    """AI-Trader pattern: channel discriminator. Default 'discussion' — even an
+    aggregated signal is just a thesis until the risk gate turns it into a
+    concrete Proposal."""
+
+    def __post_init__(self) -> None:
+        if self.message_kind not in _MESSAGE_KIND_VALUES:
+            raise ValueError(
+                f"AggregatedSignal.message_kind must be one of {sorted(_MESSAGE_KIND_VALUES)}, "
+                f"got {self.message_kind!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Proposal — concrete order intent (the 'operation' channel)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Proposal:
+    """Concrete order intent (the 'operation' channel per AI-Trader pattern).
+
+    Distinct from AnalystView/AggregatedSignal which are 'discussion' or
+    'strategy' channels. A Proposal is the only message kind that maps
+    1:1 to a potential broker action; the risk gate is the last
+    consumer that can drop it.
+
+    NOTE: This dataclass is the typed counterpart to dicts currently emitted to
+    proposals.jsonl by hermes_quant.proposals. The proposals module can adopt
+    this type incrementally — protocol.py just exports the contract.
+    """
+
+    proposal_id: str                      # prop_<UTC_ISO_seconds>_<symbol>_<random6>
+    asset: str
+    asof: pd.Timestamp
+    direction: Direction
+    target_size_pct_nav: float            # MUST be in ACTION_SPACE per governance.invariants
+    horizon: str
+    aggregated_signal_id: str | None = None
+    evidence_ids: tuple[str, ...] = ()
+    message_kind: MessageKind = 'operation'
+    """Always 'operation' — fixed per type. Enforced in __post_init__."""
+    rationale: str | None = None
+    metadata: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.message_kind != 'operation':
+            raise TypeError(
+                f"Proposal.message_kind must be 'operation', got {self.message_kind!r}. "
+                f"Proposals are the execution-channel message; thesis-channel messages "
+                f"belong on AnalystView or AggregatedSignal."
+            )
 
 
 # ---------------------------------------------------------------------------

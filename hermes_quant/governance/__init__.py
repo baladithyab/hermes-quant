@@ -12,6 +12,7 @@ from hermes_quant.governance import (  # noqa: F401
     invariants,
     kill_switch,
     promotion,
+    static_scanner,
 )
 from hermes_quant.governance.invariants import IMMUTABLE_INVARIANTS  # noqa: F401
 
@@ -21,5 +22,6 @@ __all__ = [
     "approvals",
     "promotion",
     "invariants",
+    "static_scanner",
     "IMMUTABLE_INVARIANTS",
 ]
