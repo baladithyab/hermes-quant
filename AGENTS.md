@@ -309,3 +309,22 @@ Example: `feat(analysts): add MicrostructureLite with order-book imbalance`.
 8. **Train an RL aggregator on < 90 days of data.** ADR-0006 graduation criteria are the gate.
 9. **Skip the shuffle-timestamp test on a new analyst.** That CI gate exists for a reason.
 10. **Bundle freqtrade into hermes-quant.** Sidecar architecture preserves the GPL boundary.
+
+## Anti-patterns from reference projects we explicitly reject (with citations)
+
+We've studied TauricResearch/TradingAgents, HKUDS/AI-Trader, HKUDS/Vibe-Trading, yolojewjitsu/moon-dev-ai-agents, and the FutureSim paper (arXiv 2605.15188). Some of those projects ship code we should NOT copy. Concrete file:line citations so anyone reading those repos for inspiration sees exactly which patterns we considered and rejected. Full synthesis at `docs/architecture/2026-05-24-reference-project-synthesis.md`; per-project deep-dives under `docs/research/reference-projects/`.
+
+| # | Source | Pattern (rejected) | Why we reject it |
+|---|---|---|---|
+| 1 | moon-dev `risk_agent.py:319` | `self.override_active = "OVERRIDE" in response_text.upper()` lets an LLM substring-match disable the daily loss limit for 15 minutes | Triple-stacked failure: overridable risk gate + LLM as override authority + string-grep control flow. We require ADR-0004 deterministic risk gate + non-overridable kill-switch. |
+| 2 | moon-dev `trading_agent.py:253` | `n.ai_entry(token, amount)` fires the moment the LLM's allocation JSON parses | LLM-output → money-moves with no HITL, no signed approval. We require ADR-0015 propose-decide-react with explicit human confirmation for every order. |
+| 3 | moon-dev `trading_agent.py:123-124` | `lines = response.split('\n'); action = lines[0].strip()` makes the first line of free-text output the action verb | Free-text → structured command channel. `int(''.join(filter(str.isdigit, line)))` for confidence is even worse. We require Pydantic structured output with retry-then-silence-by-default fallback. |
+| 4 | TradingAgents `agents/trader/trader.py` | `TraderProposal.position_sizing: Optional[str]` — free-text prose sizing rubber-stamped by Portfolio Manager | Free-text sizing escapes the discrete action space. We require explicit `Decimal` sizing within the {0, ±0.05, ±0.10, ±0.15, ±0.20} ladder. |
+| 5 | TradingAgents `agents/trader/trader.py` | `FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**` literal string downstream code grep-matches | String-grep contract on stochastic generator output. We use Pydantic `bind_structured` with retry. |
+| 6 | AI-Trader `services.py::_update_position_from_signal` | 1:1 blind copy-trading: subscribe-once, all leader trades cascade into follower's account | Removes the "explicit confirmation per order" guarantee. We require per-order HITL even within a methodology subscription. |
+| 7 | AI-Trader bare-string token auth | One token grants both signal-read AND order-execute scopes | No capability separation. We require read-only tools (plugin surface) vs CLI-only execution surface (ADR-0007). |
+| 8 | moon-dev (no `as_of` discipline) | Agents pull live data with no backtest-time clamp; `rbi_agent` family backtests on a single hardcoded CSV with no train/validation split | Look-ahead by default. We require ADR-0019 evaluation discipline + `tests/test_no_lookahead.py` CI gate. The FutureSim chronological-replay invariant lands in ADR-0033 evidence store. |
+| 9 | moon-dev (no audit trail) | Recommendations live in in-memory DataFrames reset per cycle | No replayability. We require ADR-0001 sidecar reproducibility + the upcoming ADR-0033 evidence store with `evidence_ids` linkage. |
+
+**Convergent failure across all four reference projects:** every one of them lets the LLM be the final execution authority somewhere. TradingAgents at the trader role; AI-Trader at the copy-trading cascade; moon-dev at the override boundary. Vibe-Trading is the lone exception — it explicitly draws the boundary at "no live execution" via absence of broker SDKs in the tool registry. **Our deterministic-risk-gate + HITL pattern is the inverse of the reference-project failure mode.** Don't regress.
+
