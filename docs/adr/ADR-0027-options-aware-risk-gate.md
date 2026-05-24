@@ -389,3 +389,135 @@ Settlement_loop (ADR-0010 + ADR-0029) wires the kill-switches to fire on every t
 - ADR-0009 §P0-1 (Kelly σ² fix), §P0-5 (rule ordering), §P1-9 (asset-class partitioning) — preserved invariants.
 - AGENTS.md "Action space is discrete" — stays true; contract count is integer-floor of a discrete-step NAV target.
 - `docs/plans/2026-05-23-options-daily-retro.md` "Risk envelope" — the user's accepted defaults (0.5%/5% halts, ¼-Kelly, 10% max single-trade notional, 8 concurrent positions). All present in the profile YAML above.
+
+
+---
+
+## Amendment 2026-05-24 -- D3 covered_call sizing denominator must include x100 multiplier
+
+**Source**: `docs/reviews/2026-05-24-synthesis-adrs-0026-0030.md` P0-3
+**Reviewer**: DeepSeek-V4-Pro
+**Status**: Adopted
+
+### What changed
+
+D3's "Income / Assignment-Risk" sizing block (this ADR, lines 126-130) explicitly states `CSP: collateral = strike x 100` (correct: equity options are 100 shares per contract). The `covered_call` case in the same paragraph references "current basis of long stock" without the `x100` multiplier on the per-contract basis. A literal implementation would size CC contracts against per-share basis and over-count contract sizing by 100x.
+
+Corrected formula, by initiation context:
+
+**Initiation case** (entering a NEW covered call where the long stock is purchased simultaneously or freshly allocated for this strategy):
+
+```
+collateral_per_contract = stock_basis_per_share x 100        # CC ties up 100 shares per contract
+credit_yield = call_mid x 100 / collateral_per_contract       # premium received vs. capital tied up
+target_contracts = floor((nav x kelly_fraction x max_position_pct_nav) / collateral_per_contract)
+```
+
+The `x 100` on BOTH numerator (premium credit is per-contract = `mid x 100`) and denominator (collateral is per-contract = `basis_per_share x 100`) means the `x 100` algebraically cancels in `credit_yield`, BUT NOT in `target_contracts` -- sizing must use per-contract collateral, not per-share basis.
+
+**Wheel-overlay case** (overlaying a CC on stock already held from a prior CSP assignment or unrelated long position):
+
+```
+# Capital is ALREADY DEPLOYED in the underlying. New capital at risk = 0 for the stock leg.
+# Sizing constraint shifts to "how many contracts can I write against held shares?"
+max_contracts_by_held_shares = held_share_count // 100   # truly covered, no naked
+
+# Premium yield denominator: the call premium is the only NEW cash flow; the stock basis
+# is sunk capital. Express yield against call_mid x 100 (per-contract premium):
+credit_yield_overlay = call_mid x 100 / (call_mid x 100)   # trivially 1.0
+# What matters in the overlay case is the strike-to-basis ratio, which is the
+# already-codified `min_strike_above_basis_pct` rule (kept from the original D3).
+
+# Sizing rule:
+target_contracts = min(max_contracts_by_held_shares, max_position_pct_nav-derived cap)
+```
+
+The two cases must be distinguished in implementation. The `_check_covered_call_hard_rules` function (referenced at line 308) takes a `composite_intent` flag (already present in D7 wheel logic, lines 226-230) and branches on it.
+
+Unit tests:
+
+- `test_cc_initiation_sizing_includes_x100`: fixture with `stock_basis_per_share=100.0`, `call_mid=2.50`, `nav=100_000`, `kelly_fraction=0.25`, `max_position_pct_nav=0.10`. Expected: `collateral_per_contract=10_000`, `target_contracts=floor((100_000 * 0.25 * 0.10) / 10_000) = 0`. Without x100 the bug would compute `target_contracts=floor(2500/100)=25` -- assert this WRONG value is NOT produced.
+- `test_cc_initiation_sizing_correct_when_capital_allows`: fixture with `nav=1_000_000`, same other values; expected `target_contracts=floor(25_000/10_000)=2`.
+- `test_cc_overlay_sizes_against_held_shares`: fixture with `held_share_count=300`, `composite_intent="wheel"`; expected `max_contracts_by_held_shares=3`. No NAV/Kelly cap applies because no new capital is deployed by the call leg; only the truly-covered constraint binds.
+- `test_cc_per_share_basis_never_used_directly_in_target_contracts`: regression test that asserts the bug shape -- if the implementation is ever reverted to using per-share basis in `target_contracts`, this test fails.
+
+### Why
+
+Equity options are 100 shares per contract; this is a fundamental units fact. The synthesis (P0-3) flagged the original D3 wording as causing implementations following the ADR literally to over-count by 100x. The CSP case got it right (`strike x 100` is explicit at line 130); the CC case must do the same. Distinguishing initiation from wheel-overlay is necessary because the capital-at-risk calculus differs (initiation deploys new capital for the stock leg; wheel-overlay uses already-deployed capital). Without that distinction, a strict "always use per-contract basis" rule would under-allocate wheel rotations.
+
+### Affected sections of this ADR
+
+- D3 "Income / Assignment-Risk (Covered Calls, CSPs, Short Puts)" sizing block (lines 126-130) -- formula corrected and split into initiation vs. overlay.
+- D7 wheel-state logic (lines 226-230) -- `composite_intent` flag now feeds into the sizing branch.
+- Test plan "Per-strategy hard rules" (line 357) -- adds the four sizing tests above.
+
+---
+
+## Amendment 2026-05-24 -- D6 net-greeks aggregation must project stock-leg synthetic greeks
+
+**Source**: `docs/reviews/2026-05-24-synthesis-adrs-0026-0030.md` P0-4
+**Reviewer**: DeepSeek-V4-Pro
+**Status**: Adopted
+
+### What changed
+
+D6's `aggregate_legs(legs: list[OptionLeg]) -> NetGreeks` (this ADR, line 190) iterates only `OptionLeg` objects. A `covered_call` proposal carries `(long stock, short call)`; the long-stock leg is NOT an `OptionLeg` and has no `greeks` field. The current spec's `sum(leg.greeks * leg.qty)` silently drops the stock leg's contribution. For a 100-share long-stock leg, the dropped delta is +100 -- a material mis-aggregation. The portfolio net-delta cap (`max_net_delta_pct_nav`, line 94) cannot be enforced correctly until this is fixed.
+
+Specify an explicit "stock-leg projection" rule:
+
+Stock legs contribute synthetic greeks per share:
+
+```
+stock_synthetic_greeks = NetGreeks(
+    delta = 1.0,    # 1.0 per share long; -1.0 per share short
+    gamma = 0.0,    # stock has no second-order price sensitivity
+    theta = 0.0,    # stock has no time decay
+    vega  = 0.0,    # stock has no IV sensitivity
+    rho   = 0.0,    # stock rho is materially zero on the trade horizons we care about
+)
+```
+
+Aggregation contract:
+
+```python
+def aggregate_legs(legs: Sequence[OptionLeg | StockLeg]) -> NetGreeks:
+    """Aggregate per-leg greeks into portfolio-level net greeks.
+
+    Stock legs project to synthetic greeks (delta=1.0/share, others=0)
+    scaled by signed share quantity. Option legs use their per-contract
+    greeks scaled by signed contract quantity x 100 (shares per contract).
+    """
+    net = NetGreeks.zero()
+    for leg in legs:
+        if isinstance(leg, OptionLeg):
+            # per-contract greeks * 100 shares/contract * signed contract count
+            net += leg.greeks * leg.qty * 100
+        elif isinstance(leg, StockLeg):
+            # delta=1.0/share * signed share count
+            net += stock_synthetic_greeks * leg.qty
+        else:
+            raise TypeError(f"unsupported leg type: {type(leg)}")
+    return net
+```
+
+`StockLeg` is added as a sibling to `OptionLeg` (defined in the implementation wave alongside the existing `OptionLeg` from ADR-0028). `MultiLegProposal.legs` becomes `tuple[OptionLeg | StockLeg, ...]`.
+
+Alternative shape (rejected): adding an `underlying_stock_position: int` field to `MultiLegProposal` and aggregating it separately. Rejected because it bifurcates the leg list and requires every consumer to remember to include both -- a footgun. The `Union[OptionLeg, StockLeg]` shape with an `isinstance` dispatch is more uniform and harder to forget.
+
+Unit tests:
+
+- `test_aggregate_covered_call_includes_stock_delta`: fixture with `100 shares long stock + 1 short 30-delta call` (`call.delta = 0.30`). Expected `net.delta = 100 * 1.0 + (-1) * 0.30 * 100 = 100 - 30 = 70`. Without the fix, the buggy result is `-30` (only the short call leg contributes).
+- `test_aggregate_csp_no_stock_leg_unchanged`: fixture with `1 short 30-delta put` only (no stock). Expected `net.delta = (-1) * (-0.30) * 100 = 30`. Asserts the stock-projection logic doesn't break the no-stock-leg case.
+- `test_aggregate_short_stock_negative_delta`: fixture with `-100 shares short stock + 1 long 30-delta call`. Expected `net.delta = -100 + 30 = -70`. Asserts the sign convention on `StockLeg.qty`.
+- `test_aggregate_unknown_leg_type_raises`: fixture with a duck-typed bogus leg; assert `TypeError`.
+- `test_aggregate_zero_shares_no_contribution`: `StockLeg(qty=0)` contributes nothing; aggregation matches no-stock-leg case.
+
+### Why
+
+The synthesis (P0-4) caught this as a silent drop bug. The covered-call strategy is the highest-priority strategy in the user's mix (per D1 lines 16-17: "covered call -> cash-secured put -> wheel state machine"); the aggregator silently mis-counting it would mean the net-delta cap could be violated by 70%+ and the gate would not catch it. This fix is the minimum sufficient correction; the `StockLeg` projection rule is the smallest schema change that makes the aggregation total-and-correct over the leg union.
+
+### Affected sections of this ADR
+
+- D6 `aggregate_legs` signature and body (line 190) -- leg type widens to `Sequence[OptionLeg | StockLeg]`; stock-leg projection rule added.
+- D6 invariant 2 "Net-delta cap holds across all leg-count combinations" (test plan, line 368) -- new fixtures must include covered-call (stock + option) cases, not just option-only mixes.
+- Implementation map (line 305) -- `greeks.py` exports both `OptionLeg`-based aggregation and the new `StockLeg` projection helper.

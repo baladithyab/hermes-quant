@@ -267,3 +267,76 @@ Hook points: `daily_picker.py` imports `loader.load_all()` at recipe-load and re
 - **Integration test.** Load every YAML in `methodology/`, run `daily-picker` against a fixture universe of ~30 names with frozen options-chain snapshots, and assert that the output `MultiLegProposal` set matches a golden file. Update the golden file deliberately when methodologies change.
 - **From-reel pipeline regression.** Replay the socalminh extraction end-to-end (cached reel + cached Whisper output + cached Gemini output) and assert the produced YAML matches the committed `methodology/socalminh-covered-call.yaml` byte-for-byte. Catches regressions in the extractor.
 - **Conflict resolution.** Synthesize two methodologies that disagree on direction for the same name; assert no proposal emits. Synthesize two that agree on direction but disagree on size; assert size = min.
+
+
+---
+
+## Amendment 2026-05-24 -- D1 add 4th DSL namespace `risk_liquidity`
+
+**Source**: `docs/reviews/2026-05-24-synthesis-adrs-0026-0030.md` P0-8
+**Reviewer**: Grok-4.3
+**Status**: Adopted
+
+### What changed
+
+D1 (this ADR, line 25 onward) defines three rule namespaces: `fundamentals`, `options_chain`, `event_flags`. Liquidity-flavored gates (bid-ask spread caps, minimum open interest, minimum daily volume, IV-rank bands) cross-cut these namespaces -- bid/ask is a chain property but the rule's purpose is a quality floor, not a methodology-specific filter. Forcing them into `options_chain` confuses the namespace abstraction (chain rules should be about strike/DTE/etc., not quality floors). Forcing them into `event_flags` is a category error. Folding them into `risk` (ADR-0027's gate) would drift the immutable risk-gate spec -- the risk gate's invariants are deliberately small and stable; per-methodology liquidity preferences shouldn't move that surface.
+
+Add a 4th namespace: `risk_liquidity`. Semantics: "the always-on quality floor every methodology must clear, regardless of what the methodology specifies." A methodology MAY override the global default for any `risk_liquidity` rule (e.g., a wheel methodology may demand `open_interest_min: 500` while the global default is `100`), but it CANNOT loosen below the daemon-published global floor (the floor is set in the `daily-picker` recipe config and is itself immutable per ADR-0027 / ADR-0026).
+
+Initial primitive set (the resolver registry -- implementation wave wires each):
+
+- `bid_ask_spread_max` -- maximum allowed bid-ask spread, expressed as either an absolute dollar amount or a percentage of mid (`{max: 0.05}` for $0.05 abs; `{max_pct_of_mid: 0.10}` for 10%-of-mid). Resolver computes per contract from the chain's quote at evaluation time.
+- `open_interest_min` -- minimum open interest per contract leg. Resolver reads `OptionContract.open_interest` from the chain.
+- `daily_volume_min` -- minimum 30-day average daily volume on the underlying (equity bars). Resolver reads from the standard yfinance/alpaca bar trail.
+- `iv_rank_band` -- IV rank window `{min: 30, max: 70}` (percentile of trailing-1y IV). Resolver computes rolling-1y IV percentile from chain's IV history (when ADR-0028 D7 parquet is available) or falls back to chain's current IV vs. the underlying's HV30 (degraded but present).
+
+YAML shape:
+
+```yaml
+risk_liquidity:
+  bid_ask_spread_max:
+    max_pct_of_mid: 0.10
+  open_interest_min:
+    min: 100
+  daily_volume_min:
+    min: 1_000_000
+  iv_rank_band:
+    min: 25
+    max: 75
+```
+
+Composition (this ADR D4 `compose` block) is unchanged in spirit; `risk_liquidity` rules participate in the AND-aggregation at the methodology level and the silence-by-default disposition is honored (any single `risk_liquidity` rule that flags an asset silences the methodology's vote on that asset). The methodology library's aggregation across methodologies (committee, ADR-0023) treats `risk_liquidity` failures the same as any other rule failure -- they suppress the methodology's vote, which then suppresses the asset's eligibility under that methodology only. Other methodologies' votes on the same asset are independent.
+
+The schema validator (`hermes_quant/methodology/schema.py`) gains `risk_liquidity` as a fourth top-level key, accepted as a dict with keys drawn from the registry above. Unknown keys in `risk_liquidity` are rejected at YAML-load time with `MethodologySchemaError("unknown risk_liquidity primitive: ...")`. Custom (registry-extending) primitives must be added in a NEW ADR amendment, not by methodology authors directly -- this keeps the registry small and audit-friendly.
+
+The global floor (the `daily-picker` recipe-level defaults that no methodology can loosen) is configured at recipe load time:
+
+```yaml
+# hermes_quant/recipes/daily_picker.yaml
+risk_liquidity_floor:
+  bid_ask_spread_max:
+    max_pct_of_mid: 0.20
+  open_interest_min:
+    min: 50
+  daily_volume_min:
+    min: 250_000
+  iv_rank_band:
+    min: 0
+    max: 100
+```
+
+A methodology's `risk_liquidity` is merged with the floor at `Methodology.evaluate` time: per-rule, the STRICTER of (methodology, floor) wins. A methodology setting `open_interest_min.min: 25` is silently coerced to `50` (the floor wins because it's stricter); a methodology setting `open_interest_min.min: 500` keeps `500` (methodology wins because it's stricter than the floor). The coercion is logged but not loud -- the operator's intent is presumed to be "at least this strict," and the floor is informational.
+
+### Why
+
+The synthesis (P0-8) flagged this as inevitable namespace creep within weeks of first reel ingestion: bid/ask, OI, volume, IV-rank are universal liquidity floors that every methodology will want some version of, and forcing every YAML author to copy-paste a "boilerplate liquidity block" into `options_chain` would breed inconsistencies. Promoting them to a first-class namespace `risk_liquidity` keeps the abstraction clean, lets a small number of resolvers handle the rules consistently, and crucially keeps the `risk` namespace (the immutable risk-gate spec from ADR-0027) invariant under methodology authoring pressure. The merge-with-floor rule preserves the "global floor cannot be loosened" property without making methodologies hard to author.
+
+### Affected sections of this ADR
+
+- D1 "Methodology DSL" (lines 25-46) -- adds `risk_liquidity` as the fourth namespace; example YAML blocks updated in subsequent amendments / revisions.
+- D4 composition arithmetic -- `risk_liquidity` rules participate in AND-aggregation per methodology; silence-by-default preserved.
+- Section 7 "Test Plan" -- additions:
+  - Schema validation: every `risk_liquidity` block in shipping YAMLs validates against the registry.
+  - Floor merge: a methodology with looser-than-floor rules is coerced to floor; a methodology with stricter-than-floor rules keeps its values.
+  - Rejection of unknown primitives: a YAML with `risk_liquidity.foo_bar: ...` fails load with `MethodologySchemaError`.
+- Implementation map -- `hermes_quant/methodology/resolvers/risk_liquidity.py` (new file) houses the four initial resolvers; the loader registers them.

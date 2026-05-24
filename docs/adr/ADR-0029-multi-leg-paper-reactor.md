@@ -230,3 +230,179 @@ def reconcile_options_ntas(asof: date) -> list[RealizedOutcome]: ...
 6. **Live-blocking guard (unit).** Construct a broker adapter pointed at a non-paper account; call `submit_mleg_order`; assert `LiveMultiLegNotAuthorized` is raised before any HTTP call is made.
 
 7. **End-to-end paper smoke (manual, weekly).** Once per week during the 60-day evidence window, a maintainer manually approves one proposal in chat and confirms (a) the order fills atomically, (b) intraday position/BP views update, and (c) the next morning's reconcile pass produces no warnings.
+
+
+---
+
+## Amendment 2026-05-24 -- D7 paper-to-live promotion: type-level prevention plus statistical criteria
+
+**Source**: `docs/reviews/2026-05-24-synthesis-adrs-0026-0030.md` CP0-1 (convergent: Gemini + Grok)
+**Reviewer**: Gemini-3.1-Pro + Grok-4.3
+**Status**: Adopted
+
+### What changed
+
+D7 (this ADR, line 194) currently guards live multi-leg via a runtime check: `account.is_paper is False -> raise LiveMultiLegNotAuthorized`. Two reviewers independently flagged this as structurally weak:
+
+1. The boolean is racy with respect to staging-environment misconfiguration (a wrongly-configured environment whose `is_paper` flips can authorize live without any code change).
+2. The "60 days, n approximately 40 outcomes" promotion criterion is too small a sample for the gate's risk-relevant events (gamma spikes, pin risk, BPR breaches) to have statistically registered.
+
+Strengthen along both axes:
+
+**Type-level prevention:**
+
+Live-trading client construction MUST require a `LiveTradingApproval` Pydantic model whose `__init__` runs the gate's promotion check. The `LiveBroker` class has NO `submit_mleg_order` method until that approval object is passed at construction time. Until a future ADR-00XX explicitly defines the approval contract and lands the method, the only class with `submit_mleg_order` is `PaperBroker`. The shape:
+
+```python
+class LiveTradingApproval(BaseModel):
+    """Constructed only by passing every promotion gate. Cannot be instantiated by mistake."""
+    approval_id: str
+    issued_at: datetime
+    paper_outcomes_count: int          # >= 100
+    rolling_30d_realized_sharpe: float # point estimate
+    sharpe_95ci_lower: float           # bootstrap lower bound, must be >= 1.0
+    rolling_30d_max_drawdown_pct: float # <= 0.01 (1%)
+    no_killswitch_in_trailing_14d: bool
+    immutable_breaches_in_window: int  # must == 0
+    weekly_retro_evidence_ids: list[str]  # ADR-0026 link
+    promoter_human_id: str             # the human who approved the promotion via CLI
+
+    @model_validator(mode="after")
+    def _enforce_thresholds(self) -> "LiveTradingApproval":
+        if self.paper_outcomes_count < 100:
+            raise ValueError("paper_outcomes_count must be >= 100")
+        if self.sharpe_95ci_lower < 1.0:
+            raise ValueError("sharpe_95ci_lower must be >= 1.0")
+        if self.rolling_30d_max_drawdown_pct > 0.01:
+            raise ValueError("rolling_30d_max_drawdown_pct must be <= 1%")
+        if not self.no_killswitch_in_trailing_14d:
+            raise ValueError("kill-switch trigger in trailing 14d disqualifies promotion")
+        if self.immutable_breaches_in_window != 0:
+            raise ValueError("any immutable-rule breach disqualifies promotion")
+        return self
+
+
+class LiveBroker:
+    """Live multi-leg requires LiveTradingApproval at construction time."""
+    def __init__(self, ..., approval: LiveTradingApproval):
+        self._approval = approval
+        # submit_mleg_order is bound here, not at class-definition time;
+        # importing LiveBroker without an approval gives a class with no
+        # multi-leg method.
+        ...
+```
+
+The `LiveTradingApproval` constructor is the only place the thresholds live; mis-spelling a threshold OR forgetting one is a `ValidationError` at construction time. This is correctness-by-construction in the same spirit as D6's atomic-HITL-approval shape.
+
+**Statistical promotion criteria (the actual numbers):**
+
+Replace the implicit "60 calendar days, ~40 outcomes" criterion with explicit statistical thresholds:
+
+- `N >= 100` settled paper multi-leg outcomes (not calendar days; trade count is what matters for sample-size).
+- Realized Sharpe over rolling 30 days, computed as `mean_daily_return / std_daily_return * sqrt(252)`.
+- 95% bootstrap CI on Sharpe via `scipy.stats.bootstrap` with `method="BCa"`, `n_resamples >= 9999`. The gate uses the LOWER bound of the CI, not the point estimate; this is a forcing function against small-sample optimism.
+- Lower-bound Sharpe `>= 1.0`.
+- Rolling 30-day max drawdown `<= 1%` of NAV.
+- Zero kill-switch triggers in trailing 14 days.
+- Zero immutable-rule breaches (silence-by-default, no-naked, BPR buffer 25%, action-discrete) over the rolling 30-day window.
+- 3-of-3 calibrator targets (per ADR-0023) within +/-5% of realized rate over the same window.
+- Weekly retro (ADR-0026) outputs include a `promotion_readiness: true` field; the gate reads it as one of its inputs (the meta-retro must independently agree the loop has converged).
+
+The `LiveTradingApproval` model is constructed by a CLI command (`hermes quant live promote --dry-run` first, then `... --confirm` with explicit human typed-acknowledgement of every threshold). The CLI computes all metrics from the local journal + retro outputs; it does not call the LLM. The CLI rejects (non-zero exit, no approval object) on any threshold miss.
+
+**Test plan additions:**
+
+- `test_live_broker_has_no_mleg_method_without_approval`: `inspect.getmembers(LiveBroker)` does not include `submit_mleg_order` when constructed without an approval; even import-time monkey-patching cannot add it because the binding is per-instance.
+- `test_live_trading_approval_rejects_subhundred_n`: `LiveTradingApproval(paper_outcomes_count=99, ...)` raises `ValidationError`.
+- `test_live_trading_approval_uses_lower_ci_not_point`: fixture with point Sharpe 1.5 but lower-CI 0.7; assert `ValidationError` (the LOWER bound, not the point estimate, is the gate).
+- `test_live_trading_approval_drawdown_threshold`: fixture with drawdown 1.001%; assert rejected.
+- `test_live_trading_approval_killswitch_window`: fixture with kill-switch 13 days ago; assert rejected (14d window is exclusive).
+- `test_live_trading_approval_calibrator_drift`: fixture where one calibrator is 5.1% off realized; assert rejected.
+- `test_promotion_cli_dry_run_idempotent`: `... --dry-run` twice on the same journal produces byte-identical output (deterministic).
+- `test_promotion_requires_retro_readiness_flag`: even if all numerics pass, missing `promotion_readiness: true` from the latest meta-retro causes the approval to fail.
+
+### Why
+
+The synthesis (CP0-1) collapsed two reviewers' independent findings into the same defect: the runtime boolean is too easy to flip wrongly, and 60 calendar days at ~5 trades/week is sample-size theater for events whose tail probability is what the system most needs to learn about. The structural fix (no live method until an approval object exists) is the cleanest defense against accidental promotion via misconfig; the statistical fix (bootstrap CI lower bound, immutable-breach floor, retro-loop concurrence) ensures the promotion is evidence-driven, not calendar-driven. Both together keep "paper -> live" a deliberate human act gated by both type-system AND data, with each layer compensating for the other's failure mode.
+
+### Affected sections of this ADR
+
+- D7 "Paper + HITL only; live multi-leg deferred" (line 135 and surrounding) -- replaces the runtime boolean with a type-level guard plus statistical promotion criteria.
+- Implementation map (line 194) -- `submit_mleg_order` on `LiveBroker` is contingent on `LiveTradingApproval` injection; `PaperBroker.submit_mleg_order` remains unconditional.
+- Test plan (existing item 6 "Live-blocking guard") -- extended with the eight tests above. Item 6 itself is preserved as a residual sanity check at the broker layer.
+
+---
+
+## Amendment 2026-05-24 -- Multi-leg order schema: position_intent and ratio_qty per leg, qty deprecated for multi-leg
+
+**Source**: `docs/research/2026-05-24-r5-alpaca-live-probe.md` "R1 sec 3 was MOSTLY RIGHT" section
+**Reviewer**: Live probe (orchestrator, paper credentials)
+**Status**: Adopted
+
+### What changed
+
+R1 documented the multi-leg POST schema using `qty` and `side` per leg. The 2026-05-24 live probe submitted a real vertical spread to the Alpaca paper API and observed the accepted shape differs:
+
+Working shape (verified live 2026-05-24, paper API returned `accepted`):
+
+```json
+{
+  "order_class": "mleg",
+  "qty": "1",
+  "type": "limit",
+  "time_in_force": "day",
+  "limit_price": "0.01",
+  "legs": [
+    {"symbol": "NVDA260612C00140000", "ratio_qty": "1", "side": "buy",  "position_intent": "buy_to_open"},
+    {"symbol": "NVDA260612C00145000", "ratio_qty": "1", "side": "sell", "position_intent": "sell_to_open"}
+  ]
+}
+```
+
+Differences from R1 / original ADR-0029 D2 (lines 56-58):
+
+1. `position_intent` is required at the per-leg level. Values: `buy_to_open`, `buy_to_close`, `sell_to_open`, `sell_to_close`. The original ADR did not include this field.
+2. `ratio_qty` is the leg multiplier (always `"1"` for vanilla spreads, can be `"2"` etc. for ratio spreads). The original ADR used `qty` at the leg level, which is wrong for multi-leg -- outer `qty` is the spread quantity and per-leg `ratio_qty` is the leg multiplier.
+3. `type` and `limit_price` are at the OUTER order level, not per-leg. Per-leg `type` and `limit_price` are NULL in the broker's response -- legs inherit from the parent order class.
+
+Updated `OptionLeg` dataclass (this ADR D5, around line 105):
+
+```python
+@dataclass(frozen=True)
+class OptionLeg:
+    symbol: str                      # OCC string
+    side: Literal["buy", "sell"]
+    position_intent: Literal["buy_to_open", "buy_to_close",
+                              "sell_to_open", "sell_to_close"]
+    ratio_qty: int = 1               # leg multiplier within the spread
+
+    # Deprecated for multi-leg; kept as alias for single-leg back-compat.
+    # New code MUST use ratio_qty + outer qty. The single-leg compat shim
+    # raises DeprecationWarning when `qty` is read off a multi-leg leg.
+    @property
+    def qty(self) -> int:
+        warnings.warn(
+            "OptionLeg.qty is deprecated for multi-leg use; "
+            "use ratio_qty (per-leg multiplier) and the parent "
+            "MultiLegProposal.qty (spread count) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.ratio_qty
+```
+
+`MultiLegProposal.limit_price` becomes the spread's net debit/credit; per-leg `limit_price` is removed from the schema (the legs inherit). This matches D6's atomic-approval posture: there is ONE net price the user approves.
+
+Broker adapter (`hermes_quant/broker/alpaca.py` `submit_mleg_order`) constructs the POST body as documented above. The single-leg path remains independent and continues to use the legacy `qty + side + type + limit_price` shape per the equity-options-single-leg flow (which is not multi-leg-class).
+
+### Why
+
+The probe confirmed the live API rejects the original ADR's schema with `422`-class errors. Discovering this at implementation time would cost a half-day round-trip; documenting the corrected schema in the ADR is free and prevents the entire wave from going down the wrong path. Marking `qty` deprecated rather than removed preserves single-leg-flow compatibility (single-leg orders DO use `qty` at the order level) while keeping the multi-leg flow type-correct. The position_intent field also matters semantically: the broker uses it to determine margin treatment (a `buy_to_close` short leg releases collateral; a `buy_to_open` does not), so the field is not just a cosmetic label.
+
+### Affected sections of this ADR
+
+- D2 "Multi-leg order body shape" (lines 56-58) -- example body updated to include `position_intent` and `ratio_qty`; outer `type` and `limit_price` clarified.
+- D5 `OptionLeg` dataclass (line 105 and surrounding) -- adds `position_intent` (required) and `ratio_qty` (defaults to 1); `qty` becomes a deprecation-warning property.
+- Implementation map (line 194) -- `submit_mleg_order` constructs the corrected POST body.
+- Test plan item 5 "Alpaca paper roundtrip" -- must assert the request body contains `position_intent` per leg and outer `qty` matches the spread count.
+- References block -- `docs/research/2026-05-24-r5-alpaca-live-probe.md` is added as the live-verification source.

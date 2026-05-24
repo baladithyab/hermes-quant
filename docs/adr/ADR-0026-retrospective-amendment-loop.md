@@ -511,3 +511,120 @@ Hot-path cost: only D0 runs in the daemon settlement_loop. D1–D5 are out-of-ba
 - ADR-0015 D2 — proposals.jsonl pattern that proposed_amendments.jsonl mirrors.
 - ADR-0023 — cross-family scatter discipline (committee aggregator); the retro loop reuses the same family-diversity invariant.
 - AGENTS.md "Things to NEVER do" #6, #7 — preserve the action-space and risk-gate untouchable surfaces. The retro loop respects both.
+
+
+---
+
+## Amendment 2026-05-24 -- Retro amendment scope hardening (mutable allowlist + immutable invariants)
+
+**Source**: `docs/reviews/2026-05-24-synthesis-adrs-0026-0030.md` P0-6
+**Reviewer**: Gemini-3.1-Pro
+**Status**: Adopted
+
+### What changed
+
+The synthesis recommended removing `code_change` from `scope_type` outright. The user has chosen to KEEP `code_change` but bound it tightly. Replace the bare `scope_type` enum (this ADR D4, lines 217-220) with an explicit allowlist of mutable scopes plus a hard-coded immutable-invariants block-list. The allowlist is enforced at TWO points: the synthesizer stage (during proposal generation in D2) AND a defense-in-depth re-check at the `hermes quant retro approve` CLI boundary (D5).
+
+Mutable scopes (allowlist):
+
+- `parameter_change` -- numeric value within already-codified bounds (e.g., a risk-gate threshold within the published ADR-0027 range; an analyst tunable within the analyst's documented parameter space). Cannot widen a bound; can only move within one.
+- `analyst_weight_change` -- re-weighting analysts inside the existing ADR-0023 reweighting machinery.
+- `data_provider_swap` -- swap one provider for another in a chain configured under ADR-0005, provided the new provider already implements the `DataProvider` Protocol.
+- `code_change` -- RESTRICTED. The unified-diff-via-`$EDITOR` flow may only patch files matching:
+  - `hermes_quant/analysts/*.py`
+  - `hermes_quant/aggregators/*.py`
+  - `hermes_quant/strategies/*.py`
+
+  And it MUST NOT touch any of:
+  - `hermes_quant/risk/**` (the deterministic risk gate; ADR-0004 + ADR-0027)
+  - `hermes_quant/governance/**` (kill-switch, halt installer, immutable-rule re-check)
+  - `hermes_quant/daemon/**` (settlement loop, tick loop, signal bus writer)
+  - `hermes_quant/proposals.py` (HITL surface; ADR-0015)
+  - `hermes_quant/data/base.py` (the `DataProvider` Protocol + `validate_bars` contract; ADR-0005)
+  - `hermes_quant/evaluation/lookahead.py` (the no-look-ahead CI gate)
+
+  Path validation is by exact glob match against the diff's file headers; ANY hunk targeting a forbidden path causes the entire amendment to be rejected at synthesizer stage with severity `CRITICAL` and reason `code_change_outside_allowlist`.
+
+- `recipe_yaml_edit` -- methodology YAML edits validated against ADR-0030's schema; loader fails fast on schema violation.
+- `adr_amendment` -- markdown edits to ADR-XXXX files; recorded as `## Amendment YYYY-MM-DD` block at end of file (this convention).
+
+Immutable invariants (block-list -- NEVER amendable by the retro loop, regardless of scope):
+
+1. **Silence-by-default** -- aggregator-on-disagreement-flat, gate-on-uncertainty-no-action, daemon-on-data-quality-skip-tick. (AGENTS.md "Critical conventions" / "Project posture" Sec.1.)
+2. **Money never goes through tools** -- plugin tool surface is read-only by construction. (AGENTS.md "Money never goes through tools".)
+3. **Action space is discrete** -- `{0, +/-0.05, +/-0.10, +/-0.15, +/-0.20}` of NAV. Widening requires a NEW ADR through normal PR review, not a retro amendment. (AGENTS.md "Action space is discrete" + ADR-0009 P0-2.)
+4. **No look-ahead bias** -- the `shuffle_timestamps_test` CI gate. (AGENTS.md "No look-ahead bias".)
+5. **Calibrator updates** -- the calibrator-from-rejections invariant in ADR-0015 D8. The retro loop may PROPOSE additional calibrator inputs but cannot disable existing ones.
+6. **Risk envelope** -- the immutable absolute floors in ADR-0027 (max-position-pct hard cap, BPR buffer, no-naked rule, drawdown circuit breakers). The retro loop may propose tightening within already-published ranges but never widening.
+
+Any proposed amendment whose `scope_type` is outside the allowlist OR whose patch material touches an immutable invariant is auto-rejected at the synthesizer stage with severity `CRITICAL` and reason `forbidden_scope_or_invariant_touch`. The CLI re-check repeats this validation before any git mutation, treating the synthesizer's pass as advisory only (defense in depth).
+
+Unit tests:
+
+- `test_retro_scope_code_change_allowed_paths`: patch targeting `hermes_quant/analysts/foo.py` passes synthesizer stage.
+- `test_retro_scope_code_change_blocks_risk`: patch targeting `hermes_quant/risk/gate.py` is rejected with `code_change_outside_allowlist`.
+- `test_retro_scope_blocks_governance`: patch touching `hermes_quant/governance/halt.py` is rejected.
+- `test_retro_scope_blocks_data_base`: patch touching `hermes_quant/data/base.py` is rejected even when proposed under `code_change`.
+- `test_retro_scope_blocks_action_space_widening`: a `parameter_change` proposing a 0.025 step in NAV sizing is rejected because the action-space invariant is on the block-list (must go through new-ADR PR).
+- `test_retro_cli_recheck_independent`: stub the synthesizer to (incorrectly) approve a forbidden patch; assert the CLI `approve` command still rejects with non-zero exit.
+
+### Why
+
+The synthesis (P0-6) flagged `code_change` as effectively arbitrary code execution -- even with `$EDITOR` review, complex diffs admit silent rule violations. The user's stated intent in keeping `code_change` is to allow the loop to evolve analyst logic without going through full PR review every time. The compromise here preserves that affordance for the `analysts/`, `aggregators/`, `strategies/` surfaces (where new evidence often suggests model tweaks) while making the safety-critical surfaces (`risk/`, `governance/`, `daemon/`, `proposals.py`, `data/base.py`) un-amendable by this loop. The block-list enumerates the six invariants from AGENTS.md "Critical conventions" so the retro loop cannot accidentally erode the constitution it is supposed to enforce.
+
+### Affected sections of this ADR
+
+- D4 -- `proposed_amendments.jsonl` schema (the `scope_type` enum at lines 217-220 is now narrower and explicitly enumerated above; `other` is removed).
+- D5 -- Approval mechanics (the re-check at the CLI boundary now includes path-glob validation for `code_change` and immutable-invariant scan for all scopes).
+- D2 -- Synthesizer prompt: must include the immutable invariants and allowlist as part of the constitutional preamble (R3 Sec.1.5 framing already supports this).
+
+---
+
+## Amendment 2026-05-24 -- D1 counterfactual fill heuristic determinism
+
+**Source**: `docs/reviews/2026-05-24-synthesis-adrs-0026-0030.md` P0-7
+**Reviewer**: Gemini-3.1-Pro
+**Status**: Adopted
+
+### What changed
+
+The `was_gate_rejection_correct` field in `PostmortemRecord` (this ADR D1, line 163) requires a counterfactual: "would the rejected trade have been profitable over its would-be hold window?" Without an explicit intra-bar fill heuristic, two replays of the same postmortem produce different counterfactuals and the gate-quality signal becomes non-deterministic. Specify the heuristic explicitly:
+
+**For market orders on equity:**
+
+- Fill at the OPEN of the next 1-minute bar AT-OR-AFTER the proposed timestamp.
+- If the next 1-minute bar is missing (data gap, market halt) OR the symbol was halted in the next bar, drop the counterfactual entirely. Set `was_gate_rejection_correct = None` and tag `counterfactual_drop_reason = "missing_or_halted_bar"`. Do NOT synthesize a fill price.
+
+**For limit orders on equity:**
+
+- Fill if-and-only-if `bar.low <= limit_price <= bar.high` for ANY 1-minute bar within the order's TIF (time-in-force) window.
+- Fill price = `limit_price` (the order's stated limit, not the bar's mid).
+- Tie-break for the same bar both touching `limit_price` from above and below (i.e., `bar.low <= limit <= bar.high` AND the bar straddles the entry side): assume worst-case fill at `limit_price` BUT use the bar's VWAP as the slip-worst estimate for cost analysis (i.e., `realized_cost_estimate = max(0, |bar.vwap - limit_price|)`).
+- If TIF expires with no qualifying bar, the limit order is treated as unfilled. `was_gate_rejection_correct = True` (the gate's rejection didn't cost a real fill since the counterfactual order wouldn't have filled either).
+
+**For options (equity options, single-leg or per-leg in multi-leg):**
+
+- Same logic as above BUT against the **option's quote series**, NOT the underlying. The option contract has its own bid/ask and 1-minute-bar trail (when available via `OptionChain.replay_chain` per ADR-0028 D7).
+- Multi-leg: each leg evaluated independently against its own quote series; the counterfactual fills if-and-only-if ALL legs would fill within the same TIF window. Otherwise drop with `counterfactual_drop_reason = "partial_leg_fill_in_counterfactual"`.
+
+**Determinism contract:**
+
+The heuristic is a pure function of `(proposal, market_data_window)`. Given byte-identical inputs, it produces byte-identical outputs. No `datetime.now()` fallback, no random tiebreaks, no provider-RTT-dependent logic. The implementation lives in `hermes_quant/evaluation/counterfactual.py` (new file in the implementation wave).
+
+Unit tests:
+
+- `test_counterfactual_market_fill_next_bar_open`: fixture with a clean 1-min bar trail; assert market-order fill at `bars[i+1].open`.
+- `test_counterfactual_market_drops_on_halted_bar`: fixture with `bar.volume == 0` (halted); assert counterfactual is dropped, `was_gate_rejection_correct is None`.
+- `test_counterfactual_limit_fills_within_tif`: fixture where `bar.low <= limit <= bar.high` on bar 5 of TIF=10m; assert fill at `limit_price`.
+- `test_counterfactual_limit_does_not_fill_outside_tif`: fixture where the bar that would have qualified is at TIF+1; assert no fill, gate rejection counts as correct.
+- `test_counterfactual_options_per_leg_fill`: 2-leg vertical, leg A would fill, leg B would not within TIF; assert overall counterfactual dropped with reason `partial_leg_fill_in_counterfactual`.
+- `test_counterfactual_determinism`: run the heuristic twice on the same fixture; assert byte-identical output (catches any nondeterministic logic regressing in).
+
+### Why
+
+The synthesis (P0-7) flagged this as a non-determinism source: without an explicit heuristic, the implementation drifts toward heuristics-of-convenience (next-tick mid, last-known-quote, etc.) and the same retrospective produces different counterfactual judgments on different runs. The "gate's rejection was correct" signal is a primary input to the retro loop's MAJOR-finding promotion logic; non-determinism here means the loop's own evidence base is unreliable. The chosen heuristic (next-bar OPEN for market, in-range limit for limit, drop-on-gap) is conservative -- it errs toward "the gate was right to reject" rather than fabricating a phantom fill, which preserves the silence-by-default disposition at the audit layer.
+
+### Affected sections of this ADR
+
+- D1 -- `PostmortemRecord` field `was_gate_rejection_correct` (line 163) and the surrounding rationale (line 166). The "deterministic post-hoc check" claim now has explicit teeth.
+- Test plan section "Postmortem record correctness" (line 473): augmented with the determinism property test.

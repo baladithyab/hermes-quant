@@ -505,3 +505,139 @@ data_provider_config:
 - AGENTS.md "No look-ahead bias" — extended to options via `as_of`-filtered chains and `shuffle_timestamps_test` on methodology analysts.
 - `py_vollib` — Black-Scholes-Merton greek library; MIT-licensed.
 - Polygon.io options: <https://polygon.io/docs/options> (recommended for v0.6.0 historical).
+
+
+---
+
+## Amendment 2026-05-24 -- D5/D7 parquet replay must enforce fetched_at <= asof at load time
+
+**Source**: `docs/reviews/2026-05-24-synthesis-adrs-0026-0030.md` P0-5
+**Reviewer**: DeepSeek-V4-Pro
+**Status**: Adopted
+
+### What changed
+
+D5 (this ADR, lines 268-275) defines `as_of` semantics for live `fetch_chain` calls but does not constrain what the parquet replay layer (D7, lines 300-327) returns. A row whose greeks were computed from chain data fetched AFTER `asof` (e.g., backfill-fix run that re-stamped `asof` but kept the original `fetched_at`) IS look-ahead-contaminated, and the existing CI gate `shuffle_timestamps_test` does not catch it because the gate operates on bar timestamps, not provenance timestamps. The replay layer must enforce the strict ordering `row.fetched_at <= row.asof` at load time.
+
+D5 amendment -- replay-time filter:
+
+```python
+def replay_chain(underlying: str, asof: datetime, ...) -> OptionChain:
+    """Read a snapshot from parquet for `underlying` at `asof`.
+
+    Drops any row where `fetched_at > asof`. This is the load-time
+    enforcement of the no-look-ahead invariant on stored greeks.
+    Dropped rows are counted via the `quant_doctor` counter
+    `option_chain_replay.lookahead_drops`; non-zero counts at
+    daemon-runtime indicate a data integrity defect that should be
+    investigated before any decision uses the chain.
+    """
+    df = pa.parquet.read_table(_path_for(underlying, asof.date())).to_pandas()
+
+    # Hard filter: contracts and greeks visible at `asof` only.
+    pre_count = len(df)
+    df = df[df["fetched_at"] <= asof]
+    df = df[df["asof"] <= asof]                 # belt + suspenders
+    dropped = pre_count - len(df)
+    if dropped > 0:
+        _doctor_counter("option_chain_replay.lookahead_drops").inc(dropped)
+        log.warning(
+            "replay_chain dropped %d look-ahead rows for %s asof=%s",
+            dropped, underlying, asof,
+        )
+
+    return _rows_to_chain(df, asof=asof)
+```
+
+D7 amendment -- parquet writer must stamp BOTH columns:
+
+The on-disk parquet schema (lines 300-306) currently lists `asof` (the snapshot's logical timestamp). Add an explicit `fetched_at` column whose semantics are "the wall-clock UTC instant when the provider returned this row's greeks/IV/quote." For Alpaca live: `fetched_at = response.headers['Date']` parsed to UTC. For synthetic provider: `fetched_at = chain.asof` (no asymmetry possible). For replay-of-replay (a replay output written back to a new parquet for downstream): `fetched_at` is preserved from the source row, NOT updated to the re-write time.
+
+Updated schema fragment:
+
+```
+asof                 timestamp[us, tz=UTC]   # logical decision time the row is valid at
+fetched_at           timestamp[us, tz=UTC]   # wall-clock when provider returned this row
+provider             string
+underlying           string
+... (rest unchanged from D7)
+```
+
+Invariant: `fetched_at <= asof` MUST hold for every row at write time. Writer asserts this before flushing; assertion failure is a `DataIntegrityError` (not silently dropped) so the operator finds out at write time, not silently at replay time. Replay-time filter is defense in depth.
+
+`quant_doctor` exposes:
+
+- `option_chain_replay.lookahead_drops` (counter, per-underlying) -- non-zero indicates contaminated parquet on disk.
+- `option_chain_writer.lookahead_assertions` (counter) -- non-zero indicates a writer bug or provider-clock skew.
+
+Unit tests (additions to existing parquet replay block, lines 485-488):
+
+- `test_replay_drops_lookahead_rows`: write a parquet with 5 rows where row 3 has `fetched_at = asof + 60s` (synthetic violation); call `replay_chain(asof=...)` requesting the asof of row 3; assert row 3 is filtered, doctor counter incremented by 1, returned chain has 4 rows.
+- `test_writer_rejects_lookahead`: attempt to call `record_chain` with a row where `fetched_at > asof`; assert `DataIntegrityError` raised at write time, parquet not flushed.
+- `test_replay_filter_is_idempotent`: replay-of-replay-write preserves `fetched_at`, doesn't update to wall-clock.
+- `test_doctor_exposes_lookahead_counter`: `quant_doctor` JSON output includes the `option_chain_replay.lookahead_drops` key with a non-negative integer value.
+
+### Why
+
+The synthesis (P0-5) flagged this as a no-look-ahead-bias bypass: the existing CI gate operates on bar timestamps and doesn't see the parquet replay's stored greeks. A backfill or repair script that updates `asof` but not `fetched_at` (or vice versa) silently injects contamination, and downstream backtests then "validate" strategies on data they would not have had at decision time. The fix is two layers: writer-time assertion (catches it early) and replay-time filter (catches anything that slipped past). The doctor counter surfaces residual contamination so an operator notices before live capital sees the bad signal.
+
+### Affected sections of this ADR
+
+- D5 "Point-in-time as_of semantics for chains" (lines 268-275) -- the canonical-`asof` rule extends with a load-time filter.
+- D7 "On-disk schema for chain replay" (lines 300-306) -- schema gains `fetched_at` column with strict-ordering invariant.
+- Test plan "Parquet replay" block (lines 485-488) -- adds the four tests above.
+- `quant_doctor` surface (cross-cutting; ADR-0007) -- exports two new counters.
+
+---
+
+## Amendment 2026-05-24 -- Alpaca live probe corrections (greeks endpoint, rho present, coverage 58.7 percent)
+
+**Source**: `docs/research/2026-05-24-r5-alpaca-live-probe.md` R1 corrections section
+**Reviewer**: Live probe (orchestrator, paper credentials)
+**Status**: Adopted
+
+### What changed
+
+R1 (`docs/research/2026-05-23-r1-alpaca-options-api.md`) made two factual claims about Alpaca's options greeks API that the 2026-05-24 live probe falsified. This ADR's D3 (provider greeks rule) and D4 (historical chain replay) reference R1 and inherited those errors. Corrections:
+
+**Correction 1 -- greeks endpoint identity:**
+
+R1 said greeks are returned via `OptionSnapshotRequest` (the snapshot endpoint). Verified live 2026-05-24: that endpoint returns OHLCV bars and bid/ask quotes only, NO greeks, NO IV. The greeks are returned via `OptionsChainRequest` (alpaca-py SDK) -- `GET /v1beta1/options/snapshots/{underlying}` augments quotes with computed greeks server-side, but only when invoked via the chain endpoint (underlying-keyed), not the per-symbol snapshots endpoint.
+
+Implication: ADR-0028 D3 implementation language must reference `OptionsChainRequest` (the SDK class) or the underlying-keyed REST path, NOT `OptionSnapshotRequest`. The provider implementation must construct chain requests, not aggregate per-contract snapshot calls (the latter would not return greeks even in principle).
+
+**Correction 2 -- rho IS in the greeks dict:**
+
+R1 said rho was missing. Verified live 2026-05-24 with NVDA chain:
+
+```python
+greeks = OptionsGreeks(
+    delta=-0.9954,
+    gamma=0.0005,
+    rho=-0.0957,           # present
+    theta=0.0146,
+    vega=0.0052,
+)
+implied_volatility = 0.6422
+```
+
+Implication: ADR-0028 D3 should not list rho as a "synthesize-always" field. Greeks fan-out is now `delta, gamma, theta, vega, rho, implied_volatility` from Alpaca's chain endpoint, falling back to py_vollib only when the provider returns `None` for a given contract.
+
+**Correction 3 -- coverage is 58.7 percent (not "all liquid"):**
+
+Live probe of NVDA's 4884-contract chain returned greeks on 2865 contracts = 58.7%. The remaining 41.3% are deep OTM/ITM contracts with unstable bid-ask where the provider's IV solver does not converge. ADR-0028 D3 must therefore retain a mandatory py_vollib fallback for the 41.3% no-greeks tier -- this is not optional. The fallback uses mid-quote IV and Black-Scholes-Merton; the resulting `iv_source` is `py_vollib_european_approximation` (per Grok P2 nit and the existing P1-E discussion).
+
+Updated D3 paragraph (replaces lines 210 and surrounding):
+
+> Greeks are sourced from the Alpaca chain endpoint (`OptionsChainRequest` via alpaca-py SDK, or `GET /v1beta1/options/snapshots/{underlying}` via REST). Coverage observed live 2026-05-24 against NVDA: 58.7% of contracts returned `(delta, gamma, theta, vega, rho, implied_volatility)`; 41.3% returned `None` for the greek block (deep OTM/ITM with unstable bid-ask). For the no-greeks tier, synthesize via py_vollib using mid-quote IV and Black-Scholes-Merton; tag the synthesized rows with `iv_source = "py_vollib_european_approximation"`. py_vollib is in-process (~0.1ms/contract); no rate-limit concern. American-vs-European approximation gap is acknowledged for early-exercise-eligible contracts; the flag distinguishes them from provider-native greeks for downstream consumers (the gate, the backtester, `quant_doctor`).
+
+### Why
+
+The original ADR-0028 was authored against R1's documentation pass, which was not live-verified. The 2026-05-24 probe (paper credentials, real API) found two material errors and one quantitative correction. Leaving the original wording would cause the implementation wave to point at the wrong endpoint and to omit a mandatory fallback for 41.3% of the chain -- both would manifest as silent decision-quality regressions (gate makes choices on missing greeks) before any live capital is at risk, but the test fixtures might not catch it if they only exercise the liquid tier.
+
+### Affected sections of this ADR
+
+- D3 "Trust provider greeks when present and fresh" (line 210) -- endpoint identity corrected; rho moved out of synthesize-always; coverage reality (58.7%/41.3%) added; py_vollib mandatory for the no-greeks tier.
+- D5 "Point-in-time as_of semantics" -- unaffected by this correction.
+- Test plan "Stale-greek detection" (line 467) -- clarify that "stale" applies to the 41.3% tier only; the 58.7% native-greek tier is computed at quote time and not "stale" in the wall-clock sense.
+- References block -- `docs/research/2026-05-24-r5-alpaca-live-probe.md` is added as the live-verification source for R1's corrections.
