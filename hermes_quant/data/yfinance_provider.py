@@ -260,12 +260,17 @@ class YFinanceProvider:
         # enforcement. Filter to as_of AFTER validation so the cutoff is
         # applied to the same canonical (UTC, ascending) dataframe an
         # analyst would otherwise see. Comparison-safe regardless of
-        # input bars timezone (validate_bars normalizes to UTC).
+        # input bars timezone (validate_bars normalizes to tz-NAIVE UTC).
         if as_of is not None:
             cutoff = as_of
             if cutoff.tzinfo is None:
                 cutoff = cutoff.tz_localize("UTC")
-            validated = validated[validated["timestamp"] <= cutoff].reset_index(drop=True)
+            # validate_bars stores timestamps tz-naive UTC (line 75 of base.py:
+            # .dt.tz_convert("UTC").dt.tz_localize(None)). Drop cutoff tz to
+            # match — comparing tz-aware vs tz-naive raises TypeError under
+            # pandas 2.x. Fix verified 2026-05-24 against yfinance 1.4.0.
+            cutoff_naive = cutoff.tz_convert("UTC").tz_localize(None)
+            validated = validated[validated["timestamp"] <= cutoff_naive].reset_index(drop=True)
 
         return validated
 

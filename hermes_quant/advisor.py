@@ -514,13 +514,14 @@ def recommend(
         return _gated_no_data(result, "no_bars_returned")
 
     # ---- Step 3: data-quality probe ----
+    # validate_bars normalizes to tz-NAIVE UTC (per data/base.py L75). Convert
+    # back to tz-aware UTC for arithmetic with asof_ts (which is tz-aware).
     last_bar_ts = bars["timestamp"].iloc[-1]
-    if hasattr(last_bar_ts, "tz_convert"):
-        last_bar_ts_utc = (
-            last_bar_ts.tz_convert("UTC") if last_bar_ts.tzinfo else last_bar_ts
-        )
+    last_bar_ts = pd.Timestamp(last_bar_ts)
+    if last_bar_ts.tzinfo is None:
+        last_bar_ts_utc = last_bar_ts.tz_localize("UTC")
     else:
-        last_bar_ts_utc = pd.Timestamp(last_bar_ts, tz="UTC")
+        last_bar_ts_utc = last_bar_ts.tz_convert("UTC")
     age_seconds = (asof_ts - last_bar_ts_utc).total_seconds()
     result.last_bar_age_minutes = max(0.0, age_seconds / 60.0)
     result.as_of = last_bar_ts_utc  # actual data anchor, not wall clock
