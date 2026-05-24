@@ -22,15 +22,19 @@ between cancel and the next daemon tick can't resume entries.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC
 from pathlib import Path
 
 import pandas as pd
 
 from hermes_quant.protocol import HaltRecord
+
+logger = logging.getLogger(__name__)
 
 # Wildcard sentinel — used instead of NULL for ANY-scope halts.
 WILDCARD = "*"
@@ -194,6 +198,39 @@ class HaltStateSQLite:
             halted_until=halted_until,
             halt_epoch=next_epoch,
         )
+
+        # Wave A wiring (ADR-0031 D2): emit kill_switch_fired governance event
+        # after the SQLite INSERT but before the JSON mirror write. Audit
+        # failure must NEVER block the halt from being created (silence-by-
+        # default observation); we swallow exceptions and log a warning.
+        try:
+            from hermes_quant.governance import audit_log
+
+            asof_dt = record.halted_at.to_pydatetime()
+            if asof_dt.tzinfo is None:
+                asof_dt = asof_dt.replace(tzinfo=UTC)
+            audit_log.append(
+                audit_log.GovernanceEvent(
+                    kind="kill_switch_fired",
+                    asof=asof_dt,
+                    source="daemon.halt_state",
+                    payload={
+                        "account_id": record.account_id,
+                        "asset_class": record.asset_class,
+                        "asset": record.asset,
+                        "reason": record.reason,
+                        "halted_until": (
+                            record.halted_until.isoformat()
+                            if record.halted_until is not None
+                            else None
+                        ),
+                        "halt_epoch": record.halt_epoch,
+                    },
+                )
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("audit_log.append failed for halt: %s", e)
+
         self._write_mirror()
         return record
 

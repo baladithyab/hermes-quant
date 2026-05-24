@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 
 import pandas as pd
 
@@ -41,6 +43,41 @@ from hermes_quant.risk.kelly import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_audit(
+    *,
+    kind: str,
+    asof: datetime,
+    payload: dict[str, Any],
+) -> None:
+    """Emit a governance audit event. Failures are swallowed (silence-by-default
+    for observation — audit must NEVER block a gate decision).
+    """
+    try:
+        from hermes_quant.governance import audit_log
+
+        audit_log.append(
+            audit_log.GovernanceEvent(
+                kind=kind,  # type: ignore[arg-type]
+                asof=asof,
+                source="risk.gate",
+                payload=payload,
+            )
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("audit_log.append failed for %s: %s", kind, e)
+
+
+def _ts_to_datetime(ts: pd.Timestamp | datetime) -> datetime:
+    """Coerce pd.Timestamp or datetime to a tz-aware UTC datetime."""
+    if isinstance(ts, pd.Timestamp):
+        py = ts.to_pydatetime()
+    else:
+        py = ts
+    if py.tzinfo is None:
+        py = py.replace(tzinfo=UTC)
+    return py
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +168,26 @@ class DefaultRiskGate:
     Per synthesis-v2 §P0-D ordering: halt FIRST, then any other check.
     """
 
-    def __init__(self, config: RiskConfig | None = None):
+    def __init__(
+        self,
+        config: RiskConfig | None = None,
+        *,
+        evidence_store: Any = None,
+    ):
+        """
+        Args:
+            config: Risk profile (defaults to moderate).
+            evidence_store: Optional EvidenceStore-like object (must expose
+                `.get(evidence_id)` returning a row dict with `available_at`).
+                When provided, the gate runs the universal lookahead check
+                (ADR-0033 D5) against component AnalystViews' evidence_ids
+                BEFORE other rules, and silences signals whose evidence is
+                tainted by data the gate could not have seen at `signal.asof`.
+                When None (default), the lookahead check is skipped — preserves
+                backward compatibility with existing tests.
+        """
         self.config = config or RiskConfig()
+        self.evidence_store = evidence_store
         self._cooldowns: dict[tuple[str, str, str], _AssetCooldownState] = {}
         # Action stats for observability
         self._n_actions = 0
@@ -143,6 +198,49 @@ class DefaultRiskGate:
         self._n_silenced_cooldown = 0
         self._n_silenced_cost_gate = 0
         self._n_silenced_min_trade = 0
+        self._n_silenced_lookahead = 0
+
+    def _audit_rejection(
+        self, signal: AggregatedSignal, reason: str
+    ) -> None:
+        """Emit a 'gate_rejection' audit event. Failures are swallowed."""
+        _emit_audit(
+            kind="gate_rejection",
+            asof=_ts_to_datetime(signal.asof),
+            payload={
+                "asset": signal.asset,
+                "direction": int(signal.direction),
+                "magnitude": float(signal.magnitude),
+                "confidence": float(signal.confidence),
+                "reason": reason,
+                "asof": signal.asof.isoformat(),
+            },
+        )
+
+    def _audit_approval(
+        self, signal: AggregatedSignal, action: Action
+    ) -> None:
+        """Emit a 'gate_approval' audit event. Failures are swallowed."""
+        _emit_audit(
+            kind="gate_approval",
+            asof=_ts_to_datetime(signal.asof),
+            payload={
+                "asset": signal.asset,
+                "direction": int(signal.direction),
+                "magnitude": float(signal.magnitude),
+                "confidence": float(signal.confidence),
+                "target_position_pct": float(action.target_position_pct),
+                "reason": action.reason,
+                "asof": signal.asof.isoformat(),
+            },
+        )
+
+    def _silence(
+        self, signal: AggregatedSignal, *, reason: str
+    ) -> None:
+        """Internal helper: emit gate_rejection audit and return None."""
+        self._audit_rejection(signal, reason)
+        return None
 
     def gate(
         self,
@@ -158,34 +256,58 @@ class DefaultRiskGate:
             portfolio.account_id, portfolio.asset_class, signal.asset
         ):
             self._n_silenced_halt += 1
-            return None
+            return self._silence(signal, reason="halt_active")
+
+        # Rule 0.5: Lookahead-evidence check (ADR-0033 D5).
+        # Drop signals whose component AnalystViews cite evidence that wasn't
+        # available at signal.asof. Only runs when an evidence_store was
+        # injected at construction; otherwise this is a no-op (backward
+        # compat with tests that don't set up an evidence store).
+        if self.evidence_store is not None and signal.components:
+            from hermes_quant.evidence.lookahead_gate import check_view_lookahead
+
+            asof_dt = _ts_to_datetime(signal.asof)
+            for view in signal.components:
+                if not view.evidence_ids:
+                    continue
+                result = check_view_lookahead(view, asof_dt, self.evidence_store)
+                if not result.ok:
+                    self._n_silenced_lookahead += 1
+                    return self._silence(
+                        signal,
+                        reason=f"lookahead_tainted_{result.violations[0].evidence_id}",
+                    )
 
         # Rule 1: Drawdown circuit breaker
         if portfolio.drawdown_pct > self.config.max_drawdown_pct:
             self._n_silenced_drawdown += 1
-            return Action(
+            action = Action(
                 target_position_pct=0.0,
                 reason=f"drawdown_circuit_breaker_{portfolio.drawdown_pct:.4f}",
                 halt=True,
                 halt_scope=(portfolio.account_id, portfolio.asset_class, None),
                 halt_until=None,  # explicit resume only
             )
+            self._audit_rejection(signal, action.reason)
+            return action
 
         # Rule 2: Daily-loss circuit breaker
         if portfolio.daily_loss_pct > self.config.max_daily_loss_pct:
             self._n_silenced_daily_loss += 1
-            return Action(
+            action = Action(
                 target_position_pct=0.0,
                 reason=f"daily_loss_circuit_breaker_{portfolio.daily_loss_pct:.4f}",
                 halt=True,
                 halt_scope=(portfolio.account_id, portfolio.asset_class, None),
                 halt_until=_next_session_open(market.tz, portfolio.asof),
             )
+            self._audit_rejection(signal, action.reason)
+            return action
 
         # Rule 3: Silence on flat or zero-confidence signal
         if signal.direction == 0 or signal.confidence < 1e-6:
             self._n_silenced_flat += 1
-            return None
+            return self._silence(signal, reason="flat_or_zero_confidence")
 
         # Rule 4: Post-loss cooldown
         cooldown_key = (portfolio.account_id, portfolio.asset_class, signal.asset)
@@ -196,7 +318,7 @@ class DefaultRiskGate:
             ).total_seconds() / 60.0
             if elapsed_minutes < self.config.cooldown_after_loss_minutes:
                 self._n_silenced_cooldown += 1
-                return None
+                return self._silence(signal, reason="post_loss_cooldown")
 
         # Rule 5: Cost gate (synthesis-v2 §P0-A: uses expected_signed_edge)
         edge = expected_signed_edge(
@@ -228,10 +350,10 @@ class DefaultRiskGate:
         # expected return in the requested direction, we hold cash.
         if edge * signal.direction <= 0:
             self._n_silenced_cost_gate += 1
-            return None
+            return self._silence(signal, reason="cost_gate_edge_sign")
         if abs(edge) < threshold:
             self._n_silenced_cost_gate += 1
-            return None
+            return self._silence(signal, reason="cost_gate_below_threshold")
 
         # Rule 6: Position size from quarter-Kelly
         # variance = volatility² (volatility per ADR-0009 §P0-1 fix is stdev)
@@ -250,10 +372,10 @@ class DefaultRiskGate:
         delta = target_size - current
         if abs(delta) < self.config.min_trade_size:
             self._n_silenced_min_trade += 1
-            return None
+            return self._silence(signal, reason="min_trade_size")
 
         self._n_actions += 1
-        return Action(
+        action = Action(
             target_position_pct=target_size,
             reason=(
                 f"signal_dir={signal.direction}_conf={signal.confidence:.3f}_"
@@ -262,6 +384,8 @@ class DefaultRiskGate:
             signal_id=signal.metadata.get("id") if signal.metadata else None,
             halt=False,
         )
+        self._audit_approval(signal, action)
+        return action
 
     def record_loss(
         self,
@@ -286,6 +410,7 @@ class DefaultRiskGate:
             "n_silenced_cooldown": self._n_silenced_cooldown,
             "n_silenced_cost_gate": self._n_silenced_cost_gate,
             "n_silenced_min_trade": self._n_silenced_min_trade,
+            "n_silenced_lookahead": self._n_silenced_lookahead,
         }
 
 

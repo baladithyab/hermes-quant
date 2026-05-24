@@ -22,11 +22,12 @@ import logging
 import secrets
 import sqlite3
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Literal
 
 from hermes_quant.daemon.signal_bus import append_locked
 
@@ -364,6 +365,55 @@ class ProposalStore:
             import os as _os
             _os.write(fd, line.encode("utf-8"))
 
+        # Wave A wiring (ADR-0031 D2): emit proposal_emitted governance audit
+        # event on the create transition. Failures NEVER block the proposal
+        # write (silence-by-default observation).
+        if event == "create":
+            try:
+                from hermes_quant.governance import audit_log
+
+                advisor = proposal.advisor_result or {}
+                aggregated = advisor.get("aggregated_signal") or {}
+                direction = aggregated.get("direction") or advisor.get("direction") or 0
+                target_size = (
+                    advisor.get("target_size_pct_nav")
+                    or advisor.get("kelly_size")
+                    or aggregated.get("target_size_pct_nav")
+                    or 0.0
+                )
+                asof_str = (
+                    advisor.get("as_of")
+                    or aggregated.get("as_of")
+                    or proposal.created_at
+                )
+                # Use creation-time for governance asof — that's when this
+                # proposal landed on the bus, which is the auditable event.
+                asof_dt = _utc_now()
+                audit_log.append(
+                    audit_log.GovernanceEvent(
+                        kind="proposal_emitted",
+                        asof=asof_dt,
+                        source="proposals.create",
+                        payload={
+                            "proposal_id": proposal.proposal_id,
+                            "asset": proposal.symbol,
+                            "asset_class": proposal.asset_class,
+                            "timeframe": proposal.timeframe,
+                            "direction": int(direction),
+                            "target_size_pct_nav": float(target_size),
+                            "asof": asof_str,
+                            "created_at": proposal.created_at,
+                            "expires_at": proposal.expires_at,
+                        },
+                    )
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "audit_log.append failed for proposal %s: %s",
+                    proposal.proposal_id,
+                    e,
+                )
+
         # SQLite upsert
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -426,21 +476,21 @@ class ProposalExpiredError(ProposalStateError):
 # ---------------------------------------------------------------------------
 
 def _utc_now() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 def _iso(dt: datetime) -> str:
     """ISO 8601 UTC with seconds precision and `Z` suffix."""
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _iso_in_past(iso_str: str) -> bool:
     """True if the parsed ISO timestamp is < now-UTC."""
     try:
         ts = datetime.strptime(iso_str.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
-        ts = ts.replace(tzinfo=timezone.utc)
+        ts = ts.replace(tzinfo=UTC)
     except ValueError:
         # Unparsable timestamp — treat as expired (safer than letting
         # a malformed pending proposal hang forever)
