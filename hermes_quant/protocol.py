@@ -81,6 +81,8 @@ class AnalystView:
       - confidence is a CALIBRATED probability of directional correctness in [0, 1]
       - confidence_raw is the analyst's pre-calibration score (for debugging + calibrator training)
       - Until a fitted calibrator exists with N >= 200 samples, confidence = max(0, raw - 0.20)
+      - evidence_ids is a tuple of EvidenceRecord IDs (per ADR-0033) cited by this view.
+        Default empty for backward-compat (Phase 1).
     """
 
     analyst: str                     # name of the emitting analyst
@@ -93,6 +95,9 @@ class AnalystView:
     metadata: Mapping[str, Any] | None = None
     """Provider-specific extras (CIs, sub-scores, ...). JSON-serialized + capped at
     1024 chars when written to signal bus."""
+    evidence_ids: tuple[str, ...] = ()
+    """ADR-0033 D4: per-row provenance linkage. Phase 1 = optional. UUIDs as strings
+    (not UUID objects) to keep dataclass JSON-serializable for signal_bus."""
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +112,8 @@ class AggregatedSignal:
       - confidence is a CALIBRATED probability (same isotonic-regression approach as analysts)
       - components is the tuple of contributing AnalystViews — required for stacking/RL training
         (per ADR-0009 §P1-10 EpisodeOutcome)
+      - evidence_ids is a tuple of EvidenceRecord IDs (per ADR-0033) cited by this view.
+        Default empty for backward-compat (Phase 1).
     """
 
     asset: str
@@ -121,6 +128,9 @@ class AggregatedSignal:
     components: tuple[AnalystView, ...]   # frozen — required for joint-state replay
     aggregator: str                  # which aggregator emitted this ("bma", "stacking", "rl", ...)
     metadata: Mapping[str, Any] | None = None
+    evidence_ids: tuple[str, ...] = ()
+    """ADR-0033 D4: per-row provenance linkage. Phase 1 = optional. UUIDs as strings
+    (not UUID objects) to keep dataclass JSON-serializable for signal_bus."""
 
 
 # ---------------------------------------------------------------------------
