@@ -48,6 +48,7 @@ class PlayProfile:
 profile_covered_call = PlayProfile(
     name="covered_call",
     hard_rules={
+        "quote_type": ("eq", "EQUITY"),
         "market_cap_usd": ("between", 2e9, 1e11),
         "avg_dollar_volume_30d": ("ge", 5e6),
         "last_close": ("between", 10.0, 500.0),
@@ -59,6 +60,7 @@ profile_covered_call = PlayProfile(
         "distance_from_52w_high_pct": ("ge", -0.15),
     },
     eviction_rules={
+        "non_equity": ("ne_field", "quote_type", "EQUITY"),
         "market_cap_too_small": ("lt_field", "market_cap_usd", 1.5e9),
         "market_cap_too_large": ("gt_field", "market_cap_usd", 1.5e11),
         "adv_too_thin": ("lt_field", "avg_dollar_volume_30d", 2e6),
@@ -72,6 +74,7 @@ profile_covered_call = PlayProfile(
 profile_csp = PlayProfile(
     name="csp",
     hard_rules={
+        "quote_type": ("eq", "EQUITY"),
         "market_cap_usd": ("ge", 1e9),
         "avg_dollar_volume_30d": ("ge", 5e6),
         "debt_to_equity": ("lt", 2.0),
@@ -83,6 +86,7 @@ profile_csp = PlayProfile(
         "beta": ("between", 0.5, 1.5),
     },
     eviction_rules={
+        "non_equity": ("ne_field", "quote_type", "EQUITY"),
         "market_cap_too_small": ("lt_field", "market_cap_usd", 5e8),
         "adv_too_thin": ("lt_field", "avg_dollar_volume_30d", 2e6),
         "price_too_low": ("lt_field", "last_close", 5.0),
@@ -124,6 +128,7 @@ profile_wheel = PlayProfile(
 profile_leaps = PlayProfile(
     name="leaps",
     hard_rules={
+        "quote_type": ("eq", "EQUITY"),
         "market_cap_usd": ("ge", 1e10),
         "avg_dollar_volume_30d": ("ge", 1e7),
         "last_close": ("between", 20.0, 500.0),
@@ -136,6 +141,7 @@ profile_leaps = PlayProfile(
         "distance_from_52w_high_pct": ("ge", -0.20),
     },
     eviction_rules={
+        "non_equity": ("ne_field", "quote_type", "EQUITY"),
         "market_cap_too_small": ("lt_field", "market_cap_usd", 5e9),
         "adv_too_thin": ("lt_field", "avg_dollar_volume_30d", 5e6),
         "leverage_too_high": ("gt_field", "debt_to_equity", 2.0),
@@ -148,6 +154,7 @@ profile_leaps = PlayProfile(
 profile_swing = PlayProfile(
     name="swing",
     hard_rules={
+        "quote_type": ("eq", "EQUITY"),
         "avg_dollar_volume_30d": ("ge", 1e7),
         "last_close": ("between", 10.0, 500.0),
         "realized_vol_30d": ("between", 0.30, 1.50),
@@ -161,6 +168,7 @@ profile_swing = PlayProfile(
         "atr_pct_of_spot": ("gt", 0.02),
     },
     eviction_rules={
+        "non_equity": ("ne_field", "quote_type", "EQUITY"),
         "adv_too_thin": ("lt_field", "avg_dollar_volume_30d", 2e6),
         "vol_runaway": ("gt_field", "realized_vol_30d", 2.0),
     },

@@ -112,6 +112,12 @@ def _eval_rule(value: Any, rule: tuple) -> bool | None:
         return value <= rule[1]
     if op == "lt":
         return value < rule[1]
+    if op == "eq":
+        return value == rule[1]
+    if op == "in":
+        # ("in", (allowed_a, allowed_b, ...))
+        allowed = rule[1]
+        return value in allowed
     if op == "nonzero_window":
         lo, hi = rule[1], rule[2]
         return (lo < value < hi) and value != 0
@@ -138,6 +144,21 @@ def _eval_eviction(snapshot: dict, rule: tuple) -> bool:
         if _is_none_or_nan(v):
             return False
         return v > threshold
+    if op == "ne_field":
+        # ("ne_field", field_name, expected_value) — evict if field != expected.
+        # Treats missing data as NOT triggering eviction (silence-friendly).
+        _, field_name, expected = rule
+        v = snapshot.get(field_name)
+        if _is_none_or_nan(v):
+            return False
+        return v != expected
+    if op == "not_in_field":
+        # ("not_in_field", field_name, (allowed_a, ...)) — evict if not in set.
+        _, field_name, allowed = rule
+        v = snapshot.get(field_name)
+        if _is_none_or_nan(v):
+            return False
+        return v not in allowed
     raise ValueError(f"unknown eviction op: {op!r}")
 
 
@@ -289,6 +310,7 @@ SNAPSHOT_FIELDS: tuple[str, ...] = (
     "gross_margin",
     "revenue_growth_yoy",
     "days_since_earnings",
+    "quote_type",
 )
 
 
@@ -433,6 +455,12 @@ def compute_play_snapshot(symbol: str, asof: date | datetime | None = None) -> d
     snap["gross_margin"] = _safe_float(info.get("grossMargins"))
     snap["revenue_growth_yoy"] = _safe_float(info.get("revenueGrowth"))
 
+    # quoteType lets us skip earnings lookups (and other equity-specific paths)
+    # for ETFs / mutual funds / indices that don't have earnings cycles.
+    qt = info.get("quoteType")
+    if isinstance(qt, str):
+        snap["quote_type"] = qt.upper()
+
     # FCF yield = freeCashflow / marketCap (best-effort)
     fcf = _safe_float(info.get("freeCashflow"))
     mcap = snap["market_cap_usd"]
@@ -444,48 +472,71 @@ def compute_play_snapshot(symbol: str, asof: date | datetime | None = None) -> d
     # yfinance's Ticker.calendar gives the *next* earnings date; we want the
     # most recent past one. Fall back to earnings_dates DataFrame which has
     # both past and future events.
+    #
+    # ETFs / funds / indices don't have earnings — skip the lookup entirely
+    # to avoid (a) HTTP 404 spam on stderr that yfinance can't be told to
+    # silence and (b) wasted round-trips on hundreds of universe symbols.
     most_recent_past: datetime | None = None
-    try:
-        ed = tk.earnings_dates  # type: ignore[attr-defined]
-        if ed is not None and len(ed) > 0:
-            for ts in ed.index:
-                ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
-                if isinstance(ts_dt, datetime):
-                    if ts_dt.tzinfo is None:
-                        ts_dt = ts_dt.replace(tzinfo=UTC)
-                    if ts_dt <= asof_dt and (most_recent_past is None or ts_dt > most_recent_past):
-                        most_recent_past = ts_dt
-    except Exception:
-        most_recent_past = None
+    if snap["quote_type"] in {"ETF", "MUTUALFUND", "INDEX", "CURRENCY", "CRYPTOCURRENCY"}:
+        # Non-equity: leave days_since_earnings as None and let the
+        # post-block default fill in the safe-large placeholder. No HTTP.
+        pass
+    else:
+        # Defense in depth: even for equities, yfinance can spuriously 404 on
+        # earnings endpoints and print to stderr regardless of try/except.
+        # Suppress stderr around the earnings calls so cron logs stay clean.
+        import contextlib as _ctxlib
+        import io as _io
+
+        _err_buf = _io.StringIO()
+        with _ctxlib.redirect_stderr(_err_buf):
+            try:
+                ed = tk.earnings_dates  # type: ignore[attr-defined]
+                if ed is not None and len(ed) > 0:
+                    for ts in ed.index:
+                        ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+                        if isinstance(ts_dt, datetime):
+                            if ts_dt.tzinfo is None:
+                                ts_dt = ts_dt.replace(tzinfo=UTC)
+                            if ts_dt <= asof_dt and (most_recent_past is None or ts_dt > most_recent_past):
+                                most_recent_past = ts_dt
+            except Exception:
+                most_recent_past = None
 
     if most_recent_past is not None:
         snap["days_since_earnings"] = (asof_dt - most_recent_past).days
-    else:
+    elif snap["quote_type"] not in {"ETF", "MUTUALFUND", "INDEX", "CURRENCY", "CRYPTOCURRENCY"}:
         # Fall back to legacy calendar (next-earnings); flip sign sensibly.
-        try:
-            cal = tk.calendar
-            earnings_date: Any = None
-            if isinstance(cal, dict):
-                earnings_date = cal.get("Earnings Date")
-                if isinstance(earnings_date, list) and earnings_date:
-                    earnings_date = earnings_date[0]
-            if earnings_date is not None:
-                to_py = getattr(earnings_date, "to_pydatetime", None)
-                if callable(to_py):
-                    earnings_date = to_py()
-                if isinstance(earnings_date, datetime):
-                    if earnings_date.tzinfo is None:
-                        earnings_date = earnings_date.replace(tzinfo=UTC)
-                    delta = (asof_dt - earnings_date).days
-                    # Only trust this if it's a past date (positive delta).
-                    if delta >= 0:
-                        snap["days_since_earnings"] = delta
-                elif isinstance(earnings_date, date):
-                    delta = (asof_dt.date() - earnings_date).days
-                    if delta >= 0:
-                        snap["days_since_earnings"] = delta
-        except Exception:
-            pass
+        # Same stderr-suppression rationale as above.
+        import contextlib as _ctxlib
+        import io as _io
+
+        _err_buf2 = _io.StringIO()
+        with _ctxlib.redirect_stderr(_err_buf2):
+            try:
+                cal = tk.calendar
+                earnings_date: Any = None
+                if isinstance(cal, dict):
+                    earnings_date = cal.get("Earnings Date")
+                    if isinstance(earnings_date, list) and earnings_date:
+                        earnings_date = earnings_date[0]
+                if earnings_date is not None:
+                    to_py = getattr(earnings_date, "to_pydatetime", None)
+                    if callable(to_py):
+                        earnings_date = to_py()
+                    if isinstance(earnings_date, datetime):
+                        if earnings_date.tzinfo is None:
+                            earnings_date = earnings_date.replace(tzinfo=UTC)
+                        delta = (asof_dt - earnings_date).days
+                        # Only trust this if it's a past date (positive delta).
+                        if delta >= 0:
+                            snap["days_since_earnings"] = delta
+                    elif isinstance(earnings_date, date):
+                        delta = (asof_dt.date() - earnings_date).days
+                        if delta >= 0:
+                            snap["days_since_earnings"] = delta
+            except Exception:
+                pass
 
     # If no earnings date is available, default to a safe-large value so
     # covered_call's days_since_earnings>=5 doesn't auto-fail purely on

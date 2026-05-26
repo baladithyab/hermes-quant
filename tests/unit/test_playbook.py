@@ -28,6 +28,7 @@ from hermes_quant.playbook import (
 def _good_covered_call_snapshot() -> dict:
     return {
         "symbol": "GOODCC",
+        "quote_type": "EQUITY",
         "last_close": 50.0,
         "market_cap_usd": 5e9,           # mid-cap
         "avg_dollar_volume_30d": 2e7,    # liquid
@@ -59,6 +60,7 @@ def _good_csp_snapshot() -> dict:
 def _good_leaps_snapshot() -> dict:
     return {
         "symbol": "GOODLEAP",
+        "quote_type": "EQUITY",
         "last_close": 100.0,
         "market_cap_usd": 5e10,
         "avg_dollar_volume_30d": 5e7,
@@ -82,6 +84,7 @@ def _good_leaps_snapshot() -> dict:
 def _good_swing_snapshot() -> dict:
     return {
         "symbol": "GOODSWG",
+        "quote_type": "EQUITY",
         "last_close": 80.0,
         "market_cap_usd": 5e10,
         "avg_dollar_volume_30d": 3e7,
@@ -314,3 +317,59 @@ def test_score_formula_all_hard_no_soft() -> None:
     # score should be 0.6 * 1.0 + 0.4 * 0.0 = 0.6 → not eligible (<0.65)
     assert fit.score == pytest.approx(0.6, abs=1e-6)
     assert fit.eligible is False
+
+
+# --------------------------------------------------------------------------- #
+# Equity-only gate: ETFs / funds / indices must be rejected by every play
+# Regression test for the May-26 noisy-yfinance bug where ETFs ran the full
+# scoring pipeline because no profile required `quote_type == "EQUITY"`.
+# --------------------------------------------------------------------------- #
+
+
+def _etf_snapshot(quote_type: str = "ETF") -> dict:
+    """Snapshot that would otherwise pass every play's hard rules but is
+    flagged as a non-equity instrument via quoteType."""
+    s = _good_covered_call_snapshot()
+    s["symbol"] = f"GOOD{quote_type}"
+    s["quote_type"] = quote_type
+    return s
+
+
+@pytest.mark.parametrize("play_name", ["covered_call", "csp", "wheel", "leaps", "swing"])
+@pytest.mark.parametrize("quote_type", ["ETF", "MUTUALFUND", "INDEX", "CURRENCY", "CRYPTOCURRENCY"])
+def test_non_equity_instruments_rejected_by_all_plays(
+    play_name: str, quote_type: str
+) -> None:
+    """Every play in the playbook must reject non-equity instruments outright,
+    both via hard-rule (pass_hard=False) AND via eviction (eligible=False with
+    'evict:non_equity' in failed_rules). This double-gate prevents ETFs from
+    entering the watchlist regardless of evict_floor configuration."""
+    snap = _etf_snapshot(quote_type)
+    # Override fields so ONLY the quote_type rule blocks it — proves the gate.
+    snap["last_close"] = 50.0
+    snap["market_cap_usd"] = 5e10
+    snap["avg_dollar_volume_30d"] = 5e7
+    snap["debt_to_equity"] = 0.4
+    snap["realized_vol_30d"] = 0.40
+
+    fit = score_all(snap)[play_name]
+    assert fit.eligible is False, (
+        f"{play_name} accepted a {quote_type} instrument: {fit}"
+    )
+    # Wheel prefixes inherited eviction rules with cc_/csp_, so accept any
+    # 'evict:*non_equity' rule name. The hard-rule failure is also acceptable.
+    has_evict = any("non_equity" in r for r in fit.failed_rules)
+    has_hard_fail = any("quote_type" in r for r in fit.failed_rules)
+    assert has_evict or has_hard_fail, (
+        f"{play_name} failed to reject {quote_type}: {fit.failed_rules}"
+    )
+
+
+def test_missing_quote_type_silenced_by_default() -> None:
+    """If quote_type is missing entirely (data outage), the eq hard-rule
+    should fail-safe to silence (pass_hard=False) rather than guess."""
+    s = _good_covered_call_snapshot()
+    s.pop("quote_type", None)
+    fit = score_covered_call(s)
+    assert fit.pass_hard is False
+    assert any("quote_type" in r for r in fit.failed_rules)
