@@ -57,9 +57,13 @@ stacking = ["scikit-learn>=1.3", "scipy>=1.11"]
 backtest = ["matplotlib>=3.7", "seaborn>=0.13"]
 # MLflow integration (optional — defaults to file backend)
 mlflow = ["mlflow>=2.10"]
+# Options pricing kernel — pure-Python, vendored from optlib (MIT).
+# scipy is already pulled in via [stacking]; numpy is a base dep.
+# Empty extra is kept so consumers can opt-in symbolically (e.g. `pip install hermes-quant[options]`).
+options = []
 # Convenience: full feature set excluding GPU-only torch builds
 all = [
-    "hermes-quant[yfinance,ccxt,alpaca,kronos,stacking,backtest,mlflow]",
+    "hermes-quant[yfinance,ccxt,alpaca,kronos,stacking,backtest,mlflow,options]",
 ]
 # Dev / testing
 dev = [
@@ -105,13 +109,22 @@ packages = [
     "hermes_quant.daemon",
     "hermes_quant.data",
     "hermes_quant.evaluation",
+    "hermes_quant.options",
+    "hermes_quant.options.pricing",
     "hermes_quant.risk",
     "hermes_quant.skills",
     "hermes_quant.training",
 ]
 
 [tool.setuptools.package-data]
-hermes_quant = ["plugin.yaml", "skills/**/*", "consumers/freqtrade/*.py", "consumers/freqtrade/*.json.example"]
+hermes_quant = [
+    "plugin.yaml",
+    "skills/**/*",
+    "consumers/freqtrade/*.py",
+    "consumers/freqtrade/*.json.example",
+    "options/pricing/LICENSE.optlib",
+    "options/pricing/README.md",
+]
 
 [tool.ruff]
 line-length = 100
