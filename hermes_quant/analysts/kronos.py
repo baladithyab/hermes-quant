@@ -22,7 +22,7 @@ Charter clauses honored:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -78,6 +78,22 @@ class KronosConfig:
 
     horizon_label: str = "1d"
     """The horizon string written to AnalystView (consumed by aggregator)."""
+
+    max_magnitude_per_horizon: dict[str, float] = field(
+        default_factory=lambda: {"1d": 0.10, "5d": 0.20, "20d": 0.40}
+    )
+    """Per-horizon hard cap on |magnitude| (signed return). Foundation-model
+    overconfidence guard for volatile names — Kronos can occasionally emit
+    physically implausible magnitudes (e.g. AMD daily forecast 36.6%, vs.
+    realized mega-cap equity 1d std ~2-3%). The cap is applied AFTER the
+    distributional median is taken; direction and confidence_raw (path
+    agreement) are preserved. Defaults are loose enough to admit real
+    macro-shock days but reject foundation-model hallucinations:
+      - 1d: 10%   (>3σ for liquid mega-caps)
+      - 5d: 20%   (~weekly tail)
+      - 20d: 40%  (~monthly tail)
+    Lookup is by `horizon_label`; missing keys disable clipping for that
+    horizon. Codex MED 2026-05-26."""
 
     deterministic_seed: int | None = 42
     """RNG seed for path sampling. The charter requires every signal
@@ -156,6 +172,14 @@ class KronosAnalyst:
             last_close=float(bars["close"].iloc[-1]),
         )
 
+        # Per-horizon magnitude clip (foundation-model hallucination guard;
+        # Codex MED 2026-05-26 — AMD 1d forecast hit 36.6%). Applied AFTER
+        # direction/confidence are derived so path-agreement signal is
+        # preserved; only |magnitude| is bounded.
+        magnitude, magnitude_clipped = self._clip_magnitude(
+            magnitude, direction=direction
+        )
+
         # ColdStart shrinkage (-0.20 until calibrator has 200+ samples)
         confidence = self.calibrator.calibrate(raw_confidence)
 
@@ -180,6 +204,7 @@ class KronosAnalyst:
                     raw_confidence == self.config.raw_confidence_clip_high
                     or raw_confidence == self.config.raw_confidence_clip_low
                 ),
+                "magnitude_clipped": magnitude_clipped,
             },
         )
 
@@ -362,6 +387,42 @@ class KronosAnalyst:
         )
 
         return direction, magnitude, raw_confidence
+
+    def _clip_magnitude(
+        self,
+        magnitude: float,
+        *,
+        direction: Direction,
+    ) -> tuple[float, bool]:
+        """Apply per-horizon magnitude cap.
+
+        Per Codex MED 2026-05-26: Kronos can emit physically implausible
+        magnitudes on volatile names (e.g. AMD 1d=36.6%, vs realized
+        mega-cap equity 1d std ~2-3%). The cap from
+        ``config.max_magnitude_per_horizon[horizon_label]`` bounds
+        ``|magnitude|`` while leaving direction/confidence intact.
+
+        Returns (clipped_magnitude, was_clipped).
+        Missing horizon key → no clipping (returns input unchanged).
+        """
+        cap = self.config.max_magnitude_per_horizon.get(
+            self.config.horizon_label
+        )
+        if cap is None:
+            return magnitude, False
+        if magnitude <= cap:
+            return magnitude, False
+
+        logger.warning(
+            "kronos: magnitude %.4f exceeds cap %.4f for horizon=%s "
+            "(direction=%+d) — clipping. This indicates foundation-model "
+            "overconfidence on a volatile name; review the symbol.",
+            magnitude,
+            cap,
+            self.config.horizon_label,
+            direction,
+        )
+        return float(cap), True
 
 
 # ---------------------------------------------------------------------------

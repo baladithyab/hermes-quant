@@ -413,3 +413,102 @@ def test_config_clip_overrides_apply():
     view = a.analyze(_make_ctx())
     # 1.0 clipped to high=0.95 (not 0.85)
     assert view.confidence_raw == pytest.approx(0.95)
+
+
+# ---------------------------------------------------------------------------
+# Magnitude clip per horizon (Codex MED 2026-05-26)
+# ---------------------------------------------------------------------------
+
+
+class _MagnitudePredictor:
+    """Predictor that emits a fixed *signed* return on every path.
+
+    Lets tests directly drive the (direction, magnitude) the analyst sees
+    without juggling sample_count / agreement bookkeeping. signed_return
+    is applied to every path, so path-agreement is unanimous and the
+    median pct_return == signed_return exactly.
+    """
+
+    def __init__(self, signed_return: float):
+        self.signed_return = signed_return
+
+    def predict_distributional(self, df, pred_len, sample_count):
+        last = float(df["close"].iloc[-1])
+        end = last * (1.0 + self.signed_return)
+        return np.array(
+            [[[end, end, end, end, 100.0] for _ in range(pred_len)]
+             for _ in range(sample_count)]
+        )
+
+
+def test_magnitude_clip_high(caplog):
+    """Forecast 0.50 with cap 0.10 → returns 0.10, log fires."""
+    cfg = KronosConfig(max_magnitude_per_horizon={"1d": 0.10})
+    fake = _MagnitudePredictor(signed_return=0.50)
+    a = KronosAnalyst(config=cfg, _predictor_factory=lambda: fake)
+    with caplog.at_level("WARNING", logger="hermes_quant.analysts.kronos"):
+        view = a.analyze(_make_ctx())
+    assert view is not None
+    assert view.direction == 1
+    assert view.magnitude == pytest.approx(0.10)
+    assert (view.metadata or {}).get("magnitude_clipped") is True
+    # Log fires: must mention "magnitude" and the cap or clipping
+    assert any(
+        "magnitude" in rec.getMessage().lower() and "clip" in rec.getMessage().lower()
+        for rec in caplog.records
+    ), f"Expected magnitude-clip warning; got: {[r.getMessage() for r in caplog.records]}"
+
+
+def test_magnitude_clip_low(caplog):
+    """Forecast -0.50 with cap 0.10 → magnitude returns 0.10, direction stays -1."""
+    cfg = KronosConfig(max_magnitude_per_horizon={"1d": 0.10})
+    fake = _MagnitudePredictor(signed_return=-0.50)
+    a = KronosAnalyst(config=cfg, _predictor_factory=lambda: fake)
+    with caplog.at_level("WARNING", logger="hermes_quant.analysts.kronos"):
+        view = a.analyze(_make_ctx())
+    assert view is not None
+    assert view.direction == -1
+    # magnitude is |median_return|; clipped to cap → 0.10
+    assert view.magnitude == pytest.approx(0.10)
+    assert (view.metadata or {}).get("magnitude_clipped") is True
+    # Confidence is unchanged by clipping (path agreement is unanimous → 0.85)
+    assert view.confidence_raw == pytest.approx(0.85)
+
+
+def test_magnitude_no_clip():
+    """Forecast 0.05 with cap 0.10 → unchanged, no warning."""
+    cfg = KronosConfig(max_magnitude_per_horizon={"1d": 0.10})
+    fake = _MagnitudePredictor(signed_return=0.05)
+    a = KronosAnalyst(config=cfg, _predictor_factory=lambda: fake)
+    view = a.analyze(_make_ctx())
+    assert view is not None
+    assert view.direction == 1
+    assert view.magnitude == pytest.approx(0.05)
+    assert (view.metadata or {}).get("magnitude_clipped") is False
+
+
+def test_config_override_clip_propagates():
+    """Custom cap config propagates correctly per horizon_label."""
+    # Tighter cap on 1d, but our analyst uses horizon_label="5d" with looser cap
+    cfg = KronosConfig(
+        horizon_label="5d",
+        max_magnitude_per_horizon={"1d": 0.05, "5d": 0.25},
+    )
+    fake = _MagnitudePredictor(signed_return=0.20)
+    a = KronosAnalyst(config=cfg, _predictor_factory=lambda: fake)
+    view = a.analyze(_make_ctx())
+    # 0.20 < 5d cap (0.25) → no clip
+    assert view.magnitude == pytest.approx(0.20)
+    assert (view.metadata or {}).get("magnitude_clipped") is False
+
+    # Now flip to 1d horizon with the same cap dict — same forecast hits 0.05 cap
+    cfg2 = KronosConfig(
+        horizon_label="1d",
+        max_magnitude_per_horizon={"1d": 0.05, "5d": 0.25},
+    )
+    fake2 = _MagnitudePredictor(signed_return=0.20)
+    a2 = KronosAnalyst(config=cfg2, _predictor_factory=lambda: fake2)
+    view2 = a2.analyze(_make_ctx())
+    assert view2.magnitude == pytest.approx(0.05)
+    assert (view2.metadata or {}).get("magnitude_clipped") is True
+    assert view2.horizon == "1d"
