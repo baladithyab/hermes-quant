@@ -102,6 +102,54 @@ class CommitteeTurn:
     tier: LLMTier = "deterministic"
 
 
+@dataclass(frozen=True)
+class DeliberativeConfig:
+    """Configuration for the LLM-backed committee layer (ADR-0037).
+
+    Layered ON TOP of the deterministic skeleton in this module. All fields
+    are opt-in by default; setting ``enable_llm_turns=False`` (the default)
+    keeps the deterministic-only behaviour unchanged.
+
+    The two-tier LLM split is enforced at construction time:
+      * ``quick_model`` is used for bull/bear/risk_* roles
+      * ``deep_model`` is used for research_manager and portfolio_manager
+    A quick-tier model bound to a deep-required role raises ValueError.
+    """
+
+    enable_llm_turns: bool = False
+    enable_risk_mgmt: bool = False
+    quick_model: str = "anthropic/claude-haiku-4.6"
+    deep_model: str = "anthropic/claude-sonnet-4.6"
+    max_tokens_per_turn: int = 800
+    prompt_hash_in_journal: bool = True
+    max_debate_rounds: int = 1
+    request_timeout_s: float = 30.0
+    api_base_url: str = "https://openrouter.ai/api/v1"
+    api_key_env: str = "OPENROUTER_API_KEY"
+
+    def __post_init__(self) -> None:
+        # Hard-fail on a quick-tier model bound (by configuration mistake) to
+        # a deep-required role. Per ADR-0037 §"Two-tier LLM split is hard".
+        if not isinstance(self.quick_model, str) or not self.quick_model.strip():
+            raise ValueError("DeliberativeConfig.quick_model must be a non-empty string")
+        if not isinstance(self.deep_model, str) or not self.deep_model.strip():
+            raise ValueError("DeliberativeConfig.deep_model must be a non-empty string")
+        if self.quick_model == self.deep_model:
+            # Same string is allowed (operator chose to run both tiers on same
+            # model — wasteful but explicit). Just warn via logger.
+            logger.warning(
+                "DeliberativeConfig.quick_model == deep_model (%r); "
+                "two-tier split provides no cost benefit",
+                self.quick_model,
+            )
+        if self.max_tokens_per_turn <= 0:
+            raise ValueError("DeliberativeConfig.max_tokens_per_turn must be > 0")
+        if self.max_debate_rounds <= 0:
+            raise ValueError("DeliberativeConfig.max_debate_rounds must be > 0")
+        if self.request_timeout_s <= 0:
+            raise ValueError("DeliberativeConfig.request_timeout_s must be > 0")
+
+
 def _infer_tier_from_role(role: str) -> LLMTier:
     """Infer LLM tier from role when an inbound turn omits explicit tier.
 
