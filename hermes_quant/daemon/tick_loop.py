@@ -23,7 +23,9 @@ v0.1.1's bottleneck is yfinance rate limiting, not loop concurrency.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -36,6 +38,7 @@ from hermes_quant.daemon.signal_bus import (
     SIGNAL_BUS_PATH,
     emit_signal_record,
 )
+from hermes_quant.daemon.watermark import Watermark, WatermarkStore
 from hermes_quant.data.base import fetch_with_chain
 from hermes_quant.protocol import (
     Action,
@@ -51,6 +54,45 @@ from hermes_quant.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ADR-0038 §D.1 — watermark integration is opt-in. When unset/`0`, this
+# module's behaviour is bit-identical to legacy: no watermark reads, no
+# writes, and `WatermarkStore` is never constructed.
+_WATERMARK_ENV = "HERMES_QUANT_WATERMARK_ENABLED"
+
+
+def _watermark_enabled() -> bool:
+    return os.environ.get(_WATERMARK_ENV, "0").strip() == "1"
+
+
+def _compute_indicator_snapshot_hash(ctx: MarketContext) -> str:
+    """Compute the 16-hex-char snapshot hash per ADR-0038 §D.1.
+
+    Hash projection: a deterministic tuple of MarketContext identity +
+    bar-summary fields — `(asset, timeframe, asset_class, exchange,
+    last_close, last_volume, asof_iso)`. We deliberately do NOT hash the
+    full bars DataFrame: bars include a rolling backfill window that
+    shifts each tick, so its hash would never match across runs even for
+    the same `bar_ts`. The projected fields uniquely identify the bar
+    that was processed; mismatch on replay is a strong signal of an
+    upstream data revision.
+    """
+    asof = ctx.asof
+    if asof.tzinfo is not None:
+        asof = asof.tz_convert("UTC").tz_localize(None)
+    payload = "|".join(
+        [
+            ctx.asset,
+            ctx.timeframe,
+            ctx.asset_class,
+            ctx.exchange or "",
+            f"{float(ctx.last_close):.10g}",
+            f"{float(ctx.last_volume):.10g}",
+            asof.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        ]
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
 
 
 @dataclass
@@ -73,6 +115,7 @@ class TickLoopState:
     last_signals_emitted: int = 0
     n_ticks: int = 0
     n_errors: int = 0
+    n_skipped_watermark: int = 0  # ADR-0038 §D.1: replays skipped via watermark.
     active_assets: list[str] = field(default_factory=list)
 
 
@@ -128,6 +171,7 @@ def run_one_tick(
     state: TickLoopState,
     bus_path=SIGNAL_BUS_PATH,
     asof: pd.Timestamp | None = None,
+    watermark_store: WatermarkStore | None = None,
 ) -> int:
     """Run one tick. Returns number of non-silent signals emitted.
 
@@ -142,6 +186,11 @@ def run_one_tick(
         state: mutable TickLoopState updated in place.
         bus_path: signal bus.
         asof: tick timestamp; default now.
+        watermark_store: optional injected WatermarkStore. When None and
+            `HERMES_QUANT_WATERMARK_ENABLED=1`, a default-path store is
+            constructed. When None and the flag is unset, the watermark
+            path is not exercised at all (legacy bit-identical behaviour
+            per ADR-0038 §D.1).
 
     Returns:
         Number of non-silent Actions emitted to the bus.
@@ -150,6 +199,16 @@ def run_one_tick(
     state.n_ticks += 1
     state.last_tick_at = asof
     state.active_assets = [t.asset for t in tasks]
+
+    # ADR-0038 §D.1: lazily resolve watermark store when the env flag is
+    # set and no caller-injected store was provided. Resolve once per tick
+    # so all assets share one connection-pool / cache.
+    if watermark_store is None and _watermark_enabled():
+        try:
+            watermark_store = WatermarkStore()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("watermark store init failed; disabling for this tick: %s", e)
+            watermark_store = None
 
     # Auto-clear expired halts
     try:
@@ -194,6 +253,46 @@ def run_one_tick(
                 last_volume=last_vol,
                 asof=asof,
             )
+
+            # ADR-0038 §D.1 — watermark short-circuit. We use the LAST bar's
+            # timestamp as `bar_ts` (the upper bound of what's been
+            # processed). If the watermark says we've already processed a
+            # bar at-or-after this `bar_ts`, this is a replay (same tick
+            # already journaled); skip it. The optional snapshot-hash
+            # mismatch is logged at WARNING level but never raised — an
+            # upstream data revision should not crash the daemon.
+            bar_ts = pd.Timestamp(bars["timestamp"].iloc[-1])
+            if bar_ts.tzinfo is not None:
+                bar_ts = bar_ts.tz_convert("UTC").tz_localize(None)
+            if watermark_store is not None:
+                try:
+                    wm = watermark_store.get(task.asset)
+                except ValueError as e:
+                    logger.warning(
+                        "corrupt watermark for %s; treating as missing: %s",
+                        task.asset,
+                        e,
+                    )
+                    wm = None
+                if wm is not None and wm.last_processed_bar_ts >= bar_ts:
+                    new_hash = _compute_indicator_snapshot_hash(ctx)
+                    if new_hash != wm.indicator_snapshot_hash:
+                        logger.warning(
+                            "watermark hash mismatch for %s at bar_ts=%s "
+                            "(stored=%s, recomputed=%s); skipping replay anyway",
+                            task.asset,
+                            bar_ts,
+                            wm.indicator_snapshot_hash,
+                            new_hash,
+                        )
+                    logger.info(
+                        "skipping replay for %s: bar_ts=%s <= watermark=%s",
+                        task.asset,
+                        bar_ts,
+                        wm.last_processed_bar_ts,
+                    )
+                    state.n_skipped_watermark += 1
+                    continue
 
             # Run analysts
             views = []
@@ -275,6 +374,33 @@ def run_one_tick(
                 action.target_position_pct,
                 action.reason,
             )
+
+            # ADR-0038 §D.1 — watermark write happens AFTER the emit
+            # returns, so on crash mid-tick we may re-emit the same
+            # `(symbol, bar_ts)` exactly once on next start; downstream
+            # consumers idempotency-key on `signal_id`.
+            if watermark_store is not None:
+                try:
+                    now = pd.Timestamp.utcnow()
+                    if now.tzinfo is not None:
+                        now = now.tz_convert("UTC").tz_localize(None)
+                    watermark_store.set(
+                        Watermark(
+                            symbol=task.asset,
+                            last_processed_bar_ts=bar_ts,
+                            indicator_snapshot_hash=_compute_indicator_snapshot_hash(ctx),
+                            updated_at=now,
+                        )
+                    )
+                except Exception as e:  # noqa: BLE001
+                    # Watermark failure is non-fatal — the bar was already
+                    # journaled; worst case we re-process it next tick.
+                    logger.warning(
+                        "watermark write failed for %s at bar_ts=%s: %s",
+                        task.asset,
+                        bar_ts,
+                        e,
+                    )
 
         except DataQualityError as e:
             logger.warning("data quality issue for %s: %s", task.asset, e)

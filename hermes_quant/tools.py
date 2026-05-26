@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -923,6 +925,10 @@ def quant_doctor(args: dict, **_kwargs) -> str:
         drift_recent_n: how many recent signals to use as the "recent"
             window for drift comparison (default 50).
         drift_threshold: absolute confidence delta to flag (default 0.15).
+        daemon_state: include content-presence DaemonState mirror per
+            ADR-0038 §D.3 / P6 (default True).
+        daemon_state_per_symbol_n: how many recent rows per symbol to
+            walk when inferring stage status (default 10).
     """
     # Re-read module attrs from the LIVE module dict via sys.modules — pytest's
     # import system can produce duplicate module-dict instances under certain
@@ -941,6 +947,8 @@ def quant_doctor(args: dict, **_kwargs) -> str:
     include_drift = args.get("drift", True)
     drift_recent_n = int(args.get("drift_recent_n", 50))
     drift_threshold = float(args.get("drift_threshold", 0.15))
+    include_daemon_state = args.get("daemon_state", True)
+    daemon_state_per_symbol_n = int(args.get("daemon_state_per_symbol_n", 10))
     pid = _daemon_pid()
 
     checks = {
@@ -976,9 +984,13 @@ def quant_doctor(args: dict, **_kwargs) -> str:
     try:
         import torch
 
-        optional_libs["torch_version"] = torch.__version__
-        optional_libs["torch_cuda_available"] = torch.cuda.is_available()
-    except ImportError:
+        optional_libs["torch_version"] = getattr(torch, "__version__", "unknown")
+        optional_libs["torch_cuda_available"] = (
+            torch.cuda.is_available() if hasattr(torch, "cuda") else False
+        )
+    except (ImportError, AttributeError):
+        # AttributeError catches the case where a stub or partially-mocked
+        # torch module is on sys.modules without the standard surface.
         pass
 
     # V03-6: analyst confidence-drift surface
@@ -990,6 +1002,14 @@ def quant_doctor(args: dict, **_kwargs) -> str:
             signal_bus_path=_SIGNAL_BUS_PATH,
         )
 
+    # ADR-0038 §D.3 (P6): content-presence DaemonState mirror
+    daemon_state_block = None
+    if include_daemon_state:
+        daemon_state_block = _compute_daemon_state_mirror(
+            signal_bus_path=_SIGNAL_BUS_PATH,
+            per_symbol_n=daemon_state_per_symbol_n,
+        )
+
     return json.dumps(
         {
             "success": True,
@@ -998,6 +1018,7 @@ def quant_doctor(args: dict, **_kwargs) -> str:
             "optional_libs": optional_libs,
             "include_calibration": include_calibration,
             "drift": drift_block,
+            "daemon_state": daemon_state_block,
             "next_step": (
                 "1. `hermes quant setup` to write config\n"
                 "2. `hermes quant start` to launch daemon (NOT YET IMPLEMENTED in v0.1.0 scaffold)\n"
@@ -1006,6 +1027,235 @@ def quant_doctor(args: dict, **_kwargs) -> str:
         },
         default=str,
     )
+
+
+# ---------------------------------------------------------------------------
+# ADR-0038 §D.3 (P6) — DaemonState content-presence mirror
+# ---------------------------------------------------------------------------
+
+# Stage discriminator: BarSnapshot slot key (V2 rows) OR legacy-row indicator key.
+# The order is the canonical pipeline order — useful for renderers.
+_STAGE_ORDER: tuple[str, ...] = (
+    "ohlcv",
+    "indicators",
+    "analysts",
+    "aggregated",
+    "risk",
+    "final",
+)
+
+
+def _infer_stages_for_row(row: dict[str, Any]) -> set[str]:
+    """Return the set of pipeline stages "seen" in a single JSONL row.
+
+    Works for both:
+      * V2 typed rows — checks BarSnapshot top-level slot keys.
+      * Legacy rows (`tick_loop._build_signal_record` shape) — infers
+        from key presence (components, aggregator, target_position_pct, ...).
+    """
+    seen: set[str] = set()
+    # V2-typed row detection: presence of the BarSnapshot top-level keys.
+    if "meta" in row and isinstance(row.get("meta"), dict):
+        if row.get("ohlcv") is not None:
+            seen.add("ohlcv")
+        if row.get("indicators") is not None:
+            seen.add("indicators")
+        if row.get("analyst_views"):
+            seen.add("analysts")
+        if row.get("aggregated_signal") is not None:
+            seen.add("aggregated")
+        if row.get("risk_check") is not None:
+            seen.add("risk")
+        if row.get("final_decision") is not None:
+            seen.add("final")
+        return seen
+
+    # Legacy row: every emitted record went through ohlcv → analysts →
+    # aggregated → risk → final, so presence of these keys implies the stage ran.
+    if row.get("type") == "heartbeat":
+        return seen
+    if row.get("decision_price") is not None:
+        seen.add("ohlcv")
+    if row.get("components"):
+        seen.add("analysts")
+    if row.get("aggregator"):
+        seen.add("aggregated")
+    if "target_position_pct" in row:
+        seen.add("risk")
+        seen.add("final")
+    return seen
+
+
+def _bar_ts_from_row(row: dict[str, Any]) -> str | None:
+    """Extract the canonical bar_ts string from a V2 or legacy row."""
+    # V2 rows put bar_ts at top-level
+    if "bar_ts" in row:
+        return row.get("bar_ts")
+    # Legacy rows use 'asof' as the decision timestamp; for dedup that's fine.
+    return row.get("asof")
+
+
+def _symbol_from_row(row: dict[str, Any]) -> str | None:
+    """Extract symbol from a V2 or legacy row."""
+    if "symbol" in row:
+        return row.get("symbol")
+    return row.get("asset")
+
+
+def _compute_daemon_state_mirror(
+    *,
+    signal_bus_path: Path,
+    per_symbol_n: int = 10,
+) -> dict[str, Any]:
+    """Build the DaemonState content-presence mirror (ADR-0038 §D.3 / P6).
+
+    Reads the last N rows of signals.jsonl per symbol and infers stage
+    status from BarSnapshot slot presence (or legacy key presence).
+    Dedup via `_seen_event_ids: set` keyed on `(symbol, bar_ts)`
+    (matches TradingAgents `_processed_message_ids` pattern).
+
+    Returns a dict shaped like
+    `hermes_quant.schemas.bar_snapshot.SymbolStatus` /
+    `HaltSummary` (model_dump form), so callers don't need pydantic.
+
+    Read-only: never raises on bus parse errors — returns empty mirror.
+    """
+    # Lazy imports — keep the doctor handler import-cheap.
+    try:
+        # We read these for typed validation but the public output is dicts.
+        from hermes_quant.schemas import HaltSummary, SymbolStatus  # noqa: F401
+    except ImportError:  # pragma: no cover — schemas package always present in v0.4
+        HaltSummary = None  # type: ignore[assignment]  # noqa: N806, F841
+        SymbolStatus = None  # type: ignore[assignment]  # noqa: N806, F841
+
+    if not signal_bus_path.exists():
+        return {
+            "per_symbol": {},
+            "halts": [],
+            "last_heartbeat_age_s": None,
+            "journal_pending_count": 0,
+            "note": "signal bus does not exist yet",
+        }
+
+    # Read a generous tail — we'll filter to last per_symbol_n per symbol.
+    # 200 rows total is enough for typical configs (1-20 symbols × 10 each).
+    raw_rows = _read_jsonl_tail(signal_bus_path, max(200, per_symbol_n * 20))
+
+    # Dedup events by (symbol, bar_ts) — TradingAgents _processed_message_ids
+    _seen_event_ids: set[tuple[str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in raw_rows:
+        sym = _symbol_from_row(row)
+        ts = _bar_ts_from_row(row)
+        if sym is None or ts is None:
+            # Heartbeats / malformed — skip silently
+            continue
+        key = (sym, ts)
+        if key in _seen_event_ids:
+            continue
+        _seen_event_ids.add(key)
+        deduped.append(row)
+
+    # Group by symbol, keeping last per_symbol_n rows per symbol
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for row in deduped:
+        sym = _symbol_from_row(row)
+        if sym is None:
+            continue
+        by_symbol.setdefault(sym, []).append(row)
+    for sym in by_symbol:
+        by_symbol[sym] = by_symbol[sym][-per_symbol_n:]
+
+    # Per-symbol status
+    per_symbol_out: dict[str, dict[str, Any]] = {}
+    for sym, rows in by_symbol.items():
+        stages_seen: set[str] = set()
+        last_bar_ts: str | None = None
+        last_action_dir: int | None = None
+        last_action_conf: float | None = None
+        for row in rows:
+            stages_seen |= _infer_stages_for_row(row)
+            ts = _bar_ts_from_row(row)
+            if ts is not None:
+                last_bar_ts = ts
+            # Action dir/conf: prefer typed slot, fall back to legacy keys
+            fd = row.get("final_decision")
+            if isinstance(fd, dict):
+                # V2: target_position_pct sign → direction; we surface direction
+                # from aggregated_signal slot for explicit dir
+                ag = row.get("aggregated_signal")
+                if isinstance(ag, dict):
+                    last_action_dir = ag.get("direction")
+                    last_action_conf = ag.get("confidence")
+            elif "direction" in row:
+                last_action_dir = row.get("direction")
+                last_action_conf = row.get("confidence")
+
+        # Stable ordered list of stages
+        ordered = [s for s in _STAGE_ORDER if s in stages_seen]
+        per_symbol_out[sym] = {
+            "last_bar_ts": last_bar_ts,
+            "stages_seen": ordered,
+            "last_action_dir": last_action_dir,
+            "last_action_conf": last_action_conf,
+        }
+
+    # Halt summary (read-only mirror)
+    halts_out: list[dict[str, Any]] = []
+    try:
+        from hermes_quant.daemon.halt_state import HaltStateSQLite
+
+        hs = HaltStateSQLite()
+        for h in hs.active_halts():
+            halts_out.append(
+                {
+                    "account_id": h.account_id,
+                    "asset_class": h.asset_class,
+                    "asset": h.asset,
+                    "reason": h.reason,
+                    "halted_at": str(h.halted_at),
+                    "halted_until": (str(h.halted_until) if h.halted_until else None),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — read-only diagnostic; never crash
+        logger.debug("daemon_state: halt registry read failed: %s", exc)
+
+    # Last heartbeat age (seconds)
+    last_heartbeat_age_s: float | None = None
+    try:
+        recent = _read_jsonl_tail(signal_bus_path, 50)
+        heartbeats = [r for r in recent if r.get("type") == "heartbeat"]
+        if heartbeats:
+            last_hb = heartbeats[-1]
+            ts_str = last_hb.get("asof") or last_hb.get("ts")
+            if ts_str:
+                import pandas as pd
+
+                last_heartbeat_age_s = float(
+                    (pd.Timestamp.utcnow().tz_localize(None) - pd.Timestamp(ts_str).tz_localize(None)).total_seconds()
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("daemon_state: heartbeat parse failed: %s", exc)
+        last_heartbeat_age_s = None
+
+    # Journal pending count
+    journal_pending_count = 0
+    try:
+        from hermes_quant.proposals import get_default_store
+
+        store = get_default_store()
+        journal_pending_count = len(store.list_pending(limit=1000))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("daemon_state: pending-proposal read failed: %s", exc)
+
+    return {
+        "per_symbol": per_symbol_out,
+        "halts": halts_out,
+        "last_heartbeat_age_s": last_heartbeat_age_s,
+        "journal_pending_count": journal_pending_count,
+        "n_dedup_events": len(_seen_event_ids),
+        "_walked_at": time.time(),
+    }
 
 
 def _compute_drift_surface(
@@ -1056,7 +1306,7 @@ def _compute_drift_surface(
       }
     """
     # Read the full bus (capped to a reasonable max for safety)
-    MAX_LIFETIME = 5000
+    MAX_LIFETIME = 5000  # noqa: N806 — module-level constant referenced inside a function-level helper
     bus_path = signal_bus_path if signal_bus_path is not None else SIGNAL_BUS_PATH
     all_records = _read_jsonl_tail(bus_path, MAX_LIFETIME)
     if not all_records:

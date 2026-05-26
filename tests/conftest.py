@@ -71,3 +71,31 @@ def _isolate_kill_switch_state_json(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     state_path = tmp_path / "state.json"
     monkeypatch.setattr(kill_switch, "STATE_JSON_PATH", state_path, raising=True)
     return state_path
+
+
+@pytest.fixture(autouse=True)
+def _autouse_dummy_third_party_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inject placeholder env vars for every third-party SDK so CI never
+    blocks on missing creds. Real tests that need real creds opt out by
+    overriding via their own monkeypatch.setenv() calls.
+
+    ADR-0038 §D.4 (P8) — TradingAgents pattern backfill, Wave D Track A.
+    """
+    placeholders = {
+        # LLM providers
+        "OPENROUTER_API_KEY": "test-placeholder",
+        "ANTHROPIC_API_KEY": "test-placeholder",
+        "OPENAI_API_KEY": "test-placeholder",
+        "AWS_BEARER_TOKEN_BEDROCK": "test-placeholder",
+        # Data providers
+        "ALPACA_API_KEY": "test-placeholder",
+        "ALPACA_SECRET_KEY": "test-placeholder",
+        "ALPHAVANTAGE_API_KEY": "test-placeholder",
+        # Exchanges (ccxt)
+        "BINANCE_API_KEY": "test-placeholder",
+        "BINANCE_SECRET": "test-placeholder",
+        "COINBASE_API_KEY": "test-placeholder",
+        "COINBASE_SECRET": "test-placeholder",
+    }
+    for key, val in placeholders.items():
+        monkeypatch.setenv(key, val)
