@@ -27,8 +27,9 @@ given a clean slate; consumers must not interpret it as an order.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -331,6 +332,258 @@ def _get_recent_lessons(symbol: str, n_same: int, n_cross: int) -> list[dict[str
 # ---------------------------------------------------------------------------
 
 
+def _build_default_analysts() -> list[Any]:
+    """Return the canonical advisor analyst loadout (ADR-0018).
+
+    Each optional dependency is wrapped so a missing dep degrades gracefully
+    rather than crashing the advisor.
+    """
+    from hermes_quant.analysts.classical_ta import ClassicalTAAnalyst
+
+    analysts: list[Any] = [ClassicalTAAnalyst()]
+    try:
+        from hermes_quant.analysts.microstructure import MicrostructureLite
+
+        analysts.append(MicrostructureLite())
+    except ImportError:
+        pass
+    try:
+        from hermes_quant.analysts.kronos import KronosAnalyst
+
+        analysts.append(KronosAnalyst())
+    except ImportError:
+        pass
+    return analysts
+
+
+def _normalize_asof(as_of: str | pd.Timestamp | None) -> pd.Timestamp:
+    if as_of is None:
+        return pd.Timestamp.now(tz="UTC")
+    if isinstance(as_of, str):
+        ts = pd.Timestamp(as_of)
+    else:
+        ts = as_of
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts
+
+
+def _fetch_bars_for_horizon(
+    provider: Any,
+    symbol: str,
+    horizon: str,
+    asof_ts: pd.Timestamp,
+    horizons_in_set: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """Fetch OHLCV bars for ``symbol`` at ``horizon``.
+
+    For native provider timeframes ('1d', '1h', '5m', ...) this delegates
+    directly to ``provider.fetch_bars``. For resampled multi-horizon timeframes
+    ('1w', '1M', '1Q') this delegates to
+    ``hermes_quant.data.horizon_cache.get_resampled_history`` which fetches
+    daily bars once and resamples in-memory (ADR-0036).
+    """
+    # Resampled horizons go through the horizon cache so the daily fetch is
+    # amortized across the full set.
+    if horizon in ("1w", "1M", "1Q"):
+        from hermes_quant.data.horizon_cache import get_resampled_history
+
+        return get_resampled_history(
+            symbol,
+            horizon,
+            asof=asof_ts,
+            horizons_in_set=horizons_in_set,
+            provider=provider,
+        )
+
+    # Native provider timeframe — same fetch path as single-horizon `recommend`
+    lookback_bars = _DEFAULT_LOOKBACK_BY_TF.get(horizon, 200)
+    end = asof_ts
+    if horizon == "1d":
+        start = end - pd.Timedelta(days=lookback_bars * 2)
+    elif horizon == "1h":
+        start = end - pd.Timedelta(hours=lookback_bars * 3)
+    else:
+        start = end - pd.Timedelta(minutes=lookback_bars * 2 * _tf_minutes(horizon))
+
+    try:
+        return provider.fetch_bars(symbol, horizon, start, end, as_of=asof_ts)
+    except TypeError as exc:
+        # Older provider without as_of kwarg
+        if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+            return provider.fetch_bars(symbol, horizon, start, end)
+        raise
+
+
+def recommend_multi_horizon(
+    symbol: str,
+    *,
+    horizons: Iterable[str] = ("1d", "1w"),
+    asset_class: str = "equity",
+    as_of: str | pd.Timestamp | None = None,
+    provider: Any = None,
+    analysts: list[Any] | None = None,
+    market_extras: Mapping[str, Any] | None = None,
+) -> list[AnalystView]:
+    """Multi-timeframe analyst fan-out (ADR-0036).
+
+    For each horizon in ``horizons``, build a MarketContext with that
+    timeframe, run all registered analysts for ``asset_class``, and return
+    the union of their AnalystView outputs. Each returned view's ``horizon``
+    field is retagged to the horizon under which it was produced (the wrapper
+    overrides the analyst's intrinsic horizon so downstream consumers — most
+    importantly the BMA aggregator's cross-horizon weighting — see one view
+    per (analyst, horizon) pair).
+
+    Silence-by-default invariants (ADR-0036 §"Silence-by-default invariants
+    preserved"):
+      - If a horizon's analyst returns None, the view is skipped, NOT
+        penalized.
+      - If a horizon yields zero bars (provider failure / empty history),
+        that horizon contributes zero views — no exception propagates.
+      - If zero horizons produce views, the returned list is empty (the
+        downstream aggregator will emit silence).
+
+    Args:
+        symbol: ticker / pair.
+        horizons: ordered set of horizon labels (default ``("1d", "1w")``
+            per ADR-0036). Duplicates are deduplicated while preserving order.
+        asset_class: ``"equity"`` | ``"etf"`` | ``"crypto"`` | ``"fx"``.
+        as_of: optional anchor timestamp for replay-mode queries.
+        provider: dependency-injected DataProvider (defaults to yfinance for
+            equity/etf).
+        analysts: dependency-injected analyst list (defaults to the canonical
+            advisor loadout).
+        market_extras: optional provider-specific extras forwarded into
+            MarketContext.extras.
+
+    Returns:
+        Flat list of AnalystView with up to N_analysts × N_horizons entries.
+
+    Note:
+        This is a wrapper-level fan-out — every existing analyst already
+        consumes ``MarketContext.timeframe`` (per ADR-0002), so no analyst
+        code changes are required.
+    """
+    # Dedupe horizons while preserving order
+    horizons_list: list[str] = []
+    for h in horizons:
+        if h not in horizons_list:
+            horizons_list.append(h)
+    if not horizons_list:
+        horizons_list = ["1d"]
+
+    if provider is None:
+        try:
+            provider = _get_default_provider(asset_class)
+        except NotImplementedError as exc:
+            logger.warning(
+                "recommend_multi_horizon: %s; returning empty view list", exc
+            )
+            return []
+
+    if analysts is None:
+        analysts = _build_default_analysts()
+
+    asof_ts = _normalize_asof(as_of)
+    all_views: list[AnalystView] = []
+
+    for h in horizons_list:
+        try:
+            bars = _fetch_bars_for_horizon(
+                provider, symbol, h, asof_ts, horizons_in_set=horizons_list
+            )
+        except (DataProviderError, DataQualityError, RateLimitError) as exc:
+            logger.info(
+                "recommend_multi_horizon: skipping %s @ %s — provider error: %s",
+                symbol,
+                h,
+                exc,
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001 — fail-soft per ADR-0036
+            logger.warning(
+                "recommend_multi_horizon: unexpected provider error for %s @ %s: %s",
+                symbol,
+                h,
+                exc,
+                exc_info=True,
+            )
+            continue
+
+        if bars is None or len(bars) == 0:
+            # Silence-by-default: no bars at this horizon → no views
+            continue
+
+        # Filter to as_of (defense-in-depth)
+        if "timestamp" in bars.columns:
+            bar_ts = bars["timestamp"]
+            if hasattr(bar_ts, "dt"):
+                if bar_ts.dt.tz is None:
+                    cutoff = (
+                        asof_ts.tz_convert(None) if asof_ts.tzinfo else asof_ts
+                    )
+                else:
+                    cutoff = asof_ts
+                bars = bars[bar_ts <= cutoff].copy()
+
+        if len(bars) == 0:
+            continue
+
+        last_bar_ts = pd.Timestamp(bars["timestamp"].iloc[-1])
+        if last_bar_ts.tzinfo is None:
+            last_bar_ts_utc = last_bar_ts.tz_localize("UTC")
+        else:
+            last_bar_ts_utc = last_bar_ts.tz_convert("UTC")
+
+        ctx = MarketContext(
+            asset=symbol,
+            timeframe=h,
+            asset_class=asset_class,
+            exchange=None,
+            bars=bars,
+            last_close=float(bars["close"].iloc[-1]),
+            last_volume=float(bars["volume"].iloc[-1]),
+            asof=last_bar_ts_utc,
+            extras=dict(market_extras or {}),
+        )
+
+        for analyst in analysts:
+            analyst_name = getattr(analyst, "name", type(analyst).__name__)
+            try:
+                if hasattr(analyst, "analyze"):
+                    view = analyst.analyze(ctx)
+                elif hasattr(analyst, "observe"):
+                    view = analyst.observe(ctx)
+                else:
+                    logger.warning(
+                        "recommend_multi_horizon: %s has no analyze/observe", analyst_name
+                    )
+                    continue
+            except Exception as exc:  # noqa: BLE001 — one bad analyst can't kill fan-out
+                logger.warning(
+                    "recommend_multi_horizon: analyst %s raised at horizon %s: %s",
+                    analyst_name,
+                    h,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+
+            if view is None:
+                continue
+
+            # Retag horizon to the fan-out's horizon (ADR-0036). The analyst
+            # may have hardcoded its own horizon in the view; for the BMA
+            # cross-horizon weighting to apply correctly, the view must
+            # carry the horizon under which it was produced.
+            if view.horizon != h:
+                view = dataclasses.replace(view, horizon=h)
+            all_views.append(view)
+
+    return all_views
+
+
 def recommend(
     symbol: str,
     *,
@@ -350,6 +603,15 @@ def recommend(
     market_extras: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Synchronous recommendation for a single symbol. Read-only (ADR-0014).
+
+    .. note::
+        This is the legacy single-horizon entry point and remains the
+        canonical advisor surface. For multi-timeframe analysis, use
+        :func:`recommend_multi_horizon` directly. ADR-0036 §"Daily-cadence
+        implications" specifies that the daily playbook tick will eventually
+        opt into multi-horizon fan-out via the ``HERMES_QUANT_HORIZONS``
+        environment variable — that wire-up is **Wave C** and intentionally
+        deferred from this commit. See ADR-0036 for the migration plan.
 
     Args:
         symbol: ticker / pair (e.g., "AAPL", "SPY").

@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +49,49 @@ from hermes_quant.protocol import (
     EpisodeOutcome,
     MarketContext,
 )
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe configuration (ADR-0036)
+# ---------------------------------------------------------------------------
+
+# Default per-horizon weight multipliers per ADR-0036 §"Cross-horizon BMA
+# aggregation" table:
+#   1d → 1.00 (reference baseline)
+#   1w → 1.20 (trend confirmation reduces noise)
+#   1M → 0.80 (useful for thesis confirmation but signal lags reality)
+#   1Q → 0.60 (low-frequency: useful for rebalance flagging, weak for entry)
+DEFAULT_HORIZON_WEIGHTS: dict[str, float] = {
+    "1d": 1.00,
+    "1w": 1.20,
+    "1M": 0.80,
+    "1Q": 0.60,
+}
+
+# Multi-timeframe agreement adjustments (ADR-0036 §"Multi-timeframe agreement
+# bonus"). Applied AFTER per-view calibration:
+#   all-agree across distinct horizons → confidence × 1.10 (capped at 1.0)
+#   any disagreement across horizons   → confidence × 0.85
+#   single horizon present             → no adjustment (no signal to compare)
+HORIZON_AGREEMENT_BONUS = 1.10
+HORIZON_DISAGREEMENT_PENALTY = 0.85
+
+
+@dataclass
+class BMAConfig:
+    """Tunable configuration for BMAAggregator (ADR-0036 amendment).
+
+    The defaults mirror pre-ADR-0036 behavior except for the new
+    horizon_weights field, which is an additive enhancement: views without an
+    entry in this dict get weight 1.0 (no suppression), so single-horizon
+    callers see no behavioral change.
+    """
+
+    horizon_weights: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_HORIZON_WEIGHTS)
+    )
+    horizon_agreement_bonus: float = HORIZON_AGREEMENT_BONUS
+    horizon_disagreement_penalty: float = HORIZON_DISAGREEMENT_PENALTY
 
 # Canonical persistence location for the bootstrapped IsotonicCalibrator.
 # Mirrors hermes_quant.training.bootstrap_calibrator.DEFAULT_CALIBRATOR_PATH;
@@ -106,11 +149,18 @@ class BMAAggregator:
         n_min_observations: int = 30,
         agreement_bonus: float = 0.10,
         calibrator_path: Path | None = None,
+        config: BMAConfig | None = None,
     ):
         self.prior_alpha = prior_alpha
         self.prior_beta = prior_beta
         self.n_min_observations = n_min_observations
         self.agreement_bonus = agreement_bonus
+
+        # Multi-timeframe config (ADR-0036). Default-on for cross-horizon
+        # weighting; the table contains 1d=1.00 so single-horizon callers
+        # see no behavior change.
+        self.config = config or BMAConfig()
+        self.horizon_weights = dict(self.config.horizon_weights)
 
         self._stats: dict[str, _AnalystStats] = {}
 
@@ -195,6 +245,14 @@ class BMAAggregator:
             return 0.5
         return stats.posterior_accuracy
 
+    def _horizon_weight(self, horizon: str) -> float:
+        """Per-ADR-0036 horizon weight multiplier.
+
+        Unknown horizons default to 1.0 (no suppression) so adding a new
+        horizon to AnalystView.horizon doesn't silently downweight views.
+        """
+        return float(self.horizon_weights.get(horizon, 1.0))
+
     def aggregate(
         self,
         views: list[AnalystView],
@@ -231,7 +289,13 @@ class BMAAggregator:
         signed_terms = []  # direction × magnitude × weight × confidence
         signed_dir_terms = []  # direction × weight × confidence (for direction)
         for v in views:
-            w = self._weight_for(v.analyst)
+            base_w = self._weight_for(v.analyst)
+            # ADR-0036: cross-horizon BMA weighting —
+            #   effective weight = base_weight(analyst) × horizon_weight(horizon)
+            #   The view's own confidence is multiplied in by signed_dir_terms
+            #   below (so the full ADR formula is base × horizon × confidence).
+            h_w = self._horizon_weight(v.horizon)
+            w = base_w * h_w
             weights.append(w)
             signed_dir_terms.append(v.direction * w * v.confidence)
 
@@ -280,6 +344,39 @@ class BMAAggregator:
         horizons = [v.horizon for v, _ in contributing]
         horizon = max(set(horizons), key=horizons.count) if horizons else views[0].horizon
 
+        # ADR-0036: multi-timeframe agreement adjustment.
+        # `horizons_present` is the set of distinct horizons across ALL views
+        # (not just contributing) — a disagreeing horizon, even if it loses
+        # the direction vote, still signals divergence.
+        horizons_present = sorted({v.horizon for v in views})
+        if len(horizons_present) <= 1:
+            # Only one horizon survived — no cross-horizon signal to compare.
+            horizon_agreement = "single_horizon"
+        else:
+            # Check whether every distinct horizon, taken collectively, votes
+            # in the same direction as the composite. We treat each horizon as
+            # the sign of its own weighted-sum so that mixed-direction analysts
+            # within a single horizon don't flip the verdict.
+            per_horizon_dir: dict[str, float] = {}
+            for v, w in zip(views, weights, strict=False):
+                per_horizon_dir[v.horizon] = (
+                    per_horizon_dir.get(v.horizon, 0.0) + v.direction * w * v.confidence
+                )
+            horizon_signs = {
+                h: (1 if s > 0 else (-1 if s < 0 else 0)) for h, s in per_horizon_dir.items()
+            }
+            non_zero_signs = [s for s in horizon_signs.values() if s != 0]
+            if non_zero_signs and all(s == composite_direction for s in non_zero_signs):
+                horizon_agreement = "all_agree"
+                confidence = float(
+                    np.clip(confidence * self.config.horizon_agreement_bonus, 0.0, 1.0)
+                )
+            else:
+                horizon_agreement = "mixed"
+                confidence = float(
+                    np.clip(confidence * self.config.horizon_disagreement_penalty, 0.0, 1.0)
+                )
+
         signal = AggregatedSignal(
             asset=context.asset,
             timeframe=context.timeframe,
@@ -297,6 +394,9 @@ class BMAAggregator:
                 "vote_share": float(vote_share),
                 "n_contributing": len(contributing),
                 "n_views": len(views),
+                # ADR-0036 audit fields
+                "horizons_present": horizons_present,
+                "horizon_agreement": horizon_agreement,
             },
         )
         self._n_aggregated += 1
