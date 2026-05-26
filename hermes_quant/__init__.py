@@ -83,7 +83,7 @@ def register(ctx: Any) -> None:
 
     Heavy imports are lazy. register() should run in <50ms.
     """
-    from . import schemas
+    from . import tool_schemas as schemas  # JSON Schema dicts for tool registration
     from . import tools as quant_tools
 
     # Tools — read-only views into daemon state (ADR-0007)

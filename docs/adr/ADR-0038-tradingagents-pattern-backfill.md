@@ -362,3 +362,74 @@ None. Watermark is daemon-internal idempotency; it does not appear in
   §3.4 — no-monkeypatches stance.
 - ADR-0010 (settlement journal), ADR-0035 (cadence), ADR-0036
   (multi-timeframe), ADR-0037 (LLM committee) — adjacent contracts.
+
+## Deviations from contract (post-Wave-D corrections — 2026-05-26)
+
+The implementation that landed at commit `77b809a` differs from the
+contract above on three points. They were caught by the Sonnet 4.6
+cross-family review and folded back into the ADR rather than chased into
+the v0.4 follow-up wave, per the principle that the ADR should describe
+what shipped, not what was intended.
+
+### Correction 1 — `tool_schemas.py` rename
+
+**Original §D.2 implication**: the new `hermes_quant/schemas/` package
+sits alongside the existing `hermes_quant/schemas.py` legacy file (which
+holds JSON Schema dicts for tool registration).
+
+**What landed**: a Python namespace collision — `hermes_quant/schemas.py`
+and `hermes_quant/schemas/` cannot coexist in the same parent (the
+package wins, the file is silently shadowed). Tool registration in
+`hermes_quant/__init__.py:register()` would have failed at plugin load
+because `schemas.QUANT_STATUS` no longer resolved.
+
+**Resolution**: legacy `hermes_quant/schemas.py` was renamed to
+`hermes_quant/tool_schemas.py` post-commit; `hermes_quant/__init__.py`
+imports it as `from . import tool_schemas as schemas` to preserve the
+local alias `schemas.QUANT_STATUS` etc. for tool registration. The new
+Pydantic package retains the canonical `hermes_quant.schemas` namespace.
+
+### Correction 2 — `fetch_latest` dropped from `core_ohlcv`
+
+**Original §D.5**: `VENDOR_METHODS` lists both `fetch_bars` and
+`fetch_latest` under the `core_ohlcv` category.
+
+**What landed**: only `fetch_bars`. `CcxtProvider.fetch_latest` does not
+exist in the current tree (only `YFinanceProvider` implements it), and
+adding it was outside Track A's edit surface (which forbade modifications
+to `hermes_quant/data/ccxt_provider.py`).
+
+**Resolution**: documented inline in `vendor_routing.py` source comment
+("Deviation from ADR-0038 §D.5"). Adding `fetch_latest` to
+`CcxtProvider` is a v0.4 follow-up wave; the dispatch table will pick it
+up automatically once the method exists, and the
+`test_vendor_completeness` test will start enforcing it as a static
+guarantee.
+
+### Correction 3 — VendorConfig YAML auto-loader and `route_to_vendor`
+wire-up deferred
+
+**Original §D.6**: "wire into `route_to_vendor` so callers pass `method`
+only; the resolver reads `VendorConfig` from
+`~/.hermes/config.yaml::quant.data`."
+
+**What landed**: `VendorConfig` is shipped as a model + `.resolve()`
+only. No YAML auto-loader; no integration into `route_to_vendor`.
+Documented inline in `vendor_config.py:23-31`.
+
+**Resolution**: callers construct `VendorConfig` from a dict
+(typically by reading the YAML themselves and passing
+`config["quant"]["data"]` to `VendorConfig.model_validate()`). The
+auto-loader is deferred to v0.4 to keep the config module testable in
+isolation and free of stdlib filesystem side-effects. The wire-up of
+`route_to_vendor` to consult `VendorConfig` is a one-liner once the
+auto-loader exists; it does not require additional contract design.
+
+### Acceptance gate — re-checked after corrections
+
+- All 81 wave_d tests still pass after rename.
+- Both namespaces (`hermes_quant.tool_schemas` for JSON Schema dicts,
+  `hermes_quant.schemas` for Pydantic models) resolve cleanly.
+- Plugin registration in `hermes_quant/__init__.py:register()` still
+  references all four `QUANT_*` schemas via the local
+  `schemas` alias.

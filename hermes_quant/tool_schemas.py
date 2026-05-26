@@ -1,4 +1,8 @@
-"""hermes_quant.schemas — JSON Schema definitions for the four read-only tools.
+"""hermes_quant.tool_schemas — JSON Schema definitions for the four read-only tools.
+
+Renamed from ``hermes_quant.schemas`` in Wave D (ADR-0038) to avoid a
+namespace collision with the new ``hermes_quant.schemas`` package, which
+holds Pydantic models for daemon-internal state (BarSnapshot etc.).
 
 Per ADR-0007: tools are read-only views over daemon state. They do not
 spawn the daemon, change config, or place trades.
