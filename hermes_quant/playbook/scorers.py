@@ -514,6 +514,13 @@ def score_symbol(symbol: str, play: str) -> float:
     each refetch yfinance fundamentals. The cache resets across days
     (asof key includes UTC date).
 
+    **Critical:** this returns 0.0 (well below evict_floor=0.45) when the
+    symbol is *ineligible* for the play (eviction rule fired or hard rule
+    failed). This is what bridges PlayFitness.eligible into the watchlist
+    evolution loop's float-score abstraction. Without this, the watchlist
+    would onboard mega-caps to covered_call etc. \u2014 the eviction-rules-
+    not-firing bug Codex review caught (HIGH, 2026-05-26).
+
     Silence-by-default: any failure returns 0.0 (cannot pass either
     onboard or evict floor; symbol stays in current state).
     """
@@ -531,6 +538,11 @@ def score_symbol(symbol: str, play: str) -> float:
         all_fits = score_all(snap)
         fitness = all_fits.get(play)
         if fitness is None:
+            return 0.0
+        # If the symbol is INELIGIBLE for the play (eviction OR hard-rule
+        # failure), return 0.0 so the evolution loop's evict_floor
+        # (default 0.45) treats it as a hard reject, not a score blip.
+        if not fitness.eligible:
             return 0.0
         return float(fitness.score)
     except Exception:
