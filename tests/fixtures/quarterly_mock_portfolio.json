@@ -1,0 +1,46 @@
+{
+  "_comment": "Mock portfolio for quant-playbook-quarterly.py testing. 5 positions designed to fire all 4 factor flags except top-1 (which should still be borderline).",
+  "cash": 12000.0,
+  "positions": [
+    {
+      "symbol": "NVDA",
+      "qty": 100,
+      "cost_basis": 75000.0,
+      "last_price": 800.0,
+      "sector": "Technology",
+      "beta": 1.65
+    },
+    {
+      "symbol": "AAPL",
+      "qty": 200,
+      "cost_basis": 35000.0,
+      "last_price": 190.0,
+      "sector": "Technology",
+      "beta": 1.20
+    },
+    {
+      "symbol": "MSFT",
+      "qty": 50,
+      "cost_basis": 18000.0,
+      "last_price": 410.0,
+      "sector": "Technology",
+      "beta": 0.95
+    },
+    {
+      "symbol": "JPM",
+      "qty": 30,
+      "cost_basis": 5500.0,
+      "last_price": 200.0,
+      "sector": "Financial Services",
+      "beta": 1.10
+    },
+    {
+      "symbol": "PG",
+      "qty": 20,
+      "cost_basis": 3300.0,
+      "last_price": 165.0,
+      "sector": "Consumer Defensive",
+      "beta": 0.50
+    }
+  ]
+}
