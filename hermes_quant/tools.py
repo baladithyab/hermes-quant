@@ -1005,8 +1005,14 @@ def quant_doctor(args: dict, **_kwargs) -> str:
     # ADR-0038 §D.3 (P6): content-presence DaemonState mirror
     daemon_state_block = None
     if include_daemon_state:
+        # Pass through the resolved configured paths so the halt mirror
+        # reads the same state.db that other quant_doctor checks consult
+        # (rather than the import-time DEFAULT_STATE_DB).
+        _halt_mirror = _QUANT_HOME / "halt_state.json"
         daemon_state_block = _compute_daemon_state_mirror(
             signal_bus_path=_SIGNAL_BUS_PATH,
+            state_db_path=_STATE_DB_PATH,
+            halt_mirror_path=_halt_mirror,
             per_symbol_n=daemon_state_per_symbol_n,
         )
 
@@ -1105,6 +1111,8 @@ def _symbol_from_row(row: dict[str, Any]) -> str | None:
 def _compute_daemon_state_mirror(
     *,
     signal_bus_path: Path,
+    state_db_path: Path | None = None,
+    halt_mirror_path: Path | None = None,
     per_symbol_n: int = 10,
 ) -> dict[str, Any]:
     """Build the DaemonState content-presence mirror (ADR-0038 §D.3 / P6).
@@ -1200,12 +1208,20 @@ def _compute_daemon_state_mirror(
             "last_action_conf": last_action_conf,
         }
 
-    # Halt summary (read-only mirror)
+    # Halt summary (read-only mirror) — honor configured state-DB path so
+    # `quant_doctor` against a redirected QUANT_HOME (e.g. tests, profiles)
+    # surfaces halts from THAT db, not the user's default ~/.hermes/quant/.
     halts_out: list[dict[str, Any]] = []
     try:
-        from hermes_quant.daemon.halt_state import HaltStateSQLite
+        from hermes_quant.daemon.halt_state import (
+            DEFAULT_HALT_JSON_MIRROR,
+            DEFAULT_STATE_DB,
+            HaltStateSQLite,
+        )
 
-        hs = HaltStateSQLite()
+        db = state_db_path if state_db_path is not None else DEFAULT_STATE_DB
+        mirror = halt_mirror_path if halt_mirror_path is not None else DEFAULT_HALT_JSON_MIRROR
+        hs = HaltStateSQLite(db_path=db, mirror_path=mirror)
         for h in hs.active_halts():
             halts_out.append(
                 {

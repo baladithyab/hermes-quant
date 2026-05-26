@@ -104,6 +104,7 @@ packages = [
     "hermes_quant.analysts",
     "hermes_quant.aggregators",
     "hermes_quant.cli",
+    "hermes_quant.config",
     "hermes_quant.consumers",
     "hermes_quant.consumers.freqtrade",
     "hermes_quant.daemon",
@@ -112,6 +113,7 @@ packages = [
     "hermes_quant.options",
     "hermes_quant.options.pricing",
     "hermes_quant.risk",
+    "hermes_quant.schemas",
     "hermes_quant.skills",
     "hermes_quant.training",
 ]

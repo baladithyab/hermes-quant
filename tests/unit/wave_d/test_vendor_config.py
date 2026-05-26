@@ -47,12 +47,20 @@ def test_category_default_resolves() -> None:
 
 
 def test_per_method_override_beats_category() -> None:
-    """vendor_overrides_by_method wins over vendors_by_category."""
+    """vendor_overrides_by_method wins over vendors_by_category.
+
+    Currently VENDOR_LIST has only ``yfinance`` (ccxt was removed due to
+    fetch_bars signature mismatch — see commit 95173a6 follow-up). This
+    test demonstrates the resolution path with the available vendor as
+    both category default and override; once a second vendor is added,
+    a sharper test asserting ``override != category`` resolution will
+    replace this one.
+    """
     cfg = VendorConfig(
         vendors_by_category={"core_ohlcv": "yfinance"},
-        vendor_overrides_by_method={"fetch_bars": "ccxt"},
+        vendor_overrides_by_method={"fetch_bars": "yfinance"},
     )
-    assert cfg.resolve("fetch_bars") == "ccxt"
+    assert cfg.resolve("fetch_bars") == "yfinance"
 
 
 def test_unknown_category_fails_at_construction() -> None:
@@ -91,7 +99,7 @@ def test_model_is_frozen() -> None:
     """ConfigDict(frozen=True) prevents post-construction mutation."""
     cfg = VendorConfig(vendors_by_category={"core_ohlcv": "yfinance"})
     with pytest.raises(ValidationError):
-        cfg.vendors_by_category = {"core_ohlcv": "ccxt"}  # type: ignore[misc]
+        cfg.vendors_by_category = {"core_ohlcv": "yfinance"}  # type: ignore[misc]
 
 
 def test_extra_keys_forbidden() -> None:
@@ -114,9 +122,9 @@ def test_model_validate_round_trip() -> None:
     """model_validate(dict) == direct constructor with kwargs."""
     payload = {
         "vendors_by_category": {"core_ohlcv": "yfinance"},
-        "vendor_overrides_by_method": {"fetch_bars": "ccxt"},
+        "vendor_overrides_by_method": {"fetch_bars": "yfinance"},
     }
     cfg_a = VendorConfig.model_validate(payload)
     cfg_b = VendorConfig(**payload)
     assert cfg_a == cfg_b
-    assert cfg_a.resolve("fetch_bars") == "ccxt"
+    assert cfg_a.resolve("fetch_bars") == "yfinance"

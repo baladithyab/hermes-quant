@@ -33,7 +33,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from hermes_quant.data.ccxt_provider import CcxtProvider
 from hermes_quant.data.yfinance_provider import YFinanceProvider
 
 # ---------------------------------------------------------------------------
@@ -46,7 +45,8 @@ from hermes_quant.data.yfinance_provider import YFinanceProvider
 # counters across the dispatch table.
 # ---------------------------------------------------------------------------
 _YFINANCE: YFinanceProvider | None = None
-_CCXT: CcxtProvider | None = None
+# NOTE: _CCXT singleton + _get_ccxt() helper removed in commit 95173a6
+# follow-up — see signature-compatibility note in VENDOR_METHODS below.
 
 
 def _get_yfinance() -> YFinanceProvider:
@@ -54,21 +54,13 @@ def _get_yfinance() -> YFinanceProvider:
 
     Lazy construction keeps ``import vendor_routing`` cheap and side-
     effect-free — important because some providers (notably
-    :class:`CcxtProvider`) hit network or config at __init__ time, which
+    ``CcxtProvider``) hit network or config at __init__ time, which
     breaks test collection if the dispatch table is built eagerly.
     """
     global _YFINANCE
     if _YFINANCE is None:
         _YFINANCE = YFinanceProvider()
     return _YFINANCE
-
-
-def _get_ccxt() -> CcxtProvider:
-    """Lazily instantiate the CcxtProvider singleton."""
-    global _CCXT
-    if _CCXT is None:
-        _CCXT = CcxtProvider()
-    return _CCXT
 
 
 # ---------------------------------------------------------------------------
@@ -89,14 +81,26 @@ def _yfinance_fetch_bars(*args: Any, **kwargs: Any) -> Any:
     return _get_yfinance().fetch_bars(*args, **kwargs)
 
 
-def _ccxt_fetch_bars(*args: Any, **kwargs: Any) -> Any:
-    return _get_ccxt().fetch_bars(*args, **kwargs)
+# NOTE: _ccxt_fetch_bars closure removed in commit 95173a6 follow-up —
+# CcxtProvider.fetch_bars signature differs from YFinanceProvider's, so it
+# cannot sit in the same dispatch entry. Reintroduce when DataProvider
+# Protocol unifies the signature (future ADR).
 
 
 VENDOR_METHODS: dict[str, dict[str, Callable[..., Any]]] = {
     "fetch_bars": {
         "yfinance": _yfinance_fetch_bars,
-        "ccxt": _ccxt_fetch_bars,
+        # NOTE: CcxtProvider.fetch_bars signature is currently
+        # `(symbol, asset_class, timeframe, *, lookback_bars, as_of)` —
+        # NOT compatible with YFinanceProvider.fetch_bars
+        # `(asset, timeframe, start, end, ...)`. Calling
+        # ``route_to_vendor("fetch_bars", "ccxt")`` and passing
+        # yfinance-style args would raise TypeError. Until the
+        # DataProvider Protocol unifies these signatures (planned for a
+        # future ADR), ccxt is intentionally absent from the dispatch
+        # table; callers that need ccxt klines should construct a
+        # CcxtProvider directly. Caught by Codex review of commit
+        # 95173a6 (Wave D, P11/P12).
     },
 }
 
@@ -113,7 +117,10 @@ TOOLS_CATEGORIES: dict[str, list[str]] = {
 }
 
 
-VENDOR_LIST: list[str] = ["yfinance", "ccxt"]
+VENDOR_LIST: list[str] = ["yfinance"]
+# NOTE: "ccxt" is intentionally NOT in VENDOR_LIST as of commit 95173a6
+# follow-up — see signature-compatibility note above. Add when the
+# DataProvider Protocol unifies fetch_bars across vendors.
 
 
 def route_to_vendor(method: str, vendor: str) -> Callable[..., Any]:

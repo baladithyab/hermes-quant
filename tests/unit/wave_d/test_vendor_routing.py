@@ -84,10 +84,16 @@ def test_route_to_vendor_yfinance_dispatches_to_yfinance_provider() -> None:
     # that here to keep the test offline-safe.
 
 
-def test_route_to_vendor_ccxt_dispatches_to_ccxt_provider() -> None:
-    """The dispatched callable is the closure wrapping CcxtProvider.fetch_bars."""
-    fn = vr.route_to_vendor("fetch_bars", "ccxt")
-    assert fn is vr._ccxt_fetch_bars
+def test_route_to_vendor_unknown_ccxt_raises() -> None:
+    """ccxt was removed from VENDOR_METHODS due to fetch_bars signature
+    incompatibility (see commit 95173a6 follow-up). Until the
+    DataProvider Protocol unifies the signature, ccxt is not in the
+    dispatch table; calling route_to_vendor("fetch_bars", "ccxt") must
+    raise KeyError so callers get a clear failure rather than a
+    surprise TypeError on first call.
+    """
+    with pytest.raises(KeyError, match="does not implement"):
+        vr.route_to_vendor("fetch_bars", "ccxt")
 
 
 def test_category_for_method_happy_path() -> None:
@@ -136,7 +142,8 @@ def test_dispatch_closures_are_callable_without_provider_instantiation() -> None
     """
     # The closure objects themselves are real callables
     assert callable(vr._yfinance_fetch_bars)
-    assert callable(vr._ccxt_fetch_bars)
     # And they appear in the dispatch table
     assert vr.VENDOR_METHODS["fetch_bars"]["yfinance"] is vr._yfinance_fetch_bars
-    assert vr.VENDOR_METHODS["fetch_bars"]["ccxt"] is vr._ccxt_fetch_bars
+    # ccxt is intentionally absent (signature mismatch — see commit 95173a6)
+    assert "ccxt" not in vr.VENDOR_METHODS["fetch_bars"]
+    assert "ccxt" not in vr.VENDOR_LIST
