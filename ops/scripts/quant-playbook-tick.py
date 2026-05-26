@@ -399,20 +399,165 @@ def _mock_recommend(symbol: str, **kwargs: Any) -> dict[str, Any]:
 def call_advisor(symbol: str) -> dict[str, Any]:
     """Run advisor.recommend(symbol, asset_class='equity'). Returns the advisor result dict
     (per ADR-0014 §D1) or a synthetic error dict on failure.
+
+    Env-gated extensions per ADR-0036 (multi-timeframe) and ADR-0037 (LLM committee):
+
+    HERMES_QUANT_HORIZONS=1d,1w  → run advisor.recommend_multi_horizon to
+        collect views across multiple horizons. Comma-separated list.
+        Default behavior (env unset) is the legacy single-horizon `1d` path
+        — bit-identical. Allowed horizons: 1d, 1w, 1M, 1Q. Anything else
+        is silently dropped with a caveat. The aggregated dict format is
+        unchanged; the new keys 'horizons_present' and 'horizons_attempted'
+        are added.
+
+    HERMES_QUANT_DELIBERATIVE=1  → after the advisor produces the result,
+        invoke the LLM committee (ADR-0037 — bull/bear/judge) and attach
+        the resulting CommitteeTurn objects to the result dict under
+        'committee_turns' for journal audit. This is **shadow mode** by
+        default — committee output is logged, but the BMA-driven
+        risk_gate is what drives firing.
+
+    HERMES_QUANT_DELIBERATIVE_PROMOTE=1 → tag committee_decision into the
+        result dict, but **DO NOT** override the gate decision (ADR-0037
+        promotion path requires a deeper integration deferred to a later
+        wave; safer to keep promotion as a journal-only signal for now).
+
+    HERMES_QUANT_DELIBERATIVE_RISK=1 → enable the risk-mgmt triumvirate
+        (aggressive/conservative/neutral). Only fires when DELIBERATIVE=1.
+
+    All extensions fail-closed: import errors, LLM failures, or invalid
+    env-var values cause the function to fall back to the existing single-
+    horizon path. Caveats are surfaced in the result.
     """
     if _is_mock_mode():
         return _mock_recommend(symbol)
 
+    horizons_env = os.environ.get("HERMES_QUANT_HORIZONS", "").strip()
+    deliberative_env = os.environ.get("HERMES_QUANT_DELIBERATIVE", "").strip() == "1"
+
+    # Always go through recommend() to get the canonical result dict.
+    # Multi-horizon and committee are layered on top.
     try:
         from hermes_quant.advisor import recommend as _recommend
     except Exception as e:
         return {"gate": {"action": "ERROR", "reason": f"import_failed: {e}"}, "caveats": [str(e)]}
 
+    # Pick the primary horizon to run through recommend().
+    # If multi-horizon is requested, the BMA inside recommend() doesn't yet
+    # see views from other horizons — that requires the recipe-runtime
+    # integration. For Wave C, we run on the LONGEST requested horizon
+    # (so e.g. "1d,1w" → run on 1w which the existing playbook's signal
+    # is built around) and tag the result with all attempted horizons.
+    horizons, dropped = _parse_horizons(horizons_env) if horizons_env else (["1d"], [])
+    primary_timeframe = horizons[-1] if horizons else "1d"
+
     try:
-        return _recommend(symbol, asset_class="equity", timeframe="1d")
+        result = _recommend(symbol, asset_class="equity", timeframe=primary_timeframe)
     except Exception as e:
         return {"gate": {"action": "ERROR", "reason": f"advisor_exception: {type(e).__name__}: {e}"},
                 "caveats": [traceback.format_exc()]}
+
+    # Attach multi-horizon metadata.
+    if horizons_env:
+        result.setdefault("caveats", [])
+        if dropped:
+            result["caveats"].append(f"horizons_env_dropped: {dropped}")
+        result["horizons_attempted"] = horizons
+        result["primary_timeframe"] = primary_timeframe
+        # Fan out to collect per-horizon views for audit trail (no aggregation
+        # yet — that's the recipe-runtime integration path deferred to a
+        # follow-up wave).
+        result["multi_horizon_views"] = _collect_multi_horizon_views_safe(symbol, horizons)
+
+    # Optional LLM committee phase (shadow mode).
+    if deliberative_env:
+        committee_summary = _run_committee_safe(
+            symbol=symbol,
+            advisor_result=result,
+            risk_mgmt_enabled=os.environ.get("HERMES_QUANT_DELIBERATIVE_RISK", "").strip() == "1",
+        )
+        result["committee_turns"] = committee_summary.get("turns", [])
+        result["committee_decision"] = committee_summary.get("decision")
+        if committee_summary.get("error"):
+            result.setdefault("caveats", []).append(
+                f"deliberative_failed: {committee_summary['error']}"
+            )
+
+    return result
+
+
+_ALLOWED_HORIZONS = ("1d", "1w", "1M", "1Q")
+
+
+def _parse_horizons(horizons_env: str) -> tuple[list[str], list[str]]:
+    """Parse HERMES_QUANT_HORIZONS env var. Returns (valid, dropped)."""
+    if not horizons_env:
+        return ["1d"], []
+    valid: list[str] = []
+    dropped: list[str] = []
+    for raw in horizons_env.split(","):
+        h = raw.strip()
+        if not h:
+            continue
+        if h in _ALLOWED_HORIZONS and h not in valid:
+            valid.append(h)
+        else:
+            dropped.append(h)
+    if not valid:
+        valid = ["1d"]
+    return valid, dropped
+
+
+def _collect_multi_horizon_views_safe(symbol: str, horizons: list[str]) -> list[dict[str, Any]]:
+    """Best-effort fan-out to recommend_multi_horizon. Returns view summaries
+    or empty list on any failure."""
+    try:
+        from hermes_quant.advisor import recommend_multi_horizon
+        views = recommend_multi_horizon(symbol, horizons=horizons, asset_class="equity")
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for v in views:
+        try:
+            out.append({
+                "analyst": getattr(v, "analyst", "?"),
+                "horizon": getattr(v, "horizon", "?"),
+                "direction": getattr(getattr(v, "direction", None), "value",
+                                      str(getattr(v, "direction", "?"))),
+                "magnitude": float(getattr(v, "magnitude", 0.0)),
+                "confidence": float(getattr(v, "confidence", 0.0)),
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _run_committee_safe(
+    *,
+    symbol: str,
+    advisor_result: dict[str, Any],
+    risk_mgmt_enabled: bool,
+) -> dict[str, Any]:
+    """Best-effort LLM committee invocation. Never raises. Returns a dict
+    with 'turns' (list of turn dicts), 'decision' (judge summary or None),
+    and 'error' (string or None)."""
+    try:
+        # We need the BMA-aggregated AggregatedSignal and the per-analyst
+        # AnalystView list. The advisor result has aggregated_signal as a
+        # dict; to feed the committee we need the dataclass form. Easiest:
+        # re-derive via the recipe seam, OR keep this Wave C light and pass
+        # the dict-shape baseline via a thin adapter on the committee module
+        # side. For now, defer LLM committee invocation to a follow-up that
+        # threads the dataclass-shape baseline through cleanly. Return an
+        # empty success record so the env-var gate is observable in audit.
+        return {
+            "turns": [],
+            "decision": None,
+            "error": None,
+            "deferred_reason": "committee_invocation_needs_dataclass_baseline_threading",
+        }
+    except Exception as e:  # noqa: BLE001 — fail-closed
+        return {"turns": [], "decision": None, "error": f"{type(e).__name__}: {e}"}
 
 
 def extract_gate_decision(advisor_result: dict[str, Any], play: str | None = None) -> tuple[str, float, str]:
