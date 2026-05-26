@@ -16,12 +16,30 @@ Each tick:
      - First market-day tick → heartbeat
      - Threshold breach / new fill / regime shift → alert
      - Otherwise → silent (empty stdout)
+  7. **OPTIONAL autonomous propose+fire phase** (gated on
+     `HERMES_QUANT_AUTONOMOUS=1`): after the read-only snapshot/alert
+     pass, dynamically import the daily playbook tick and invoke
+     `run_tick(dry_run=...)` so any opportunity that wasn't caught at
+     09:00 ET (e.g. signal flipped post-09:00, or 09:00 cron was DOWN)
+     can still fire on a later hourly tick. Idempotency is shared via
+     ~/.hermes/quant/playbook/tick-journal.jsonl — `fired_today_pairs()`
+     reads cross-cron, so the daily cron and any number of hourly
+     ticks cannot double-fire on the same `(symbol, play)` per ET day.
 
-Posture: DETERMINISTIC, no LLM. READ-ONLY against Alpaca. Silence-by-default.
+     Two env-var knobs:
+       HERMES_QUANT_AUTONOMOUS=1        — enable phase 7 at all
+       HERMES_QUANT_AUTONOMOUS_ARMED=1  — actually place orders (else dry-run)
+     The default (no env vars) preserves the read-only-only posture.
+
+Posture: DETERMINISTIC, no LLM. READ-ONLY against Alpaca by default.
+Silence-by-default. Optional autonomy is opt-in per ADR-0035 §"Hourly
+health monitor" amendment (read-only-by-default, opt-in propose+fire).
 
 ADR refs: ADR-0001 (sidecar/reproducibility), ADR-0004 (deterministic risk gate +
 0.5%/5% drawdown halts), ADR-0014 (advisor surface), ADR-0027 (options-aware risk
-gate — kill-switch hooks land here in a future revision).
+gate — kill-switch hooks land here in a future revision), ADR-0035 (cadence —
+this hourly cron is read-only-by-default and gates any propose+fire phase
+on HERMES_QUANT_AUTONOMOUS=1).
 """
 from __future__ import annotations
 
@@ -396,6 +414,117 @@ def render_alerts(alerts: list[str], snap: dict) -> str:
     return "\n".join(pieces)
 
 
+# ---------- optional autonomous propose+fire phase (Option B per ADR-0035) ----------
+PLAYBOOK_TICK_SCRIPT = Path.home() / ".hermes" / "scripts" / "quant-playbook-tick.py"
+
+
+def _import_playbook_tick():
+    """Dynamically import the daily playbook tick as a module.
+
+    We use a path-based import (not `from x import y`) because both this
+    file and quant-playbook-tick.py live in ~/.hermes/scripts/ which is
+    not on sys.path. Returns the module on success, None on failure
+    (import error, missing file, etc.).
+    """
+    try:
+        import importlib.util
+        if not PLAYBOOK_TICK_SCRIPT.exists():
+            return None
+        spec = importlib.util.spec_from_file_location(
+            "_quant_playbook_tick", str(PLAYBOOK_TICK_SCRIPT)
+        )
+        if spec is None or spec.loader is None:
+            return None
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)  # type: ignore[union-attr]
+        return m
+    except Exception:
+        return None
+
+
+def maybe_run_autonomous_phase() -> str:
+    """Run the optional propose+fire phase if HERMES_QUANT_AUTONOMOUS=1.
+
+    Returns a single-line summary string (empty string if not enabled or
+    nothing notable). Caller appends to the alert pieces only if
+    non-empty AND non-silent.
+
+    Default posture: ALWAYS DRY-RUN unless HERMES_QUANT_AUTONOMOUS_ARMED=1.
+    This matches the daily playbook tick's `dry_run = not args.armed`
+    safety pattern — the operator must explicitly arm both surfaces.
+    """
+    if os.environ.get("HERMES_QUANT_AUTONOMOUS", "").strip() != "1":
+        return ""
+
+    armed = os.environ.get("HERMES_QUANT_AUTONOMOUS_ARMED", "").strip() == "1"
+    dry_run = not armed
+
+    m = _import_playbook_tick()
+    if m is None:
+        return "⚠️ autonomous phase requested but quant-playbook-tick.py could not be imported"
+
+    try:
+        summary = m.run_tick(dry_run=dry_run)
+    except Exception as e:
+        return f"⚠️ autonomous phase crashed: {type(e).__name__}: {e}"
+
+    # Tag every journal record this tick wrote with source=hourly so the
+    # daily/hourly surfaces are distinguishable in audit. We do this by
+    # appending a tick-summary record marking source=hourly. The per-pair
+    # records the playbook tick itself wrote already have tick_id; we
+    # tie them by writing one umbrella record.
+    try:
+        m.append_journal({
+            "event": "autonomous_phase_summary",
+            "source": "hourly",
+            "tick_id": summary.get("tick_id"),
+            "date_et": summary.get("date_et"),
+            "dry_run": summary.get("dry_run"),
+            "scanned": summary.get("scanned", 0),
+            "fired": summary.get("fired", 0),
+            "silenced": summary.get("silenced", 0),
+            "gate_rejected": summary.get("gate_rejected", 0),
+            "idempotent_skipped": summary.get("idempotent_skipped", 0),
+            "errors": summary.get("errors", 0),
+            "halt_aborted": summary.get("halt_aborted", False),
+        })
+    except Exception:
+        pass  # journal append is best-effort
+
+    # Compose summary line. Keep it terse — this fires up to 7×/day so
+    # silence-by-default matters more here than in the daily tick.
+    halt = summary.get("halt_aborted")
+    fired = summary.get("fired", 0)
+    silenced = summary.get("silenced", 0)
+    gate_rejected = summary.get("gate_rejected", 0)
+    skipped = summary.get("idempotent_skipped", 0)
+    errors = summary.get("errors", 0)
+    scanned = summary.get("scanned", 0)
+
+    # Emit ONLY when something actionable happened. Silence-by-default.
+    notable = (
+        fired > 0
+        or errors > 0
+        or halt
+        or (armed and silenced > 0)  # silences-while-armed are worth knowing
+    )
+    if not notable:
+        return ""
+
+    suffix = "" if armed else " (dry-run)"
+    if halt:
+        return f"🚨 autonomous phase{suffix}: HALT ABORT (active halts present)"
+    parts = [f"⚙️ autonomous phase{suffix}",
+             f"scanned={scanned}",
+             f"fired={fired}",
+             f"silenced={silenced}",
+             f"gate_rejected={gate_rejected}",
+             f"idempotent_skipped={skipped}"]
+    if errors > 0:
+        parts.append(f"errors={errors}")
+    return " ".join(parts)
+
+
 # ---------- main ----------
 def main() -> int:
     now_utc = datetime.now(UTC)
@@ -435,6 +564,13 @@ def main() -> int:
             pieces.append(hb)
     if alerts:
         pieces.append(render_alerts(alerts, snap))
+
+    # Optional autonomous propose+fire phase (Option B per ADR-0035 amendment).
+    # Gated on HERMES_QUANT_AUTONOMOUS=1; orders only if HERMES_QUANT_AUTONOMOUS_ARMED=1.
+    # Default (no env vars) preserves the historical read-only-only posture.
+    auto_line = maybe_run_autonomous_phase()
+    if auto_line:
+        pieces.append(auto_line)
 
     if pieces:
         print("\n\n".join(pieces), flush=True)

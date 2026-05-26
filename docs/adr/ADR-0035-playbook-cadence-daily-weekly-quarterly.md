@@ -161,6 +161,73 @@ All firing happens at the four named action cadences above.
 - **Sub-second order routing / TWAP / VWAP.** Live execution stays at
   market-on-open / limit-day for the daily decision tick.
 
+## Amendment 2026-05-26 evening — Option B: opt-in autonomous propose+fire on the hourly monitor
+
+The user accepted Option B from the same-day "what happens between the daily
+ticks?" decision matrix: **augment the existing hourly read-only monitor with
+an opt-in propose+fire phase**, so opportunities that didn't qualify at 09:00
+ET (signal flipped post-09:00, or the 09:00 cron was DOWN) can still be acted
+on later in the day, without breaking the daily-cadence contract this ADR
+codifies.
+
+The amendment is **additive** and preserves the daily-only firing contract by
+default:
+
+- The hourly cron (`ops/scripts/quant-hourly-tick.py`, job `b487b97ad4d2`)
+  remains read-only-by-default. With NO environment variables set, behavior
+  is bit-identical to the pre-amendment version. The `maybe_run_autonomous_phase()`
+  function early-returns the empty string in 0.0 ms.
+
+- When `HERMES_QUANT_AUTONOMOUS=1` is set in the environment, the hourly cron
+  path-imports `~/.hermes/scripts/quant-playbook-tick.py` and invokes its
+  existing `run_tick(dry_run=…)` after the read-only snapshot/alert pass. The
+  per-pair journal at `~/.hermes/quant/playbook/tick-journal.jsonl` is the
+  cross-cron coordination point: `fired_today_pairs()` reads it, so the daily
+  09:00 cron and any number of subsequent hourly invocations cannot
+  double-fire on the same `(symbol, play)` per ET day.
+
+- Two-knob safety, mirroring the daily tick's `dry_run = not args.armed`
+  pattern:
+  - `HERMES_QUANT_AUTONOMOUS=1`        — enable phase 7 at all (else read-only)
+  - `HERMES_QUANT_AUTONOMOUS_ARMED=1`  — actually place orders (else dry-run)
+  Both must be set to fire real orders. The default of *neither* preserves
+  the historical posture; the default of *just `_AUTONOMOUS=1`* runs the
+  pipeline, writes the journal record, and never sends an order — useful as
+  a "shadow mode" to observe what would have fired before arming.
+
+- An umbrella audit record is appended to the same journal with
+  `event="autonomous_phase_summary"` and `source="hourly"`, distinguishing
+  hourly-surface fires from daily-surface fires in audit. Per-pair records
+  the playbook tick itself wrote already carry `tick_id`, which ties them
+  together.
+
+- The hourly summary line (visible in Discord when something fires or halts)
+  is silenced by default — only `fired > 0`, `errors > 0`, `halt_aborted`,
+  or `armed AND silenced > 0` produce output. The hourly cron fires up to
+  7×/day, so silence-by-default matters more here than on the once-daily tick.
+
+This amendment does not contradict the original ADR's "no intraday tick
+reactor" position because:
+
+1. The four named action cadences (daily / weekly / quarterly / NTA reconcile)
+   remain the **primary** firing surfaces.
+2. The hourly augmentation is **opt-in** — no operator action means no behavior
+   change.
+3. The hourly augmentation **does not introduce a new strategy or horizon** —
+   it reuses the daily playbook tick's logic verbatim, just gives it more
+   chances to react to a signal that flipped after 09:00 ET. The 5-play
+   playbook's holding periods are unchanged.
+4. The shared journal makes double-firing impossible by construction.
+
+Operational cost is one extra import + one `run_tick()` call per hourly tick
+when enabled (~30s wall time observed in the 2026-05-26 evening verification),
+well within the hour budget.
+
+Tests: `tests/unit/test_quant_hourly_tick_autonomous.py` — 8 tests covering
+default-disabled, dry-run-by-default, fire emits summary, armed loses dry-run
+suffix, halt-abort surfaces 🚨, import-failure handled, run_tick crash handled,
+audit record always appended.
+
 ## Implementation notes
 
 - The cron writer (`hermes quant playbook install-crons`) is the contract surface
