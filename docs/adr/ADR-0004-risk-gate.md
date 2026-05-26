@@ -235,3 +235,58 @@ Numbering preserved across the amendment to keep test names and log breadcrumbs 
 ### Provenance
 
 Phase-8 synthesis: `docs/reviews/2026-05-13-v0.1.1-phase8/synthesis.md` §P0-B (Part A — Claude P2 and DeepSeek P0 converged on the same root cause from different traces) and §P1-δ (Part B). Implementations: `hermes_quant/risk/gate.py:229-231` (Part A, shipped) and `hermes_quant/risk/gate.py:300-310` (Part B's current naive `_next_session_open`, to be replaced in v0.1.2).
+
+---
+
+## Amendment 2026-05-26: Paper-mode-only cost-gate override
+
+**Status**: accepted (paper-only)
+**Date**: 2026-05-26
+
+### Context
+
+Per `docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md`, the autonomous tick on Alpaca paper has been emitting near-zero fires while the calibrator is cold-starting. Diagnosis: with default `cost_multiple=2.0` against the bootstrap `commission + 0.5×spread + slippage_estimate` round-trip, the live cost-gate threshold is several basis points — but on Alpaca **paper** trading the real fees are zero and slippage is simulated, so the buffer is artificially conservative. The aggregator can't yet emit edges large enough to clear it.
+
+This is a paper-only inefficiency. Live trading must continue to enforce the full friction-aware threshold; defects there subtract from real capital. But the discipline asymmetry is clear: silence-by-default applies to **putting capital at risk**, not to refusing to learn on paper.
+
+### Decision (paper-only)
+
+Add a single config flag, default off, to bypass the cost-gate threshold on paper accounts only. The edge-sign alignment guard (Rule 5a) is **never** bypassed.
+
+```yaml
+quant:
+  risk:
+    paper_zero_costs: false   # default; conservative
+    # Set to `true` ONLY when the active autonomous reactor is 'paper'.
+    # The autonomous loop fails closed (raises ValueError) if a non-paper
+    # reactor is ever invoked while this flag is set.
+```
+
+When `paper_zero_costs=true`:
+
+- Rule 5's threshold is forced to `0.0` instead of `cost_multiple × round_trip_cost`. The `|expected_signed_edge| < threshold` check still runs against `0.0` — meaning any positive-magnitude signed edge clears the threshold, but exactly-zero edges still silence (consistent with the Rule 3 zero-confidence guard).
+- Rule 5a (`expected_signed_edge × signal.direction <= 0` → silence) is **untouched**. Negative-signed-edge signals continue to be silenced. The override widens the cost-gate's threshold ONLY; it does not weaken the sign discipline.
+- All other rules (halt, drawdown, daily-loss, post-loss cooldown, Kelly sizer caps, action_step rounding, min_trade_size churn guard) are untouched.
+
+### Discipline guards
+
+1. **Default off.** `RiskConfig().paper_zero_costs is False`. A repo without explicit YAML opt-in behaves identically to v0.1.1.
+2. **Paper-only invariant in the autonomous loop.** `hermes_quant/autonomous.py::_react()` raises `ValueError("paper_zero_costs is set but reactor is not paper")` if the flag is true and the active reactor's `name != "paper"`. This is the fail-closed guard against accidental live-mode invocation.
+3. **No widening of any other action-space limit.** `max_position_pct`, `action_step`, `min_trade_size`, `quarter_kelly`, the drawdown/daily-loss circuit breakers, and the post-loss cooldown all retain their existing values regardless of the flag.
+4. **Edge-sign guard preserved.** The Phase-8 P0-B amendment (Rule 5a) is what protects against negative-edge sign-flip; that protection is upstream of the cost-gate threshold check and runs in **both** branches.
+
+### Updated rule sequence (no renumber)
+
+The canonical sequence from the 2026-05-13 amendment is unchanged. Rule 5's threshold computation is the only line that branches on `paper_zero_costs`; the sequence, naming, and silence-by-default ordering are stable.
+
+### Negative consequences accepted
+
+- A paper-mode tick can fire on tiny positive-edge signals that would never clear the live cost gate. This is intended — the paper run's purpose is to feed the calibrator, not to optimize paper P&L.
+- Paper-mode fire counts and live-mode fire counts are no longer apples-to-apples. Any analytics that compare them must filter on the `paper_zero_costs` flag (recorded in the action audit payload via the existing `gate_approval` event).
+
+### Implementation references
+
+- `hermes_quant/risk/gate.py` — `RiskConfig.paper_zero_costs` (dataclass field + docstring) and the threshold branch inside `DefaultRiskGate.gate()`.
+- `hermes_quant/autonomous.py::_read_safety_rails` — reads `quant.risk.paper_zero_costs` from config.
+- `hermes_quant/autonomous.py::_react` — fail-closed guard against non-paper reactors.
+- `tests/unit/test_paper_zero_costs.py` — four tests covering default-off, threshold-zeroing, edge-sign-guard preservation, and the cold-start clearing behavior.

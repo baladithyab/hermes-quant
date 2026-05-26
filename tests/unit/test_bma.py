@@ -72,7 +72,14 @@ class TestAggregate:
         assert sig.aggregator == "bma"
 
     def test_unanimous_long_returns_long(self):
+        # Use ColdStartCalibrator explicitly so this test is isolated from
+        # the on-disk fitted IsotonicCalibrator (which BMAAggregator now
+        # auto-loads from ~/.hermes/quant/calibrators/isotonic.pkl when present
+        # post-bootstrap). The BMA-specific behavior under test is
+        # cold-start shrinkage + agreement bonus, not the calibration source.
+        from hermes_quant.calibrators import ColdStartCalibrator
         a = BMAAggregator()
+        a.calibrator = ColdStartCalibrator()
         views = [
             _view("classical-ta", 1, mag=0.012, conf=0.7),
             _view("microstructure", 1, mag=0.008, conf=0.6),
@@ -81,9 +88,9 @@ class TestAggregate:
         sig = a.aggregate(views, _ctx())
         assert sig.direction == 1
         assert sig.magnitude > 0
-        # Pre-calibration: cold-start shrinkage of 0.20
+        # Pre-calibration: cold-start Beta(2,5) prior caps at 0.375
         assert sig.confidence_raw > sig.confidence
-        # Agreement bonus applied (all 3 agree)
+        # Agreement bonus applied (all 3 agree) → raw > 0.5
         assert sig.confidence_raw > 0.5
 
     def test_unanimous_short_returns_short(self):

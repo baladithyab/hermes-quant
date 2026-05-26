@@ -33,12 +33,14 @@ Per ADR-0009 §P1-10:
 from __future__ import annotations
 
 import logging
+import pickle
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from hermes_quant.calibrators import ColdStartCalibrator
+from hermes_quant.calibrators import ColdStartCalibrator, IsotonicCalibrator
 from hermes_quant.protocol import (
     AggregatedSignal,
     AnalystView,
@@ -47,6 +49,11 @@ from hermes_quant.protocol import (
     EpisodeOutcome,
     MarketContext,
 )
+
+# Canonical persistence location for the bootstrapped IsotonicCalibrator.
+# Mirrors hermes_quant.training.bootstrap_calibrator.DEFAULT_CALIBRATOR_PATH;
+# we don't import that module here to keep the BMA dependency surface clean.
+_DEFAULT_CALIBRATOR_PATH = Path.home() / ".hermes" / "quant" / "calibrators" / "isotonic.pkl"
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +105,7 @@ class BMAAggregator:
         prior_beta: float = 5.0,
         n_min_observations: int = 30,
         agreement_bonus: float = 0.10,
+        calibrator_path: Path | None = None,
     ):
         self.prior_alpha = prior_alpha
         self.prior_beta = prior_beta
@@ -105,10 +113,70 @@ class BMAAggregator:
         self.agreement_bonus = agreement_bonus
 
         self._stats: dict[str, _AnalystStats] = {}
-        self.calibrator = ColdStartCalibrator()
+
+        # Calibrator: prefer a fitted IsotonicCalibrator persisted on disk;
+        # fall back to ColdStartCalibrator on missing-file or any unpickle
+        # error. The fallback path preserves silence-by-default — a corrupt
+        # pickle does NOT crash the aggregator, it just downgrades to
+        # cold-start (which is the conservative default).
+        self.calibrator_path = (
+            Path(calibrator_path) if calibrator_path is not None else _DEFAULT_CALIBRATOR_PATH
+        )
+        self.calibrator = self._load_calibrator(self.calibrator_path)
 
         self._n_aggregated = 0
         self._last_aggregated_at: pd.Timestamp | None = None
+
+    @staticmethod
+    def _load_calibrator(path: Path):
+        """Load IsotonicCalibrator from `path`, or return ColdStartCalibrator on any error.
+
+        Money-software discipline: a corrupt or schema-shifted pickle must
+        NOT propagate. The aggregator falls back to the cold-start calibrator
+        (whose Beta(2,5) prior caps confidence at 0.375 — silence-by-default
+        for the cost gate). The fallback is logged at WARNING so operators
+        can catch a stale/bad calibrator file in journalctl.
+        """
+        try:
+            if not path.exists():
+                logger.info(
+                    "BMAAggregator: no persisted calibrator at %s; using ColdStartCalibrator",
+                    path,
+                )
+                return ColdStartCalibrator()
+            with open(path, "rb") as f:
+                obj = pickle.load(f)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "BMAAggregator: failed to load calibrator from %s (%s); falling back "
+                "to ColdStartCalibrator",
+                path,
+                exc,
+            )
+            return ColdStartCalibrator()
+
+        if not isinstance(obj, IsotonicCalibrator):
+            logger.warning(
+                "BMAAggregator: pickle at %s is %s, not IsotonicCalibrator; "
+                "falling back to ColdStartCalibrator",
+                path,
+                type(obj).__name__,
+            )
+            return ColdStartCalibrator()
+        if not getattr(obj, "is_calibrated", False):
+            logger.warning(
+                "BMAAggregator: IsotonicCalibrator at %s is not fitted; "
+                "falling back to ColdStartCalibrator",
+                path,
+            )
+            return ColdStartCalibrator()
+
+        logger.info(
+            "BMAAggregator: loaded fitted IsotonicCalibrator from %s (n_samples=%d)",
+            path,
+            obj.n_samples,
+        )
+        return obj
 
     def _get_or_create_stats(self, analyst_name: str) -> _AnalystStats:
         if analyst_name not in self._stats:

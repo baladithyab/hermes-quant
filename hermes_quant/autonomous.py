@@ -93,12 +93,17 @@ def _read_silence_bias_config() -> GateConfig:
 def _read_safety_rails() -> dict:
     cfg = _read_config()
     auto = (cfg.get("quant") or {}).get("autonomous") or {}
+    risk = (cfg.get("quant") or {}).get("risk") or {}
     return {
         "max_per_tick_opens": int(auto.get("max_per_tick_opens", 1)),
         "max_concurrent_positions": int(auto.get("max_concurrent_positions", 5)),
         "kill_switch_pct": float(auto.get("kill_switch_pct", 0.10)),
         "log_silences": bool(auto.get("log_silences", False)),
         "allow_live": bool(auto.get("allow_live", False)),
+        # Paper-mode-only cost-gate override. Default False (conservative).
+        # Consumed by the autonomous tick when constructing RiskConfig and
+        # enforced fail-closed in _react() against the active reactor name.
+        "paper_zero_costs": bool(risk.get("paper_zero_costs", False)),
     }
 
 
@@ -399,7 +404,12 @@ def tick(
 
             if not dry_run:
                 try:
-                    execution_id = _react(advisor_result, entry, kelly)
+                    execution_id = _react(
+                        advisor_result,
+                        entry,
+                        kelly,
+                        paper_zero_costs=bool(rails.get("paper_zero_costs", False)),
+                    )
                     decision.execution_id = execution_id
                     fires_this_tick += 1
                 except Exception as exc:  # noqa: BLE001
@@ -430,6 +440,8 @@ def _react(
     advisor_result: dict[str, Any],
     entry: WatchlistEntry,
     fill_size_pct: float,
+    *,
+    paper_zero_costs: bool = False,
 ) -> str:
     """Fire the PaperReactor for an autonomous decision and return the
     synthesized proposal_id (used as the execution_id surfaced in tick output).
@@ -437,9 +449,19 @@ def _react(
     We construct a minimal Proposal-shaped object on the fly so we can
     reuse PaperReactor without forcing it to depend on the proposal store.
     The execution lands in executions.jsonl per ADR-0015 §D6.
+
+    Fail-closed guard (paper-mode-only cost-gate override):
+      `paper_zero_costs=True` REQUIRES that the active reactor is named
+      'paper'. If a non-paper reactor were ever wired in here while the
+      flag is set, raise ValueError before any execution side-effect.
+      Live behavior must be unaffected by this flag — silence-by-default.
     """
     from hermes_quant.proposals import Proposal, _make_proposal_id, _utc_now
     from hermes_quant.react import PaperReactor
+
+    reactor = PaperReactor()
+    if paper_zero_costs and getattr(reactor, "name", None) != "paper":
+        raise ValueError("paper_zero_costs is set but reactor is not paper")
 
     # Synthesize a Proposal stand-in. We DO NOT register it in the
     # proposal store — autonomous fires bypass HITL's pending state.
@@ -458,7 +480,6 @@ def _react(
         advisor_result=advisor_result,
     )
 
-    reactor = PaperReactor()
     reactor.execute(
         proposal,
         fill_size_pct=fill_size_pct,

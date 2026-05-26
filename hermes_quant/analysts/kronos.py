@@ -392,19 +392,55 @@ class _DistributionalKronosPredictor:
         pred_len: int,
         sample_count: int,
     ) -> np.ndarray:
-        """Return [sample_count, pred_len, n_features] array."""
-        # Per ADR-0018 §D2 fallback: run predict sample_count times.
-        # Each call uses Kronos's internal stochasticity; the average is
-        # what predict() returns by default. We collect the per-call output
-        # which IS the per-sample mean. To get distinct paths we need to
-        # call with sample_count=1 each time so internal mean is identity.
+        """Return [sample_count, pred_len, n_features] array.
+
+        Per ADR-0018 §D2 fallback: run predict sample_count times.
+        Each call uses Kronos's internal stochasticity; the average is
+        what predict() returns by default.
+
+        Upstream Kronos's `KronosPredictor.predict` requires explicit
+        `x_timestamp` (history) and `y_timestamp` (future) DatetimeIndex
+        arguments. We synthesize them from the input df's index and a
+        pred_len extension at a 1-day cadence (matching our analyst's
+        timeframe contract).
+        """
+        # x_timestamp = the bars' timestamps; y_timestamp = pred_len
+        # business-day extensions past the last bar.
+        # IMPORTANT: upstream Kronos's `calc_time_stamps` calls `.dt.minute` on
+        # the timestamp argument, which only exists on pandas Series (not on
+        # DatetimeIndex). We always pass a Series of datetimes.
+        if isinstance(df.index, pd.DatetimeIndex):
+            x_timestamp = pd.Series(df.index)
+        elif "timestamp" in df.columns:
+            x_timestamp = pd.Series(pd.to_datetime(df["timestamp"]).values)
+        else:
+            # Codex review HIGH (2026-05-26): silently synthesizing timestamps
+            # from utcnow() loses temporal alignment with the bars and
+            # produces nonsense Kronos forecasts (foundation-model time
+            # embeddings depend on actual hour/weekday/month). Fail closed.
+            raise ValueError(
+                "KronosAnalyst requires bars with a DatetimeIndex or a "
+                "'timestamp' column. Synthesizing timestamps from utcnow() "
+                "produces wrong forecasts because Kronos's time embeddings "
+                "depend on actual hour/weekday/month."
+            )
+
+        last = pd.Timestamp(x_timestamp.iloc[-1])
+        # Use business-day frequency for equity timeframes; 1h/15m would
+        # need a different freq but our daily-screen path is 1d.
+        y_timestamp = pd.Series(pd.date_range(start=last + pd.Timedelta(days=1),
+                                              periods=pred_len, freq="B"))
+
         paths = []
         for _ in range(sample_count):
             out_df = self._base.predict(
                 df=df,
+                x_timestamp=x_timestamp,
+                y_timestamp=y_timestamp,
                 pred_len=pred_len,
                 sample_count=1,
+                verbose=False,
             )
-            # out_df has columns ['open', 'high', 'low', 'close', 'volume']
+            # out_df has columns ['open', 'high', 'low', 'close', 'volume', ...]
             paths.append(out_df[["close", "open", "high", "low", "volume"]].values)
         return np.array(paths)

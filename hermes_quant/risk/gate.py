@@ -116,6 +116,26 @@ class RiskConfig:
     """Cooldown window after a realized loss (heuristic; v0.2 may
     config-default-off)."""
 
+    paper_zero_costs: bool = False
+    """PAPER-MODE-ONLY override: when True, the cost-gate threshold is
+    forced to 0.0 (skipping the `cost_multiple × round_trip_cost` check)
+    while preserving the edge-sign alignment guard.
+
+    Rationale (per docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md):
+    Alpaca paper trading has zero real fees and only simulated slippage.
+    The default `2× round_trip_cost` buffer is artificially conservative
+    on paper while the calibrator is cold-starting and can't yet emit
+    edges large enough to clear the live-mode threshold. This unblocks
+    paper-mode learning without touching live behavior.
+
+    Discipline:
+      - Default False (conservative; live-mode behavior unchanged).
+      - The edge-sign alignment guard (`edge * direction <= 0`) is NEVER
+        bypassed — silence-by-default still wins on negative-edge signals.
+      - Live-mode invocation with this flag must fail closed; the
+        autonomous loop enforces that invariant before reaching the gate.
+    """
+
     @classmethod
     def conservative(cls) -> RiskConfig:
         return cls(
@@ -322,12 +342,25 @@ class DefaultRiskGate:
             probability=signal.confidence,
             magnitude=abs(signal.magnitude),
         )
-        threshold = cost_gate_threshold(
-            market_commission=market.commission,
-            market_spread=market.spread,
-            market_slippage=market.slippage_estimate,
-            cost_multiple=self.config.cost_multiple,
-        )
+        # PAPER-MODE-ONLY override (per docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md):
+        # when `paper_zero_costs=True`, the threshold is forced to 0.0
+        # INSTEAD of computing `cost_multiple × round_trip_cost` from
+        # market.commission/spread/slippage. Paper accounts (Alpaca) have
+        # zero real fees and only simulated slippage, so the live buffer
+        # is artificially conservative on paper. Live behavior is
+        # unchanged: this branch is only ever reached when an explicit
+        # config flag is set, and the autonomous loop fails closed if
+        # the active reactor is not 'paper'. The edge-sign alignment
+        # guard below is NEVER bypassed.
+        if self.config.paper_zero_costs:
+            threshold = 0.0
+        else:
+            threshold = cost_gate_threshold(
+                market_commission=market.commission,
+                market_spread=market.spread,
+                market_slippage=market.slippage_estimate,
+                cost_multiple=self.config.cost_multiple,
+            )
         # Phase-8 P0-B (synthesis 2026-05-13): edge-sign alignment guard.
         # `expected_signed_edge` returns positive when the signal's
         # direction-weighted expected return is favorable, negative when
