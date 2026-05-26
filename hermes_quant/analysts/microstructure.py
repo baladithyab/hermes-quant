@@ -36,6 +36,7 @@ that makes BMA do anything; with one analyst the aggregator is degenerate
 (ClassicalTA + microstructure + Kronos) is the empirical test of whether
 the ensemble pattern adds value at all.
 """
+
 from __future__ import annotations
 
 import logging
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Indicator math (pure functions; no state)
 # ---------------------------------------------------------------------------
+
 
 def percent_b(close: pd.Series, period: int = 20, n_std: float = 2.0) -> float:
     """Bollinger %B = (close - lower) / (upper - lower).
@@ -90,11 +92,14 @@ def atr_relative(bars: pd.DataFrame, period: int = 14) -> float:
     low = bars["low"]
     close = bars["close"]
     prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
     atr = tr.ewm(alpha=1 / period, adjust=False).mean().iloc[-1]
     last_close = close.iloc[-1]
     if last_close == 0 or np.isnan(last_close):
@@ -110,7 +115,7 @@ def trend_quality(close: pd.Series, period: int = 14) -> float:
     """
     if len(close) < period + 1:
         return float("nan")
-    window = close.iloc[-(period + 1):]
+    window = close.iloc[-(period + 1) :]
     net_move = abs(window.iloc[-1] - window.iloc[0])
     bar_moves = window.diff().abs().sum()
     if bar_moves == 0:
@@ -137,10 +142,12 @@ def directional_bar_imbalance(bars: pd.DataFrame, period: int = 20) -> float:
 # Sub-signal helpers
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _SubSignal:
     """Per-rule emission. direction in {-1, 0, +1}, magnitude as fraction,
     raw_confidence in [0, 1]."""
+
     direction: int
     magnitude: float
     raw_confidence: float
@@ -150,6 +157,7 @@ class _SubSignal:
 # ---------------------------------------------------------------------------
 # MicrostructureLite analyst
 # ---------------------------------------------------------------------------
+
 
 class MicrostructureLite:
     """Microstructure-lite analyst. Per the founding charter §"Layer 1".
@@ -215,9 +223,7 @@ class MicrostructureLite:
             return _SubSignal(-1, mag, min(1.0, (b - 0.95) * 5), "bollinger")
         return _SubSignal(0, 0.0, 0.0, "bollinger")
 
-    def _trend_quality_signal(
-        self, close: pd.Series, bar_imbalance: float
-    ) -> _SubSignal:
+    def _trend_quality_signal(self, close: pd.Series, bar_imbalance: float) -> _SubSignal:
         """High trend quality + bar imbalance directional → follow it."""
         q = trend_quality(close, period=self.adx_period)
         if np.isnan(q):
@@ -235,9 +241,7 @@ class MicrostructureLite:
         conf = float(min(1.0, q * abs(bar_imbalance) * 2))
         return _SubSignal(direction, mag, conf, "trend_quality")
 
-    def _toxicity_signal(
-        self, bars: pd.DataFrame, atr_rel: float
-    ) -> _SubSignal:
+    def _toxicity_signal(self, bars: pd.DataFrame, atr_rel: float) -> _SubSignal:
         """Order-flow toxicity: high ATR + persistent bar imbalance.
 
         Real VPIN measures buy-vs-sell volume imbalance from tick data.
@@ -285,7 +289,8 @@ class MicrostructureLite:
             self._error_count += 1
             logger.warning(
                 "microstructure_lite: analysis failed for %s",
-                ctx.asset, exc_info=True,
+                ctx.asset,
+                exc_info=True,
             )
             return None
 
@@ -303,14 +308,10 @@ class MicrostructureLite:
 
         # Composite magnitude: weighted average of magnitude across active
         weight_sum = sum(s.raw_confidence for s in active) or 1.0
-        composite_magnitude = sum(
-            s.magnitude * s.raw_confidence for s in active
-        ) / weight_sum
+        composite_magnitude = sum(s.magnitude * s.raw_confidence for s in active) / weight_sum
 
         # Raw confidence: agreement fraction
-        agreeing = sum(
-            1 for s in active if s.direction == composite_direction
-        )
+        agreeing = sum(1 for s in active if s.direction == composite_direction)
         raw_confidence = agreeing / len(sub_signals)  # full N=3 denominator
 
         # Calibrate
@@ -328,13 +329,9 @@ class MicrostructureLite:
             horizon=self.horizon,
             rationale=self._render_rationale(active),
             metadata={
-                "bollinger_pct_b": _safe(
-                    percent_b(close, self.bb_period, self.bb_std)
-                ),
+                "bollinger_pct_b": _safe(percent_b(close, self.bb_period, self.bb_std)),
                 "atr_relative": _safe(atr_rel),
-                "trend_quality": _safe(
-                    trend_quality(close, self.adx_period)
-                ),
+                "trend_quality": _safe(trend_quality(close, self.adx_period)),
                 "bar_imbalance": _safe(imbalance),
                 "active_subsignals": [s.rule for s in active],
                 "n_active_subsignals": len(active),
@@ -358,9 +355,7 @@ class MicrostructureLite:
         return {
             "name": self.name,
             "n_views_emitted": self._n_views_emitted,
-            "last_view_at": (
-                str(self._last_view_at) if self._last_view_at else None
-            ),
+            "last_view_at": (str(self._last_view_at) if self._last_view_at else None),
             "error_count": self._error_count,
             "calibrated": self.calibrator.is_calibrated,
             "n_calibration_samples": self.calibrator.n_samples,
@@ -369,10 +364,7 @@ class MicrostructureLite:
     @staticmethod
     def _render_rationale(active: list[_SubSignal]) -> str:
         """Human-readable rule summary; capped at 256 chars per Protocol."""
-        parts = [
-            f"{s.rule}={s.direction:+d}@{s.raw_confidence:.2f}"
-            for s in active
-        ]
+        parts = [f"{s.rule}={s.direction:+d}@{s.raw_confidence:.2f}" for s in active]
         return f"[microstructure] {', '.join(parts)}"[:256]
 
 

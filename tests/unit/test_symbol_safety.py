@@ -4,6 +4,7 @@ Per the founding charter §"Layer 1 Analyst Pool" — symbols flow into
 filesystem paths (cache files, JSONL filenames, log paths). The
 sanitizer is the trust boundary between user/wire input and disk.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -15,14 +16,18 @@ from hermes_quant.utils.symbol_safety import safe_symbol_component
 # Happy path — common ticker shapes
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("symbol,expected", [
-    ("AAPL", "AAPL"),
-    ("SPY", "SPY"),
-    ("BRK.B", "BRK.B"),         # dot inside is fine
-    ("BRK-B", "BRK-B"),         # hyphen is fine (Yahoo convention)
-    ("ES_F", "ES_F"),           # underscore is fine
-    ("BTC_USDT", "BTC_USDT"),
-])
+
+@pytest.mark.parametrize(
+    "symbol,expected",
+    [
+        ("AAPL", "AAPL"),
+        ("SPY", "SPY"),
+        ("BRK.B", "BRK.B"),  # dot inside is fine
+        ("BRK-B", "BRK-B"),  # hyphen is fine (Yahoo convention)
+        ("ES_F", "ES_F"),  # underscore is fine
+        ("BTC_USDT", "BTC_USDT"),
+    ],
+)
 def test_normal_tickers_pass_through(symbol, expected):
     assert safe_symbol_component(symbol) == expected
 
@@ -37,14 +42,18 @@ def test_crypto_pair_slash_replaced():
 # Path-traversal attack class
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("hostile", [
-    "../../etc/passwd",
-    "..",
-    ".",
-    "../sibling",
-    "/absolute/path",
-    "C:\\Windows\\System32",
-])
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "../../etc/passwd",
+        "..",
+        ".",
+        "../sibling",
+        "/absolute/path",
+        "C:\\Windows\\System32",
+    ],
+)
 def test_path_traversal_attempts_neutralized(hostile):
     """Either raises ValueError, or returns a string with no traversal tokens."""
     try:
@@ -85,6 +94,7 @@ def test_non_string_input_raises():
 # Length cap + character whitelist
 # ---------------------------------------------------------------------------
 
+
 def test_long_symbol_capped_at_32_chars():
     long = "A" * 100
     out = safe_symbol_component(long)
@@ -118,9 +128,16 @@ def test_whitespace_in_middle_replaced():
 # Idempotency: applying twice doesn't change the result
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("symbol", [
-    "AAPL", "BTC/USDT", "BRK.B", "../etc",
-])
+
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "AAPL",
+        "BTC/USDT",
+        "BRK.B",
+        "../etc",
+    ],
+)
 def test_idempotent(symbol):
     try:
         once = safe_symbol_component(symbol)

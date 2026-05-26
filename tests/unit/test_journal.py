@@ -14,6 +14,7 @@ Coverage:
 - File corruption: unparseable file backs up + recovers
 - Empty / missing file: returns []
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -58,26 +59,30 @@ def _make_entry(
         decision_price=decision_price,
         benchmark_symbol="SPY",
         per_analyst_components=[
-            AnalystComponent(analyst="classical_ta", direction=direction,
-                             confidence=0.6, weight=0.5),
-            AnalystComponent(analyst="microstructure_lite", direction=direction,
-                             confidence=0.7, weight=0.5),
+            AnalystComponent(
+                analyst="classical_ta", direction=direction, confidence=0.6, weight=0.5
+            ),
+            AnalystComponent(
+                analyst="microstructure_lite", direction=direction, confidence=0.7, weight=0.5
+            ),
         ],
         reason=f"Test {entry_id}",
     )
     if resolved:
         e = SettlementEntry(
-            **{**_entry_to_dict(e),
-               "asof_settlement": when + timedelta(hours=4),
-               "exit_price": decision_price * 1.02,
-               "raw_return": 0.02,
-               "alpha_return": 0.012,
-               "hold_minutes": 240,
-               "reflection": Reflection(
-                   thesis_held=direction > 0,
-                   magnitude_error=0.5,
-               ),
-               })
+            **{
+                **_entry_to_dict(e),
+                "asof_settlement": when + timedelta(hours=4),
+                "exit_price": decision_price * 1.02,
+                "raw_return": 0.02,
+                "alpha_return": 0.012,
+                "hold_minutes": 240,
+                "reflection": Reflection(
+                    thesis_held=direction > 0,
+                    magnitude_error=0.5,
+                ),
+            }
+        )
     return e
 
 
@@ -85,10 +90,12 @@ def _entry_to_dict(e: SettlementEntry) -> dict:
     if hasattr(e, "model_dump"):
         return e.model_dump()
     from dataclasses import asdict
+
     return asdict(e)
 
 
 # ---------------------------------------------------------------------------
+
 
 def test_append_pending_writes_phase_a_entry(tmp_path):
     journal = tmp_path / "journal.md"
@@ -258,14 +265,14 @@ def test_corrupt_file_backs_up_and_recovers(tmp_path):
 # HITL integration
 # ---------------------------------------------------------------------------
 
+
 def test_append_human_override_approve(tmp_path, monkeypatch):
     journal = tmp_path / "journal.md"
-    monkeypatch.setattr(
-        "hermes_quant.journal.writer.DEFAULT_JOURNAL_PATH", journal
-    )
+    monkeypatch.setattr("hermes_quant.journal.writer.DEFAULT_JOURNAL_PATH", journal)
 
     # Hand-build a proposal stand-in
     from hermes_quant.proposals import Proposal
+
     proposal = Proposal(
         proposal_id="prop_20260513T180000_AAPL_xyz789",
         state="approved",
@@ -296,6 +303,7 @@ def test_append_human_override_approve(tmp_path, monkeypatch):
 def test_append_human_override_reject_persists_reason(tmp_path):
     journal = tmp_path / "journal.md"
     from hermes_quant.proposals import Proposal
+
     proposal = Proposal(
         proposal_id="prop_20260513T180000_AAPL_rej111",
         state="rejected",
@@ -315,7 +323,8 @@ def test_append_human_override_reject_persists_reason(tmp_path):
         },
     )
     entry = append_human_override(
-        proposal, kind="reject",
+        proposal,
+        kind="reject",
         reason="Earnings tomorrow, too risky",
         path=journal,
     )
@@ -330,6 +339,7 @@ def test_append_human_override_idempotent_on_same_id(tmp_path):
     """Same proposal_id passed twice updates rather than duplicates."""
     journal = tmp_path / "journal.md"
     from hermes_quant.proposals import Proposal
+
     proposal = Proposal(
         proposal_id="prop_20260513T180000_AAPL_dup222",
         state="rejected",
@@ -345,10 +355,8 @@ def test_append_human_override_idempotent_on_same_id(tmp_path):
             "analyst_views": [],
         },
     )
-    append_human_override(proposal, kind="reject",
-                          reason="first reason", path=journal)
-    append_human_override(proposal, kind="reject",
-                          reason="updated reason", path=journal)
+    append_human_override(proposal, kind="reject", reason="first reason", path=journal)
+    append_human_override(proposal, kind="reject", reason="updated reason", path=journal)
     parsed = parse_journal(journal.read_text())
     assert len(parsed) == 1
     assert parsed[0].hitl_reason == "updated reason"
@@ -357,6 +365,7 @@ def test_append_human_override_idempotent_on_same_id(tmp_path):
 # ---------------------------------------------------------------------------
 # Recent-lessons retrieval (ADR-0010 §7)
 # ---------------------------------------------------------------------------
+
 
 def test_get_recent_lessons_returns_n_same_plus_n_cross(tmp_path):
     journal = tmp_path / "journal.md"

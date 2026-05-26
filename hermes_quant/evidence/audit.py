@@ -15,6 +15,7 @@ Doesn't import the live EvidenceStore type — uses duck-typed `store`
 argument with `.get(id)` and `.supersedes_chain(id)` methods. Sibling task
 implements the real store.
 """
+
 from __future__ import annotations
 
 import json
@@ -116,8 +117,7 @@ class AuditTree:
                 f"supersedes={ev.supersedes})"
             )
         lines.append(
-            f"  Summary: {self.n_evidence_total} evidence, "
-            f"{self.n_evidence_missing} missing"
+            f"  Summary: {self.n_evidence_total} evidence, {self.n_evidence_missing} missing"
         )
         return "\n".join(lines)
 
@@ -157,9 +157,7 @@ def _walkback_view(view: AnalystView, store: _StoreProtocol) -> AnalystAuditNode
     )
 
 
-def walkback_aggregated_signal(
-    signal: AggregatedSignal, store: _StoreProtocol
-) -> AuditTree:
+def walkback_aggregated_signal(signal: AggregatedSignal, store: _StoreProtocol) -> AuditTree:
     """Walk back from an AggregatedSignal."""
     components = tuple(_walkback_view(v, store) for v in (signal.components or ()))
     n_total = sum(len(c.evidence) for c in components)
@@ -214,9 +212,7 @@ def walkback_evidence(evidence_id: UUID | str, store: _StoreProtocol) -> AuditTr
     )
 
 
-def supersedes_history(
-    evidence_id: UUID | str, store: _StoreProtocol
-) -> list[EvidenceAuditNode]:
+def supersedes_history(evidence_id: UUID | str, store: _StoreProtocol) -> list[EvidenceAuditNode]:
     """Returns supersedes chain (most recent first)."""
     chain = store.supersedes_chain(evidence_id)
     return [

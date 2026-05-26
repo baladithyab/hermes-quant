@@ -13,6 +13,7 @@ Coverage of all 8 rules:
   Rule 7: Min-trade-size churn guard
 + Rule ordering / priority assertions.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -37,6 +38,7 @@ from hermes_quant.risk.gate import (
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 def _signal(
     direction: int = 1,
@@ -131,6 +133,7 @@ def halt_state(tmp_path: Path) -> HaltStateSQLite:
 # Protocol contract
 # ---------------------------------------------------------------------------
 
+
 class TestProtocol:
     def test_satisfies_risk_gate_protocol(self):
         g = DefaultRiskGate()
@@ -140,6 +143,7 @@ class TestProtocol:
 # ---------------------------------------------------------------------------
 # Rule 0: Halt check (HIGHEST priority)
 # ---------------------------------------------------------------------------
+
 
 class TestRule0Halt:
     def test_halt_silences_action(self, halt_state):
@@ -159,9 +163,7 @@ class TestRule0Halt:
         halt_state.add_halt("alpaca-paper", "crypto", "BTC/USDT", reason="halt")
         g = DefaultRiskGate()
         # Drawdown would normally fire (0.5 > 0.15)
-        action = g.gate(
-            _signal(), _market(), _portfolio(drawdown=0.50), halt_state
-        )
+        action = g.gate(_signal(), _market(), _portfolio(drawdown=0.50), halt_state)
         # But halt silences entirely — no flatten action emitted
         assert action is None
 
@@ -170,12 +172,11 @@ class TestRule0Halt:
 # Rule 1: Drawdown circuit breaker
 # ---------------------------------------------------------------------------
 
+
 class TestRule1Drawdown:
     def test_drawdown_above_max_flattens(self, halt_state):
         g = DefaultRiskGate()  # default max_drawdown_pct=0.15
-        action = g.gate(
-            _signal(), _market(), _portfolio(drawdown=0.20), halt_state
-        )
+        action = g.gate(_signal(), _market(), _portfolio(drawdown=0.20), halt_state)
         assert action is not None
         assert action.target_position_pct == 0.0
         assert action.halt is True
@@ -183,9 +184,7 @@ class TestRule1Drawdown:
 
     def test_drawdown_below_max_passes(self, halt_state):
         g = DefaultRiskGate()
-        action = g.gate(
-            _signal(), _market(), _portfolio(drawdown=0.10), halt_state
-        )
+        action = g.gate(_signal(), _market(), _portfolio(drawdown=0.10), halt_state)
         # No drawdown halt fires; some action may emit (depends on Kelly)
         assert action is None or action.halt is False
 
@@ -194,12 +193,11 @@ class TestRule1Drawdown:
 # Rule 2: Daily-loss circuit breaker
 # ---------------------------------------------------------------------------
 
+
 class TestRule2DailyLoss:
     def test_daily_loss_above_max_flattens_with_session_halt(self, halt_state):
         g = DefaultRiskGate()  # default max_daily_loss_pct=0.05
-        action = g.gate(
-            _signal(), _market(), _portfolio(daily_loss=0.06), halt_state
-        )
+        action = g.gate(_signal(), _market(), _portfolio(daily_loss=0.06), halt_state)
         assert action is not None
         assert action.target_position_pct == 0.0
         assert action.halt is True
@@ -209,7 +207,9 @@ class TestRule2DailyLoss:
     def test_daily_loss_below_max_passes(self, halt_state):
         g = DefaultRiskGate()
         action = g.gate(
-            _signal(direction=0), _market(), _portfolio(daily_loss=0.02),
+            _signal(direction=0),
+            _market(),
+            _portfolio(daily_loss=0.02),
             halt_state,
         )
         # No daily-loss halt; flat signal silences
@@ -219,6 +219,7 @@ class TestRule2DailyLoss:
 # ---------------------------------------------------------------------------
 # Rule 3: Flat / zero-confidence silence
 # ---------------------------------------------------------------------------
+
 
 class TestRule3FlatSilence:
     def test_flat_direction_silences(self, halt_state):
@@ -245,6 +246,7 @@ class TestRule3FlatSilence:
 # ---------------------------------------------------------------------------
 # Rule 4: Post-loss cooldown
 # ---------------------------------------------------------------------------
+
 
 class TestRule4Cooldown:
     def test_cooldown_active_silences(self, halt_state):
@@ -285,6 +287,7 @@ class TestRule4Cooldown:
 # Rule 5: Cost gate (synthesis-v2 §P0-A — uses expected_signed_edge)
 # ---------------------------------------------------------------------------
 
+
 class TestRule5CostGate:
     def test_sub_cost_signal_silences(self, halt_state):
         g = DefaultRiskGate(RiskConfig(cost_multiple=10.0))  # impossibly high
@@ -316,62 +319,61 @@ class TestRule5CostGate:
     def test_negatively_edged_long_signal_silenced(self, halt_state):
         """A long signal with cold-start-shrunk confidence < 0.5 → negative
         edge → MUST silence (not flip to short)."""
-        g = DefaultRiskGate(RiskConfig(
-            cost_multiple=0.5,  # low threshold so |edge| > threshold
-            min_trade_size=0.0,
-            max_position_pct=0.20,
-        ))
+        g = DefaultRiskGate(
+            RiskConfig(
+                cost_multiple=0.5,  # low threshold so |edge| > threshold
+                min_trade_size=0.0,
+                max_position_pct=0.20,
+            )
+        )
         # confidence 0.40 with magnitude 0.10:
         #   expected_signed_edge ≈ 0.40 * log(1.10) + 0.60 * log(0.90)
         #                        ≈ 0.40 * 0.0953 + 0.60 * (-0.1054)
         #                        ≈ -0.0251  (negative for direction=+1)
         action = g.gate(
             _signal(direction=1, magnitude=0.10, confidence=0.40),
-            _market(volatility=0.02, commission=0.00005, spread=0.00005,
-                    slippage=0.00005),
+            _market(volatility=0.02, commission=0.00005, spread=0.00005, slippage=0.00005),
             _portfolio(),
             halt_state,
         )
         assert action is None, (
-            "negatively-edged long must silence, not emit a short — "
-            "Phase-8 P0-B regression"
+            "negatively-edged long must silence, not emit a short — Phase-8 P0-B regression"
         )
 
     def test_negatively_edged_short_signal_silenced(self, halt_state):
         """A short signal with cold-start-shrunk confidence < 0.5 → negative
         edge in the short direction → MUST silence (not flip to long)."""
-        g = DefaultRiskGate(RiskConfig(
-            cost_multiple=0.5,
-            min_trade_size=0.0,
-            max_position_pct=0.20,
-        ))
+        g = DefaultRiskGate(
+            RiskConfig(
+                cost_multiple=0.5,
+                min_trade_size=0.0,
+                max_position_pct=0.20,
+            )
+        )
         # For direction=-1, expected_signed_edge has its sign flipped from
         # the long-equivalent formula. With confidence 0.40 + magnitude 0.10
         # for a SHORT, edge ≈ +0.0251 — but expected_signed_edge negates for
         # shorts so the *signed* edge is -0.0251 in the short direction.
         action = g.gate(
             _signal(direction=-1, magnitude=0.10, confidence=0.40),
-            _market(volatility=0.02, commission=0.00005, spread=0.00005,
-                    slippage=0.00005),
+            _market(volatility=0.02, commission=0.00005, spread=0.00005, slippage=0.00005),
             _portfolio(),
             halt_state,
         )
         assert action is None, (
-            "negatively-edged short must silence, not emit a long — "
-            "Phase-8 P0-B regression"
+            "negatively-edged short must silence, not emit a long — Phase-8 P0-B regression"
         )
 
     def test_positively_edged_signal_still_passes(self, halt_state):
         """Sanity check: the alignment guard does NOT block legitimate
         positively-edged signals."""
-        g = DefaultRiskGate(RiskConfig(
-            cost_multiple=0.5, min_trade_size=0.0, max_position_pct=0.20
-        ))
+        g = DefaultRiskGate(
+            RiskConfig(cost_multiple=0.5, min_trade_size=0.0, max_position_pct=0.20)
+        )
         # confidence 0.65 + magnitude 0.10 + direction +1 gives edge > 0
         action = g.gate(
             _signal(direction=1, magnitude=0.10, confidence=0.65),
-            _market(volatility=0.02, commission=0.00005, spread=0.00005,
-                    slippage=0.00005),
+            _market(volatility=0.02, commission=0.00005, spread=0.00005, slippage=0.00005),
             _portfolio(),
             halt_state,
         )
@@ -383,11 +385,13 @@ class TestRule5CostGate:
 # Rule 6: Quarter-Kelly sizer (synthesis-v2 §P0-A)
 # ---------------------------------------------------------------------------
 
+
 class TestRule6KellySizer:
     def test_kelly_sizes_within_max_position(self, halt_state):
         g = DefaultRiskGate(
-            RiskConfig(max_position_pct=0.20, action_step=0.05,
-                       cost_multiple=1.0, min_trade_size=0.0)
+            RiskConfig(
+                max_position_pct=0.20, action_step=0.05, cost_multiple=1.0, min_trade_size=0.0
+            )
         )
         action = g.gate(
             _signal(direction=1, magnitude=0.05, confidence=0.95),
@@ -400,8 +404,9 @@ class TestRule6KellySizer:
 
     def test_kelly_short_direction_negative_size(self, halt_state):
         g = DefaultRiskGate(
-            RiskConfig(max_position_pct=0.20, action_step=0.05,
-                       cost_multiple=1.0, min_trade_size=0.0)
+            RiskConfig(
+                max_position_pct=0.20, action_step=0.05, cost_multiple=1.0, min_trade_size=0.0
+            )
         )
         action = g.gate(
             _signal(direction=-1, magnitude=0.05, confidence=0.95),
@@ -436,9 +441,12 @@ class TestRule6KellySizer:
         Different! Verify we're in the true-formula regime.
         """
         g = DefaultRiskGate(
-            RiskConfig(max_position_pct=0.20, action_step=0.05,
-                       cost_multiple=0.0,  # no cost gate (we want Kelly to fire)
-                       min_trade_size=0.0)
+            RiskConfig(
+                max_position_pct=0.20,
+                action_step=0.05,
+                cost_multiple=0.0,  # no cost gate (we want Kelly to fire)
+                min_trade_size=0.0,
+            )
         )
         action = g.gate(
             _signal(direction=1, magnitude=0.001, confidence=0.55),
@@ -455,11 +463,13 @@ class TestRule6KellySizer:
 # Rule 7: Min trade size (anti-churn)
 # ---------------------------------------------------------------------------
 
+
 class TestRule7MinTradeSize:
     def test_small_delta_silences(self, halt_state):
         g = DefaultRiskGate(
-            RiskConfig(min_trade_size=0.05, max_position_pct=0.20,
-                       action_step=0.05, cost_multiple=1.0)
+            RiskConfig(
+                min_trade_size=0.05, max_position_pct=0.20, action_step=0.05, cost_multiple=1.0
+            )
         )
         # Already at 0.10; new target after Kelly is similar → small delta → silence
         action = g.gate(
@@ -478,6 +488,7 @@ class TestRule7MinTradeSize:
 # ---------------------------------------------------------------------------
 # Profiles
 # ---------------------------------------------------------------------------
+
 
 class TestProfiles:
     def test_conservative_lower_max_position(self):

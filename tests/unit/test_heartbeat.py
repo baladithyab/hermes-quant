@@ -6,6 +6,7 @@ Anchor: synthesis-v2 §P0-C. Verifies:
 - Inside bootstrap grace with no heartbeat: daemon=ALIVE (waiting).
 - Backtest mode synthesizes per-bar heartbeats (no spurious safe-stop).
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -24,6 +25,7 @@ from hermes_quant.daemon.heartbeat import (
 # ---------------------------------------------------------------------------
 # HeartbeatChecker — synthesis-v2 §P0-C bootstrap fix
 # ---------------------------------------------------------------------------
+
 
 class TestHeartbeatCheckerBootstrap:
     """Critical path: consumer boots with daemon dead → must enter safe-stop."""
@@ -59,8 +61,7 @@ class TestHeartbeatCheckerBootstrap:
     def test_heartbeat_observed_inside_grace_clears_bootstrap(self):
         """A heartbeat observed during grace transitions to steady-state."""
         start = pd.Timestamp("2026-05-13T00:00:00Z")
-        cfg = HeartbeatCheckerConfig(bootstrap_grace_seconds=120.0,
-                                      dead_man_switch_seconds=60.0)
+        cfg = HeartbeatCheckerConfig(bootstrap_grace_seconds=120.0, dead_man_switch_seconds=60.0)
         c = HeartbeatChecker(cfg, start_time=start)
 
         # 30s in, heartbeat arrives
@@ -149,6 +150,7 @@ class TestHeartbeatCheckerBacktest:
 # is_heartbeat_record / heartbeat_asof helpers
 # ---------------------------------------------------------------------------
 
+
 class TestRecordHelpers:
     def test_is_heartbeat_record_positive(self):
         assert is_heartbeat_record({"type": "heartbeat", "schema_version": 1})
@@ -174,15 +176,19 @@ class TestRecordHelpers:
 # HeartbeatEmitter — daemon side
 # ---------------------------------------------------------------------------
 
+
 class TestHeartbeatEmitter:
     def test_emit_writes_to_bus(self, tmp_path: Path):
         bus = tmp_path / "bus.jsonl"
-        state = {"last_tick_at": pd.Timestamp("2026-05-13T00:00:00Z"),
-                 "active_assets": ["BTC/USDT"]}
+        state = {
+            "last_tick_at": pd.Timestamp("2026-05-13T00:00:00Z"),
+            "active_assets": ["BTC/USDT"],
+        }
         emitter = HeartbeatEmitter(get_state=lambda: state, bus_path=bus)
         emitter.emit_now()
         assert bus.exists()
         import json
+
         rec = json.loads(bus.read_text().strip())
         assert rec["type"] == "heartbeat"
         assert rec["schema_version"] == 1
@@ -196,6 +202,7 @@ class TestHeartbeatEmitter:
         emitter = HeartbeatEmitter(get_state=lambda: {}, bus_path=bus)
         emitter.emit_now()
         import json
+
         rec = json.loads(bus.read_text().strip())
         assert rec["last_tick_seconds_ago"] is None
         assert rec["active_assets"] == []
@@ -205,11 +212,10 @@ class TestHeartbeatEmitter:
         """Thread starts, emits, and stops cleanly."""
         bus = tmp_path / "bus.jsonl"
         state = {"last_tick_at": pd.Timestamp("2026-05-13T00:00:00Z")}
-        emitter = HeartbeatEmitter(
-            get_state=lambda: state, interval_seconds=0.1, bus_path=bus
-        )
+        emitter = HeartbeatEmitter(get_state=lambda: state, interval_seconds=0.1, bus_path=bus)
         emitter.start()
         import time
+
         time.sleep(0.4)  # ~3-4 emits
         emitter.stop(timeout=2.0)
         # Bus should have at least 2 heartbeat records

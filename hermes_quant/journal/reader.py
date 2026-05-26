@@ -8,6 +8,7 @@ the source of truth for round-tripping. Narrative prose is preserved
 in the rendered file but not re-extracted (lossy is fine: round-trip
 is anchored to the meta block).
 """
+
 from __future__ import annotations
 
 import logging
@@ -86,6 +87,7 @@ def get_recent_lessons(
     Sorted newest-first.
     """
     from .writer import DEFAULT_JOURNAL_PATH  # local import to avoid cycle
+
     target = path or DEFAULT_JOURNAL_PATH
     target = Path(target)
     if not target.exists():
@@ -104,11 +106,13 @@ def get_recent_lessons(
 
     same_symbol = sorted(
         [e for e in all_entries if e.symbol == symbol],
-        key=_sort_key, reverse=True,
+        key=_sort_key,
+        reverse=True,
     )[:n_same]
     cross_symbol = sorted(
         [e for e in all_entries if e.symbol != symbol],
-        key=_sort_key, reverse=True,
+        key=_sort_key,
+        reverse=True,
     )[:n_cross]
 
     out: list[dict[str, Any]] = []
@@ -122,6 +126,7 @@ def get_recent_lessons(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _extract_meta(block: str) -> dict[str, str] | None:
     """Extract the META_BEGIN..META_END block as a dict."""
@@ -145,9 +150,7 @@ def _meta_to_entry(meta: dict[str, str]) -> SettlementEntry:
     asof_decision = _parse_iso(meta["asof_decision"])
     direction = int(meta["direction"])
 
-    asof_settlement = (
-        _parse_iso(meta["asof_settlement"]) if "asof_settlement" in meta else None
-    )
+    asof_settlement = _parse_iso(meta["asof_settlement"]) if "asof_settlement" in meta else None
 
     reflection: Reflection | None = None
     if "reflection_thesis_held" in meta:
@@ -167,7 +170,7 @@ def _meta_to_entry(meta: dict[str, str]) -> SettlementEntry:
         target_position_pct=float(meta.get("target_position_pct", 0.0)),
         decision_price=float(meta.get("decision_price", 0.0)),
         benchmark_symbol=meta.get("benchmark_symbol", "SPY"),
-        per_analyst_components=[],   # not round-tripped from prose body
+        per_analyst_components=[],  # not round-tripped from prose body
         reason=meta.get("reason", ""),
         asof_settlement=asof_settlement,
         exit_price=_safe_float(meta.get("exit_price")),
@@ -210,7 +213,8 @@ def _entry_to_lesson(e: SettlementEntry, *, is_same: bool) -> dict[str, Any]:
                 "thesis_held": e.reflection.thesis_held,
                 "magnitude_error": e.reflection.magnitude_error,
             }
-            if e.reflection else None
+            if e.reflection
+            else None
         ),
         "reason": e.reason,
     }

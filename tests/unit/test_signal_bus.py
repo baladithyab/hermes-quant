@@ -7,6 +7,7 @@ Anchor: synthesis-v2 §P0-B. Verifies:
 - Read-tail tolerates partial trailing line.
 - Filter helper respects schema_version + asset.
 """
+
 from __future__ import annotations
 
 import json

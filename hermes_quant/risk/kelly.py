@@ -17,6 +17,7 @@ acceptable for users with track record; quarter Kelly is the conservative ship.
 
 Per ADR-0004 + ADR-0009 §P0-1 + synthesis-v2 §P0-A.
 """
+
 from __future__ import annotations
 
 import math

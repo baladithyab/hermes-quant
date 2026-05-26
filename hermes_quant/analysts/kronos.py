@@ -18,6 +18,7 @@ Charter clauses honored:
 - "PPO or recurrent SAC for the aggregator, with the analyst pool frozen"
   → KronosAnalyst NEVER trains, only infers (ADR-0018 §D8)
 """
+
 from __future__ import annotations
 
 import logging
@@ -41,14 +42,15 @@ logger = logging.getLogger(__name__)
 # Configuration (per ADR-0018 §D6)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class KronosConfig:
-    model: str = "base"                # base | small | mini
+    model: str = "base"  # base | small | mini
     """Kronos model variant. `base` = 102M params, recommended default.
     `small` = 24.7M (lighter), `mini` = 4.1M (CPU-comfortable). `large`
     is closed-source per upstream and won't load."""
 
-    device: str = "cpu"                # cpu | cuda | mps
+    device: str = "cpu"  # cpu | cuda | mps
     """Inference device. CPU latency is 3-10s/call at base; GPU is 150-400ms."""
 
     max_context: int = 512
@@ -90,6 +92,7 @@ class KronosConfig:
 # ---------------------------------------------------------------------------
 # KronosAnalyst — main class
 # ---------------------------------------------------------------------------
+
 
 class KronosAnalyst:
     """Kronos foundation-model OHLCV forecaster as an Analyst.
@@ -142,13 +145,15 @@ class KronosAnalyst:
             paths = self._predict_paths(bars)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "kronos: inference failed: %s; abstaining for this call", exc,
+                "kronos: inference failed: %s; abstaining for this call",
+                exc,
                 exc_info=True,
             )
             return self._abstain(reason=f"inference_error: {exc}")
 
         direction, magnitude, raw_confidence = self._direction_from_paths(
-            paths, last_close=float(bars["close"].iloc[-1]),
+            paths,
+            last_close=float(bars["close"].iloc[-1]),
         )
 
         # ColdStart shrinkage (-0.20 until calibrator has 200+ samples)
@@ -248,13 +253,16 @@ class KronosAnalyst:
             self._predictor = _DistributionalKronosPredictor(base_predictor)
             logger.info(
                 "kronos: loaded %s on %s; pred_len=%d sample_count=%d",
-                model_id, self.config.device,
-                self.config.pred_len, self.config.sample_count,
+                model_id,
+                self.config.device,
+                self.config.pred_len,
+                self.config.sample_count,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             self._abstain_reason = f"weight_load_failed: {exc}"
             logger.warning(
-                "kronos: weight load from HF failed: %s; abstaining", exc,
+                "kronos: weight load from HF failed: %s; abstaining",
+                exc,
             )
 
     def _abstain(self, *, reason: str) -> AnalystView:
@@ -291,6 +299,7 @@ class KronosAnalyst:
             np.random.seed(self.config.deterministic_seed)
             try:
                 import torch  # type: ignore
+
                 torch.manual_seed(self.config.deterministic_seed)
                 if torch.cuda.is_available():
                     torch.cuda.manual_seed_all(self.config.deterministic_seed)
@@ -341,16 +350,16 @@ class KronosAnalyst:
         if direction == 0:
             sign_agreement = 0.5
         else:
-            sign_agreement = float(
-                np.mean(np.sign(pct_returns) == np.sign(median_return))
-            )
+            sign_agreement = float(np.mean(np.sign(pct_returns) == np.sign(median_return)))
 
         # Clip to [low, high] (foundation-model overconfidence guard)
-        raw_confidence = float(np.clip(
-            sign_agreement,
-            self.config.raw_confidence_clip_low,
-            self.config.raw_confidence_clip_high,
-        ))
+        raw_confidence = float(
+            np.clip(
+                sign_agreement,
+                self.config.raw_confidence_clip_low,
+                self.config.raw_confidence_clip_high,
+            )
+        )
 
         return direction, magnitude, raw_confidence
 
@@ -358,6 +367,7 @@ class KronosAnalyst:
 # ---------------------------------------------------------------------------
 # _DistributionalKronosPredictor — subclass to expose sample paths
 # ---------------------------------------------------------------------------
+
 
 class _DistributionalKronosPredictor:
     """Wrap upstream KronosPredictor to expose pre-mean paths.
@@ -391,7 +401,9 @@ class _DistributionalKronosPredictor:
         paths = []
         for _ in range(sample_count):
             out_df = self._base.predict(
-                df=df, pred_len=pred_len, sample_count=1,
+                df=df,
+                pred_len=pred_len,
+                sample_count=1,
             )
             # out_df has columns ['open', 'high', 'low', 'close', 'volume']
             paths.append(out_df[["close", "open", "high", "low", "volume"]].values)

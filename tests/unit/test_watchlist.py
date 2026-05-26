@@ -3,6 +3,7 @@
 Covers add/remove/list, validation, idempotency, atomic-rename, and
 flock concurrent-write safety.
 """
+
 from __future__ import annotations
 
 import os
@@ -29,6 +30,7 @@ def tmp_config(tmp_path: Path) -> Path:
 # Empty / missing config
 # ---------------------------------------------------------------------------
 
+
 def test_list_empty_when_config_missing(tmp_config: Path):
     assert list_watchlist(path=tmp_config) == []
 
@@ -46,6 +48,7 @@ def test_list_empty_when_config_corrupt(tmp_config: Path):
 # ---------------------------------------------------------------------------
 # Add
 # ---------------------------------------------------------------------------
+
 
 def test_add_creates_config_when_absent(tmp_config: Path):
     entry = add_to_watchlist("AAPL", "equity", path=tmp_config)
@@ -111,6 +114,7 @@ def test_add_preserves_unrelated_config_keys(tmp_config: Path):
     add_to_watchlist("AAPL", "equity", path=tmp_config)
 
     import yaml
+
     cfg = yaml.safe_load(tmp_config.read_text(encoding="utf-8"))
     assert cfg["homepage"] == "https://example.com"
     assert cfg["quant"]["pdr"]["mode"] == "advise"
@@ -121,6 +125,7 @@ def test_add_preserves_unrelated_config_keys(tmp_config: Path):
 # ---------------------------------------------------------------------------
 # Remove
 # ---------------------------------------------------------------------------
+
 
 def test_remove_existing_returns_true(tmp_config: Path):
     add_to_watchlist("AAPL", "equity", path=tmp_config)
@@ -155,6 +160,7 @@ def test_clear_returns_count(tmp_config: Path):
 # ---------------------------------------------------------------------------
 # Atomic-rename + concurrent-write
 # ---------------------------------------------------------------------------
+
 
 def test_atomic_write_no_partial_state_on_disk(tmp_config: Path, monkeypatch):
     """If the write process is interrupted between fsync and rename, the

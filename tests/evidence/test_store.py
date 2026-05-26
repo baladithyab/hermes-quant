@@ -2,6 +2,7 @@
 
 Each test gets a fresh root via ``tmp_path``.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -74,9 +75,7 @@ def test_store_creates_directory_layout(tmp_path: Path):
     assert (root / "evidence_index.db").is_file()
     # Confirm the table exists
     with sqlite3.connect(root / "evidence_index.db") as conn:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     table_names = {r[0] for r in rows}
     assert "evidence_index" in table_names
     # Touch store to silence unused-var warnings
@@ -101,12 +100,7 @@ def test_append_writes_parquet_partition_at_correct_path(tmp_path: Path):
     rec = _make_bar(payload=b"row-1")
     store.append(rec)
     avail = rec.available_at
-    expected_dir = (
-        root
-        / f"year={avail.year:04d}"
-        / f"month={avail.month:02d}"
-        / "kind=bar"
-    )
+    expected_dir = root / f"year={avail.year:04d}" / f"month={avail.month:02d}" / "kind=bar"
     assert expected_dir.is_dir()
     parts = list(expected_dir.glob("part-*.parquet"))
     assert len(parts) == 1
@@ -120,8 +114,7 @@ def test_append_writes_index_row_with_correct_columns(tmp_path: Path):
     store.append(rec)
     with sqlite3.connect(root / "evidence_index.db") as conn:
         row = conn.execute(
-            "SELECT id, kind, symbol, source, schema_version "
-            "FROM evidence_index WHERE id = ?",
+            "SELECT id, kind, symbol, source, schema_version FROM evidence_index WHERE id = ?",
             (str(rec.id),),
         ).fetchone()
     assert row is not None

@@ -1,4 +1,5 @@
 """Unit tests for hermes_quant.analysts.classical_ta."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -22,14 +23,16 @@ def _make_context(close_series: list[float], asof_offset: int = 0) -> MarketCont
     """Build a synthetic MarketContext with a given close series."""
     n = len(close_series)
     ts = pd.date_range("2026-05-01T00:00:00", periods=n, freq="1h")
-    bars = pd.DataFrame({
-        "timestamp": ts,
-        "open": close_series,
-        "high": [c * 1.01 for c in close_series],
-        "low": [c * 0.99 for c in close_series],
-        "close": close_series,
-        "volume": [1000.0] * n,
-    })
+    bars = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": close_series,
+            "high": [c * 1.01 for c in close_series],
+            "low": [c * 0.99 for c in close_series],
+            "close": close_series,
+            "volume": [1000.0] * n,
+        }
+    )
     return MarketContext(
         asset="BTC/USDT",
         timeframe="1h",
@@ -45,6 +48,7 @@ def _make_context(close_series: list[float], asof_offset: int = 0) -> MarketCont
 # ---------------------------------------------------------------------------
 # Pure indicator math
 # ---------------------------------------------------------------------------
+
 
 class TestIndicators:
     def test_rsi_at_neutral_around_50(self):
@@ -101,6 +105,7 @@ class TestIndicators:
 # Analyst protocol & basic emit
 # ---------------------------------------------------------------------------
 
+
 class TestAnalystContract:
     def test_satisfies_analyst_protocol(self):
         a = ClassicalTAAnalyst()
@@ -130,9 +135,12 @@ class TestAnalyze:
         assert view.analyst == "classical-ta"
         assert view.direction == 1
         assert view.magnitude > 0
-        # Confidence is calibrated (cold-start: raw - 0.20)
-        assert view.confidence_raw >= view.confidence
-        assert view.confidence >= 0
+        # Confidence is calibrated. Cold-start (Beta(2,5)) amplifies low raws
+        # toward the prior mean ~0.286, so calibrated CAN exceed raw — the
+        # invariant we keep is that calibrated stays inside [0.25, 0.375] with
+        # an unfitted calibrator.
+        assert 0.25 <= view.confidence <= 0.375
+        assert view.confidence > 0
         assert view.confidence_raw > 0
 
     def test_downtrend_emits_short_view(self):
@@ -168,16 +176,23 @@ class TestAnalyze:
         assert view.metadata is not None
         assert "sub_signals" in view.metadata
 
-    def test_calibration_shrinkage_applied(self):
-        """ColdStartCalibrator subtracts 0.20 from raw."""
+    def test_calibration_beta_prior_applied(self):
+        """ColdStartCalibrator applies Beta(2,5) posterior to raw confidence.
+
+        ADR-0009 §P0-2 amendment 2026-05-26 (see
+        docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md):
+        cold-start is now (raw + alpha) / (1 + alpha + beta), alpha=2 beta=5.
+        """
         a = ClassicalTAAnalyst()
         prices = [100 + i * 0.3 for i in range(80)]
         ctx = _make_context(prices)
         view = a.analyze(ctx)
         assert view is not None
-        # cold-start: confidence = max(0, raw - 0.20)
-        expected = max(0.0, view.confidence_raw - 0.20)
+        # cold-start: (raw + 2.0) / (1 + 2.0 + 5.0) = (raw + 2.0) / 8.0
+        expected = (view.confidence_raw + 2.0) / 8.0
         assert view.confidence == pytest.approx(expected, abs=1e-6)
+        # Sanity: no longer punished to zero on typical agreement.
+        assert view.confidence > 0.0
 
 
 class TestHealth:
@@ -205,18 +220,24 @@ class TestErrorHandling:
         a = ClassicalTAAnalyst()
         # Build a context with NaN-filled bars
         ts = pd.date_range("2026-05-01", periods=80, freq="1h")
-        bars = pd.DataFrame({
-            "timestamp": ts,
-            "open": [float("nan")] * 80,
-            "high": [float("nan")] * 80,
-            "low": [float("nan")] * 80,
-            "close": [float("nan")] * 80,
-            "volume": [1000.0] * 80,
-        })
+        bars = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "open": [float("nan")] * 80,
+                "high": [float("nan")] * 80,
+                "low": [float("nan")] * 80,
+                "close": [float("nan")] * 80,
+                "volume": [1000.0] * 80,
+            }
+        )
         ctx = MarketContext(
-            asset="BTC/USDT", timeframe="1h", asset_class="crypto",
-            exchange="binance", bars=bars,
-            last_close=100.0, last_volume=1000.0,
+            asset="BTC/USDT",
+            timeframe="1h",
+            asset_class="crypto",
+            exchange="binance",
+            bars=bars,
+            last_close=100.0,
+            last_volume=1000.0,
             asof=ts[-1],
         )
         # Should not crash; returns None or sane handling

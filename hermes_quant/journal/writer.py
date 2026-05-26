@@ -9,6 +9,7 @@ the signal_bus uses (atomic rename is itself a hostile-thread-safe op
 on POSIX, but flock prevents two writers materializing different .tmp
 contents from racing the rename).
 """
+
 from __future__ import annotations
 
 import fcntl
@@ -70,6 +71,7 @@ def _flocked(path: Path) -> Iterator[None]:
 # Errors
 # ---------------------------------------------------------------------------
 
+
 class JournalEntryNotFound(KeyError):
     """No entry with the requested entry_id exists in the journal."""
 
@@ -81,6 +83,7 @@ class JournalEntryAlreadyResolved(ValueError):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def append_pending(
     entry: SettlementEntry,
@@ -101,8 +104,7 @@ def append_pending(
 
     if entry.is_resolved():
         raise ValueError(
-            f"append_pending requires a Phase-A entry; "
-            f"entry {entry.entry_id} is already resolved"
+            f"append_pending requires a Phase-A entry; entry {entry.entry_id} is already resolved"
         )
 
     with _get_path_lock(target):
@@ -111,8 +113,7 @@ def append_pending(
             for existing in entries:
                 if existing.entry_id == entry.entry_id:
                     raise ValueError(
-                        f"entry_id {entry.entry_id!r} already in journal; "
-                        "duplicate append_pending"
+                        f"entry_id {entry.entry_id!r} already in journal; duplicate append_pending"
                     )
             entries.append(entry)
             _atomic_write(target, render_journal(entries))
@@ -156,14 +157,16 @@ def resolve(
 
             # Patch
             data = _entry_to_dict(existing)
-            data.update({
-                "asof_settlement": asof_settlement,
-                "exit_price": exit_price,
-                "raw_return": raw_return,
-                "alpha_return": alpha_return,
-                "hold_minutes": hold_minutes,
-                "reflection": reflection,
-            })
+            data.update(
+                {
+                    "asof_settlement": asof_settlement,
+                    "exit_price": exit_price,
+                    "raw_return": raw_return,
+                    "alpha_return": alpha_return,
+                    "hold_minutes": hold_minutes,
+                    "reflection": reflection,
+                }
+            )
             patched = SettlementEntry.from_dict(data)
             entries[target_idx] = patched
             _atomic_write(target, render_journal(entries))
@@ -171,9 +174,9 @@ def resolve(
 
 
 def append_human_override(
-    proposal: object,    # hermes_quant.proposals.Proposal
+    proposal: object,  # hermes_quant.proposals.Proposal
     *,
-    kind: str,           # "approve" | "reject" | "expire"
+    kind: str,  # "approve" | "reject" | "expire"
     reason: str | None = None,
     path: Path | None = None,
 ) -> SettlementEntry:
@@ -212,8 +215,7 @@ def append_human_override(
 
     entry = SettlementEntry(
         entry_id=proposal.proposal_id,
-        asof_decision=_parse_iso_safe(advisor_result.get("as_of"))
-                      or _utc_now(),
+        asof_decision=_parse_iso_safe(advisor_result.get("as_of")) or _utc_now(),
         symbol=proposal.symbol,
         asset_class=proposal.asset_class,
         direction=int(sig.get("direction", 0)),
@@ -254,6 +256,7 @@ def append_human_override(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _atomic_write(target: Path, content: str) -> None:
     """Write content to target.tmp, fsync, rename. Crash-safe."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -276,7 +279,8 @@ def _load_entries_safe(target: Path) -> list[SettlementEntry]:
         logger.warning(
             "journal: parse failed for %s — %s. Starting fresh; backing up "
             "old file as journal.md.bak",
-            target, exc,
+            target,
+            exc,
         )
         backup = target.with_suffix(target.suffix + ".bak")
         try:
@@ -291,6 +295,7 @@ def _entry_to_dict(e: SettlementEntry) -> dict:
     if hasattr(e, "model_dump"):
         return e.model_dump()
     from dataclasses import asdict
+
     return asdict(e)
 
 
@@ -340,10 +345,7 @@ def _hitl_reason_text(
     direction = int(sig.get("direction", 0))
     conf = float(sig.get("confidence", 0.0))
     kelly = float(rg.get("kelly_fraction", 0.0))
-    base = (
-        f"HITL {kind} — direction={direction:+d}, "
-        f"confidence={conf:.2f}, kelly={kelly:+.4f}"
-    )
+    base = f"HITL {kind} — direction={direction:+d}, confidence={conf:.2f}, kelly={kelly:+.4f}"
     if reason:
         base += f". Operator note: {reason}"
     return base

@@ -1,4 +1,5 @@
 """Tests for hermes_quant.governance.invariants (ADR-0031 D6)."""
+
 from __future__ import annotations
 
 import pytest

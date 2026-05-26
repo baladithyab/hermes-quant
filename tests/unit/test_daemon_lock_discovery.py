@@ -1,4 +1,5 @@
 """Tests for daemon/lock.py + daemon/discovery.py + daemon/portfolio_loader.py."""
+
 from __future__ import annotations
 
 import multiprocessing
@@ -24,6 +25,7 @@ from hermes_quant.protocol import DaemonAlreadyRunning
 # ---------------------------------------------------------------------------
 # DaemonLock
 # ---------------------------------------------------------------------------
+
 
 class TestDaemonLock:
     def test_acquire_and_release(self, tmp_path):
@@ -79,6 +81,7 @@ class TestDaemonLock:
 # Discovery
 # ---------------------------------------------------------------------------
 
+
 class TestDiscovery:
     """These tests require entry points to be registered (via pip install -e).
 
@@ -113,6 +116,7 @@ class TestDiscovery:
 # PortfolioLoader
 # ---------------------------------------------------------------------------
 
+
 class TestPortfolioReconstruction:
     def _exec(
         self,
@@ -142,8 +146,10 @@ class TestPortfolioReconstruction:
     def test_empty_executions_returns_initial_cash(self, tmp_path):
         bus = tmp_path / "execs.jsonl"
         p = reconstruct_portfolio(
-            "alpaca-paper", "crypto",
-            initial_cash=100_000.0, bus_path=bus,
+            "alpaca-paper",
+            "crypto",
+            initial_cash=100_000.0,
+            bus_path=bus,
         )
         assert p.cash == 100_000.0
         assert p.positions == {}
@@ -157,8 +163,10 @@ class TestPortfolioReconstruction:
         emit_execution_record(self._exec("sell", 1.0, 62_000.0), path=bus)
 
         p = reconstruct_portfolio(
-            "alpaca-paper", "crypto",
-            initial_cash=100_000.0, bus_path=bus,
+            "alpaca-paper",
+            "crypto",
+            initial_cash=100_000.0,
+            bus_path=bus,
         )
         # Position closed
         assert "BTC/USDT" not in p.positions
@@ -169,8 +177,10 @@ class TestPortfolioReconstruction:
         bus = tmp_path / "execs.jsonl"
         emit_execution_record(self._exec("buy", 1.0, 60_000.0), path=bus)
         p = reconstruct_portfolio(
-            "alpaca-paper", "crypto",
-            initial_cash=100_000.0, bus_path=bus,
+            "alpaca-paper",
+            "crypto",
+            initial_cash=100_000.0,
+            bus_path=bus,
             mark_prices={"BTC/USDT": 65_000.0},
         )
         assert "BTC/USDT" in p.positions
@@ -192,20 +202,22 @@ class TestPortfolioReconstruction:
         )
         # Only alpaca-paper records should affect this portfolio
         p = reconstruct_portfolio(
-            "alpaca-paper", "crypto",
-            initial_cash=100_000.0, bus_path=bus,
+            "alpaca-paper",
+            "crypto",
+            initial_cash=100_000.0,
+            bus_path=bus,
         )
         assert p.positions["BTC/USDT"].qty == 1.0  # only one buy
 
     def test_drawdown_pct(self, tmp_path):
         bus = tmp_path / "execs.jsonl"
         # Buy 1 BTC at 60k, immediately mark at 50k (loss)
-        emit_execution_record(
-            self._exec("buy", 1.0, 60_000.0), path=bus
-        )
+        emit_execution_record(self._exec("buy", 1.0, 60_000.0), path=bus)
         p = reconstruct_portfolio(
-            "alpaca-paper", "crypto",
-            initial_cash=100_000.0, bus_path=bus,
+            "alpaca-paper",
+            "crypto",
+            initial_cash=100_000.0,
+            bus_path=bus,
             mark_prices={"BTC/USDT": 50_000.0},
         )
         # equity = (100k - 60k cash) + 1*50k mark = 90k
@@ -214,12 +226,12 @@ class TestPortfolioReconstruction:
 
     def test_fees_subtract_from_cash(self, tmp_path):
         bus = tmp_path / "execs.jsonl"
-        emit_execution_record(
-            self._exec("buy", 1.0, 60_000.0, fees=10.0), path=bus
-        )
+        emit_execution_record(self._exec("buy", 1.0, 60_000.0, fees=10.0), path=bus)
         p = reconstruct_portfolio(
-            "alpaca-paper", "crypto",
-            initial_cash=100_000.0, bus_path=bus,
+            "alpaca-paper",
+            "crypto",
+            initial_cash=100_000.0,
+            bus_path=bus,
             mark_prices={"BTC/USDT": 60_000.0},
         )
         # cash = 100k - 60k - 10 = 39990
@@ -232,13 +244,19 @@ class TestPortfolioReconstruction:
         good = self._exec("buy", 1.0, 60_000.0)
         emit_execution_record(good, path=bus)
         # Append a malformed record manually (missing asset)
-        bad = {"schema_version": 1, "side": "buy",
-               "account_id": "alpaca-paper", "asset_class": "crypto"}
+        bad = {
+            "schema_version": 1,
+            "side": "buy",
+            "account_id": "alpaca-paper",
+            "asset_class": "crypto",
+        }
         emit_execution_record(bad, path=bus)
         # Reconstruction skips the bad one
         p = reconstruct_portfolio(
-            "alpaca-paper", "crypto",
-            initial_cash=100_000.0, bus_path=bus,
+            "alpaca-paper",
+            "crypto",
+            initial_cash=100_000.0,
+            bus_path=bus,
         )
         # Good record processed
         assert "BTC/USDT" in p.positions
@@ -260,8 +278,10 @@ class TestPortfolioReconstruction:
 
         with _pytest.raises(NotImplementedError, match="Phase-8 P1-α"):
             reconstruct_portfolio(
-                "alpaca-paper", "crypto",
-                initial_cash=100_000.0, bus_path=bus,
+                "alpaca-paper",
+                "crypto",
+                initial_cash=100_000.0,
+                bus_path=bus,
             )
 
     def test_direction_flip_raises_not_implemented(self, tmp_path):
@@ -274,8 +294,10 @@ class TestPortfolioReconstruction:
 
         with _pytest.raises(NotImplementedError, match="Phase-8 P1-α"):
             reconstruct_portfolio(
-                "alpaca-paper", "crypto",
-                initial_cash=100_000.0, bus_path=bus,
+                "alpaca-paper",
+                "crypto",
+                initial_cash=100_000.0,
+                bus_path=bus,
             )
 
     def test_buy_then_full_close_still_works(self, tmp_path):
@@ -285,8 +307,10 @@ class TestPortfolioReconstruction:
         emit_execution_record(self._exec("sell", 1.0, 62_000.0), path=bus)
 
         p = reconstruct_portfolio(
-            "alpaca-paper", "crypto",
-            initial_cash=100_000.0, bus_path=bus,
+            "alpaca-paper",
+            "crypto",
+            initial_cash=100_000.0,
+            bus_path=bus,
         )
         assert "BTC/USDT" not in p.positions
         assert p.realized_pnl_total == pytest.approx(2_000.0)
@@ -299,8 +323,10 @@ class TestPortfolioReconstruction:
         emit_execution_record(self._exec("buy", 0.5, 61_000.0), path=bus)
 
         p = reconstruct_portfolio(
-            "alpaca-paper", "crypto",
-            initial_cash=200_000.0, bus_path=bus,
+            "alpaca-paper",
+            "crypto",
+            initial_cash=200_000.0,
+            bus_path=bus,
             mark_prices={"BTC/USDT": 62_000.0},
         )
         assert "BTC/USDT" in p.positions

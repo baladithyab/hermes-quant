@@ -15,6 +15,7 @@ The gate is decoupled from any specific EvidenceStore implementation —
 it requires only a `store.get(evidence_id) -> dict | None` shape where
 the returned row has an `available_at` field (datetime or ISO str).
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -87,9 +88,7 @@ def _coerce_available_at(value: object) -> datetime:
         return value
     if isinstance(value, str):
         return datetime.fromisoformat(value)
-    raise TypeError(
-        f"available_at must be datetime or ISO str, got {type(value).__name__}"
-    )
+    raise TypeError(f"available_at must be datetime or ISO str, got {type(value).__name__}")
 
 
 def check_view_lookahead(
@@ -129,9 +128,7 @@ def check_view_lookahead(
     )
 
 
-def assert_no_lookahead(
-    view: AnalystView, asof: datetime, store: _StoreLike
-) -> None:
+def assert_no_lookahead(view: AnalystView, asof: datetime, store: _StoreLike) -> None:
     """Strict-mode assert. Raises EvidenceLookaheadError on the first
     violation. Used by the CI gate."""
     result = check_view_lookahead(view, asof, store)

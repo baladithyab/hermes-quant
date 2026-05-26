@@ -4,6 +4,7 @@ The CLI's `_autonomous_start --no-cron` path is the safe default for these
 tests; the cron-creation path is tested by mocking shutil.which and
 subprocess.run.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -19,7 +20,8 @@ from hermes_quant.cli import _autonomous_start, _create_autonomous_cron_job
 def isolate_config(tmp_path, monkeypatch):
     cfg = tmp_path / "config.yaml"
     monkeypatch.setattr(
-        "hermes_quant.cli.Path", Path,   # noop sanity
+        "hermes_quant.cli.Path",
+        Path,  # noop sanity
     )
     # Redirect ~/.hermes/config.yaml to tmpdir
     fake_home = tmp_path / "home"
@@ -33,6 +35,7 @@ def isolate_config(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # _create_autonomous_cron_job — happy + sad paths
 # ---------------------------------------------------------------------------
+
 
 def test_cron_creation_succeeds_when_hermes_on_path():
     with mock.patch("shutil.which", return_value="/usr/bin/hermes"):
@@ -92,14 +95,14 @@ def test_cron_creation_handles_subprocess_timeout():
             result = _create_autonomous_cron_job(cadence="15m")
 
     assert result["created"] is False
-    assert "TimeoutExpired" in result["reason"] or \
-           "Command 'hermes' timed out" in result["reason"]
+    assert "TimeoutExpired" in result["reason"] or "Command 'hermes' timed out" in result["reason"]
 
 
 def test_cron_creation_handles_oserror():
     with mock.patch("shutil.which", return_value="/usr/bin/hermes"):
         with mock.patch(
-            "subprocess.run", side_effect=OSError("fork failed"),
+            "subprocess.run",
+            side_effect=OSError("fork failed"),
         ):
             result = _create_autonomous_cron_job(cadence="15m")
 
@@ -117,18 +120,19 @@ def test_cron_creation_extracts_job_id_from_various_formats():
         with mock.patch("shutil.which", return_value="/usr/bin/hermes"):
             with mock.patch("subprocess.run") as mock_run:
                 mock_run.return_value = mock.Mock(
-                    returncode=0, stdout=stdout, stderr="",
+                    returncode=0,
+                    stdout=stdout,
+                    stderr="",
                 )
                 result = _create_autonomous_cron_job(cadence="15m")
         assert result["created"] is True
-        assert result["job_id"] == expected_id, (
-            f"failed for stdout={stdout!r}"
-        )
+        assert result["job_id"] == expected_id, f"failed for stdout={stdout!r}"
 
 
 # ---------------------------------------------------------------------------
 # _autonomous_start --no-cron path (the safe default for tests)
 # ---------------------------------------------------------------------------
+
 
 def test_autonomous_start_no_cron_skips_creation(tmp_path, monkeypatch, capsys):
     fake_home = tmp_path / "home"
@@ -151,7 +155,9 @@ def test_autonomous_start_no_cron_skips_creation(tmp_path, monkeypatch, capsys):
 
 
 def test_autonomous_start_with_cron_writes_config_and_calls_subprocess(
-    tmp_path, monkeypatch, capsys,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
@@ -187,7 +193,9 @@ def test_autonomous_start_with_cron_writes_config_and_calls_subprocess(
 
 
 def test_autonomous_start_handles_cron_failure_gracefully(
-    tmp_path, monkeypatch, capsys,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     """When `hermes cron create` fails, the config STILL gets written
     (autonomous mode is set; only the cron wiring is missing) and the
@@ -196,14 +204,14 @@ def test_autonomous_start_handles_cron_failure_gracefully(
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
 
-    with mock.patch("shutil.which", return_value=None):   # no hermes
+    with mock.patch("shutil.which", return_value=None):  # no hermes
         rc = _autonomous_start(
             cadence="15m",
             watchlist_str="AAPL:equity:1d",
             no_cron=False,
         )
 
-    assert rc == 0   # don't fail just because cron creation failed
+    assert rc == 0  # don't fail just because cron creation failed
     cfg_path = fake_home / ".hermes" / "config.yaml"
     assert cfg_path.exists()
     out = capsys.readouterr().out

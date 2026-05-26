@@ -8,6 +8,7 @@ The principle is the founding charter's "rewarded for correct inaction"
 invariant — autonomous mode must default to silence and only fire when
 all four dimensions cross their thresholds.
 """
+
 from __future__ import annotations
 
 from .silence_bias import (

@@ -23,6 +23,7 @@ Calibration: each sub-signal individually emits a raw confidence in [0,1];
 the composite raw is the agreement fraction (4 sub-signals: 4/4 = 1.0,
 3/4 = 0.75, 2/4 = 0.5, etc.). Disagreement (no plurality direction) → flat.
 """
+
 from __future__ import annotations
 
 import logging
@@ -47,6 +48,7 @@ logger = logging.getLogger(__name__)
 # Indicator math (pure functions; no state)
 # ---------------------------------------------------------------------------
 
+
 def rsi(close: pd.Series, period: int = 14) -> float:
     """Wilder's RSI, last value.
 
@@ -69,9 +71,7 @@ def rsi(close: pd.Series, period: int = 14) -> float:
     return 100.0 - 100.0 / (1.0 + rs)
 
 
-def macd_histogram(
-    close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
-) -> float:
+def macd_histogram(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> float:
     """MACD histogram = (EMA_fast - EMA_slow) - signal_EMA."""
     if len(close) < slow + signal:
         return float("nan")
@@ -114,6 +114,7 @@ def sma_cross_signal(
 # ---------------------------------------------------------------------------
 # ClassicalTAAnalyst
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class _SubSignal:
@@ -182,7 +183,9 @@ class ClassicalTAAnalyst:
             return _SubSignal(1, mag, conf, "rsi")
         if r > self.rsi_short_threshold:
             mag = float(np.clip((r - self.rsi_short_threshold) / 100.0, 0.001, 0.05))
-            conf = float(np.clip((r - self.rsi_short_threshold) / (100 - self.rsi_short_threshold), 0.1, 1.0))
+            conf = float(
+                np.clip((r - self.rsi_short_threshold) / (100 - self.rsi_short_threshold), 0.1, 1.0)
+            )
             return _SubSignal(-1, mag, conf, "rsi")
         return _SubSignal(0, 0.0, 0.0, "rsi")
 
@@ -207,11 +210,11 @@ class ClassicalTAAnalyst:
         if np.isnan(upper):
             return _SubSignal(0, 0.0, 0.0, "bollinger")
         last = close.iloc[-1]
-        band_width = (upper - lower)
+        band_width = upper - lower
         if band_width <= 0:
             return _SubSignal(0, 0.0, 0.0, "bollinger")
         # Position within bands (-1 = at lower, +1 = at upper)
-        position = (2 * (last - mid) / band_width)
+        position = 2 * (last - mid) / band_width
         if last < lower:
             mag = float(np.clip((lower - last) / last, 0.001, 0.05))
             return _SubSignal(1, mag, float(np.clip(abs(position) - 1, 0.1, 1.0)), "bollinger")
@@ -272,11 +275,28 @@ class ClassicalTAAnalyst:
             mean_sub_conf = float(np.mean([s.raw_confidence for s in contributing]))
             confidence_raw = float(np.clip(agreement * mean_sub_conf, 0.0, 1.0))
 
-            # Calibrate (cold-start: max(0, raw - 0.20))
+            # Calibrate. If the calibrator hasn't accumulated fitted data yet,
+            # fall back to a Bayesian beta-prior warm-start instead of the
+            # legacy `max(0, raw - 0.20)` punishment.
+            #
+            # The legacy fallback drove a 2/4-agreement signal (raw≈0.20) to
+            # exactly 0.0 confidence — silencing every symbol the analyst saw
+            # before the calibrator had any samples. The replacement uses a
+            # Beta(alpha=2, beta=5) weak prior centered at 2/(2+5) ≈ 0.286,
+            # treating `raw` as a single observation:
+            #     posterior = (raw * 1 + alpha) / (1 + alpha + beta)
+            # This lets agreement signals pass through (~0.29 for raw=0.0,
+            # ~0.43 for raw=1.0) while staying meaningfully below what a
+            # well-calibrated 2/4 signal would emit once data accumulates.
+            # Silence-by-default still holds: ties and all-flat sub-signals
+            # short-circuit to None upstream; this only governs the
+            # confidence emitted on a real directional signal.
             try:
                 calibrated = self.calibrator.calibrate(confidence_raw)
             except CalibratorNotReady:
-                calibrated = max(0.0, confidence_raw - 0.20)
+                alpha = 2.0
+                beta = 5.0
+                calibrated = (confidence_raw * 1.0 + alpha) / (1.0 + alpha + beta)
 
             view = AnalystView(
                 analyst=self.name,
@@ -291,8 +311,12 @@ class ClassicalTAAnalyst:
                 ),
                 metadata={
                     "sub_signals": [
-                        {"label": s.label, "direction": s.direction,
-                         "magnitude": s.magnitude, "raw_conf": s.raw_confidence}
+                        {
+                            "label": s.label,
+                            "direction": s.direction,
+                            "magnitude": s.magnitude,
+                            "raw_conf": s.raw_confidence,
+                        }
                         for s in sub_signals
                     ],
                 },
@@ -320,9 +344,7 @@ class ClassicalTAAnalyst:
         return {
             "name": self.name,
             "n_views_emitted": self._n_views_emitted,
-            "last_view_at": (
-                self._last_view_at.isoformat() if self._last_view_at else None
-            ),
+            "last_view_at": (self._last_view_at.isoformat() if self._last_view_at else None),
             "error_count": self._error_count,
             "calibrator_status": self.calibrator.status(),
         }

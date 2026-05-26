@@ -29,6 +29,7 @@ Three TradingAgents safety patterns are enforced at the intake boundary:
    `context_messages`, `prior_messages` are stripped from inbound turn
    metadata.
 """
+
 from __future__ import annotations
 
 import logging
@@ -175,10 +176,16 @@ class DeliberativeCommitteeAggregator:
 
         semantic_views = [v for v in effective_views if "semantic" in v.analyst.lower()]
         if semantic_views and baseline_signal.direction != 0:
-            aligned_semantic = [v for v in semantic_views if v.direction == baseline_signal.direction]
+            aligned_semantic = [
+                v for v in semantic_views if v.direction == baseline_signal.direction
+            ]
             if aligned_semantic:
-                confidence = min(1.0, confidence + min(self.semantic_bonus_cap, 0.02 * len(aligned_semantic)))
-                confidence_raw = min(1.0, confidence_raw + min(self.semantic_bonus_cap, 0.02 * len(aligned_semantic)))
+                confidence = min(
+                    1.0, confidence + min(self.semantic_bonus_cap, 0.02 * len(aligned_semantic))
+                )
+                confidence_raw = min(
+                    1.0, confidence_raw + min(self.semantic_bonus_cap, 0.02 * len(aligned_semantic))
+                )
 
         if disagreement >= 0.80:
             return self._flat_from_baseline(
@@ -272,7 +279,9 @@ class DeliberativeCommitteeAggregator:
             CommitteeTurn(
                 role="risk_conservative",
                 stance="prefer_silence_on_uncertainty",
-                direction=0 if self._disagreement_score(views) > 0.25 else baseline_signal.direction,
+                direction=0
+                if self._disagreement_score(views) > 0.25
+                else baseline_signal.direction,
                 confidence=min(1.0, self._disagreement_score(views) + 0.25),
                 rationale="Conservative risk penalizes disagreement and missing voices",
             ),
@@ -280,7 +289,9 @@ class DeliberativeCommitteeAggregator:
                 role="risk_neutral",
                 stance="baseline_with_penalty",
                 direction=baseline_signal.direction,
-                confidence=max(0.0, float(baseline_signal.confidence) - self._disagreement_score(views) * 0.15),
+                confidence=max(
+                    0.0, float(baseline_signal.confidence) - self._disagreement_score(views) * 0.15
+                ),
                 rationale="Neutral risk follows baseline after disagreement penalty",
             ),
             CommitteeTurn(
@@ -329,9 +340,7 @@ class DeliberativeCommitteeAggregator:
                     cleaned_metadata = raw.metadata
                     if isinstance(cleaned_metadata, dict):
                         cleaned_metadata = {
-                            k: v
-                            for k, v in cleaned_metadata.items()
-                            if k not in _MSG_CLEAR_KEYS
+                            k: v for k, v in cleaned_metadata.items() if k not in _MSG_CLEAR_KEYS
                         }
                     # Tier-split rejection.
                     if tier == "quick" and role in _DEEP_REQUIRED_ROLES:

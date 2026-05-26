@@ -12,9 +12,10 @@ Covers:
   - Update calibrator hook is a no-op stub (Wave D wires it)
   - health() reports correct loaded/abstain state
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -23,30 +24,31 @@ import pytest
 from hermes_quant.analysts.kronos import (
     KronosAnalyst,
     KronosConfig,
-    _DistributionalKronosPredictor,
 )
 from hermes_quant.protocol import MarketContext
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_bars(n: int, *, drift: float = 0.5, base: float = 100.0):
     """Build n hourly OHLCV bars with optional linear drift."""
     rows = []
-    start = datetime(2026, 5, 13, 0, 0, 0, tzinfo=timezone.utc)
+    start = datetime(2026, 5, 13, 0, 0, 0, tzinfo=UTC)
     for i in range(n):
         ts = start + timedelta(hours=i)
         c = base + i * drift
-        rows.append({
-            "timestamp": ts,
-            "open": c - drift / 4,
-            "high": c + 1.0,
-            "low": c - 1.0,
-            "close": c,
-            "volume": 100.0,
-        })
+        rows.append(
+            {
+                "timestamp": ts,
+                "open": c - drift / 4,
+                "high": c + 1.0,
+                "low": c - 1.0,
+                "close": c,
+                "volume": 100.0,
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -70,17 +72,20 @@ class _FakePredictor:
     Returns paths that are deterministic given a `direction` argument
     (used by tests): +1 → all paths trend up, -1 → all down, 0 → split.
     """
+
     def __init__(self, *, direction: int = 1, agreement: float = 0.93):
         self.direction = direction
         self.agreement = agreement
         self.calls: list[dict] = []
 
     def predict_distributional(self, df, pred_len, sample_count):
-        self.calls.append({
-            "df_len": len(df),
-            "pred_len": pred_len,
-            "sample_count": sample_count,
-        })
+        self.calls.append(
+            {
+                "df_len": len(df),
+                "pred_len": pred_len,
+                "sample_count": sample_count,
+            }
+        )
         last_close = float(df["close"].iloc[-1])
         # Build paths: agreement * sample_count agree with direction;
         # rest go the other way
@@ -90,18 +95,21 @@ class _FakePredictor:
         for _ in range(n_agree):
             # this path's last close = last_close * (1 + direction * 0.02)
             end_close = last_close * (1 + self.direction * 0.02)
-            paths.append([[end_close, end_close, end_close, end_close, 100.0]
-                          for _ in range(pred_len)])
+            paths.append(
+                [[end_close, end_close, end_close, end_close, 100.0] for _ in range(pred_len)]
+            )
         for _ in range(n_disagree):
             end_close = last_close * (1 - self.direction * 0.02)
-            paths.append([[end_close, end_close, end_close, end_close, 100.0]
-                          for _ in range(pred_len)])
+            paths.append(
+                [[end_close, end_close, end_close, end_close, 100.0] for _ in range(pred_len)]
+            )
         return np.array(paths)
 
 
 # ---------------------------------------------------------------------------
 # Lazy-load + missing-package abstain
 # ---------------------------------------------------------------------------
+
 
 def test_no_load_at_construction():
     """Per ADR-0018 §D4, lazy-load means construction does NOT touch HF."""
@@ -128,6 +136,7 @@ def test_missing_kronos_package_emits_abstain():
 
 def test_factory_failure_emits_abstain():
     """When the test-seam factory raises, abstain consistently."""
+
     def boom():
         raise RuntimeError("simulated weight load failure")
 
@@ -147,6 +156,7 @@ def test_factory_failure_emits_abstain():
 # Insufficient bars -> None
 # ---------------------------------------------------------------------------
 
+
 def test_insufficient_bars_returns_none():
     a = KronosAnalyst()
     # 16 bars < 32 minimum
@@ -157,6 +167,7 @@ def test_insufficient_bars_returns_none():
 # ---------------------------------------------------------------------------
 # Happy path with fake predictor
 # ---------------------------------------------------------------------------
+
 
 def test_predicts_direction_up():
     fake = _FakePredictor(direction=1, agreement=0.90)
@@ -194,17 +205,18 @@ def test_path_agreement_clipped_to_low():
     90% disagree (i.e., go -1), so median is -1 with 0.90 agreement. So
     we test the floor by configuring a near-50/50 split.
     """
-    fake = _FakePredictor(direction=1, agreement=20/30)  # exactly 20 agree
+    fake = _FakePredictor(direction=1, agreement=20 / 30)  # exactly 20 agree
     a = KronosAnalyst(_predictor_factory=lambda: fake)
     view = a.analyze(_make_ctx())
     # 20/30 = 0.667 within [0.30, 0.85] -> not clipped
-    assert view.confidence_raw == pytest.approx(20/30)
+    assert view.confidence_raw == pytest.approx(20 / 30)
 
 
 def test_path_agreement_floor_clipped():
     """Agreement very near 50/50 still floors at 0.30 — but with non-degenerate
     data we won't hit it under the FakePredictor model. Use a custom predictor
     that returns paths where the median is barely positive but most paths split."""
+
     class NearTiePredictor:
         def predict_distributional(self, df, pred_len, sample_count):
             last = float(df["close"].iloc[-1])
@@ -229,26 +241,34 @@ def test_path_agreement_floor_clipped():
     assert view.confidence_raw == pytest.approx(0.85)
 
 
-def test_calibrator_shrinkage_applied():
-    """ColdStartCalibrator subtracts 0.20 from raw_confidence."""
+def test_calibrator_beta_prior_applied():
+    """ColdStartCalibrator applies Beta(2,5) posterior to raw_confidence.
+
+    ADR-0009 §P0-2 amendment 2026-05-26 (see
+    docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md):
+    cold-start = (raw + alpha) / (1 + alpha + beta), alpha=2 beta=5.
+    """
     fake = _FakePredictor(direction=1, agreement=0.50)
-    # 0.50 within clip range -> raw=0.50; calibrated = max(0, 0.50 - 0.20) = 0.30
+    # raw=0.50; calibrated = (0.50 + 2.0) / (1 + 2.0 + 5.0) = 0.3125
     a = KronosAnalyst(_predictor_factory=lambda: fake)
     view = a.analyze(_make_ctx())
     assert view.confidence_raw == pytest.approx(0.50)
-    assert view.confidence == pytest.approx(0.30)
+    assert view.confidence == pytest.approx(0.3125)
 
 
 # ---------------------------------------------------------------------------
 # Inference exception -> abstain (one-call abstain, doesn't poison future)
 # ---------------------------------------------------------------------------
 
+
 def test_inference_exception_abstains_for_this_call():
     """If predict_distributional raises, abstain for THIS call but allow
     future calls to retry (per the per-call-abstain pattern)."""
+
     class FlakyPredictor:
         def __init__(self):
             self.called = 0
+
         def predict_distributional(self, df, pred_len, sample_count):
             self.called += 1
             if self.called == 1:
@@ -256,10 +276,7 @@ def test_inference_exception_abstains_for_this_call():
             # Second call succeeds
             n = sample_count
             last = float(df["close"].iloc[-1])
-            return np.array([
-                [[last * 1.01] * 5 for _ in range(pred_len)]
-                for _ in range(n)
-            ])
+            return np.array([[[last * 1.01] * 5 for _ in range(pred_len)] for _ in range(n)])
 
     flaky = FlakyPredictor()
     a = KronosAnalyst(_predictor_factory=lambda: flaky)
@@ -277,16 +294,15 @@ def test_inference_exception_abstains_for_this_call():
 # Median-zero direction edge case
 # ---------------------------------------------------------------------------
 
+
 def test_median_zero_returns_flat_direction():
     """When the median path is exactly flat, direction=0, conf=0.30 (floor)."""
+
     class FlatPredictor:
         def predict_distributional(self, df, pred_len, sample_count):
             last = float(df["close"].iloc[-1])
             # All paths exactly == last_close -> pct_returns all zero
-            return np.array([
-                [[last] * 5 for _ in range(pred_len)]
-                for _ in range(sample_count)
-            ])
+            return np.array([[[last] * 5 for _ in range(pred_len)] for _ in range(sample_count)])
 
     a = KronosAnalyst(_predictor_factory=lambda: FlatPredictor())
     view = a.analyze(_make_ctx())
@@ -300,9 +316,11 @@ def test_median_zero_returns_flat_direction():
 # Update calibrator hook
 # ---------------------------------------------------------------------------
 
+
 def test_update_calibrator_is_noop_stub():
     """Per ADR-0018 §D8 — analysts never train. Hook honored as no-op."""
-    from hermes_quant.protocol import RealizedOutcome, AnalystView
+    from hermes_quant.protocol import AnalystView, RealizedOutcome
+
     a = KronosAnalyst()
     view = AnalystView(
         analyst="kronos",
@@ -328,6 +346,7 @@ def test_update_calibrator_is_noop_stub():
 # Health
 # ---------------------------------------------------------------------------
 
+
 def test_health_reports_loaded_after_first_analyze():
     fake = _FakePredictor()
     a = KronosAnalyst(_predictor_factory=lambda: fake)
@@ -342,12 +361,14 @@ def test_health_reports_calibrator_status():
     h = a.health()
     assert "calibrator" in h
     assert h["calibrator"]["name"] == "cold_start"
-    assert h["calibrator"]["shrinkage"] == 0.20
+    assert h["calibrator"]["prior_alpha"] == 2.0
+    assert h["calibrator"]["prior_beta"] == 5.0
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
 
 def test_config_overrides_propagate():
     cfg = KronosConfig(

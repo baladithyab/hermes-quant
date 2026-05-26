@@ -1,4 +1,5 @@
 """Unit tests for hermes_quant.calibrators."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -42,23 +43,39 @@ class TestIdentity:
 
 
 class TestColdStart:
-    def test_shrinkage_default_020(self):
-        c = ColdStartCalibrator()
-        assert c.shrinkage == 0.20
-        assert c.calibrate(0.8) == pytest.approx(0.6)
-        assert c.calibrate(0.5) == pytest.approx(0.3)
+    def test_beta_prior_default_alpha2_beta5(self):
+        """ADR-0009 §P0-2 amendment 2026-05-26: cold-start uses Beta(2,5) prior.
 
-    def test_clamps_at_zero(self):
+        Formula: (raw + alpha) / (1 + alpha + beta) = (raw + 2) / 8.
+        """
         c = ColdStartCalibrator()
-        assert c.calibrate(0.1) == 0.0
-        assert c.calibrate(0.0) == 0.0
-        assert c.calibrate(-0.5) == 0.0
+        assert c.prior_alpha == 2.0
+        assert c.prior_beta == 5.0
+        assert c.calibrate(0.8) == pytest.approx(0.35)  # (0.8 + 2)/8 = 0.35
+        assert c.calibrate(0.5) == pytest.approx(0.3125)  # (0.5 + 2)/8 = 0.3125
+
+    def test_clamps_at_unit_interval(self):
+        """Beta posterior never escapes [0.25, 0.375] for raw in [0, 1].
+
+        Replaces the legacy clamp-to-zero test: the new formula does NOT
+        zero out small raws (that was the deadlock bug) but its output is
+        still bounded inside a sub-interval that respects silence-by-default.
+        """
+        c = ColdStartCalibrator()
+        # raw=0.0 → 0.25 (was 0.0 under shrinkage formula); raw=-0.5 clipped to 0 → 0.25
+        assert c.calibrate(0.1) == pytest.approx(0.2625)
+        assert c.calibrate(0.0) == pytest.approx(0.25)
+        assert c.calibrate(-0.5) == pytest.approx(0.25)
+        # raw=1.5 clipped to 1.0 → 0.375; the cap stays below silence-bias min_conf=0.65
+        assert c.calibrate(1.5) == pytest.approx(0.375)
+        assert c.calibrate(2.0) == pytest.approx(0.375)
 
     def test_status_reports_not_calibrated(self):
         c = ColdStartCalibrator()
         s = c.status()
         assert s["is_calibrated"] is False
-        assert s["shrinkage"] == 0.20
+        assert s["prior_alpha"] == 2.0
+        assert s["prior_beta"] == 5.0
 
 
 class TestIsotonic:

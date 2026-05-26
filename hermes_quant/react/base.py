@@ -1,4 +1,5 @@
 """hermes_quant.react.base — Reactor Protocol + ExecutionRecord (ADR-0015)."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -16,17 +17,18 @@ class ExecutionRecord:
         target on partial fills in live mode; equals target for paper)
       - reactor_metadata: free-form dict for adapter-specific receipt info
     """
+
     proposal_id: str
-    signal_id: str | None       # links back to the AggregatedSignal that drove the proposal
+    signal_id: str | None  # links back to the AggregatedSignal that drove the proposal
     asset: str
     asset_class: str
     timeframe: str
-    asof_decision: str          # ISO UTC: when the advisor view was computed
-    asof_execution: str         # ISO UTC: when React fired
+    asof_decision: str  # ISO UTC: when the advisor view was computed
+    asof_execution: str  # ISO UTC: when React fired
     target_position_pct: float  # signed, e.g. +0.05 = 5% NAV long
-    decision_price: float       # last_close at advisor time
-    fill_price: float           # paper=decision_price; live=broker-reported
-    fill_size_pct: float        # actual filled (paper=target; live may diverge)
+    decision_price: float  # last_close at advisor time
+    fill_price: float  # paper=decision_price; live=broker-reported
+    fill_size_pct: float  # actual filled (paper=target; live may diverge)
     reactor_name: str
     human_in_the_loop: bool
     approver_user_id: str | None = None
@@ -53,9 +55,8 @@ class Reactor(Protocol):
 
     def execute(
         self,
-        proposal: Any,                 # hermes_quant.proposals.Proposal
+        proposal: Any,  # hermes_quant.proposals.Proposal
         *,
         fill_size_pct: float,
         approver_user_id: str | None = None,
-    ) -> ExecutionRecord:
-        ...
+    ) -> ExecutionRecord: ...

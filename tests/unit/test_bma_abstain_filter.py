@@ -18,6 +18,7 @@ With this filter, the abstain view is dropped before aggregation;
 the silence-bias gate sees only the two real voices; if those agree,
 FIRE is correct; if not, silence is preserved.
 """
+
 from __future__ import annotations
 
 import pandas as pd
@@ -28,25 +29,45 @@ from hermes_quant.protocol import AnalystView, MarketContext
 
 
 def _ctx():
-    bars = pd.DataFrame([
-        {"timestamp": pd.Timestamp("2026-05-13T00:00:00Z"),
-         "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1000},
-        {"timestamp": pd.Timestamp("2026-05-13T01:00:00Z"),
-         "open": 100, "high": 102, "low": 99, "close": 101, "volume": 1000},
-    ])
+    bars = pd.DataFrame(
+        [
+            {
+                "timestamp": pd.Timestamp("2026-05-13T00:00:00Z"),
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 1000,
+            },
+            {
+                "timestamp": pd.Timestamp("2026-05-13T01:00:00Z"),
+                "open": 100,
+                "high": 102,
+                "low": 99,
+                "close": 101,
+                "volume": 1000,
+            },
+        ]
+    )
     return MarketContext(
-        asset="BTC/USDT", asset_class="crypto", timeframe="1h",
+        asset="BTC/USDT",
+        asset_class="crypto",
+        timeframe="1h",
         exchange="binance",
         asof=bars["timestamp"].iloc[-1],
         bars=bars,
-        last_close=101.0, last_volume=1000.0,
+        last_close=101.0,
+        last_volume=1000.0,
     )
 
 
 def _view(name, *, confidence, direction=1, magnitude=0.05):
     return AnalystView(
-        analyst=name, direction=direction, magnitude=magnitude,
-        confidence=confidence, confidence_raw=confidence + 0.10,
+        analyst=name,
+        direction=direction,
+        magnitude=magnitude,
+        confidence=confidence,
+        confidence_raw=confidence + 0.10,
         horizon="1h",
     )
 
@@ -55,6 +76,7 @@ def _view(name, *, confidence, direction=1, magnitude=0.05):
 # The abstain-filter regression
 # ---------------------------------------------------------------------------
 
+
 def test_abstain_view_dropped_from_components():
     """A confidence=0.0 view (KronosAnalyst-style abstain) MUST NOT appear
     in the aggregated signal's components tuple."""
@@ -62,7 +84,7 @@ def test_abstain_view_dropped_from_components():
     views = [
         _view("classical_ta", confidence=0.7),
         _view("microstructure_lite", confidence=0.6),
-        _view("kronos", confidence=0.0),    # abstain
+        _view("kronos", confidence=0.0),  # abstain
     ]
     sig = agg.aggregate(views, _ctx())
     component_names = [c.analyst for c in sig.components]
@@ -122,7 +144,7 @@ def test_two_real_plus_one_abstain_does_not_inflate_voices():
     ]
     sig = agg.aggregate(views, _ctx())
     assert len(sig.components) == 2
-    assert sig.direction == 1   # both voted long
+    assert sig.direction == 1  # both voted long
 
 
 def test_disagreement_with_abstainer_handled_correctly():

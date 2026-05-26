@@ -8,6 +8,7 @@ Per ADR-0005:
   timestamp, sort. If <2 valid bars remain, raise DataQualityError.
 - Bars are UTC. Localization is display-only.
 """
+
 from __future__ import annotations
 
 import logging
@@ -94,8 +95,7 @@ def validate_bars(
 
     if len(out) < min_bars:
         raise DataQualityError(
-            f"only {len(out)} valid bars after validation (min {min_bars}); "
-            f"started with {len(df)}"
+            f"only {len(out)} valid bars after validation (min {min_bars}); started with {len(df)}"
         )
 
     return out
@@ -140,26 +140,28 @@ def fetch_with_chain(
     for provider in providers_list:
         for attempt in range(max_retries + 1):
             try:
-                bars = provider.fetch_bars(
-                    asset, timeframe, start, end, use_cache=use_cache
-                )
+                bars = provider.fetch_bars(asset, timeframe, start, end, use_cache=use_cache)
                 # Validate (will raise DataQualityError if bad)
                 validated = validate_bars(bars)
                 return validated
             except RateLimitError as e:
                 logger.warning(
                     "rate limit on provider=%s attempt=%d: %s",
-                    provider.name, attempt, e,
+                    provider.name,
+                    attempt,
+                    e,
                 )
                 if attempt < max_retries:
-                    time.sleep(2.0 ** attempt)  # exponential backoff
+                    time.sleep(2.0**attempt)  # exponential backoff
                     continue
                 errors.append((provider.name, e))
                 break  # try next provider
             except DataProviderError as e:
                 logger.warning(
                     "transient provider error provider=%s attempt=%d: %s",
-                    provider.name, attempt, e,
+                    provider.name,
+                    attempt,
+                    e,
                 )
                 if attempt < max_retries:
                     time.sleep(0.5)

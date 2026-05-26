@@ -20,6 +20,7 @@ Per synthesis-v2 §P0-D + §P2-θ + ADR-0009 §P0-4:
 A halt at scope `(*, *, *)` halts everything. Wildcard semantics from
 hermes_quant.daemon.halt_state.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -50,6 +51,7 @@ def cmd_halt(args: argparse.Namespace) -> int:
 
     # Resolve defaults at call time so test monkeypatch works
     from hermes_quant.daemon import halt_state as _halt_module
+
     halt_state = HaltStateSQLite(
         db_path=_halt_module.DEFAULT_STATE_DB,
         mirror_path=_halt_module.DEFAULT_HALT_JSON_MIRROR,
@@ -61,13 +63,17 @@ def cmd_halt(args: argparse.Namespace) -> int:
             asset=asset,
             reason=reason,
         )
-        print(f"halted: account={rec.account_id} class={rec.asset_class} "
-              f"asset={rec.asset or '*'} epoch={rec.halt_epoch}")
+        print(
+            f"halted: account={rec.account_id} class={rec.asset_class} "
+            f"asset={rec.asset or '*'} epoch={rec.halt_epoch}"
+        )
         print(f"reason: {rec.reason}")
         print()
         print("Active halts persist across daemon restart. To lift:")
-        print(f"  hermes quant resume {rec.account_id} {rec.asset_class} "
-              f"{rec.asset or '*'} --reason \"why are you lifting?\"")
+        print(
+            f"  hermes quant resume {rec.account_id} {rec.asset_class} "
+            f'{rec.asset or "*"} --reason "why are you lifting?"'
+        )
         return 0
     except ValueError as e:
         print(f"halt failed: {e}", file=sys.stderr)
@@ -83,6 +89,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     # Resolve defaults at call time so test monkeypatch works
     from hermes_quant.daemon import halt_state as _halt_module
+
     halt_state = HaltStateSQLite(
         db_path=_halt_module.DEFAULT_STATE_DB,
         mirror_path=_halt_module.DEFAULT_HALT_JSON_MIRROR,
@@ -95,13 +102,16 @@ def cmd_resume(args: argparse.Namespace) -> int:
             reason=reason,
         )
         if cleared:
-            print(f"resumed: account={account or '*'} class={asset_class or '*'} "
-                  f"asset={asset or '*'}")
+            print(
+                f"resumed: account={account or '*'} class={asset_class or '*'} asset={asset or '*'}"
+            )
             print(f"reason: {reason}")
             return 0
         else:
-            print(f"no active halt at scope ({account or '*'}, "
-                  f"{asset_class or '*'}, {asset or '*'})", file=sys.stderr)
+            print(
+                f"no active halt at scope ({account or '*'}, {asset_class or '*'}, {asset or '*'})",
+                file=sys.stderr,
+            )
             return 1
     except ValueError as e:
         print(f"resume failed: {e}", file=sys.stderr)
@@ -121,6 +131,7 @@ def cmd_emergency_stop(args: argparse.Namespace) -> int:
 
     # Resolve defaults at call time so test monkeypatch works
     from hermes_quant.daemon import halt_state as _halt_module
+
     halt_state = HaltStateSQLite(
         db_path=_halt_module.DEFAULT_STATE_DB,
         mirror_path=_halt_module.DEFAULT_HALT_JSON_MIRROR,
@@ -132,11 +143,10 @@ def cmd_emergency_stop(args: argparse.Namespace) -> int:
         rec = halt_state.add_halt(
             account_id=account,
             asset_class=None,  # all classes
-            asset=None,        # all assets
+            asset=None,  # all assets
             reason=reason,
         )
-        print(f"durable halt installed: scope=({rec.account_id}, *, *) "
-              f"epoch={rec.halt_epoch}")
+        print(f"durable halt installed: scope=({rec.account_id}, *, *) epoch={rec.halt_epoch}")
     except ValueError as e:
         # Existing halt blocks add_halt; that's fine for emergency-stop —
         # it means a halt is already active. Continue with bus signal + broker.
@@ -155,11 +165,13 @@ def cmd_emergency_stop(args: argparse.Namespace) -> int:
     try:
         # Resolve path at call time (not import time) so test monkeypatch works
         from hermes_quant.daemon import signal_bus as _bus_module
+
         emit_signal_record(halt_signal, path=_bus_module.SIGNAL_BUS_PATH)
         print("halt signal emitted to bus")
     except Exception as e:  # noqa: BLE001
-        print(f"halt signal emission failed (halt is still durable in SQLite): {e}",
-              file=sys.stderr)
+        print(
+            f"halt signal emission failed (halt is still durable in SQLite): {e}", file=sys.stderr
+        )
 
     # Step 3: broker cancel  (v0.1.1: intent only)
     print()
@@ -169,5 +181,5 @@ def cmd_emergency_stop(args: argparse.Namespace) -> int:
     print("  2. (For ccxt/alpaca consumers in v0.2: this will auto-cancel.)")
     print()
     print("To resume after the underlying issue is resolved:")
-    print(f"  hermes quant resume {halt_account} --reason \"<why are you resuming?>\"")
+    print(f'  hermes quant resume {halt_account} --reason "<why are you resuming?>"')
     return 0

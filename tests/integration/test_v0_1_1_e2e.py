@@ -10,6 +10,7 @@ Tests that exercise the whole pipeline end-to-end with synthetic data:
 These tests are still unit-y (no real network, no real broker), but
 exercise the full module wiring beyond what the per-module unit tests cover.
 """
+
 from __future__ import annotations
 
 import json
@@ -46,11 +47,16 @@ def _make_bars(n: int = 100, base: float = 60_000.0):
     rng = np.random.default_rng(42)
     ts = pd.date_range("2026-05-13T00:00:00", periods=n, freq="1h")
     closes = base * np.cumprod(1 + 0.001 + rng.normal(0, 0.005, n))
-    return pd.DataFrame({
-        "timestamp": ts,
-        "open": closes, "high": closes * 1.005, "low": closes * 0.995,
-        "close": closes, "volume": [1000.0] * n,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": closes,
+            "high": closes * 1.005,
+            "low": closes * 0.995,
+            "close": closes,
+            "volume": [1000.0] * n,
+        }
+    )
 
 
 def _mock_provider(bars):
@@ -64,8 +70,12 @@ def _mock_analyst(direction: int, name: str, conf: float = 0.7):
     a = MagicMock()
     a.name = name
     a.analyze.return_value = AnalystView(
-        analyst=name, direction=direction, magnitude=0.02,
-        confidence=conf, confidence_raw=conf + 0.2, horizon="4h",
+        analyst=name,
+        direction=direction,
+        magnitude=0.02,
+        confidence=conf,
+        confidence_raw=conf + 0.2,
+        horizon="4h",
     )
     return a
 
@@ -73,18 +83,25 @@ def _mock_analyst(direction: int, name: str, conf: float = 0.7):
 def _empty_portfolio_for(equity: float = 100_000.0):
     def _f(account_id, asset_class):
         return Portfolio(
-            account_id=account_id, asset_class=asset_class,
+            account_id=account_id,
+            asset_class=asset_class,
             asof=pd.Timestamp.utcnow(),
-            positions={}, cash=equity, equity_total=equity,
-            realized_pnl_total=0.0, realized_fees_total=0.0,
-            peak_equity=equity, daily_open_equity=equity,
+            positions={},
+            cash=equity,
+            equity_total=equity,
+            realized_pnl_total=0.0,
+            realized_fees_total=0.0,
+            peak_equity=equity,
+            daily_open_equity=equity,
         )
+
     return _f
 
 
 # ---------------------------------------------------------------------------
 # End-to-end: tick → bus emission
 # ---------------------------------------------------------------------------
+
 
 class TestE2ETickEmits:
     def test_full_tick_emits_signal_to_bus(self, tmp_path):
@@ -97,15 +114,18 @@ class TestE2ETickEmits:
         analysts = [_mock_analyst(1, "a"), _mock_analyst(1, "b")]
         agg = BMAAggregator()
         gate = DefaultRiskGate(
-            RiskConfig(cost_multiple=0.5, min_trade_size=0.0,
-                       cooldown_after_loss_minutes=0, max_position_pct=0.20)
+            RiskConfig(
+                cost_multiple=0.5,
+                min_trade_size=0.0,
+                cooldown_after_loss_minutes=0,
+                max_position_pct=0.20,
+            )
         )
         halt_state = HaltStateSQLite(halt_db, halt_mirror)
 
         state = TickLoopState()
         n = run_one_tick(
-            tasks=[AssetTask("BTC/USDT", "crypto", "1h", exchange="binance",
-                             horizon="4h")],
+            tasks=[AssetTask("BTC/USDT", "crypto", "1h", exchange="binance", horizon="4h")],
             data_providers=[provider],
             analysts=analysts,
             aggregator=agg,
@@ -175,13 +195,16 @@ class TestE2ETickEmits:
 # Heartbeat emitter writes to bus
 # ---------------------------------------------------------------------------
 
+
 class TestHeartbeatToBus:
     @pytest.mark.timeout(10)
     def test_heartbeat_writes_distinguishable_records(self, tmp_path):
         bus = tmp_path / "signals.jsonl"
         emitter = HeartbeatEmitter(
-            get_state=lambda: {"last_tick_at": pd.Timestamp.utcnow(),
-                                "active_assets": ["BTC/USDT"]},
+            get_state=lambda: {
+                "last_tick_at": pd.Timestamp.utcnow(),
+                "active_assets": ["BTC/USDT"],
+            },
             interval_seconds=0.05,
             bus_path=bus,
         )
@@ -203,6 +226,7 @@ class TestHeartbeatToBus:
 # Multi-process flock under daemon + freqtrade concurrent writers
 # ---------------------------------------------------------------------------
 
+
 def _bus_writer(args: tuple) -> int:
     bus_path_str, n_records, role = args
     bus_path = Path(bus_path_str)
@@ -214,38 +238,44 @@ def _bus_writer(args: tuple) -> int:
 
     if role == "daemon-signal":
         for i in range(n_records):
-            emit_signal_record({
-                "schema_version": 1,
-                "id": f"sig-{role}-{i:04d}",
-                "asof": pd.Timestamp.utcnow().isoformat(),
-                "asset": "BTC/USDT",
-                "exchange": "binance",
-                "timeframe": "1h",
-                "direction": 1,
-                "magnitude": 0.01,
-                "confidence": 0.6,
-                "horizon": "4h",
-                "target_position_pct": 0.05,
-                "reason": "test",
-                "halt": False,
-                "role": role,
-            }, path=bus_path)
+            emit_signal_record(
+                {
+                    "schema_version": 1,
+                    "id": f"sig-{role}-{i:04d}",
+                    "asof": pd.Timestamp.utcnow().isoformat(),
+                    "asset": "BTC/USDT",
+                    "exchange": "binance",
+                    "timeframe": "1h",
+                    "direction": 1,
+                    "magnitude": 0.01,
+                    "confidence": 0.6,
+                    "horizon": "4h",
+                    "target_position_pct": 0.05,
+                    "reason": "test",
+                    "halt": False,
+                    "role": role,
+                },
+                path=bus_path,
+            )
     else:  # freqtrade-exec
         for i in range(n_records):
-            emit_execution_record({
-                "schema_version": 1,
-                "exec_id": f"exec-{role}-{i:04d}",
-                "asof": pd.Timestamp.utcnow().isoformat(),
-                "asset": "BTC/USDT",
-                "side": "buy",
-                "qty": 0.001,
-                "fill_price": 60_000.0,
-                "decision_price": 60_000.0,
-                "fees": 0.05,
-                "account_id": "freqtrade",
-                "asset_class": "crypto",
-                "role": role,
-            }, path=bus_path)
+            emit_execution_record(
+                {
+                    "schema_version": 1,
+                    "exec_id": f"exec-{role}-{i:04d}",
+                    "asof": pd.Timestamp.utcnow().isoformat(),
+                    "asset": "BTC/USDT",
+                    "side": "buy",
+                    "qty": 0.001,
+                    "fill_price": 60_000.0,
+                    "decision_price": 60_000.0,
+                    "fees": 0.05,
+                    "account_id": "freqtrade",
+                    "asset_class": "crypto",
+                    "role": role,
+                },
+                path=bus_path,
+            )
     return n_records
 
 
@@ -258,12 +288,15 @@ class TestDaemonFreqtradeConcurrentWrites:
         exec_bus = tmp_path / "executions.jsonl"
 
         with multiprocessing.Pool(4) as pool:
-            results = pool.map(_bus_writer, [
-                (str(signal_bus), 30, "daemon-signal"),
-                (str(signal_bus), 20, "daemon-signal"),
-                (str(exec_bus), 25, "freqtrade-exec"),
-                (str(exec_bus), 30, "freqtrade-exec"),
-            ])
+            results = pool.map(
+                _bus_writer,
+                [
+                    (str(signal_bus), 30, "daemon-signal"),
+                    (str(signal_bus), 20, "daemon-signal"),
+                    (str(exec_bus), 25, "freqtrade-exec"),
+                    (str(exec_bus), 30, "freqtrade-exec"),
+                ],
+            )
 
         assert sum(results) == 105
 
@@ -283,6 +316,7 @@ class TestDaemonFreqtradeConcurrentWrites:
 # ---------------------------------------------------------------------------
 # Halt persistence across daemon restart simulation
 # ---------------------------------------------------------------------------
+
 
 class TestHaltPersistsAcrossSimulatedRestart:
     def test_halt_survives_reopen_via_sqlite(self, tmp_path):
@@ -306,6 +340,7 @@ class TestHaltPersistsAcrossSimulatedRestart:
 # Freqtrade strategy can be imported (smoke; no IStrategy method execution)
 # ---------------------------------------------------------------------------
 
+
 class TestFreqtradeStrategyImports:
     def test_strategy_module_importable(self):
         """The strategy file must be import-clean even without freqtrade installed."""
@@ -324,6 +359,7 @@ class TestFreqtradeStrategyImports:
         from hermes_quant.consumers.freqtrade.quant_consumer_strategy import (
             HermesQuantConsumer,
         )
+
         # Per ADR-0008
         assert hasattr(HermesQuantConsumer, "populate_indicators")
         assert hasattr(HermesQuantConsumer, "populate_entry_trend")

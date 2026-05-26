@@ -6,6 +6,7 @@ LiveTradingApproval gives you a class with no `submit_mleg_order` method.
 
 Follow ADR-0029 patched D7 thresholds verbatim. Do NOT alter.
 """
+
 from __future__ import annotations
 
 from datetime import datetime

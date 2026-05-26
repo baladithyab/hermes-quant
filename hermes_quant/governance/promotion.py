@@ -10,6 +10,7 @@ fallback.
 
 # TODO(integration): remove fallback once react.live lands.
 """
+
 from __future__ import annotations
 
 import logging
@@ -150,9 +151,7 @@ def _collect_metrics(asof: datetime) -> dict[str, Any]:
             dd = evt.payload.get("rolling_30d_max_drawdown_pct")
             if dd is not None:
                 try:
-                    rolling_30d_max_drawdown_pct = max(
-                        rolling_30d_max_drawdown_pct, float(dd)
-                    )
+                    rolling_30d_max_drawdown_pct = max(rolling_30d_max_drawdown_pct, float(dd))
                 except (TypeError, ValueError):
                     pass
 
@@ -211,9 +210,7 @@ def evaluate(asof: datetime) -> PromotionDecision:
             f"< min={thresholds['min_sharpe_95ci_lower']:.2f}"
         )
 
-    if metrics["rolling_30d_max_drawdown_pct"] > float(
-        thresholds["max_rolling_30d_drawdown_pct"]
-    ):
+    if metrics["rolling_30d_max_drawdown_pct"] > float(thresholds["max_rolling_30d_drawdown_pct"]):
         blocked.append(
             f"rolling_30d_max_drawdown_pct={metrics['rolling_30d_max_drawdown_pct']:.4f} "
             f"> max={thresholds['max_rolling_30d_drawdown_pct']:.4f}"
@@ -221,14 +218,12 @@ def evaluate(asof: datetime) -> PromotionDecision:
 
     if not metrics["no_killswitch_in_trailing_14d"]:
         blocked.append(
-            f"kill switch fired within trailing "
-            f"{int(thresholds['killswitch_window_days'])}d window"
+            f"kill switch fired within trailing {int(thresholds['killswitch_window_days'])}d window"
         )
 
     if metrics["immutable_breaches_in_window"] != 0:
         blocked.append(
-            f"immutable_breaches_in_window="
-            f"{metrics['immutable_breaches_in_window']} (must be 0)"
+            f"immutable_breaches_in_window={metrics['immutable_breaches_in_window']} (must be 0)"
         )
 
     if metrics["calibrator_drift_max"] > float(thresholds["max_calibrator_drift"]):

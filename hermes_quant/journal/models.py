@@ -7,6 +7,7 @@ Pydantic optional: hermes-quant doesn't pin pydantic as a hard dep, so
 we fall back to a dataclass shim if pydantic isn't available. The shim
 mimics the validation surface enough that callers don't need to branch.
 """
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -14,10 +15,11 @@ from typing import Any, Literal, Optional
 
 try:
     from pydantic import BaseModel, Field
+
     _USE_PYDANTIC = True
 except ImportError:
     _USE_PYDANTIC = False
-    BaseModel = object   # type: ignore[assignment,misc]
+    BaseModel = object  # type: ignore[assignment,misc]
 
     def Field(*args: Any, **kwargs: Any) -> Any:  # type: ignore[no-redef]
         return None
@@ -31,12 +33,10 @@ if _USE_PYDANTIC:
         confidence: float = Field(ge=0.0, le=1.0)
         weight: float = Field(ge=0.0, le=1.0)
 
-
     class Reflection(BaseModel):  # type: ignore[no-redef]
         thesis_held: bool
         magnitude_error: float
         rule_version: str = "deterministic-v1"
-
 
     class SettlementEntry(BaseModel):  # type: ignore[no-redef]
         # Phase A (required at decision time)

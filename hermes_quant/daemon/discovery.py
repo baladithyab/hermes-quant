@@ -14,6 +14,7 @@ Per ADR-0007: discoverable extensions via [project.entry-points.*] in pyproject.
 The daemon's bootstrap reads `hermes-quant.config.yaml::quant.<role>.enabled`
 to choose which discovered classes to instantiate.
 """
+
 from __future__ import annotations
 
 import importlib.metadata
@@ -55,8 +56,7 @@ def _load_entry_points(group: str) -> dict[str, type]:
             cls = ep.load()
             out[ep.name] = cls
         except Exception as e:  # noqa: BLE001
-            logger.warning("failed to load entry point %s in %s: %s",
-                            ep.name, group, e)
+            logger.warning("failed to load entry point %s in %s: %s", ep.name, group, e)
             continue
     return out
 
@@ -106,9 +106,7 @@ def instantiate_analysts(
             continue
         # Light protocol check
         if not hasattr(instance, "analyze"):
-            logger.warning(
-                "analyst %s missing analyze(); skipping", name
-            )
+            logger.warning("analyst %s missing analyze(); skipping", name)
             continue
         out.append(instance)
     return out

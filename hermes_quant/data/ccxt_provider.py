@@ -14,6 +14,7 @@ Optional-extras: install with `pip install 'hermes-quant[ccxt]'`. The ccxt
 import is lazy (inside __init__) so the module loads without ccxt and only
 fails on instantiation, not on import.
 """
+
 from __future__ import annotations
 
 import logging
@@ -83,22 +84,22 @@ class CcxtProvider:
                 import ccxt  # noqa: I001
             except ImportError as exc:
                 raise DataProviderError(
-                    "ccxt is not installed. Install with: "
-                    "pip install 'hermes-quant[ccxt]'"
+                    "ccxt is not installed. Install with: pip install 'hermes-quant[ccxt]'"
                 ) from exc
 
             try:
                 exchange_cls = getattr(ccxt, exchange_id)
             except AttributeError as exc:
                 raise DataProviderError(
-                    f"unknown exchange_id={exchange_id!r}; see ccxt.exchanges "
-                    "for valid identifiers"
+                    f"unknown exchange_id={exchange_id!r}; see ccxt.exchanges for valid identifiers"
                 ) from exc
 
-            self._ex = exchange_cls({
-                "enableRateLimit": rate_limit,
-                "options": {"defaultType": "spot"},
-            })
+            self._ex = exchange_cls(
+                {
+                    "enableRateLimit": rate_limit,
+                    "options": {"defaultType": "spot"},
+                }
+            )
             if sandbox:
                 self._ex.set_sandbox_mode(True)
 
@@ -133,8 +134,7 @@ class CcxtProvider:
             )
         if timeframe not in _VALID_TIMEFRAMES:
             raise DataProviderError(
-                f"timeframe must be one of {sorted(_VALID_TIMEFRAMES)}, "
-                f"got {timeframe!r}"
+                f"timeframe must be one of {sorted(_VALID_TIMEFRAMES)}, got {timeframe!r}"
             )
         if "/" not in symbol:
             raise DataProviderError(
@@ -163,7 +163,10 @@ class CcxtProvider:
         max_iters = 20  # 20 * 1000 = 20K bars upper safety cap
         for _ in range(max_iters):
             chunk = self._fetch_with_retry(
-                symbol=symbol, timeframe=timeframe, since=cur_since, limit=1000,
+                symbol=symbol,
+                timeframe=timeframe,
+                since=cur_since,
+                limit=1000,
             )
             if not chunk:
                 break
@@ -194,14 +197,15 @@ class CcxtProvider:
         # Normalize timestamp dtype to nanosecond UTC (validate_bars may
         # return microsecond-precision in some pandas versions, which is
         # incompatible with pd.Timedelta arithmetic in others).
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).astype(
-            "datetime64[ns, UTC]"
-        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).astype("datetime64[ns, UTC]")
 
         # CRITICAL: as_of filter — bar must CLOSE at or before as_of (ADR-0017 §D3)
         # bar's open_time + timeframe = bar close_time
-        as_of = pd.Timestamp(as_of).tz_convert("UTC") if as_of.tzinfo else \
-                pd.Timestamp(as_of).tz_localize("UTC")
+        as_of = (
+            pd.Timestamp(as_of).tz_convert("UTC")
+            if as_of.tzinfo
+            else pd.Timestamp(as_of).tz_localize("UTC")
+        )
         bar_close_time = df["timestamp"] + pd.Timedelta(seconds=tf_seconds)
         df = df[bar_close_time <= as_of].reset_index(drop=True)
 
@@ -236,6 +240,7 @@ class CcxtProvider:
         # Lazy import so the module loads without ccxt
         try:
             import ccxt
+
             NetworkError = ccxt.NetworkError
             RateLimitExceeded = ccxt.RateLimitExceeded
             ExchangeError = ccxt.ExchangeError
@@ -244,6 +249,7 @@ class CcxtProvider:
             # Fake exchange; create stub exception types
             class _Stub(Exception):
                 pass
+
             NetworkError = RateLimitExceeded = _Stub
             ExchangeError = BadSymbol = _Stub
 
@@ -255,17 +261,19 @@ class CcxtProvider:
                 last_exc = exc
                 if attempt == max_attempts - 1:
                     raise RateLimitError(str(exc)) from exc
-                delay = base_delay_s * (2 ** attempt)
+                delay = base_delay_s * (2**attempt)
                 logger.warning(
                     "ccxt: rate-limit on %s %s; sleeping %.1fs (attempt %d/%d)",
-                    symbol, timeframe, delay, attempt + 1, max_attempts,
+                    symbol,
+                    timeframe,
+                    delay,
+                    attempt + 1,
+                    max_attempts,
                 )
                 time.sleep(delay)
             except BadSymbol as exc:
                 # Don't retry; bad config
-                raise DataProviderError(
-                    f"ccxt rejected symbol {symbol!r}: {exc}"
-                ) from exc
+                raise DataProviderError(f"ccxt rejected symbol {symbol!r}: {exc}") from exc
             except ExchangeError as exc:
                 # Most ExchangeError subclasses are fatal (auth, bad request)
                 raise DataProviderError(f"ccxt exchange error: {exc}") from exc
@@ -275,17 +283,18 @@ class CcxtProvider:
                     raise DataProviderError(
                         f"ccxt network error after {max_attempts} attempts: {exc}"
                     ) from exc
-                delay = base_delay_s * (2 ** attempt)
+                delay = base_delay_s * (2**attempt)
                 logger.warning(
                     "ccxt: network error on %s %s: %s; retrying in %.1fs",
-                    symbol, timeframe, exc, delay,
+                    symbol,
+                    timeframe,
+                    exc,
+                    delay,
                 )
                 time.sleep(delay)
             except Exception as exc:  # noqa: BLE001
                 # Unknown error class — surface, don't retry blindly
-                raise DataProviderError(
-                    f"ccxt unexpected error: {exc}"
-                ) from exc
+                raise DataProviderError(f"ccxt unexpected error: {exc}") from exc
 
         # Should not reach here, but defensively
         if last_exc:

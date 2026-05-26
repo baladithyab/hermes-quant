@@ -1,4 +1,5 @@
 """Unit tests for hermes_quant.aggregators.bma — BMAAggregator."""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -15,23 +16,36 @@ from hermes_quant.protocol import (
 
 def _ctx() -> MarketContext:
     ts = pd.date_range("2026-05-13", periods=2, freq="1h")
-    bars = pd.DataFrame({
-        "timestamp": ts,
-        "open": [100.0, 101.0],
-        "high": [101.0, 102.0],
-        "low": [99.0, 100.0],
-        "close": [100.5, 101.5],
-        "volume": [1000.0, 1000.0],
-    })
+    bars = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1000.0, 1000.0],
+        }
+    )
     return MarketContext(
-        asset="BTC/USDT", timeframe="1h", asset_class="crypto",
-        exchange="binance", bars=bars,
-        last_close=101.5, last_volume=1000.0, asof=ts[-1],
+        asset="BTC/USDT",
+        timeframe="1h",
+        asset_class="crypto",
+        exchange="binance",
+        bars=bars,
+        last_close=101.5,
+        last_volume=1000.0,
+        asof=ts[-1],
     )
 
 
-def _view(name: str, direction: int, mag: float = 0.01, conf: float = 0.7,
-          conf_raw: float = 0.85, horizon: str = "1h") -> AnalystView:
+def _view(
+    name: str,
+    direction: int,
+    mag: float = 0.01,
+    conf: float = 0.7,
+    conf_raw: float = 0.85,
+    horizon: str = "1h",
+) -> AnalystView:
     return AnalystView(
         analyst=name,
         direction=direction,
@@ -125,7 +139,8 @@ class TestUpdate:
         sig = a.aggregate(views, _ctx())
 
         outcome = EpisodeOutcome(
-            asset="BTC/USDT", timeframe="1h",
+            asset="BTC/USDT",
+            timeframe="1h",
             asof=pd.Timestamp("2026-05-13"),
             aggregated_signal=sig,
             realized_returns={"1h": 0.01},
@@ -142,7 +157,8 @@ class TestUpdate:
         views = [_view("a", 1)]
         sig = a.aggregate(views, _ctx())
         outcome = EpisodeOutcome(
-            asset="BTC/USDT", timeframe="1h",
+            asset="BTC/USDT",
+            timeframe="1h",
             asof=pd.Timestamp("2026-05-13"),
             aggregated_signal=sig,
             realized_returns={"1h": -0.01},
@@ -161,7 +177,8 @@ class TestUpdate:
             views = [_view("a", 1), _view("b", 1)]
             sig = a.aggregate(views, _ctx())
             outcome = EpisodeOutcome(
-                asset="BTC/USDT", timeframe="1h",
+                asset="BTC/USDT",
+                timeframe="1h",
                 asof=pd.Timestamp("2026-05-13"),
                 aggregated_signal=sig,
                 realized_returns={"1h": 0.01},
@@ -182,7 +199,8 @@ class TestUpdate:
         views = [_view("a", 1), _view("b", 1)]
         sig = a.aggregate(views, _ctx())
         outcome = EpisodeOutcome(
-            asset="BTC/USDT", timeframe="1h",
+            asset="BTC/USDT",
+            timeframe="1h",
             asof=pd.Timestamp("2026-05-13"),
             aggregated_signal=sig,
             realized_returns={"1h": 0.01},
@@ -190,8 +208,7 @@ class TestUpdate:
         )
         a.update(outcome)
         # 'b' stats untouched
-        assert "b" not in a._stats or a._stats.get("b") is None or \
-               a._stats["b"].n_observations == 0
+        assert "b" not in a._stats or a._stats.get("b") is None or a._stats["b"].n_observations == 0
 
 
 class TestUniformPreCalibration:
@@ -205,7 +222,8 @@ class TestUniformPreCalibration:
             views = [_view("bad", 1)]
             sig = a.aggregate(views, _ctx())
             outcome = EpisodeOutcome(
-                asset="BTC/USDT", timeframe="1h",
+                asset="BTC/USDT",
+                timeframe="1h",
                 asof=pd.Timestamp("2026-05-13"),
                 aggregated_signal=sig,
                 realized_returns={"1h": 0.01},

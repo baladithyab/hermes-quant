@@ -5,6 +5,7 @@ method at the class level, and instances cannot be built without a fully
 validated LiveTradingApproval. There is no runtime boolean an attacker (or
 an unattended LLM) can flip to authorize live multi-leg trading.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -76,12 +77,8 @@ def test_live_trading_approval_uses_lower_ci_not_point():
 
 def test_live_trading_approval_drawdown_threshold():
     # Just over 1% — rejected.
-    with pytest.raises(
-        ValidationError, match=r"rolling_30d_max_drawdown_pct must be <= 0\.01"
-    ):
-        LiveTradingApproval(
-            **_valid_approval_kwargs(rolling_30d_max_drawdown_pct=0.01001)
-        )
+    with pytest.raises(ValidationError, match=r"rolling_30d_max_drawdown_pct must be <= 0\.01"):
+        LiveTradingApproval(**_valid_approval_kwargs(rolling_30d_max_drawdown_pct=0.01001))
 
     # Exactly 1.0% — OK (boundary).
     a1 = LiveTradingApproval(**_valid_approval_kwargs(rolling_30d_max_drawdown_pct=0.01))
@@ -94,9 +91,7 @@ def test_live_trading_approval_drawdown_threshold():
 
 def test_live_trading_approval_killswitch_window():
     with pytest.raises(ValidationError, match=r"kill-switch"):
-        LiveTradingApproval(
-            **_valid_approval_kwargs(no_killswitch_in_trailing_14d=False)
-        )
+        LiveTradingApproval(**_valid_approval_kwargs(no_killswitch_in_trailing_14d=False))
 
 
 def test_live_trading_approval_immutable_breach_zero():

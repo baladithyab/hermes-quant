@@ -19,6 +19,7 @@ The module does NOT prove the analyst is correct; it only fails analysts
 that exhibit lookahead. Other forms of overfitting are caught by
 walk-forward CV (see cv.py) and DSR (see dsr.py).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -112,9 +113,7 @@ def shuffle_timestamps_test(
         distribution.
     """
     if "timestamp" not in bars.columns:
-        raise ValueError(
-            "bars must have a 'timestamp' column for shuffle_timestamps_test"
-        )
+        raise ValueError("bars must have a 'timestamp' column for shuffle_timestamps_test")
 
     rng = np.random.default_rng(seed)
 
@@ -138,7 +137,7 @@ def shuffle_timestamps_test(
     # to timestamp noise (suggesting it doesn't depend on temporal
     # ordering — could be lookahead OR noise-blind).
     n_at_or_above = sum(1 for s in shuffled_scores if s >= real_score)
-    p_value = (n_at_or_above + 1) / (n_shuffles + 1)   # Laplace smoothing
+    p_value = (n_at_or_above + 1) / (n_shuffles + 1)  # Laplace smoothing
 
     return LookaheadTestResult(
         p_value=p_value,

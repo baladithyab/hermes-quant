@@ -4,6 +4,7 @@ Semantic packets are precomputed Hermes/model/human research artifacts. The
 trading tick consumes them as immutable inputs; it never calls an LLM or the web
 from inside the analyst hot path. This preserves replayability.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -63,7 +64,9 @@ class SemanticPacket:
         return semantic_packet_hash(self.to_dict(include_hash=False))
 
     def with_hash(self) -> SemanticPacket:
-        return SemanticPacket(**{**self.to_dict(include_hash=True), "packet_hash": self.computed_hash})
+        return SemanticPacket(
+            **{**self.to_dict(include_hash=True), "packet_hash": self.computed_hash}
+        )
 
 
 def semantic_packet_hash(payload: dict[str, Any]) -> str:
@@ -135,12 +138,18 @@ def validate_semantic_packet(
     if age_minutes > max_age_minutes:
         return False, "stale_packet"
 
-    if verify_hash and packet.packet_hash is not None and packet.packet_hash != packet.computed_hash:
+    if (
+        verify_hash
+        and packet.packet_hash is not None
+        and packet.packet_hash != packet.computed_hash
+    ):
         return False, "packet_hash_mismatch"
     return True, "ok"
 
 
-def semantic_packet_from_dict(payload: dict[str, Any], *, attach_hash: bool = True) -> SemanticPacket:
+def semantic_packet_from_dict(
+    payload: dict[str, Any], *, attach_hash: bool = True
+) -> SemanticPacket:
     """Convenience helper for tests/packet writers."""
     packet = parse_semantic_packet(payload)
     return packet.with_hash() if attach_hash else packet

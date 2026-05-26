@@ -8,6 +8,7 @@ Machine Learning" (2018), Chapter 7.
 v0.3 ships the API + minimal tests; v0.4 RL training will be the primary
 consumer when training the aggregator on rolling windows.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,12 +22,12 @@ class WalkForwardSplit:
     """One train/val/test window from a PurgedWalkForward iterator."""
 
     train_start: pd.Timestamp
-    train_end: pd.Timestamp        # exclusive of embargo region
+    train_end: pd.Timestamp  # exclusive of embargo region
     val_start: pd.Timestamp
     val_end: pd.Timestamp
     test_start: pd.Timestamp
     test_end: pd.Timestamp
-    fold: int                      # 0-indexed fold number
+    fold: int  # 0-indexed fold number
 
     def assert_no_leakage(self) -> None:
         """Per López de Prado §7.4: train_end < val_start, val_end <= test_start.
@@ -34,8 +35,7 @@ class WalkForwardSplit:
         Raise AssertionError if the split is internally inconsistent.
         """
         assert self.train_end < self.val_start, (
-            f"train_end={self.train_end} must precede val_start={self.val_start} "
-            f"(embargo violated)"
+            f"train_end={self.train_end} must precede val_start={self.val_start} (embargo violated)"
         )
         assert self.val_end <= self.test_start, (
             f"val_end={self.val_end} must precede test_start={self.test_start}"
@@ -121,7 +121,7 @@ class PurgedWalkForward:
             embargo = fold_span * self.embargo_pct
             train_end = train_end_raw - embargo
 
-            val_start = train_end_raw   # embargo is BETWEEN train and val
+            val_start = train_end_raw  # embargo is BETWEEN train and val
             val_end = val_start + fold_span * self.val_pct
 
             test_start = val_end
@@ -145,6 +145,4 @@ class PurgedWalkForward:
             return df["timestamp"].sort_values().reset_index(drop=True)
         if isinstance(df.index, pd.DatetimeIndex):
             return df.index.to_series().sort_values().reset_index(drop=True)
-        raise ValueError(
-            "DataFrame needs a 'timestamp' column or DatetimeIndex"
-        )
+        raise ValueError("DataFrame needs a 'timestamp' column or DatetimeIndex")

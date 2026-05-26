@@ -1,4 +1,5 @@
 """Tests for hermes_quant.governance.approvals (ADR-0031 D4)."""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -30,13 +31,9 @@ def test_grant_then_require_round_trip(gov_paths: Path) -> None:
     assert fetched.token_id == t.token_id
 
 
-def test_approval_token_expires_after_ttl(
-    gov_paths: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_approval_token_expires_after_ttl(gov_paths: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Grant a 1-minute token; advance time 2 minutes; require fails."""
-    t = approvals.grant_token(
-        "promotion", "live_broker", granted_by="alice", ttl_minutes=1
-    )
+    t = approvals.grant_token("promotion", "live_broker", granted_by="alice", ttl_minutes=1)
 
     fake_now = t.granted_at + timedelta(minutes=2)
 
@@ -68,8 +65,7 @@ def test_grant_token_emits_audit_event(gov_paths: Path) -> None:
     approvals.grant_token("proposal", "prop_x", granted_by="alice")
     rows = list(audit_log.read())
     assert any(
-        r.payload.get("row_type") == "approval_granted"
-        and r.payload.get("scope") == "proposal"
+        r.payload.get("row_type") == "approval_granted" and r.payload.get("scope") == "proposal"
         for r in rows
     )
 
@@ -79,9 +75,7 @@ def test_retro_code_change_target_governance_path_rejected(gov_paths: Path) -> N
     require_human_token call refuses to look one up under governance/.
     """
     with pytest.raises(NoApprovalError):
-        approvals.require_human_token(
-            "retro_code_change", "hermes_quant/governance/audit_log.py"
-        )
+        approvals.require_human_token("retro_code_change", "hermes_quant/governance/audit_log.py")
 
 
 def test_invalid_scope_rejected(gov_paths: Path) -> None:

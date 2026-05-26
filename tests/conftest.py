@@ -9,6 +9,7 @@ Discovered 2026-05-24: 9,104 test-fixture rows had accumulated in the live
 audit log because integration tests of `advisor.recommend()` were running
 the gate without redirecting `governance.audit_log.AUDIT_LOG_PATH`.
 """
+
 from __future__ import annotations
 
 from pathlib import Path

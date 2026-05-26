@@ -5,6 +5,7 @@ These are CONSTANTS. The rest of the system imports them; nothing in the
 retro loop's code_change allowlist may modify this file (ADR-0026 D5 +
 ADR-0031 D7). CI verifies disjointness with the retro allowlist.
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterable

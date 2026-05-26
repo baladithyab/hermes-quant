@@ -19,6 +19,7 @@ Per synthesis-v2 §P0-D, emergency-stop ordering is HALT FIRST, then broker
 cancel — the durable halt is committed before any broker call so a race
 between cancel and the next daemon tick can't resume entries.
 """
+
 from __future__ import annotations
 
 import json
@@ -89,8 +90,9 @@ class HaltStateSQLite:
       cleared) don't collide
     """
 
-    def __init__(self, db_path: Path = DEFAULT_STATE_DB,
-                 mirror_path: Path = DEFAULT_HALT_JSON_MIRROR):
+    def __init__(
+        self, db_path: Path = DEFAULT_STATE_DB, mirror_path: Path = DEFAULT_HALT_JSON_MIRROR
+    ):
         self.db_path = db_path
         self.mirror_path = mirror_path
         self._lock = threading.RLock()
@@ -115,8 +117,9 @@ class HaltStateSQLite:
             conn.executescript(_SCHEMA)
 
     @staticmethod
-    def _normalize_scope(account_id: str | None, asset_class: str | None,
-                         asset: str | None) -> tuple[str, str, str]:
+    def _normalize_scope(
+        account_id: str | None, asset_class: str | None, asset: str | None
+    ) -> tuple[str, str, str]:
         """Replace None with WILDCARD sentinel."""
         return (
             account_id if account_id else WILDCARD,
@@ -299,8 +302,7 @@ class HaltStateSQLite:
             self._write_mirror()
         return n
 
-    def is_halted(self, account_id: str, asset_class: str,
-                  asset: str | None = None) -> bool:
+    def is_halted(self, account_id: str, asset_class: str, asset: str | None = None) -> bool:
         """Check if a (account, asset_class, asset) is in halt scope.
 
         A halt at scope `('*', '*', '*')` halts everything. A halt at
@@ -327,9 +329,7 @@ class HaltStateSQLite:
                 "AND (account_id = ? OR account_id = ?) "
                 "AND (asset_class = ? OR asset_class = ?) "
                 "AND (asset = ? OR asset = ?)",
-                (account_id, WILDCARD,
-                 asset_class, WILDCARD,
-                 check_asset, WILDCARD),
+                (account_id, WILDCARD, asset_class, WILDCARD, check_asset, WILDCARD),
             ).fetchall()
 
         return len(rows) > 0
@@ -338,8 +338,7 @@ class HaltStateSQLite:
         """List all active halts."""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM halts WHERE cleared_at IS NULL "
-                "ORDER BY halted_at DESC"
+                "SELECT * FROM halts WHERE cleared_at IS NULL ORDER BY halted_at DESC"
             ).fetchall()
         return [self._row_to_record(r) for r in rows]
 

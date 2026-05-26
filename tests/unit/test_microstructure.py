@@ -1,4 +1,5 @@
 """Tests for MicrostructureLite analyst (Wave B.3)."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -15,9 +16,9 @@ from hermes_quant.analysts.microstructure import (
 from hermes_quant.protocol import MarketContext
 
 
-def _make_bars(n: int = 100, *, base: float = 100.0,
-               trend_per_bar: float = 0.0,
-               noise: float = 0.5) -> pd.DataFrame:
+def _make_bars(
+    n: int = 100, *, base: float = 100.0, trend_per_bar: float = 0.0, noise: float = 0.5
+) -> pd.DataFrame:
     """Synthetic OHLCV with optional drift."""
     rng = np.random.default_rng(seed=42)
     timestamps = pd.date_range("2026-01-01", periods=n, freq="1D", tz="UTC")
@@ -26,11 +27,16 @@ def _make_bars(n: int = 100, *, base: float = 100.0,
     highs = np.maximum(closes, opens) + rng.uniform(0, noise * 0.7, n)
     lows = np.minimum(closes, opens) - rng.uniform(0, noise * 0.7, n)
     volumes = rng.uniform(1e6, 5e6, n)
-    return pd.DataFrame({
-        "timestamp": timestamps,
-        "open": opens, "high": highs, "low": lows,
-        "close": closes, "volume": volumes,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+        }
+    )
 
 
 def _ctx(bars, *, symbol="TEST", asset_class="equity") -> MarketContext:
@@ -50,6 +56,7 @@ def _ctx(bars, *, symbol="TEST", asset_class="equity") -> MarketContext:
 # ---------------------------------------------------------------------------
 # Indicator math sanity
 # ---------------------------------------------------------------------------
+
 
 def test_percent_b_returns_nan_on_short_data():
     short = pd.Series([100.0, 101.0])
@@ -91,6 +98,7 @@ def test_directional_bar_imbalance_returns_zero_on_short_data():
 # MicrostructureLite emission
 # ---------------------------------------------------------------------------
 
+
 def test_microstructure_returns_none_on_insufficient_history():
     a = MicrostructureLite()
     bars = _make_bars(10)
@@ -122,10 +130,16 @@ def test_microstructure_emits_long_on_strong_uptrend():
     highs = closes + 0.3
     lows = opens - 0.3
     volumes = np.full(n, 2e6)
-    bars = pd.DataFrame({
-        "timestamp": timestamps, "open": opens, "high": highs,
-        "low": lows, "close": closes, "volume": volumes,
-    })
+    bars = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+        }
+    )
     view = a.analyze(_ctx(bars))
     if view is not None:
         # Strong directional should emit long
@@ -140,8 +154,14 @@ def test_microstructure_metadata_includes_indicators():
     view = a.analyze(_ctx(bars))
     if view is not None:
         md = view.metadata
-        for key in ["bollinger_pct_b", "atr_relative", "trend_quality",
-                    "bar_imbalance", "active_subsignals", "n_active_subsignals"]:
+        for key in [
+            "bollinger_pct_b",
+            "atr_relative",
+            "trend_quality",
+            "bar_imbalance",
+            "active_subsignals",
+            "n_active_subsignals",
+        ]:
             assert key in md
 
 
@@ -183,7 +203,8 @@ def test_microstructure_via_advisor_pipeline():
             return _make_bars(120, trend_per_bar=0.5)
 
     result = recommend(
-        symbol="TREND", provider=FakeProvider(),
+        symbol="TREND",
+        provider=FakeProvider(),
         include_lessons=False,
     )
     # Should have at least one analyst view (ClassicalTA) — micro may be silent

@@ -9,6 +9,7 @@ Per ADR-0014 §D6 test fence:
 5. recommend does NOT call any calibrator update method
 6. recommend with no_lessons=True returns lessons=[] without journal IO
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -28,21 +29,22 @@ from hermes_quant.protocol import (
 # Fixtures: synthetic OHLCV bars + a fake DataProvider
 # ---------------------------------------------------------------------------
 
+
 def _make_bars(n: int = 100, start_price: float = 100.0) -> pd.DataFrame:
     """Generate deterministic synthetic OHLCV bars for tests."""
-    timestamps = pd.date_range(
-        start="2026-01-01", periods=n, freq="1D", tz="UTC"
-    )
+    timestamps = pd.date_range(start="2026-01-01", periods=n, freq="1D", tz="UTC")
     # A monotone trend so analysts have some signal to chew on
     closes = [start_price + i * 0.5 for i in range(n)]
-    return pd.DataFrame({
-        "timestamp": timestamps,
-        "open": [c - 0.1 for c in closes],
-        "high": [c + 0.3 for c in closes],
-        "low": [c - 0.4 for c in closes],
-        "close": closes,
-        "volume": [1_000_000.0] * n,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [c - 0.1 for c in closes],
+            "high": [c + 0.3 for c in closes],
+            "low": [c - 0.4 for c in closes],
+            "close": closes,
+            "volume": [1_000_000.0] * n,
+        }
+    )
 
 
 class _FakeProvider:
@@ -69,6 +71,7 @@ class _FakeProvider:
 # Test cases
 # ---------------------------------------------------------------------------
 
+
 def test_recommend_returns_structurally_valid_dict():
     """ADR-0014 §D6.1: known-symbol returns the documented shape."""
     provider = _FakeProvider()
@@ -82,9 +85,17 @@ def test_recommend_returns_structurally_valid_dict():
 
     # Top-level keys per ADR-0014 §D1
     assert set(result.keys()) >= {
-        "symbol", "asset_class", "timeframe", "as_of",
-        "data_quality", "analyst_views", "aggregated_signal",
-        "risk_gate", "lessons", "caveats", "doctor",
+        "symbol",
+        "asset_class",
+        "timeframe",
+        "as_of",
+        "data_quality",
+        "analyst_views",
+        "aggregated_signal",
+        "risk_gate",
+        "lessons",
+        "caveats",
+        "doctor",
     }
     assert result["symbol"] == "FAKE"
     assert result["asset_class"] == "equity"
@@ -98,10 +109,18 @@ def test_recommend_returns_structurally_valid_dict():
 
 def test_recommend_with_empty_bars_returns_gated_no_exception():
     """ADR-0014 §D3.4: safe under no-data scenarios."""
-    provider = _FakeProvider(bars=pd.DataFrame({
-        "timestamp": [], "open": [], "high": [],
-        "low": [], "close": [], "volume": [],
-    }))
+    provider = _FakeProvider(
+        bars=pd.DataFrame(
+            {
+                "timestamp": [],
+                "open": [],
+                "high": [],
+                "low": [],
+                "close": [],
+                "volume": [],
+            }
+        )
+    )
     result = recommend(
         symbol="EMPTY",
         provider=provider,
@@ -117,6 +136,7 @@ def test_recommend_with_empty_bars_returns_gated_no_exception():
 def test_recommend_handles_provider_rate_limit():
     """Rate limit raises become gated dict, not propagated exceptions."""
     from hermes_quant.protocol import RateLimitError
+
     provider = _FakeProvider(raise_on_fetch=RateLimitError("throttled"))
     result = recommend(
         symbol="LIMITED",
@@ -143,13 +163,12 @@ def test_recommend_handles_provider_data_error():
 def test_recommend_does_not_call_calibrator_update():
     """ADR-0014 §D3.1: read-only — no calibrator.fit/update calls."""
     from hermes_quant.analysts.classical_ta import ClassicalTAAnalyst
+
     analyst = ClassicalTAAnalyst()
     # Spy on the calibrator - the advisor must not touch its mutate methods
     analyst.calibrator.fit = MagicMock(side_effect=AssertionError("fit called"))
     if hasattr(analyst.calibrator, "update"):
-        analyst.calibrator.update = MagicMock(
-            side_effect=AssertionError("update called")
-        )
+        analyst.calibrator.update = MagicMock(side_effect=AssertionError("update called"))
 
     provider = _FakeProvider()
     result = recommend(
@@ -176,9 +195,7 @@ def test_recommend_no_lessons_returns_empty_lessons_no_journal_io(monkeypatch):
         call_count["n"] += 1
         return [{"sentinel": "should-not-appear"}]
 
-    monkeypatch.setattr(
-        advisor_module, "_get_recent_lessons", _spy_get_recent_lessons
-    )
+    monkeypatch.setattr(advisor_module, "_get_recent_lessons", _spy_get_recent_lessons)
 
     provider = _FakeProvider()
     result = recommend(
@@ -200,9 +217,7 @@ def test_recommend_with_lessons_calls_journal(monkeypatch):
         call_count["n"] += 1
         return [{"symbol": symbol, "reflection": "test"}]
 
-    monkeypatch.setattr(
-        advisor_module, "_get_recent_lessons", _spy_get_recent_lessons
-    )
+    monkeypatch.setattr(advisor_module, "_get_recent_lessons", _spy_get_recent_lessons)
 
     provider = _FakeProvider()
     result = recommend(
@@ -223,18 +238,21 @@ def test_recommend_deterministic_given_same_inputs():
     provider2 = _FakeProvider(bars=bars.copy())
 
     r1 = recommend(
-        symbol="DET", provider=provider1, include_lessons=False,
+        symbol="DET",
+        provider=provider1,
+        include_lessons=False,
         as_of="2026-04-01T00:00:00",
     )
     r2 = recommend(
-        symbol="DET", provider=provider2, include_lessons=False,
+        symbol="DET",
+        provider=provider2,
+        include_lessons=False,
         as_of="2026-04-01T00:00:00",
     )
 
     # Compare core fields — exclude metadata that legitimately varies
     # (e.g. wall-clock embedded in caveats: none currently, but be safe)
-    for key in ["symbol", "asset_class", "timeframe", "as_of",
-                "aggregated_signal", "risk_gate"]:
+    for key in ["symbol", "asset_class", "timeframe", "as_of", "aggregated_signal", "risk_gate"]:
         assert r1[key] == r2[key], f"non-deterministic: {key}"
 
 
@@ -283,7 +301,9 @@ def test_advisor_caveats_always_include_disclaimers():
     """Per ADR-0014 §D1: caveats are NOT optional disclaimers."""
     provider = _FakeProvider()
     result = recommend(
-        symbol="DISC", provider=provider, include_lessons=False,
+        symbol="DISC",
+        provider=provider,
+        include_lessons=False,
     )
     caveats_text = " ".join(result["caveats"]).lower()
     assert "snapshot" in caveats_text
@@ -312,10 +332,12 @@ def test_quant_recommend_tool_handler_parses_args():
     from hermes_quant.tools import quant_recommend
 
     # Use a symbol/asset_class combo that shortcuts to gated (no network)
-    out = quant_recommend({
-        "symbol": "BTC/USDT",
-        "asset_class": "crypto",  # unsupported in v0.1.2 -> gated
-    })
+    out = quant_recommend(
+        {
+            "symbol": "BTC/USDT",
+            "asset_class": "crypto",  # unsupported in v0.1.2 -> gated
+        }
+    )
     parsed = _json.loads(out)
     assert parsed["success"] is True  # the call succeeded; the gate gated
     assert parsed["risk_gate"]["pass"] is False

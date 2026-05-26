@@ -12,6 +12,7 @@ fill. This is deliberate: HITL paper fills feed the same calibrator that
 autonomous-mode fills will feed in v0.2, so the calibrator's training
 data is consistent across modes.
 """
+
 from __future__ import annotations
 
 import json
@@ -83,7 +84,7 @@ class PaperReactor:
             asof_execution=now,
             target_position_pct=fill_size_pct,
             decision_price=decision_price,
-            fill_price=decision_price,    # paper: no slippage
+            fill_price=decision_price,  # paper: no slippage
             fill_size_pct=fill_size_pct,
             reactor_name=self.name,
             human_in_the_loop=True,
@@ -97,14 +98,15 @@ class PaperReactor:
         # Append to the executions bus. Same flock pattern signal_bus uses.
         # The record format aligns with what the daemon's settlement loop
         # already consumes — see daemon/settlement_loop.py for the reader side.
-        line = json.dumps(_record_to_dict(record), separators=(",", ":"),
-                          sort_keys=True) + "\n"
+        line = json.dumps(_record_to_dict(record), separators=(",", ":"), sort_keys=True) + "\n"
         with append_locked(self.executions_path) as fd:
             os.write(fd, line.encode("utf-8"))
 
         logger.info(
             "paper-react: %s asset=%s size=%+.4f decision_price=%.4f",
-            record.proposal_id, record.asset, record.fill_size_pct,
+            record.proposal_id,
+            record.asset,
+            record.fill_size_pct,
             record.decision_price,
         )
         return record
@@ -129,7 +131,7 @@ class PaperReactor:
                 pass
         # Fallback for pre-Wave-B.1 advisor_results stored before the fix:
         # ClassicalTA's metadata happens to carry last_close.
-        for view in (ar.get("analyst_views") or []):
+        for view in ar.get("analyst_views") or []:
             md = view.get("metadata") or {}
             if "last_close" in md:
                 try:

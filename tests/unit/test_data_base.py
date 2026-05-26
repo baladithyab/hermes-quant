@@ -1,4 +1,5 @@
 """Unit tests for hermes_quant.data.base — validation gates + provider chain."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -20,14 +21,16 @@ from hermes_quant.protocol import (
 
 def _good_bars(n: int = 10, start: str = "2026-05-13T00:00:00") -> pd.DataFrame:
     ts = pd.date_range(start, periods=n, freq="1h")
-    return pd.DataFrame({
-        "timestamp": ts,
-        "open": [100.0 + i for i in range(n)],
-        "high": [101.0 + i for i in range(n)],
-        "low": [99.0 + i for i in range(n)],
-        "close": [100.5 + i for i in range(n)],
-        "volume": [1000 + i for i in range(n)],
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": [100.0 + i for i in range(n)],
+            "high": [101.0 + i for i in range(n)],
+            "low": [99.0 + i for i in range(n)],
+            "close": [100.5 + i for i in range(n)],
+            "volume": [1000 + i for i in range(n)],
+        }
+    )
 
 
 class TestValidateBars:
@@ -83,14 +86,16 @@ class TestValidateBars:
     def test_timestamp_normalized_to_utc(self):
         """tz-aware → UTC; tz-naive treated as UTC."""
         ts_aware = pd.date_range("2026-05-13", periods=3, freq="1h", tz="America/New_York")
-        bars = pd.DataFrame({
-            "timestamp": ts_aware,
-            "open": [100, 101, 102.0],
-            "high": [101, 102, 103.0],
-            "low": [99, 100, 101.0],
-            "close": [100.5, 101.5, 102.5],
-            "volume": [100, 100, 100],
-        })
+        bars = pd.DataFrame(
+            {
+                "timestamp": ts_aware,
+                "open": [100, 101, 102.0],
+                "high": [101, 102, 103.0],
+                "low": [99, 100, 101.0],
+                "close": [100.5, 101.5, 102.5],
+                "volume": [100, 100, 100],
+            }
+        )
         out = validate_bars(bars)
         # Output is tz-naive UTC
         assert out["timestamp"].dt.tz is None
@@ -110,8 +115,11 @@ class TestFetchWithChain:
         p1 = self._make_provider("p1", [bars])
         p2 = self._make_provider("p2", [bars])
         out = fetch_with_chain(
-            [p1, p2], "BTC/USDT", "1h",
-            pd.Timestamp("2026-05-12"), pd.Timestamp("2026-05-13"),
+            [p1, p2],
+            "BTC/USDT",
+            "1h",
+            pd.Timestamp("2026-05-12"),
+            pd.Timestamp("2026-05-13"),
         )
         assert len(out) == 10
         p1.fetch_bars.assert_called_once()
@@ -120,15 +128,21 @@ class TestFetchWithChain:
     def test_falls_back_on_rate_limit(self):
         bars = _good_bars(10)
         # p1 always rate-limited; p2 succeeds
-        p1 = self._make_provider("p1", [
-            RateLimitError("throttled"),
-            RateLimitError("throttled"),
-            RateLimitError("throttled"),  # exhausts retries
-        ])
+        p1 = self._make_provider(
+            "p1",
+            [
+                RateLimitError("throttled"),
+                RateLimitError("throttled"),
+                RateLimitError("throttled"),  # exhausts retries
+            ],
+        )
         p2 = self._make_provider("p2", [bars])
         out = fetch_with_chain(
-            [p1, p2], "BTC/USDT", "1h",
-            pd.Timestamp("2026-05-12"), pd.Timestamp("2026-05-13"),
+            [p1, p2],
+            "BTC/USDT",
+            "1h",
+            pd.Timestamp("2026-05-12"),
+            pd.Timestamp("2026-05-13"),
             max_retries=2,
         )
         assert len(out) == 10
@@ -137,15 +151,21 @@ class TestFetchWithChain:
 
     def test_falls_back_on_transient(self):
         bars = _good_bars(10)
-        p1 = self._make_provider("p1", [
-            DataProviderError("network blip"),
-            DataProviderError("network blip"),
-            DataProviderError("network blip"),
-        ])
+        p1 = self._make_provider(
+            "p1",
+            [
+                DataProviderError("network blip"),
+                DataProviderError("network blip"),
+                DataProviderError("network blip"),
+            ],
+        )
         p2 = self._make_provider("p2", [bars])
         out = fetch_with_chain(
-            [p1, p2], "BTC/USDT", "1h",
-            pd.Timestamp("2026-05-12"), pd.Timestamp("2026-05-13"),
+            [p1, p2],
+            "BTC/USDT",
+            "1h",
+            pd.Timestamp("2026-05-12"),
+            pd.Timestamp("2026-05-13"),
             max_retries=2,
         )
         assert len(out) == 10
@@ -157,31 +177,48 @@ class TestFetchWithChain:
         p2 = self._make_provider("p2", [_good_bars(10)])
         with pytest.raises(DataQualityError):
             fetch_with_chain(
-                [p1, p2], "BTC/USDT", "1h",
-                pd.Timestamp("2026-05-12"), pd.Timestamp("2026-05-13"),
+                [p1, p2],
+                "BTC/USDT",
+                "1h",
+                pd.Timestamp("2026-05-12"),
+                pd.Timestamp("2026-05-13"),
             )
         # p2 was NOT tried because data-quality error propagates immediately
         p2.fetch_bars.assert_not_called()
 
     def test_all_providers_fail_raises(self):
-        p1 = self._make_provider("p1", [
-            DataProviderError("p1 down"), DataProviderError("p1 down"),
-            DataProviderError("p1 down"),
-        ])
-        p2 = self._make_provider("p2", [
-            DataProviderError("p2 down"), DataProviderError("p2 down"),
-            DataProviderError("p2 down"),
-        ])
+        p1 = self._make_provider(
+            "p1",
+            [
+                DataProviderError("p1 down"),
+                DataProviderError("p1 down"),
+                DataProviderError("p1 down"),
+            ],
+        )
+        p2 = self._make_provider(
+            "p2",
+            [
+                DataProviderError("p2 down"),
+                DataProviderError("p2 down"),
+                DataProviderError("p2 down"),
+            ],
+        )
         with pytest.raises(DataProviderError, match="all providers failed"):
             fetch_with_chain(
-                [p1, p2], "BTC/USDT", "1h",
-                pd.Timestamp("2026-05-12"), pd.Timestamp("2026-05-13"),
+                [p1, p2],
+                "BTC/USDT",
+                "1h",
+                pd.Timestamp("2026-05-12"),
+                pd.Timestamp("2026-05-13"),
                 max_retries=2,
             )
 
     def test_empty_provider_list_raises(self):
         with pytest.raises(DataProviderError, match="no providers"):
             fetch_with_chain(
-                [], "BTC/USDT", "1h",
-                pd.Timestamp("2026-05-12"), pd.Timestamp("2026-05-13"),
+                [],
+                "BTC/USDT",
+                "1h",
+                pd.Timestamp("2026-05-12"),
+                pd.Timestamp("2026-05-13"),
             )

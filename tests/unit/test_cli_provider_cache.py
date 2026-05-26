@@ -1,4 +1,5 @@
 """Tests for backtest CLI provider/cache wiring (V03-7)."""
+
 from __future__ import annotations
 
 import argparse
@@ -12,15 +13,22 @@ from hermes_quant.cli import _fetch_bars_via_provider, setup_argparse
 def test_backtest_parser_accepts_provider_cache_flags():
     p = argparse.ArgumentParser()
     setup_argparse(p)
-    args = p.parse_args([
-        "backtest",
-        "--symbol", "BTC/USDT",
-        "--asset-class", "crypto",
-        "--provider", "ccxt:kraken",
-        "--cache-root", "/tmp/hq-cache",
-        "--walk-forward",
-        "--n-splits", "3",
-    ])
+    args = p.parse_args(
+        [
+            "backtest",
+            "--symbol",
+            "BTC/USDT",
+            "--asset-class",
+            "crypto",
+            "--provider",
+            "ccxt:kraken",
+            "--cache-root",
+            "/tmp/hq-cache",
+            "--walk-forward",
+            "--n-splits",
+            "3",
+        ]
+    )
     assert args.provider == "ccxt:kraken"
     assert args.cache_root == "/tmp/hq-cache"
     assert args.walk_forward

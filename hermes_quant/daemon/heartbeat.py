@@ -27,6 +27,7 @@ Heartbeat record schema (in signals.jsonl):
         "active_assets": ["BTC/USDT", "ETH/USDT"]
     }
 """
+
 from __future__ import annotations
 
 import os
@@ -42,6 +43,7 @@ from hermes_quant.daemon.signal_bus import SIGNAL_BUS_PATH, emit_signal_record
 # ---------------------------------------------------------------------------
 # Heartbeat emitter (daemon side)
 # ---------------------------------------------------------------------------
+
 
 class HeartbeatEmitter:
     """Daemon-side heartbeat emitter.
@@ -84,11 +86,7 @@ class HeartbeatEmitter:
         now = self._clock()
         state = self._get_state() or {}
         last_tick_at = state.get("last_tick_at")
-        last_tick_ago = (
-            (now - last_tick_at).total_seconds()
-            if last_tick_at is not None
-            else None
-        )
+        last_tick_ago = (now - last_tick_at).total_seconds() if last_tick_at is not None else None
         record = {
             "schema_version": 1,
             "type": "heartbeat",
@@ -134,9 +132,11 @@ class HeartbeatEmitter:
 # Heartbeat checker (consumer side, e.g. freqtrade strategy)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class HeartbeatCheckerConfig:
     """Per synthesis-v2 §P0-C: separate bootstrap grace from steady-state stale window."""
+
     bootstrap_grace_seconds: float = 120.0
     """Max seconds after consumer start with no heartbeat before declaring daemon dead.
     Default 120s = 2× typical daemon boot + first-tick fetch."""
@@ -153,6 +153,7 @@ class HeartbeatCheckerConfig:
 @dataclass
 class HeartbeatCheckResult:
     """Result of a single dead-man-switch check."""
+
     daemon_alive: bool
     reason: str
     """One of: 'heartbeat_fresh', 'no_heartbeat_observed_after_bootstrap',
@@ -200,6 +201,7 @@ class HeartbeatChecker:
         # the dead-man-switch decision uses monotonic age while the JSONL
         # records keep wall-clock asof (operators read those).
         import time as _time
+
         self._monotonic_clock_ns = monotonic_clock_ns or _time.monotonic_ns
         self._start_monotonic_ns = self._monotonic_clock_ns()
         self._last_heartbeat_monotonic_ns: int | None = None

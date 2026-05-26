@@ -4,6 +4,7 @@ Consumes precomputed semantic packets from MarketContext.extras and emits a
 normal AnalystView. It never calls a model or web API inside analyze(); Hermes or
 another upstream job must create packets ahead of time.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -130,7 +131,9 @@ class HermesSemanticAnalyst:
             "name": self.name,
             "enabled": self.enabled,
             "n_views_emitted": self._n_views_emitted,
-            "last_view_at": self._last_view_at.isoformat() if self._last_view_at is not None else None,
+            "last_view_at": self._last_view_at.isoformat()
+            if self._last_view_at is not None
+            else None,
             "error_count": self._error_count,
             "last_abstain_reason": self._last_abstain_reason,
             "calibrator_status": {

@@ -1,4 +1,5 @@
 """Tests for cli/halts.py — halt + resume + emergency-stop with synthesis-v2 ordering."""
+
 from __future__ import annotations
 
 import argparse
@@ -28,6 +29,7 @@ def isolated_quant_home(tmp_path: Path, monkeypatch):
     # Patch every spot that hardcodes the default
     from hermes_quant.daemon import halt_state as halt_module
     from hermes_quant.daemon import signal_bus as bus_module
+
     monkeypatch.setattr(halt_module, "DEFAULT_STATE_DB", fake_state_db)
     monkeypatch.setattr(halt_module, "DEFAULT_HALT_JSON_MIRROR", fake_mirror)
     monkeypatch.setattr(bus_module, "SIGNAL_BUS_PATH", fake_signal_bus)
@@ -47,8 +49,10 @@ class TestParseScopeArg:
 class TestCmdHalt:
     def test_basic_halt_succeeds(self, isolated_quant_home, capsys):
         ns = argparse.Namespace(
-            account="alpaca-paper", asset_class="crypto",
-            asset="BTC/USDT", reason="manual halt for review",
+            account="alpaca-paper",
+            asset_class="crypto",
+            asset="BTC/USDT",
+            reason="manual halt for review",
         )
         rc = cmd_halt(ns)
         assert rc == 0
@@ -58,8 +62,10 @@ class TestCmdHalt:
 
     def test_empty_reason_returns_1(self, isolated_quant_home, capsys):
         ns = argparse.Namespace(
-            account="alpaca-paper", asset_class="crypto",
-            asset="BTC/USDT", reason="",
+            account="alpaca-paper",
+            asset_class="crypto",
+            asset="BTC/USDT",
+            reason="",
         )
         rc = cmd_halt(ns)
         assert rc == 1
@@ -68,7 +74,9 @@ class TestCmdHalt:
 
     def test_wildcard_account(self, isolated_quant_home, capsys):
         ns = argparse.Namespace(
-            account="*", asset_class="*", asset="*",
+            account="*",
+            asset_class="*",
+            asset="*",
             reason="emergency",
         )
         rc = cmd_halt(ns)
@@ -78,40 +86,60 @@ class TestCmdHalt:
 class TestCmdResume:
     def test_resume_active_halt(self, isolated_quant_home, capsys):
         # First halt, then resume
-        cmd_halt(argparse.Namespace(
-            account="alpaca-paper", asset_class="crypto",
-            asset="BTC/USDT", reason="halt",
-        ))
+        cmd_halt(
+            argparse.Namespace(
+                account="alpaca-paper",
+                asset_class="crypto",
+                asset="BTC/USDT",
+                reason="halt",
+            )
+        )
         capsys.readouterr()  # clear
 
-        rc = cmd_resume(argparse.Namespace(
-            account="alpaca-paper", asset_class="crypto",
-            asset="BTC/USDT", reason="reviewed and clear",
-        ))
+        rc = cmd_resume(
+            argparse.Namespace(
+                account="alpaca-paper",
+                asset_class="crypto",
+                asset="BTC/USDT",
+                reason="reviewed and clear",
+            )
+        )
         assert rc == 0
         out = capsys.readouterr().out
         assert "resumed" in out
 
     def test_resume_nonexistent_returns_1(self, isolated_quant_home, capsys):
-        rc = cmd_resume(argparse.Namespace(
-            account="alpaca-paper", asset_class="crypto",
-            asset="BTC/USDT", reason="r",
-        ))
+        rc = cmd_resume(
+            argparse.Namespace(
+                account="alpaca-paper",
+                asset_class="crypto",
+                asset="BTC/USDT",
+                reason="r",
+            )
+        )
         assert rc == 1
         err = capsys.readouterr().err
         assert "no active halt" in err
 
     def test_empty_reason_rejected(self, isolated_quant_home, capsys):
-        cmd_halt(argparse.Namespace(
-            account="alpaca-paper", asset_class="crypto",
-            asset="BTC/USDT", reason="halt",
-        ))
+        cmd_halt(
+            argparse.Namespace(
+                account="alpaca-paper",
+                asset_class="crypto",
+                asset="BTC/USDT",
+                reason="halt",
+            )
+        )
         capsys.readouterr()
 
-        rc = cmd_resume(argparse.Namespace(
-            account="alpaca-paper", asset_class="crypto",
-            asset="BTC/USDT", reason="",
-        ))
+        rc = cmd_resume(
+            argparse.Namespace(
+                account="alpaca-paper",
+                asset_class="crypto",
+                asset="BTC/USDT",
+                reason="",
+            )
+        )
         assert rc == 1
 
 
@@ -134,6 +162,7 @@ class TestCmdEmergencyStop:
         cmd_emergency_stop(argparse.Namespace(account="alpaca-paper"))
         # Use the patched defaults to verify
         from hermes_quant.daemon import halt_state as _halt_module
+
         hs = HaltStateSQLite(
             db_path=_halt_module.DEFAULT_STATE_DB,
             mirror_path=_halt_module.DEFAULT_HALT_JSON_MIRROR,
@@ -149,16 +178,16 @@ class TestCmdEmergencyStop:
         cmd_emergency_stop(argparse.Namespace(account="alpaca-paper"))
         # Verify the bus has a halt-type record
         from hermes_quant.daemon import signal_bus as bus_module
+
         bus_path = bus_module.SIGNAL_BUS_PATH
         assert bus_path.exists()
         import json
+
         records = [json.loads(line) for line in bus_path.read_text().splitlines() if line.strip()]
         halt_records = [r for r in records if r.get("type") == "halt"]
         assert len(halt_records) >= 1
 
-    def test_emergency_stop_idempotent_when_already_halted(
-        self, isolated_quant_home, capsys
-    ):
+    def test_emergency_stop_idempotent_when_already_halted(self, isolated_quant_home, capsys):
         """If a halt already exists at the scope, emergency-stop continues
         with bus signal + broker step; doesn't crash."""
         cmd_emergency_stop(argparse.Namespace(account="alpaca-paper"))

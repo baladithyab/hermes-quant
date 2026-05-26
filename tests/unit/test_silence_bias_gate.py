@@ -3,6 +3,7 @@
 Covers all four dimensions of the gate, the structured silence reasons,
 the gated-by-advisor pass-through, and the dim ordering (cheap dims first).
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from hermes_quant.gates.silence_bias import (
 # Helpers — synthesize advisor results
 # ---------------------------------------------------------------------------
 
+
 def _result(
     *,
     confidence: float = 0.8,
@@ -31,8 +33,7 @@ def _result(
 ):
     """Build a minimal advisor result dict suitable for the gate."""
     views = [
-        {"analyst": f"A{i}", "metadata": {"atr_relative": atr_relative}}
-        for i in range(n_voices)
+        {"analyst": f"A{i}", "metadata": {"atr_relative": atr_relative}} for i in range(n_voices)
     ]
     return {
         "aggregated_signal": {
@@ -54,6 +55,7 @@ def _result(
 # Dim 0: pass-through when advisor's risk gate already vetoed
 # ---------------------------------------------------------------------------
 
+
 def test_silence_when_advisor_risk_gate_failed():
     r = _result(risk_pass=False, risk_reason="cost_gate_veto")
     out = silence_bias_gate(r)
@@ -66,8 +68,9 @@ def test_silence_when_advisor_risk_gate_failed():
 # Dim 1: confidence threshold
 # ---------------------------------------------------------------------------
 
+
 def test_silence_low_confidence_default():
-    r = _result(confidence=0.5)   # below default 0.65
+    r = _result(confidence=0.5)  # below default 0.65
     out = silence_bias_gate(r)
     assert out.decision == GateDecision.SILENCE_LOW_CONFIDENCE
     assert out.details["confidence"] == 0.5
@@ -88,6 +91,7 @@ def test_fire_at_confidence_threshold():
 # ---------------------------------------------------------------------------
 # Dim 2: urgency threshold
 # ---------------------------------------------------------------------------
+
 
 def test_silence_low_urgency_when_edge_too_small_vs_vol():
     r = _result(confidence=0.7, magnitude=0.01, atr_relative=0.10)
@@ -123,6 +127,7 @@ def test_market_volatility_override():
 # Dim 3: compute budget (number of voices)
 # ---------------------------------------------------------------------------
 
+
 def test_silence_insufficient_voices():
     r = _result(n_voices=1)
     out = silence_bias_gate(r)
@@ -149,16 +154,14 @@ def test_voices_threshold_configurable():
 # Dim 4: salience (recent rejections)
 # ---------------------------------------------------------------------------
 
+
 def test_silence_salience_veto():
     r = _result(confidence=0.9, magnitude=0.10, atr_relative=0.05)
     now = datetime.now(tz=UTC)
     lessons = [
-        {"hitl_kind": "reject", "when": (now - timedelta(hours=1)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")},
-        {"hitl_kind": "reject", "when": (now - timedelta(hours=2)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")},
-        {"hitl_kind": "reject", "when": (now - timedelta(hours=3)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")},
+        {"hitl_kind": "reject", "when": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")},
+        {"hitl_kind": "reject", "when": (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")},
+        {"hitl_kind": "reject", "when": (now - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")},
     ]
     out = silence_bias_gate(r, journal_lessons=lessons)
     assert out.decision == GateDecision.SILENCE_SALIENCE_VETO
@@ -170,8 +173,7 @@ def test_salience_below_threshold_doesnt_veto():
     r = _result(confidence=0.9, magnitude=0.10, atr_relative=0.05)
     now = datetime.now(tz=UTC)
     lessons = [
-        {"hitl_kind": "reject", "when": (now - timedelta(hours=1)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")},
+        {"hitl_kind": "reject", "when": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")},
     ]
     out = silence_bias_gate(r, journal_lessons=lessons)
     assert out.decision == GateDecision.FIRE
@@ -182,8 +184,8 @@ def test_salience_outside_window_ignored():
     now = datetime.now(tz=UTC)
     # Three rejections, but all > 7 days old (default window)
     lessons = [
-        {"hitl_kind": "reject", "when": (now - timedelta(hours=200)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")} for _ in range(3)
+        {"hitl_kind": "reject", "when": (now - timedelta(hours=200)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        for _ in range(3)
     ]
     out = silence_bias_gate(r, journal_lessons=lessons)
     assert out.decision == GateDecision.FIRE
@@ -194,8 +196,8 @@ def test_salience_only_counts_rejects():
     r = _result(confidence=0.9, magnitude=0.10, atr_relative=0.05)
     now = datetime.now(tz=UTC)
     lessons = [
-        {"hitl_kind": "approve", "when": (now - timedelta(hours=1)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")} for _ in range(5)
+        {"hitl_kind": "approve", "when": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        for _ in range(5)
     ]
     out = silence_bias_gate(r, journal_lessons=lessons)
     assert out.decision == GateDecision.FIRE
@@ -211,7 +213,7 @@ def test_count_recent_rejections_handles_missing_when_conservatively():
 def test_count_recent_rejections_handles_malformed_when():
     lessons = [{"hitl_kind": "reject", "when": "not-a-date"}]
     n = _count_recent_rejections(lessons, window_hours=168)
-    assert n == 1   # conservative
+    assert n == 1  # conservative
 
 
 def test_count_recent_rejections_naive_timestamp_treated_as_utc():
@@ -226,6 +228,7 @@ def test_count_recent_rejections_naive_timestamp_treated_as_utc():
 # ---------------------------------------------------------------------------
 # Dim ordering — cheap dims first
 # ---------------------------------------------------------------------------
+
 
 def test_voices_dim_evaluated_first():
     """If voices fail AND confidence fails, we should report voices (cheaper
@@ -247,6 +250,7 @@ def test_confidence_dim_evaluated_before_urgency():
 # FIRE happy path
 # ---------------------------------------------------------------------------
 
+
 def test_fire_when_all_dims_pass():
     r = _result(confidence=0.85, magnitude=0.10, atr_relative=0.05, n_voices=2)
     out = silence_bias_gate(r)
@@ -254,7 +258,10 @@ def test_fire_when_all_dims_pass():
     assert out.fired
     assert "passed_dims" in out.details
     assert set(out.details["passed_dims"]) == {
-        "confidence", "urgency", "compute_budget", "salience",
+        "confidence",
+        "urgency",
+        "compute_budget",
+        "salience",
     }
 
 
@@ -271,6 +278,7 @@ def test_details_dict_includes_diagnostics_on_fire():
 # Class wrapper
 # ---------------------------------------------------------------------------
 
+
 def test_class_wrapper_evaluates_and_tracks_stats():
     gate = SilenceBiasGate()
     fire_r = _result(confidence=0.85, magnitude=0.10, atr_relative=0.05)
@@ -283,7 +291,7 @@ def test_class_wrapper_evaluates_and_tracks_stats():
     stats = gate.stats()
     assert stats["n_evaluated"] == 3
     assert stats["n_fires"] == 1
-    assert abs(stats["fire_rate"] - 1/3) < 1e-9
+    assert abs(stats["fire_rate"] - 1 / 3) < 1e-9
 
 
 def test_class_wrapper_uses_custom_config():
@@ -298,6 +306,7 @@ def test_class_wrapper_uses_custom_config():
 # ---------------------------------------------------------------------------
 # Defensive — bad input
 # ---------------------------------------------------------------------------
+
 
 def test_handles_empty_advisor_result():
     out = silence_bias_gate({})

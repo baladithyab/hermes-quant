@@ -28,6 +28,7 @@ Per synthesis-v2: NO unilateral spending of compute. The daemon's tick
 interval default (60s) is conservative; a user can lower it via config
 once they're paper-trading happily.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -78,30 +79,39 @@ def _sigterm_handler(_signum, _frame):
 def _build_default_tasks() -> list[AssetTask]:
     """v0.1.1 default tasks. v0.1.2 will read from config."""
     return [
-        AssetTask(asset="BTC/USDT", asset_class="crypto", timeframe="1h",
-                  exchange="binance", horizon="4h"),
+        AssetTask(
+            asset="BTC/USDT", asset_class="crypto", timeframe="1h", exchange="binance", horizon="4h"
+        ),
     ]
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hermes-quant-daemon")
-    parser.add_argument("--account", default="default",
-                        help="Account ID (used for lock file and partitions)")
-    parser.add_argument("--profile", default="conservative",
-                        choices=list(PROFILES.keys()),
-                        help="Risk config profile")
-    parser.add_argument("--tick-interval", type=int, default=60,
-                        help="Seconds between ticks (default 60)")
-    parser.add_argument("--data-provider", default="yfinance",
-                        help="Primary data provider (entry-point name)")
-    parser.add_argument("--aggregator", default="bma",
-                        help="Aggregator (entry-point name)")
-    parser.add_argument("--analysts", default="classical-ta",
-                        help="Comma-separated analyst names (entry-point keys)")
-    parser.add_argument("--max-ticks", type=int, default=0,
-                        help="Stop after N ticks (0 = forever)")
-    parser.add_argument("--initial-cash", type=float, default=100_000.0,
-                        help="Starting cash (paper-trade)")
+    parser.add_argument(
+        "--account", default="default", help="Account ID (used for lock file and partitions)"
+    )
+    parser.add_argument(
+        "--profile",
+        default="conservative",
+        choices=list(PROFILES.keys()),
+        help="Risk config profile",
+    )
+    parser.add_argument(
+        "--tick-interval", type=int, default=60, help="Seconds between ticks (default 60)"
+    )
+    parser.add_argument(
+        "--data-provider", default="yfinance", help="Primary data provider (entry-point name)"
+    )
+    parser.add_argument("--aggregator", default="bma", help="Aggregator (entry-point name)")
+    parser.add_argument(
+        "--analysts",
+        default="classical-ta",
+        help="Comma-separated analyst names (entry-point keys)",
+    )
+    parser.add_argument("--max-ticks", type=int, default=0, help="Stop after N ticks (0 = forever)")
+    parser.add_argument(
+        "--initial-cash", type=float, default=100_000.0, help="Starting cash (paper-trade)"
+    )
     parser.add_argument("--log-level", default="INFO")
 
     args = parser.parse_args(argv)
@@ -171,7 +181,8 @@ def main(argv: list[str] | None = None) -> int:
         # Portfolio loader factory
         def portfolio_for(account_id: str, asset_class: str):
             return reconstruct_portfolio(
-                account_id, asset_class,
+                account_id,
+                asset_class,
                 initial_cash=args.initial_cash,
                 bus_path=EXECUTION_BUS_PATH,
             )
@@ -184,7 +195,9 @@ def main(argv: list[str] | None = None) -> int:
         tasks = _build_default_tasks()
         logger.info(
             "daemon started: account=%s profile=%s tick=%ds analysts=%s",
-            args.account, args.profile, args.tick_interval,
+            args.account,
+            args.profile,
+            args.tick_interval,
             [a.name for a in analysts],
         )
 
@@ -205,8 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                     state=state,
                 )
                 if n_emitted > 0:
-                    logger.info("tick #%d: emitted %d signals",
-                                tick_count, n_emitted)
+                    logger.info("tick #%d: emitted %d signals", tick_count, n_emitted)
             except Exception as e:  # noqa: BLE001
                 logger.exception("tick failed: %s", e)
                 state.n_errors += 1
@@ -220,7 +232,8 @@ def main(argv: list[str] | None = None) -> int:
                     realized = construct_realized_outcomes(new_records, signals)
                     episodes = construct_episode_outcomes(new_records, signals)
                     stats = dispatch_settlement(
-                        realized, episodes,
+                        realized,
+                        episodes,
                         analysts_by_name=analysts_by_name,
                         aggregator=aggregator,
                     )
@@ -241,8 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(1)
 
         heartbeat.stop()
-        logger.info("daemon shutdown complete: %d ticks, %d errors",
-                    state.n_ticks, state.n_errors)
+        logger.info("daemon shutdown complete: %d ticks, %d errors", state.n_ticks, state.n_errors)
         return 0
 
     finally:

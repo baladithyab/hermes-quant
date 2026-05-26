@@ -10,6 +10,7 @@ construct without colliding with the separator.
 The rendered output is read by humans (operators scrolling the journal)
 and parsed by `journal.reader.parse_journal` (round-trip stable).
 """
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -110,10 +111,7 @@ def _render_entry(entry: SettlementEntry) -> str:
         lines.append("**Components**:")
         for c in entry.per_analyst_components:
             d_arrow = {1: "↑", -1: "↓", 0: "→"}.get(int(c.direction), "?")
-            lines.append(
-                f"- `{c.analyst}` {d_arrow} "
-                f"conf={c.confidence:.2f} weight={c.weight:.2f}"
-            )
+            lines.append(f"- `{c.analyst}` {d_arrow} conf={c.confidence:.2f} weight={c.weight:.2f}")
         lines.append("")
 
     # Reflection narrative (Phase B)

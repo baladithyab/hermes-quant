@@ -17,6 +17,7 @@ ticker shapes but `/` is a path separator. Callers that want the
 original symbol for display can keep it; this is for the FILESYSTEM
 component only.
 """
+
 from __future__ import annotations
 
 import re
@@ -41,9 +42,7 @@ def safe_symbol_component(symbol: str) -> str:
             `.` after sanitization (the path-traversal attack class).
     """
     if not isinstance(symbol, str):
-        raise ValueError(
-            f"symbol must be str, got {type(symbol).__name__}"
-        )
+        raise ValueError(f"symbol must be str, got {type(symbol).__name__}")
     s = symbol.strip()
     if not s:
         raise ValueError("symbol must be non-empty")
@@ -62,12 +61,8 @@ def safe_symbol_component(symbol: str) -> str:
 
     # Final guard: refuse if cleaning produced empty or pure-traversal.
     if not cleaned:
-        raise ValueError(
-            f"symbol {symbol!r} sanitizes to empty string"
-        )
+        raise ValueError(f"symbol {symbol!r} sanitizes to empty string")
     if cleaned in {".", ".."}:
-        raise ValueError(
-            f"symbol {symbol!r} resolves to traversal token {cleaned!r}"
-        )
+        raise ValueError(f"symbol {symbol!r} resolves to traversal token {cleaned!r}")
 
     return cleaned

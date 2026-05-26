@@ -11,6 +11,7 @@ Covers:
   - Empty result -> DataQualityError
   - <2 bars after as_of filter -> DataQualityError
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ from hermes_quant.protocol import (
 # Fake ccxt exchange for unit tests
 # ---------------------------------------------------------------------------
 
+
 class FakeExchange:
     """Minimal ccxt-shaped fake. Stores a list of [ts_ms, o, h, l, c, v] rows.
 
@@ -45,8 +47,7 @@ class FakeExchange:
 
     def fetch_ohlcv(self, symbol, timeframe, since=None, limit=1000):
         self.calls.append(
-            {"symbol": symbol, "timeframe": timeframe,
-             "since": since, "limit": limit}
+            {"symbol": symbol, "timeframe": timeframe, "since": since, "limit": limit}
         )
         if self.raise_on_call:
             exc = self.raise_on_call.pop(0)
@@ -69,8 +70,12 @@ def _make_bars(
     """Build n synthetic OHLCV rows starting at `start`."""
     rows = []
     for i in range(n):
-        ts_ms = int((start + timedelta(seconds=i * timeframe_seconds))
-                    .replace(tzinfo=timezone.utc).timestamp() * 1000)
+        ts_ms = int(
+            (start + timedelta(seconds=i * timeframe_seconds))
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+            * 1000
+        )
         o = open_price + i * drift
         h = o + 1.0
         low = o - 1.0
@@ -102,6 +107,7 @@ def provider_with_bars(hourly_bars):
 # Validation
 # ---------------------------------------------------------------------------
 
+
 def test_rejects_unknown_asset_class(provider_with_bars):
     with pytest.raises(DataProviderError, match="asset_class"):
         provider_with_bars.fetch_bars("BTC/USDT", "equity", "1h")
@@ -121,6 +127,7 @@ def test_rejects_no_slash_symbol(provider_with_bars):
 # as_of lookahead filter (the critical money-software path)
 # ---------------------------------------------------------------------------
 
+
 def test_as_of_drops_in_flight_bar(provider_with_bars, hourly_bars):
     """as_of mid-bar must drop the in-flight bar."""
     # 24 bars starting 00:00, hourly. as_of = 14:30 should ADMIT bars
@@ -130,8 +137,11 @@ def test_as_of_drops_in_flight_bar(provider_with_bars, hourly_bars):
     # Result: 14 bars (open_times 0..13).
     as_of = pd.Timestamp("2026-05-13T14:30:00Z")
     result = provider_with_bars.fetch_bars(
-        "BTC/USDT", "crypto", "1h",
-        lookback_bars=100, as_of=as_of,
+        "BTC/USDT",
+        "crypto",
+        "1h",
+        lookback_bars=100,
+        as_of=as_of,
     )
     assert len(result) == 14
     # Last admitted bar: open_time = 13:00
@@ -143,8 +153,11 @@ def test_as_of_exactly_on_close_admits_bar(provider_with_bars):
     # Bar opening 13:00 closes at 14:00. as_of=14:00 -> bar admitted.
     as_of = pd.Timestamp("2026-05-13T14:00:00Z")
     result = provider_with_bars.fetch_bars(
-        "BTC/USDT", "crypto", "1h",
-        lookback_bars=100, as_of=as_of,
+        "BTC/USDT",
+        "crypto",
+        "1h",
+        lookback_bars=100,
+        as_of=as_of,
     )
     assert result["timestamp"].iloc[-1] == pd.Timestamp("2026-05-13T13:00:00Z")
     assert len(result) == 14
@@ -154,8 +167,11 @@ def test_as_of_one_second_before_close_drops_bar(provider_with_bars):
     """as_of one second BEFORE close_time must DROP that bar."""
     as_of = pd.Timestamp("2026-05-13T13:59:59Z")
     result = provider_with_bars.fetch_bars(
-        "BTC/USDT", "crypto", "1h",
-        lookback_bars=100, as_of=as_of,
+        "BTC/USDT",
+        "crypto",
+        "1h",
+        lookback_bars=100,
+        as_of=as_of,
     )
     # bar opening 13:00 closes at 14:00 > 13:59:59 → DROPPED
     # last admitted is bar opening 12:00, closing 13:00
@@ -181,11 +197,15 @@ def test_default_as_of_is_now(hourly_bars):
 # Lookback bar count
 # ---------------------------------------------------------------------------
 
+
 def test_returns_at_most_lookback_bars(provider_with_bars):
     as_of = pd.Timestamp("2026-05-13T23:00:00Z")
     result = provider_with_bars.fetch_bars(
-        "BTC/USDT", "crypto", "1h",
-        lookback_bars=5, as_of=as_of,
+        "BTC/USDT",
+        "crypto",
+        "1h",
+        lookback_bars=5,
+        as_of=as_of,
     )
     assert len(result) == 5
 
@@ -194,8 +214,11 @@ def test_returns_tail_not_head(provider_with_bars):
     """When more bars exist than lookback, return the LATEST ones."""
     as_of = pd.Timestamp("2026-05-13T23:00:00Z")
     result = provider_with_bars.fetch_bars(
-        "BTC/USDT", "crypto", "1h",
-        lookback_bars=3, as_of=as_of,
+        "BTC/USDT",
+        "crypto",
+        "1h",
+        lookback_bars=3,
+        as_of=as_of,
     )
     # 23:00 is the as_of; bar opening 22:00 closes at 23:00 -> last admitted
     assert result["timestamp"].iloc[-1] == pd.Timestamp("2026-05-13T22:00:00Z")
@@ -205,6 +228,7 @@ def test_returns_tail_not_head(provider_with_bars):
 # ---------------------------------------------------------------------------
 # Empty result + insufficient bars
 # ---------------------------------------------------------------------------
+
 
 def test_empty_result_raises_data_quality_error():
     provider = CcxtProvider(_exchange_factory=lambda: FakeExchange(rows=[]))
@@ -225,9 +249,11 @@ def test_insufficient_bars_after_as_of_filter_raises(hourly_bars):
 # Error taxonomy
 # ---------------------------------------------------------------------------
 
+
 def test_rate_limit_exceeded_maps_to_rate_limit_error():
     """ccxt.RateLimitExceeded after retries -> hermes_quant.RateLimitError."""
-    import ccxt as _ccxt   # only import for the exception class
+    import ccxt as _ccxt  # only import for the exception class
+
     fake = FakeExchange()
     fake.raise_on_call = [
         _ccxt.RateLimitExceeded("rate limit"),
@@ -237,21 +263,30 @@ def test_rate_limit_exceeded_maps_to_rate_limit_error():
     provider = CcxtProvider(_exchange_factory=lambda: fake)
     with pytest.raises(RateLimitError):
         provider._fetch_with_retry(
-            symbol="BTC/USDT", timeframe="1h",
-            since=0, limit=10, max_attempts=3, base_delay_s=0.001,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            since=0,
+            limit=10,
+            max_attempts=3,
+            base_delay_s=0.001,
         )
 
 
 def test_bad_symbol_does_not_retry():
     """ccxt.BadSymbol -> DataProviderError immediately, no retry."""
     import ccxt as _ccxt
+
     fake = FakeExchange()
     fake.raise_on_call = [_ccxt.BadSymbol("unknown symbol")]
     provider = CcxtProvider(_exchange_factory=lambda: fake)
     with pytest.raises(DataProviderError, match="rejected symbol"):
         provider._fetch_with_retry(
-            symbol="FAKE/X", timeframe="1h",
-            since=0, limit=10, max_attempts=3, base_delay_s=0.001,
+            symbol="FAKE/X",
+            timeframe="1h",
+            since=0,
+            limit=10,
+            max_attempts=3,
+            base_delay_s=0.001,
         )
     # Verify: only 1 call (no retry)
     assert len(fake.calls) == 1
@@ -259,6 +294,7 @@ def test_bad_symbol_does_not_retry():
 
 def test_network_error_retries_then_raises():
     import ccxt as _ccxt
+
     fake = FakeExchange()
     fake.raise_on_call = [
         _ccxt.NetworkError("conn reset"),
@@ -268,21 +304,30 @@ def test_network_error_retries_then_raises():
     provider = CcxtProvider(_exchange_factory=lambda: fake)
     with pytest.raises(DataProviderError, match="network error"):
         provider._fetch_with_retry(
-            symbol="BTC/USDT", timeframe="1h",
-            since=0, limit=10, max_attempts=3, base_delay_s=0.001,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            since=0,
+            limit=10,
+            max_attempts=3,
+            base_delay_s=0.001,
         )
-    assert len(fake.calls) == 3   # all 3 attempts made
+    assert len(fake.calls) == 3  # all 3 attempts made
 
 
 def test_network_error_then_success():
     """Transient NetworkError followed by success returns the data."""
     import ccxt as _ccxt
+
     fake = FakeExchange(rows=[[0, 1, 1, 1, 1, 1]])
     fake.raise_on_call = [_ccxt.NetworkError("transient")]
     provider = CcxtProvider(_exchange_factory=lambda: fake)
     result = provider._fetch_with_retry(
-        symbol="BTC/USDT", timeframe="1h",
-        since=0, limit=10, max_attempts=3, base_delay_s=0.001,
+        symbol="BTC/USDT",
+        timeframe="1h",
+        since=0,
+        limit=10,
+        max_attempts=3,
+        base_delay_s=0.001,
     )
     assert result == [[0, 1, 1, 1, 1, 1]]
 
@@ -290,6 +335,7 @@ def test_network_error_then_success():
 # ---------------------------------------------------------------------------
 # Pagination
 # ---------------------------------------------------------------------------
+
 
 def test_pagination_terminates_on_empty_chunk():
     """Empty response from fetch_ohlcv terminates the loop."""
@@ -303,14 +349,16 @@ def test_pagination_terminates_on_empty_chunk():
 def test_pagination_terminates_on_partial_page():
     """When ccxt returns fewer than limit rows, that's the last page."""
     rows = _make_bars(
-        n=50,   # fewer than the 1000-row limit
+        n=50,  # fewer than the 1000-row limit
         start=datetime(2026, 5, 13, 0, 0, 0),
         timeframe_seconds=3600,
     )
     fake = FakeExchange(rows=rows)
     provider = CcxtProvider(_exchange_factory=lambda: fake)
     result = provider.fetch_bars(
-        "BTC/USDT", "crypto", "1h",
+        "BTC/USDT",
+        "crypto",
+        "1h",
         lookback_bars=100,
         as_of=pd.Timestamp("2026-05-15T23:00:00Z"),
     )
@@ -324,6 +372,7 @@ def test_pagination_terminates_on_partial_page():
 # Symbol normalization (we DON'T normalize; we reject)
 # ---------------------------------------------------------------------------
 
+
 def test_provider_does_not_silently_normalize_symbols(provider_with_bars):
     """Per ADR-0017 §D2, no-slash symbols raise immediately, not silently retry."""
     with pytest.raises(DataProviderError, match="ccxt rejects"):
@@ -334,9 +383,11 @@ def test_provider_does_not_silently_normalize_symbols(provider_with_bars):
 # Health
 # ---------------------------------------------------------------------------
 
+
 def test_health_returns_provider_info():
     provider = CcxtProvider(
-        exchange_id="binance", sandbox=True,
+        exchange_id="binance",
+        sandbox=True,
         _exchange_factory=lambda: FakeExchange(),
     )
     h = provider.health()
@@ -349,9 +400,11 @@ def test_health_returns_provider_info():
 # Optional-extras: missing ccxt
 # ---------------------------------------------------------------------------
 
+
 def test_missing_ccxt_install_fails_at_construction(monkeypatch):
     """Without ccxt installed, instantiating raises DataProviderError."""
     import sys
+
     # Simulate missing ccxt
     monkeypatch.setitem(sys.modules, "ccxt", None)
     with pytest.raises(DataProviderError, match="ccxt is not installed"):

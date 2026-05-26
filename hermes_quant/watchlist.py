@@ -18,6 +18,7 @@ watchlist is small operator state, not high-frequency).
 Concurrent-write safety: a per-config-path lock + atomic-rename
 (`.tmp` → `fsync` → `rename`). Same pattern the journal writer uses.
 """
+
 from __future__ import annotations
 
 import fcntl
@@ -56,6 +57,7 @@ class WatchlistEntry:
 # ---------------------------------------------------------------------------
 # Config path resolution
 # ---------------------------------------------------------------------------
+
 
 def get_config_path() -> Path:
     """Return the active Hermes config.yaml path. Profile-aware.
@@ -108,6 +110,7 @@ def _flocked(path: Path) -> Iterator[None]:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def list_watchlist(path: Path | None = None) -> list[WatchlistEntry]:
     """Return the configured watchlist. Empty list if config missing or
     no watchlist key."""
@@ -122,14 +125,14 @@ def list_watchlist(path: Path | None = None) -> list[WatchlistEntry]:
         asset_class = entry.get("asset_class")
         if not symbol or not asset_class:
             continue
-        timeframe = entry.get("timeframe") or _DEFAULT_TF_BY_ASSET_CLASS.get(
-            asset_class, "1d"
+        timeframe = entry.get("timeframe") or _DEFAULT_TF_BY_ASSET_CLASS.get(asset_class, "1d")
+        out.append(
+            WatchlistEntry(
+                symbol=str(symbol),
+                asset_class=str(asset_class),
+                timeframe=str(timeframe),
+            )
         )
-        out.append(WatchlistEntry(
-            symbol=str(symbol),
-            asset_class=str(asset_class),
-            timeframe=str(timeframe),
-        ))
     return out
 
 
@@ -144,14 +147,11 @@ def add_to_watchlist(
     asset_class) — duplicates with the same key are replaced."""
     if asset_class not in _VALID_ASSET_CLASSES:
         raise ValueError(
-            f"asset_class must be one of {sorted(_VALID_ASSET_CLASSES)}, "
-            f"got {asset_class!r}"
+            f"asset_class must be one of {sorted(_VALID_ASSET_CLASSES)}, got {asset_class!r}"
         )
     tf = timeframe or _DEFAULT_TF_BY_ASSET_CLASS.get(asset_class, "1d")
     if tf not in _VALID_TIMEFRAMES:
-        raise ValueError(
-            f"timeframe must be one of {sorted(_VALID_TIMEFRAMES)}, got {tf!r}"
-        )
+        raise ValueError(f"timeframe must be one of {sorted(_VALID_TIMEFRAMES)}, got {tf!r}")
 
     cfg_path = path or get_config_path()
     new_entry = WatchlistEntry(
@@ -171,7 +171,8 @@ def add_to_watchlist(
 
             # Remove any existing entry with the same (symbol, asset_class)
             filtered = [
-                e for e in existing
+                e
+                for e in existing
                 if not (
                     isinstance(e, dict)
                     and e.get("symbol") == new_entry.symbol
@@ -240,25 +241,25 @@ def clear_watchlist(path: Path | None = None) -> int:
 # Internal — YAML load/save with atomic-rename
 # ---------------------------------------------------------------------------
 
+
 def _load_config(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
         import yaml
+
         text = path.read_text(encoding="utf-8")
         if not text.strip():
             return {}
         return yaml.safe_load(text) or {}
     except ImportError:
-        logger.warning(
-            "watchlist: pyyaml not installed; cannot read config — "
-            "returning empty"
-        )
+        logger.warning("watchlist: pyyaml not installed; cannot read config — returning empty")
         return {}
     except Exception as exc:
         logger.warning(
             "watchlist: failed to parse %s: %s — treating as empty",
-            path, exc,
+            path,
+            exc,
         )
         return {}
 

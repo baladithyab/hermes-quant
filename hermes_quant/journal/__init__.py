@@ -19,6 +19,7 @@ Public API:
 This module is lazily-importable: tools that depend on the journal degrade
 to no-ops when the writer isn't available, so older deploys keep working.
 """
+
 from __future__ import annotations
 
 from .models import (

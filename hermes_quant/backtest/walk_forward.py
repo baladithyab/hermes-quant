@@ -6,6 +6,7 @@ peek at the test fold. Train/validation windows are recorded as metadata for
 future calibrator pretraining, but v0.4's first use is simply: run the same
 advisor pipeline on each out-of-sample test slice and aggregate results.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -65,13 +66,17 @@ class WalkForwardBacktestResult:
     def mean_sharpe_delta(self) -> float:
         if not self.folds:
             return float("nan")
-        return sum((f.result.sharpe - f.result.buy_hold_sharpe) for f in self.folds) / len(self.folds)
+        return sum((f.result.sharpe - f.result.buy_hold_sharpe) for f in self.folds) / len(
+            self.folds
+        )
 
     @property
     def positive_excess_fold_rate(self) -> float:
         if not self.folds:
             return float("nan")
-        return sum(1 for f in self.folds if f.result.excess_return_vs_buy_hold_pct > 0) / len(self.folds)
+        return sum(1 for f in self.folds if f.result.excess_return_vs_buy_hold_pct > 0) / len(
+            self.folds
+        )
 
     @property
     def total_decisions(self) -> int:
@@ -123,19 +128,23 @@ class WalkForwardBacktestResult:
             )
         lines.append("")
         if self.mean_excess_return_vs_buy_hold_pct <= 0:
-            lines.extend([
-                "## Charter decision",
-                "",
-                "**NEGATIVE aggregate excess return** — per charter, fix analysts/aggregator before RL aggregator work.",
-                "",
-            ])
+            lines.extend(
+                [
+                    "## Charter decision",
+                    "",
+                    "**NEGATIVE aggregate excess return** — per charter, fix analysts/aggregator before RL aggregator work.",
+                    "",
+                ]
+            )
         else:
-            lines.extend([
-                "## Charter decision",
-                "",
-                "**POSITIVE aggregate excess return** — paper-trade/live-reactor work may proceed only if risk gates and drawdown locks also pass.",
-                "",
-            ])
+            lines.extend(
+                [
+                    "## Charter decision",
+                    "",
+                    "**POSITIVE aggregate excess return** — paper-trade/live-reactor work may proceed only if risk gates and drawdown locks also pass.",
+                    "",
+                ]
+            )
         return "\n".join(lines)
 
 
@@ -181,7 +190,9 @@ def walk_forward_replay(
 
     fold_results: list[WalkForwardFoldResult] = []
     for split in splitter.split(bars):
-        train_mask = (bars["timestamp"] >= split.train_start) & (bars["timestamp"] < split.train_end)
+        train_mask = (bars["timestamp"] >= split.train_start) & (
+            bars["timestamp"] < split.train_end
+        )
         val_mask = (bars["timestamp"] >= split.val_start) & (bars["timestamp"] < split.val_end)
         test_mask = (bars["timestamp"] >= split.test_start) & (bars["timestamp"] <= split.test_end)
         test_bars = bars.loc[test_mask].copy().reset_index(drop=True)
@@ -206,14 +217,16 @@ def walk_forward_replay(
             committee_turns=committee_turns,
             advisor_recommend=advisor_recommend,
         )
-        fold_results.append(WalkForwardFoldResult(
-            fold=split.fold,
-            split=split,
-            result=result,
-            n_train_bars=int(train_mask.sum()),
-            n_val_bars=int(val_mask.sum()),
-            n_test_bars=len(test_bars),
-        ))
+        fold_results.append(
+            WalkForwardFoldResult(
+                fold=split.fold,
+                split=split,
+                result=result,
+                n_train_bars=int(train_mask.sum()),
+                n_val_bars=int(val_mask.sum()),
+                n_test_bars=len(test_bars),
+            )
+        )
 
     return WalkForwardBacktestResult(
         symbol=symbol,

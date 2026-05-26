@@ -1,4 +1,5 @@
 """Tests for hermes_quant.governance.kill_switch (ADR-0031 D3)."""
+
 from __future__ import annotations
 
 import json
@@ -89,17 +90,13 @@ def test_kill_switch_clear_requires_token(gov_paths: Path) -> None:
 
 def test_kill_switch_clear_with_valid_token(gov_paths: Path) -> None:
     kill_switch.fire("r", "s")
-    token = approvals.grant_token(
-        "kill_switch_clear", "state.json", granted_by="admin"
-    )
+    token = approvals.grant_token("kill_switch_clear", "state.json", granted_by="admin")
     kill_switch.clear(token)
     assert kill_switch.is_halted() is False
 
 
 def test_kill_switch_clear_rejects_wrong_scope_token(gov_paths: Path) -> None:
     kill_switch.fire("r", "s")
-    bad_token = approvals.grant_token(
-        "promotion", "anything", granted_by="admin"
-    )
+    bad_token = approvals.grant_token("promotion", "anything", granted_by="admin")
     with pytest.raises(NoApprovalError):
         kill_switch.clear(bad_token)

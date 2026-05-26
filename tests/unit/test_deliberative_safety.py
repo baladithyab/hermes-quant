@@ -8,6 +8,7 @@ Three patterns:
      tool_calls, context_messages, prior_messages) are stripped from inbound
      turn metadata.
 """
+
 from __future__ import annotations
 
 import pandas as pd
@@ -112,14 +113,18 @@ def test_committee_turn_quick_tier_rejected_for_portfolio_manager():
     }
     agg = DeliberativeCommitteeAggregator()
     signal = agg.aggregate(_aligned_views(), _ctx(extras={"committee_turns": [rejected]}))
-    pm_turns = [t for t in signal.metadata["committee"]["turns"] if t["role"] == "portfolio_manager"]
+    pm_turns = [
+        t for t in signal.metadata["committee"]["turns"] if t["role"] == "portfolio_manager"
+    ]
     # Only the deterministic PM should remain.
     assert len(pm_turns) == 1
     assert pm_turns[0]["model"].startswith("deterministic:")
     assert pm_turns[0]["tier"] == "deterministic"
     # And the rejected one didn't sneak into model_backed_turns either.
     pm_model_turns = [
-        t for t in signal.metadata["committee"]["model_backed_turns"] if t["role"] == "portfolio_manager"
+        t
+        for t in signal.metadata["committee"]["model_backed_turns"]
+        if t["role"] == "portfolio_manager"
     ]
     assert pm_model_turns == []
 
@@ -161,7 +166,9 @@ def test_committee_turn_deep_tier_accepted_for_portfolio_manager():
     agg = DeliberativeCommitteeAggregator()
     signal = agg.aggregate(_aligned_views(), _ctx(extras={"committee_turns": [accepted]}))
     pm_model_turns = [
-        t for t in signal.metadata["committee"]["model_backed_turns"] if t["role"] == "portfolio_manager"
+        t
+        for t in signal.metadata["committee"]["model_backed_turns"]
+        if t["role"] == "portfolio_manager"
     ]
     assert len(pm_model_turns) == 1
     assert pm_model_turns[0]["tier"] == "deep"
@@ -260,7 +267,9 @@ def test_msg_clear_strips_messages_from_inbound_metadata():
     agg = DeliberativeCommitteeAggregator(max_debate_rounds=2)
     signal = agg.aggregate(_aligned_views(), _ctx(extras={"committee_turns": [inbound]}))
     bull_model_turns = [
-        t for t in signal.metadata["committee"]["model_backed_turns"] if t["role"] == "bull_researcher"
+        t
+        for t in signal.metadata["committee"]["model_backed_turns"]
+        if t["role"] == "bull_researcher"
     ]
     assert len(bull_model_turns) == 1
     md = bull_model_turns[0]["metadata"] or {}

@@ -15,6 +15,7 @@ This module is PURE FUNCTION (no IO, no logger side effects beyond
 the standard logger). The autonomous orchestrator handles tick output,
 audit trail, and React. The gate decides; the orchestrator acts.
 """
+
 from __future__ import annotations
 
 import enum
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Decision enum
 # ---------------------------------------------------------------------------
+
 
 class GateDecision(enum.StrEnum):
     """Per ADR-0016 §D2. Structured silence reasons make tuning a data
@@ -58,6 +60,7 @@ class GateDecision(enum.StrEnum):
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class GateConfig:
@@ -102,6 +105,7 @@ class GateConfig:
 # Result
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class GateResult:
     """Decision + structured details. The `details` dict is intended for
@@ -119,6 +123,7 @@ class GateResult:
 # ---------------------------------------------------------------------------
 # The pure-function gate
 # ---------------------------------------------------------------------------
+
 
 def silence_bias_gate(
     advisor_result: dict[str, Any],
@@ -211,7 +216,8 @@ def silence_bias_gate(
         return GateResult(
             decision=GateDecision.SILENCE_LOW_URGENCY,
             details={
-                "edge": 0.0, "min_required": cfg.min_urgency,
+                "edge": 0.0,
+                "min_required": cfg.min_urgency,
                 "rationale": "Direction is flat; nothing to act on.",
             },
         )
@@ -278,7 +284,10 @@ def silence_bias_gate(
             "n_voices": n_emitted,
             "recent_rejections": rejections,
             "passed_dims": [
-                "confidence", "urgency", "compute_budget", "salience",
+                "confidence",
+                "urgency",
+                "compute_budget",
+                "salience",
             ],
         },
     )
@@ -287,6 +296,7 @@ def silence_bias_gate(
 # ---------------------------------------------------------------------------
 # Class wrapper (state-bearing, for ergonomics; the function is canonical)
 # ---------------------------------------------------------------------------
+
 
 class SilenceBiasGate:
     """Convenience wrapper around silence_bias_gate() for callers that
@@ -324,9 +334,7 @@ class SilenceBiasGate:
         return {
             "n_evaluated": self._n_evaluated,
             "n_fires": self._n_fires,
-            "fire_rate": (
-                self._n_fires / self._n_evaluated if self._n_evaluated else 0.0
-            ),
+            "fire_rate": (self._n_fires / self._n_evaluated if self._n_evaluated else 0.0),
             "config": {
                 "min_confidence": self.config.min_confidence,
                 "min_urgency": self.config.min_urgency,
@@ -340,6 +348,7 @@ class SilenceBiasGate:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _count_recent_rejections(
     journal_lessons: list[dict[str, Any]],
@@ -375,5 +384,5 @@ def _count_recent_rejections(
             if ts >= cutoff:
                 count += 1
         except (ValueError, TypeError):
-            count += 1   # conservative
+            count += 1  # conservative
     return count

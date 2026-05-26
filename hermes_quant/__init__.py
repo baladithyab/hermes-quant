@@ -6,6 +6,7 @@ architecture. AGENTS.md has the development guide.
 Plugin entry: register(ctx) — wires tools, slash command, CLI subcommands.
 Daemon entry: hermes_quant.daemon.main:main — the long-lived signal loop.
 """
+
 from __future__ import annotations
 
 import logging
@@ -195,6 +196,7 @@ def register(ctx: Any) -> None:
     # CLI subcommand tree — control plane (ADR-0007 §canonical CLI)
     try:
         from . import cli as quant_cli
+
         ctx.register_cli_command(
             name="quant",
             help="hermes-quant: trading daemon control plane",
@@ -207,6 +209,7 @@ def register(ctx: Any) -> None:
     # Skill — voice-mode usage / troubleshooting playbook
     try:
         from pathlib import Path
+
         skill_md = Path(__file__).parent / "skills" / "hermes-quant" / "SKILL.md"
         if skill_md.exists():
             ctx.register_skill("hermes-quant", skill_md)
@@ -217,9 +220,11 @@ def register(ctx: Any) -> None:
     # (per references/plugin-authoring.md "Discord slash-command fingerprint-skip")
     try:
         from .discord_slash import install_quant_slash_on_pre_dispatch
+
         ctx.register_hook("pre_gateway_dispatch", install_quant_slash_on_pre_dispatch)
     except Exception as exc:
-        logger.warning("hermes-quant: Discord slash hook registration skipped: %s",
-                       exc, exc_info=True)
+        logger.warning(
+            "hermes-quant: Discord slash hook registration skipped: %s", exc, exc_info=True
+        )
 
     logger.info("hermes-quant plugin v%s registered", __version__)

@@ -20,6 +20,7 @@ The rolling estimator returns a per-asset slippage estimate that bootstraps
 from a constant (5-25 bps depending on asset class) until 30 days of fills
 exist (per ADR-0004 implementation notes).
 """
+
 from __future__ import annotations
 
 from collections import deque
@@ -65,10 +66,10 @@ def compute_adverse_bps_signed(
 # Bootstrap defaults per ADR-0004 implementation notes
 # (5 bps liquid crypto, 2 bps liquid equities, 25 bps illiquid, etc.)
 DEFAULT_BOOTSTRAP_SLIPPAGE = {
-    "crypto": 0.0012,    # 12 bps round-trip
-    "equity": 0.0005,    # 5 bps round-trip
-    "etf": 0.0005,       # 5 bps
-    "fx": 0.0008,        # 8 bps
+    "crypto": 0.0012,  # 12 bps round-trip
+    "equity": 0.0005,  # 5 bps round-trip
+    "etf": 0.0005,  # 5 bps
+    "fx": 0.0008,  # 8 bps
     "illiquid": 0.0025,  # 25 bps
 }
 
@@ -111,9 +112,7 @@ class RollingSlippageEstimator:
 
     def __post_init__(self) -> None:
         if self.bootstrap_default is None:
-            self.bootstrap_default = DEFAULT_BOOTSTRAP_SLIPPAGE.get(
-                self.asset_class, 0.0012
-            )
+            self.bootstrap_default = DEFAULT_BOOTSTRAP_SLIPPAGE.get(self.asset_class, 0.0012)
         # The deque may have been initialized with non-bounded length; bound it
         if self._samples.maxlen != self.max_samples:
             self._samples = deque(self._samples, maxlen=self.max_samples)

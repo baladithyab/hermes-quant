@@ -1,4 +1,5 @@
 """Tests for hermes_quant.governance.static_scanner (ADR-0031, Vibe-Trading pattern)."""
+
 from __future__ import annotations
 
 import pytest
@@ -92,10 +93,10 @@ def test_require_clean_passes_on_clean_text():
 def test_scan_finding_includes_line_number_and_matched_text():
     text = "\n".join(
         [
-            "import os",         # line 1
-            "import sys",        # line 2
-            "",                  # line 3
-            "def f():",          # line 4
+            "import os",  # line 1
+            "import sys",  # line 2
+            "",  # line 3
+            "def f():",  # line 4
             "    alpaca.submit_order(qty=1)",  # line 5
         ]
     )

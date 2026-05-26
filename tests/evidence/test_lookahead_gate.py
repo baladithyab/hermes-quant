@@ -5,6 +5,7 @@ EvidenceStore implementation (sibling Wave-B task). The gate only requires
 a `.get(evidence_id) -> dict | None` shape, which is the contract these
 tests pin.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

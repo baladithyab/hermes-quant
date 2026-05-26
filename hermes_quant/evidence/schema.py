@@ -8,6 +8,7 @@ Per-kind ``ingest_lag_floor`` values implement the ADR-0033 D2 table; an
 analyst at backtest tick T may consume a record only if
 ``record.available_at <= T``.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -119,9 +120,7 @@ def compute_available_at(
     available_at = published_at + max(0, ingest_lag_floor[kind] OR override).
     """
     lag = (
-        override_lag_seconds
-        if override_lag_seconds is not None
-        else INGEST_LAG_FLOOR_SECONDS[kind]
+        override_lag_seconds if override_lag_seconds is not None else INGEST_LAG_FLOOR_SECONDS[kind]
     )
     return published_at + timedelta(seconds=max(0, lag))
 
@@ -135,9 +134,7 @@ def sha256_of_json(payload: Any) -> str:
     """SHA-256 hex digest of a JSON-serializable payload, using a canonical
     encoding (sorted keys, no whitespace) so the same logical payload yields
     the same hash regardless of Python dict ordering."""
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 

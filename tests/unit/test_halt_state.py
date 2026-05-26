@@ -12,6 +12,7 @@ Anchor: synthesis-v2 §P0-D + §P1-β. Verifies:
 - Protocol contract (HaltState)
 - auto_clear_expired
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -51,9 +52,7 @@ class TestSchemaConstraints:
         assert rec.account_id == WILDCARD
         # Verify directly via SQLite
         with hs._conn() as conn:
-            row = conn.execute(
-                "SELECT account_id FROM halts WHERE asset_class='crypto'"
-            ).fetchone()
+            row = conn.execute("SELECT account_id FROM halts WHERE asset_class='crypto'").fetchone()
             assert row["account_id"] == "*"
 
     def test_columns_are_not_null(self, hs: HaltStateSQLite):
@@ -61,8 +60,7 @@ class TestSchemaConstraints:
         with hs._conn() as conn:
             cols = list(conn.execute("PRAGMA table_info(halts)"))
         col_map = {c["name"]: c for c in cols}
-        for col in ["account_id", "asset_class", "asset", "reason",
-                    "halted_at", "halt_epoch"]:
+        for col in ["account_id", "asset_class", "asset", "reason", "halted_at", "halt_epoch"]:
             assert col_map[col]["notnull"] == 1, f"{col} must be NOT NULL"
 
     def test_table_is_without_rowid(self, hs: HaltStateSQLite):
@@ -93,8 +91,9 @@ class TestAddHalt:
 
     def test_add_with_halted_until(self, hs: HaltStateSQLite):
         until = pd.Timestamp("2026-12-31T00:00:00Z")
-        rec = hs.add_halt("alpaca-paper", "crypto", "BTC/USDT",
-                          reason="cooldown", halted_until=until)
+        rec = hs.add_halt(
+            "alpaca-paper", "crypto", "BTC/USDT", reason="cooldown", halted_until=until
+        )
         assert rec.halted_until == until
 
     def test_reject_empty_reason(self, hs: HaltStateSQLite):
@@ -145,9 +144,7 @@ class TestIsHalted:
         assert hs.is_halted("binance-spot", "equity", "AAPL")
         assert hs.is_halted("ibkr", "fx", "EUR/USD")
 
-    def test_asset_none_in_query_only_matches_class_or_account_wildcard(
-        self, hs: HaltStateSQLite
-    ):
+    def test_asset_none_in_query_only_matches_class_or_account_wildcard(self, hs: HaltStateSQLite):
         """Querying with asset=None ('any asset in class') matches halts at
         (account, class, *) or wider — not at a specific asset."""
         hs.add_halt("alpaca-paper", "crypto", "BTC/USDT", reason="specific")
@@ -167,13 +164,13 @@ class TestIsHalted:
 class TestClearHalt:
     def test_clear_active(self, hs: HaltStateSQLite):
         hs.add_halt("alpaca-paper", "crypto", "BTC/USDT", reason="test")
-        assert hs.clear_halt("alpaca-paper", "crypto", "BTC/USDT",
-                             reason="manual resume after review")
+        assert hs.clear_halt(
+            "alpaca-paper", "crypto", "BTC/USDT", reason="manual resume after review"
+        )
         assert not hs.is_halted("alpaca-paper", "crypto", "BTC/USDT")
 
     def test_clear_nonexistent_returns_false(self, hs: HaltStateSQLite):
-        assert not hs.clear_halt("alpaca-paper", "crypto", "BTC/USDT",
-                                  reason="nothing to clear")
+        assert not hs.clear_halt("alpaca-paper", "crypto", "BTC/USDT", reason="nothing to clear")
 
     def test_clear_requires_reason(self, hs: HaltStateSQLite):
         hs.add_halt("alpaca-paper", "crypto", "BTC/USDT", reason="t")
@@ -183,8 +180,7 @@ class TestClearHalt:
     def test_cleared_halt_persists_in_audit_log(self, hs: HaltStateSQLite):
         """Cleared halts stay in the table with cleared_at + cleared_reason."""
         hs.add_halt("alpaca-paper", "crypto", "BTC/USDT", reason="orig")
-        hs.clear_halt("alpaca-paper", "crypto", "BTC/USDT",
-                      reason="reviewed and resuming")
+        hs.clear_halt("alpaca-paper", "crypto", "BTC/USDT", reason="reviewed and resuming")
         with hs._conn() as conn:
             rows = list(conn.execute("SELECT * FROM halts"))
         assert len(rows) == 1  # still there for audit
@@ -195,8 +191,7 @@ class TestClearHalt:
 class TestAutoClearExpired:
     def test_expired_halt_auto_clears(self, hs: HaltStateSQLite):
         past = pd.Timestamp.utcnow() - pd.Timedelta(minutes=5)
-        hs.add_halt("alpaca-paper", "crypto", "BTC/USDT",
-                    reason="cooldown", halted_until=past)
+        hs.add_halt("alpaca-paper", "crypto", "BTC/USDT", reason="cooldown", halted_until=past)
         assert hs.is_halted("alpaca-paper", "crypto", "BTC/USDT")
         n = hs.auto_clear_expired()
         assert n == 1
@@ -204,16 +199,14 @@ class TestAutoClearExpired:
 
     def test_future_halt_not_cleared(self, hs: HaltStateSQLite):
         future = pd.Timestamp.utcnow() + pd.Timedelta(hours=1)
-        hs.add_halt("alpaca-paper", "crypto", "BTC/USDT",
-                    reason="cooldown", halted_until=future)
+        hs.add_halt("alpaca-paper", "crypto", "BTC/USDT", reason="cooldown", halted_until=future)
         n = hs.auto_clear_expired()
         assert n == 0
         assert hs.is_halted("alpaca-paper", "crypto", "BTC/USDT")
 
     def test_no_halted_until_not_auto_cleared(self, hs: HaltStateSQLite):
         """halted_until=None means explicit-resume only; auto_clear ignores."""
-        hs.add_halt("alpaca-paper", "crypto", "BTC/USDT",
-                    reason="manual halt", halted_until=None)
+        hs.add_halt("alpaca-paper", "crypto", "BTC/USDT", reason="manual halt", halted_until=None)
         n = hs.auto_clear_expired()
         assert n == 0
 

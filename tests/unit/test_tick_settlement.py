@@ -3,6 +3,7 @@
 Uses fake/mock data providers + analysts + aggregators to test the wiring
 without requiring network or real entry points.
 """
+
 from __future__ import annotations
 
 import json
@@ -42,14 +43,16 @@ def _make_bars(n: int = 100, base: float = 100.0, drift: float = 0.001):
     rng = np.random.default_rng(42)
     ts = pd.date_range("2026-05-13T00:00:00", periods=n, freq="1h")
     closes = base * np.cumprod(1 + drift + rng.normal(0, 0.01, n))
-    return pd.DataFrame({
-        "timestamp": ts,
-        "open": closes,
-        "high": closes * 1.005,
-        "low": closes * 0.995,
-        "close": closes,
-        "volume": [1000.0] * n,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": closes,
+            "high": closes * 1.005,
+            "low": closes * 0.995,
+            "close": closes,
+            "volume": [1000.0] * n,
+        }
+    )
 
 
 def _make_provider(bars: pd.DataFrame):
@@ -59,8 +62,7 @@ def _make_provider(bars: pd.DataFrame):
     return p
 
 
-def _make_analyst(direction: int, mag: float = 0.02, conf: float = 0.7,
-                  name: str = "mock"):
+def _make_analyst(direction: int, mag: float = 0.02, conf: float = 0.7, name: str = "mock"):
     a = MagicMock()
     a.name = name
     a.analyze.return_value = AnalystView(
@@ -88,12 +90,14 @@ def _make_portfolio_factory(equity: float = 100_000.0):
             peak_equity=equity,
             daily_open_equity=equity,
         )
+
     return portfolio_for
 
 
 # ---------------------------------------------------------------------------
 # compute_market_state
 # ---------------------------------------------------------------------------
+
 
 class TestComputeMarketState:
     def test_basic(self):
@@ -109,12 +113,16 @@ class TestComputeMarketState:
 
     def test_zero_returns_uses_bootstrap(self):
         ts = pd.date_range("2026-05-13", periods=50, freq="1h")
-        bars = pd.DataFrame({
-            "timestamp": ts,
-            "open": [100.0] * 50, "high": [100.0] * 50,
-            "low": [100.0] * 50, "close": [100.0] * 50,
-            "volume": [1000.0] * 50,
-        })
+        bars = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "open": [100.0] * 50,
+                "high": [100.0] * 50,
+                "low": [100.0] * 50,
+                "close": [100.0] * 50,
+                "volume": [1000.0] * 50,
+            }
+        )
         ms = compute_market_state(bars, asset="X", asof=pd.Timestamp.utcnow())
         # Zero stdev → bootstrap default
         assert ms.volatility == 0.01
@@ -124,6 +132,7 @@ class TestComputeMarketState:
 # run_one_tick
 # ---------------------------------------------------------------------------
 
+
 class TestRunOneTick:
     def test_emits_signal_when_aligned(self, tmp_path):
         bus = tmp_path / "signals.jsonl"
@@ -131,9 +140,21 @@ class TestRunOneTick:
         provider = _make_provider(bars)
         analysts = [_make_analyst(1, name="a"), _make_analyst(1, name="b")]
         agg = BMAAggregator()
+        # ADR-0009 §P0-2 amendment 2026-05-26: cold-start now caps at ~0.375,
+        # which floors signed-edge below the cost-gate threshold for typical
+        # synthetic bars. Force IdentityCalibrator so the test exercises the
+        # tick-emission path (the calibrator behavior is tested separately
+        # in test_calibrators.py and test_classical_ta.py).
+        from hermes_quant.calibrators import IdentityCalibrator
+
+        agg.calibrator = IdentityCalibrator()
         gate = DefaultRiskGate(
-            RiskConfig(cost_multiple=0.5, min_trade_size=0.0,
-                       cooldown_after_loss_minutes=0, max_position_pct=0.20)
+            RiskConfig(
+                cost_multiple=0.5,
+                min_trade_size=0.0,
+                cooldown_after_loss_minutes=0,
+                max_position_pct=0.20,
+            )
         )
         halt_state = HaltStateSQLite(
             db_path=tmp_path / "halts.db",
@@ -225,12 +246,14 @@ class TestRunOneTick:
         analysts = [_make_analyst(1)]
         agg = BMAAggregator()
         # Tight drawdown limit: 5% drawdown will trip
-        gate = DefaultRiskGate(RiskConfig(
-            max_drawdown_pct=0.05,
-            cost_multiple=0.5,
-            min_trade_size=0.0,
-            cooldown_after_loss_minutes=0,
-        ))
+        gate = DefaultRiskGate(
+            RiskConfig(
+                max_drawdown_pct=0.05,
+                cost_multiple=0.5,
+                min_trade_size=0.0,
+                cooldown_after_loss_minutes=0,
+            )
+        )
         halt_state = HaltStateSQLite(
             db_path=tmp_path / "halts.db",
             mirror_path=tmp_path / "halt.json",
@@ -289,12 +312,14 @@ class TestRunOneTick:
         provider = _make_provider(bars)
         analysts = [_make_analyst(1)]
         agg = BMAAggregator()
-        gate = DefaultRiskGate(RiskConfig(
-            max_drawdown_pct=0.05,
-            cost_multiple=0.5,
-            min_trade_size=0.0,
-            cooldown_after_loss_minutes=0,
-        ))
+        gate = DefaultRiskGate(
+            RiskConfig(
+                max_drawdown_pct=0.05,
+                cost_multiple=0.5,
+                min_trade_size=0.0,
+                cooldown_after_loss_minutes=0,
+            )
+        )
         halt_state = HaltStateSQLite(
             db_path=tmp_path / "halts.db",
             mirror_path=tmp_path / "halt.json",
@@ -350,18 +375,27 @@ class TestRunOneTick:
 # settlement_loop
 # ---------------------------------------------------------------------------
 
+
 class TestSettlementLoop:
     def test_find_signals_for_executions_match(self, tmp_path):
         sig_bus = tmp_path / "signals.jsonl"
-        emit_signal_record({
-            "schema_version": 1, "id": "sig-1", "asof": "2026-05-13T00:00:00Z",
-            "asset": "BTC/USDT", "timeframe": "1h", "direction": 1,
-            "components": [],
-        }, path=sig_bus)
-        executions = [{"signal_id": "sig-1", "side": "buy"},
-                       {"signal_id": "sig-99", "side": "buy"}]
+        emit_signal_record(
+            {
+                "schema_version": 1,
+                "id": "sig-1",
+                "asof": "2026-05-13T00:00:00Z",
+                "asset": "BTC/USDT",
+                "timeframe": "1h",
+                "direction": 1,
+                "components": [],
+            },
+            path=sig_bus,
+        )
+        executions = [{"signal_id": "sig-1", "side": "buy"}, {"signal_id": "sig-99", "side": "buy"}]
         out = find_signals_for_executions(
-            executions, signal_bus_path=sig_bus, n_signal_records=100,
+            executions,
+            signal_bus_path=sig_bus,
+            n_signal_records=100,
         )
         assert "sig-1" in out
         assert "sig-99" not in out
@@ -374,8 +408,14 @@ class TestSettlementLoop:
                 "direction": 1,
                 "horizon": "1h",
                 "components": [
-                    {"analyst": "a", "direction": 1, "magnitude": 0.01,
-                     "confidence": 0.7, "confidence_raw": 0.85, "horizon": "1h"},
+                    {
+                        "analyst": "a",
+                        "direction": 1,
+                        "magnitude": 0.01,
+                        "confidence": 0.7,
+                        "confidence_raw": 0.85,
+                        "horizon": "1h",
+                    },
                 ],
             },
         }
@@ -408,10 +448,22 @@ class TestSettlementLoop:
                 "horizon": "4h",
                 "aggregator": "bma",
                 "components": [
-                    {"analyst": "a", "direction": 1, "magnitude": 0.02,
-                     "confidence": 0.7, "confidence_raw": 0.85, "horizon": "4h"},
-                    {"analyst": "b", "direction": 1, "magnitude": 0.02,
-                     "confidence": 0.6, "confidence_raw": 0.75, "horizon": "4h"},
+                    {
+                        "analyst": "a",
+                        "direction": 1,
+                        "magnitude": 0.02,
+                        "confidence": 0.7,
+                        "confidence_raw": 0.85,
+                        "horizon": "4h",
+                    },
+                    {
+                        "analyst": "b",
+                        "direction": 1,
+                        "magnitude": 0.02,
+                        "confidence": 0.6,
+                        "confidence_raw": 0.75,
+                        "horizon": "4h",
+                    },
                 ],
             },
         }
@@ -441,10 +493,15 @@ class TestSettlementLoop:
         agg.update = MagicMock()
 
         view = AnalystView(
-            analyst="a", direction=1, magnitude=0.01,
-            confidence=0.7, confidence_raw=0.85, horizon="1h",
+            analyst="a",
+            direction=1,
+            magnitude=0.01,
+            confidence=0.7,
+            confidence_raw=0.85,
+            horizon="1h",
         )
         from hermes_quant.protocol import RealizedOutcome
+
         outcome = RealizedOutcome(
             view=view,
             asof_view=pd.Timestamp("2026-05-13"),
@@ -453,14 +510,23 @@ class TestSettlementLoop:
             direction_correct=True,
         )
         sig = AggregatedSignal(
-            asset="BTC/USDT", timeframe="1h", asset_class="crypto",
+            asset="BTC/USDT",
+            timeframe="1h",
+            asset_class="crypto",
             asof=pd.Timestamp("2026-05-13"),
-            direction=1, magnitude=0.01, confidence=0.7, confidence_raw=0.85,
-            horizon="1h", components=(view,), aggregator="bma",
+            direction=1,
+            magnitude=0.01,
+            confidence=0.7,
+            confidence_raw=0.85,
+            horizon="1h",
+            components=(view,),
+            aggregator="bma",
         )
         from hermes_quant.protocol import EpisodeOutcome
+
         episode = EpisodeOutcome(
-            asset="BTC/USDT", timeframe="1h",
+            asset="BTC/USDT",
+            timeframe="1h",
             asof=pd.Timestamp("2026-05-13"),
             aggregated_signal=sig,
             realized_returns={"1h": 0.01},

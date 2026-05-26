@@ -1,4 +1,5 @@
 """Tests for Hermes semantic perception packets (ADR-0022)."""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -10,14 +11,16 @@ from hermes_quant.semantic import semantic_packet_from_dict, validate_semantic_p
 
 def _ctx(*, extras=None, asof="2024-01-02T00:00:00Z"):
     ts = pd.date_range("2024-01-01", periods=5, freq="1h", tz="UTC")
-    bars = pd.DataFrame({
-        "timestamp": ts,
-        "open": [100, 101, 102, 103, 104],
-        "high": [101, 102, 103, 104, 105],
-        "low": [99, 100, 101, 102, 103],
-        "close": [100, 101, 102, 103, 104],
-        "volume": [1000] * 5,
-    })
+    bars = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": [100, 101, 102, 103, 104],
+            "high": [101, 102, 103, 104, 105],
+            "low": [99, 100, 101, 102, 103],
+            "close": [100, 101, 102, 103, 104],
+            "volume": [1000] * 5,
+        }
+    )
     return MarketContext(
         asset="BTC/USDT",
         timeframe="1h",
@@ -81,7 +84,9 @@ def test_semantic_analyst_abstains_when_packet_missing():
 
 def test_semantic_analyst_rejects_future_packet():
     analyst = HermesSemanticAnalyst()
-    view = analyst.analyze(_ctx(extras={"semantic_packets": [_packet(asof="2024-01-03T00:00:00Z")]}))
+    view = analyst.analyze(
+        _ctx(extras={"semantic_packets": [_packet(asof="2024-01-03T00:00:00Z")]})
+    )
     assert view.direction == 0
     assert view.metadata["abstain_reason"] == "future_packet"
 

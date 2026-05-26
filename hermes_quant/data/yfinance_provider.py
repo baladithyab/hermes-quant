@@ -14,6 +14,7 @@ Note on rate limiting: yfinance is unofficial. Yahoo throttles aggressively
 on bursts. We add a 100ms inter-call sleep and retry with backoff inside
 the provider chain (see data.base.fetch_with_chain).
 """
+
 from __future__ import annotations
 
 import logging
@@ -39,7 +40,7 @@ _TF_TO_YF_INTERVAL = {
     "15m": "15m",
     "30m": "30m",
     "1h": "60m",  # yfinance uses '60m' for hourly
-    "4h": None,   # not directly supported; skip for v0.1.1
+    "4h": None,  # not directly supported; skip for v0.1.1
     "1d": "1d",
 }
 
@@ -75,6 +76,7 @@ def _retry_with_backoff(
     flaps / brief network blips are also transient.
     """
     import time as _time
+
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
@@ -83,11 +85,13 @@ def _retry_with_backoff(
             last_exc = e
             if attempt + 1 >= max_attempts:
                 break  # exhausted; re-raise outside loop
-            delay = base_delay_s * (factor ** attempt)
+            delay = base_delay_s * (factor**attempt)
             logger.warning(
-                "yfinance transient failure (attempt %d/%d): %s — "
-                "retrying in %.1fs",
-                attempt + 1, max_attempts, e, delay,
+                "yfinance transient failure (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1,
+                max_attempts,
+                e,
+                delay,
             )
             _time.sleep(delay)
     assert last_exc is not None  # mypy
@@ -180,14 +184,11 @@ class YFinanceProvider:
         """
         if timeframe not in self.timeframes:
             raise DataProviderError(
-                f"timeframe {timeframe!r} not supported by yfinance; "
-                f"options: {self.timeframes}"
+                f"timeframe {timeframe!r} not supported by yfinance; options: {self.timeframes}"
             )
         yf_interval = _TF_TO_YF_INTERVAL[timeframe]
         if yf_interval is None:
-            raise DataProviderError(
-                f"timeframe {timeframe!r} not supported in v0.1.1"
-            )
+            raise DataProviderError(f"timeframe {timeframe!r} not supported in v0.1.1")
 
         # Inter-call sleep to avoid burst throttling
         if self._last_fetch_at is not None:
@@ -284,8 +285,13 @@ class YFinanceProvider:
         end = pd.Timestamp.utcnow()
         # Estimate the start range conservatively
         tf_to_seconds = {
-            "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
-            "1h": 3600, "4h": 14400, "1d": 86400,
+            "1m": 60,
+            "5m": 300,
+            "15m": 900,
+            "30m": 1800,
+            "1h": 3600,
+            "4h": 14400,
+            "1d": 86400,
         }
         secs = tf_to_seconds.get(timeframe)
         if secs is None:
@@ -300,8 +306,6 @@ class YFinanceProvider:
             "provider": self.name,
             "n_fetches": self._n_fetches,
             "n_errors": self._n_errors,
-            "last_fetch_at": (
-                self._last_fetch_at.isoformat() if self._last_fetch_at else None
-            ),
+            "last_fetch_at": (self._last_fetch_at.isoformat() if self._last_fetch_at else None),
             "yfinance_loaded": self._yf is not None,
         }

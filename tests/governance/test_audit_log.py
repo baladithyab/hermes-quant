@@ -1,4 +1,5 @@
 """Tests for hermes_quant.governance.audit_log (ADR-0031 D2)."""
+
 from __future__ import annotations
 
 import builtins
@@ -57,9 +58,7 @@ def test_audit_log_is_append_only_no_truncate(
         if str(file) == str(audit_path):
             forbidden = {"w", "x", "+"}
             if any(ch in mode for ch in forbidden):
-                raise AppendOnlyViolation(
-                    f"audit_log opened with disallowed mode {mode!r}"
-                )
+                raise AppendOnlyViolation(f"audit_log opened with disallowed mode {mode!r}")
         return real_open(file, mode, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "open", guarded_open)
@@ -111,9 +110,7 @@ def test_audit_log_read_filters_by_since(audit_path: Path) -> None:
     assert [r.payload["i"] for r in rows] == [1, 2]
 
 
-def test_audit_log_fsync_after_write(
-    audit_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_audit_log_fsync_after_write(audit_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch os.fsync; assert it was called after append."""
     import os
 

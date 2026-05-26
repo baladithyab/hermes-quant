@@ -9,6 +9,7 @@ charter MVP recipe was undelivered for live ticks.
 This test pins the advisor's default analyst loadout so a future refactor
 can't silently drop a voice.
 """
+
 from __future__ import annotations
 
 from unittest import mock
@@ -24,6 +25,7 @@ def test_advisor_default_loadout_includes_three_analysts():
     # market data).
     from hermes_quant.advisor import recommend
     import inspect
+
     src = inspect.getsource(recommend)
     # The advisor MUST mention all three analyst classes by name
     assert "ClassicalTAAnalyst" in src
@@ -37,10 +39,11 @@ def test_advisor_kronos_import_failure_does_not_break_advisor():
     # Verify the import is wrapped in try/except
     from hermes_quant.advisor import recommend
     import inspect
+
     src = inspect.getsource(recommend)
     # Find the section after KronosAnalyst import
     idx = src.find("from hermes_quant.analysts.kronos import KronosAnalyst")
     assert idx > 0, "KronosAnalyst import not found in advisor"
     # The next ~5 lines should contain `except`
-    excerpt = src[idx:idx + 400]
+    excerpt = src[idx : idx + 400]
     assert "except" in excerpt, "KronosAnalyst import is not wrapped in try/except"

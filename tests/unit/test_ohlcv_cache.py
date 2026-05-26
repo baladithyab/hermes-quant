@@ -1,4 +1,5 @@
 """Tests for V03-7 OHLCV file cache."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -11,14 +12,16 @@ def _bars(n=10, start="2024-01-01", *, seed=1):
     rng = np.random.default_rng(seed)
     ts = pd.date_range(start, periods=n, freq="1h", tz="UTC")
     close = 100 + np.cumsum(rng.normal(0, 0.1, n))
-    return pd.DataFrame({
-        "timestamp": ts,
-        "open": close - 0.1,
-        "high": close + 0.2,
-        "low": close - 0.2,
-        "close": close,
-        "volume": 1000.0,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": close - 0.1,
+            "high": close + 0.2,
+            "low": close - 0.2,
+            "close": close,
+            "volume": 1000.0,
+        }
+    )
 
 
 def test_safe_path_uses_provider_symbol_timeframe(tmp_path):

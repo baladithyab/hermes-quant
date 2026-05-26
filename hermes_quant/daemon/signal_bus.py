@@ -16,6 +16,7 @@ layouts (helps debugging when grep-ing the bus). Records exceeding our
 chosen 16384-byte cap raise SignalTooLarge — we cap rationale, components,
 metadata at upstream construction time.
 """
+
 from __future__ import annotations
 
 import fcntl
@@ -123,9 +124,7 @@ def emit_signal_record(record: dict[str, Any], path: Path = SIGNAL_BUS_PATH) -> 
             raise OSError(f"short write to {path}: {n}/{len(encoded)} bytes")
 
 
-def emit_execution_record(
-    record: dict[str, Any], path: Path = EXECUTION_BUS_PATH
-) -> None:
+def emit_execution_record(record: dict[str, Any], path: Path = EXECUTION_BUS_PATH) -> None:
     """Append a single execution record to the executions bus atomically.
 
     Same protocol as emit_signal_record. Producers (freqtrade strategy,
@@ -212,9 +211,7 @@ def read_signals_for_asset(
     # Read a larger tail and filter; for typical bus rates this is fine.
     raw = read_jsonl_tail(path, n=n * 10, max_chunk=4_194_304)  # 4 MB tail
     matching = [
-        r
-        for r in raw
-        if r.get("asset") == asset and r.get("schema_version") == schema_version
+        r for r in raw if r.get("asset") == asset and r.get("schema_version") == schema_version
     ]
     return matching[-n:]
 

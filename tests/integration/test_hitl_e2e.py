@@ -14,6 +14,7 @@
 11. List pending: filters by symbol, sweeps expired
 12. Audit trail completeness: every transition appends a JSONL line
 """
+
 from __future__ import annotations
 
 import json
@@ -41,6 +42,7 @@ from hermes_quant.react import PaperReactor
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def isolated_store(tmp_path):
     """Per-test ProposalStore writing into tmp_path."""
@@ -53,7 +55,7 @@ def isolated_store(tmp_path):
 @pytest.fixture
 def isolated_paths(tmp_path, monkeypatch):
     """Redirect both proposals + executions paths to tmp_path."""
-    monkeypatch.setenv("HOME", str(tmp_path))   # in case anything reads $HOME
+    monkeypatch.setenv("HOME", str(tmp_path))  # in case anything reads $HOME
     return {
         "proposals_jsonl": tmp_path / "proposals.jsonl",
         "proposals_db": tmp_path / "proposals.db",
@@ -124,6 +126,7 @@ def _patch_executions_path(monkeypatch, path):
 # 1: Happy path — propose -> approve -> execution written
 # ---------------------------------------------------------------------------
 
+
 def test_happy_path_propose_then_approve(isolated_store, tmp_path, monkeypatch):
     _patch_default_store(monkeypatch, isolated_store)
     exec_path = tmp_path / "executions.jsonl"
@@ -133,7 +136,9 @@ def test_happy_path_propose_then_approve(isolated_store, tmp_path, monkeypatch):
     # quant_propose does after advisor.recommend returns)
     advisor = _sample_advisor_result()
     proposal = isolated_store.propose(
-        symbol="AAPL", asset_class="equity", timeframe="1d",
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=advisor,
     )
     assert proposal.state == "pending"
@@ -169,9 +174,12 @@ def test_happy_path_propose_then_approve(isolated_store, tmp_path, monkeypatch):
 # 2: Happy path — propose -> reject -> reason persisted
 # ---------------------------------------------------------------------------
 
+
 def test_happy_path_propose_then_reject(isolated_store):
     proposal = isolated_store.propose(
-        symbol="AAPL", asset_class="equity", timeframe="1d",
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result(),
     )
     rejected = isolated_store.reject(
@@ -192,6 +200,7 @@ def test_happy_path_propose_then_reject(isolated_store):
 # 3: Mode mismatch — advise-mode propose returns mode_mismatch
 # ---------------------------------------------------------------------------
 
+
 def test_quant_propose_advise_mode_returns_mode_mismatch(monkeypatch, tmp_path):
     """Default config has no quant.pdr.mode set → defaults to 'advise'.
     quant_propose should refuse with mode_mismatch and NOT write anything."""
@@ -200,6 +209,7 @@ def test_quant_propose_advise_mode_returns_mode_mismatch(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
     from hermes_quant.tools import quant_propose
+
     out = quant_propose({"symbol": "AAPL"})
     parsed = json.loads(out)
     assert parsed["success"] is False
@@ -210,6 +220,7 @@ def test_quant_propose_advise_mode_returns_mode_mismatch(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # 4: Advisor-gated proposal refused
 # ---------------------------------------------------------------------------
+
 
 def test_quant_propose_refuses_when_advisor_gated(monkeypatch, tmp_path):
     """If advisor.recommend returns risk_gate.pass=False, no proposal stored."""
@@ -226,10 +237,10 @@ def test_quant_propose_refuses_when_advisor_gated(monkeypatch, tmp_path):
     from hermes_quant.advisor import recommend as real_recommend  # noqa: F401
 
     def gated_recommend(*args, **kwargs):
-        return _sample_advisor_result(symbol=kwargs.get("symbol", "X"),
-                                      pass_gate=False)
+        return _sample_advisor_result(symbol=kwargs.get("symbol", "X"), pass_gate=False)
 
     import hermes_quant.advisor as advisor_module
+
     monkeypatch.setattr(advisor_module, "recommend", gated_recommend)
 
     out = tools_module.quant_propose({"symbol": "BAD"})
@@ -247,11 +258,13 @@ def test_quant_propose_refuses_when_advisor_gated(monkeypatch, tmp_path):
 # 5: Approve non-existent proposal -> not_found
 # ---------------------------------------------------------------------------
 
+
 def test_approve_nonexistent_returns_not_found(isolated_store, monkeypatch, tmp_path):
     _patch_default_store(monkeypatch, isolated_store)
     _patch_executions_path(monkeypatch, tmp_path / "executions.jsonl")
 
     from hermes_quant.tools import quant_approve
+
     out = quant_approve({"proposal_id": "prop_nonexistent_AAPL_zzzzzz"})
     parsed = json.loads(out)
     assert parsed["success"] is False
@@ -262,9 +275,12 @@ def test_approve_nonexistent_returns_not_found(isolated_store, monkeypatch, tmp_
 # 6: Approve already-approved -> state_mismatch
 # ---------------------------------------------------------------------------
 
+
 def test_approve_already_approved_returns_state_mismatch(isolated_store):
     proposal = isolated_store.propose(
-        symbol="AAPL", asset_class="equity", timeframe="1d",
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result(),
     )
     isolated_store.approve(proposal.proposal_id)
@@ -277,15 +293,19 @@ def test_approve_already_approved_returns_state_mismatch(isolated_store):
 # 7: Reject without reason -> reason_required
 # ---------------------------------------------------------------------------
 
+
 def test_reject_without_reason_returns_reason_required(isolated_store, monkeypatch):
     _patch_default_store(monkeypatch, isolated_store)
 
     proposal = isolated_store.propose(
-        symbol="AAPL", asset_class="equity", timeframe="1d",
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result(),
     )
 
     from hermes_quant.tools import quant_reject
+
     out = quant_reject({"proposal_id": proposal.proposal_id, "reason": ""})
     parsed = json.loads(out)
     assert parsed["success"] is False
@@ -304,9 +324,12 @@ def test_reject_without_reason_returns_reason_required(isolated_store, monkeypat
 # 8: Reject already-rejected -> state_mismatch
 # ---------------------------------------------------------------------------
 
+
 def test_reject_already_rejected_returns_state_mismatch(isolated_store):
     proposal = isolated_store.propose(
-        symbol="AAPL", asset_class="equity", timeframe="1d",
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result(),
     )
     isolated_store.reject(proposal.proposal_id, reason="first reject")
@@ -318,10 +341,13 @@ def test_reject_already_rejected_returns_state_mismatch(isolated_store):
 # 9: TTL elapsed -> pending becomes expired on read
 # ---------------------------------------------------------------------------
 
+
 def test_ttl_elapsed_proposal_auto_expires_on_read(isolated_store):
     """Per ADR-0015 §D9 lazy expiration."""
     proposal = isolated_store.propose(
-        symbol="AAPL", asset_class="equity", timeframe="1d",
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result(),
         ttl_minutes=1,
     )
@@ -330,8 +356,7 @@ def test_ttl_elapsed_proposal_auto_expires_on_read(isolated_store):
     # Force the expires_at into the past by re-writing the record
     # (simulates "1 minute later" without sleeping)
     expired_proposal = Proposal(
-        **{**proposal.__dict__,
-           "expires_at": "2020-01-01T00:00:00Z"}  # way in past
+        **{**proposal.__dict__, "expires_at": "2020-01-01T00:00:00Z"}  # way in past
     )
     isolated_store._persist(expired_proposal, event="create")
 
@@ -345,17 +370,17 @@ def test_ttl_elapsed_proposal_auto_expires_on_read(isolated_store):
 # 10: Approve expired proposal -> state_mismatch
 # ---------------------------------------------------------------------------
 
+
 def test_approve_expired_proposal_returns_state_mismatch(isolated_store):
     proposal = isolated_store.propose(
-        symbol="AAPL", asset_class="equity", timeframe="1d",
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result(),
         ttl_minutes=1,
     )
     # Force expiration
-    expired = Proposal(
-        **{**proposal.__dict__,
-           "expires_at": "2020-01-01T00:00:00Z"}
-    )
+    expired = Proposal(**{**proposal.__dict__, "expires_at": "2020-01-01T00:00:00Z"})
     isolated_store._persist(expired, event="create")
 
     # Approve must fail
@@ -367,17 +392,24 @@ def test_approve_expired_proposal_returns_state_mismatch(isolated_store):
 # 11: list_pending filters by symbol, sweeps expired
 # ---------------------------------------------------------------------------
 
+
 def test_list_pending_filters_and_sweeps(isolated_store):
     p1 = isolated_store.propose(
-        symbol="AAPL", asset_class="equity", timeframe="1d",
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result("AAPL"),
     )
     p2 = isolated_store.propose(
-        symbol="MSFT", asset_class="equity", timeframe="1d",
+        symbol="MSFT",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result("MSFT"),
     )
     p3 = isolated_store.propose(
-        symbol="AAPL", asset_class="equity", timeframe="1d",
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result("AAPL"),
     )
     # Force p2 to expired
@@ -393,36 +425,41 @@ def test_list_pending_filters_and_sweeps(isolated_store):
     assert {p.proposal_id for p in aapl_only} == {p1.proposal_id, p3.proposal_id}
 
     msft_only = isolated_store.list_pending(symbol="MSFT")
-    assert msft_only == []   # p2 expired, no longer pending
+    assert msft_only == []  # p2 expired, no longer pending
 
 
 # ---------------------------------------------------------------------------
 # 12: Audit trail — every transition appends a JSONL line
 # ---------------------------------------------------------------------------
 
+
 def test_audit_trail_every_transition_appends_jsonl(isolated_store, tmp_path):
     bus_path = isolated_store.bus_path
 
     proposal = isolated_store.propose(
-        symbol="AAPL", asset_class="equity", timeframe="1d",
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result(),
     )
     isolated_store.approve(proposal.proposal_id)
 
     other = isolated_store.propose(
-        symbol="MSFT", asset_class="equity", timeframe="1d",
+        symbol="MSFT",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result("MSFT"),
     )
     isolated_store.reject(other.proposal_id, reason="too volatile")
 
     # Force-expire a third
     third = isolated_store.propose(
-        symbol="GOOG", asset_class="equity", timeframe="1d",
+        symbol="GOOG",
+        asset_class="equity",
+        timeframe="1d",
         advisor_result=_sample_advisor_result("GOOG"),
     )
-    third_expired = Proposal(
-        **{**third.__dict__, "expires_at": "2020-01-01T00:00:00Z"}
-    )
+    third_expired = Proposal(**{**third.__dict__, "expires_at": "2020-01-01T00:00:00Z"})
     isolated_store._persist(third_expired, event="create")
     isolated_store.get(third.proposal_id)  # triggers expire
 
@@ -431,7 +468,7 @@ def test_audit_trail_every_transition_appends_jsonl(isolated_store, tmp_path):
 
     # We should see: 3 creates + 1 approve + 1 reject + 1 force-rewrite + 1 expire
     event_kinds = [e.get("_event") for e in events]
-    assert event_kinds.count("create") >= 3   # original creates + force-rewrite
+    assert event_kinds.count("create") >= 3  # original creates + force-rewrite
     assert event_kinds.count("approve") == 1
     assert event_kinds.count("reject") == 1
     assert event_kinds.count("expire") == 1
@@ -444,6 +481,7 @@ def test_audit_trail_every_transition_appends_jsonl(isolated_store, tmp_path):
 # ---------------------------------------------------------------------------
 # Bonus: PaperReactor writes correct shape
 # ---------------------------------------------------------------------------
+
 
 def test_paper_reactor_writes_executions_record(tmp_path):
     exec_path = tmp_path / "executions.jsonl"
@@ -460,8 +498,7 @@ def test_paper_reactor_writes_executions_record(tmp_path):
         expires_at="2026-05-13T18:15:00Z",
         advisor_result=_sample_advisor_result(),
     )
-    record = reactor.execute(proposal, fill_size_pct=0.05,
-                             approver_user_id="codeseys")
+    record = reactor.execute(proposal, fill_size_pct=0.05, approver_user_id="codeseys")
 
     assert record.proposal_id == "prop_test_AAPL_abc123"
     assert record.asset == "AAPL"

@@ -6,6 +6,7 @@ Public surface:
     EvidenceCausalityError, EvidenceStore, EvidenceStoreImmutable,
     EvidenceStoreFull.
 """
+
 from __future__ import annotations
 
 from hermes_quant.evidence.schema import (

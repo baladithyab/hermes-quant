@@ -4,6 +4,7 @@ Per ADR-0020 §D3. Single-symbol single-book paper portfolio for
 backtesting. v0.4+ will unify with `portfolio_loader` (ADR-0011)
 once the calibrator-from-fills feedback loop needs both.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -76,22 +77,24 @@ class PaperPortfolio:
         delta_qty = target_qty - self.position_qty
         if abs(delta_qty) < 1e-9:
             return {
-                "delta_qty": 0.0, "fill_price": bar_close,
-                "commission_paid": 0.0, "realized_pnl_delta": 0.0,
-                "skipped": True, "reason": "no_change",
+                "delta_qty": 0.0,
+                "fill_price": bar_close,
+                "commission_paid": 0.0,
+                "realized_pnl_delta": 0.0,
+                "skipped": True,
+                "reason": "no_change",
             }
 
         # Apply slippage in the trade's adverse direction
-        if delta_qty > 0:    # buying
+        if delta_qty > 0:  # buying
             fill_price = bar_close * (1 + slippage)
-        else:                # selling
+        else:  # selling
             fill_price = bar_close * (1 - slippage)
 
         # Compute realized P&L if we're reducing or flipping a position
         realized_pnl_delta = 0.0
         if self.position_qty != 0 and (
-            (self.position_qty > 0 and delta_qty < 0)
-            or (self.position_qty < 0 and delta_qty > 0)
+            (self.position_qty > 0 and delta_qty < 0) or (self.position_qty < 0 and delta_qty > 0)
         ):
             # Reducing or flipping
             close_qty = min(abs(delta_qty), abs(self.position_qty))
@@ -101,7 +104,7 @@ class PaperPortfolio:
 
             if abs(delta_qty) > abs(self.position_qty):
                 # Flip — new entry on the OTHER side
-                new_qty = delta_qty + self.position_qty   # signed
+                new_qty = delta_qty + self.position_qty  # signed
                 # avg_entry_price for the new side
                 self.avg_entry_price = fill_price
             elif abs(delta_qty) == abs(self.position_qty):
@@ -118,8 +121,7 @@ class PaperPortfolio:
             else:
                 # Weighted average
                 self.avg_entry_price = (
-                    self.avg_entry_price * self.position_qty
-                    + fill_price * delta_qty
+                    self.avg_entry_price * self.position_qty + fill_price * delta_qty
                 ) / new_total_qty
 
         # Cash flow: positive delta_qty (buy) reduces cash; negative (sell) increases

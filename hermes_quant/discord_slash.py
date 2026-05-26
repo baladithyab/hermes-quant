@@ -13,6 +13,7 @@ The fix is a deferred install via `pre_gateway_dispatch` hook + forced
 explicit sync. Lifted near-verbatim from hermes-s2s `voice/slash.py` —
 attribution + similar pattern.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -69,7 +70,7 @@ def _install_quant_command_on_adapter(adapter: Any) -> bool:
     if tree is None:
         return False
     if getattr(tree, _QUANT_COMMAND_INSTALLED, False):
-        return False    # already installed by some other path
+        return False  # already installed by some other path
 
     # Defer the discord.py import — keeps register-time fast
     try:
@@ -78,12 +79,13 @@ def _install_quant_command_on_adapter(adapter: Any) -> bool:
         logger.debug("hermes-quant: discord.py not available; /quant not installed")
         return False
 
-    @app_commands.command(name="quant",
-                          description="hermes-quant: status, signals, doctor")
-    @app_commands.describe(subcommand="status | signals | doctor",
-                            arg="optional: asset symbol or N")
+    @app_commands.command(name="quant", description="hermes-quant: status, signals, doctor")
+    @app_commands.describe(
+        subcommand="status | signals | doctor", arg="optional: asset symbol or N"
+    )
     async def quant_cmd(interaction, subcommand: str = "status", arg: str = ""):
         from .tools import handle_quant_slash
+
         sub_args = [subcommand]
         if arg:
             sub_args.append(arg)
@@ -93,9 +95,7 @@ def _install_quant_command_on_adapter(adapter: Any) -> bool:
                 f"```json\n{result[:1900]}\n```", ephemeral=True
             )
         except Exception as exc:
-            await interaction.response.send_message(
-                f"hermes-quant error: {exc}", ephemeral=True
-            )
+            await interaction.response.send_message(f"hermes-quant error: {exc}", ephemeral=True)
 
     tree.add_command(quant_cmd)
     setattr(tree, _QUANT_COMMAND_INSTALLED, True)
@@ -104,11 +104,13 @@ def _install_quant_command_on_adapter(adapter: Any) -> bool:
     # this from Discord's UI
     loop = getattr(client, "loop", None)
     if loop is not None and not loop.is_closed():
+
         async def _resync():
             try:
                 await tree.sync()
             except Exception as exc:
                 logger.warning("hermes-quant: post-install tree.sync() failed: %s", exc)
+
         asyncio.run_coroutine_threadsafe(_resync(), loop)
 
     return True

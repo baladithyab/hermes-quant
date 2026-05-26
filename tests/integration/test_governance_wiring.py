@@ -10,6 +10,7 @@ Verifies the safety modules ACTUALLY FIRE on Tuesday's market-open path:
 - Audit failures NEVER block gate decisions (silence-by-default observation).
 - Backward compat: gate without evidence_store skips the lookahead check.
 """
+
 from __future__ import annotations
 
 import logging
@@ -244,12 +245,10 @@ def test_risk_gate_audit_failure_does_not_block_gate_decision(
     assert action is not None
     assert action.target_position_pct > 0
     # And surfaces a warning so the operator can detect audit-pipeline failure.
-    warning_messages = [
-        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-    ]
-    assert any(
-        "audit_log.append failed" in m for m in warning_messages
-    ), f"expected an audit-failure warning, got: {warning_messages}"
+    warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("audit_log.append failed" in m for m in warning_messages), (
+        f"expected an audit-failure warning, got: {warning_messages}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -260,9 +259,7 @@ def test_risk_gate_audit_failure_does_not_block_gate_decision(
 def test_halt_state_create_emits_kill_switch_fired_event(
     audit_path: Path, halt_state: HaltStateSQLite
 ) -> None:
-    record = halt_state.add_halt(
-        "alpaca-paper", "crypto", "BTC/USDT", reason="manual_test_halt"
-    )
+    record = halt_state.add_halt("alpaca-paper", "crypto", "BTC/USDT", reason="manual_test_halt")
     assert record.halt_epoch >= 1
 
     events = _read_audit_events(audit_path, kind="kill_switch_fired")
@@ -281,9 +278,7 @@ def test_halt_state_create_emits_kill_switch_fired_event(
 # ---------------------------------------------------------------------------
 
 
-def test_proposal_create_emits_proposal_emitted_event(
-    audit_path: Path, tmp_path: Path
-) -> None:
+def test_proposal_create_emits_proposal_emitted_event(audit_path: Path, tmp_path: Path) -> None:
     store = ProposalStore(
         bus_path=tmp_path / "proposals.jsonl",
         db_path=tmp_path / "proposals.db",
@@ -334,9 +329,7 @@ def test_risk_gate_drops_signal_with_lookahead_tainted_evidence_id(
     starting 'lookahead_tainted_'."""
     asof = datetime(2026, 5, 13, 0, 0, 0, tzinfo=UTC)
     # Available 1h AFTER asof — this is look-ahead bias.
-    tainted = _make_bar_evidence(
-        payload=b"future-bar", available_at=asof + timedelta(hours=1)
-    )
+    tainted = _make_bar_evidence(payload=b"future-bar", available_at=asof + timedelta(hours=1))
     evidence_store.append(tainted)
 
     view = AnalystView(
@@ -380,9 +373,7 @@ def test_risk_gate_passes_clean_signal_through_lookahead_check(
     must let the signal proceed (no lookahead silence)."""
     asof = datetime(2026, 5, 13, 0, 0, 0, tzinfo=UTC)
     # Available 1h BEFORE asof — clean.
-    clean = _make_bar_evidence(
-        payload=b"past-bar", available_at=asof - timedelta(hours=1)
-    )
+    clean = _make_bar_evidence(payload=b"past-bar", available_at=asof - timedelta(hours=1))
     evidence_store.append(clean)
 
     view = AnalystView(
@@ -411,9 +402,7 @@ def test_risk_gate_passes_clean_signal_through_lookahead_check(
     assert len(approvals) == 1
     rejections = _read_audit_events(audit_path, kind="gate_rejection")
     # No lookahead rejection
-    assert not any(
-        r.payload.get("reason", "").startswith("lookahead_tainted_") for r in rejections
-    )
+    assert not any(r.payload.get("reason", "").startswith("lookahead_tainted_") for r in rejections)
     assert g.stats()["n_silenced_lookahead"] == 0
 
 

@@ -29,6 +29,7 @@ Per ADR-0009 §P1-10:
 - v0.1.1 BMA only updates per-analyst Beta posteriors; correlations are
   not yet exploited (deferred to StackingAggregator in v0.1.3).
 """
+
 from __future__ import annotations
 
 import logging
@@ -61,6 +62,7 @@ ABSTAIN_THRESHOLD = 0.10
 @dataclass
 class _AnalystStats:
     """Per-analyst Beta-binomial posterior."""
+
     name: str
     alpha: float
     beta: float
@@ -174,7 +176,8 @@ class BMAAggregator:
 
         # Magnitude: weighted mean of magnitudes from contributing-direction views
         contributing = [
-            (v, w) for v, w in zip(views, weights, strict=False)
+            (v, w)
+            for v, w in zip(views, weights, strict=False)
             if v.direction == composite_direction
         ]
         total_w = sum(w for _, w in contributing)
@@ -196,11 +199,14 @@ class BMAAggregator:
         else:
             confidence_raw = vote_share
 
-        # Calibrate
+        # Calibrate. CalibratorNotReady fallback uses the same Beta(2,5)
+        # prior as ColdStartCalibrator (ADR-0009 §P0-2 amendment 2026-05-26):
+        # see hermes_quant/calibrators.py and
+        # docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md.
         try:
             confidence = self.calibrator.calibrate(confidence_raw)
         except CalibratorNotReady:
-            confidence = max(0.0, confidence_raw - 0.20)
+            confidence = (confidence_raw + 2.0) / 8.0
 
         # Horizon: use the modal horizon among contributing views; default to first
         horizons = [v.horizon for v, _ in contributing]
@@ -271,9 +277,7 @@ class BMAAggregator:
             "name": self.name,
             "n_aggregated": self._n_aggregated,
             "last_aggregated_at": (
-                self._last_aggregated_at.isoformat()
-                if self._last_aggregated_at
-                else None
+                self._last_aggregated_at.isoformat() if self._last_aggregated_at else None
             ),
             "analyst_stats": {
                 name: {

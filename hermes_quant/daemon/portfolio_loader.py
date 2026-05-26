@@ -23,6 +23,7 @@ Execution record schema (in executions.jsonl):
     "realized_pnl": null            # null if entry; computed at exit
   }
 """
+
 from __future__ import annotations
 
 import logging
@@ -68,7 +69,8 @@ def reconstruct_portfolio(
     records = read_jsonl_tail(bus_path, n=n_records)
     # Filter to scope
     matching = [
-        r for r in records
+        r
+        for r in records
         if r.get("account_id") == account_id
         and r.get("asset_class") == asset_class
         and r.get("schema_version") == 1

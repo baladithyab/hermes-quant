@@ -20,6 +20,7 @@ Per ADR-0004 §Configuration profiles: ships three named profiles
 (conservative, moderate, aggressive) loaded from
 ~/.hermes/config.yaml::quant.risk.profile.
 """
+
 from __future__ import annotations
 
 import logging
@@ -84,9 +85,11 @@ def _ts_to_datetime(ts: pd.Timestamp | datetime) -> datetime:
 # Configuration
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class RiskConfig:
     """Per ADR-0004 + ADR-0009 §P0-5."""
+
     max_position_pct: float = 0.20
     """Hard cap on absolute target position fraction. Default 20% NAV."""
 
@@ -149,15 +152,18 @@ PROFILES = {
 # Per-asset state (cooldown timers, last-loss tracking)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _AssetCooldownState:
     """Cooldown timers per (account, asset_class, asset)."""
+
     last_loss_at: pd.Timestamp | None = None
 
 
 # ---------------------------------------------------------------------------
 # DefaultRiskGate
 # ---------------------------------------------------------------------------
+
 
 class DefaultRiskGate:
     """Concrete risk gate implementation.
@@ -200,9 +206,7 @@ class DefaultRiskGate:
         self._n_silenced_min_trade = 0
         self._n_silenced_lookahead = 0
 
-    def _audit_rejection(
-        self, signal: AggregatedSignal, reason: str
-    ) -> None:
+    def _audit_rejection(self, signal: AggregatedSignal, reason: str) -> None:
         """Emit a 'gate_rejection' audit event. Failures are swallowed."""
         _emit_audit(
             kind="gate_rejection",
@@ -217,9 +221,7 @@ class DefaultRiskGate:
             },
         )
 
-    def _audit_approval(
-        self, signal: AggregatedSignal, action: Action
-    ) -> None:
+    def _audit_approval(self, signal: AggregatedSignal, action: Action) -> None:
         """Emit a 'gate_approval' audit event. Failures are swallowed."""
         _emit_audit(
             kind="gate_approval",
@@ -235,9 +237,7 @@ class DefaultRiskGate:
             },
         )
 
-    def _silence(
-        self, signal: AggregatedSignal, *, reason: str
-    ) -> None:
+    def _silence(self, signal: AggregatedSignal, *, reason: str) -> None:
         """Internal helper: emit gate_rejection audit and return None."""
         self._audit_rejection(signal, reason)
         return None
@@ -252,9 +252,7 @@ class DefaultRiskGate:
         """Enforce the 8-rule sequence. Returns None for silence."""
 
         # Rule 0: Halt check (HIGHEST PRIORITY per synthesis-v2 §P0-D ordering)
-        if halt_state.is_halted(
-            portfolio.account_id, portfolio.asset_class, signal.asset
-        ):
+        if halt_state.is_halted(portfolio.account_id, portfolio.asset_class, signal.asset):
             self._n_silenced_halt += 1
             return self._silence(signal, reason="halt_active")
 
@@ -313,9 +311,7 @@ class DefaultRiskGate:
         cooldown_key = (portfolio.account_id, portfolio.asset_class, signal.asset)
         cooldown = self._cooldowns.get(cooldown_key)
         if cooldown is not None and cooldown.last_loss_at is not None:
-            elapsed_minutes = (
-                portfolio.asof - cooldown.last_loss_at
-            ).total_seconds() / 60.0
+            elapsed_minutes = (portfolio.asof - cooldown.last_loss_at).total_seconds() / 60.0
             if elapsed_minutes < self.config.cooldown_after_loss_minutes:
                 self._n_silenced_cooldown += 1
                 return self._silence(signal, reason="post_loss_cooldown")
@@ -357,7 +353,7 @@ class DefaultRiskGate:
 
         # Rule 6: Position size from quarter-Kelly
         # variance = volatility² (volatility per ADR-0009 §P0-1 fix is stdev)
-        variance = market.volatility ** 2
+        variance = market.volatility**2
         target_size = quarter_kelly_size(
             edge=edge,
             variance=variance,

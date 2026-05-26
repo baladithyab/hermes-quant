@@ -7,6 +7,7 @@ append + dedupe + atomic-rename write discipline.
 CSV fallback is supported when parquet engines are unavailable, but parquet is
 preferred for fidelity and speed.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

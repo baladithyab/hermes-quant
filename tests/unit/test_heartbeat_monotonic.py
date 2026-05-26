@@ -14,6 +14,7 @@ This fence pins:
 5. Backward-compat: existing tests still pass (covered by the rest
    of the test_heartbeat suite).
 """
+
 from __future__ import annotations
 
 import pandas as pd
@@ -27,6 +28,7 @@ from hermes_quant.daemon.heartbeat import (
 
 class _MockMonotonic:
     """Manually-advanceable monotonic clock for tests."""
+
     def __init__(self, start_ns: int = 1_000_000_000):
         self.now_ns = start_ns
 
@@ -39,12 +41,12 @@ class _MockMonotonic:
 
 # ---------------------------------------------------------------------------
 
+
 def test_dead_man_switch_fires_on_monotonic_staleness():
     """Heartbeat marked, then monotonic advances past dead_man window.
     Wall-clock unchanged — the switch must STILL fire."""
     mock = _MockMonotonic()
-    config = HeartbeatCheckerConfig(dead_man_switch_seconds=30.0,
-                                     bootstrap_grace_seconds=120.0)
+    config = HeartbeatCheckerConfig(dead_man_switch_seconds=30.0, bootstrap_grace_seconds=120.0)
     start = pd.Timestamp("2026-05-13T10:00:00Z")
     checker = HeartbeatChecker(config, start_time=start, monotonic_clock_ns=mock)
 

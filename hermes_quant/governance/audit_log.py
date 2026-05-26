@@ -8,6 +8,7 @@ mode; never opened with 'w', 'r+', 'x', or any '+' mode. Each row carries
 The seven event kinds are exactly those listed in ADR-0031 D1; new kinds
 require a schema_version bump and human-edited ADR amendment.
 """
+
 from __future__ import annotations
 
 import json
@@ -169,8 +170,7 @@ def read(
             row_version = row.get("schema_version")
             if row_version != CURRENT_SCHEMA_VERSION:
                 raise AuditLogSchemaMismatch(
-                    f"row schema_version={row_version!r} "
-                    f"but reader is at {CURRENT_SCHEMA_VERSION}"
+                    f"row schema_version={row_version!r} but reader is at {CURRENT_SCHEMA_VERSION}"
                 )
 
             row_kind = row.get("kind")

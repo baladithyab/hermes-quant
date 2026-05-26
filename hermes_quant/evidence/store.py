@@ -9,6 +9,7 @@ Layout::
 Append-only. Updates emit a new record with ``supersedes=<old_uuid>``.
 50GB local cap (overridable via ``HERMES_QUANT_EVIDENCE_DIR`` env var).
 """
+
 from __future__ import annotations
 
 import os
@@ -88,18 +89,10 @@ class EvidenceStore:
                 )
                 """
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_kind ON evidence_index(kind)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_symbol ON evidence_index(symbol)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_avail ON evidence_index(available_at)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_supersedes ON evidence_index(supersedes)"
-            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kind ON evidence_index(kind)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol ON evidence_index(symbol)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_avail ON evidence_index(available_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_supersedes ON evidence_index(supersedes)")
             conn.commit()
 
     @contextmanager
@@ -242,6 +235,5 @@ class EvidenceStore:
         error rather than silently corrupting the store.
         """
         raise EvidenceStoreImmutable(
-            f"overwrite_partition is forbidden (ADR-0033 D3 append-only). "
-            f"Path: {partition_path}"
+            f"overwrite_partition is forbidden (ADR-0033 D3 append-only). Path: {partition_path}"
         )

@@ -13,6 +13,7 @@ Singleton check from external readers (e.g., quant_status, quant_doctor):
 read the file, parse the PID, check os.kill(pid, 0). If kill raises
 ProcessLookupError, the lock is stale.
 """
+
 from __future__ import annotations
 
 import errno
@@ -87,6 +88,7 @@ class DaemonLock:
         # Got the lock. NOW it's safe to truncate.
         os.ftruncate(fd, 0)
         import time
+
         content = f"{os.getpid()} {time.time():.6f}\n".encode()
         os.write(fd, content)
         os.fsync(fd)

@@ -5,6 +5,7 @@ Three lenses:
 2. replay() end-to-end: synthetic bars -> BacktestResult shape
 3. Reproducibility (same input -> same config_hash + same equity curve)
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -18,23 +19,27 @@ from hermes_quant.backtest import BacktestResult, PaperPortfolio, replay
 # Synthetic data
 # ---------------------------------------------------------------------------
 
+
 def _bars(n: int = 200, *, seed: int = 42, drift: float = 0.0, vol: float = 0.5):
     rng = np.random.default_rng(seed)
     ts = pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC")
     closes = 100 + np.cumsum(rng.normal(drift, vol, n))
-    return pd.DataFrame({
-        "timestamp": ts,
-        "open": closes - 0.1,
-        "high": closes + 0.5,
-        "low": closes - 0.5,
-        "close": closes,
-        "volume": 1000.0,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": closes - 0.1,
+            "high": closes + 0.5,
+            "low": closes - 0.5,
+            "close": closes,
+            "volume": 1000.0,
+        }
+    )
 
 
 # ===========================================================================
 # PaperPortfolio
 # ===========================================================================
+
 
 def test_portfolio_fresh_starts_with_full_cash():
     p = PaperPortfolio.fresh(10_000.0)
@@ -47,8 +52,9 @@ def test_portfolio_fresh_starts_with_full_cash():
 
 def test_portfolio_open_long_position():
     p = PaperPortfolio.fresh(10_000.0)
-    trade = p.apply_target(target_position_pct=0.10, bar_close=100.0,
-                           commission=0.001, slippage=0.0005)
+    trade = p.apply_target(
+        target_position_pct=0.10, bar_close=100.0, commission=0.001, slippage=0.0005
+    )
     # 10% of NAV at close=100 means $1,000 long, ~10 qty
     assert p.position_qty > 9 and p.position_qty < 11
     assert p.avg_entry_price > 100  # slippage on the buy side
@@ -122,40 +128,50 @@ def test_portfolio_equity_includes_position_mtm():
 # replay() — basic shape
 # ===========================================================================
 
+
 def test_replay_returns_backtest_result():
-    r = replay(_bars(200), symbol="TEST", asset_class="equity",
-               timeframe="1h", initial_equity=10_000, warmup_bars=60)
+    r = replay(
+        _bars(200),
+        symbol="TEST",
+        asset_class="equity",
+        timeframe="1h",
+        initial_equity=10_000,
+        warmup_bars=60,
+    )
     assert isinstance(r, BacktestResult)
     assert r.symbol == "TEST"
     assert r.timeframe == "1h"
-    assert r.n_bars == 140   # 200 - 60 warmup
+    assert r.n_bars == 140  # 200 - 60 warmup
     assert r.initial_equity == 10_000
 
 
 def test_replay_too_few_bars_raises():
     with pytest.raises(ValueError, match="at least"):
-        replay(_bars(50), symbol="TEST", asset_class="equity",
-               timeframe="1h", warmup_bars=60)
+        replay(_bars(50), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
 
 
 def test_replay_equity_curve_length_matches_bars_processed():
-    r = replay(_bars(200), symbol="TEST", asset_class="equity",
-               timeframe="1h", warmup_bars=60)
+    r = replay(_bars(200), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
     assert len(r.equity_curve) == 140
     assert len(r.bh_equity_curve) == 140
     assert len(r.positions) == 140
 
 
 def test_replay_initial_equity_starts_curve_close_to_input():
-    r = replay(_bars(200), symbol="TEST", asset_class="equity",
-               timeframe="1h", initial_equity=10_000, warmup_bars=60)
+    r = replay(
+        _bars(200),
+        symbol="TEST",
+        asset_class="equity",
+        timeframe="1h",
+        initial_equity=10_000,
+        warmup_bars=60,
+    )
     # First equity value is post-first-bar-trade; should be close to 10k
     assert abs(r.equity_curve.iloc[0] - 10_000) < 200
 
 
 def test_replay_buy_and_hold_baseline_computed():
-    r = replay(_bars(200), symbol="TEST", asset_class="equity",
-               timeframe="1h", warmup_bars=60)
+    r = replay(_bars(200), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
     # Buy-hold equity curve must match qty*close exactly
     bh_curve = r.bh_equity_curve
     assert bh_curve.iloc[0] > 0
@@ -164,8 +180,7 @@ def test_replay_buy_and_hold_baseline_computed():
 
 
 def test_replay_excess_return_is_strategy_minus_buy_hold():
-    r = replay(_bars(200), symbol="TEST", asset_class="equity",
-               timeframe="1h", warmup_bars=60)
+    r = replay(_bars(200), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
     assert r.excess_return_vs_buy_hold_pct == pytest.approx(
         r.total_return_pct - r.buy_hold_total_return_pct,
         rel=1e-9,
@@ -176,19 +191,20 @@ def test_replay_excess_return_is_strategy_minus_buy_hold():
 # Reproducibility (charter Reproducibility invariant)
 # ===========================================================================
 
+
 def test_replay_same_input_same_config_hash():
-    r1 = replay(_bars(200, seed=42), symbol="TEST", asset_class="equity",
-                timeframe="1h", warmup_bars=60)
-    r2 = replay(_bars(200, seed=42), symbol="TEST", asset_class="equity",
-                timeframe="1h", warmup_bars=60)
+    r1 = replay(
+        _bars(200, seed=42), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60
+    )
+    r2 = replay(
+        _bars(200, seed=42), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60
+    )
     assert r1.config_hash == r2.config_hash
 
 
 def test_replay_different_warmup_changes_config_hash():
-    r1 = replay(_bars(200), symbol="TEST", asset_class="equity",
-                timeframe="1h", warmup_bars=60)
-    r2 = replay(_bars(200), symbol="TEST", asset_class="equity",
-                timeframe="1h", warmup_bars=80)
+    r1 = replay(_bars(200), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
+    r2 = replay(_bars(200), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=80)
     assert r1.config_hash != r2.config_hash
 
 
@@ -196,10 +212,8 @@ def test_replay_same_bars_same_equity_curve():
     """Charter Reproducibility: two runs with identical bars produce
     byte-identical equity curves."""
     bars = _bars(200, seed=42)
-    r1 = replay(bars.copy(), symbol="TEST", asset_class="equity",
-                timeframe="1h", warmup_bars=60)
-    r2 = replay(bars.copy(), symbol="TEST", asset_class="equity",
-                timeframe="1h", warmup_bars=60)
+    r1 = replay(bars.copy(), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
+    r2 = replay(bars.copy(), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
     assert r1.total_return_pct == r2.total_return_pct
     assert r1.n_trades == r2.n_trades
     pd.testing.assert_series_equal(r1.equity_curve, r2.equity_curve)
@@ -209,9 +223,9 @@ def test_replay_same_bars_same_equity_curve():
 # Markdown report
 # ===========================================================================
 
+
 def test_replay_markdown_report_includes_charter_headline():
-    r = replay(_bars(200), symbol="TEST", asset_class="equity",
-               timeframe="1h", warmup_bars=60)
+    r = replay(_bars(200), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
     md = r.to_markdown_report()
     assert "Backtest report" in md
     assert "Excess return vs buy-and-hold" in md
@@ -225,8 +239,7 @@ def test_replay_negative_excess_marked_as_charter_block():
     # Use a strong-trend up market — strategy with discrete-position
     # actuator and slippage almost always loses to buy-and-hold.
     bars = _bars(200, seed=1, drift=0.5, vol=0.1)
-    r = replay(bars, symbol="UPONLY", asset_class="equity",
-               timeframe="1h", warmup_bars=60)
+    r = replay(bars, symbol="UPONLY", asset_class="equity", timeframe="1h", warmup_bars=60)
     md = r.to_markdown_report()
     if r.excess_return_vs_buy_hold_pct < 0:
         assert "NEGATIVE" in md
@@ -237,20 +250,20 @@ def test_replay_negative_excess_marked_as_charter_block():
 # JSON serialization
 # ===========================================================================
 
+
 def test_replay_to_dict_is_json_serializable():
     import json
-    r = replay(_bars(200), symbol="TEST", asset_class="equity",
-               timeframe="1h", warmup_bars=60)
+
+    r = replay(_bars(200), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
     d = r.to_dict()
-    s = json.dumps(d)   # no exception
+    s = json.dumps(d)  # no exception
     assert "config_hash" in s
     assert "excess_return_vs_buy_hold_pct" in s
 
 
 def test_replay_to_dict_excludes_pd_series():
     """to_dict must not contain pd.Series (not JSON-serializable)."""
-    r = replay(_bars(200), symbol="TEST", asset_class="equity",
-               timeframe="1h", warmup_bars=60)
+    r = replay(_bars(200), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
     d = r.to_dict()
     for v in d.values():
         assert not isinstance(v, pd.Series)
@@ -260,9 +273,9 @@ def test_replay_to_dict_excludes_pd_series():
 # DSR computed when n_observations >= 30
 # ===========================================================================
 
+
 def test_replay_dsr_computed_for_long_runs():
-    r = replay(_bars(200), symbol="TEST", asset_class="equity",
-               timeframe="1h", warmup_bars=60)
+    r = replay(_bars(200), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
     # 140 bars >> 30, so DSR should be a finite float
     assert not np.isnan(r.deflated_sharpe)
     assert 0.0 <= r.deflated_sharpe <= 1.0
@@ -271,14 +284,14 @@ def test_replay_dsr_computed_for_long_runs():
 def test_replay_dsr_nan_for_short_runs():
     """With < 30 observations DSR is undefined; result reports NaN."""
     # 50 bars with warmup 35 -> 15 observations, < 30
-    r = replay(_bars(50), symbol="TEST", asset_class="equity",
-               timeframe="1h", warmup_bars=35)
+    r = replay(_bars(50), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=35)
     assert np.isnan(r.deflated_sharpe)
 
 
 # ===========================================================================
 # Advisor failure does not crash the backtest
 # ===========================================================================
+
 
 def test_advisor_exception_treated_as_flat():
     """If advisor raises mid-replay, that bar is treated as no-op."""
@@ -291,16 +304,22 @@ def test_advisor_exception_treated_as_flat():
             raise RuntimeError("simulated transient error")
         # Otherwise return a no-trade signal
         return {
-            "as_of": kwargs["as_of"].isoformat() if hasattr(kwargs["as_of"], "isoformat") else str(kwargs["as_of"]),
-            "aggregated_signal": {"direction": 0, "magnitude": 0.0,
-                                   "confidence": 0.0},
+            "as_of": kwargs["as_of"].isoformat()
+            if hasattr(kwargs["as_of"], "isoformat")
+            else str(kwargs["as_of"]),
+            "aggregated_signal": {"direction": 0, "magnitude": 0.0, "confidence": 0.0},
             "risk_gate": {"pass": False, "kelly_fraction": 0.0},
             "analyst_views": [],
         }
 
-    r = replay(bars, symbol="TEST", asset_class="equity",
-               timeframe="1h", warmup_bars=60,
-               advisor_recommend=flaky_advisor)
+    r = replay(
+        bars,
+        symbol="TEST",
+        asset_class="equity",
+        timeframe="1h",
+        warmup_bars=60,
+        advisor_recommend=flaky_advisor,
+    )
     # No crash; result is structurally valid
     assert isinstance(r, BacktestResult)
     assert r.n_decisions == 0  # advisor never returned a non-flat signal

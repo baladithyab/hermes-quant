@@ -47,6 +47,7 @@ RollingSlippageEstimator can still be wired up correctly because it
 explicitly wants the per-fill adverse-bps value, not the directional
 return.
 """
+
 from __future__ import annotations
 
 import logging
@@ -93,19 +94,12 @@ def find_signals_for_executions(
     Returns:
         {signal_id: signal_record} for matched signals.
     """
-    needed_ids = {
-        rec["signal_id"]
-        for rec in execution_records
-        if rec.get("signal_id")
-    }
+    needed_ids = {rec["signal_id"] for rec in execution_records if rec.get("signal_id")}
     if not needed_ids:
         return {}
 
     signals = read_jsonl_tail(signal_bus_path, n=n_signal_records)
-    return {
-        s["id"]: s for s in signals
-        if s.get("id") in needed_ids
-    }
+    return {s["id"]: s for s in signals if s.get("id") in needed_ids}
 
 
 def construct_realized_outcomes(
@@ -178,9 +172,8 @@ def construct_realized_outcomes(
                 )
             except (KeyError, ValueError, TypeError):
                 continue
-            comp_direction_correct = (
-                (comp["direction"] > 0 and realized_return > 0)
-                or (comp["direction"] < 0 and realized_return < 0)
+            comp_direction_correct = (comp["direction"] > 0 and realized_return > 0) or (
+                comp["direction"] < 0 and realized_return < 0
             )
             outcomes.append(
                 RealizedOutcome(
@@ -250,9 +243,8 @@ def construct_episode_outcomes(
             except (KeyError, ValueError, TypeError):
                 continue
             direction_correct[comp["analyst"]] = (
-                (comp["direction"] > 0 and realized_return > 0)
-                or (comp["direction"] < 0 and realized_return < 0)
-            )
+                comp["direction"] > 0 and realized_return > 0
+            ) or (comp["direction"] < 0 and realized_return < 0)
 
         agg_signal = AggregatedSignal(
             asset=sig["asset"],
@@ -332,15 +324,14 @@ def dispatch_settlement(
                 analyst.update(outcome)
                 stats["n_analyst_updates"] += 1
             except Exception as e:  # noqa: BLE001
-                logger.warning("analyst %s update failed: %s",
-                               outcome.view.analyst, e)
+                logger.warning("analyst %s update failed: %s", outcome.view.analyst, e)
 
     # Episode outcomes: also skip if their aggregated_signal carries the
     # slippage-only quality tag on its components (which they will in v0.1.1
     # because construct_episode_outcomes inherits the single-fill slippage
     # formula).
     for sig_id, episode in episode_outcomes:
-        sig_meta = (episode.aggregated_signal.metadata or {})
+        sig_meta = episode.aggregated_signal.metadata or {}
         if sig_meta.get("_calibration_quality") == CALIBRATION_QUALITY_SLIPPAGE_ONLY:
             stats["n_skipped_slippage_only"] += 1
             continue

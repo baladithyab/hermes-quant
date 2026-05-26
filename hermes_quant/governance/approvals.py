@@ -5,6 +5,7 @@ is append-only — expired or consumed tokens are filtered at read time, never
 deleted in place. NEVER auto-grants. Including from `--yes`. Including from
 the daemon. Including from a retro proposal.
 """
+
 from __future__ import annotations
 
 import json
@@ -104,11 +105,7 @@ def _iter_rows() -> Iterator[dict[str, Any]]:
 
 
 def _consumed_ids() -> set[str]:
-    return {
-        row["token_id"]
-        for row in _iter_rows()
-        if row.get("row_type") == "consumed"
-    }
+    return {row["token_id"] for row in _iter_rows() if row.get("row_type") == "consumed"}
 
 
 def _utc(dt: datetime) -> datetime:
@@ -175,12 +172,8 @@ def require_human_token(
     `hermes_quant/governance/**` when scope is `retro_code_change` —
     defense-in-depth per ADR-0031 D7.
     """
-    if scope == "retro_code_change" and target_ref.startswith(
-        "hermes_quant/governance/"
-    ):
-        raise NoApprovalError(
-            "retro_code_change tokens cannot target hermes_quant/governance/**"
-        )
+    if scope == "retro_code_change" and target_ref.startswith("hermes_quant/governance/"):
+        raise NoApprovalError("retro_code_change tokens cannot target hermes_quant/governance/**")
 
     consumed = _consumed_ids()
     now = datetime.now(UTC)
@@ -213,8 +206,7 @@ def require_human_token(
 
     if candidate is None:
         raise NoApprovalError(
-            f"no unexpired human approval token for scope={scope!r} "
-            f"target_ref={target_ref!r}"
+            f"no unexpired human approval token for scope={scope!r} target_ref={target_ref!r}"
         )
     return candidate
 

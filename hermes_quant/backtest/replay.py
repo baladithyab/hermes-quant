@@ -9,6 +9,7 @@ The replay uses a thin `_ReplayProvider` that wraps the input bars and
 honors the as_of contract (same Protocol as YFinanceProvider /
 CcxtProvider).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 # Result schema
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class BacktestResult:
     """Per ADR-0020 §D4."""
@@ -39,7 +41,7 @@ class BacktestResult:
     n_bars: int
     n_decisions: int
     n_fires: int
-    n_settlements: int = 0       # episodes settled back into the aggregator (V03-5)
+    n_settlements: int = 0  # episodes settled back into the aggregator (V03-5)
 
     initial_equity: float = 10_000.0
     final_equity: float = 10_000.0
@@ -64,7 +66,7 @@ class BacktestResult:
     # Reproducibility + posterior diagnostics
     run_at: str = ""
     config_hash: str = ""
-    aggregator_posteriors: dict | None = None    # snapshot of BMA per-analyst stats at end of run
+    aggregator_posteriors: dict | None = None  # snapshot of BMA per-analyst stats at end of run
 
     def to_dict(self) -> dict:
         """JSON-serializable view (excludes pd.Series; saves them as lists)."""
@@ -122,22 +124,26 @@ class BacktestResult:
             "",
             "## Charter-gating headline",
             "",
-            (f"**Excess return vs buy-and-hold: {self.excess_return_vs_buy_hold_pct:+.2%}**"
-             if self.excess_return_vs_buy_hold_pct > 0
-             else f"**Excess return vs buy-and-hold: {self.excess_return_vs_buy_hold_pct:+.2%}** "
-                  "(NEGATIVE — fix analysts/aggregator before RL aggregator work, per charter)"),
+            (
+                f"**Excess return vs buy-and-hold: {self.excess_return_vs_buy_hold_pct:+.2%}**"
+                if self.excess_return_vs_buy_hold_pct > 0
+                else f"**Excess return vs buy-and-hold: {self.excess_return_vs_buy_hold_pct:+.2%}** "
+                "(NEGATIVE — fix analysts/aggregator before RL aggregator work, per charter)"
+            ),
             "",
         ]
         # Aggregator posterior table (Wave G observability surface)
         if self.aggregator_posteriors:
             stats = self.aggregator_posteriors.get("analyst_stats") or {}
             if stats:
-                lines.extend([
-                    "## Per-analyst empirical accuracy (BMA posteriors)",
-                    "",
-                    "| Analyst | n_obs | α | β | posterior_accuracy |",
-                    "|---|---|---|---|---|",
-                ])
+                lines.extend(
+                    [
+                        "## Per-analyst empirical accuracy (BMA posteriors)",
+                        "",
+                        "| Analyst | n_obs | α | β | posterior_accuracy |",
+                        "|---|---|---|---|---|",
+                    ]
+                )
                 for name, s in sorted(stats.items()):
                     lines.append(
                         f"| `{name}` | {s.get('n_observations', 0)} | "
@@ -151,6 +157,7 @@ class BacktestResult:
 # ---------------------------------------------------------------------------
 # Internal: ReplayProvider — exposes input bars via DataProvider Protocol
 # ---------------------------------------------------------------------------
+
 
 class _ReplayProvider:
     """DataProvider that returns slices of a fixed input DataFrame
@@ -166,7 +173,8 @@ class _ReplayProvider:
         self._bars = bars.copy()
         # Normalize timestamp dtype
         self._bars["timestamp"] = pd.to_datetime(
-            self._bars["timestamp"], utc=True,
+            self._bars["timestamp"],
+            utc=True,
         )
         self._bars = self._bars.sort_values("timestamp").reset_index(drop=True)
 
@@ -202,9 +210,7 @@ class _ReplayProvider:
                 as_of_ts = as_of_ts.tz_localize("UTC")
             df = df[df["timestamp"] <= as_of_ts]
         if len(df) < 2:
-            raise DataQualityError(
-                f"replay provider has {len(df)} bars at as_of={as_of}; need >=2"
-            )
+            raise DataQualityError(f"replay provider has {len(df)} bars at as_of={as_of}; need >=2")
         return df.reset_index(drop=True)
 
     def health(self) -> dict:
@@ -214,6 +220,7 @@ class _ReplayProvider:
 # ---------------------------------------------------------------------------
 # Replay loop
 # ---------------------------------------------------------------------------
+
 
 def replay(
     bars: pd.DataFrame,
@@ -230,8 +237,8 @@ def replay(
     recipe_id: str | None = None,
     semantic_packets: list[dict] | None = None,
     committee_turns: list[dict] | None = None,
-    advisor_recommend=None,        # inject for testing
-    aggregator=None,               # inject for testing or to seed posteriors
+    advisor_recommend=None,  # inject for testing
+    aggregator=None,  # inject for testing or to seed posteriors
 ) -> BacktestResult:
     """Walk bars[warmup_bars:] forward chronologically, replaying through
     the advisor pipeline.
@@ -277,9 +284,11 @@ def replay(
     if aggregator is None and learn_from_fills:
         if recipe_id:
             from hermes_quant.recipes import get_recipe, instantiate_recipe_aggregator
+
             aggregator = instantiate_recipe_aggregator(get_recipe(recipe_id))
         else:
             from hermes_quant.aggregators.bma import BMAAggregator
+
             aggregator = BMAAggregator()
 
     # Normalize bars
@@ -360,7 +369,9 @@ def replay(
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "backtest: advisor raised at %s: %s; treating as flat",
-                as_of, exc, exc_info=True,
+                as_of,
+                exc,
+                exc_info=True,
             )
             equity_records.append((as_of, portfolio.equity(bar_close)))
             bh_equity_records.append((as_of, bh_qty * bar_close))
@@ -381,14 +392,16 @@ def replay(
             if learn_from_fills and aggregator is not None:
                 settle_at = i + settlement_horizon_bars
                 if settle_at < len(bars):
-                    pending_settlements.append({
-                        "settle_at_idx": settle_at,
-                        "decision_idx": i,
-                        "decision_close": bar_close,
-                        "as_of": as_of,
-                        "agg_signal_dict": sig,
-                        "components": result.get("analyst_views", []),
-                    })
+                    pending_settlements.append(
+                        {
+                            "settle_at_idx": settle_at,
+                            "decision_idx": i,
+                            "decision_close": bar_close,
+                            "as_of": as_of,
+                            "agg_signal_dict": sig,
+                            "components": result.get("analyst_views", []),
+                        }
+                    )
 
         # Apply to portfolio
         trade = portfolio.apply_target(
@@ -411,22 +424,25 @@ def replay(
             for view in result.get("analyst_views", [])
             if ((view.get("metadata") or {}).get("packet_hash"))
         ]
-        decisions_summary.append({
-            "asof": as_of.isoformat(),
-            "bar_close": bar_close,
-            "signal_direction": direction,
-            "kelly_fraction": float(rg.get("kelly_fraction", 0.0)),
-            "rg_pass": rg_pass,
-            "trade": trade if not trade.get("skipped") else None,
-            "recipe": result.get("recipe"),
-            "semantic_packet_hashes": semantic_hashes,
-            "committee_turns_hashes": [
-                turn.get("input_hash") for turn in committee.get("model_backed_turns", [])
-                if turn.get("input_hash")
-            ],
-            "committee_decision": committee.get("decision"),
-            "aggregator": sig.get("aggregator"),
-        })
+        decisions_summary.append(
+            {
+                "asof": as_of.isoformat(),
+                "bar_close": bar_close,
+                "signal_direction": direction,
+                "kelly_fraction": float(rg.get("kelly_fraction", 0.0)),
+                "rg_pass": rg_pass,
+                "trade": trade if not trade.get("skipped") else None,
+                "recipe": result.get("recipe"),
+                "semantic_packet_hashes": semantic_hashes,
+                "committee_turns_hashes": [
+                    turn.get("input_hash")
+                    for turn in committee.get("model_backed_turns", [])
+                    if turn.get("input_hash")
+                ],
+                "committee_decision": committee.get("decision"),
+                "aggregator": sig.get("aggregator"),
+            }
+        )
 
     # ---- Compute metrics ----
     equity_curve = pd.Series(
@@ -463,7 +479,8 @@ def replay(
     n_observations = len(strat_returns)
     annualized_return_pct = (
         ((1 + total_return_pct) ** (bars_per_year / max(n_observations, 1))) - 1.0
-        if n_observations > 0 else 0.0
+        if n_observations > 0
+        else 0.0
     )
 
     # Max drawdown
@@ -474,6 +491,7 @@ def replay(
     # Deflated Sharpe (PSR with n_trials=1) — only when n_observations >= 30
     if n_observations >= 30:
         from hermes_quant.evaluation.dsr import deflated_sharpe
+
         try:
             dsr = deflated_sharpe(
                 observed_sharpe=sharpe,
@@ -489,13 +507,21 @@ def replay(
 
     # Config hash for reproducibility
     config_hash = _compute_config_hash(
-        symbol=symbol, timeframe=timeframe, asset_class=asset_class,
-        warmup_bars=warmup_bars, commission=commission, slippage=slippage,
+        symbol=symbol,
+        timeframe=timeframe,
+        asset_class=asset_class,
+        warmup_bars=warmup_bars,
+        commission=commission,
+        slippage=slippage,
         settlement_horizon_bars=settlement_horizon_bars,
         learn_from_fills=learn_from_fills,
         recipe_id=recipe_id,
-        semantic_packet_hashes=[p.get("packet_hash") for p in (semantic_packets or []) if p.get("packet_hash")],
-        committee_turn_hashes=[t.get("input_hash") for t in (committee_turns or []) if t.get("input_hash")],
+        semantic_packet_hashes=[
+            p.get("packet_hash") for p in (semantic_packets or []) if p.get("packet_hash")
+        ],
+        committee_turn_hashes=[
+            t.get("input_hash") for t in (committee_turns or []) if t.get("input_hash")
+        ],
         n_bars=len(bars),
     )
 
@@ -542,6 +568,7 @@ def replay(
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _sharpe(returns: pd.Series, *, bars_per_year: float, rf_rate: float = 0.0) -> float:
     """Annualized Sharpe ratio."""
     if len(returns) < 2:
@@ -560,7 +587,7 @@ def _bars_per_year(timeframe: str) -> float:
         "5m": 252 * 6.5 * 12,
         "15m": 252 * 6.5 * 4,
         "30m": 252 * 6.5 * 2,
-        "1h": 252 * 6.5,        # equity hours/year (close enough for crypto too)
+        "1h": 252 * 6.5,  # equity hours/year (close enough for crypto too)
         "4h": 252 * 1.6,
         "1d": 252,
     }.get(timeframe, 252)
@@ -624,9 +651,8 @@ def _settle_episode(
             # Flat call — only "correct" if realized was also (approximately) flat
             direction_correct[view.analyst] = abs(realized_return) < 1e-6
         else:
-            direction_correct[view.analyst] = (
-                (view.direction > 0 and realized_return > 0)
-                or (view.direction < 0 and realized_return < 0)
+            direction_correct[view.analyst] = (view.direction > 0 and realized_return > 0) or (
+                view.direction < 0 and realized_return < 0
             )
 
     if not components:
@@ -654,7 +680,7 @@ def _settle_episode(
             aggregated_signal=agg_sig,
             realized_returns={agg_sig.horizon: realized_return},
             direction_correct=direction_correct,
-            realized_net_pnl=None,   # paper backtest; per-trade P&L handled by PaperPortfolio
+            realized_net_pnl=None,  # paper backtest; per-trade P&L handled by PaperPortfolio
         )
     except (TypeError, ValueError) as exc:
         logger.debug("settle_episode: failed to build EpisodeOutcome: %s", exc)
@@ -665,6 +691,8 @@ def _settle_episode(
         return 1
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "settle_episode: aggregator.update raised: %s", exc, exc_info=True,
+            "settle_episode: aggregator.update raised: %s",
+            exc,
+            exc_info=True,
         )
         return 0

@@ -5,6 +5,7 @@ local deterministic synthesis so the CLI works for every installer. External
 Hermes/model mixtures can generate richer turns upstream and still use the same
 artifact schema.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -103,7 +104,10 @@ def build_model_mixture_prompt(
     The prompt asks the agent to produce replayable CommitteeTurn JSON only;
     it does not grant any trading authority.
     """
-    packet_hashes = [parse_semantic_packet(p).packet_hash or parse_semantic_packet(p).computed_hash for p in packets]
+    packet_hashes = [
+        parse_semantic_packet(p).packet_hash or parse_semantic_packet(p).computed_hash
+        for p in packets
+    ]
     models_text = ", ".join(models) if models else "current Hermes model"
     return (
         "You are running a hermes-quant model-mixture committee job. Do NOT trade. "

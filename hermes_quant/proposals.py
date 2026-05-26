@@ -15,6 +15,7 @@ Per ADR-0015 D3, proposal_id format is:
 e.g. prop_2026-05-13T184230_AAPL_7f3a91. Stable, unique-enough,
 human-readable.
 """
+
 from __future__ import annotations
 
 import json
@@ -47,6 +48,7 @@ ProposalState = Literal["pending", "approved", "rejected", "expired"]
 # Proposal record (Python dataclass; serialized as JSON on the bus)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Proposal:
     """A pending HITL proposal awaiting human approve/reject.
@@ -55,14 +57,15 @@ class Proposal:
     a JSONL record. Approved/rejected/expired records carry the same shape
     plus state-transition fields.
     """
+
     proposal_id: str
     state: ProposalState
     symbol: str
     asset_class: str
     timeframe: str
-    created_at: str       # ISO UTC seconds
-    expires_at: str       # ISO UTC seconds
-    advisor_result: dict[str, Any]   # the full advisor.recommend() output
+    created_at: str  # ISO UTC seconds
+    expires_at: str  # ISO UTC seconds
+    advisor_result: dict[str, Any]  # the full advisor.recommend() output
 
     # State-transition fields (None until applicable)
     approved_at: str | None = None
@@ -79,6 +82,7 @@ class Proposal:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 class ProposalStore:
     """Pending-proposal store with JSONL+SQLite dual-write.
@@ -204,13 +208,15 @@ class ProposalStore:
             self._require_state(current, "pending")
 
             updated = Proposal(
-                **{**_proposal_to_dict(current),
-                   "state": "approved",
-                   "approved_at": _iso(_utc_now()),
-                   "approver_user_id": approver_user_id,
-                   "size_override_pct": size_override_pct,
-                   "execution": execution,
-                   })
+                **{
+                    **_proposal_to_dict(current),
+                    "state": "approved",
+                    "approved_at": _iso(_utc_now()),
+                    "approver_user_id": approver_user_id,
+                    "size_override_pct": size_override_pct,
+                    "execution": execution,
+                }
+            )
             self._persist(updated, event="approve")
             return updated
 
@@ -229,11 +235,13 @@ class ProposalStore:
             self._require_state(current, "pending")
 
             updated = Proposal(
-                **{**_proposal_to_dict(current),
-                   "state": "rejected",
-                   "rejected_at": _iso(_utc_now()),
-                   "rejection_reason": reason.strip(),
-                   })
+                **{
+                    **_proposal_to_dict(current),
+                    "state": "rejected",
+                    "rejected_at": _iso(_utc_now()),
+                    "rejection_reason": reason.strip(),
+                }
+            )
             self._persist(updated, event="reject")
             return updated
 
@@ -248,10 +256,12 @@ class ProposalStore:
             if current.state != "pending":
                 return None
             updated = Proposal(
-                **{**_proposal_to_dict(current),
-                   "state": "expired",
-                   "expired_at": _iso(_utc_now()),
-                   })
+                **{
+                    **_proposal_to_dict(current),
+                    "state": "expired",
+                    "expired_at": _iso(_utc_now()),
+                }
+            )
             self._persist(updated, event="expire")
             return updated
 
@@ -264,8 +274,7 @@ class ProposalStore:
         now_iso = _iso(_utc_now())
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT proposal_id FROM proposals "
-                "WHERE state = 'pending' AND expires_at <= ?",
+                "SELECT proposal_id FROM proposals WHERE state = 'pending' AND expires_at <= ?",
                 (now_iso,),
             ).fetchall()
         n_expired = 0
@@ -336,8 +345,7 @@ class ProposalStore:
     def _require_state(self, proposal: Proposal, want: ProposalState) -> None:
         if proposal.state != want:
             raise ProposalStateError(
-                f"proposal {proposal.proposal_id} is in state "
-                f"{proposal.state!r}; expected {want!r}"
+                f"proposal {proposal.proposal_id} is in state {proposal.state!r}; expected {want!r}"
             )
 
     def _reject_if_expired(self, proposal: Proposal) -> None:
@@ -345,8 +353,7 @@ class ProposalStore:
         if proposal.state == "pending" and _iso_in_past(proposal.expires_at):
             self.expire_one(proposal.proposal_id)
             raise ProposalExpiredError(
-                f"proposal {proposal.proposal_id} expired at "
-                f"{proposal.expires_at}"
+                f"proposal {proposal.proposal_id} expired at {proposal.expires_at}"
             )
 
     def _persist(self, proposal: Proposal, *, event: str) -> None:
@@ -357,12 +364,13 @@ class ProposalStore:
         v0.1.2 surfaces a warning).
         """
         record = _proposal_to_dict(proposal)
-        record["_event"] = event   # "create" | "approve" | "reject" | "expire"
+        record["_event"] = event  # "create" | "approve" | "reject" | "expire"
         record["_event_at"] = _iso(_utc_now())
 
         line = json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
         with append_locked(self.bus_path) as fd:
             import os as _os
+
             _os.write(fd, line.encode("utf-8"))
 
         # Wave A wiring (ADR-0031 D2): emit proposal_emitted governance audit
@@ -381,11 +389,7 @@ class ProposalStore:
                     or aggregated.get("target_size_pct_nav")
                     or 0.0
                 )
-                asof_str = (
-                    advisor.get("as_of")
-                    or aggregated.get("as_of")
-                    or proposal.created_at
-                )
+                asof_str = advisor.get("as_of") or aggregated.get("as_of") or proposal.created_at
                 # Use creation-time for governance asof — that's when this
                 # proposal landed on the bus, which is the auditable event.
                 asof_dt = _utc_now()
@@ -463,6 +467,7 @@ class ProposalStore:
 # Errors
 # ---------------------------------------------------------------------------
 
+
 class ProposalStateError(Exception):
     """The proposal is not in the state required for this operation."""
 
@@ -474,6 +479,7 @@ class ProposalExpiredError(ProposalStateError):
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
 
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)

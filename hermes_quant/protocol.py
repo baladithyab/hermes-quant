@@ -15,6 +15,7 @@ Anchor ADRs: 0002 (analyst protocol), 0003 (aggregator), 0004 (risk gate),
 Versioning rule: fields are added only, never renamed/removed before a major
 version bump. New fields have sensible defaults. Consumers ignore unknown fields.
 """
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -34,10 +35,10 @@ Direction = Literal[-1, 0, 1]
 # intent. Strategy = high-level thesis (what we believe will happen).
 # Discussion = analyst debate prose (no action implied, just context).
 # Forbidden = a sentinel for messages that fail static security scan.
-MessageKind = Literal['operation', 'strategy', 'discussion', 'forbidden']
+MessageKind = Literal["operation", "strategy", "discussion", "forbidden"]
 """Channel discriminator for routing messages between thesis vs execution paths."""
 
-_MESSAGE_KIND_VALUES = frozenset({'operation', 'strategy', 'discussion', 'forbidden'})
+_MESSAGE_KIND_VALUES = frozenset({"operation", "strategy", "discussion", "forbidden"})
 """Runtime mirror of MessageKind for __post_init__ validation. Tests assert
 this stays in sync with MessageKind.__args__ (catches drift)."""
 
@@ -51,6 +52,7 @@ AssetClass = Literal["crypto", "equity", "etf", "fx", "option"]
 # ---------------------------------------------------------------------------
 # MarketContext — input to analysts
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class MarketContext:
@@ -66,14 +68,14 @@ class MarketContext:
     this before MarketContext is constructed.
     """
 
-    asset: str                       # e.g., "BTC/USDT", "AAPL"
-    timeframe: str                   # one of Timeframe
-    asset_class: str                 # one of AssetClass
-    exchange: str | None             # for crypto: "binance", "kraken", ...; None for yfinance equity
-    bars: pd.DataFrame               # canonical OHLCV
-    last_close: float                # bars.iloc[-1]["close"] cached for convenience
-    last_volume: float               # bars.iloc[-1]["volume"]
-    asof: pd.Timestamp               # decision timestamp, UTC
+    asset: str  # e.g., "BTC/USDT", "AAPL"
+    timeframe: str  # one of Timeframe
+    asset_class: str  # one of AssetClass
+    exchange: str | None  # for crypto: "binance", "kraken", ...; None for yfinance equity
+    bars: pd.DataFrame  # canonical OHLCV
+    last_close: float  # bars.iloc[-1]["close"] cached for convenience
+    last_volume: float  # bars.iloc[-1]["volume"]
+    asof: pd.Timestamp  # decision timestamp, UTC
     extras: Mapping[str, Any] = field(default_factory=dict)
     """Provider-specific extras (orderbook, news, regime, ...). Read-only Mapping
     (an immutable proxy view) — analysts must NOT mutate. Per ADR-0009 §P1 fix
@@ -83,6 +85,7 @@ class MarketContext:
 # ---------------------------------------------------------------------------
 # AnalystView — output from analysts
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class AnalystView:
@@ -99,20 +102,20 @@ class AnalystView:
         aggregator + risk-gate pipeline turns them into 'operation' Proposals.
     """
 
-    analyst: str                     # name of the emitting analyst
+    analyst: str  # name of the emitting analyst
     direction: Direction
-    magnitude: float                 # expected return as fraction (e.g., 0.012 = 1.2%)
-    confidence: float                # CALIBRATED probability in [0, 1]
-    confidence_raw: float            # raw, uncalibrated score (for debugging + calibrator training)
-    horizon: str                     # "5m" | "1h" | "1d" — over what window the view holds
-    rationale: str | None = None     # optional human-readable explanation; truncated to 256 chars
+    magnitude: float  # expected return as fraction (e.g., 0.012 = 1.2%)
+    confidence: float  # CALIBRATED probability in [0, 1]
+    confidence_raw: float  # raw, uncalibrated score (for debugging + calibrator training)
+    horizon: str  # "5m" | "1h" | "1d" — over what window the view holds
+    rationale: str | None = None  # optional human-readable explanation; truncated to 256 chars
     metadata: Mapping[str, Any] | None = None
     """Provider-specific extras (CIs, sub-scores, ...). JSON-serialized + capped at
     1024 chars when written to signal bus."""
     evidence_ids: tuple[str, ...] = ()
     """ADR-0033 D4: per-row provenance linkage. Phase 1 = optional. UUIDs as strings
     (not UUID objects) to keep dataclass JSON-serializable for signal_bus."""
-    message_kind: MessageKind = 'discussion'
+    message_kind: MessageKind = "discussion"
     """AI-Trader pattern: channel discriminator. Default 'discussion' — analyst
     views are analytical commentary unless explicitly upgraded to 'strategy'."""
 
@@ -127,6 +130,7 @@ class AnalystView:
 # ---------------------------------------------------------------------------
 # AggregatedSignal — output from aggregators, input to risk gate
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class AggregatedSignal:
@@ -149,16 +153,16 @@ class AggregatedSignal:
     asof: pd.Timestamp
     direction: Direction
     magnitude: float
-    confidence: float                # CALIBRATED
+    confidence: float  # CALIBRATED
     confidence_raw: float
     horizon: str
-    components: tuple[AnalystView, ...]   # frozen — required for joint-state replay
-    aggregator: str                  # which aggregator emitted this ("bma", "stacking", "rl", ...)
+    components: tuple[AnalystView, ...]  # frozen — required for joint-state replay
+    aggregator: str  # which aggregator emitted this ("bma", "stacking", "rl", ...)
     metadata: Mapping[str, Any] | None = None
     evidence_ids: tuple[str, ...] = ()
     """ADR-0033 D4: per-row provenance linkage. Phase 1 = optional. UUIDs as strings
     (not UUID objects) to keep dataclass JSON-serializable for signal_bus."""
-    message_kind: MessageKind = 'discussion'
+    message_kind: MessageKind = "discussion"
     """AI-Trader pattern: channel discriminator. Default 'discussion' — even an
     aggregated signal is just a thesis until the risk gate turns it into a
     concrete Proposal."""
@@ -175,6 +179,7 @@ class AggregatedSignal:
 # Proposal — concrete order intent (the 'operation' channel)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Proposal:
     """Concrete order intent (the 'operation' channel per AI-Trader pattern).
@@ -189,21 +194,21 @@ class Proposal:
     this type incrementally — protocol.py just exports the contract.
     """
 
-    proposal_id: str                      # prop_<UTC_ISO_seconds>_<symbol>_<random6>
+    proposal_id: str  # prop_<UTC_ISO_seconds>_<symbol>_<random6>
     asset: str
     asof: pd.Timestamp
     direction: Direction
-    target_size_pct_nav: float            # MUST be in ACTION_SPACE per governance.invariants
+    target_size_pct_nav: float  # MUST be in ACTION_SPACE per governance.invariants
     horizon: str
     aggregated_signal_id: str | None = None
     evidence_ids: tuple[str, ...] = ()
-    message_kind: MessageKind = 'operation'
+    message_kind: MessageKind = "operation"
     """Always 'operation' — fixed per type. Enforced in __post_init__."""
     rationale: str | None = None
     metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if self.message_kind != 'operation':
+        if self.message_kind != "operation":
             raise TypeError(
                 f"Proposal.message_kind must be 'operation', got {self.message_kind!r}. "
                 f"Proposals are the execution-channel message; thesis-channel messages "
@@ -215,6 +220,7 @@ class Proposal:
 # MarketState — input to risk gate (transaction costs, volatility, etc.)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class MarketState:
     """Per-asset cost + risk environment at decision time.
@@ -225,25 +231,27 @@ class MarketState:
 
     asset: str
     asof: pd.Timestamp
-    volatility: float                # per-period stdev of LOG returns (NOT variance)
+    volatility: float  # per-period stdev of LOG returns (NOT variance)
     """For Kelly sizing: f* = μ * p / σ²  (per ADR-0009 §P0-1 fix)."""
-    commission: float                # fraction (e.g., 0.001 = 10 bps round-trip)
-    spread: float                    # fraction (round-trip, e.g., 0.0008 = 8 bps)
-    slippage_estimate: float         # fraction; defaults: crypto=12 bps, equity=5 bps, illiquid=25 bps
-    funding_cost: float = 0.0        # per-period; perps only
-    borrow_cost: float = 0.0         # per-period; shorts only
-    tz: str = "UTC"                  # for daily-loss session reset
+    commission: float  # fraction (e.g., 0.001 = 10 bps round-trip)
+    spread: float  # fraction (round-trip, e.g., 0.0008 = 8 bps)
+    slippage_estimate: float  # fraction; defaults: crypto=12 bps, equity=5 bps, illiquid=25 bps
+    funding_cost: float = 0.0  # per-period; perps only
+    borrow_cost: float = 0.0  # per-period; shorts only
+    tz: str = "UTC"  # for daily-loss session reset
 
 
 # ---------------------------------------------------------------------------
 # Portfolio — REAL portfolio state, sourced from executions.jsonl
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Position:
     """An open position with mark-to-market accounting."""
+
     asset: str
-    qty: float                       # signed; positive = long, negative = short
+    qty: float  # signed; positive = long, negative = short
     avg_entry_price: float
     mark_price: float
     unrealized_pnl: float
@@ -260,16 +268,16 @@ class Portfolio:
       - All P&L metrics are mark-to-market (include unrealized)
     """
 
-    account_id: str                  # e.g., "alpaca-paper", "binance-spot"
+    account_id: str  # e.g., "alpaca-paper", "binance-spot"
     asset_class: str
     asof: pd.Timestamp
     positions: Mapping[str, Position]
     cash: float
-    equity_total: float              # cash + sum(positions.mark_value)
+    equity_total: float  # cash + sum(positions.mark_value)
     realized_pnl_total: float
     realized_fees_total: float
-    peak_equity: float               # rolling peak for drawdown calc
-    daily_open_equity: float         # set at session open
+    peak_equity: float  # rolling peak for drawdown calc
+    daily_open_equity: float  # set at session open
 
     @property
     def drawdown_pct(self) -> float:
@@ -299,15 +307,16 @@ class Portfolio:
 # HaltState — durable halt registry (ADR-0009 §P0-4)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class HaltRecord:
     account_id: str
     asset_class: str
-    asset: str | None                # None = all assets in class
+    asset: str | None  # None = all assets in class
     reason: str
     halted_at: pd.Timestamp
     halted_until: pd.Timestamp | None  # None = until explicit resume
-    halt_epoch: int                   # monotonic per (account, asset_class, asset)
+    halt_epoch: int  # monotonic per (account, asset_class, asset)
 
 
 @runtime_checkable
@@ -328,14 +337,15 @@ class HaltState(Protocol):
 # Action — output from risk gate
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Action:
     """The risk gate's emit. None means silence (do nothing)."""
 
-    target_position_pct: float       # signed; e.g., 0.10 = 10% NAV long, -0.05 = 5% NAV short
-    reason: str                      # human-readable justification
-    signal_id: str | None = None     # links to AggregatedSignal that drove this
-    halt: bool = False               # if True, also enter halt for halt_scope
+    target_position_pct: float  # signed; e.g., 0.10 = 10% NAV long, -0.05 = 5% NAV short
+    reason: str  # human-readable justification
+    signal_id: str | None = None  # links to AggregatedSignal that drove this
+    halt: bool = False  # if True, also enter halt for halt_scope
     halt_scope: tuple[str, str, str | None] | None = None  # (account, asset_class, asset?)
     halt_until: pd.Timestamp | None = None  # for daily-loss auto-clear
 
@@ -344,6 +354,7 @@ class Action:
 # Settlement — outcomes for analyst.update() and aggregator.update()
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class RealizedOutcome:
     """Per-analyst settlement input. Each AnalystView gets one of these."""
@@ -351,7 +362,7 @@ class RealizedOutcome:
     view: AnalystView
     asof_view: pd.Timestamp
     asof_settlement: pd.Timestamp
-    realized_return: float            # actual return over view.horizon
+    realized_return: float  # actual return over view.horizon
     direction_correct: bool
 
 
@@ -367,8 +378,8 @@ class EpisodeOutcome:
     asset: str
     timeframe: str
     asof: pd.Timestamp
-    aggregated_signal: AggregatedSignal              # contains components: tuple[AnalystView, ...]
-    realized_returns: Mapping[str, float]             # horizon -> return: {"5m": 0.003, "1h": 0.012}
+    aggregated_signal: AggregatedSignal  # contains components: tuple[AnalystView, ...]
+    realized_returns: Mapping[str, float]  # horizon -> return: {"5m": 0.003, "1h": 0.012}
     direction_correct: Mapping[str, bool]
     realized_net_pnl: float | None = None
     """Actual after-fee P&L from executions.jsonl (ADR-0009 §P0-3).
@@ -378,6 +389,7 @@ class EpisodeOutcome:
 # ---------------------------------------------------------------------------
 # Calibrator (per-analyst and per-aggregator)
 # ---------------------------------------------------------------------------
+
 
 class Calibrator(Protocol):
     """Maps raw confidence scores to calibrated probabilities (ADR-0009 §P0-2).
@@ -400,6 +412,7 @@ class Calibrator(Protocol):
 # Analyst, Aggregator, RiskGate Protocols
 # ---------------------------------------------------------------------------
 
+
 @runtime_checkable
 class Analyst(Protocol):
     """An analyst module emits AnalystViews from MarketContexts.
@@ -413,9 +426,11 @@ class Analyst(Protocol):
     enabled: bool
 
     def analyze(self, ctx: MarketContext) -> AnalystView | None: ...
+
     """Returns None if no view (out-of-scope, insufficient context, etc.)."""
 
     def health(self) -> dict: ...
+
     """Surfaces in `quant_doctor`. Must include {n_views_emitted, last_view_at,
     error_count, calibrator_status}."""
 
@@ -423,6 +438,7 @@ class Analyst(Protocol):
 @runtime_checkable
 class StatefulAnalyst(Analyst, Protocol):
     """Analysts that learn from realized outcomes implement update()."""
+
     def update(self, outcome: RealizedOutcome) -> None: ...
 
 
@@ -435,10 +451,10 @@ class Aggregator(Protocol):
 
     name: str
 
-    def aggregate(self, views: list[AnalystView],
-                  context: MarketContext) -> AggregatedSignal: ...
+    def aggregate(self, views: list[AnalystView], context: MarketContext) -> AggregatedSignal: ...
 
     def update(self, outcome: EpisodeOutcome) -> None: ...
+
     """Settlement loop calls this per cross-sectional episode."""
 
 
@@ -453,16 +469,21 @@ class RiskGate(Protocol):
       - Hard rules — aggregator (RL or otherwise) cannot bypass
     """
 
-    def gate(self, signal: AggregatedSignal,
-             market: MarketState,
-             portfolio: Portfolio,
-             halt_state: HaltState) -> Action | None: ...
+    def gate(
+        self,
+        signal: AggregatedSignal,
+        market: MarketState,
+        portfolio: Portfolio,
+        halt_state: HaltState,
+    ) -> Action | None: ...
+
     """Returns None for silence, Action for decision."""
 
 
 # ---------------------------------------------------------------------------
 # DataProvider Protocol
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class DataProvider(Protocol):
@@ -473,18 +494,24 @@ class DataProvider(Protocol):
     timeframes: list[str]
     requires_credentials: bool
 
-    def fetch_bars(self, asset: str, timeframe: str,
-                   start: pd.Timestamp, end: pd.Timestamp,
-                   *, use_cache: bool = True,
-                   as_of: pd.Timestamp | None = None) -> pd.DataFrame: ...
+    def fetch_bars(
+        self,
+        asset: str,
+        timeframe: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        *,
+        use_cache: bool = True,
+        as_of: pd.Timestamp | None = None,
+    ) -> pd.DataFrame: ...
+
     """Per ADR-0005 amendment 2026-05-13 (Wave C.1): `as_of` enforces
     point-in-time semantics at the LEAF (data layer), preventing
     lookahead bias from any caller that forgets to filter. When set,
     bars with `timestamp > as_of` MUST be filtered out before return.
     Default None = current behavior (no filter)."""
 
-    def fetch_latest(self, asset: str, timeframe: str,
-                     lookback: int = 500) -> pd.DataFrame: ...
+    def fetch_latest(self, asset: str, timeframe: str, lookback: int = 500) -> pd.DataFrame: ...
 
     def health(self) -> dict: ...
 
@@ -492,6 +519,7 @@ class DataProvider(Protocol):
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
+
 
 class HermesQuantError(Exception):
     """Base for all hermes-quant errors."""

@@ -1,4 +1,5 @@
 """Wave I — walk-forward replay composition."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -15,14 +16,16 @@ def _bars(n: int = 600, *, seed: int = 42, drift: float = 0.01, vol: float = 0.4
     rng = np.random.default_rng(seed)
     ts = pd.date_range("2023-01-01", periods=n, freq="1h", tz="UTC")
     closes = 100 + np.cumsum(rng.normal(drift, vol, n))
-    return pd.DataFrame({
-        "timestamp": ts,
-        "open": closes - 0.1,
-        "high": closes + 0.5,
-        "low": closes - 0.5,
-        "close": closes,
-        "volume": 1000.0,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": closes - 0.1,
+            "high": closes + 0.5,
+            "low": closes - 0.5,
+            "close": closes,
+            "volume": 1000.0,
+        }
+    )
 
 
 def _advisor(direction=0):
@@ -42,13 +45,17 @@ def _advisor(direction=0):
             },
             "risk_gate": {"pass": direction != 0, "kelly_fraction": 0.10 if direction else 0.0},
             "analyst_views": [
-                {"analyst": "wf_voice", "direction": direction,
-                 "magnitude": 0.5 if direction else 0.0,
-                 "confidence": 0.7 if direction else 0.0,
-                 "confidence_raw": 0.7 if direction else 0.0,
-                 "horizon": "1h"},
+                {
+                    "analyst": "wf_voice",
+                    "direction": direction,
+                    "magnitude": 0.5 if direction else 0.0,
+                    "confidence": 0.7 if direction else 0.0,
+                    "confidence_raw": 0.7 if direction else 0.0,
+                    "horizon": "1h",
+                },
             ],
         }
+
     return fake_advisor
 
 

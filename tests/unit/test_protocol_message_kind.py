@@ -7,6 +7,7 @@ Steals AI-Trader's signal-type discriminator pattern:
 Together these enforce channel separation at the type level so downstream
 consumers don't have to string-grep to find the actionable record.
 """
+
 from __future__ import annotations
 
 import pandas as pd
@@ -69,6 +70,7 @@ def _make_proposal(**overrides) -> Proposal:
 # AnalystView
 # ---------------------------------------------------------------------------
 
+
 def test_analystview_message_kind_default_discussion() -> None:
     """Default AnalystView is on the 'discussion' channel — pure commentary."""
     view = _make_view()
@@ -91,6 +93,7 @@ def test_analystview_rejects_unknown_kind() -> None:
 # AggregatedSignal
 # ---------------------------------------------------------------------------
 
+
 def test_aggregatedsignal_message_kind_default_discussion() -> None:
     """Default AggregatedSignal is also 'discussion' — only the risk gate
     promotes it to an actionable channel by minting a Proposal."""
@@ -101,6 +104,7 @@ def test_aggregatedsignal_message_kind_default_discussion() -> None:
 # ---------------------------------------------------------------------------
 # Proposal
 # ---------------------------------------------------------------------------
+
 
 def test_proposal_default_message_kind_is_operation() -> None:
     """Proposals are pinned to the 'operation' channel by default."""
@@ -125,6 +129,7 @@ def test_proposal_required_fields_enforced() -> None:
 # ---------------------------------------------------------------------------
 # Drift guard
 # ---------------------------------------------------------------------------
+
 
 def test_message_kind_literal_set_matches_dataclass_runtime_check() -> None:
     """If MessageKind grows a new value but _MESSAGE_KIND_VALUES doesn't (or

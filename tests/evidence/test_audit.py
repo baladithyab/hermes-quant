@@ -1,4 +1,5 @@
 """Tests for hermes_quant.evidence.audit (Wave B.5 / ADR-0033 D6)."""
+
 from __future__ import annotations
 
 import json
@@ -45,8 +46,14 @@ class _MockStore:
         return chain
 
 
-def _row(eid: str, *, kind: str = "ohlcv", source: str = "yfinance",
-         supersedes: str | None = None, payload_ref: str | None = None) -> dict[str, Any]:
+def _row(
+    eid: str,
+    *,
+    kind: str = "ohlcv",
+    source: str = "yfinance",
+    supersedes: str | None = None,
+    payload_ref: str | None = None,
+) -> dict[str, Any]:
     return {
         "id": eid,
         "kind": kind,
@@ -227,11 +234,13 @@ def test_audit_tree_to_tree_text_marks_missing_evidence_with_bang() -> None:
 def test_supersedes_history_returns_most_recent_first() -> None:
     a, b, c = str(uuid4()), str(uuid4()), str(uuid4())
     # Chain: C -> B -> A (C is the most recent correction; A is the original)
-    store = _MockStore(rows={
-        a: _row(a, supersedes=None),
-        b: _row(b, supersedes=a),
-        c: _row(c, supersedes=b),
-    })
+    store = _MockStore(
+        rows={
+            a: _row(a, supersedes=None),
+            b: _row(b, supersedes=a),
+            c: _row(c, supersedes=b),
+        }
+    )
 
     history = supersedes_history(c, store)
 
@@ -247,10 +256,12 @@ def test_supersedes_history_returns_most_recent_first() -> None:
 def test_supersedes_history_terminates_on_broken_chain() -> None:
     # Cycle: A -> B -> A. Mock store's chain walker uses `seen` set to guard.
     a, b = str(uuid4()), str(uuid4())
-    store = _MockStore(rows={
-        a: _row(a, supersedes=b),
-        b: _row(b, supersedes=a),
-    })
+    store = _MockStore(
+        rows={
+            a: _row(a, supersedes=b),
+            b: _row(b, supersedes=a),
+        }
+    )
 
     history = supersedes_history(a, store)
 

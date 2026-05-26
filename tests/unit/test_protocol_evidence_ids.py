@@ -2,6 +2,7 @@
 
 Phase 1: field is optional, defaults to empty tuple, no CI gate yet.
 """
+
 from __future__ import annotations
 
 import dataclasses

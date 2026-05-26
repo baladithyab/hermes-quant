@@ -11,6 +11,7 @@ Public API:
 
 Cross-cuts ADR-0014 (advisor), ADR-0019 (DSR), AGENTS.md "Reproducibility".
 """
+
 from .portfolio import PaperPortfolio
 from .replay import BacktestResult, replay
 from .walk_forward import (

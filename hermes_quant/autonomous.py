@@ -26,6 +26,7 @@ start drops below `quant.autonomous.kill_switch_pct`, the orchestrator
 returns disabled-with-alert and refuses further fires until the
 operator runs `hermes quant autonomous reset --confirm`.
 """
+
 from __future__ import annotations
 
 import json
@@ -53,14 +54,17 @@ KILL_SWITCH_PATH = QUANT_HOME / "autonomous_kill_switch.json"
 # Config helpers
 # ---------------------------------------------------------------------------
 
+
 def _read_config() -> dict:
     """Read ~/.hermes/config.yaml (profile-aware via watchlist module)."""
     from hermes_quant.watchlist import get_config_path
+
     path = get_config_path()
     if not path.exists():
         return {}
     try:
         import yaml
+
         return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception as exc:
         logger.warning("autonomous: config read failed: %s", exc)
@@ -69,7 +73,7 @@ def _read_config() -> dict:
 
 def _read_pdr_mode() -> str:
     cfg = _read_config()
-    pdr = ((cfg.get("quant") or {}).get("pdr") or {})
+    pdr = (cfg.get("quant") or {}).get("pdr") or {}
     mode = pdr.get("mode", "advise")
     return mode if mode in {"advise", "hitl", "autonomous"} else "advise"
 
@@ -102,6 +106,7 @@ def _read_safety_rails() -> dict:
 # Kill-switch state
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class KillSwitchState:
     tripped: bool
@@ -116,8 +121,11 @@ def _read_kill_switch() -> KillSwitchState:
     return not-tripped state."""
     if not KILL_SWITCH_PATH.exists():
         return KillSwitchState(
-            tripped=False, tripped_at=None,
-            cumulative_pnl_pct=0.0, threshold_pct=0.10, reason=None,
+            tripped=False,
+            tripped_at=None,
+            cumulative_pnl_pct=0.0,
+            threshold_pct=0.10,
+            reason=None,
         )
     try:
         d = json.loads(KILL_SWITCH_PATH.read_text(encoding="utf-8"))
@@ -131,13 +139,15 @@ def _read_kill_switch() -> KillSwitchState:
     except Exception as exc:
         logger.warning("autonomous: kill-switch read failed: %s", exc)
         return KillSwitchState(
-            tripped=False, tripped_at=None,
-            cumulative_pnl_pct=0.0, threshold_pct=0.10, reason=None,
+            tripped=False,
+            tripped_at=None,
+            cumulative_pnl_pct=0.0,
+            threshold_pct=0.10,
+            reason=None,
         )
 
 
-def trip_kill_switch(*, cumulative_pnl_pct: float, threshold_pct: float,
-                     reason: str) -> None:
+def trip_kill_switch(*, cumulative_pnl_pct: float, threshold_pct: float, reason: str) -> None:
     KILL_SWITCH_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "tripped": True,
@@ -169,6 +179,7 @@ def reset_kill_switch() -> bool:
 # ---------------------------------------------------------------------------
 # Tick orchestration
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SymbolDecision:
@@ -267,7 +278,9 @@ def tick(
     # Mode gate
     if mode != "autonomous":
         return TickResult(
-            asof=asof, mode=mode, dry_run=dry_run,
+            asof=asof,
+            mode=mode,
+            dry_run=dry_run,
             watchlist_size=0,
             decisions=[],
             errors=1,
@@ -278,7 +291,9 @@ def tick(
     ks = _read_kill_switch()
     if ks.tripped:
         return TickResult(
-            asof=asof, mode=mode, dry_run=dry_run,
+            asof=asof,
+            mode=mode,
+            dry_run=dry_run,
             watchlist_size=0,
             decisions=[],
             errors=0,
@@ -294,7 +309,9 @@ def tick(
     rails = _read_safety_rails()
 
     result = TickResult(
-        asof=asof, mode=mode, dry_run=dry_run,
+        asof=asof,
+        mode=mode,
+        dry_run=dry_run,
         watchlist_size=len(watchlist),
         kill_switch_state=ks,
     )
@@ -316,15 +333,19 @@ def tick(
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "autonomous: advisor failed for %s: %s",
-                entry.symbol, exc, exc_info=True,
+                entry.symbol,
+                exc,
+                exc_info=True,
             )
-            result.decisions.append(SymbolDecision(
-                symbol=entry.symbol,
-                asset_class=entry.asset_class,
-                timeframe=entry.timeframe,
-                gate="ERROR",
-                error=f"advisor failed: {exc}",
-            ))
+            result.decisions.append(
+                SymbolDecision(
+                    symbol=entry.symbol,
+                    asset_class=entry.asset_class,
+                    timeframe=entry.timeframe,
+                    gate="ERROR",
+                    error=f"advisor failed: {exc}",
+                )
+            )
             result.errors += 1
             continue
 
@@ -384,7 +405,9 @@ def tick(
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "autonomous: React failed for %s: %s",
-                        entry.symbol, exc, exc_info=True,
+                        entry.symbol,
+                        exc,
+                        exc_info=True,
                     )
                     decision.error = f"react_failed: {exc}"
                     decision.gate = "ERROR"
@@ -424,14 +447,12 @@ def _react(
     pid = _make_proposal_id(entry.symbol, _utc_now())
     proposal = Proposal(
         proposal_id=pid,
-        state="approved",   # synthetic; never written to store
+        state="approved",  # synthetic; never written to store
         symbol=entry.symbol,
         asset_class=entry.asset_class,
         timeframe=entry.timeframe,
-        created_at=advisor_result.get("as_of") or _utc_now().strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        ),
-        expires_at="",   # unused for autonomous
+        created_at=advisor_result.get("as_of") or _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        expires_at="",  # unused for autonomous
         approved_at=_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         approver_user_id="autonomous",
         advisor_result=advisor_result,
@@ -449,6 +470,7 @@ def _react(
     # across HITL and autonomous).
     try:
         from hermes_quant.journal.writer import append_human_override
+
         append_human_override(
             proposal,
             kind="approve",

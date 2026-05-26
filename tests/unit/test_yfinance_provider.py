@@ -5,6 +5,7 @@ in normal CI; manually invoke before tagging a release.
 
 Other tests use mocked yfinance — just verify the contract.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -60,7 +61,8 @@ class TestFetchBarsWithMockedYf:
         p._yf = mock_yf
 
         out = p.fetch_bars(
-            "AAPL", "1h",
+            "AAPL",
+            "1h",
             pd.Timestamp("2026-05-12T00:00:00Z"),
             pd.Timestamp("2026-05-14T00:00:00Z"),
         )
@@ -74,7 +76,8 @@ class TestFetchBarsWithMockedYf:
         p = YFinanceProvider()
         with pytest.raises(DataProviderError, match="not supported"):
             p.fetch_bars(
-                "AAPL", "30s",  # invalid
+                "AAPL",
+                "30s",  # invalid
                 pd.Timestamp("2026-05-12T00:00:00Z"),
                 pd.Timestamp("2026-05-13T00:00:00Z"),
             )
@@ -84,7 +87,8 @@ class TestFetchBarsWithMockedYf:
         p = YFinanceProvider()
         with pytest.raises(DataProviderError, match="not supported"):
             p.fetch_bars(
-                "AAPL", "4h",
+                "AAPL",
+                "4h",
                 pd.Timestamp("2026-05-12T00:00:00Z"),
                 pd.Timestamp("2026-05-13T00:00:00Z"),
             )
@@ -101,7 +105,8 @@ class TestFetchBarsWithMockedYf:
 
         with pytest.raises(RateLimitError):
             p.fetch_bars(
-                "AAPL", "1h",
+                "AAPL",
+                "1h",
                 pd.Timestamp("2026-05-12T00:00:00Z"),
                 pd.Timestamp("2026-05-13T00:00:00Z"),
             )
@@ -119,7 +124,8 @@ class TestFetchBarsWithMockedYf:
 
         with pytest.raises(DataProviderError):
             p.fetch_bars(
-                "AAPL", "1h",
+                "AAPL",
+                "1h",
                 pd.Timestamp("2026-05-12T00:00:00Z"),
                 pd.Timestamp("2026-05-13T00:00:00Z"),
             )
@@ -144,9 +150,7 @@ class TestFetchBarsWithMockedYf:
                 "Close": [100.5],
                 "Volume": [1000],
             },
-            index=pd.DatetimeIndex(
-                [pd.Timestamp("2026-05-12T14:00:00Z")], tz="UTC"
-            ),
+            index=pd.DatetimeIndex([pd.Timestamp("2026-05-12T14:00:00Z")], tz="UTC"),
         )
         mock_ticker.history.side_effect = [
             Exception("HTTP 429: Too Many Requests"),  # transient
@@ -162,8 +166,8 @@ class TestFetchBarsWithMockedYf:
                 "Volume": [1000, 1100],
             },
             index=pd.DatetimeIndex(
-                [pd.Timestamp("2026-05-12T14:00:00Z"),
-                 pd.Timestamp("2026-05-12T15:00:00Z")], tz="UTC"
+                [pd.Timestamp("2026-05-12T14:00:00Z"), pd.Timestamp("2026-05-12T15:00:00Z")],
+                tz="UTC",
             ),
         )
         mock_ticker.history.side_effect = [
@@ -175,7 +179,8 @@ class TestFetchBarsWithMockedYf:
         p._yf = mock_yf
 
         bars = p.fetch_bars(
-            "AAPL", "1h",
+            "AAPL",
+            "1h",
             pd.Timestamp("2026-05-12T00:00:00Z"),
             pd.Timestamp("2026-05-13T00:00:00Z"),
         )
@@ -197,7 +202,8 @@ class TestFetchBarsWithMockedYf:
 
         with pytest.raises(RateLimitError):
             p.fetch_bars(
-                "AAPL", "1h",
+                "AAPL",
+                "1h",
                 pd.Timestamp("2026-05-12T00:00:00Z"),
                 pd.Timestamp("2026-05-13T00:00:00Z"),
             )
@@ -214,7 +220,8 @@ class TestFetchBarsWithMockedYf:
 
         with pytest.raises(DataQualityError):
             p.fetch_bars(
-                "AAPL", "1h",
+                "AAPL",
+                "1h",
                 pd.Timestamp("2026-05-12T00:00:00Z"),
                 pd.Timestamp("2026-05-13T00:00:00Z"),
             )
@@ -247,7 +254,8 @@ class TestHealth:
         p._yf = mock_yf
 
         p.fetch_bars(
-            "AAPL", "1h",
+            "AAPL",
+            "1h",
             pd.Timestamp("2026-05-12T00:00:00Z"),
             pd.Timestamp("2026-05-13T00:00:00Z"),
         )
@@ -261,6 +269,7 @@ class TestHealth:
 # Optional network-bound tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.requires_network
 @pytest.mark.skip(reason="network-bound; run manually before release")
 class TestRealNetwork:
@@ -269,7 +278,8 @@ class TestRealNetwork:
     def test_real_fetch_aapl_1d(self):
         p = YFinanceProvider()
         bars = p.fetch_bars(
-            "AAPL", "1d",
+            "AAPL",
+            "1d",
             pd.Timestamp("2024-01-01T00:00:00Z"),
             pd.Timestamp("2024-02-01T00:00:00Z"),
         )

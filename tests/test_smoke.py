@@ -2,6 +2,7 @@
 
 Per references/plugin-authoring.md "Smoke-testing your plugin BEFORE pushing".
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock
 def test_register_runs_clean():
     """Critical: register(ctx) MUST run without error, register expected things."""
     import hermes_quant
+
     ctx = MagicMock()
     ctx.register_tool = MagicMock()
     ctx.register_command = MagicMock()
@@ -49,6 +51,7 @@ def test_protocol_contracts_importable():
         AnalystView,
         MarketContext,
     )
+
     # Just verify they're real classes
     assert hasattr(MarketContext, "__dataclass_fields__")
     assert hasattr(AnalystView, "__dataclass_fields__")
@@ -59,6 +62,7 @@ def test_protocol_contracts_importable():
 def test_plugin_yaml_valid():
     """plugin.yaml must parse and have required fields."""
     import yaml
+
     p = Path(__file__).parent.parent / "plugin.yaml"
     assert p.exists(), f"plugin.yaml missing at {p}"
     data = yaml.safe_load(p.read_text())
@@ -66,8 +70,9 @@ def test_plugin_yaml_valid():
     assert data["kind"] == "standalone"
     assert "manifest_version" in data
     # Must use optional_env, NOT requires_env (per references/plugin-authoring.md)
-    assert "requires_env" not in data, ("requires_env BLOCKS install. "
-                                          "Use optional_env per plugin-authoring guide.")
+    assert "requires_env" not in data, (
+        "requires_env BLOCKS install. Use optional_env per plugin-authoring guide."
+    )
     assert "optional_env" in data
 
 
@@ -76,6 +81,7 @@ def test_no_eager_heavy_imports():
     Heavy deps must be lazy-loaded inside analyst/aggregator code.
     """
     import sys
+
     # Reset modules that might be cached from earlier tests
     for mod in list(sys.modules):
         if mod.startswith("hermes_quant") or mod in ("torch", "sklearn"):
@@ -84,6 +90,7 @@ def test_no_eager_heavy_imports():
     from unittest.mock import MagicMock
 
     import hermes_quant
+
     ctx = MagicMock()
     hermes_quant.register(ctx)
 
@@ -102,11 +109,27 @@ def test_canonical_cli_surface():
     setup_argparse(parser)
 
     expected_subcommands = {
-        "setup", "start", "stop", "restart", "uninstall", "status",
-        "resume", "halt", "emergency-stop",
-        "signals", "show-views", "doctor", "logs", "recipes", "semantic-packet",
-        "committee", "perception", "backtest", "backtest-replay",
-        "freqtrade-setup", "freqtrade-backtest",
+        "setup",
+        "start",
+        "stop",
+        "restart",
+        "uninstall",
+        "status",
+        "resume",
+        "halt",
+        "emergency-stop",
+        "signals",
+        "show-views",
+        "doctor",
+        "logs",
+        "recipes",
+        "semantic-packet",
+        "committee",
+        "perception",
+        "backtest",
+        "backtest-replay",
+        "freqtrade-setup",
+        "freqtrade-backtest",
         "config",
     }
     # Parse a sample to verify the parser has all subcommands
@@ -128,9 +151,17 @@ def test_canonical_cli_surface():
             elif sub == "perception":
                 parser.parse_args([sub, "start", "--asset", "BTC/USDT", "--dry-run"])
             elif sub == "backtest":
-                parser.parse_args([sub, "--symbol", "BTC/USDT",
-                                   "--asset-class", "crypto",
-                                   "--bars-file", "/dev/null"])
+                parser.parse_args(
+                    [
+                        sub,
+                        "--symbol",
+                        "BTC/USDT",
+                        "--asset-class",
+                        "crypto",
+                        "--bars-file",
+                        "/dev/null",
+                    ]
+                )
             elif sub == "backtest-replay":
                 parser.parse_args([sub, "test-run-id"])
             elif sub == "freqtrade-backtest":

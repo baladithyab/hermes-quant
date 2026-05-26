@@ -4,6 +4,7 @@ Anchor: synthesis-v2 §P0-A. The amended ADR-0009 §P0-1 used `edge = p*m`
 which overestimates edge whenever p > 0.5. This test suite enforces the
 corrected formula.
 """
+
 from __future__ import annotations
 
 import math

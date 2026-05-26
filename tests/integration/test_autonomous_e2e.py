@@ -11,6 +11,7 @@ Covers:
   - empty watchlist no-op
   - reset_kill_switch recovers
 """
+
 from __future__ import annotations
 
 import json
@@ -33,10 +34,12 @@ def isolate_quant_home(tmp_path, monkeypatch):
     qhome = tmp_path / "quant"
     qhome.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(
-        "hermes_quant.autonomous.QUANT_HOME", qhome,
+        "hermes_quant.autonomous.QUANT_HOME",
+        qhome,
     )
     monkeypatch.setattr(
-        "hermes_quant.autonomous.KILL_SWITCH_PATH", qhome / "autonomous_kill_switch.json",
+        "hermes_quant.autonomous.KILL_SWITCH_PATH",
+        qhome / "autonomous_kill_switch.json",
     )
     return qhome
 
@@ -45,7 +48,8 @@ def isolate_quant_home(tmp_path, monkeypatch):
 def isolate_config(tmp_path, monkeypatch):
     cfg = tmp_path / "config.yaml"
     monkeypatch.setattr(
-        "hermes_quant.watchlist.get_config_path", lambda: cfg,
+        "hermes_quant.watchlist.get_config_path",
+        lambda: cfg,
     )
     # autonomous module reads via watchlist's get_config_path, so this is enough
     return cfg
@@ -53,6 +57,7 @@ def isolate_config(tmp_path, monkeypatch):
 
 def _set_mode_autonomous(cfg_path: Path):
     import yaml
+
     cfg = {}
     if cfg_path.exists():
         cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
@@ -62,8 +67,14 @@ def _set_mode_autonomous(cfg_path: Path):
 
 
 def _make_advisor_result(
-    *, confidence=0.85, direction=1, magnitude=0.05,
-    n_voices=2, risk_pass=True, kelly=0.05, atr_rel=0.05,
+    *,
+    confidence=0.85,
+    direction=1,
+    magnitude=0.05,
+    n_voices=2,
+    risk_pass=True,
+    kelly=0.05,
+    atr_rel=0.05,
     lessons=None,
 ):
     return {
@@ -82,8 +93,7 @@ def _make_advisor_result(
             "gated_reason": None if risk_pass else "vetoed",
         },
         "analyst_views": [
-            {"analyst": f"A{i}", "metadata": {"atr_relative": atr_rel}}
-            for i in range(n_voices)
+            {"analyst": f"A{i}", "metadata": {"atr_relative": atr_rel}} for i in range(n_voices)
         ],
         "lessons": lessons or [],
     }
@@ -92,6 +102,7 @@ def _make_advisor_result(
 # ---------------------------------------------------------------------------
 # Mode gate
 # ---------------------------------------------------------------------------
+
 
 def test_tick_returns_mode_mismatch_when_advise(isolate_config, isolate_quant_home):
     # Default mode is 'advise' (no config written -> _read_pdr_mode returns advise)
@@ -106,7 +117,7 @@ def test_tick_runs_when_mode_autonomous(isolate_config, isolate_quant_home):
     _set_mode_autonomous(isolate_config)
     result = tick(
         dry_run=True,
-        symbols=[],   # empty watchlist
+        symbols=[],  # empty watchlist
         advisor_recommend=lambda **kw: _make_advisor_result(),
     )
     assert result.mode == "autonomous"
@@ -116,6 +127,7 @@ def test_tick_runs_when_mode_autonomous(isolate_config, isolate_quant_home):
 # ---------------------------------------------------------------------------
 # Empty watchlist
 # ---------------------------------------------------------------------------
+
 
 def test_tick_empty_watchlist_is_noop(isolate_config, isolate_quant_home):
     _set_mode_autonomous(isolate_config)
@@ -134,8 +146,10 @@ def test_tick_empty_watchlist_is_noop(isolate_config, isolate_quant_home):
 # Dry-run safety
 # ---------------------------------------------------------------------------
 
+
 def test_dry_run_does_not_react_even_on_fire(
-    isolate_config, isolate_quant_home,
+    isolate_config,
+    isolate_quant_home,
 ):
     """Even when the gate FIREs, dry_run=True must NOT call PaperReactor."""
     _set_mode_autonomous(isolate_config)
@@ -147,7 +161,7 @@ def test_dry_run_does_not_react_even_on_fire(
 
     with mock.patch(
         "hermes_quant.autonomous._react",
-        side_effect=lambda *a, **k: react_calls.append((a, k)) or "exec_xxx"
+        side_effect=lambda *a, **k: react_calls.append((a, k)) or "exec_xxx",
     ):
         result = tick(
             dry_run=True,
@@ -156,12 +170,13 @@ def test_dry_run_does_not_react_even_on_fire(
         )
 
     assert result.fires == 1
-    assert react_calls == []   # KEY: no React in dry-run
+    assert react_calls == []  # KEY: no React in dry-run
     assert result.decisions[0].execution_id is None  # unset in dry-run
 
 
 def test_no_dry_run_calls_react_on_fire(
-    isolate_config, isolate_quant_home,
+    isolate_config,
+    isolate_quant_home,
 ):
     _set_mode_autonomous(isolate_config)
 
@@ -172,7 +187,8 @@ def test_no_dry_run_calls_react_on_fire(
         return f"exec_{entry.symbol}"
 
     with mock.patch(
-        "hermes_quant.autonomous._react", side_effect=fake_react,
+        "hermes_quant.autonomous._react",
+        side_effect=fake_react,
     ):
         result = tick(
             dry_run=False,
@@ -189,8 +205,10 @@ def test_no_dry_run_calls_react_on_fire(
 # max_per_tick_opens cap
 # ---------------------------------------------------------------------------
 
+
 def test_max_per_tick_opens_caps_fires(
-    isolate_config, isolate_quant_home,
+    isolate_config,
+    isolate_quant_home,
 ):
     """First FIRE goes through; subsequent FIREs become SILENCE_PER_TICK_CAP."""
     _set_mode_autonomous(isolate_config)
@@ -218,10 +236,12 @@ def test_max_per_tick_opens_caps_fires(
 # Kill-switch
 # ---------------------------------------------------------------------------
 
+
 def test_kill_switch_trip_halts_tick(isolate_config, isolate_quant_home):
     _set_mode_autonomous(isolate_config)
     trip_kill_switch(
-        cumulative_pnl_pct=-0.15, threshold_pct=0.10,
+        cumulative_pnl_pct=-0.15,
+        threshold_pct=0.10,
         reason="manual_test_trip",
     )
     result = tick(
@@ -231,15 +251,15 @@ def test_kill_switch_trip_halts_tick(isolate_config, isolate_quant_home):
     )
     assert result.kill_switch_state.tripped is True
     assert result.fires == 0
-    assert result.decisions == []   # tick aborts before evaluating symbols
+    assert result.decisions == []  # tick aborts before evaluating symbols
 
 
 def test_reset_kill_switch_resumes_normal_operation(
-    isolate_config, isolate_quant_home,
+    isolate_config,
+    isolate_quant_home,
 ):
     _set_mode_autonomous(isolate_config)
-    trip_kill_switch(cumulative_pnl_pct=-0.15, threshold_pct=0.10,
-                     reason="test")
+    trip_kill_switch(cumulative_pnl_pct=-0.15, threshold_pct=0.10, reason="test")
     cleared = reset_kill_switch()
     assert cleared is True
 
@@ -253,7 +273,8 @@ def test_reset_kill_switch_resumes_normal_operation(
 
 
 def test_reset_kill_switch_when_not_tripped_returns_false(
-    isolate_config, isolate_quant_home,
+    isolate_config,
+    isolate_quant_home,
 ):
     assert reset_kill_switch() is False
 
@@ -262,8 +283,10 @@ def test_reset_kill_switch_when_not_tripped_returns_false(
 # Per-symbol error isolation
 # ---------------------------------------------------------------------------
 
+
 def test_advisor_failure_for_one_symbol_does_not_break_tick(
-    isolate_config, isolate_quant_home,
+    isolate_config,
+    isolate_quant_home,
 ):
     _set_mode_autonomous(isolate_config)
 
@@ -293,14 +316,21 @@ def test_advisor_failure_for_one_symbol_does_not_break_tick(
 # All silence reasons appear in output
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("scenario,expected_gate", [
-    ("low_confidence", "SILENCE_LOW_CONFIDENCE"),
-    ("low_urgency", "SILENCE_LOW_URGENCY"),
-    ("insufficient_voices", "SILENCE_INSUFFICIENT_VOICES"),
-    ("gated_by_advisor", "SILENCE_GATED_BY_ADVISOR"),
-])
+
+@pytest.mark.parametrize(
+    "scenario,expected_gate",
+    [
+        ("low_confidence", "SILENCE_LOW_CONFIDENCE"),
+        ("low_urgency", "SILENCE_LOW_URGENCY"),
+        ("insufficient_voices", "SILENCE_INSUFFICIENT_VOICES"),
+        ("gated_by_advisor", "SILENCE_GATED_BY_ADVISOR"),
+    ],
+)
 def test_all_silence_reasons_surface(
-    isolate_config, isolate_quant_home, scenario, expected_gate,
+    isolate_config,
+    isolate_quant_home,
+    scenario,
+    expected_gate,
 ):
     _set_mode_autonomous(isolate_config)
 
@@ -329,6 +359,7 @@ def test_all_silence_reasons_surface(
 # Tick output shape (operator-readable per ADR-0016 §D8)
 # ---------------------------------------------------------------------------
 
+
 def test_tick_output_to_dict_shape(isolate_config, isolate_quant_home):
     _set_mode_autonomous(isolate_config)
     result = tick(
@@ -350,7 +381,7 @@ def test_tick_output_to_dict_shape(isolate_config, isolate_quant_home):
 
     # Must be JSON-serializable
     serialized = json.dumps(out, default=str)
-    assert serialized   # didn't raise
+    assert serialized  # didn't raise
 
     # Each decision has required fields
     for d in out["decisions"]:
@@ -360,11 +391,13 @@ def test_tick_output_to_dict_shape(isolate_config, isolate_quant_home):
 
 
 def test_fire_decision_includes_action_and_execution_id(
-    isolate_config, isolate_quant_home,
+    isolate_config,
+    isolate_quant_home,
 ):
     _set_mode_autonomous(isolate_config)
     with mock.patch(
-        "hermes_quant.autonomous._react", return_value="exec_AAPL_001",
+        "hermes_quant.autonomous._react",
+        return_value="exec_AAPL_001",
     ):
         result = tick(
             dry_run=False,
@@ -384,8 +417,10 @@ def test_fire_decision_includes_action_and_execution_id(
 # React error isolation
 # ---------------------------------------------------------------------------
 
+
 def test_react_failure_marks_decision_error_but_continues(
-    isolate_config, isolate_quant_home,
+    isolate_config,
+    isolate_quant_home,
 ):
     _set_mode_autonomous(isolate_config)
 
@@ -395,7 +430,8 @@ def test_react_failure_marks_decision_error_but_continues(
         return f"exec_{entry.symbol}"
 
     with mock.patch(
-        "hermes_quant.autonomous._react", side_effect=fake_react,
+        "hermes_quant.autonomous._react",
+        side_effect=fake_react,
     ):
         result = tick(
             dry_run=False,

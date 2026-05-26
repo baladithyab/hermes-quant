@@ -25,6 +25,7 @@ flock-protected append helper as the daemon (synthesis-v2 §P0-B).
 This is intentionally TINY (~250 LOC). The intelligence is upstream in
 hermes-quant; freqtrade owns order management.
 """
+
 from __future__ import annotations
 
 import fcntl
@@ -90,9 +91,13 @@ def _emit_execution(record: dict) -> None:
         logger.error(
             "execution record too large (%d bytes > %d cap); DROPPED — "
             "signal_id=%s exec_id=%s asset=%s side=%s qty=%s",
-            len(encoded), RECORD_BYTE_CAP,
-            record.get("signal_id"), record.get("exec_id"),
-            record.get("asset"), record.get("side"), record.get("qty"),
+            len(encoded),
+            RECORD_BYTE_CAP,
+            record.get("signal_id"),
+            record.get("exec_id"),
+            record.get("asset"),
+            record.get("side"),
+            record.get("qty"),
         )
         return
     try:
@@ -116,7 +121,7 @@ def _read_jsonl_tail(path: Path, n: int = 1000, max_chunk: int = 4_194_304) -> l
         first_nl = chunk.find(b"\n")
         if first_nl < 0:
             return []
-        chunk = chunk[first_nl + 1:]
+        chunk = chunk[first_nl + 1 :]
     out = []
     for line in chunk.split(b"\n"):
         if not line:
@@ -131,6 +136,7 @@ def _read_jsonl_tail(path: Path, n: int = 1000, max_chunk: int = 4_194_304) -> l
 # ---------------------------------------------------------------------------
 # HermesQuantConsumer strategy
 # ---------------------------------------------------------------------------
+
 
 class HermesQuantConsumer(IStrategy):
     """Freqtrade strategy that consumes signals from hermes-quant daemon."""
@@ -154,7 +160,7 @@ class HermesQuantConsumer(IStrategy):
     max_signal_age_minutes = 30.0
 
     minimal_roi = {"0": 100.0}  # disable freqtrade's TP/SL — daemon controls
-    stoploss = -0.99            # effectively disabled — daemon controls
+    stoploss = -0.99  # effectively disabled — daemon controls
 
     def __init__(self, config: dict | None = None, **kwargs):
         if IStrategy is not object:
@@ -177,7 +183,9 @@ class HermesQuantConsumer(IStrategy):
         if self._safe_stop_active:
             return df
 
-        signal = self._latest_signal_for(metadata["pair"], df["date"].iloc[-1] if "date" in df.columns else None)
+        signal = self._latest_signal_for(
+            metadata["pair"], df["date"].iloc[-1] if "date" in df.columns else None
+        )
         if signal is None:
             return df
         if signal.get("halt", False):
@@ -191,7 +199,9 @@ class HermesQuantConsumer(IStrategy):
         if self._safe_stop_active:
             df["exit_long"] = 1  # exit everything on safe-stop
             return df
-        signal = self._latest_signal_for(metadata["pair"], df["date"].iloc[-1] if "date" in df.columns else None)
+        signal = self._latest_signal_for(
+            metadata["pair"], df["date"].iloc[-1] if "date" in df.columns else None
+        )
         if signal is None:
             return df
         if signal.get("halt", False):
@@ -201,8 +211,19 @@ class HermesQuantConsumer(IStrategy):
             df.iloc[-1, df.columns.get_loc("exit_long")] = 1
         return df
 
-    def custom_stake_amount(self, pair: str, current_time, current_rate, proposed_stake,
-                              min_stake, max_stake, leverage, entry_tag, side, **kwargs):
+    def custom_stake_amount(
+        self,
+        pair: str,
+        current_time,
+        current_rate,
+        proposed_stake,
+        min_stake,
+        max_stake,
+        leverage,
+        entry_tag,
+        side,
+        **kwargs,
+    ):
         signal = self._latest_signal_for(pair, current_time)
         if signal is None:
             return 0
@@ -215,8 +236,9 @@ class HermesQuantConsumer(IStrategy):
             wallet_balance = max_stake
         return min(max_stake, wallet_balance * target)
 
-    def confirm_trade_entry(self, pair, order_type, amount, rate, time_in_force,
-                             current_time, entry_tag, side, **kwargs) -> bool:
+    def confirm_trade_entry(
+        self, pair, order_type, amount, rate, time_in_force, current_time, entry_tag, side, **kwargs
+    ) -> bool:
         # Refresh dead-man-switch + halt state right before entry
         self._refresh_state(current_time)
         if self._safe_stop_active:
@@ -224,8 +246,18 @@ class HermesQuantConsumer(IStrategy):
             return False
         return True
 
-    def confirm_trade_exit(self, pair, trade, order_type, amount, rate,
-                            time_in_force, sell_reason, current_time, **kwargs) -> bool:
+    def confirm_trade_exit(
+        self,
+        pair,
+        trade,
+        order_type,
+        amount,
+        rate,
+        time_in_force,
+        sell_reason,
+        current_time,
+        **kwargs,
+    ) -> bool:
         return True
 
     def order_filled(self, pair, trade, order, current_time, **kwargs) -> None:

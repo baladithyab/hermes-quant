@@ -1,4 +1,5 @@
 """Tests for hermes_quant.governance.promotion (ADR-0031 D5)."""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -156,18 +157,12 @@ def test_promotion_gate_emits_audit_event(audit_path: Path) -> None:
     _seed_passing_run(NOW, n_outcomes=100)
 
     before_rows = list(audit_log.read(kinds=["promotion_event"]))
-    n_before = sum(
-        1 for r in before_rows
-        if r.payload.get("row_type") == "evaluate_result"
-    )
+    n_before = sum(1 for r in before_rows if r.payload.get("row_type") == "evaluate_result")
 
     promotion.evaluate(NOW)
 
     after_rows = list(audit_log.read(kinds=["promotion_event"]))
-    n_after = sum(
-        1 for r in after_rows
-        if r.payload.get("row_type") == "evaluate_result"
-    )
+    n_after = sum(1 for r in after_rows if r.payload.get("row_type") == "evaluate_result")
     assert n_after == n_before + 1
 
 

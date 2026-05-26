@@ -1,4 +1,5 @@
 """Tests for V03-6: quant_doctor analyst confidence-drift surface."""
+
 from __future__ import annotations
 
 import json
@@ -24,6 +25,7 @@ def signal_bus(tmp_path, monkeypatch):
     Python code, even when function `__globals__` are stale).
     """
     import hermes_quant.tools as t
+
     bus = tmp_path / "signals.jsonl"
     exec_bus = tmp_path / "executions.jsonl"
     state_db = tmp_path / "state.db"
@@ -46,8 +48,7 @@ def _signal(views: list[tuple[str, float]], **extra) -> dict:
         "asset": extra.get("asset", "BTC/USDT"),
         "asof": extra.get("asof", "2024-06-01T00:00:00Z"),
         "analyst_views": [
-            {"analyst": name, "confidence": conf,
-             "direction": 1, "magnitude": 0.5, "horizon": "1h"}
+            {"analyst": name, "confidence": conf, "direction": 1, "magnitude": 0.5, "horizon": "1h"}
             for name, conf in views
         ],
     }
@@ -56,6 +57,7 @@ def _signal(views: list[tuple[str, float]], **extra) -> dict:
 # ===========================================================================
 # Drift computation
 # ===========================================================================
+
 
 def test_drift_empty_bus_returns_safe_default(signal_bus):
     write, bus = signal_bus
@@ -69,9 +71,7 @@ def test_drift_empty_bus_returns_safe_default(signal_bus):
 def test_drift_stable_analyst_not_flagged(signal_bus):
     """An analyst whose confidence stays at ~0.7 throughout shouldn't flag."""
     write, bus = signal_bus
-    records = [
-        _signal([("steady", 0.7)]) for _ in range(100)
-    ]
+    records = [_signal([("steady", 0.7)]) for _ in range(100)]
     write(records)
     out = _compute_drift_surface(recent_n=20, threshold=0.15, signal_bus_path=bus)
     e = out["per_analyst"]["steady"]
@@ -84,10 +84,9 @@ def test_drift_recent_shift_flags_analyst(signal_bus):
     """An analyst whose recent confidence dropped sharply should flag."""
     write, bus = signal_bus
     # 80 historical observations at 0.8, then 20 recent at 0.3
-    records = (
-        [_signal([("regime_change", 0.8)]) for _ in range(80)]
-        + [_signal([("regime_change", 0.3)]) for _ in range(20)]
-    )
+    records = [_signal([("regime_change", 0.8)]) for _ in range(80)] + [
+        _signal([("regime_change", 0.3)]) for _ in range(20)
+    ]
     write(records)
     out = _compute_drift_surface(recent_n=20, threshold=0.15, signal_bus_path=bus)
     e = out["per_analyst"]["regime_change"]
@@ -114,7 +113,7 @@ def test_drift_analyst_silent_in_recent_window_flagged(signal_bus):
     write, bus = signal_bus
     records = (
         [_signal([("vanishing", 0.7), ("loud", 0.5)]) for _ in range(30)]
-        + [_signal([("loud", 0.5)]) for _ in range(50)]      # vanishing absent
+        + [_signal([("loud", 0.5)]) for _ in range(50)]  # vanishing absent
     )
     write(records)
     out = _compute_drift_surface(recent_n=30, threshold=0.15, signal_bus_path=bus)
@@ -129,10 +128,9 @@ def test_drift_threshold_respected(signal_bus):
     """Lower threshold catches smaller drifts."""
     write, bus = signal_bus
     # 0.10 shift — not flagged at threshold=0.15, flagged at threshold=0.05
-    records = (
-        [_signal([("borderline", 0.7)]) for _ in range(80)]
-        + [_signal([("borderline", 0.6)]) for _ in range(20)]
-    )
+    records = [_signal([("borderline", 0.7)]) for _ in range(80)] + [
+        _signal([("borderline", 0.6)]) for _ in range(20)
+    ]
     write(records)
 
     loose = _compute_drift_surface(recent_n=20, threshold=0.15, signal_bus_path=bus)
@@ -163,11 +161,10 @@ def test_drift_skips_malformed_views(signal_bus):
 # Wiring: quant_doctor surfaces the drift block
 # ===========================================================================
 
+
 def test_quant_doctor_includes_drift_block(signal_bus):
     write, bus = signal_bus
-    records = [
-        _signal([("steady", 0.7)]) for _ in range(50)
-    ]
+    records = [_signal([("steady", 0.7)]) for _ in range(50)]
     write(records)
     raw = quant_doctor({})
     out = json.loads(raw)
@@ -188,13 +185,16 @@ def test_quant_doctor_drift_can_be_disabled(signal_bus):
 def test_quant_doctor_no_signal_bus_skips_drift(tmp_path, monkeypatch):
     """No signal bus on disk → drift block is None, no crash."""
     monkeypatch.setattr(
-        "hermes_quant.tools.SIGNAL_BUS_PATH", tmp_path / "missing.jsonl",
+        "hermes_quant.tools.SIGNAL_BUS_PATH",
+        tmp_path / "missing.jsonl",
     )
     monkeypatch.setattr(
-        "hermes_quant.tools.EXECUTION_BUS_PATH", tmp_path / "missing-exec.jsonl",
+        "hermes_quant.tools.EXECUTION_BUS_PATH",
+        tmp_path / "missing-exec.jsonl",
     )
     monkeypatch.setattr(
-        "hermes_quant.tools.STATE_DB_PATH", tmp_path / "missing-state.db",
+        "hermes_quant.tools.STATE_DB_PATH",
+        tmp_path / "missing-state.db",
     )
     monkeypatch.setattr("hermes_quant.tools.QUANT_HOME", tmp_path)
     out = json.loads(quant_doctor({}))
@@ -205,10 +205,9 @@ def test_quant_doctor_no_signal_bus_skips_drift(tmp_path, monkeypatch):
 def test_quant_doctor_drift_threshold_passthrough(signal_bus):
     """drift_threshold arg is honored end-to-end."""
     write, bus = signal_bus
-    records = (
-        [_signal([("borderline", 0.7)]) for _ in range(80)]
-        + [_signal([("borderline", 0.6)]) for _ in range(20)]
-    )
+    records = [_signal([("borderline", 0.7)]) for _ in range(80)] + [
+        _signal([("borderline", 0.6)]) for _ in range(20)
+    ]
     write(records)
     out_loose = json.loads(quant_doctor({"drift_threshold": 0.15, "drift_recent_n": 20}))
     assert not out_loose["drift"]["per_analyst"]["borderline"]["flagged"]

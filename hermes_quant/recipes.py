@@ -6,6 +6,7 @@ runtime. Components are still discovered/implemented as Python classes; recipes
 compose them into named strategies that Hermes can inspect, backtest, schedule,
 and eventually run in HITL/autonomous modes.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -237,18 +238,23 @@ def instantiate_recipe_analysts(recipe: PDRRecipe):
         kwargs = recipe.analyst_config.get(name, {})
         if name == "classical_ta":
             from hermes_quant.analysts.classical_ta import ClassicalTAAnalyst
+
             out.append(ClassicalTAAnalyst(**kwargs))
         elif name == "microstructure_lite":
             from hermes_quant.analysts.microstructure import MicrostructureLite
+
             out.append(MicrostructureLite(**kwargs))
         elif name == "kronos":
             from hermes_quant.analysts.kronos import KronosAnalyst
+
             out.append(KronosAnalyst(**kwargs))
         elif name == "hermes_semantic":
             from hermes_quant.analysts.semantic import HermesSemanticAnalyst
+
             out.append(HermesSemanticAnalyst(**kwargs))
         else:
             from hermes_quant.daemon.discovery import instantiate_analysts
+
             found = instantiate_analysts([name], overrides={name: kwargs})
             if not found:
                 raise ValueError(f"recipe {recipe.id}: analyst {name!r} is not available")
@@ -259,11 +265,14 @@ def instantiate_recipe_analysts(recipe: PDRRecipe):
 def instantiate_recipe_aggregator(recipe: PDRRecipe):
     if recipe.aggregator == "bma":
         from hermes_quant.aggregators.bma import BMAAggregator
+
         return BMAAggregator(**recipe.aggregator_config)
     if recipe.aggregator == "deliberative_committee":
         from hermes_quant.aggregators.deliberative import DeliberativeCommitteeAggregator
+
         return DeliberativeCommitteeAggregator(**recipe.aggregator_config)
     from hermes_quant.daemon.discovery import instantiate_aggregator
+
     agg = instantiate_aggregator(recipe.aggregator, **recipe.aggregator_config)
     if agg is None:
         raise ValueError(f"recipe {recipe.id}: aggregator {recipe.aggregator!r} is not available")
@@ -273,5 +282,6 @@ def instantiate_recipe_aggregator(recipe: PDRRecipe):
 def instantiate_recipe_risk_gate(recipe: PDRRecipe):
     if recipe.risk_gate == "default":
         from hermes_quant.risk.gate import DefaultRiskGate
+
         return DefaultRiskGate(**recipe.risk_gate_config)
     raise ValueError(f"recipe {recipe.id}: risk gate {recipe.risk_gate!r} is not available")

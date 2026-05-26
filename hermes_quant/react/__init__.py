@@ -18,6 +18,7 @@ v0.2 adds:
 Per ADR-0015 §D5 the Protocol contract is intentionally minimal so v0.2
 adapters drop in without touching the proposals/store/tools layer.
 """
+
 from __future__ import annotations
 
 from .base import ExecutionRecord, Reactor

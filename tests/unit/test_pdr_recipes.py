@@ -1,4 +1,5 @@
 """Tests for PDR recipe runtime contract (ADR-0021)."""
+
 from __future__ import annotations
 
 import json
@@ -27,14 +28,16 @@ class _Provider:
     def fetch_bars(self, symbol, timeframe, *args, **kwargs):
         ts = pd.date_range("2024-01-01", periods=120, freq="1h", tz="UTC")
         close = [100 + i * 0.01 for i in range(120)]
-        return pd.DataFrame({
-            "timestamp": ts,
-            "open": close,
-            "high": [c + 0.1 for c in close],
-            "low": [c - 0.1 for c in close],
-            "close": close,
-            "volume": 1000.0,
-        })
+        return pd.DataFrame(
+            {
+                "timestamp": ts,
+                "open": close,
+                "high": [c + 0.1 for c in close],
+                "low": [c - 0.1 for c in close],
+                "close": close,
+                "volume": 1000.0,
+            }
+        )
 
 
 def test_default_recipe_validates_and_hash_stable():
@@ -46,9 +49,7 @@ def test_default_recipe_validates_and_hash_stable():
 
 def test_recipe_hash_changes_with_composition():
     a = DEFAULT_RECIPE
-    b = PDRRecipe(
-        **{**a.to_dict(), "analysts": ("classical_ta",)}
-    )
+    b = PDRRecipe(**{**a.to_dict(), "analysts": ("classical_ta",)})
     assert a.config_hash != b.config_hash
 
 
@@ -100,13 +101,17 @@ def test_builtin_recipe_components_instantiate():
 
 def test_user_recipe_yaml_loads_from_custom_root(tmp_path):
     import yaml
+
     data = example_user_recipe()
     data["id"] = "custom-yaml-recipe"
     path = tmp_path / "custom-yaml-recipe.yaml"
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     recipes = load_user_recipes(root=tmp_path)
     assert recipes["custom-yaml-recipe"].id == "custom-yaml-recipe"
-    assert get_recipe("custom-yaml-recipe", user_root=tmp_path).config_hash == recipes["custom-yaml-recipe"].config_hash
+    assert (
+        get_recipe("custom-yaml-recipe", user_root=tmp_path).config_hash
+        == recipes["custom-yaml-recipe"].config_hash
+    )
     listed = list_recipes(user_root=tmp_path)
     assert "custom-yaml-recipe" in [r.id for r in listed]
 
@@ -119,6 +124,7 @@ def test_recipe_from_mapping_normalizes_lists():
 
 def test_user_recipe_cannot_shadow_builtin(tmp_path):
     import yaml
+
     data = example_user_recipe()
     data["id"] = "btc-usdt-mvp"
     (tmp_path / "shadow.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
@@ -162,6 +168,7 @@ def test_advisor_deliberative_recipe_accepts_semantic_packet():
         "model": "hermes:test",
     }
     from hermes_quant.semantic import semantic_packet_from_dict
+
     packet = semantic_packet_from_dict(packet).to_dict()
     result = recommend(
         "BTC/USDT",
@@ -173,4 +180,7 @@ def test_advisor_deliberative_recipe_accepts_semantic_packet():
     assert result["recipe"]["id"] == "btc-usdt-deliberative"
     assert any(v["analyst"] == "hermes_semantic" for v in result["analyst_views"])
     assert result["aggregated_signal"]["aggregator"] == "deliberative_committee"
-    assert result["aggregated_signal"]["metadata"]["committee"]["safety"]["risk_gate_still_required"] is True
+    assert (
+        result["aggregated_signal"]["metadata"]["committee"]["safety"]["risk_gate_still_required"]
+        is True
+    )

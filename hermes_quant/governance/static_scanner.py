@@ -14,6 +14,7 @@ This is layer-3 of the live-trading defense:
   Layer 2: governance.invariants 'live_orders_blocked_in_research_mode'
   Layer 3: static_scanner (this module) — rejects raw text early
 """
+
 from __future__ import annotations
 
 import re
@@ -132,8 +133,7 @@ def scan_text(text: str, *, mode: Mode = "research") -> ScanResult:
                 )
             )
     blocked = any(
-        f.severity == "block"
-        or (mode in ("research", "paper") and f.severity == "warn_research")
+        f.severity == "block" or (mode in ("research", "paper") and f.severity == "warn_research")
         for f in findings
     )
     return ScanResult(blocked=blocked, findings=tuple(findings), mode=mode)
@@ -149,6 +149,4 @@ def require_clean(text: str, *, mode: Mode = "research") -> None:
             f"  line {f.line_number}: {f.reason} (matched: {f.matched_text!r})"
             for f in result.blocking_findings
         )
-        raise StaticScannerError(
-            f"Static scanner rejected text (mode={mode}):\n{reasons}"
-        )
+        raise StaticScannerError(f"Static scanner rejected text (mode={mode}):\n{reasons}")

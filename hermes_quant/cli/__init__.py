@@ -33,6 +33,7 @@ v0.1.0 SCAFFOLD: lifecycle / backtest / freqtrade subcommands print
 "NOT YET IMPLEMENTED — track v0.1.1 milestone"; status / signals / doctor /
 config-show ARE wired to read-only state.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -47,21 +48,35 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
 
     # setup
     p_setup = sub.add_parser("setup", help="Interactive setup wizard")
-    p_setup.add_argument("profile_pos", nargs="?", choices=PROFILES, default=None,
-                          metavar="PROFILE", help="Risk profile to apply")
-    p_setup.add_argument("--use-profile", dest="use_profile", choices=PROFILES,
-                          default=None, help="Risk profile (alias for positional)")
+    p_setup.add_argument(
+        "profile_pos",
+        nargs="?",
+        choices=PROFILES,
+        default=None,
+        metavar="PROFILE",
+        help="Risk profile to apply",
+    )
+    p_setup.add_argument(
+        "--use-profile",
+        dest="use_profile",
+        choices=PROFILES,
+        default=None,
+        help="Risk profile (alias for positional)",
+    )
 
     # Daemon lifecycle
     for verb, helptext in [
-        ("start",     "Start the hermes-quant daemon (systemd/launchd/tmux fallback)"),
-        ("stop",      "Stop the daemon"),
-        ("restart",   "Restart the daemon"),
+        ("start", "Start the hermes-quant daemon (systemd/launchd/tmux fallback)"),
+        ("stop", "Stop the daemon"),
+        ("restart", "Restart the daemon"),
         ("uninstall", "Remove the systemd/launchd unit"),
     ]:
         p = sub.add_parser(verb, help=helptext)
-        p.add_argument("--account", default=None,
-                       help="Account identifier (default: configured primary account)")
+        p.add_argument(
+            "--account",
+            default=None,
+            help="Account identifier (default: configured primary account)",
+        )
 
     # Status
     p_status = sub.add_parser("status", help="Show daemon status")
@@ -73,8 +88,9 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_resume.add_argument("account")
     p_resume.add_argument("asset_class", nargs="?", default="*")
     p_resume.add_argument("asset", nargs="?", default=None)
-    p_resume.add_argument("--reason", required=True,
-                           help="Why are you lifting this halt? (audit log)")
+    p_resume.add_argument(
+        "--reason", required=True, help="Why are you lifting this halt? (audit log)"
+    )
 
     p_halt = sub.add_parser("halt", help="Manually halt a scope")
     p_halt.add_argument("account")
@@ -82,16 +98,16 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_halt.add_argument("asset", nargs="?", default=None)
     p_halt.add_argument("--reason", required=True)
 
-    p_estop = sub.add_parser("emergency-stop",
-                              help="Cancel all orders + create durable halt across all scopes")
+    p_estop = sub.add_parser(
+        "emergency-stop", help="Cancel all orders + create durable halt across all scopes"
+    )
     p_estop.add_argument("--account", default=None)
 
     # Information
     p_signals = sub.add_parser("signals", help="Show recent signals from the bus")
     p_signals.add_argument("-n", type=int, default=20)
     p_signals.add_argument("--asset", default=None)
-    p_signals.add_argument("--follow", action="store_true",
-                           help="Tail-follow the signal bus")
+    p_signals.add_argument("--follow", action="store_true", help="Tail-follow the signal bus")
 
     p_views = sub.add_parser("show-views", help="Show analyst views for an asset")
     p_views.add_argument("--asset", required=True)
@@ -99,10 +115,10 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_views.add_argument("-n", type=int, default=10)
 
     p_doctor = sub.add_parser("doctor", help="Comprehensive health check")
-    p_doctor.add_argument("--fix", action="store_true",
-                           help="Attempt to fix issues found")
-    p_doctor.add_argument("--calibration", action="store_true",
-                           help="Include per-analyst calibration table")
+    p_doctor.add_argument("--fix", action="store_true", help="Attempt to fix issues found")
+    p_doctor.add_argument(
+        "--calibration", action="store_true", help="Include per-analyst calibration table"
+    )
 
     p_logs = sub.add_parser("logs", help="Show daemon logs")
     p_logs.add_argument("--follow", action="store_true")
@@ -114,24 +130,42 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
         help="Get a snapshot recommendation for a symbol (no daemon, ADR-0014)",
     )
     p_rec.add_argument("symbol")
-    p_rec.add_argument("--asset-class", default="equity",
-                       choices=["equity", "etf", "crypto", "fx"])
-    p_rec.add_argument("--timeframe", default=None,
-                       choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
-    p_rec.add_argument("--lookback", type=int, default=None,
-                       help="Bars of history to fetch (default per timeframe)")
-    p_rec.add_argument("--no-lessons", action="store_true",
-                       help="Skip recent journal lesson retrieval (saves tokens)")
-    p_rec.add_argument("--as-of", default=None,
-                       help="ISO timestamp anchor for replay-mode (default: now)")
-    p_rec.add_argument("--recipe-id", default=None,
-                       help="PDR recipe id (e.g. btc-usdt-deliberative)")
-    p_rec.add_argument("--semantic-packet-file", action="append", default=[],
-                       help="Semantic packet artifact JSON to inject (repeatable)")
-    p_rec.add_argument("--committee-turns-file", action="append", default=[],
-                       help="Committee-turn artifact JSON to inject (repeatable)")
-    p_rec.add_argument("--json", action="store_true",
-                       help="Print raw JSON instead of rich-formatted output")
+    p_rec.add_argument("--asset-class", default="equity", choices=["equity", "etf", "crypto", "fx"])
+    p_rec.add_argument(
+        "--timeframe", default=None, choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+    )
+    p_rec.add_argument(
+        "--lookback",
+        type=int,
+        default=None,
+        help="Bars of history to fetch (default per timeframe)",
+    )
+    p_rec.add_argument(
+        "--no-lessons",
+        action="store_true",
+        help="Skip recent journal lesson retrieval (saves tokens)",
+    )
+    p_rec.add_argument(
+        "--as-of", default=None, help="ISO timestamp anchor for replay-mode (default: now)"
+    )
+    p_rec.add_argument(
+        "--recipe-id", default=None, help="PDR recipe id (e.g. btc-usdt-deliberative)"
+    )
+    p_rec.add_argument(
+        "--semantic-packet-file",
+        action="append",
+        default=[],
+        help="Semantic packet artifact JSON to inject (repeatable)",
+    )
+    p_rec.add_argument(
+        "--committee-turns-file",
+        action="append",
+        default=[],
+        help="Committee-turn artifact JSON to inject (repeatable)",
+    )
+    p_rec.add_argument(
+        "--json", action="store_true", help="Print raw JSON instead of rich-formatted output"
+    )
 
     # Recipes
     p_recipes = sub.add_parser("recipes", help="List/validate/example PDR recipes")
@@ -142,10 +176,14 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     recipes_validate.add_argument("path")
     recipes_validate.add_argument("--json", action="store_true")
     recipes_example = recipes_sub.add_parser("example", help="Print an example user recipe YAML")
-    recipes_example.add_argument("--output", default=None, help="Optional path to write YAML template")
+    recipes_example.add_argument(
+        "--output", default=None, help="Optional path to write YAML template"
+    )
 
     # Semantic perception artifacts
-    p_sem = sub.add_parser("semantic-packet", help="Write/validate/list semantic perception artifacts")
+    p_sem = sub.add_parser(
+        "semantic-packet", help="Write/validate/list semantic perception artifacts"
+    )
     sem_sub = p_sem.add_subparsers(dest="semantic_cmd", required=True)
     sem_write = sem_sub.add_parser("write", help="Write a hashed semantic packet artifact")
     sem_write.add_argument("--asset", required=True)
@@ -154,8 +192,12 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     sem_write.add_argument("--confidence", required=True, type=float)
     sem_write.add_argument("--magnitude", required=True, type=float)
     sem_write.add_argument("--summary", required=True)
-    sem_write.add_argument("--source", action="append", default=[],
-                           help="Source ref as type:ref or type:ref|title, repeatable")
+    sem_write.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        help="Source ref as type:ref or type:ref|title, repeatable",
+    )
     sem_write.add_argument("--model", default="hermes:manual")
     sem_write.add_argument("--as-of", default=None)
     sem_write.add_argument("--output-root", default=None)
@@ -173,9 +215,13 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     sem_list.add_argument("--json", action="store_true")
 
     # Committee-turn artifacts
-    p_committee = sub.add_parser("committee", help="Build/list deliberative committee-turn artifacts")
+    p_committee = sub.add_parser(
+        "committee", help="Build/list deliberative committee-turn artifacts"
+    )
     committee_sub = p_committee.add_subparsers(dest="committee_cmd", required=True)
-    committee_run = committee_sub.add_parser("run", help="Build committee_turns from semantic packet artifacts")
+    committee_run = committee_sub.add_parser(
+        "run", help="Build committee_turns from semantic packet artifacts"
+    )
     committee_run.add_argument("--asset", required=True)
     committee_run.add_argument("--semantic-packet-file", action="append", required=True)
     committee_run.add_argument("--model", default="deterministic:semantic_packets")
@@ -186,24 +232,34 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     committee_list.add_argument("--asset", default=None)
     committee_list.add_argument("--limit", type=int, default=20)
     committee_list.add_argument("--json", action="store_true")
-    committee_prompt = committee_sub.add_parser("prompt", help="Print a safe Hermes prompt for model-mixture committee turns")
+    committee_prompt = committee_sub.add_parser(
+        "prompt", help="Print a safe Hermes prompt for model-mixture committee turns"
+    )
     committee_prompt.add_argument("--asset", required=True)
     committee_prompt.add_argument("--semantic-packet-file", action="append", required=True)
-    committee_prompt.add_argument("--models", default="", help="Comma-separated provider/model ids to use or simulate")
+    committee_prompt.add_argument(
+        "--models", default="", help="Comma-separated provider/model ids to use or simulate"
+    )
     committee_prompt.add_argument("--json", action="store_true")
 
     # Perception cron helper
     p_perception = sub.add_parser("perception", help="Autonomous semantic perception setup")
     perception_sub = p_perception.add_subparsers(dest="perception_cmd", required=True)
-    perception_start = perception_sub.add_parser("start", help="Create a Hermes cron job that generates semantic packets")
+    perception_start = perception_sub.add_parser(
+        "start", help="Create a Hermes cron job that generates semantic packets"
+    )
     perception_start.add_argument("--asset", required=True)
     perception_start.add_argument("--horizon", default="1h")
     perception_start.add_argument("--cadence", default="1h")
-    perception_start.add_argument("--sources", default="operator notes, major market news, exchange status, macro regime")
+    perception_start.add_argument(
+        "--sources", default="operator notes, major market news, exchange status, macro regime"
+    )
     perception_start.add_argument("--recipe-id", default="btc-usdt-deliberative")
     perception_start.add_argument("--dry-run", action="store_true")
     perception_start.add_argument("--json", action="store_true")
-    perception_status = perception_sub.add_parser("status", help="Show semantic packet freshness for a recipe")
+    perception_status = perception_sub.add_parser(
+        "status", help="Show semantic packet freshness for a recipe"
+    )
     perception_status.add_argument("--recipe-id", default="btc-usdt-deliberative")
     perception_status.add_argument("--packet-root", default=None)
     perception_status.add_argument("--json", action="store_true")
@@ -214,28 +270,33 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
         help="Propose a trade for human approval (HITL mode, ADR-0015)",
     )
     p_propose.add_argument("symbol")
-    p_propose.add_argument("--asset-class", default="equity",
-                           choices=["equity", "etf", "crypto", "fx"])
-    p_propose.add_argument("--timeframe", default=None,
-                           choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
+    p_propose.add_argument(
+        "--asset-class", default="equity", choices=["equity", "etf", "crypto", "fx"]
+    )
+    p_propose.add_argument(
+        "--timeframe", default=None, choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+    )
     p_propose.add_argument("--ttl-minutes", type=int, default=15)
     p_propose.add_argument("--lookback", type=int, default=None)
     p_propose.add_argument("--as-of", default=None)
     p_propose.add_argument("--json", action="store_true")
 
-    p_approve = sub.add_parser("approve",
-                               help="Approve a pending proposal (paper React)")
+    p_approve = sub.add_parser("approve", help="Approve a pending proposal (paper React)")
     p_approve.add_argument("proposal_id")
-    p_approve.add_argument("--size-override", type=float, default=None,
-                           dest="size_override_pct",
-                           help="Override the advisor's Kelly fraction "
-                                "(signed; e.g. -0.03 = 3% short)")
+    p_approve.add_argument(
+        "--size-override",
+        type=float,
+        default=None,
+        dest="size_override_pct",
+        help="Override the advisor's Kelly fraction (signed; e.g. -0.03 = 3% short)",
+    )
     p_approve.add_argument("--json", action="store_true")
 
     p_reject = sub.add_parser("reject", help="Reject a pending proposal")
     p_reject.add_argument("proposal_id")
-    p_reject.add_argument("--reason", required=True,
-                          help="Why are you rejecting? Becomes a journal entry.")
+    p_reject.add_argument(
+        "--reason", required=True, help="Why are you rejecting? Becomes a journal entry."
+    )
     p_reject.add_argument("--json", action="store_true")
 
     p_pend = sub.add_parser("pending", help="List pending proposals")
@@ -255,16 +316,21 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     auto_sub = p_auto.add_subparsers(dest="autonomous_cmd", required=True)
 
     p_auto_tick = auto_sub.add_parser(
-        "tick", help="Run a single autonomous tick (default: dry-run)",
+        "tick",
+        help="Run a single autonomous tick (default: dry-run)",
     )
-    p_auto_tick.add_argument("--no-dry-run", action="store_true",
-                              help="ACTUALLY fire paper trades on FIRE. "
-                                   "Default is dry-run for safety; this flag "
-                                   "is what cron uses.")
+    p_auto_tick.add_argument(
+        "--no-dry-run",
+        action="store_true",
+        help="ACTUALLY fire paper trades on FIRE. "
+        "Default is dry-run for safety; this flag "
+        "is what cron uses.",
+    )
     p_auto_tick.add_argument("--json", action="store_true")
 
     p_auto_status = auto_sub.add_parser(
-        "status", help="Show autonomous-mode state",
+        "status",
+        help="Show autonomous-mode state",
     )
     p_auto_status.add_argument("--json", action="store_true")
 
@@ -272,15 +338,20 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
         "start",
         help="Enable autonomous mode + create a Hermes cron job for the tick cadence",
     )
-    p_auto_start.add_argument("--cadence", default="15m",
-                              help="Cron schedule expression (default: 15m)")
-    p_auto_start.add_argument("--watchlist", default=None,
-                              help="Comma-separated SYMBOL[:asset_class[:timeframe]] "
-                                   "entries; sets the watchlist and overrides existing")
     p_auto_start.add_argument(
-        "--no-cron", action="store_true",
+        "--cadence", default="15m", help="Cron schedule expression (default: 15m)"
+    )
+    p_auto_start.add_argument(
+        "--watchlist",
+        default=None,
+        help="Comma-separated SYMBOL[:asset_class[:timeframe]] "
+        "entries; sets the watchlist and overrides existing",
+    )
+    p_auto_start.add_argument(
+        "--no-cron",
+        action="store_true",
         help="Skip creating the Hermes cron job; just enable autonomous mode "
-             "in config (the operator can run ticks manually or wire cron later)",
+        "in config (the operator can run ticks manually or wire cron later)",
     )
 
     auto_sub.add_parser(
@@ -292,92 +363,153 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
         "reset",
         help="Reset the kill switch (re-enable autonomous mode after a trip)",
     )
-    p_auto_reset.add_argument("--confirm", action="store_true", required=False,
-                               help="Required to actually reset")
+    p_auto_reset.add_argument(
+        "--confirm", action="store_true", required=False, help="Required to actually reset"
+    )
 
     p_auto_wl = auto_sub.add_parser(
-        "watchlist", help="Manage the autonomous-mode watchlist",
+        "watchlist",
+        help="Manage the autonomous-mode watchlist",
     )
     wl_sub = p_auto_wl.add_subparsers(dest="watchlist_cmd", required=True)
 
     wl_add = wl_sub.add_parser("add", help="Add or update a watchlist entry")
     wl_add.add_argument("symbol")
-    wl_add.add_argument("--asset-class", default="equity",
-                        choices=["equity", "etf", "crypto", "fx"])
-    wl_add.add_argument("--timeframe", default=None,
-                        choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
+    wl_add.add_argument(
+        "--asset-class", default="equity", choices=["equity", "etf", "crypto", "fx"]
+    )
+    wl_add.add_argument(
+        "--timeframe", default=None, choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+    )
 
     wl_rm = wl_sub.add_parser("remove", help="Remove a watchlist entry")
     wl_rm.add_argument("symbol")
-    wl_rm.add_argument("--asset-class", default=None,
-                       choices=["equity", "etf", "crypto", "fx"])
+    wl_rm.add_argument("--asset-class", default=None, choices=["equity", "etf", "crypto", "fx"])
 
     wl_list = wl_sub.add_parser("list", help="List watchlist entries")
     wl_list.add_argument("--json", action="store_true")
 
     # Backtest
     p_bt = sub.add_parser("backtest", help="Run hermes-quant against historical bars (ADR-0020)")
-    p_bt.add_argument("--symbol", required=True,
-                      help="Trading symbol (e.g. AAPL, BTC/USDT)")
-    p_bt.add_argument("--asset-class", default="equity",
-                      choices=["equity", "etf", "crypto", "fx"])
-    p_bt.add_argument("--timeframe", default="1h",
-                      choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
-    p_bt.add_argument("--bars-file",
-                      help="Path to CSV/parquet with OHLCV bars (timestamp, open, high, low, close, volume)")
-    p_bt.add_argument("--recipe-id", default=None,
-                      help="PDR recipe id to select analyst/aggregator/risk-gate composition")
-    p_bt.add_argument("--semantic-packet-file", action="append", default=[],
-                      help="Semantic packet artifact JSON to inject into replay (repeatable)")
-    p_bt.add_argument("--committee-turns-file", action="append", default=[],
-                      help="Committee-turn artifact JSON to inject into replay (repeatable)")
-    p_bt.add_argument("--provider", default=None,
-                      help="Fetch provider when --bars-file omitted (e.g. ccxt:kraken, ccxt:coinbase, yfinance)")
-    p_bt.add_argument("--no-cache", action="store_true",
-                      help="Disable OHLCV file cache for provider fetches")
-    p_bt.add_argument("--cache-root", default=None,
-                      help="OHLCV cache root (default ~/.hermes/quant/cache)")
-    p_bt.add_argument("--start", default=None,
-                      help="Start date (ISO 8601); used when fetching via configured provider")
-    p_bt.add_argument("--end", default=None,
-                      help="End date (ISO 8601); used when fetching via configured provider")
+    p_bt.add_argument("--symbol", required=True, help="Trading symbol (e.g. AAPL, BTC/USDT)")
+    p_bt.add_argument("--asset-class", default="equity", choices=["equity", "etf", "crypto", "fx"])
+    p_bt.add_argument(
+        "--timeframe", default="1h", choices=["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+    )
+    p_bt.add_argument(
+        "--bars-file",
+        help="Path to CSV/parquet with OHLCV bars (timestamp, open, high, low, close, volume)",
+    )
+    p_bt.add_argument(
+        "--recipe-id",
+        default=None,
+        help="PDR recipe id to select analyst/aggregator/risk-gate composition",
+    )
+    p_bt.add_argument(
+        "--semantic-packet-file",
+        action="append",
+        default=[],
+        help="Semantic packet artifact JSON to inject into replay (repeatable)",
+    )
+    p_bt.add_argument(
+        "--committee-turns-file",
+        action="append",
+        default=[],
+        help="Committee-turn artifact JSON to inject into replay (repeatable)",
+    )
+    p_bt.add_argument(
+        "--provider",
+        default=None,
+        help="Fetch provider when --bars-file omitted (e.g. ccxt:kraken, ccxt:coinbase, yfinance)",
+    )
+    p_bt.add_argument(
+        "--no-cache", action="store_true", help="Disable OHLCV file cache for provider fetches"
+    )
+    p_bt.add_argument(
+        "--cache-root", default=None, help="OHLCV cache root (default ~/.hermes/quant/cache)"
+    )
+    p_bt.add_argument(
+        "--start",
+        default=None,
+        help="Start date (ISO 8601); used when fetching via configured provider",
+    )
+    p_bt.add_argument(
+        "--end",
+        default=None,
+        help="End date (ISO 8601); used when fetching via configured provider",
+    )
     p_bt.add_argument("--initial-equity", type=float, default=10_000.0)
-    p_bt.add_argument("--warmup-bars", type=int, default=60,
-                      help="Bars consumed for analyst warmup before any decisions")
-    p_bt.add_argument("--commission", type=float, default=0.001,
-                      help="Per-trade commission as fraction (default 10bps)")
-    p_bt.add_argument("--slippage", type=float, default=0.0005,
-                      help="Per-trade slippage as fraction (default 5bps)")
-    p_bt.add_argument("--settlement-horizon-bars", type=int, default=1,
-                      help="Bars forward used to settle decisions into aggregator posteriors")
-    p_bt.add_argument("--no-learn-from-fills", action="store_true",
-                      help="Disable in-replay calibrator updates")
-    p_bt.add_argument("--walk-forward", action="store_true",
-                      help="Run purged walk-forward replay folds instead of one contiguous backtest")
-    p_bt.add_argument("--n-splits", type=int, default=5,
-                      help="Number of walk-forward folds (default 5)")
-    p_bt.add_argument("--embargo-pct", type=float, default=0.01,
-                      help="Train/validation embargo fraction for walk-forward")
-    p_bt.add_argument("--train-pct", type=float, default=0.6,
-                      help="Train fraction inside each walk-forward fold")
-    p_bt.add_argument("--val-pct", type=float, default=0.2,
-                      help="Validation fraction inside each walk-forward fold")
-    p_bt.add_argument("--output-dir", default=None,
-                      help="Directory to write report.md + result.json (default: ~/.hermes/quant/backtests/<run-id>/)")
+    p_bt.add_argument(
+        "--warmup-bars",
+        type=int,
+        default=60,
+        help="Bars consumed for analyst warmup before any decisions",
+    )
+    p_bt.add_argument(
+        "--commission",
+        type=float,
+        default=0.001,
+        help="Per-trade commission as fraction (default 10bps)",
+    )
+    p_bt.add_argument(
+        "--slippage",
+        type=float,
+        default=0.0005,
+        help="Per-trade slippage as fraction (default 5bps)",
+    )
+    p_bt.add_argument(
+        "--settlement-horizon-bars",
+        type=int,
+        default=1,
+        help="Bars forward used to settle decisions into aggregator posteriors",
+    )
+    p_bt.add_argument(
+        "--no-learn-from-fills", action="store_true", help="Disable in-replay calibrator updates"
+    )
+    p_bt.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="Run purged walk-forward replay folds instead of one contiguous backtest",
+    )
+    p_bt.add_argument(
+        "--n-splits", type=int, default=5, help="Number of walk-forward folds (default 5)"
+    )
+    p_bt.add_argument(
+        "--embargo-pct",
+        type=float,
+        default=0.01,
+        help="Train/validation embargo fraction for walk-forward",
+    )
+    p_bt.add_argument(
+        "--train-pct", type=float, default=0.6, help="Train fraction inside each walk-forward fold"
+    )
+    p_bt.add_argument(
+        "--val-pct",
+        type=float,
+        default=0.2,
+        help="Validation fraction inside each walk-forward fold",
+    )
+    p_bt.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory to write report.md + result.json (default: ~/.hermes/quant/backtests/<run-id>/)",
+    )
     p_bt.add_argument("--json", action="store_true", help="Print JSON to stdout instead of report")
 
-    p_btr = sub.add_parser("backtest-replay",
-                            help="Replay a signal log through freqtrade backtester")
+    p_btr = sub.add_parser(
+        "backtest-replay", help="Replay a signal log through freqtrade backtester"
+    )
     p_btr.add_argument("run_id")
 
     # Freqtrade integration
-    p_fts = sub.add_parser("freqtrade-setup",
-                            help="Wire hermes-quant into a local freqtrade install")
-    p_fts.add_argument("--freqtrade-dir", default=None,
-                        help="Path to freqtrade install (default: auto-detect)")
+    p_fts = sub.add_parser(
+        "freqtrade-setup", help="Wire hermes-quant into a local freqtrade install"
+    )
+    p_fts.add_argument(
+        "--freqtrade-dir", default=None, help="Path to freqtrade install (default: auto-detect)"
+    )
 
-    p_ftb = sub.add_parser("freqtrade-backtest",
-                            help="Run freqtrade backtest against a signal log")
+    p_ftb = sub.add_parser("freqtrade-backtest", help="Run freqtrade backtest against a signal log")
     p_ftb.add_argument("signal_log")
     p_ftb.add_argument("--freqtrade-config", default=None)
 
@@ -399,49 +531,69 @@ def dispatch(args: argparse.Namespace) -> int:
     # v0.1.0 SCAFFOLD — three commands work; rest are stubs
     if cmd == "status":
         from hermes_quant.tools import quant_status
+
         result = json.loads(quant_status({"account": args.account}))
         _pretty_print_status(result)
         return 0
 
     if cmd == "signals":
         from hermes_quant.tools import quant_show_signals
-        result = json.loads(quant_show_signals({
-            "n": args.n, "asset": args.asset,
-        }))
+
+        result = json.loads(
+            quant_show_signals(
+                {
+                    "n": args.n,
+                    "asset": args.asset,
+                }
+            )
+        )
         _pretty_print_signals(result)
         return 0
 
     if cmd == "show-views":
         from hermes_quant.tools import quant_show_views
-        result = json.loads(quant_show_views({
-            "asset": args.asset, "analyst": args.analyst, "n": args.n,
-        }))
+
+        result = json.loads(
+            quant_show_views(
+                {
+                    "asset": args.asset,
+                    "analyst": args.analyst,
+                    "n": args.n,
+                }
+            )
+        )
         print(json.dumps(result, indent=2, default=str))
         return 0
 
     if cmd == "doctor":
         from hermes_quant.tools import quant_doctor
+
         result = json.loads(quant_doctor({"calibration": args.calibration}))
         _pretty_print_doctor(result)
         return 0
 
     if cmd == "recommend":
         from hermes_quant.tools import quant_recommend
+
         semantic_packets, committee_turns = _load_perception_artifacts(
             getattr(args, "semantic_packet_file", []),
             getattr(args, "committee_turns_file", []),
         )
-        result = json.loads(quant_recommend({
-            "symbol": args.symbol,
-            "asset_class": args.asset_class,
-            "timeframe": args.timeframe,
-            "lookback_bars": args.lookback,
-            "include_lessons": not args.no_lessons,
-            "as_of": args.as_of,
-            "recipe_id": args.recipe_id,
-            "semantic_packets": semantic_packets,
-            "committee_turns": committee_turns,
-        }))
+        result = json.loads(
+            quant_recommend(
+                {
+                    "symbol": args.symbol,
+                    "asset_class": args.asset_class,
+                    "timeframe": args.timeframe,
+                    "lookback_bars": args.lookback,
+                    "include_lessons": not args.no_lessons,
+                    "as_of": args.as_of,
+                    "recipe_id": args.recipe_id,
+                    "semantic_packets": semantic_packets,
+                    "committee_turns": committee_turns,
+                }
+            )
+        )
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
@@ -462,14 +614,19 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if cmd == "propose":
         from hermes_quant.tools import quant_propose
-        result = json.loads(quant_propose({
-            "symbol": args.symbol,
-            "asset_class": args.asset_class,
-            "timeframe": args.timeframe,
-            "lookback_bars": args.lookback,
-            "ttl_minutes": args.ttl_minutes,
-            "as_of": args.as_of,
-        }))
+
+        result = json.loads(
+            quant_propose(
+                {
+                    "symbol": args.symbol,
+                    "asset_class": args.asset_class,
+                    "timeframe": args.timeframe,
+                    "lookback_bars": args.lookback,
+                    "ttl_minutes": args.ttl_minutes,
+                    "as_of": args.as_of,
+                }
+            )
+        )
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
@@ -478,10 +635,15 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if cmd == "approve":
         from hermes_quant.tools import quant_approve
-        result = json.loads(quant_approve({
-            "proposal_id": args.proposal_id,
-            "size_override_pct": args.size_override_pct,
-        }))
+
+        result = json.loads(
+            quant_approve(
+                {
+                    "proposal_id": args.proposal_id,
+                    "size_override_pct": args.size_override_pct,
+                }
+            )
+        )
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
@@ -490,10 +652,15 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if cmd == "reject":
         from hermes_quant.tools import quant_reject
-        result = json.loads(quant_reject({
-            "proposal_id": args.proposal_id,
-            "reason": args.reason,
-        }))
+
+        result = json.loads(
+            quant_reject(
+                {
+                    "proposal_id": args.proposal_id,
+                    "reason": args.reason,
+                }
+            )
+        )
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
@@ -502,9 +669,15 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if cmd == "pending":
         from hermes_quant.tools import quant_pending
-        result = json.loads(quant_pending({
-            "limit": args.n, "symbol": args.symbol,
-        }))
+
+        result = json.loads(
+            quant_pending(
+                {
+                    "limit": args.n,
+                    "symbol": args.symbol,
+                }
+            )
+        )
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
@@ -513,9 +686,14 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if cmd == "proposal":
         from hermes_quant.tools import quant_proposal
-        result = json.loads(quant_proposal({
-            "proposal_id": args.proposal_id,
-        }))
+
+        result = json.loads(
+            quant_proposal(
+                {
+                    "proposal_id": args.proposal_id,
+                }
+            )
+        )
         # always pretty-print as JSON for now (rich form deferred)
         print(json.dumps(result, indent=2, default=str))
         return 0 if result.get("success") else 1
@@ -533,12 +711,15 @@ def dispatch(args: argparse.Namespace) -> int:
     # v0.1.1: halt / resume / emergency-stop are wired
     if cmd == "halt":
         from hermes_quant.cli.halts import cmd_halt
+
         return cmd_halt(args)
     if cmd == "resume":
         from hermes_quant.cli.halts import cmd_resume
+
         return cmd_resume(args)
     if cmd == "emergency-stop":
         from hermes_quant.cli.halts import cmd_emergency_stop
+
         return cmd_emergency_stop(args)
 
     # Everything else: scaffold notice
@@ -571,8 +752,10 @@ def _pretty_print_status(result: dict) -> None:
     print(f"  Signal bus: {'exists' if result['signal_bus_exists'] else 'NOT CREATED'}")
     if result.get("last_signal"):
         sig = result["last_signal"]
-        print(f"  Last signal: {sig.get('asof', '?')} {sig.get('asset')} "
-              f"dir={sig.get('direction')} conf={sig.get('confidence')}")
+        print(
+            f"  Last signal: {sig.get('asof', '?')} {sig.get('asset')} "
+            f"dir={sig.get('direction')} conf={sig.get('confidence')}"
+        )
     if result.get("last_heartbeat"):
         hb = result["last_heartbeat"]
         print(f"  Last heartbeat: {hb.get('asof', '?')}")
@@ -591,10 +774,12 @@ def _pretty_print_signals(result: dict) -> None:
             print(f"\n{result['note']}")
         return
     for s in sigs:
-        print(f"  {s.get('asof', '?')} {s.get('asset', '?'):20} "
-              f"dir={s.get('direction', '?'):>2} "
-              f"size={s.get('target_position_pct', 0):>+6.2%} "
-              f"conf={s.get('confidence', 0):.2f}")
+        print(
+            f"  {s.get('asof', '?')} {s.get('asset', '?'):20} "
+            f"dir={s.get('direction', '?'):>2} "
+            f"size={s.get('target_position_pct', 0):>+6.2%} "
+            f"conf={s.get('confidence', 0):.2f}"
+        )
 
 
 def _pretty_print_doctor(result: dict) -> None:
@@ -688,12 +873,15 @@ def _pretty_print_pending(result: dict) -> None:
     print()
     for p in proposals:
         print(f"  {p['proposal_id']}")
-        print(f"    {p['symbol']:12} {p['asset_class']:8} {p['timeframe']:5}  "
-              f"expires {p['expires_at']}")
+        print(
+            f"    {p['symbol']:12} {p['asset_class']:8} {p['timeframe']:5}  "
+            f"expires {p['expires_at']}"
+        )
         rg = (p.get("advisor_result") or {}).get("risk_gate") or {}
         if rg.get("pass"):
-            print(f"    {rg.get('recommended_action', '?')}, "
-                  f"kelly={rg.get('kelly_fraction', 0):+.4f}")
+            print(
+                f"    {rg.get('recommended_action', '?')}, kelly={rg.get('kelly_fraction', 0):+.4f}"
+            )
         else:
             print(f"    GATED — {rg.get('gated_reason', 'unknown')}")
         print()
@@ -715,15 +903,22 @@ def _dispatch_recipes(args) -> int:
             print(json.dumps(result, indent=2, default=str))
         else:
             for r in recipes:
-                print(f"{r.id:24} {r.asset_class:7} {r.timeframe:4} {r.aggregator:24} {r.config_hash}")
+                print(
+                    f"{r.id:24} {r.asset_class:7} {r.timeframe:4} {r.aggregator:24} {r.config_hash}"
+                )
         return 0
 
     if args.recipes_cmd == "validate":
         try:
             import yaml
+
             data = yaml.safe_load(Path(args.path).expanduser().read_text(encoding="utf-8")) or {}
             recipe = recipe_from_mapping(data)
-            result = {"success": True, "recipe": recipe.to_dict(), "config_hash": recipe.config_hash}
+            result = {
+                "success": True,
+                "recipe": recipe.to_dict(),
+                "config_hash": recipe.config_hash,
+            }
         except Exception as exc:  # noqa: BLE001
             result = {"success": False, "error": str(exc)}
         if args.json:
@@ -780,10 +975,12 @@ def _load_perception_artifacts(
     committee_turns = []
     if semantic_packet_files:
         from hermes_quant.artifacts import load_semantic_packet
+
         for path in semantic_packet_files:
             semantic_packets.append(load_semantic_packet(path).to_dict())
     if committee_turns_files:
         from hermes_quant.artifacts import load_committee_turns
+
         for path in committee_turns_files:
             payload = load_committee_turns(path)
             committee_turns.extend(payload.get("turns") or [])
@@ -823,7 +1020,9 @@ def _dispatch_semantic_packet(args) -> int:
         else:
             print(f"semantic packet written: {path}")
             print(f"  hash: {packet.get('packet_hash')}")
-            print(f"  {packet.get('asset')} {packet.get('horizon')} {packet.get('stance')} conf={packet.get('confidence')}")
+            print(
+                f"  {packet.get('asset')} {packet.get('horizon')} {packet.get('stance')} conf={packet.get('confidence')}"
+            )
         return 0
 
     if args.semantic_cmd == "validate":
@@ -849,7 +1048,9 @@ def _dispatch_semantic_packet(args) -> int:
             print(json.dumps(result, indent=2, default=str))
         else:
             for pkt in packets:
-                print(f"{pkt['asof']} {pkt['asset']:14} {pkt['stance']:7} conf={pkt['confidence']:.2f} {pkt['path']}")
+                print(
+                    f"{pkt['asof']} {pkt['asset']:14} {pkt['stance']:7} conf={pkt['confidence']:.2f} {pkt['path']}"
+                )
         return 0
 
     return 2
@@ -890,11 +1091,14 @@ def _dispatch_committee(args) -> int:
             print(json.dumps(result, indent=2, default=str))
         else:
             for artifact in artifacts:
-                print(f"{artifact['asof']} {artifact['asset']:14} turns={artifact['n_turns']} {artifact['path']}")
+                print(
+                    f"{artifact['asof']} {artifact['asset']:14} turns={artifact['n_turns']} {artifact['path']}"
+                )
         return 0
 
     if args.committee_cmd == "prompt":
         from hermes_quant.committee_runner import build_model_mixture_prompt
+
         packets = [load_semantic_packet(path).to_dict() for path in args.semantic_packet_file]
         models = [m.strip() for m in args.models.split(",") if m.strip()]
         prompt = build_model_mixture_prompt(packets, asset=args.asset, models=models)
@@ -933,10 +1137,14 @@ def _perception_status(args) -> int:
         for row in status["symbols"]:
             age = row["age_minutes"]
             age_s = "n/a" if age is None else f"{age:.1f}m"
-            print(f"  {row['symbol']:14} {row['status']:7} age={age_s} max={row['max_age_minutes']:.0f}m")
+            print(
+                f"  {row['symbol']:14} {row['status']:7} age={age_s} max={row['max_age_minutes']:.0f}m"
+            )
             latest = row.get("latest_packet") or {}
             if latest:
-                print(f"    {latest.get('stance')} conf={latest.get('confidence')} hash={latest.get('packet_hash')}")
+                print(
+                    f"    {latest.get('stance')} conf={latest.get('confidence')} hash={latest.get('packet_hash')}"
+                )
     return 0
 
 
@@ -1064,18 +1272,23 @@ def _dispatch_backtest(args) -> int:
     # Determine output dir
     out_dir = (
         _Path(args.output_dir).expanduser()
-        if args.output_dir else
-        _Path.home() / ".hermes" / "quant" / "backtests"
+        if args.output_dir
+        else _Path.home()
+        / ".hermes"
+        / "quant"
+        / "backtests"
         / f"{args.symbol.replace('/', '_')}-{args.timeframe}-{_uuid.uuid4().hex[:8]}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Write artifacts
     (out_dir / "result.json").write_text(
-        _json.dumps(result.to_dict(), indent=2, default=str), encoding="utf-8",
+        _json.dumps(result.to_dict(), indent=2, default=str),
+        encoding="utf-8",
     )
     (out_dir / "report.md").write_text(
-        result.to_markdown_report(), encoding="utf-8",
+        result.to_markdown_report(),
+        encoding="utf-8",
     )
 
     if args.walk_forward:
@@ -1084,19 +1297,25 @@ def _dispatch_backtest(args) -> int:
             with open(out_dir / f"fold-{fold.fold}-decisions.jsonl", "w", encoding="utf-8") as f:
                 for d in fold.result.decisions_summary:
                     f.write(_json.dumps(d, default=str) + "\n")
-            eq_df = _pd.DataFrame({
-                "equity": fold.result.equity_curve.values,
-                "buy_hold_equity": fold.result.bh_equity_curve.values,
-                "position": fold.result.positions.values,
-            }, index=fold.result.equity_curve.index)
+            eq_df = _pd.DataFrame(
+                {
+                    "equity": fold.result.equity_curve.values,
+                    "buy_hold_equity": fold.result.bh_equity_curve.values,
+                    "position": fold.result.positions.values,
+                },
+                index=fold.result.equity_curve.index,
+            )
             eq_df.to_csv(out_dir / f"fold-{fold.fold}-equity_curve.csv")
     else:
         # Equity curve as CSV
-        eq_df = _pd.DataFrame({
-            "equity": result.equity_curve.values,
-            "buy_hold_equity": result.bh_equity_curve.values,
-            "position": result.positions.values,
-        }, index=result.equity_curve.index)
+        eq_df = _pd.DataFrame(
+            {
+                "equity": result.equity_curve.values,
+                "buy_hold_equity": result.bh_equity_curve.values,
+                "position": result.positions.values,
+            },
+            index=result.equity_curve.index,
+        )
         eq_df.to_csv(out_dir / "equity_curve.csv")
 
         # Decisions JSONL
@@ -1144,10 +1363,7 @@ def _load_bars_file(path: str):
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     missing = required - set(bars.columns)
     if missing:
-        raise ValueError(
-            f"bars file missing required columns: {missing}; "
-            f"required: {required}"
-        )
+        raise ValueError(f"bars file missing required columns: {missing}; required: {required}")
     return bars
 
 
@@ -1179,14 +1395,19 @@ def _fetch_bars_via_provider(
         as_of = as_of.tz_localize("UTC")
 
     # Compute lookback_bars from start/end if provided
-    lookback = 1000   # default
+    lookback = 1000  # default
     if start and end:
         s = _pd.Timestamp(start)
         e = _pd.Timestamp(end)
         delta_seconds = (e - s).total_seconds()
         tf_seconds = {
-            "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
-            "1h": 3600, "4h": 14400, "1d": 86400,
+            "1m": 60,
+            "5m": 300,
+            "15m": 900,
+            "30m": 1800,
+            "1h": 3600,
+            "4h": 14400,
+            "1d": 86400,
         }.get(timeframe, 3600)
         # Small buffer only: provider implementations add their own pagination
         # / closed-bar slack. A large CLI buffer makes caches miss forever when
@@ -1201,7 +1422,7 @@ def _fetch_bars_via_provider(
             return None
         try:
             from hermes_quant.data.ccxt_provider import CcxtProvider
-        except Exception:   # noqa: BLE001
+        except Exception:  # noqa: BLE001
             return None
         parts = provider_spec.split(":", 1)
         exchange_id = parts[1] if len(parts) == 2 and parts[1] else "binance"
@@ -1221,7 +1442,7 @@ def _fetch_bars_via_provider(
             return None
         try:
             from hermes_quant.data.yfinance_provider import YFinanceProvider
-        except Exception:   # noqa: BLE001
+        except Exception:  # noqa: BLE001
             return None
         provider = YFinanceProvider()
         provider_name = "yfinance"
@@ -1243,6 +1464,7 @@ def _fetch_bars_via_provider(
         return fetch()
 
     from hermes_quant.data.cache import cached_fetch
+
     root = _Path(cache_root).expanduser() if cache_root else None
     bars, meta = cached_fetch(
         fetch,
@@ -1264,15 +1486,19 @@ def _dispatch_autonomous(args) -> int:
     """Dispatch `hermes quant autonomous <subcommand>` (ADR-0016)."""
     sub = getattr(args, "autonomous_cmd", None)
     if sub is None:
-        print("hermes quant autonomous: missing subcommand. "
-              "Try `hermes quant autonomous --help`.")
+        print("hermes quant autonomous: missing subcommand. Try `hermes quant autonomous --help`.")
         return 2
 
     if sub == "tick":
         from hermes_quant.tools import quant_autonomous_tick
-        result = json.loads(quant_autonomous_tick({
-            "dry_run": not args.no_dry_run,
-        }))
+
+        result = json.loads(
+            quant_autonomous_tick(
+                {
+                    "dry_run": not args.no_dry_run,
+                }
+            )
+        )
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
@@ -1281,6 +1507,7 @@ def _dispatch_autonomous(args) -> int:
 
     if sub == "status":
         from hermes_quant.tools import quant_autonomous_status
+
         result = json.loads(quant_autonomous_status({}))
         if args.json:
             print(json.dumps(result, indent=2, default=str))
@@ -1290,7 +1517,8 @@ def _dispatch_autonomous(args) -> int:
 
     if sub == "start":
         return _autonomous_start(
-            cadence=args.cadence, watchlist_str=args.watchlist,
+            cadence=args.cadence,
+            watchlist_str=args.watchlist,
             no_cron=args.no_cron,
         )
 
@@ -1303,6 +1531,7 @@ def _dispatch_autonomous(args) -> int:
             print("This re-enables autonomous mode after a kill-switch trip.")
             return 2
         from hermes_quant.autonomous import reset_kill_switch
+
         cleared = reset_kill_switch()
         print(f"kill switch reset: {cleared}")
         print("Run `hermes quant autonomous status` to verify.")
@@ -1319,26 +1548,34 @@ def _dispatch_watchlist(args) -> int:
     sub = getattr(args, "watchlist_cmd", None)
     if sub == "add":
         from hermes_quant.tools import quant_watchlist_add
-        result = json.loads(quant_watchlist_add({
-            "symbol": args.symbol,
-            "asset_class": args.asset_class,
-            "timeframe": args.timeframe,
-        }))
+
+        result = json.loads(
+            quant_watchlist_add(
+                {
+                    "symbol": args.symbol,
+                    "asset_class": args.asset_class,
+                    "timeframe": args.timeframe,
+                }
+            )
+        )
         if result.get("success"):
             entry = result["added"]
-            print(f"added: {entry['symbol']} ({entry['asset_class']}, "
-                  f"{entry['timeframe']})")
+            print(f"added: {entry['symbol']} ({entry['asset_class']}, {entry['timeframe']})")
             return 0
-        print(f"watchlist add failed: {result.get('error')}: "
-              f"{result.get('message', '')}")
+        print(f"watchlist add failed: {result.get('error')}: {result.get('message', '')}")
         return 1
 
     if sub == "remove":
         from hermes_quant.tools import quant_watchlist_remove
-        result = json.loads(quant_watchlist_remove({
-            "symbol": args.symbol,
-            "asset_class": args.asset_class,
-        }))
+
+        result = json.loads(
+            quant_watchlist_remove(
+                {
+                    "symbol": args.symbol,
+                    "asset_class": args.asset_class,
+                }
+            )
+        )
         if result.get("success"):
             if result["removed"]:
                 print(f"removed: {args.symbol}")
@@ -1350,6 +1587,7 @@ def _dispatch_watchlist(args) -> int:
 
     if sub == "list":
         from hermes_quant.tools import quant_watchlist_list
+
         result = json.loads(quant_watchlist_list({}))
         if args.json:
             print(json.dumps(result, indent=2, default=str))
@@ -1370,7 +1608,10 @@ def _dispatch_watchlist(args) -> int:
 
 
 def _autonomous_start(
-    *, cadence: str, watchlist_str: str | None, no_cron: bool = False,
+    *,
+    cadence: str,
+    watchlist_str: str | None,
+    no_cron: bool = False,
 ) -> int:
     """Set quant.pdr.mode=autonomous + (optionally) write the watchlist
     + (optionally) create a Hermes cron job for the tick cadence (per
@@ -1382,6 +1623,7 @@ def _autonomous_start(
     """
     import os as _os
     from pathlib import Path as _Path
+
     try:
         import yaml as _yaml
     except ImportError:
@@ -1436,9 +1678,11 @@ def _autonomous_start(
         print("(skipped cron job creation per --no-cron)")
         print()
         print("To create the cron tick job manually, run:")
-        print(f'  hermes cron create "{cadence}" \\\n'
-              '    --script "$(which hermes) quant autonomous tick --no-dry-run --json" \\\n'
-              '    --no-agent')
+        print(
+            f'  hermes cron create "{cadence}" \\\n'
+            '    --script "$(which hermes) quant autonomous tick --no-dry-run --json" \\\n'
+            "    --no-agent"
+        )
         print()
         print("Verify with: hermes quant autonomous status")
         return 0
@@ -1454,9 +1698,11 @@ def _autonomous_start(
         print(f"⚠ cron job creation skipped: {cron_result['reason']}")
         print()
         print("To create the cron tick job manually, run:")
-        print(f'  hermes cron create "{cadence}" \\\n'
-              '    --script "$(which hermes) quant autonomous tick --no-dry-run --json" \\\n'
-              '    --no-agent')
+        print(
+            f'  hermes cron create "{cadence}" \\\n'
+            '    --script "$(which hermes) quant autonomous tick --no-dry-run --json" \\\n'
+            "    --no-agent"
+        )
 
     print()
     print("Verify with: hermes quant autonomous status")
@@ -1482,18 +1728,26 @@ def _create_autonomous_cron_job(*, cadence: str) -> dict:
             "reason": "`hermes` CLI not found on PATH",
         }
 
-    script = (f"{hermes_bin} quant autonomous tick "
-              f"--no-dry-run --json")
+    script = f"{hermes_bin} quant autonomous tick --no-dry-run --json"
 
     cmd = [
-        hermes_bin, "cron", "create", cadence,
-        "--script", script,
+        hermes_bin,
+        "cron",
+        "create",
+        cadence,
+        "--script",
+        script,
         "--no-agent",
-        "--name", f"hermes-quant-autonomous-{cadence}",
+        "--name",
+        f"hermes-quant-autonomous-{cadence}",
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15, check=False,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         return {
@@ -1516,6 +1770,7 @@ def _create_autonomous_cron_job(*, cadence: str) -> dict:
         if "job_id" in line.lower() or "created" in line.lower():
             # Extract anything that looks like an ID
             import re
+
             m = re.search(r"\b([a-f0-9]{6,}|[A-Z0-9_-]{4,})\b", line)
             if m:
                 job_id = m.group(1)
@@ -1532,6 +1787,7 @@ def _autonomous_stop() -> int:
     """Set quant.pdr.mode=advise — autonomous tick will refuse to fire."""
     import os as _os
     from pathlib import Path as _Path
+
     try:
         import yaml as _yaml
     except ImportError:
@@ -1592,8 +1848,7 @@ def _pretty_print_autonomous_tick(result: dict) -> None:
         if gate == "FIRE":
             action = d.get("action", {})
             tgt = action.get("target_position_pct", 0.0)
-            dir_word = {1: "LONG", -1: "SHORT", 0: "FLAT"}.get(
-                action.get("direction"), "?")
+            dir_word = {1: "LONG", -1: "SHORT", 0: "FLAT"}.get(action.get("direction"), "?")
             exec_id = d.get("execution_id", "(dry-run)")
             print(f"  ✓ {sym:14}  FIRE  {dir_word:5}  size={tgt:+.4f}  exec={exec_id}")
         elif gate == "ERROR":
@@ -1653,8 +1908,10 @@ def _pretty_print_recommend(result: dict) -> None:
     if not result.get("success"):
         print(json.dumps(result, indent=2))
         return
-    print(f"hermes-quant recommend — {result.get('symbol', '?')} "
-          f"({result.get('asset_class', '?')}, {result.get('timeframe', '?')})")
+    print(
+        f"hermes-quant recommend — {result.get('symbol', '?')} "
+        f"({result.get('asset_class', '?')}, {result.get('timeframe', '?')})"
+    )
     print("=" * 60)
     dq = result.get("data_quality", {})
     print(f"  as_of:       {result.get('as_of', '?')}")
@@ -1669,28 +1926,34 @@ def _pretty_print_recommend(result: dict) -> None:
         print("Analyst views:")
         for v in views:
             d = {-1: "SHORT", 0: "FLAT", 1: "LONG"}.get(v.get("direction"), "?")
-            print(f"  {v.get('analyst', '?'):20} {d:5}  "
-                  f"conf={v.get('confidence', 0):.2f}  "
-                  f"mag={v.get('magnitude', 0):+.4f}  "
-                  f"horizon={v.get('horizon', '?')}")
+            print(
+                f"  {v.get('analyst', '?'):20} {d:5}  "
+                f"conf={v.get('confidence', 0):.2f}  "
+                f"mag={v.get('magnitude', 0):+.4f}  "
+                f"horizon={v.get('horizon', '?')}"
+            )
         print()
 
     sig = result.get("aggregated_signal")
     if sig:
         d = {-1: "SHORT", 0: "FLAT", 1: "LONG"}.get(sig.get("direction"), "?")
-        print(f"Aggregated:    {d:5}  "
-              f"conf={sig.get('confidence', 0):.2f}  "
-              f"mag={sig.get('magnitude', 0):+.4f}  "
-              f"({sig.get('aggregator', '?')}, "
-              f"{sig.get('n_components', 0)} components)")
+        print(
+            f"Aggregated:    {d:5}  "
+            f"conf={sig.get('confidence', 0):.2f}  "
+            f"mag={sig.get('magnitude', 0):+.4f}  "
+            f"({sig.get('aggregator', '?')}, "
+            f"{sig.get('n_components', 0)} components)"
+        )
     else:
         print("Aggregated:    (none — no analyst views)")
     print()
 
     gate = result.get("risk_gate") or {}
     if gate.get("pass"):
-        print(f"Risk gate:     PASS  →  {gate.get('recommended_action', '?')}  "
-              f"(kelly={gate.get('kelly_fraction', 0):+.4f})")
+        print(
+            f"Risk gate:     PASS  →  {gate.get('recommended_action', '?')}  "
+            f"(kelly={gate.get('kelly_fraction', 0):+.4f})"
+        )
         if gate.get("reason"):
             print(f"  reason:      {gate['reason']}")
     else:
@@ -1728,6 +1991,7 @@ def _show_config() -> None:
     from pathlib import Path
 
     import yaml
+
     cfg_path = Path.home() / ".hermes" / "config.yaml"
     if not cfg_path.exists():
         print(f"No config at {cfg_path}. Run `hermes quant setup` first.")

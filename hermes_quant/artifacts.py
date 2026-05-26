@@ -3,6 +3,7 @@
 The stores are deliberately filesystem-first: JSON artifacts under
 ~/.hermes/quant/ are easy to inspect, copy into backtests, hash, and replay.
 """
+
 from __future__ import annotations
 
 import json
@@ -105,17 +106,19 @@ def list_semantic_packets(
             packet = load_semantic_packet(path)
         except Exception:
             continue
-        out.append({
-            "path": str(path),
-            "asset": packet.asset,
-            "asof": packet.asof,
-            "horizon": packet.horizon,
-            "stance": packet.stance,
-            "confidence": packet.confidence,
-            "magnitude": packet.magnitude,
-            "packet_hash": packet.packet_hash,
-            "summary": packet.summary,
-        })
+        out.append(
+            {
+                "path": str(path),
+                "asset": packet.asset,
+                "asof": packet.asof,
+                "horizon": packet.horizon,
+                "stance": packet.stance,
+                "confidence": packet.confidence,
+                "magnitude": packet.magnitude,
+                "packet_hash": packet.packet_hash,
+                "summary": packet.summary,
+            }
+        )
     return out
 
 
@@ -125,7 +128,10 @@ def latest_semantic_packets_for_asset(
     root: Path | None = None,
     limit: int = 8,
 ) -> list[dict[str, Any]]:
-    return [load_semantic_packet(item["path"]).to_dict() for item in list_semantic_packets(asset=asset, root=root, limit=limit)]
+    return [
+        load_semantic_packet(item["path"]).to_dict()
+        for item in list_semantic_packets(asset=asset, root=root, limit=limit)
+    ]
 
 
 def committee_turns_hash(turns: list[dict[str, Any]]) -> str:
@@ -171,7 +177,9 @@ def load_committee_turns(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-def semantic_status_for_recipe(recipe, *, root: Path | None = None, now: pd.Timestamp | None = None) -> dict[str, Any]:
+def semantic_status_for_recipe(
+    recipe, *, root: Path | None = None, now: pd.Timestamp | None = None
+) -> dict[str, Any]:
     """Summarize semantic packet freshness for each symbol in a recipe."""
     now_ts = now or pd.Timestamp.now(tz="UTC")
     sem_cfg = (recipe.analyst_config or {}).get("hermes_semantic", {})
@@ -185,8 +193,14 @@ def semantic_status_for_recipe(recipe, *, root: Path | None = None, now: pd.Time
         age_minutes = None
         if latest:
             pkt_asof = pd.Timestamp(latest["asof"])
-            pkt_asof = pkt_asof.tz_localize("UTC") if pkt_asof.tzinfo is None else pkt_asof.tz_convert("UTC")
-            ctx_now = now_ts.tz_localize("UTC") if now_ts.tzinfo is None else now_ts.tz_convert("UTC")
+            pkt_asof = (
+                pkt_asof.tz_localize("UTC")
+                if pkt_asof.tzinfo is None
+                else pkt_asof.tz_convert("UTC")
+            )
+            ctx_now = (
+                now_ts.tz_localize("UTC") if now_ts.tzinfo is None else now_ts.tz_convert("UTC")
+            )
             age_minutes = (ctx_now - pkt_asof).total_seconds() / 60.0
             if age_minutes < 0:
                 status = "future"
@@ -194,13 +208,15 @@ def semantic_status_for_recipe(recipe, *, root: Path | None = None, now: pd.Time
                 status = "fresh"
             else:
                 status = "stale"
-        rows.append({
-            "symbol": symbol,
-            "status": status,
-            "max_age_minutes": max_age,
-            "age_minutes": age_minutes,
-            "latest_packet": latest,
-        })
+        rows.append(
+            {
+                "symbol": symbol,
+                "status": status,
+                "max_age_minutes": max_age,
+                "age_minutes": age_minutes,
+                "latest_packet": latest,
+            }
+        )
     return {
         "recipe_id": recipe.id,
         "recipe_hash": recipe.config_hash,
@@ -226,12 +242,14 @@ def list_committee_turn_artifacts(
             payload = load_committee_turns(path)
         except Exception:
             continue
-        out.append({
-            "path": str(path),
-            "asset": payload.get("asset"),
-            "asof": payload.get("asof"),
-            "turns_hash": payload.get("turns_hash"),
-            "n_turns": len(payload.get("turns") or []),
-            "roles": [turn.get("role") for turn in payload.get("turns", [])],
-        })
+        out.append(
+            {
+                "path": str(path),
+                "asset": payload.get("asset"),
+                "asof": payload.get("asof"),
+                "turns_hash": payload.get("turns_hash"),
+                "n_turns": len(payload.get("turns") or []),
+                "roles": [turn.get("role") for turn in payload.get("turns", [])],
+            }
+        )
     return out

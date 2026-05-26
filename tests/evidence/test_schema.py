@@ -1,4 +1,5 @@
 """Tests for hermes_quant.evidence.schema (ADR-0033 D1, D2)."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta

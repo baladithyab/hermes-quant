@@ -3,6 +3,7 @@
 Idempotent `fire()`. Atomic-rename writes to `~/.hermes/quant/state.json`.
 `clear()` requires a HumanApprovalToken with scope='kill_switch_clear'.
 """
+
 from __future__ import annotations
 
 import json
@@ -107,9 +108,7 @@ def clear(token: approvals.HumanApprovalToken | None = None) -> None:
     if token.scope != "kill_switch_clear":
         from hermes_quant.governance.approvals import NoApprovalError
 
-        raise NoApprovalError(
-            f"token scope is {token.scope!r}; kill_switch_clear required"
-        )
+        raise NoApprovalError(f"token scope is {token.scope!r}; kill_switch_clear required")
 
     # Validate via the canonical check (raises if invalid)
     approvals.require_human_token("kill_switch_clear", token.target_ref)

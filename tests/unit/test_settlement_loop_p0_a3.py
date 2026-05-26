@@ -11,6 +11,7 @@ construct_realized_outcomes but forgetting to update construct_episode_outcomes
 or vice versa, or removing the gate from dispatch_settlement) would fail
 loudly.
 """
+
 from __future__ import annotations
 
 import pandas as pd
@@ -100,8 +101,7 @@ def _make_exec(
 class TestRealizedOutcomeQualityTagging:
     def test_buy_fill_outcome_tagged_slippage_only(self):
         sig = _make_signal()
-        exec_rec = _make_exec(side="buy", fill_price=50_500.0,
-                              decision_price=50_000.0)
+        exec_rec = _make_exec(side="buy", fill_price=50_500.0, decision_price=50_000.0)
         outcomes = construct_realized_outcomes([exec_rec], {sig["id"]: sig})
 
         assert len(outcomes) == 1
@@ -109,28 +109,24 @@ class TestRealizedOutcomeQualityTagging:
         # horizon-return; the tag MUST be present so dispatch skips this.
         assert outcomes[0].view.metadata is not None
         assert (
-            outcomes[0].view.metadata["_calibration_quality"]
-            == CALIBRATION_QUALITY_SLIPPAGE_ONLY
+            outcomes[0].view.metadata["_calibration_quality"] == CALIBRATION_QUALITY_SLIPPAGE_ONLY
         )
 
     def test_sell_fill_outcome_tagged_slippage_only(self):
         sig = _make_signal(direction=-1)
-        exec_rec = _make_exec(side="sell", fill_price=49_500.0,
-                              decision_price=50_000.0)
+        exec_rec = _make_exec(side="sell", fill_price=49_500.0, decision_price=50_000.0)
         outcomes = construct_realized_outcomes([exec_rec], {sig["id"]: sig})
 
         assert len(outcomes) == 1
         assert (
-            outcomes[0].view.metadata["_calibration_quality"]
-            == CALIBRATION_QUALITY_SLIPPAGE_ONLY
+            outcomes[0].view.metadata["_calibration_quality"] == CALIBRATION_QUALITY_SLIPPAGE_ONLY
         )
 
     def test_realized_return_is_per_fill_slippage_not_horizon_return(self):
         """Document that v0.1.1's `realized_return` is slippage."""
         sig = _make_signal()
         # Buy at 50_500, decision was 50_000. Slippage = 1% (paid 1% more).
-        exec_rec = _make_exec(side="buy", fill_price=50_500.0,
-                              decision_price=50_000.0)
+        exec_rec = _make_exec(side="buy", fill_price=50_500.0, decision_price=50_000.0)
         outcomes = construct_realized_outcomes([exec_rec], {sig["id"]: sig})
         # The "realized_return" stored is slippage, NOT horizon return.
         # (fill_price - decision_price) / decision_price = 0.01
@@ -153,10 +149,7 @@ class TestEpisodeOutcomeQualityTagging:
         # The AggregatedSignal in EpisodeOutcome inherits the slippage-only
         # tag so dispatch_settlement's aggregator.update() guard skips it.
         agg_meta = episode.aggregated_signal.metadata or {}
-        assert (
-            agg_meta.get("_calibration_quality")
-            == CALIBRATION_QUALITY_SLIPPAGE_ONLY
-        )
+        assert agg_meta.get("_calibration_quality") == CALIBRATION_QUALITY_SLIPPAGE_ONLY
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +197,8 @@ class TestDispatchGating:
         analyst = _RecordingAnalyst()
         agg = _RecordingAggregator()
         stats = dispatch_settlement(
-            outcomes, episodes,
+            outcomes,
+            episodes,
             analysts_by_name={"classical_ta": analyst},
             aggregator=agg,
         )
@@ -269,7 +263,8 @@ class TestDispatchGating:
         analyst = _RecordingAnalyst()
         agg = _RecordingAggregator()
         stats = dispatch_settlement(
-            [outcome], [("sig-1", episode)],
+            [outcome],
+            [("sig-1", episode)],
             analysts_by_name={"classical_ta": analyst},
             aggregator=agg,
         )
@@ -305,7 +300,8 @@ class TestDispatchGating:
         analyst = _RecordingAnalyst()
         agg = _RecordingAggregator()
         stats = dispatch_settlement(
-            [outcome], [],
+            [outcome],
+            [],
             analysts_by_name={"classical_ta": analyst},
             aggregator=agg,
         )

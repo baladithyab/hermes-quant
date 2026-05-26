@@ -155,9 +155,7 @@ def _run_summary(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def _scalar_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     return {
-        key: value
-        for key, value in metrics.items()
-        if key != "validation" and _is_scalar(value)
+        key: value for key, value in metrics.items() if key != "validation" and _is_scalar(value)
     }
 
 

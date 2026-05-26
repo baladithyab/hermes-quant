@@ -4,6 +4,7 @@ Append-only governance artifacts: invariants, kill switch, HITL approvals,
 paper→live promotion evaluator, audit log. This package is excluded from
 the retro-amendment loop's code_change allowlist (ADR-0026 D5 / ADR-0031 D7).
 """
+
 from __future__ import annotations
 
 from hermes_quant.governance import (  # noqa: F401

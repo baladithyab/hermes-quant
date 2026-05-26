@@ -20,6 +20,7 @@ other assets.
 This is a SYNCHRONOUS loop. v0.2 may add asyncio.gather over assets, but
 v0.1.1's bottleneck is yfinance rate limiting, not loop concurrency.
 """
+
 from __future__ import annotations
 
 import logging
@@ -55,6 +56,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AssetTask:
     """One unit of work for the tick loop."""
+
     asset: str
     asset_class: str
     timeframe: str
@@ -66,6 +68,7 @@ class AssetTask:
 @dataclass
 class TickLoopState:
     """Mutable state passed to each tick."""
+
     last_tick_at: pd.Timestamp | None = None
     last_signals_emitted: int = 0
     n_ticks: int = 0
@@ -161,12 +164,21 @@ def run_one_tick(
             # Fetch bars
             end = asof
             tf_secs = {
-                "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
-                "1h": 3600, "4h": 14400, "1d": 86400,
+                "1m": 60,
+                "5m": 300,
+                "15m": 900,
+                "30m": 1800,
+                "1h": 3600,
+                "4h": 14400,
+                "1d": 86400,
             }.get(task.timeframe, 3600)
             start = end - pd.Timedelta(seconds=tf_secs * task.lookback_bars * 2)
             bars = fetch_with_chain(
-                data_providers, task.asset, task.timeframe, start, end,
+                data_providers,
+                task.asset,
+                task.timeframe,
+                start,
+                end,
             )
 
             # Build context
@@ -191,9 +203,7 @@ def run_one_tick(
                     if v is not None:
                         views.append(v)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "analyst %s failed on %s: %s", a.name, task.asset, e
-                    )
+                    logger.warning("analyst %s failed on %s: %s", a.name, task.asset, e)
                     continue
 
             if not views:
@@ -206,7 +216,9 @@ def run_one_tick(
 
             # Compute market state
             market = compute_market_state(
-                bars, asset=task.asset, asof=asof,
+                bars,
+                asset=task.asset,
+                asof=asof,
                 tz="UTC" if task.asset_class == "crypto" else "America/New_York",
             )
 
@@ -248,7 +260,8 @@ def run_one_tick(
                     # the gate will re-emit on the next tick.
                     logger.exception(
                         "halt installation failed for scope=%s: %s",
-                        action.halt_scope, e,
+                        action.halt_scope,
+                        e,
                     )
 
             # Emit signal record
@@ -257,7 +270,9 @@ def run_one_tick(
             n_emitted += 1
             logger.info(
                 "emitted signal: asset=%s dir=%d tgt=%.3f reason=%s",
-                task.asset, signal.direction, action.target_position_pct,
+                task.asset,
+                signal.direction,
+                action.target_position_pct,
                 action.reason,
             )
 
@@ -337,7 +352,11 @@ def _build_signal_record(
         ],
         "committee_turns_hashes": [
             turn.get("input_hash")
-            for turn in ((dict(signal.metadata).get("committee") or {}).get("model_backed_turns", []) if signal.metadata else [])
+            for turn in (
+                (dict(signal.metadata).get("committee") or {}).get("model_backed_turns", [])
+                if signal.metadata
+                else []
+            )
             if turn.get("input_hash")
         ],
     }
