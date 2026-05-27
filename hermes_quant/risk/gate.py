@@ -70,6 +70,59 @@ def _emit_audit(
         logger.warning("audit_log.append failed for %s: %s", kind, e)
 
 
+def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
+    """Build the signal_provenance block for audit-log payloads (ADR-0039).
+
+    The block carries the discriminative metadata required to detect
+    BMA-degeneracy retroactively from the audit trail alone, replacing the
+    out-of-band recommend()-reprobe pattern that surfaced during the
+    2026-05-26 BMA n=1 collapse incident.
+
+    All fields default to None when the underlying signal does not produce
+    them (e.g., a signal from a pre-Wave-1 aggregator that doesn't expose
+    bma_weights). The fields that ARE always derivable from the
+    AggregatedSignal protocol (n_views, n_distinct_analysts,
+    contributing_analysts, aggregator_class) MUST be populated and are not
+    nullable. Tests guard this contract.
+
+    Per ADR-0039: this is the canonical predicate input. The
+    `is_bma_degenerate(event)` helper in
+    `hermes_quant.governance.audit_log_query` consumes this block.
+    """
+    components = signal.components or ()
+    md = dict(signal.metadata or {})
+
+    contributing_analysts = sorted({v.analyst for v in components})
+    analyst_view_ids: list[str] = []
+    for v in components:
+        v_md = dict(v.metadata or {})
+        # Per-view stable ID — present on Wave-1+ analyst views; falls back
+        # to the analyst-class-name when absent so the field is always
+        # populated for cross-referencing.
+        vid = v_md.get("view_id")
+        if vid:
+            analyst_view_ids.append(str(vid))
+        else:
+            analyst_view_ids.append(f"{v.analyst}:{v.horizon}")
+
+    # data_quality may live on the signal itself or on the aggregator
+    # metadata. Prefer the signal-level field if present; otherwise fall
+    # back to metadata; otherwise None.
+    dq = getattr(signal, "data_quality", None) or md.get("data_quality")
+
+    return {
+        "n_views": len(components),
+        "n_distinct_analysts": len(set(contributing_analysts)),
+        "contributing_analysts": contributing_analysts,
+        "vote_share": md.get("vote_share"),
+        "n_contributing": md.get("n_contributing"),
+        "bma_weights": md.get("bma_weights"),
+        "aggregator_class": signal.aggregator,
+        "analyst_view_ids": analyst_view_ids,
+        "data_quality": dq,
+    }
+
+
 def _ts_to_datetime(ts: pd.Timestamp | datetime) -> datetime:
     """Coerce pd.Timestamp or datetime to a tz-aware UTC datetime."""
     if isinstance(ts, pd.Timestamp):
@@ -238,6 +291,7 @@ class DefaultRiskGate:
                 "confidence": float(signal.confidence),
                 "reason": reason,
                 "asof": signal.asof.isoformat(),
+                "signal_provenance": _build_signal_provenance(signal),
             },
         )
 
@@ -254,6 +308,7 @@ class DefaultRiskGate:
                 "target_position_pct": float(action.target_position_pct),
                 "reason": action.reason,
                 "asof": signal.asof.isoformat(),
+                "signal_provenance": _build_signal_provenance(signal),
             },
         )
 
