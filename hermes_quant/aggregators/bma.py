@@ -58,6 +58,17 @@ try:
 except ImportError:  # pragma: no cover
     _ICDedupGate = None  # type: ignore[assignment,misc]
 
+# RegimeDetector is an optional dependency (Wave 7).  When None (default) the
+# aggregator behaves identically to pre-Wave-7 code (bit-identical output).
+try:
+    from hermes_quant.regime.detector import RegimeDetector as _RegimeDetector
+    from hermes_quant.regime.per_regime_weights import apply_regime_weights as _apply_regime_weights
+    from hermes_quant.regime.state_variables import compute_state_variables as _compute_state_variables
+except ImportError:  # pragma: no cover
+    _RegimeDetector = None  # type: ignore[assignment,misc]
+    _apply_regime_weights = None  # type: ignore[assignment,misc]
+    _compute_state_variables = None  # type: ignore[assignment,misc]
+
 
 # ---------------------------------------------------------------------------
 # Multi-timeframe configuration (ADR-0036)
@@ -160,6 +171,7 @@ class BMAAggregator:
         calibrator_path: Path | None = None,
         config: BMAConfig | None = None,
         ic_dedup_gate=None,
+        regime_detector=None,
     ):
         self.prior_alpha = prior_alpha
         self.prior_beta = prior_beta
@@ -204,6 +216,15 @@ class BMAAggregator:
         # the exclusion list is recorded in signal metadata under the key
         # ``ic_dedup_excluded_analysts``.
         self.ic_dedup_gate = ic_dedup_gate
+
+        # Regime detector (Wave 7).  When None (default), behavior is
+        # bit-identical to pre-Wave-7 BMA.  When provided, the detector
+        # classifies the current regime from context.bars and multiplies
+        # per-analyst weights by regime-specific multipliers BEFORE the vote-
+        # share calculation.  The regime state and multipliers are recorded in
+        # AggregatedSignal.metadata under 'regime_state' and
+        # 'regime_weight_multipliers'.
+        self.regime_detector = regime_detector
 
     @staticmethod
     def _load_calibrator(path: Path):
@@ -358,11 +379,62 @@ class BMAAggregator:
                 filtered_views.append(v)
             views = filtered_views
 
+        # Wave 7: regime-aware weight adjustment.
+        # When regime_detector is None (default) this block is entirely skipped —
+        # bit-identical pre-Wave-7 behavior is preserved.
+        # Regime applies AFTER IC dedup (same analysts always survive both
+        # filters) and BEFORE the vote-share calculation.
+        regime_state_value: str | None = None
+        regime_weight_multipliers: dict[str, float] | None = None
+        if self.regime_detector is not None and _apply_regime_weights is not None and _compute_state_variables is not None:
+            try:
+                bars_df = getattr(context, "bars", None)
+                if bars_df is not None and len(bars_df) >= 2:
+                    state_vars = _compute_state_variables(bars_df)
+                    regime_state, _regime_reason = self.regime_detector.classify(state_vars)
+                    regime_state_value = str(regime_state.value)
+                    # Build base weight map (analyst → base_w) so we can record multipliers
+                    base_weights_map = {v.analyst: self._weight_for(v.analyst) for v in views}
+                    adjusted_map = _apply_regime_weights(base_weights_map, regime_state)
+                    regime_weight_multipliers = {
+                        analyst: (
+                            adjusted_map[analyst] / base_weights_map[analyst]
+                            if base_weights_map[analyst] > 1e-12
+                            else 1.0
+                        )
+                        for analyst in base_weights_map
+                    }
+                    # Stash for the weights loop below (analyst → adjusted weight)
+                    _regime_adjusted: dict[str, float] = adjusted_map
+                    logger.debug(
+                        "BMA: regime=%s, multipliers=%s",
+                        regime_state_value,
+                        regime_weight_multipliers,
+                    )
+                else:
+                    _regime_adjusted = {}
+                    regime_state_value = "unknown"
+                    logger.debug(
+                        "BMA: regime_detector set but bars unavailable/empty; "
+                        "regime_state=unknown, no weight adjustment"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "BMA: regime_detector raised %s; skipping regime adjustment", exc
+                )
+                _regime_adjusted = {}
+        else:
+            _regime_adjusted = {}
+
         weights = []
         signed_terms = []  # direction × magnitude × weight × confidence
         signed_dir_terms = []  # direction × weight × confidence (for direction)
         for v in views:
-            base_w = self._weight_for(v.analyst)
+            # Base weight: regime-adjusted if available, else posterior/uniform.
+            if _regime_adjusted and v.analyst in _regime_adjusted:
+                base_w = _regime_adjusted[v.analyst]
+            else:
+                base_w = self._weight_for(v.analyst)
             # ADR-0036: cross-horizon BMA weighting —
             #   effective weight = base_weight(analyst) × horizon_weight(horizon)
             #   The view's own confidence is multiplied in by signed_dir_terms
@@ -525,6 +597,9 @@ class BMAAggregator:
                 "horizon_agreement": horizon_agreement,
                 # Wave 6b: IC dedup audit
                 "ic_dedup_excluded_analysts": ic_dedup_excluded,
+                # Wave 7: regime audit (None when regime_detector is not set)
+                "regime_state": regime_state_value,
+                "regime_weight_multipliers": regime_weight_multipliers,
             },
         )
         self._n_aggregated += 1
