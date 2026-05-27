@@ -390,3 +390,29 @@ class AlphaZoo:
             "AlphaZoo is append-only. update() is not permitted. "
             "Register a new version with an incremented version field instead."
         )
+
+    # ------------------------------------------------------------------
+    # FactorOracle convenience bridge
+    # ------------------------------------------------------------------
+
+    def verdict_for(self, factor_id: str) -> "FactorVerdict | None":
+        """Return the latest production-readiness verdict for *factor_id*.
+
+        Reads directly from the append-only ``factor_verdicts.jsonl`` log
+        managed by :class:`~hermes_quant.factors.factor_oracle.FactorOracle`.
+        Returns ``None`` if the factor has never been evaluated.
+
+        Args:
+            factor_id: The factor identifier to look up.
+
+        Returns:
+            The most-recently appended :class:`~hermes_quant.factors.factor_oracle.FactorVerdict`
+            for *factor_id*, or ``None``.
+        """
+        from hermes_quant.factors.factor_oracle import (  # noqa: PLC0415
+            FactorOracle,
+            FactorVerdict,
+        )
+
+        oracle = FactorOracle(self)
+        return oracle.latest_verdict(factor_id)
