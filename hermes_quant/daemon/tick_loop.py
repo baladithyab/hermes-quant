@@ -26,7 +26,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -369,8 +368,12 @@ def run_one_tick(
                         e,
                     )
 
-            # Emit signal record
-            record = _build_signal_record(signal, action, task, asof, ctx)
+            # Emit signal record. Pass bar_ts so the signal_id is
+            # deterministic across replays — without this, a crash
+            # between emit and watermark.set() produces duplicate rows
+            # with different UUIDs that downstream consumers can't
+            # collapse on signal_id (codex P2 finding 2026-05-26).
+            record = _build_signal_record(signal, action, task, asof, ctx, bar_ts)  # type: ignore[arg-type]
             emit_signal_record(record, path=bus_path)
             n_emitted += 1
             logger.info(
@@ -433,6 +436,7 @@ def _build_signal_record(
     task: AssetTask,
     asof: pd.Timestamp,
     ctx: MarketContext,
+    bar_ts: pd.Timestamp,
 ) -> dict:
     """Construct the JSONL record per ADR-0008 schema.
 
@@ -440,8 +444,36 @@ def _build_signal_record(
     consumers can correctly attribute slippage and the settlement loop can
     compute the realized return formula correctly. `decision_price` is the
     signal's bar-close at signal.asof — that is, `ctx.last_close`.
+
+    The `id` field is a CONTENT-DETERMINISTIC hash of the canonical replay
+    identity `(asset, exchange, timeframe, bar_ts)`. Replaying the same
+    market bar produces the same `id`, so downstream consumers can dedupe
+    on signal_id and the watermark idempotency loop closes properly: a
+    crash between `emit_signal_record()` and `watermark_store.set()` no
+    longer leaks a fresh-UUID duplicate on restart.
+
+    The `asof` decision-time prefix is preserved for human-debug
+    readability ("which tick emitted this") but the disambiguating tail
+    is now a sha1[:12] of the dedup tuple, not a random hex.
     """
-    sig_id = f"sig-{asof.strftime('%Y%m%dT%H%M%SZ')}-{task.asset.replace('/', '-')}-{uuid.uuid4().hex[:6]}"
+    bar_ts_iso = (
+        bar_ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        if hasattr(bar_ts, "strftime")
+        else str(bar_ts)
+    )
+    dedup_payload = "|".join(
+        [
+            task.asset,
+            task.exchange or "",
+            task.timeframe,
+            bar_ts_iso,
+        ]
+    ).encode()
+    dedup_tail = hashlib.sha1(dedup_payload).hexdigest()[:12]
+    sig_id = (
+        f"sig-{asof.strftime('%Y%m%dT%H%M%SZ')}-"
+        f"{task.asset.replace('/', '-')}-{dedup_tail}"
+    )
     return {
         "schema_version": 1,
         "id": sig_id,

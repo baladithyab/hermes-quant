@@ -514,3 +514,90 @@ edges.
   84-test broader slice.
 - Ruff clean on all touched files; pre-existing 4 N806 in `tools.py`
   baseline unchanged.
+
+## Second post-merge codex review (2026-05-26 — security + invariant lens)
+
+A second codex review with `--lens security --lens invariant` against
+HEAD `87c945a` flagged five items. Three were already addressed by the
+first follow-up (commit `91d4796`). Two were new and one of them was
+introduced BY the first follow-up. Fixed in the second follow-up:
+
+### P2-A — `DeliberativeConfig` keyword mismatch
+(`ops/scripts/quant-playbook-tick.py:681`, regression introduced by `169b2fa`)
+
+Root cause: when the LLM-committee threading work in `169b2fa` rebuilt
+the `DeliberativeConfig` from the advisor's flat dict, it spelled the
+risk-mgmt switch as `include_risk_mgmt=...`. The dataclass field is
+`enable_risk_mgmt`. The frozen+slots dataclass rejects unknown kwargs,
+so `HERMES_QUANT_DELIBERATIVE=1` would have raised `TypeError` before
+`run_llm_committee()` could run — meaning the deliberative path the
+first follow-up "shipped" never actually executed against an LLM.
+
+Fix: rename to `enable_risk_mgmt=`. Pinned by three new tests:
+canonical-field acceptance, `include_risk_mgmt` raises TypeError, and
+a static check asserting `ops/scripts/quant-playbook-tick.py` contains
+`enable_risk_mgmt=` and does NOT contain `include_risk_mgmt=`.
+
+The runtime copy at `~/.hermes/scripts/quant-playbook-tick.py` was
+also updated so the next playbook-tick cron picks it up.
+
+### P2-B — Non-deterministic `signal_id` breaks watermark idempotency
+(`hermes_quant/daemon/tick_loop.py:444`)
+
+Root cause: `_build_signal_record` set
+`sig_id = f"sig-...{uuid.uuid4().hex[:6]}"`. Under
+`HERMES_QUANT_WATERMARK_ENABLED=1`, a crash or DB error after
+`emit_signal_record()` returns but before `watermark_store.set()`
+re-runs the same `(symbol, bar_ts)` on restart and emits a SECOND
+record. With a random tail, downstream consumers cannot dedupe on
+`signal_id` — the watermark idempotency loop is incomplete.
+
+Fix: replaced the random tail with `hashlib.sha1(...).hexdigest()[:12]`
+of the canonical replay identity:
+`(asset, exchange, timeframe, bar_ts_iso)`. Same bar produces the same
+id. The `asof` decision-time prefix is preserved for human-debug
+readability ("which tick emitted this") but the disambiguator is now
+content-deterministic. Pinned by five new tests covering:
+
+- same `(symbol, exchange, timeframe, bar_ts)` produces the same id
+- different bar_ts produces different id
+- different exchange produces different id
+- different timeframe produces different id (pairs with the watermark
+  composite-key fix from `91d4796`)
+- end-to-end: two `run_one_tick` calls on identical bars produce
+  records sharing the same dedup-tail
+
+Removed the now-unused `import uuid` from `tick_loop.py`.
+
+### P2-C — `quant_doctor` cold-start hides halts
+(`hermes_quant/tools.py:1139-1146`)
+
+Root cause: when `signals.jsonl` did not exist yet (cold start, fresh
+profile, deleted bus), the `_compute_daemon_state_mirror` early-returned
+`halts: []` without consulting the halt registry. `state.db` can have
+an active operator-emergency-stop before the daemon ever writes a row;
+suppressing it here is the false-clean failure mode that hid the May
+13 phantom-halt scare.
+
+Fix: replaced the hard early-return with a `bus_present` flag. When
+the bus is absent, per_symbol/heartbeat probes are skipped (they need
+bus rows); halt registry + journal-pending probes still run. The
+"signal bus does not exist yet" note is preserved for human callers
+but as `out["note"]` rather than a return early. Pinned by two new
+tests: halts-with-bus-absent must surface, and no-halts-no-bus
+returns empty halts plus the cold-start note.
+
+### Acceptance after second follow-up
+
+- Wave-D test count: 94 → 105 (+11: three risk_mgmt-keyword pins, two
+  cold-start halt-visibility cases, six signal_id determinism cases).
+- All 105 pass; 141-test broader slice (signal_bus, doctor_drift,
+  protocol parity) all green.
+- `_build_signal_record` signature change updated in 4 V1↔V2 parity
+  test call sites in `test_bar_snapshot.py`.
+- Ruff clean on all touched files; pre-existing 4 N806 in `tools.py`
+  baseline unchanged.
+- Production impact: P2-A would have surfaced the moment
+  `HERMES_QUANT_DELIBERATIVE=1` flipped (deliberative path was
+  ungated but non-functional). P2-B and P2-C were latent until
+  `HERMES_QUANT_WATERMARK_ENABLED=1` flipped or the bus was deleted.

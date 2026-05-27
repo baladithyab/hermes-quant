@@ -1136,18 +1136,22 @@ def _compute_daemon_state_mirror(
         HaltSummary = None  # type: ignore[assignment]  # noqa: N806, F841
         SymbolStatus = None  # type: ignore[assignment]  # noqa: N806, F841
 
-    if not signal_bus_path.exists():
-        return {
-            "per_symbol": {},
-            "halts": [],
-            "last_heartbeat_age_s": None,
-            "journal_pending_count": 0,
-            "note": "signal bus does not exist yet",
-        }
+    # Cold-start guard: when the signal bus hasn't been created yet,
+    # skip per-symbol/heartbeat probes (they need bus rows) but still
+    # run the halt-registry and proposal-pending probes. A missing bus
+    # is NOT a "no halts" signal — operator emergency stops live in
+    # state.db and may exist before the daemon ever writes a row.
+    # Suppressing them here is exactly the false-clean failure mode
+    # that hid the May 13 phantom-halt scare.
+    bus_present = signal_bus_path.exists()
 
     # Read a generous tail — we'll filter to last per_symbol_n per symbol.
     # 200 rows total is enough for typical configs (1-20 symbols × 10 each).
-    raw_rows = _read_jsonl_tail(signal_bus_path, max(200, per_symbol_n * 20))
+    raw_rows: list[dict[str, Any]] = (
+        _read_jsonl_tail(signal_bus_path, max(200, per_symbol_n * 20))
+        if bus_present
+        else []
+    )
 
     # Dedup events by (symbol, bar_ts) — TradingAgents _processed_message_ids
     _seen_event_ids: set[tuple[str, str]] = set()
@@ -1272,7 +1276,7 @@ def _compute_daemon_state_mirror(
     except Exception as exc:  # noqa: BLE001
         logger.debug("daemon_state: pending-proposal probe failed: %s", exc)
 
-    return {
+    out: dict[str, Any] = {
         "per_symbol": per_symbol_out,
         "halts": halts_out,
         "last_heartbeat_age_s": last_heartbeat_age_s,
@@ -1280,6 +1284,12 @@ def _compute_daemon_state_mirror(
         "n_dedup_events": len(_seen_event_ids),
         "_walked_at": time.time(),
     }
+    if not bus_present:
+        # Surface the cold-start state so callers know per_symbol/heartbeat
+        # are empty because the bus is absent, not because no signals
+        # have been emitted. Halts + pending counts above DID run.
+        out["note"] = "signal bus does not exist yet"
+    return out
 
 
 def _compute_drift_surface(

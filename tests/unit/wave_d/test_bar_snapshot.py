@@ -271,8 +271,10 @@ def test_jsonl_parity_default(monkeypatch, ctx, view, signal, action, task, env_
         ctx, [view], signal, action, signal_id=sig_id
     )
 
-    # Build the legacy record the way tick_loop does it
-    legacy = _build_signal_record(signal, action, task, ctx.asof, ctx)
+    # Build the legacy record the way tick_loop does it (bar_ts arg added
+    # post-91d4796 to make the id deterministic; the test overrides the
+    # id below so the actual value doesn't affect parity).
+    legacy = _build_signal_record(signal, action, task, ctx.asof, ctx, ctx.asof)
     # Replace legacy's randomly-suffixed id with our deterministic one for comparison
     legacy["id"] = sig_id
 
@@ -304,7 +306,7 @@ def test_jsonl_parity_with_halt(monkeypatch, ctx, view, signal, task) -> None:
         ctx, [view], signal, halt_action, signal_id=sig_id
     )
 
-    legacy = _build_signal_record(signal, halt_action, task, ctx.asof, ctx)
+    legacy = _build_signal_record(signal, halt_action, task, ctx.asof, ctx, ctx.asof)
     legacy["id"] = sig_id
     new = snap.to_jsonl_row()
 
@@ -320,7 +322,7 @@ def test_jsonl_parity_packet_hash_extraction(monkeypatch, ctx, signal, action, t
         ctx, list(signal.components), signal, action, signal_id=sig_id
     )
 
-    legacy = _build_signal_record(signal, action, task, ctx.asof, ctx)
+    legacy = _build_signal_record(signal, action, task, ctx.asof, ctx, ctx.asof)
     legacy["id"] = sig_id
     new = snap.to_jsonl_row()
     assert new["semantic_packet_hashes"] == legacy["semantic_packet_hashes"]
@@ -359,7 +361,7 @@ def test_jsonl_parity_committee_turns(monkeypatch, ctx, view, action, task) -> N
         ctx, [view], sig_with_committee, action, signal_id=sig_id
     )
 
-    legacy = _build_signal_record(sig_with_committee, action, task, ctx.asof, ctx)
+    legacy = _build_signal_record(sig_with_committee, action, task, ctx.asof, ctx, ctx.asof)
     legacy["id"] = sig_id
     new = snap.to_jsonl_row()
     assert new["committee_turns_hashes"] == ["h1", "h2"]

@@ -678,7 +678,7 @@ def _run_committee_safe(
         # risk-mgmt switch + max_debate_rounds matter to the committee.
         cfg = DeliberativeConfig(
             enable_llm_turns=True,
-            include_risk_mgmt=risk_mgmt_enabled,
+            enable_risk_mgmt=risk_mgmt_enabled,
             quick_model=os.environ.get(
                 "HERMES_QUANT_DELIBERATIVE_QUICK_MODEL",
                 "anthropic/claude-haiku-4.6",
