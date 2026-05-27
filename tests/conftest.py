@@ -80,12 +80,15 @@ def _autouse_dummy_third_party_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     blocks on missing creds. Real tests that need real creds opt out by
     overriding via their own monkeypatch.setenv() calls.
 
+<<<<<<< Updated upstream
     BACKFILL ONLY: if the env var is already set (e.g. live-integration
     runs with `HERMES_QUANT_LIVE_LLM=1` and a real OPENROUTER_API_KEY
     in the environment), do NOT overwrite it. This preserves existing
     credentials so live tests can authenticate while still defaulting
     every absent key to the placeholder for offline-CI reliability.
 
+=======
+>>>>>>> Stashed changes
     ADR-0038 §D.4 (P8) — TradingAgents pattern backfill, Wave D Track A.
     """
     placeholders = {
@@ -105,5 +108,9 @@ def _autouse_dummy_third_party_keys(monkeypatch: pytest.MonkeyPatch) -> None:
         "COINBASE_SECRET": "test-placeholder",
     }
     for key, val in placeholders.items():
+<<<<<<< Updated upstream
         if key not in os.environ:
             monkeypatch.setenv(key, val)
+=======
+        monkeypatch.setenv(key, val)
+>>>>>>> Stashed changes

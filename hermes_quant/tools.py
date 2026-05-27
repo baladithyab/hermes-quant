@@ -1005,6 +1005,7 @@ def quant_doctor(args: dict, **_kwargs) -> str:
     # ADR-0038 §D.3 (P6): content-presence DaemonState mirror
     daemon_state_block = None
     if include_daemon_state:
+<<<<<<< Updated upstream
         # Pass through the resolved configured paths so the halt mirror
         # reads the same state.db that other quant_doctor checks consult
         # (rather than the import-time DEFAULT_STATE_DB).
@@ -1013,6 +1014,10 @@ def quant_doctor(args: dict, **_kwargs) -> str:
             signal_bus_path=_SIGNAL_BUS_PATH,
             state_db_path=_STATE_DB_PATH,
             halt_mirror_path=_halt_mirror,
+=======
+        daemon_state_block = _compute_daemon_state_mirror(
+            signal_bus_path=_SIGNAL_BUS_PATH,
+>>>>>>> Stashed changes
             per_symbol_n=daemon_state_per_symbol_n,
         )
 
@@ -1111,8 +1116,11 @@ def _symbol_from_row(row: dict[str, Any]) -> str | None:
 def _compute_daemon_state_mirror(
     *,
     signal_bus_path: Path,
+<<<<<<< Updated upstream
     state_db_path: Path | None = None,
     halt_mirror_path: Path | None = None,
+=======
+>>>>>>> Stashed changes
     per_symbol_n: int = 10,
 ) -> dict[str, Any]:
     """Build the DaemonState content-presence mirror (ADR-0038 §D.3 / P6).
@@ -1132,6 +1140,7 @@ def _compute_daemon_state_mirror(
     try:
         # We read these for typed validation but the public output is dicts.
         from hermes_quant.schemas import HaltSummary, SymbolStatus  # noqa: F401
+<<<<<<< Updated upstream
     except ImportError:  # pragma: no cover — schemas package always present in v0.4
         HaltSummary = None  # type: ignore[assignment]  # noqa: N806, F841
         SymbolStatus = None  # type: ignore[assignment]  # noqa: N806, F841
@@ -1152,6 +1161,24 @@ def _compute_daemon_state_mirror(
         if bus_present
         else []
     )
+=======
+    except ImportError:  # pragma: no cover — pydantic is a hard dep already
+        HaltSummary = None  # type: ignore[assignment]
+        SymbolStatus = None  # type: ignore[assignment]
+
+    if not signal_bus_path.exists():
+        return {
+            "per_symbol": {},
+            "halts": [],
+            "last_heartbeat_age_s": None,
+            "journal_pending_count": 0,
+            "note": "signal bus does not exist yet",
+        }
+
+    # Read a generous tail — we'll filter to last per_symbol_n per symbol.
+    # 200 rows total is enough for typical configs (1-20 symbols × 10 each).
+    raw_rows = _read_jsonl_tail(signal_bus_path, max(200, per_symbol_n * 20))
+>>>>>>> Stashed changes
 
     # Dedup events by (symbol, bar_ts) — TradingAgents _processed_message_ids
     _seen_event_ids: set[tuple[str, str]] = set()
@@ -1212,6 +1239,7 @@ def _compute_daemon_state_mirror(
             "last_action_conf": last_action_conf,
         }
 
+<<<<<<< Updated upstream
     # Halt summary (read-only mirror) — honor configured state-DB path so
     # `quant_doctor` against a redirected QUANT_HOME (e.g. tests, profiles)
     # surfaces halts from THAT db, not the user's default ~/.hermes/quant/.
@@ -1226,6 +1254,14 @@ def _compute_daemon_state_mirror(
         db = state_db_path if state_db_path is not None else DEFAULT_STATE_DB
         mirror = halt_mirror_path if halt_mirror_path is not None else DEFAULT_HALT_JSON_MIRROR
         hs = HaltStateSQLite(db_path=db, mirror_path=mirror)
+=======
+    # Halt summary (read-only mirror)
+    halts_out: list[dict[str, Any]] = []
+    try:
+        from hermes_quant.daemon.halt_state import HaltStateSQLite
+
+        hs = HaltStateSQLite()
+>>>>>>> Stashed changes
         for h in hs.active_halts():
             halts_out.append(
                 {
@@ -1258,6 +1294,7 @@ def _compute_daemon_state_mirror(
         logger.debug("daemon_state: heartbeat parse failed: %s", exc)
         last_heartbeat_age_s = None
 
+<<<<<<< Updated upstream
     # Journal pending count — read-only file probe, no ProposalStore
     # construction (which would touch ~/.hermes/quant/proposals.{jsonl,db}
     # and trigger the expiration sweep on `list_pending`). We tail the
@@ -1277,6 +1314,19 @@ def _compute_daemon_state_mirror(
         logger.debug("daemon_state: pending-proposal probe failed: %s", exc)
 
     out: dict[str, Any] = {
+=======
+    # Journal pending count
+    journal_pending_count = 0
+    try:
+        from hermes_quant.proposals import get_default_store
+
+        store = get_default_store()
+        journal_pending_count = len(store.list_pending(limit=1000))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("daemon_state: pending-proposal read failed: %s", exc)
+
+    return {
+>>>>>>> Stashed changes
         "per_symbol": per_symbol_out,
         "halts": halts_out,
         "last_heartbeat_age_s": last_heartbeat_age_s,
@@ -1284,12 +1334,15 @@ def _compute_daemon_state_mirror(
         "n_dedup_events": len(_seen_event_ids),
         "_walked_at": time.time(),
     }
+<<<<<<< Updated upstream
     if not bus_present:
         # Surface the cold-start state so callers know per_symbol/heartbeat
         # are empty because the bus is absent, not because no signals
         # have been emitted. Halts + pending counts above DID run.
         out["note"] = "signal bus does not exist yet"
     return out
+=======
+>>>>>>> Stashed changes
 
 
 def _compute_drift_surface(

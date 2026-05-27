@@ -26,6 +26,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+<<<<<<< Updated upstream
+=======
+import uuid
+>>>>>>> Stashed changes
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -265,6 +269,7 @@ def run_one_tick(
                 bar_ts = bar_ts.tz_convert("UTC").tz_localize(None)
             if watermark_store is not None:
                 try:
+<<<<<<< Updated upstream
                     wm = watermark_store.get(
                         task.asset,
                         task.exchange or "",
@@ -276,6 +281,13 @@ def run_one_tick(
                         task.asset,
                         task.exchange or "",
                         task.timeframe,
+=======
+                    wm = watermark_store.get(task.asset)
+                except ValueError as e:
+                    logger.warning(
+                        "corrupt watermark for %s; treating as missing: %s",
+                        task.asset,
+>>>>>>> Stashed changes
                         e,
                     )
                     wm = None
@@ -396,9 +408,13 @@ def run_one_tick(
                     watermark_store.set(
                         Watermark(
                             symbol=task.asset,
+<<<<<<< Updated upstream
                             exchange=task.exchange or "",
                             timeframe=task.timeframe,
                             last_processed_bar_ts=bar_ts,  # type: ignore[arg-type]
+=======
+                            last_processed_bar_ts=bar_ts,
+>>>>>>> Stashed changes
                             indicator_snapshot_hash=_compute_indicator_snapshot_hash(ctx),
                             updated_at=now,
                         )
