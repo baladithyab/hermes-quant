@@ -38,4 +38,7 @@ Analyst views ({n_views} total, calibrated):
 All prior committee turns (bull, bear, judge, risk triumvirate):
 {prior_turns_json}
 
+Lessons from prior decisions and outcomes:
+{lessons_block}
+
 Render the final portfolio decision as a single JSON object per the schema.

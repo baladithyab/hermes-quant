@@ -68,6 +68,12 @@ class PaperReactor:
                 what should land here; otherwise the advisor's
                 kelly_fraction.
             approver_user_id: Hermes user id of approver, if available.
+
+        Wave 4 (ADR-0042) reflection hook:
+            When env var HERMES_QUANT_REFLECTION=1 is set AND the fill
+            brings the position quantity to zero (i.e., a close), the
+            Reflector is triggered asynchronously.  Default OFF — behavior
+            is bit-identical to pre-Wave-4 when the env var is absent.
         """
         decision_price = self._extract_decision_price(proposal)
         signal_id = self._extract_signal_id(proposal)
@@ -127,6 +133,25 @@ class PaperReactor:
             get_portfolio_state().apply_execution(_record_dict)
         except Exception as _e:  # pragma: no cover — defensive
             logger.warning("PortfolioState.apply_execution failed (non-blocking): %s", _e)
+
+        # -----------------------------------------------------------------------
+        # Wave 4 (ADR-0042): trigger Reflector on position close.
+        # Gated by HERMES_QUANT_REFLECTION=1 — default OFF.
+        # "Position close" heuristic: fill_size_pct has the opposite sign to
+        # the existing open position (detected via PortfolioState), OR the
+        # resulting net exposure rounds to zero. We use a simple sign-flip
+        # heuristic here; the full settlement-loop path is the authoritative
+        # close detector (daemon/settlement_loop.py).
+        # -----------------------------------------------------------------------
+        import os as _os
+        if _os.environ.get("HERMES_QUANT_REFLECTION", "0") == "1":
+            try:
+                from hermes_quant.memory._paper_reflection_hook import (
+                    maybe_reflect_on_close,
+                )
+                maybe_reflect_on_close(record, proposal)
+            except Exception as _re:  # pragma: no cover — non-blocking
+                logger.warning("Wave4 reflection hook failed (non-blocking): %s", _re)
 
         return record
 
