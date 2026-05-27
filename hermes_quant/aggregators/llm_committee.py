@@ -243,6 +243,12 @@ def _render_prompt(
 
     Returns (system_text, user_text). The two messages are kept separate so
     the LLM client can pass them as ``role='system'`` and ``role='user'``.
+
+    Wave 4 (ADR-0042): When env var HERMES_QUANT_MEMORY_INJECT=1, the
+    portfolio_manager prompt is amended with a ``Lessons from prior decisions
+    and outcomes:`` block populated from get_past_context().  Default OFF —
+    bit-identical to pre-Wave-4 when the env var is absent.  Bull, bear, and
+    risk debaters do NOT see the lessons block (ADR-0042 anti-pattern list).
     """
     template = _load_prompt(role)
     system_tmpl, user_tmpl = _split_system_user(template)
@@ -258,6 +264,35 @@ def _render_prompt(
     }.get(role, role)
     role_direction = "bullish" if role == "bull_researcher" else "bearish"
 
+    # -----------------------------------------------------------------------
+    # Wave 4 memory injection (HERMES_QUANT_MEMORY_INJECT=1, default OFF).
+    # Only portfolio_manager (and research_manager) see the lessons block.
+    # Debaters (bull/bear/risk) are deliberately kept clean (ADR-0042).
+    # -----------------------------------------------------------------------
+    lessons_block = "(none)"
+    if role in ("portfolio_manager", "research_manager"):
+        if os.environ.get("HERMES_QUANT_MEMORY_INJECT", "0") == "1":
+            try:
+                from hermes_quant.memory.retriever import (
+                    format_context_block,
+                    get_past_context,
+                )
+                asof_dt = market_context.asof if isinstance(market_context.asof, __import__("datetime").datetime) else None  # type: ignore[attr-defined]
+                if asof_dt is None:
+                    from datetime import UTC, datetime
+                    asof_dt = datetime.now(UTC)
+                ctx = get_past_context(
+                    ticker=market_context.asset,
+                    asof=asof_dt,
+                )
+                lessons_block = format_context_block(ctx, max_chars=2048)
+            except Exception:
+                logger.warning(
+                    "Memory injection failed for role=%r (non-blocking); "
+                    "using '(none)'",
+                    role,
+                )
+
     fmt: dict[str, Any] = {
         "role": role,
         "role_value": role,
@@ -271,6 +306,7 @@ def _render_prompt(
         "analyst_views_json": _serialize_views(analyst_views),
         "baseline_signal_json": _serialize_signal(baseline_signal),
         "prior_turns_json": _serialize_prior_turns(prior_turns),
+        "lessons_block": lessons_block,
     }
 
     # Use ``str.format_map`` with a defaultdict-like fallback so missing
