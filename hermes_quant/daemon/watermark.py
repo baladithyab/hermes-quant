@@ -54,6 +54,27 @@ def _resolve_profile_path() -> Path:
 
 
 _SCHEMA = """
+-- v2 schema (ADR-0038 §D.1 watermark composite-key correction).
+-- Composite PK on (symbol, exchange, timeframe) — keying on `symbol` alone
+-- caused multi-timeframe horizons (e.g. 1d + 1w on the same symbol) to
+-- silently kill each other when the first emit's bar_ts shadowed the
+-- second's in the watermark short-circuit. See codex P2 finding
+-- 2026-05-26 (tests + concurrency lens).
+CREATE TABLE IF NOT EXISTS watermark_v2 (
+    symbol TEXT NOT NULL,
+    exchange TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    last_processed_bar_ts TEXT NOT NULL,
+    indicator_snapshot_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, exchange, timeframe)
+) WITHOUT ROWID;
+
+-- v1 schema (legacy, tombstone). New writes go to watermark_v2; this
+-- table is preserved so any pre-migration row remains queryable for
+-- forensic purposes. Reads do NOT fall back to v1 — a missing v2 row
+-- is treated as "no watermark" and the bar is re-processed (safe per
+-- ADR-0038 §D.1: signal_id is the canonical idempotency key).
 CREATE TABLE IF NOT EXISTS watermark (
     symbol TEXT PRIMARY KEY,
     last_processed_bar_ts TEXT NOT NULL,
@@ -83,12 +104,17 @@ def _ts_from_iso(s: str) -> pd.Timestamp:
 
 @dataclass(frozen=True, slots=True)
 class Watermark:
-    """Per-symbol resume marker.
+    """Per-(symbol, exchange, timeframe) resume marker.
 
     Per ADR-0038 §D.1.
 
     Attributes:
         symbol: e.g. "BTC/USDT" or "AAPL".
+        exchange: e.g. "binance" or "alpaca". Required for the composite
+            PK — a symbol can be quoted on multiple venues.
+        timeframe: e.g. "1d", "1h", "5m". Required for the composite PK
+            so multi-timeframe horizons on the same symbol don't shadow
+            each other in the watermark short-circuit.
         last_processed_bar_ts: tz-naive UTC. Inclusive — a tick whose
             `ctx.bar_ts <= last_processed_bar_ts` is a replay and is skipped.
         indicator_snapshot_hash: 16-hex-char prefix of sha256 over a
@@ -100,16 +126,19 @@ class Watermark:
     """
 
     symbol: str
+    exchange: str
+    timeframe: str
     last_processed_bar_ts: pd.Timestamp
     indicator_snapshot_hash: str
     updated_at: pd.Timestamp
 
 
 class WatermarkStore:
-    """SQLite-backed (symbol -> Watermark) store.
+    """SQLite-backed ((symbol, exchange, timeframe) -> Watermark) store.
 
-    Writes are atomic via WAL + INSERT OR REPLACE on the symbol PK. Reads
-    are lock-free under WAL. Profile-aware via `_resolve_profile_path`.
+    Writes are atomic via WAL + INSERT OR REPLACE on the composite PK.
+    Reads are lock-free under WAL. Profile-aware via
+    `_resolve_profile_path`.
 
     Thread-safe via per-instance RLock; multi-process safe via SQLite's
     own file locking (we set `busy_timeout` so writers don't fail-fast on
@@ -139,8 +168,13 @@ class WatermarkStore:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
 
-    def get(self, symbol: str) -> Watermark | None:
-        """Return latest watermark for `symbol`, or None if absent.
+    def get(
+        self,
+        symbol: str,
+        exchange: str,
+        timeframe: str,
+    ) -> Watermark | None:
+        """Return latest watermark for `(symbol, exchange, timeframe)`, or None.
 
         Raises ValueError if the stored row is malformed (corrupt
         timestamp). Callers should treat ValueError as a "missing
@@ -148,54 +182,71 @@ class WatermarkStore:
         """
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT symbol, last_processed_bar_ts, indicator_snapshot_hash, updated_at "
-                "FROM watermark WHERE symbol = ?",
-                (symbol,),
+                "SELECT symbol, exchange, timeframe, last_processed_bar_ts, "
+                "indicator_snapshot_hash, updated_at "
+                "FROM watermark_v2 "
+                "WHERE symbol = ? AND exchange = ? AND timeframe = ?",
+                (symbol, exchange, timeframe),
             ).fetchone()
         if row is None:
             return None
         return self._row_to_watermark(row)
 
     def set(self, wm: Watermark) -> None:
-        """Insert or overwrite the watermark for `wm.symbol`.
+        """Insert or overwrite the watermark for the composite PK.
 
         Atomic via INSERT OR REPLACE on the PK. Latest write wins.
         """
         with self._lock, self._conn() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO watermark "
-                "(symbol, last_processed_bar_ts, indicator_snapshot_hash, updated_at) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO watermark_v2 "
+                "(symbol, exchange, timeframe, last_processed_bar_ts, "
+                "indicator_snapshot_hash, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     wm.symbol,
+                    wm.exchange,
+                    wm.timeframe,
                     _ts_to_iso(wm.last_processed_bar_ts),
                     wm.indicator_snapshot_hash,
                     _ts_to_iso(wm.updated_at),
                 ),
             )
 
-    def all_for_symbols(self, symbols: list[str]) -> dict[str, Watermark]:
-        """Batch-read watermarks for a list of symbols.
+    def all_for_keys(
+        self,
+        keys: list[tuple[str, str, str]],
+    ) -> dict[tuple[str, str, str], Watermark]:
+        """Batch-read watermarks for a list of (symbol, exchange, timeframe).
 
-        Returns a dict mapping symbol -> Watermark, omitting symbols that
-        have no row. Empty `symbols` returns `{}` without touching the DB.
+        Returns a dict mapping composite-key tuple -> Watermark, omitting
+        keys that have no row. Empty `keys` returns `{}` without touching
+        the DB.
 
         Malformed rows raise ValueError (consistent with `.get`); the
         store is not corrupted by the failed read since reads are
         side-effect-free.
         """
-        if not symbols:
+        if not keys:
             return {}
-        # Build IN-clause with a fresh placeholder per symbol (sqlite3
-        # does not bind a list to a single placeholder).
-        placeholders = ",".join("?" for _ in symbols)
+        # Build IN-clause with a fresh placeholder triple per key.
+        placeholders = ",".join("(?, ?, ?)" for _ in keys)
+        flat: list[str] = []
+        for k in keys:
+            flat.extend(k)
         with self._conn() as conn:
             rows = conn.execute(
-                f"SELECT symbol, last_processed_bar_ts, indicator_snapshot_hash, updated_at "
-                f"FROM watermark WHERE symbol IN ({placeholders})",
-                tuple(symbols),
+                f"SELECT symbol, exchange, timeframe, last_processed_bar_ts, "
+                f"indicator_snapshot_hash, updated_at "
+                f"FROM watermark_v2 "
+                f"WHERE (symbol, exchange, timeframe) IN ({placeholders})",
+                tuple(flat),
             ).fetchall()
-        return {row["symbol"]: self._row_to_watermark(row) for row in rows}
+        out: dict[tuple[str, str, str], Watermark] = {}
+        for row in rows:
+            wm = self._row_to_watermark(row)
+            out[(wm.symbol, wm.exchange, wm.timeframe)] = wm
+        return out
 
     @staticmethod
     def _row_to_watermark(row: sqlite3.Row) -> Watermark:
@@ -208,10 +259,14 @@ class WatermarkStore:
             updated_at = _ts_from_iso(row["updated_at"])
         except (ValueError, TypeError) as e:
             raise ValueError(
-                f"corrupt watermark row for symbol={row['symbol']!r}: {e}"
+                f"corrupt watermark row for "
+                f"(symbol={row['symbol']!r}, exchange={row['exchange']!r}, "
+                f"timeframe={row['timeframe']!r}): {e}"
             ) from e
         return Watermark(
             symbol=row["symbol"],
+            exchange=row["exchange"],
+            timeframe=row["timeframe"],
             last_processed_bar_ts=last_ts,
             indicator_snapshot_hash=row["indicator_snapshot_hash"],
             updated_at=updated_at,

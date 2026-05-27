@@ -266,11 +266,17 @@ def run_one_tick(
                 bar_ts = bar_ts.tz_convert("UTC").tz_localize(None)
             if watermark_store is not None:
                 try:
-                    wm = watermark_store.get(task.asset)
+                    wm = watermark_store.get(
+                        task.asset,
+                        task.exchange or "",
+                        task.timeframe,
+                    )
                 except ValueError as e:
                     logger.warning(
-                        "corrupt watermark for %s; treating as missing: %s",
+                        "corrupt watermark for %s/%s/%s; treating as missing: %s",
                         task.asset,
+                        task.exchange or "",
+                        task.timeframe,
                         e,
                     )
                     wm = None
@@ -387,7 +393,9 @@ def run_one_tick(
                     watermark_store.set(
                         Watermark(
                             symbol=task.asset,
-                            last_processed_bar_ts=bar_ts,
+                            exchange=task.exchange or "",
+                            timeframe=task.timeframe,
+                            last_processed_bar_ts=bar_ts,  # type: ignore[arg-type]
                             indicator_snapshot_hash=_compute_indicator_snapshot_hash(ctx),
                             updated_at=now,
                         )

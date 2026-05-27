@@ -233,11 +233,38 @@ class BarSnapshot(BaseModel):
         ``signal_id`` is required because BarSnapshot.meta requires it
         (catches misuse — every emit needs an id).
         """
-        # Resolve timestamps (default to ctx.asof for both bar_ts and asof_decision)
-        ts = bar_ts if bar_ts is not None else ctx.asof
-        ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        # Resolve timestamps. `bar_ts` defaults to the LAST bar's timestamp
+        # in `ctx.bars` — the upper bound of what's been processed by the
+        # advisor. This is the correct identity for per-bar dedup (replay
+        # diagnostics, V2 row dedup): re-running the same tick on the same
+        # market bar must produce the same `bar_ts`. `asof_decision` defaults
+        # to `ctx.asof` (the decision/tick wall-clock time), which can be
+        # AFTER the last bar (e.g. tick at 10:05 processing the 10:00 bar).
+        # See ADR-0038 §D.1 — `bar_ts` is the watermark/dedup identity,
+        # `asof_decision` is the decision-clock anchor.
         ad = asof_decision if asof_decision is not None else ctx.asof
         ad_dt = ad.to_pydatetime() if hasattr(ad, "to_pydatetime") else ad
+
+        if bar_ts is not None:
+            ts = bar_ts
+        else:
+            # Try last bar timestamp from ctx.bars; fall back to asof if
+            # bars is empty or column missing (defensive — advisor inputs
+            # have always carried bars+timestamp at this stage).
+            ts = ctx.asof
+            try:
+                bars_attr = getattr(ctx, "bars", None)
+                if bars_attr is not None and len(bars_attr) > 0:
+                    ts_col = bars_attr["timestamp"]
+                    last_bar_ts = ts_col.iloc[-1]
+                    # Normalize to tz-naive UTC to match watermark.py
+                    if hasattr(last_bar_ts, "tzinfo") and last_bar_ts.tzinfo is not None:
+                        last_bar_ts = last_bar_ts.tz_convert("UTC").tz_localize(None)
+                    ts = last_bar_ts
+            except (KeyError, AttributeError, IndexError):
+                # Bars structure missing or malformed — preserve legacy fallback
+                ts = ctx.asof
+        ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts  # type: ignore[union-attr]
 
         meta = MetaSlot(
             signal_id=signal_id,

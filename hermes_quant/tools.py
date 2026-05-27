@@ -1254,15 +1254,23 @@ def _compute_daemon_state_mirror(
         logger.debug("daemon_state: heartbeat parse failed: %s", exc)
         last_heartbeat_age_s = None
 
-    # Journal pending count
+    # Journal pending count — read-only file probe, no ProposalStore
+    # construction (which would touch ~/.hermes/quant/proposals.{jsonl,db}
+    # and trigger the expiration sweep on `list_pending`). We tail the
+    # JSONL log directly and count rows whose status is "pending".
     journal_pending_count = 0
     try:
-        from hermes_quant.proposals import get_default_store
+        from hermes_quant.proposals import PROPOSAL_BUS_PATH
 
-        store = get_default_store()
-        journal_pending_count = len(store.list_pending(limit=1000))
+        if PROPOSAL_BUS_PATH.exists():
+            # Single-pass tail: read last 5000 rows, count status=="pending".
+            # Bounded read; pending proposals are short-lived (TTL-bounded).
+            recent = _read_jsonl_tail(PROPOSAL_BUS_PATH, 5000)
+            journal_pending_count = sum(
+                1 for r in recent if r.get("status") == "pending"
+            )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("daemon_state: pending-proposal read failed: %s", exc)
+        logger.debug("daemon_state: pending-proposal probe failed: %s", exc)
 
     return {
         "per_symbol": per_symbol_out,

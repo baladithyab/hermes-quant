@@ -441,3 +441,76 @@ delegates to `get_vendor_config().resolve(method)`.
 - Plugin registration in `hermes_quant/__init__.py:register()` still
   references all four `QUANT_*` schemas via the local
   `schemas` alias.
+
+## Post-merge codex review (2026-05-26 — tests + concurrency lens)
+
+A follow-up codex review with `--lens tests --lens concurrency` against
+HEAD `87c945a` surfaced three P2 correctness findings, all real. Fixed
+in the immediate follow-up commit:
+
+### P2-1 — Watermark composite-key collision (`tick_loop.py:269,387` /
+`watermark.py`)
+
+Root cause: the watermark `(get|set)` keyed on `task.asset` only. Under
+ADR-0036 multi-timeframe horizons (e.g. `1d` + `1w` for the same
+symbol) the first-emitted timeframe's `bar_ts` would shadow the
+second's in the watermark short-circuit, silently killing the second
+horizon's emit until its `bar_ts` caught up.
+
+Fix: new schema `watermark_v2` with composite PK
+`(symbol, exchange, timeframe)`. Old `watermark` table left in place as
+a forensic tombstone (no fallback reads — a missing v2 row simply
+re-processes the bar, safe per §D.1's "signal_id is the canonical
+idempotency key" invariant). `Watermark` dataclass gains `exchange` and
+`timeframe` fields; `WatermarkStore.get` takes 3 keys; the batch
+helper renamed `all_for_symbols` → `all_for_keys` taking a list of
+`(symbol, exchange, timeframe)` tuples. Equity tasks with `exchange=None`
+coerce to `""` at the call site (sentinel; round-trips cleanly and
+does not collide with a real exchange string). New tests cover the
+two-timeframes and two-exchanges no-collision invariants.
+
+Production impact: zero — `HERMES_QUANT_WATERMARK_ENABLED` is unset in
+all live crons (verified via `cronjob list` 2026-05-26), so the
+watermark module never ran in production. The bug was latent; the fix
+ships clean.
+
+### P2-2 — `quant_doctor` daemon_state mutated proposal state
+(`tools.py:1260`)
+
+Root cause: the `daemon_state` block called
+`hermes_quant.proposals.get_default_store().list_pending(limit=1000)`,
+which on a fresh signal-bus implicitly creates
+`~/.hermes/quant/proposals.{jsonl,db}` AND triggers an expiration
+sweep that writes `expired` records. A read-only diagnostic tool
+should not mutate operator state.
+
+Fix: switched to a bounded JSONL tail probe via
+`_read_jsonl_tail(PROPOSAL_BUS_PATH, 5000)` counting `status=="pending"`
+rows. No `ProposalStore` construction, no expiration sweep. If the
+JSONL doesn't exist, returns 0 silently.
+
+### P2-3 — `BarSnapshot.bar_ts` defaulted to `ctx.asof` not last bar
+(`schemas/bar_snapshot.py:237`)
+
+Root cause: when callers omitted `bar_ts`, the snapshot defaulted to
+`ctx.asof` (the decision/tick wall-clock time, which can be AFTER the
+last closed bar). Replaying the same market bar at a different tick
+time produced a different `bar_ts` each replay, breaking V2 per-bar
+dedup and replay diagnostics.
+
+Fix: `bar_ts` now defaults to the last timestamp in `ctx.bars`
+(normalized to tz-naive UTC), matching the watermark/dedup identity
+established in §D.1. `asof_decision` continues to default to
+`ctx.asof`. Defensive fallback to `ctx.asof` if `ctx.bars` is empty or
+the `timestamp` column is missing, preserving legacy behaviour at the
+edges.
+
+### Acceptance after follow-up
+
+- Wave-D test count: 89 → 94 (+5: two no-collision tests, v2
+  composite-PK schema check, v1 tombstone presence check, empty-
+  exchange sentinel).
+- All 94 pass; no signal_bus / protocol parity regressions in
+  84-test broader slice.
+- Ruff clean on all touched files; pre-existing 4 N806 in `tools.py`
+  baseline unchanged.
