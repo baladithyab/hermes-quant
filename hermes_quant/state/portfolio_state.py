@@ -1,6 +1,6 @@
 """hermes_quant.state.portfolio_state — PortfolioState reconstruction engine.
 
-ADR-0039 wave 1c: materialized-view projection of executions.jsonl into
+ADR-0041 wave 1c: materialized-view projection of executions.jsonl into
 state.db positions + cash tables.
 
 Key design decisions
@@ -17,7 +17,7 @@ Key design decisions
    ExecutionRecord stores fill_size_pct as a SIGNED fraction of NAV,
    NOT a share quantity. e.g. +0.05 means "buy 5 % of current NAV".
    We store this directly as the position's quantity field in v0.1.
-   This is documented in ADR-0039 §D7: share-quantity tracking requires
+   This is documented in ADR-0041 §D7: share-quantity tracking requires
    knowing NAV at execution time; v0.1 stores the fractional-of-NAV
    representation because it is self-contained in each record. Position
    quantity = cumulative sum of fill_size_pct across all fills.
@@ -29,7 +29,7 @@ Key design decisions
    - Short fills (fill_size_pct < 0) INCREASE cash by the same magnitude.
    This is approximate in v0.1 because fill_size_pct is a NAV fraction, not
    shares.  The approximation is consistent with how PaperReactor uses the
-   field.  Documented in ADR-0039 §D7.
+   field.  Documented in ADR-0041 §D7.
 
 5. Sign convention:
    - position.quantity > 0  → long
@@ -552,7 +552,7 @@ def _update_position(
 ) -> tuple[float, float]:
     """Compute new quantity and avg_entry_price after a fill.
 
-    Design (ADR-0039 §D7):
+    Design (ADR-0041 §D7):
     - Weighted-average cost basis (not FIFO) for v0.1.
     - fill_size_pct is SIGNED: positive = long fill, negative = short fill.
     - new_qty = old_qty + fill_size_pct  (position in NAV-fraction units)
@@ -560,7 +560,7 @@ def _update_position(
           new_avg = (old_qty × old_avg + fill_size_pct × fill_price) / new_qty
     - Reducing / closing a position (opposite sign):
           avg_entry_price stays at old_avg for the residual lot
-          (residual-lot rule, ADR-0039 §D7).
+          (residual-lot rule, ADR-0041 §D7).
     - Full close (new_qty ≈ 0): avg_entry_price → 0.0.
     - Direction flip (sign changes, |new_qty| > 0 in opposite direction):
           new_avg = fill_price (new position opened at fill_price).

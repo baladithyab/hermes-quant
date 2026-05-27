@@ -20,9 +20,9 @@ The reference projects (TauricResearch/TradingAgents, HKUDS/Vibe-Trading, Mai031
 
 | Item | Source | Effort |
 |---|---|---|
-| ADR-0039: signal_provenance on every audit-log event | Critique + research consensus | S |
+| ADR-0041: signal_provenance on every audit-log event (renumbered from 0039 due to upstream conflict) | Critique + research consensus | S |
 | Plumb n_distinct_analysts/n_views/contributing_analysts through risk/gate.py:`_audit_approval` and `_audit_rejection` | Critique | S |
-| `is_bma_degenerate(event)` predicate + CLI tool | ADR-0039 | S |
+| `is_bma_degenerate(event)` predicate + CLI tool | ADR-0041 | S |
 | Add `positions` and `cash` tables to state.db | Critique | M |
 | PaperReactor.settle() reconstructs positions from executions.jsonl into state.db | Critique | M |
 | Fix `quant-watchlist-evolve-daily` 120s timeout (profile + speed up OR retire if redundant) | Critique | M |
@@ -61,14 +61,14 @@ The reference projects (TauricResearch/TradingAgents, HKUDS/Vibe-Trading, Mai031
 
 | Item | Source | Effort |
 |---|---|---|
-| ADR-0040: Decision log + reflection log + retriever | TauricResearch + Mai0313 + Vibe-Trading | M |
-| `hermes_quant/memory/decisions.py` (append-only JSONL) | ADR-0040 | M |
+| ADR-0042: Decision log + reflection log + retriever (renumbered from 0040) | TauricResearch + Mai0313 + Vibe-Trading | M |
+| `hermes_quant/memory/decisions.py` (append-only JSONL) | ADR-0042 | M |
 | `hermes_quant/memory/reflector.py` (haiku-tier post-trade reflection with rubric) | Mai0313 | M |
 | `hermes_quant/memory/retriever.py` (BM25 over thesis_summary + same/cross-ticker/cross-sector top-k) | Mai0313 BM25, Vibe-Trading FTS5 | M |
 | **Oracle Fallacy guard test** (`tests/memory/test_retriever_oracle_fallacy.py`) | arxiv:2605.19337 § 4.2 | S |
 | PaperReactor.settle() computes alpha vs SPY (per-asset-class benchmark map) | TauricResearch | M |
 | PM prompt amendment: `Lessons from prior decisions and outcomes:` block (max 2KB) | TauricResearch | S |
-| Env-var rollout: `HERMES_QUANT_REFLECTION=1` then `HERMES_QUANT_MEMORY_INJECT=1` after 30d of reflections | ADR-0040 phasing | — |
+| Env-var rollout: `HERMES_QUANT_REFLECTION=1` then `HERMES_QUANT_MEMORY_INJECT=1` after 30d of reflections | ADR-0042 phasing | — |
 
 ## Wave 5: Data grounding + anti-hallucination
 
@@ -123,7 +123,7 @@ The reference projects (TauricResearch/TradingAgents, HKUDS/Vibe-Trading, Mai031
 - ❌ **Self-graded reflection**: the PM model that made the decision is NOT the reflector. Reflection runs on the haiku tier. (Wave 4.)
 - ❌ **Single decision surface = "the LLM"**: prompt-only LLM trading is below baseline (consensus pattern C2). hermes-quant's deterministic risk gate stays the final authority; the committee is evidence, not authority. (Existing — preserved.)
 - ❌ **Generative factor mining without IC dedup**: produces a Correlation Red Sea. Mandatory IC gate. (Wave 6.)
-- ❌ **Confidence as accuracy proxy**: PHANTOM benchmark shows LLM confidence is uncorrelated with numerical-claim accuracy. We treat conf=1.0 as a discriminator-input, not a sizing-multiplier. (ADR-0039.)
+- ❌ **Confidence as accuracy proxy**: PHANTOM benchmark shows LLM confidence is uncorrelated with numerical-claim accuracy. We treat conf=1.0 as a discriminator-input, not a sizing-multiplier. (ADR-0041.)
 
 ## Wave dependency graph
 

@@ -1,4 +1,4 @@
-"""hermes_quant.state — Durable portfolio state (ADR-0039 wave 1c).
+"""hermes_quant.state — Durable portfolio state (ADR-0041 wave 1c).
 
 The state package provides:
   - PortfolioState: materialized-view projection of executions.jsonl

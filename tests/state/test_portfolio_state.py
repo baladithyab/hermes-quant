@@ -1,4 +1,4 @@
-"""Comprehensive tests for hermes_quant.state.portfolio_state (ADR-0039 wave 1c).
+"""Comprehensive tests for hermes_quant.state.portfolio_state (ADR-0041 wave 1c).
 
 Test coverage:
   1. Empty state.db + 0 executions → empty positions, no cash row
@@ -700,7 +700,7 @@ class TestPartialClose:
         positions = ps.get_positions("paper-default")
         pos = positions[("equity", "AAPL")]
         assert pos.quantity == pytest.approx(0.05, rel=1e-9)
-        # ADR-0039 §D7: residual-lot rule — avg_entry stays at original 100.0
+        # ADR-0041 §D7: residual-lot rule — avg_entry stays at original 100.0
         assert pos.avg_entry_price == pytest.approx(100.0, rel=1e-9)
 
 

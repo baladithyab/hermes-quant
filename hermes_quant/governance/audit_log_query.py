@@ -1,5 +1,5 @@
 """hermes_quant.governance.audit_log_query — Read-only predicates over the
-governance audit log (ADR-0039).
+governance audit log (ADR-0041).
 
 This module provides canonical predicates and counters operators can run
 against `~/.hermes/quant/governance/audit_log.jsonl` to detect known
@@ -7,7 +7,7 @@ failure modes (BMA degeneracy, gate-pass coverage gaps, schema-version
 mismatch). Predicates are the audit-trail-only replacement for out-of-band
 `recommend()` reprobe scripts.
 
-Per ADR-0039: the canonical degeneracy discriminator is
+Per ADR-0041: the canonical degeneracy discriminator is
 `is_bma_degenerate(event)`. Operators run it via the CLI form below or
 import it directly into incident-response notebooks.
 
@@ -38,7 +38,7 @@ DEFAULT_AUDIT_LOG_PATH = Path.home() / ".hermes" / "quant" / "governance" / "aud
 def is_bma_degenerate(event: dict[str, Any]) -> bool:
     """Canonical predicate: True iff this event is the BMA n=1 collapse signature.
 
-    Per ADR-0039, the n=1 collapse fires when the BMA aggregator emits a
+    Per ADR-0041, the n=1 collapse fires when the BMA aggregator emits a
     signal with a single distinct analyst voice and the calibrator returns
     confidence=1.00 — the surface signature of the 2026-05-26 incident.
 
@@ -54,7 +54,7 @@ def is_bma_degenerate(event: dict[str, Any]) -> bool:
     Returns False on any event that:
       - has kind != "gate_approval" (rejections aren't approvable, can't be
         the failure mode this predicate names)
-      - lacks a signal_provenance block (pre-ADR-0039 schema_version=1
+      - lacks a signal_provenance block (pre-ADR-0041 schema_version=1
         events) — operators should treat those as "unknown" and reach for
         the incident-response reference doc, not this predicate.
       - has any malformed/missing field — defensive: better to under-flag
@@ -84,7 +84,7 @@ def is_bma_degenerate(event: dict[str, Any]) -> bool:
 
 
 def is_pre_provenance_schema(event: dict[str, Any]) -> bool:
-    """True iff the event is from a pre-ADR-0039 era (no signal_provenance).
+    """True iff the event is from a pre-ADR-0041 era (no signal_provenance).
 
     Useful for operators trying to estimate audit-trail observability
     coverage — count of these events / total events = blind-spot ratio.
@@ -145,7 +145,7 @@ def coverage_summary(path: Path = DEFAULT_AUDIT_LOG_PATH) -> dict[str, int]:
         gate_rejections: count of kind=gate_rejection
         with_provenance: gate_approval+gate_rejection events that DO carry
             a signal_provenance block
-        without_provenance: ditto, lacking the block (pre-ADR-0039 era)
+        without_provenance: ditto, lacking the block (pre-ADR-0041 era)
         degenerate: count where is_bma_degenerate is True
     """
     counts = {

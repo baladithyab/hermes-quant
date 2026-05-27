@@ -1,4 +1,6 @@
-# ADR-0039: Signal Provenance & Audit-Trail Observability
+# ADR-0041: Signal Provenance & Audit-Trail Observability
+
+> Note (2026-05-27): renumbered from ADR-0039 → ADR-0041 to avoid conflict with the upstream-merged ADR-0039 (Robinhood Agentic Trading MCP Reactor) on origin/main. ADR-0040 is also taken downstream (by docs/adr/ADR-0040-persistent-memory-reflection.md, which we renumbered to ADR-0042 in the same pass).
 
 **Status:** Proposed
 **Date:** 2026-05-27
@@ -136,8 +138,8 @@ This ADR aligns hermes-quant with the cross-project consensus pattern from the 2
 - **Mai0313/TradingAgents** — `TradeRecommendation` schema includes `confidence: float (0–1)` AND `warning_message: str | None` for self-flagged degeneracy.
 - **virattt/ai-hedge-fund** — `{signal, confidence, reasoning}` wire format per analyst; reasoning lives on the view, not in free-form rationale fields.
 
-## Future work (deferred to ADR-0040, ADR-0041)
+## Future work (deferred to ADR-0042, ADR-0043, ADR-0044)
 
-- ADR-0040: Persistent memory + reflection layer (TauricResearch + Mai0313 + Vibe-Trading FTS5)
-- ADR-0041: 3-way risk committee (Aggressive/Conservative/Neutral) post-trader-stage (TauricResearch gap)
-- ADR-0042: Trader intermediate stage with `TraderProposal` Pydantic schema (entry_price, stop_loss, time_horizon)
+- ADR-0042: Persistent memory + reflection layer (TauricResearch + Mai0313 + Vibe-Trading FTS5)
+- ADR-0043: 3-way risk committee (Aggressive/Conservative/Neutral) post-trader-stage (TauricResearch gap)
+- ADR-0044: Trader intermediate stage with `TraderProposal` Pydantic schema (entry_price, stop_loss, time_horizon)

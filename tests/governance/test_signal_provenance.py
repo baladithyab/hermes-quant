@@ -1,4 +1,4 @@
-"""Tests for ADR-0039 signal_provenance plumbing through risk/gate.py.
+"""Tests for ADR-0041 signal_provenance plumbing through risk/gate.py.
 
 Validates the contract:
 - gate_approval and gate_rejection audit events MUST carry a
@@ -230,7 +230,7 @@ def _read_payloads(path: Path, kind: str) -> list[dict]:
 
 
 def test_gate_approval_carries_signal_provenance(audit_path: Path, halt_state) -> None:
-    """ADR-0039 contract: every gate_approval payload includes signal_provenance."""
+    """ADR-0041 contract: every gate_approval payload includes signal_provenance."""
     components = (_av("ClassicalTA", direction=1), _av("Kronos", direction=1))
     signal = _make_signal(direction=1, confidence=0.85, components=components)
     g = DefaultRiskGate()
@@ -248,7 +248,7 @@ def test_gate_approval_carries_signal_provenance(audit_path: Path, halt_state) -
 
 
 def test_gate_rejection_carries_signal_provenance(audit_path: Path, halt_state) -> None:
-    """ADR-0039 contract: every gate_rejection payload also includes signal_provenance."""
+    """ADR-0041 contract: every gate_rejection payload also includes signal_provenance."""
     components = (_av("Kronos", direction=1),)
     signal = _make_signal(direction=1, confidence=0.85, components=components)
     g = DefaultRiskGate()
@@ -330,7 +330,7 @@ def test_is_bma_degenerate_returns_false_on_rejection_kind() -> None:
 
 
 def test_is_bma_degenerate_returns_false_on_pre_provenance_event() -> None:
-    """Pre-ADR-0039 events have no signal_provenance block. Predicate
+    """Pre-ADR-0041 events have no signal_provenance block. Predicate
     must NOT flag these (we don't know if they're degenerate from the
     audit alone)."""
     ev = _approval_event()

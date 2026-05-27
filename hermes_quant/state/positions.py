@@ -1,13 +1,13 @@
 """hermes_quant.state.positions — Position and CashState typed views.
 
-ADR-0039 wave 1c: these dataclasses are the Python-facing read-views over
+ADR-0041 wave 1c: these dataclasses are the Python-facing read-views over
 the positions and cash tables in state.db.
 
 Design notes
 ------------
 - Position.quantity is SIGNED: positive = long, negative = short.
 - Position.avg_entry_price uses weighted-average cost basis (v0.1 choice,
-  documented in ADR-0039 §D7: FIFO is cleaner for tax lots but more
+  documented in ADR-0041 §D7: FIFO is cleaner for tax lots but more
   complex; deferred to v0.2).
 - CashState.equity_total is denormalized for fast reads; rebuilt from
   cash_balance + mark values each time reconstruct_from runs.
@@ -34,7 +34,7 @@ class Position:
         Signed shares/units: positive = long, negative = short.
     avg_entry_price:
         Weighted-average cost basis per unit (v0.1: weighted-average,
-        not FIFO — see ADR-0039 §D7).
+        not FIFO — see ADR-0041 §D7).
     last_update_at:
         ISO 8601 UTC of the last fill that touched this position.
     """

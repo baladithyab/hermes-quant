@@ -110,7 +110,7 @@ class PaperReactor:
             record.decision_price,
         )
 
-        # Wave 1c (ADR-0039): update PortfolioState incrementally.
+        # Wave 1c (ADR-0041): update PortfolioState incrementally.
         # Failure must NOT block execution — silence-by-default per ADR-0031.
         try:
             from hermes_quant.state.portfolio_state import get_portfolio_state

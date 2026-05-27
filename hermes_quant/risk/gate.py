@@ -71,7 +71,7 @@ def _emit_audit(
 
 
 def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
-    """Build the signal_provenance block for audit-log payloads (ADR-0039).
+    """Build the signal_provenance block for audit-log payloads (ADR-0041).
 
     The block carries the discriminative metadata required to detect
     BMA-degeneracy retroactively from the audit trail alone, replacing the
@@ -85,7 +85,7 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
     contributing_analysts, aggregator_class) MUST be populated and are not
     nullable. Tests guard this contract.
 
-    Per ADR-0039: this is the canonical predicate input. The
+    Per ADR-0041: this is the canonical predicate input. The
     `is_bma_degenerate(event)` helper in
     `hermes_quant.governance.audit_log_query` consumes this block.
     """

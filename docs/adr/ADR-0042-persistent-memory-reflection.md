@@ -1,4 +1,6 @@
-# ADR-0040: Persistent Memory & Deferred Reflection Layer
+# ADR-0042: Persistent Memory & Deferred Reflection Layer
+
+> Note (2026-05-27): renumbered from ADR-0040 → ADR-0042. See ADR-0041 ¶Note for context.
 
 **Status:** Proposed
 **Date:** 2026-05-27
@@ -42,7 +44,7 @@ One row per committee decision (whether approved, rejected, or silenced). Schema
   "target_position_pct": -0.2,
   "thesis_summary": "...",             // one-paragraph summary from PM
   "thesis_evidence_ids": ["ev_..."],   // ADR-0033 evidence store IDs
-  "signal_provenance": {...},          // from ADR-0039
+  "signal_provenance": {...},          // from ADR-0041
   "research_plan_text": "...",         // from research_manager debate output
   "trader_proposal": {...},            // from TraderNode (when ADR-0042 lands)
   "risk_debate_summary": "...",        // from 3-way risk committee (when ADR-0041 lands)
@@ -254,4 +256,4 @@ Phase 4 (after 30 days of accumulated reflections): Flip both env-var defaults t
 - ADR-0033 (Evidence Store) — `thesis_evidence_ids` reuses evidence IDs.
 - ADR-0034 (Run Cards) — reflection_id can be referenced from run-card artifacts.
 - ADR-0037 (LLM Committee) — quick-tier LLM (haiku) is the reflector.
-- ADR-0039 (Signal Provenance) — `signal_provenance` is copied into decision_log row at decision time.
+- ADR-0041 (Signal Provenance) — `signal_provenance` is copied into decision_log row at decision time.
