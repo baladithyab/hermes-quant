@@ -117,7 +117,13 @@ def read_active_halts() -> list[dict]:
     except (json.JSONDecodeError, OSError) as e:
         return [{"reason": f"halt_state.json corrupt: {e}", "scope": "fail-closed"}]
     if not isinstance(data, list):
-        return []
+        # 2026-05-27 hardening: a non-list mirror (e.g. {} from a partial
+        # atomic-replace race or a misconfigured tool) used to fall through
+        # as "no halt active". That violates the fail-closed contract from
+        # ADR-0009 — a corrupt-shape mirror is indistinguishable from an
+        # absent halt registry, which is operationally unsafe. Now we
+        # treat shape mismatch as an active fail-closed halt.
+        return [{"reason": f"halt_state.json wrong shape: {type(data).__name__}", "scope": "fail-closed"}]
     # Filter to active halts only (cleared_at is None / missing)
     active = [h for h in data if isinstance(h, dict) and not h.get("cleared_at")]
     return active
