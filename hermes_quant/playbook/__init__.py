@@ -37,11 +37,13 @@ from hermes_quant.playbook.profiles import (
 from hermes_quant.playbook.scorers import (
     PlayFitness,
     compute_play_snapshot,
+    prewarm_snapshot_cache,
     score_all,
     score_covered_call,
     score_csp,
     score_leaps,
     score_swing,
+    score_symbol,
     score_wheel,
 )
 from hermes_quant.playbook.watchlist_evolution import (
@@ -62,6 +64,7 @@ __all__ = [
     "PlayFitness",
     "PlayProfile",
     "compute_play_snapshot",
+    "prewarm_snapshot_cache",
     "profile_covered_call",
     "profile_csp",
     "profile_leaps",
@@ -72,5 +75,6 @@ __all__ = [
     "score_csp",
     "score_leaps",
     "score_swing",
+    "score_symbol",
     "score_wheel",
 ]
