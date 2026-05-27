@@ -183,6 +183,15 @@ def create_proposals_for_actionables(actionables: list[dict]) -> list[dict]:
     except Exception as exc:
         _trader_node = None  # type: ignore[assignment]
 
+    # Wave 3 (ADR-0043): 3-way risk committee runs after the trader,
+    # before the deterministic risk gate. Failure to construct is non-fatal —
+    # we just skip risk-debate enrichment.
+    try:
+        from hermes_quant.agents.risk_committee import RiskCommittee
+        _risk_committee = RiskCommittee()
+    except Exception:
+        _risk_committee = None  # type: ignore[assignment]
+
     store = get_default_store()
     for v in actionables:
         full = v.pop("_advisor_result", None)
@@ -211,6 +220,22 @@ def create_proposals_for_actionables(actionables: list[dict]) -> list[dict]:
                 v["trader_time_horizon_days"] = full["trader_proposal"].get("time_horizon_days")
                 v["trader_size_fraction"] = full["trader_proposal"].get("size_fraction")
                 v["trader_warning"] = full["trader_proposal"].get("warning_message")
+
+                # Wave 3 (ADR-0043): 3-way risk committee debate.
+                # Committee can ONLY silence (multiplier ≤ 1.0), never amplify.
+                if _risk_committee is not None:
+                    try:
+                        risk_summary = _risk_committee.debate(
+                            trader_proposal,
+                            research_plan,
+                            proposal_id=v.get("symbol", "unknown"),
+                        )
+                        full["risk_debate_summary"] = risk_summary.model_dump(mode="json")
+                        v["risk_silence_multiplier"] = risk_summary.silence_multiplier
+                        v["risk_final_recommendation"] = risk_summary.final_recommendation
+                        v["risk_n_rounds"] = risk_summary.n_rounds
+                    except Exception as exc_rc:
+                        v["risk_debate_error"] = f"{type(exc_rc).__name__}: {exc_rc}"
             except Exception as exc_tp:
                 v["trader_proposal_error"] = f"{type(exc_tp).__name__}: {exc_tp}"
 
@@ -369,6 +394,23 @@ def format_brief(actionable: list[dict], silent: list[dict],
                 lines.append(f"  - ⚠️ trader-warning: {tw}")
             elif v.get("trader_proposal_error"):
                 lines.append(f"  - ⚠️ trader-proposal error: {v['trader_proposal_error']}")
+
+            # Wave 3 (ADR-0043): Risk debate subsection — 3 personas' critiques
+            # and the final silence_multiplier.
+            risk_summary = (v.get("_advisor_result") or {}).get("risk_debate_summary")
+            if risk_summary is None:
+                # The advisor_result was already popped/embedded; the formatter
+                # may need to re-read it from the surfaced fields.
+                pass
+            silence_mult = v.get("risk_silence_multiplier")
+            if silence_mult is not None:
+                lines.append(
+                    f"  - 🛡️ Risk debate (mult={silence_mult:.2f}, "
+                    f"{v.get('risk_n_rounds', 0)} round(s)): "
+                    f"{v.get('risk_final_recommendation', '')}"
+                )
+            elif v.get("risk_debate_error"):
+                lines.append(f"  - ⚠️ risk-debate error: {v['risk_debate_error']}")
             if rat:
                 lines.append(f"  - {rat}")
         lines.append("")
