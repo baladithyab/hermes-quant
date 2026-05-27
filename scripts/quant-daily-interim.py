@@ -33,6 +33,12 @@ if HERMES_VENV_PY.exists() and sys.executable != str(HERMES_VENV_PY):
 UNIVERSE_PATH = Path.home() / ".hermes" / "scripts" / "quant-universe-interim.txt"
 WATCHLIST_PATH = Path.home() / ".hermes" / "quant" / "watchlist" / "play-fit.json"
 
+# Wave 7/8 data paths — read-only, graceful degradation when absent.
+_YIELD_CACHE_PATH = Path.home() / ".hermes" / "quant" / "cache" / "yield-curve-cache.json"
+_HYPOTHESES_PATH = Path.home() / ".hermes" / "quant" / "research" / "hypotheses.jsonl"
+_RUN_CARDS_PATH = Path.home() / ".hermes" / "quant" / "research" / "run_cards.jsonl"
+_SHADOW_HOME = Path.home() / ".hermes" / "quant" / "shadow"
+
 
 def load_universe() -> list[tuple[str, str, str]]:
     """Load the universe of symbols to score.
@@ -329,9 +335,267 @@ def rank_picks(views: list[dict]) -> tuple[list[dict], list[dict], list[dict], l
     return actionable, silent, data_blocked, failed
 
 
+# ---------------------------------------------------------------------------
+# Wave 7: Market Regime subsection
+# ---------------------------------------------------------------------------
+
+def _compute_regime_section(bars_by_symbol: dict | None = None) -> str:
+    """Compute and format the 🌡️ Market Regime subsection.
+
+    Reads the most-recently-computed state variables for the primary universe.
+    Falls back to "(unavailable)" on any error — never crashes the brief.
+
+    Args:
+        bars_by_symbol: Optional pre-fetched {symbol: bars_df} mapping.
+            When None, attempts to fetch SPY bars from the advisor data layer.
+    """
+    try:
+        return _compute_regime_section_inner(bars_by_symbol)
+    except Exception as exc:
+        return f"## 🌡️ Market Regime\n_(unavailable: {type(exc).__name__}: {exc})_\n"
+
+
+def _compute_regime_section_inner(bars_by_symbol: dict | None) -> str:
+    # Import Wave 7 modules — graceful on ImportError
+    try:
+        from hermes_quant.regime.state_variables import compute_state_variables
+        from hermes_quant.regime.detector import RegimeDetector, RegimeState
+    except ImportError as exc:
+        return f"## 🌡️ Market Regime\n_(unavailable: regime module not installed: {exc})_\n"
+
+    # Get bars for SPY (broad market proxy) — or use provided bars
+    bars_df = None
+    if bars_by_symbol:
+        # Prefer SPY, fall back to first available symbol
+        _candidate = bars_by_symbol.get("SPY")
+        if _candidate is None:
+            _candidate = next(iter(bars_by_symbol.values()), None)
+        bars_df = _candidate
+
+    if bars_df is None:
+        try:
+            import yfinance as yf
+            import pandas as pd
+            raw = yf.download("SPY", period="400d", interval="1d",
+                              auto_adjust=True, progress=False)
+            if raw is not None and not raw.empty:
+                raw.columns = [c.lower() if isinstance(c, str) else c[0].lower()
+                               for c in raw.columns]
+                bars_df = raw
+        except Exception:
+            pass
+
+    if bars_df is None or (hasattr(bars_df, "__len__") and len(bars_df) < 10):
+        return "## 🌡️ Market Regime\n_(unavailable: insufficient bars for SPY)_\n"
+
+    sv = compute_state_variables(bars_df)
+    detector = RegimeDetector()
+    regime, reason = detector.classify(sv)
+
+    # Regime emoji
+    regime_emoji = {
+        "bull": "🟢", "bear": "🔴", "volatile": "🌪️", "unknown": "⚪"
+    }.get(regime.value, "⚪")
+
+    lines = ["## 🌡️ Market Regime", ""]
+    lines.append(f"**{regime_emoji} {regime.value.upper()}**")
+
+    # Realized vol
+    vol_pct_label = f"{sv.realized_vol_percentile:.0%}" if sv.realized_vol_percentile is not None else "n/a"
+    lines.append(f"  vol(60d)={sv.realized_vol_60d:.1%}  pct={vol_pct_label}")
+
+    # Trend strength
+    if sv.trend_strength is not None:
+        lines.append(f"  trend(z)={sv.trend_strength:+.2f}")
+    else:
+        lines.append("  trend(z)=n/a")
+
+    # Yield curve slope (optional)
+    if sv.yield_curve_slope is not None:
+        lines.append(f"  yield-curve(10y-2y)={sv.yield_curve_slope:+.2f}%")
+
+    # Classifier reason (truncated to keep brief terse)
+    if reason:
+        short_reason = reason[:120] + "…" if len(reason) > 120 else reason
+        lines.append(f"  _{short_reason}_")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Wave 8a: Active Research subsection
+# ---------------------------------------------------------------------------
+
+def _compute_research_section() -> str:
+    """Compute and format the 🔬 Active Research subsection.
+
+    Reads ~/.hermes/quant/research/hypotheses.jsonl.
+    Gracefully degrades on missing file or parse errors.
+    """
+    try:
+        return _compute_research_section_inner()
+    except Exception as exc:
+        return f"## 🔬 Active Research\n_(unavailable: {type(exc).__name__}: {exc})_\n"
+
+
+def _compute_research_section_inner() -> str:
+    lines = ["## 🔬 Active Research", ""]
+
+    if not _HYPOTHESES_PATH.exists():
+        lines.append(
+            "_(no active research — use `scripts/research-autopilot.py register` to start one)_"
+        )
+        lines.append("")
+        return "\n".join(lines)
+
+    # Parse hypotheses JSONL — append-only, last status_change wins per ID
+    hypotheses: dict[str, dict] = {}  # hypothesis_id → latest record
+    try:
+        raw_text = _HYPOTHESES_PATH.read_text()
+    except OSError as exc:
+        lines.append(f"_(unavailable: {exc})_")
+        lines.append("")
+        return "\n".join(lines)
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        hid = row.get("hypothesis_id") or ""
+        if not hid:
+            continue
+        kind = row.get("kind", "hypothesis")
+        if kind == "hypothesis":
+            hypotheses.setdefault(hid, {}).update(row)
+        elif kind == "status_change":
+            hypotheses.setdefault(hid, {}).update(row)
+
+    # Filter to running hypotheses
+    running = [h for h in hypotheses.values() if h.get("status") == "running"]
+
+    if not running:
+        lines.append(
+            "_(no active research — use `scripts/research-autopilot.py register` to start one)_"
+        )
+        lines.append("")
+        return "\n".join(lines)
+
+    now = datetime.now(timezone.utc)
+    for h in running[:5]:
+        hid = h.get("hypothesis_id", "?")
+        claim = h.get("claim", "")
+        claim_short = (claim[:80] + "…") if len(claim) > 80 else claim
+        created_at_str = h.get("created_at", "")
+        days_running = "?"
+        if created_at_str:
+            try:
+                from datetime import timezone as _tz
+                created_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                days_running = str((now - created_dt).days)
+            except Exception:
+                pass
+        related = h.get("related_adrs", [])
+        related_str = f"  [{', '.join(related)}]" if related else ""
+        lines.append(f"- `{hid}` ({days_running}d)  {claim_short}{related_str}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Wave 8b: Shadow Counterfactuals subsection
+# ---------------------------------------------------------------------------
+
+def _compute_shadow_section() -> str:
+    """Compute and format the 📊 Shadow Counterfactuals subsection.
+
+    Reads SQLite DBs under ~/.hermes/quant/shadow/*.db.
+    Gracefully degrades when no DBs exist or are corrupt.
+    """
+    try:
+        return _compute_shadow_section_inner()
+    except Exception as exc:
+        return f"## 📊 Shadow Counterfactuals\n_(unavailable: {type(exc).__name__}: {exc})_\n"
+
+
+def _compute_shadow_section_inner() -> str:
+    lines = ["## 📊 Shadow Counterfactuals", ""]
+
+    if not _SHADOW_HOME.exists():
+        lines.append(
+            "_(shadow accounts dormant — run `scripts/shadow-replay-daily.py` to backfill)_"
+        )
+        lines.append("")
+        return "\n".join(lines)
+
+    db_files = list(_SHADOW_HOME.glob("*.db"))
+    if not db_files:
+        lines.append(
+            "_(shadow accounts dormant — run `scripts/shadow-replay-daily.py` to backfill)_"
+        )
+        lines.append("")
+        return "\n".join(lines)
+
+    # Read all-time total pnl from each shadow DB
+    import sqlite3
+    rule_pnls: list[tuple[str, float]] = []  # (rule_name, pnl_total)
+
+    for db_path in db_files:
+        rule_name = db_path.stem
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=2.0)
+            try:
+                row = conn.execute(
+                    "SELECT pnl_total FROM shadow_pnl_history ORDER BY asof DESC LIMIT 1"
+                ).fetchone()
+                if row is not None:
+                    rule_pnls.append((rule_name, float(row[0])))
+            except sqlite3.OperationalError:
+                pass  # empty / no pnl_history table yet
+            finally:
+                conn.close()
+        except Exception:
+            continue  # corrupt DB — skip
+
+    if not rule_pnls:
+        lines.append(
+            "_(shadow accounts dormant — run `scripts/shadow-replay-daily.py` to backfill)_"
+        )
+        lines.append("")
+        return "\n".join(lines)
+
+    # Sort by pnl descending
+    rule_pnls.sort(key=lambda x: x[1], reverse=True)
+
+    # Top 3 winners
+    winners = [(n, p) for n, p in rule_pnls if p >= 0][:3]
+    losers = [(n, p) for n, p in rule_pnls if p < 0][-1:]  # worst 1
+
+    if winners:
+        lines.append("**Top performers (all-time P&L vs production):**")
+        for rank, (name, pnl) in enumerate(winners, 1):
+            sign = "+" if pnl >= 0 else ""
+            lines.append(f"  {rank}. `{name}` {sign}${pnl:,.0f}")
+    if losers:
+        lines.append("**Underperformer:**")
+        for name, pnl in losers:
+            lines.append(f"  ⚠️ `{name}` ${pnl:,.0f}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def format_brief(actionable: list[dict], silent: list[dict],
                  data_blocked: list[dict], failed: list[dict],
-                 universe_size: int, halt_note: str | None = None) -> str:
+                 universe_size: int, halt_note: str | None = None,
+                 regime_section: str | None = None,
+                 research_section: str | None = None,
+                 shadow_section: str | None = None) -> str:
     now = datetime.now(timezone.utc).astimezone()
     lines = []
     lines.append(f"# 📊 Hermes-Quant Daily Brief — {now.strftime('%a %Y-%m-%d %H:%M %Z')}")
@@ -431,6 +695,17 @@ def format_brief(actionable: list[dict], silent: list[dict],
             lines.append(f"- {v['symbol']}: {v.get('error','unknown')}")
         lines.append("")
 
+    # ---- Wave 7/8 subsections (ADR-0053) ----
+    if regime_section:
+        lines.append(regime_section.rstrip())
+        lines.append("")
+    if research_section:
+        lines.append(research_section.rstrip())
+        lines.append("")
+    if shadow_section:
+        lines.append(shadow_section.rstrip())
+        lines.append("")
+
     lines.append("---")
     lines.append("_Disclaimer: educational analysis only, not financial advice. "
                  "This is a paper-trading research system._")
@@ -479,7 +754,19 @@ def main() -> int:
         for v in bucket:
             v.pop("_advisor_result", None)
     halt_note = _read_halt_note()
-    brief = format_brief(actionable, silent, data_blocked, failed, len(rows), halt_note=halt_note)
+
+    # Wave 7/8 subsections — each degrades gracefully on error (ADR-0053)
+    regime_section = _compute_regime_section()
+    research_section = _compute_research_section()
+    shadow_section = _compute_shadow_section()
+
+    brief = format_brief(
+        actionable, silent, data_blocked, failed, len(rows),
+        halt_note=halt_note,
+        regime_section=regime_section,
+        research_section=research_section,
+        shadow_section=shadow_section,
+    )
     # Print to stdout — the cron LLM wrapper picks this up
     print(brief)
     # Also persist a structured copy for later retro-loop ingestion
