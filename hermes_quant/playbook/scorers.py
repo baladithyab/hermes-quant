@@ -19,12 +19,17 @@ lazily inside compute_play_snapshot so unit tests don't require it.
 
 from __future__ import annotations
 
+import logging
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
 
 from .profiles import PROFILES, PlayProfile
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # Output dataclass
@@ -556,6 +561,144 @@ def compute_play_snapshot(symbol: str, asof: date | datetime | None = None) -> d
 # Module-level cache to avoid recomputing the snapshot for the same symbol
 # across all 5 plays in one evolution tick. Keyed by (symbol, asof_date_str).
 _SNAPSHOT_CACHE: dict[tuple[str, str], dict] = {}
+
+
+# Default worker count for the parallel prewarm. yfinance is HTTP-bound (the
+# GIL releases on socket I/O), so threads scale well, but we keep this modest
+# to avoid hammering Yahoo. Override with HERMES_QUANT_PREWARM_WORKERS.
+_DEFAULT_PREWARM_WORKERS = 12
+
+
+def prewarm_snapshot_cache(
+    symbols: list[str],
+    asof: date | datetime | None = None,
+    *,
+    max_workers: int | None = None,
+    timeout_per_symbol: float = 30.0,
+) -> dict[str, Any]:
+    """Pre-populate ``_SNAPSHOT_CACHE`` for ``symbols`` in parallel.
+
+    Each ``compute_play_snapshot`` call is 3 yfinance HTTP requests; running
+    them serially across a 500-symbol universe takes 3-5 minutes and routinely
+    blows the cron's hard timeout wall. This helper fans the calls out across
+    a thread pool (HTTP-bound work, GIL releases on sockets) so the same
+    universe completes in 30-60s.
+
+    The cache key matches ``score_symbol`` exactly — ``(SYMBOL, YYYY-MM-DD)``
+    in UTC — so subsequent ``score_symbol`` calls for those symbols hit the
+    cache and never touch yfinance again that day.
+
+    Silence-by-default: per-symbol failures (yfinance 404s, network blips)
+    are caught and logged at debug level only. The symbol's cache entry is
+    NOT populated on failure, so ``score_symbol`` will retry it serially
+    later — this is the right shape for partial-prewarm robustness.
+
+    Args:
+        symbols: Universe to prewarm. Order doesn't matter; duplicates fine.
+        asof: As-of date, defaults to ``datetime.now(UTC)``. Used for cache
+            keying — pass the same value here that ``score_symbol`` will see
+            (i.e. don't prewarm with yesterday's date or the cache misses).
+        max_workers: Thread pool size. Defaults to
+            ``HERMES_QUANT_PREWARM_WORKERS`` env var, then 12.
+        timeout_per_symbol: Per-future ``.result()`` timeout in seconds.
+            Slow symbols are skipped, not allowed to wedge the whole pool.
+
+    Returns:
+        ``{"prewarmed": int, "skipped": int, "errors": int, "elapsed_s": float}``
+        — summary suitable for caller logs / cron stdout.
+    """
+    if not symbols:
+        return {"prewarmed": 0, "skipped": 0, "errors": 0, "elapsed_s": 0.0}
+
+    # Resolve asof once so both prewarm and downstream score_symbol agree on
+    # the cache-key date. score_symbol uses datetime.now(UTC) at call time;
+    # passing the same instant here keeps them aligned within the run.
+    if asof is None:
+        asof_dt: datetime = datetime.now(UTC)
+    elif isinstance(asof, date) and not isinstance(asof, datetime):
+        asof_dt = datetime(asof.year, asof.month, asof.day, tzinfo=UTC)
+    else:
+        asof_dt = asof
+    asof_key = asof_dt.strftime("%Y-%m-%d")
+
+    if max_workers is None:
+        env_val = os.environ.get("HERMES_QUANT_PREWARM_WORKERS", "").strip()
+        if env_val:
+            try:
+                max_workers = max(1, int(env_val))
+            except ValueError:
+                max_workers = _DEFAULT_PREWARM_WORKERS
+        else:
+            max_workers = _DEFAULT_PREWARM_WORKERS
+
+    # Dedupe + drop already-cached symbols so prewarm is idempotent.
+    todo: list[str] = []
+    seen: set[str] = set()
+    skipped = 0
+    for s in symbols:
+        if not isinstance(s, str) or not s:
+            continue
+        upper = s.upper()
+        if upper in seen:
+            continue
+        seen.add(upper)
+        if (upper, asof_key) in _SNAPSHOT_CACHE:
+            skipped += 1
+            continue
+        todo.append(upper)
+
+    if not todo:
+        return {"prewarmed": 0, "skipped": skipped, "errors": 0, "elapsed_s": 0.0}
+
+    import time
+
+    t0 = time.perf_counter()
+    prewarmed = 0
+    errors = 0
+
+    def _fetch_one(sym: str) -> tuple[str, dict | None, BaseException | None]:
+        try:
+            snap = compute_play_snapshot(sym, asof_dt)
+            return sym, snap, None
+        except BaseException as exc:  # noqa: BLE001 — we never propagate from a worker
+            return sym, None, exc
+
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="prewarm") as pool:
+        futures = {pool.submit(_fetch_one, sym): sym for sym in todo}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                _, snap, exc = fut.result(timeout=timeout_per_symbol)
+            except BaseException as outer_exc:  # noqa: BLE001 — timeout / cancellation
+                errors += 1
+                logger.debug(
+                    "prewarm: future for %s raised on result(): %s", sym, outer_exc
+                )
+                continue
+            if exc is not None or snap is None:
+                errors += 1
+                logger.debug("prewarm: %s failed inside worker: %s", sym, exc)
+                continue
+            _SNAPSHOT_CACHE[(sym, asof_key)] = snap
+            prewarmed += 1
+
+    elapsed = time.perf_counter() - t0
+    logger.info(
+        "prewarm_snapshot_cache: %d prewarmed, %d skipped (already cached), "
+        "%d errors in %.1fs (workers=%d, asof=%s)",
+        prewarmed,
+        skipped,
+        errors,
+        elapsed,
+        max_workers,
+        asof_key,
+    )
+    return {
+        "prewarmed": prewarmed,
+        "skipped": skipped,
+        "errors": errors,
+        "elapsed_s": round(elapsed, 2),
+    }
 
 
 def score_symbol(symbol: str, play: str) -> float:
