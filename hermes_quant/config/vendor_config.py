@@ -10,28 +10,29 @@ method name to the configured vendor using two layers:
    override exists; the method's category is looked up via
    :func:`hermes_quant.data.vendor_routing.category_for_method`.
 
-Example ``~/.hermes/config.yaml`` snippet (NOT yet read by this class —
-see "Deviation" below)::
+Example ``~/.hermes/config.yaml`` snippet (read by
+:meth:`VendorConfig.from_yaml`)::
 
     quant:
       data:
         vendors_by_category:
           core_ohlcv: yfinance
         vendor_overrides_by_method:
-          fetch_latest: alpaca
+          fetch_latest: alpaca  # if you want intraday from alpaca
 
-Deviation from ADR-0038 §D.6 (documented)
-----------------------------------------
-The ADR describes wiring the resolver to read ``~/.hermes/config.yaml::
-quant.data``. For Wave D Track A we ship the model + ``.resolve()`` only;
-callers construct a ``VendorConfig`` from a dict (for example, by reading
-the YAML themselves and passing the ``quant.data`` slice to
-``VendorConfig.model_validate(...)``). The YAML auto-loader is deferred
-to v0.4 so this module stays testable in isolation and free of stdlib
-filesystem side-effects.
+Loader closes ADR-0038 §"Correction 3" deviation
+-------------------------------------------------
+Wave D originally shipped this module as a model + ``.resolve()`` only;
+``VendorConfig.from_yaml()`` and the module-level ``get_vendor_config()``
+helper were added in the follow-up commit. The integration of
+``route_to_vendor`` to consult ``VendorConfig`` is still deferred —
+once a second vendor joins ``VENDOR_LIST`` (post DataProvider Protocol
+unification), it becomes a one-liner.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -144,5 +145,63 @@ class VendorConfig(BaseModel):
             f"or vendor_overrides_by_method[{method!r}]"
         )
 
+    @classmethod
+    def from_yaml(cls, path: Path | None = None) -> VendorConfig:
+        """Load a VendorConfig from ``~/.hermes/config.yaml::quant.data``.
 
-__all__ = ["VendorConfig"]
+        Profile-aware: when ``path`` is None we resolve the active Hermes
+        config via :func:`hermes_quant.watchlist.get_config_path`, which
+        honors ``HERMES_PROFILE``.
+
+        Returns an empty :class:`VendorConfig` when:
+        - the config file does not exist,
+        - the file exists but contains no ``quant.data`` section,
+        - the section is missing both ``vendors_by_category`` and
+          ``vendor_overrides_by_method`` keys.
+
+        Raises ``pydantic.ValidationError`` when the YAML's keys/values
+        violate the model's validators (unknown category, unknown vendor,
+        unknown method, extra keys). The validation fires at load time
+        rather than at first ``.resolve()`` call so config typos surface
+        immediately.
+
+        Closes ADR-0038 §"Correction 3" deviation.
+        """
+        if path is None:
+            from hermes_quant.watchlist import get_config_path
+
+            path = get_config_path()
+        path = Path(path)
+        if not path.exists():
+            return cls()
+
+        try:
+            import yaml
+        except ImportError:  # pragma: no cover — yaml is a hard dep already
+            return cls()
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        section = ((raw.get("quant") or {}).get("data") or {})
+
+        # Filter to the keys VendorConfig knows about so unrelated
+        # ``quant.data.*`` siblings (added by other features) don't trip
+        # extra=forbid. Validation still fires on the keys we DO accept.
+        accepted = {
+            k: section[k]
+            for k in ("vendors_by_category", "vendor_overrides_by_method")
+            if k in section
+        }
+        return cls.model_validate(accepted)
+
+
+def get_vendor_config(path: Path | None = None) -> VendorConfig:
+    """Module-level convenience wrapper around :meth:`VendorConfig.from_yaml`.
+
+    Mirrors the ergonomics of other ``hermes_quant`` config helpers
+    (``autonomous._read_config``); call sites that don't need to pass
+    a custom path can use this directly.
+    """
+    return VendorConfig.from_yaml(path)
+
+
+__all__ = ["VendorConfig", "get_vendor_config"]

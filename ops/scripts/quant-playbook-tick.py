@@ -42,7 +42,7 @@ import logging
 import os
 import sys
 import traceback
-from datetime import datetime, date, timezone, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -65,7 +65,7 @@ JOURNAL_PATH = PLAYBOOK_DIR / "tick-journal.jsonl"
 SECRETS_PATH = HERMES_HOME / "secrets" / "alpaca.env"
 
 ET = ZoneInfo("America/New_York")
-UTC = timezone.utc
+UTC = UTC
 
 # ---------- constants ----------
 # Half A: only swing + leaps fire as equity proposals. Other plays (covered_call,
@@ -212,8 +212,8 @@ def place_paper_market_order(symbol: str, notional_usd: float, *, side: str = "b
     Returns Alpaca's order JSON on 200/201, or {"error": ...} on failure.
     Never raises — a routing failure shouldn't crash the whole tick.
     """
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     creds = _load_creds()
     key = creds.get("ALPACA_API_KEY_ID")
@@ -293,8 +293,10 @@ def compute_silence_snapshot(symbol: str) -> dict[str, Any]:
     # already cached upstream by compute_play_snapshot's yfinance Ticker).
     prior_close: float | None = None
     try:
+        import contextlib
+        import io
+
         import yfinance as yf
-        import contextlib, io
         _err = io.StringIO()
         with contextlib.redirect_stderr(_err):
             t = yf.Ticker(symbol)
@@ -307,8 +309,10 @@ def compute_silence_snapshot(symbol: str) -> dict[str, Any]:
     # days_until_earnings: forward-looking. Fall back to large-positive on miss.
     days_until_earnings: int | None = None
     try:
+        import contextlib
+        import io
+
         import yfinance as yf
-        import contextlib, io
         _err = io.StringIO()
         with contextlib.redirect_stderr(_err):
             t = yf.Ticker(symbol)
@@ -540,21 +544,188 @@ def _run_committee_safe(
 ) -> dict[str, Any]:
     """Best-effort LLM committee invocation. Never raises. Returns a dict
     with 'turns' (list of turn dicts), 'decision' (judge summary or None),
-    and 'error' (string or None)."""
+    and 'error' (string or None).
+
+    Threads the dict-shape ``advisor_result`` through dataclass
+    reconstruction so ``run_llm_committee`` can consume it. The advisor
+    stores analyst_views and aggregated_signal as dicts (for JSONL
+    portability); we rebuild minimal MarketContext / AnalystView /
+    AggregatedSignal dataclasses with just the fields the committee
+    callers reference, then invoke the LLM committee.
+
+    Failure-closed (ADR-0037): any exception during reconstruction or
+    committee call -> empty result with the error captured. Never raises
+    because this runs inside the daily playbook tick which must stay
+    silent on partial failures.
+    """
     try:
-        # We need the BMA-aggregated AggregatedSignal and the per-analyst
-        # AnalystView list. The advisor result has aggregated_signal as a
-        # dict; to feed the committee we need the dataclass form. Easiest:
-        # re-derive via the recipe seam, OR keep this Wave C light and pass
-        # the dict-shape baseline via a thin adapter on the committee module
-        # side. For now, defer LLM committee invocation to a follow-up that
-        # threads the dataclass-shape baseline through cleanly. Return an
-        # empty success record so the env-var gate is observable in audit.
+        # Short-circuits ---------------------------------------------------
+        env_flag = os.environ.get("HERMES_QUANT_DELIBERATIVE", "").strip()
+        if env_flag != "1":
+            return {
+                "turns": [],
+                "decision": None,
+                "error": None,
+                "deferred_reason": "deliberative_env_not_set",
+            }
+
+        api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        if not api_key or api_key == "test-placeholder":
+            return {
+                "turns": [],
+                "decision": None,
+                "error": None,
+                "deferred_reason": "openrouter_key_unset_or_placeholder",
+            }
+
+        # Lazy imports — keep module-load light when DELIBERATIVE=0.
+        import pandas as pd
+
+        from hermes_quant.aggregators.deliberative import DeliberativeConfig
+        from hermes_quant.aggregators.llm_committee import run_llm_committee
+        from hermes_quant.protocol import (
+            AggregatedSignal,
+            AnalystView,
+            Direction,
+            MarketContext,
+        )
+
+        # Reconstruct MarketContext (minimal — only fields the committee
+        # prompts cite; bars is required by the dataclass but the
+        # committee prompt path never reads it past last_close).
+        sig_d = advisor_result.get("aggregated_signal") or {}
+        timeframe = str(sig_d.get("timeframe") or advisor_result.get("timeframe") or "1d")
+        asset_class = str(sig_d.get("asset_class") or advisor_result.get("asset_class") or "equity")
+        last_close = float(advisor_result.get("last_close") or 0.0)
+        asof = pd.to_datetime(
+            sig_d.get("asof") or advisor_result.get("asof") or pd.Timestamp.utcnow(),
+            utc=True,
+        ).tz_localize(None) if pd.to_datetime(
+            sig_d.get("asof") or advisor_result.get("asof") or pd.Timestamp.utcnow(),
+            utc=True,
+        ).tzinfo is not None else pd.to_datetime(
+            sig_d.get("asof") or advisor_result.get("asof") or pd.Timestamp.utcnow()
+        )
+
+        # Minimal stub bars frame so MarketContext(bars=...) constructor
+        # validation (if any) doesn't reject. Only last_close is read by
+        # the committee prompt template.
+        empty_bars = pd.DataFrame(
+            {
+                "timestamp": [asof],
+                "open": [last_close or 1.0],
+                "high": [last_close or 1.0],
+                "low": [last_close or 1.0],
+                "close": [last_close or 1.0],
+                "volume": [0.0],
+            }
+        )
+
+        ctx = MarketContext(
+            asset=symbol,
+            timeframe=timeframe,
+            asset_class=asset_class,
+            exchange=None,
+            bars=empty_bars,
+            last_close=last_close or 1.0,
+            asof=asof,
+        )
+
+        # Reconstruct list[AnalystView] from the dict form. Drop entries
+        # that don't carry the minimum required fields rather than raise.
+        analyst_view_dicts = advisor_result.get("analyst_views") or []
+        views: list[AnalystView] = []
+        for vd in analyst_view_dicts:
+            try:
+                views.append(
+                    AnalystView(
+                        analyst=str(vd["analyst"]),
+                        direction=Direction(int(vd["direction"])),
+                        magnitude=float(vd["magnitude"]),
+                        confidence=float(vd["confidence"]),
+                        confidence_raw=float(vd.get("confidence_raw", vd["confidence"])),
+                        horizon=str(vd.get("horizon", timeframe)),
+                        rationale=vd.get("rationale"),
+                    )
+                )
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        if not views:
+            return {
+                "turns": [],
+                "decision": None,
+                "error": None,
+                "deferred_reason": "no_reconstructable_analyst_views",
+            }
+
+        # Reconstruct AggregatedSignal from the dict form.
+        baseline_signal = AggregatedSignal(
+            asset=str(sig_d.get("asset", symbol)),
+            timeframe=timeframe,
+            asset_class=asset_class,
+            asof=asof,
+            direction=Direction(int(sig_d.get("direction", 0))),
+            magnitude=float(sig_d.get("magnitude", 0.0)),
+            confidence=float(sig_d.get("confidence", 0.0)),
+            confidence_raw=float(sig_d.get("confidence_raw", sig_d.get("confidence", 0.0))),
+            horizon=str(sig_d.get("horizon", timeframe)),
+            aggregator=str(sig_d.get("aggregator", "bma")),
+            components=tuple(views),  # placeholder reconstruction is fine for the LLM
+        )
+
+        # DeliberativeConfig — pull defaults; only enable_llm_turns + the
+        # risk-mgmt switch + max_debate_rounds matter to the committee.
+        cfg = DeliberativeConfig(
+            enable_llm_turns=True,
+            include_risk_mgmt=risk_mgmt_enabled,
+            quick_model=os.environ.get(
+                "HERMES_QUANT_DELIBERATIVE_QUICK_MODEL",
+                "anthropic/claude-haiku-4.6",
+            ),
+            deep_model=os.environ.get(
+                "HERMES_QUANT_DELIBERATIVE_DEEP_MODEL",
+                "anthropic/claude-sonnet-4.6",
+            ),
+        )
+
+        # Run the LLM committee. Failure-closed inside run_llm_committee
+        # already; we wrap once more in case the constructor itself raises.
+        turns = run_llm_committee(
+            market_context=ctx,
+            analyst_views=views,
+            baseline_signal=baseline_signal,
+            config=cfg,
+        )
+
+        # Project turns to dicts for the JSONL audit log.
+        turn_dicts: list[dict[str, Any]] = []
+        decision: dict[str, Any] | None = None
+        for t in turns:
+            try:
+                td = {
+                    "role": getattr(t, "role", "?"),
+                    "model": getattr(t, "model", None),
+                    "stance": getattr(t, "stance", None),
+                    "confidence": getattr(t, "confidence", None),
+                    "decision_multiplier": getattr(t, "decision_multiplier", 1.0),
+                    "prompt_hash": (t.metadata or {}).get("prompt_hash") if hasattr(t, "metadata") else None,
+                }
+                turn_dicts.append(td)
+                if td["role"] == "portfolio_manager":
+                    decision = {
+                        "rating": getattr(t, "rating", None),
+                        "decision_multiplier": td["decision_multiplier"],
+                        "stance": td["stance"],
+                    }
+            except Exception:  # noqa: BLE001 — never raise from audit projection
+                continue
+
         return {
-            "turns": [],
-            "decision": None,
+            "turns": turn_dicts,
+            "decision": decision,
             "error": None,
-            "deferred_reason": "committee_invocation_needs_dataclass_baseline_threading",
+            "n_turns": len(turn_dicts),
         }
     except Exception as e:  # noqa: BLE001 — fail-closed
         return {"turns": [], "decision": None, "error": f"{type(e).__name__}: {e}"}

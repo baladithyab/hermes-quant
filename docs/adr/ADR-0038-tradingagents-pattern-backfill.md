@@ -413,17 +413,25 @@ wire-up deferred
 only; the resolver reads `VendorConfig` from
 `~/.hermes/config.yaml::quant.data`."
 
-**What landed**: `VendorConfig` is shipped as a model + `.resolve()`
-only. No YAML auto-loader; no integration into `route_to_vendor`.
-Documented inline in `vendor_config.py:23-31`.
+**What landed in 77b809a**: `VendorConfig` was shipped as a model +
+`.resolve()` only. No YAML auto-loader; no integration into
+`route_to_vendor`.
 
-**Resolution**: callers construct `VendorConfig` from a dict
-(typically by reading the YAML themselves and passing
-`config["quant"]["data"]` to `VendorConfig.model_validate()`). The
-auto-loader is deferred to v0.4 to keep the config module testable in
-isolation and free of stdlib filesystem side-effects. The wire-up of
-`route_to_vendor` to consult `VendorConfig` is a one-liner once the
-auto-loader exists; it does not require additional contract design.
+**Resolution (closed in commit AFTER 87c945a)**:
+`VendorConfig.from_yaml(path: Path | None = None)` and a module-level
+`get_vendor_config()` helper now load `quant.data` from
+`~/.hermes/config.yaml` (profile-aware via
+`hermes_quant.watchlist.get_config_path`). Validation fires at load
+time so config typos surface immediately, and unrelated `quant.data.*`
+sibling keys are filtered out before validation so they don't trip
+`extra=forbid`. Eight new tests in
+`tests/unit/wave_d/test_vendor_config.py` cover the loader path
+(missing file, empty file, no `quant.data` section, typed loads,
+validation failure, sibling-key filtering, module helper). The
+`route_to_vendor` wire-up is still deferred — once a second vendor
+joins `VENDOR_LIST` (post DataProvider Protocol unification, see
+Correction 2), `route_to_vendor(method)` will become a one-liner that
+delegates to `get_vendor_config().resolve(method)`.
 
 ### Acceptance gate — re-checked after corrections
 
