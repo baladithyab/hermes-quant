@@ -109,6 +109,25 @@ class PaperReactor:
             record.fill_size_pct,
             record.decision_price,
         )
+
+        # Wave 1c (ADR-0041): update PortfolioState incrementally.
+        # Failure must NOT block execution — silence-by-default per ADR-0031.
+        try:
+            from hermes_quant.state.portfolio_state import get_portfolio_state
+
+            _record_dict = _record_to_dict(record)
+            # Inject account_id so PortfolioState can partition by account.
+            # PaperReactor doesn't carry an account_id field today — use the
+            # execution bus default sentinel "paper-default" unless reactor_metadata
+            # carries an override (forward-compat for v0.2 named-account support).
+            if "account_id" not in _record_dict or not _record_dict.get("account_id"):
+                _record_dict["account_id"] = (
+                    (record.reactor_metadata or {}).get("account_id") or "paper-default"
+                )
+            get_portfolio_state().apply_execution(_record_dict)
+        except Exception as _e:  # pragma: no cover — defensive
+            logger.warning("PortfolioState.apply_execution failed (non-blocking): %s", _e)
+
         return record
 
     @staticmethod

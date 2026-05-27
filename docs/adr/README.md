@@ -26,3 +26,5 @@
 - [ADR-0024-autonomous-semantic-perception.md](ADR-0024-autonomous-semantic-perception.md) — ADR-0024: Autonomous semantic perception artifacts
 - [ADR-0025-user-editable-recipes-and-perception-status.md](ADR-0025-user-editable-recipes-and-perception-status.md) — ADR-0025: User-editable recipes and perception status
 - [ADR-0039-robinhood-mcp-reactor.md](ADR-0039-robinhood-mcp-reactor.md) — ADR-0039: Robinhood Agentic Trading MCP Reactor — additive equity execution rail
+- [ADR-0041-signal-provenance-audit-trail.md](ADR-0041-signal-provenance-audit-trail.md) — ADR-0041: Signal provenance & audit-trail observability (renumbered from 0039 due to upstream conflict)
+- [ADR-0042-persistent-memory-reflection.md](ADR-0042-persistent-memory-reflection.md) — ADR-0042: Persistent memory & deferred reflection layer (renumbered from 0040)

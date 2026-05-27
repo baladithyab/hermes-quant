@@ -43,6 +43,7 @@ EventKind = Literal[
     "kill_switch_fired",
     "promotion_event",
     "retro_amendment_applied",
+    "state_reconstruction_failed",
 ]
 
 VALID_KINDS: tuple[str, ...] = (
@@ -53,6 +54,7 @@ VALID_KINDS: tuple[str, ...] = (
     "kill_switch_fired",
     "promotion_event",
     "retro_amendment_applied",
+    "state_reconstruction_failed",
 )
 
 
