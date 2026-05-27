@@ -148,6 +148,7 @@ class BMAAggregator:
         prior_beta: float = 5.0,
         n_min_observations: int = 30,
         agreement_bonus: float = 0.10,
+        require_ensemble: bool = True,
         calibrator_path: Path | None = None,
         config: BMAConfig | None = None,
     ):
@@ -155,6 +156,17 @@ class BMAAggregator:
         self.prior_beta = prior_beta
         self.n_min_observations = n_min_observations
         self.agreement_bonus = agreement_bonus
+        # `require_ensemble`: when True (default, added 2026-05-26), the
+        # aggregator silences candidates with n_contributing < 2. BMA's
+        # value-add is ensemble disagreement-resolution; with one voice
+        # there's no ensemble. The previous behavior produced
+        # confidence=1.00 because vote_share collapses to 1.0 for a
+        # single contributor (|w*d*c| / |w*d*c| = 1.0). When False, the
+        # aggregator falls back to the lone analyst's confidence_raw —
+        # honest but still actionable. Set False only in tests or in
+        # research configurations where you explicitly want single-
+        # source signals to flow through.
+        self.require_ensemble = require_ensemble
 
         # Multi-timeframe config (ADR-0036). Default-on for cross-horizon
         # weighting; the table contains 1d=1.00 so single-horizon callers
@@ -324,11 +336,64 @@ class BMAAggregator:
         else:
             vote_share = abs(weighted_dir_sum) / denom
 
-        # Agreement bonus: if all (non-flat) views agree on direction, bump
+        # Single-contributor degenerate-confidence guard (added 2026-05-26
+        # after MoA committee + production scan surfaced 24 picks at
+        # confidence=1.00 driven by lone Kronos votes — silence-by-default
+        # in TA/microstructure was working correctly, but BMA's vote_share
+        # mathematically collapses to 1.0 when n_contributing == 1 because
+        # `|w*d*c| / |w*d*c| = 1.0`, which then takes the agreement_bonus
+        # AND looks like full unanimity to downstream gates).
+        #
+        # Two-tier fix:
+        #   1. n_contributing == 1 → use the lone analyst's own
+        #      confidence_raw (not vote_share). The "ensemble" is a single
+        #      voice; BMA reports honestly that the strength is whatever
+        #      that voice claimed.
+        #   2. The require_ensemble flag (default True) makes single-
+        #      source signals silence at the aggregator. This honors
+        #      AGENTS.md silence-by-default — BMA's value-add is ensemble
+        #      disagreement-resolution, so with one voice we should
+        #      either pass through (require_ensemble=False) or silence
+        #      (require_ensemble=True). Default is silence.
+        # Single-source guard: count DISTINCT analysts in the input views
+        # (not just `contributing` to composite_direction). This is the
+        # right anti-degeneracy criterion — a single Kronos vote with all
+        # other analysts abstaining IS single-source; two analysts on
+        # different horizons disagreeing on direction is NOT (the
+        # disagreement IS the ensemble signal). Silencing on the latter
+        # would discard genuine multi-source dissent.
+        n_distinct_analysts = len({v.analyst for v in views})
         non_flat = [v for v in views if v.direction != 0]
-        if non_flat and all(v.direction == composite_direction for v in non_flat):
+        if n_distinct_analysts <= 1:
+            if self.require_ensemble:
+                # Silence: log that we had a single-source candidate so
+                # operators can debug analyst dropouts. Carry the lone
+                # view in components so the calibrator-update loop can
+                # still credit per-analyst outcomes.
+                lone = views[0] if views else None
+                logger.debug(
+                    "BMA: silencing %s — n_distinct_analysts=%d (require_ensemble=True). "
+                    "Sole analyst was %s with raw_conf=%.3f",
+                    context.asset if context else "?",
+                    n_distinct_analysts,
+                    lone.analyst if lone else "none",
+                    lone.confidence_raw if lone else 0.0,
+                )
+                return self._flat_signal(
+                    context,
+                    components=tuple(views),
+                    reason="silenced_single_source",
+                )
+            # Pass-through: keep the aggregator alive but report honest
+            # confidence. Downstream gates / sizing decide based on the
+            # analyst's actual confidence, not synthesized unanimity.
+            sole_v, _w = contributing[0]
+            confidence_raw = float(np.clip(sole_v.confidence_raw, 0.0, 1.0))
+        elif non_flat and all(v.direction == composite_direction for v in non_flat):
+            # Multi-contributor unanimous: vote_share + agreement bonus.
             confidence_raw = float(np.clip(vote_share + self.agreement_bonus, 0.0, 1.0))
         else:
+            # Multi-contributor with dissent: vote_share only.
             confidence_raw = vote_share
 
         # Calibrate. CalibratorNotReady fallback uses the same Beta(2,5)
@@ -403,8 +468,20 @@ class BMAAggregator:
         self._last_aggregated_at = context.asof
         return signal
 
-    def _flat_signal(self, context: MarketContext) -> AggregatedSignal:
-        """Construct a flat AggregatedSignal (silence)."""
+    def _flat_signal(
+        self,
+        context: MarketContext,
+        components: tuple = (),
+        reason: str = "flat_or_no_views",
+    ) -> AggregatedSignal:
+        """Construct a flat AggregatedSignal (silence).
+
+        ``components`` is the original views list — included so that
+        ``update()`` (calibration loop) can still credit per-analyst
+        outcomes even when the aggregator silenced. Default empty for
+        backward compatibility with the upstream callers that already
+        passed no components.
+        """
         return AggregatedSignal(
             asset=context.asset,
             timeframe=context.timeframe,
@@ -415,9 +492,9 @@ class BMAAggregator:
             confidence=0.0,
             confidence_raw=0.0,
             horizon="0m",
-            components=(),
+            components=components,
             aggregator=self.name,
-            metadata={"reason": "flat_or_no_views"},
+            metadata={"reason": reason},
         )
 
     def update(self, outcome: EpisodeOutcome) -> None:
