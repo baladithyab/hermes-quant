@@ -50,6 +50,14 @@ from hermes_quant.protocol import (
     MarketContext,
 )
 
+# ICDedupGate is an optional dependency — import lazily to avoid circular
+# issues and to allow the BMA module to load even if hermes_quant.factors is
+# not yet installed (e.g. partial deploys).
+try:
+    from hermes_quant.factors.ic_dedup import ICDedupGate as _ICDedupGate
+except ImportError:  # pragma: no cover
+    _ICDedupGate = None  # type: ignore[assignment,misc]
+
 
 # ---------------------------------------------------------------------------
 # Multi-timeframe configuration (ADR-0036)
@@ -151,6 +159,7 @@ class BMAAggregator:
         require_ensemble: bool = True,
         calibrator_path: Path | None = None,
         config: BMAConfig | None = None,
+        ic_dedup_gate=None,
     ):
         self.prior_alpha = prior_alpha
         self.prior_beta = prior_beta
@@ -188,6 +197,13 @@ class BMAAggregator:
 
         self._n_aggregated = 0
         self._last_aggregated_at: pd.Timestamp | None = None
+
+        # IC dedup gate (Wave 6b).  When None (default), behavior is
+        # bit-identical to pre-Wave-6 BMA.  When provided, analyst views whose
+        # returns would be rejected by the gate are excluded from aggregation;
+        # the exclusion list is recorded in signal metadata under the key
+        # ``ic_dedup_excluded_analysts``.
+        self.ic_dedup_gate = ic_dedup_gate
 
     @staticmethod
     def _load_calibrator(path: Path):
@@ -296,6 +312,51 @@ class BMAAggregator:
 
         if not views:
             return self._flat_signal(context)
+
+        # Wave 6b: IC dedup gate filter.
+        # When ic_dedup_gate is None this block is entirely skipped —
+        # bit-identical pre-Wave-6 behavior is preserved.
+        ic_dedup_excluded: list[str] = []
+        if self.ic_dedup_gate is not None:
+            # Track which analysts have been kept so far so we never exclude
+            # the LAST representative of a correlated cluster — IC dedup
+            # semantics is "keep one, discard near-duplicates", not
+            # "discard everything correlated".
+            kept_so_far: list[str] = []
+            filtered_views = []
+            for v in views:
+                analyst_name = v.analyst
+                if (
+                    analyst_name in self.ic_dedup_gate
+                    and len(self.ic_dedup_gate.library) > 1
+                    and len(kept_so_far) > 0  # only run dedup once we have a representative
+                ):
+                    # Check the candidate against the analysts ALREADY KEPT
+                    # (not the full library minus self) — this is the
+                    # cluster-representative semantics that prevents the
+                    # all-correlated → all-excluded degenerate case.
+                    lib_kept = {
+                        k: self.ic_dedup_gate.library[k]
+                        for k in kept_so_far
+                        if k in self.ic_dedup_gate
+                    }
+                    if lib_kept:
+                        result = self.ic_dedup_gate.check(
+                            self.ic_dedup_gate.library[analyst_name],
+                            existing_library=lib_kept,
+                        )
+                        if not result.passes:
+                            ic_dedup_excluded.append(analyst_name)
+                            logger.debug(
+                                "BMA: ic_dedup_gate excluded analyst %r "
+                                "(%s)",
+                                analyst_name,
+                                result.reason,
+                            )
+                            continue
+                kept_so_far.append(analyst_name)
+                filtered_views.append(v)
+            views = filtered_views
 
         weights = []
         signed_terms = []  # direction × magnitude × weight × confidence
@@ -462,6 +523,8 @@ class BMAAggregator:
                 # ADR-0036 audit fields
                 "horizons_present": horizons_present,
                 "horizon_agreement": horizon_agreement,
+                # Wave 6b: IC dedup audit
+                "ic_dedup_excluded_analysts": ic_dedup_excluded,
             },
         )
         self._n_aggregated += 1
