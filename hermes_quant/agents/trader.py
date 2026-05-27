@@ -1,6 +1,8 @@
-"""hermes_quant.agents.trader — TraderProposal schema + TraderNode v0.1 (deterministic).
+"""hermes_quant.agents.trader — TraderProposal schema + TraderNode v0.1 (deterministic)
+                                + TraderNodeLLM v0.2 (feature-flagged, silence-by-default).
 
 ADR-0044: Wave 2 — Trader stage + structured output.
+ADR-0054: LLM-Caller Foundation & TraderNode v0.2.
 
 TraderNode v0.1 is DETERMINISTIC — no LLM call.
 It maps a 5-tier research recommendation → concrete TraderProposal with:
@@ -10,11 +12,21 @@ It maps a 5-tier research recommendation → concrete TraderProposal with:
   - time_horizon_days (conservative default per rating)
   - confidence (passed through from ResearchPlan)
 
-LLM-driven v0.2 is deferred; this makes Wave 2 testable cheaply without
-incurring any LLM cost.
+TraderNodeLLM v0.2 wraps v0.1 with an optional LLM upgrade path:
+  - Feature-flagged via HERMES_QUANT_TRADER_LLM=1 (default OFF / 0).
+  - Falls back to v0.1 if: flag is OFF, no API key, LLM call fails, or
+    structured output is invalid.
+  - Audit log records which path fired.
+  - NEVER raises on LLM error (ADR-0031 silence-by-default contract).
 
 Usage:
+    # v0.1 (always safe, deterministic):
     node = TraderNode()
+    proposal = node(research_plan_dict, advisor_signal_dict)
+
+    # v0.2 (LLM upgrade with v0.1 fallback):
+    from hermes_quant.agents.llm_caller import LLMCaller
+    node = TraderNodeLLM(llm_caller=LLMCaller())
     proposal = node(research_plan_dict, advisor_signal_dict)
 
 Inputs:
@@ -39,10 +51,14 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from enum import Enum
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from pydantic import BaseModel, Field, model_validator
+
+if TYPE_CHECKING:
+    from hermes_quant.agents.llm_caller import LLMCaller
 
 logger = logging.getLogger(__name__)
 
@@ -420,3 +436,175 @@ def _parse_horizon(horizon_emphasis: Any) -> Optional[int]:
     if "long" in horizon_emphasis.lower():
         return 90
     return None
+
+
+# ---------------------------------------------------------------------------
+# Feature-flag helper
+# ---------------------------------------------------------------------------
+
+
+def _trader_llm_enabled() -> bool:
+    """Return True iff HERMES_QUANT_TRADER_LLM=1 (default OFF)."""
+    return os.environ.get("HERMES_QUANT_TRADER_LLM", "0").strip() == "1"
+
+
+# ---------------------------------------------------------------------------
+# TraderNodeLLM — v0.2 (LLM-driven with v0.1 fallback)
+# ---------------------------------------------------------------------------
+
+# Prompt templates used by TraderNodeLLM v0.2.
+_SYSTEM_PROMPT = """\
+You are a disciplined quantitative trading analyst for hermes-quant.
+Your task is to translate a research plan and an advisor signal into a \
+precise, risk-controlled TraderProposal.
+
+Rules:
+- Always respect the research plan's recommendation (Buy/Overweight/Hold/\
+Underweight/Sell).
+- For BUY actions, stop_loss MUST be strictly less than entry_price.
+- For SELL actions, stop_loss MUST be strictly greater than entry_price.
+- size_fraction must be in [0.0, 1.0]; confidence must be in [0.0, 1.0].
+- Provide a 2–4 sentence rationale anchored in the research plan.
+- Return ONLY valid JSON conforming to the TraderProposal schema.
+"""
+
+_USER_PROMPT_TEMPLATE = """\
+Research plan:
+{research_plan_json}
+
+Advisor signal:
+{advisor_signal_json}
+
+Emit a TraderProposal JSON object. Do not include any prose outside the JSON.
+"""
+
+
+class TraderNodeLLM:
+    """TraderNode v0.2 — LLM-driven with silence-by-default v0.1 fallback.
+
+    ADR-0054: wraps v0.1 deterministic node with an optional LLM upgrade.
+
+    Feature flag: HERMES_QUANT_TRADER_LLM=1 enables LLM path (default OFF).
+
+    Fallback chain:
+        1. Flag OFF                         → v0.1 deterministic
+        2. Flag ON, llm_caller.available()  → LLM call attempted
+           a. LLM returns valid proposal    → v0.2 path (audit: v02_llm_succeeded)
+           b. LLM returns None / invalid    → v0.1 (audit: v02_llm_fallback_to_v01)
+           c. LLM call raises               → v0.1 (audit: v02_llm_fallback_to_v01)
+        3. Flag ON, not available()         → v0.1 (audit: v02_llm_fallback_to_v01)
+
+    Args:
+        llm_caller:      LLMCaller instance. None → always falls back to v0.1.
+        atr_multiplier:  Passed to the underlying TraderNode (default 2.0).
+    """
+
+    def __init__(
+        self,
+        *,
+        llm_caller: Optional["LLMCaller"] = None,
+        atr_multiplier: float = _ATR_STOP_MULTIPLIER,
+    ) -> None:
+        self._llm_caller = llm_caller
+        self._v01_node = TraderNode(atr_multiplier=atr_multiplier)
+        self.atr_multiplier = atr_multiplier
+
+    def __call__(
+        self,
+        research_plan: dict[str, Any],
+        advisor_signal: dict[str, Any] | None = None,
+    ) -> TraderProposal:
+        """Produce a TraderProposal, routing to LLM or v0.1 per flag + availability.
+
+        Never raises — v0.1 is always the safety net.
+        """
+        import json as _json
+
+        advisor_signal = advisor_signal or {}
+
+        # --- Path A: flag OFF or no caller → pure v0.1 ---
+        if not _trader_llm_enabled() or self._llm_caller is None:
+            proposal = self._v01_node(research_plan, advisor_signal)
+            self._record_path("v01_deterministic", proposal)
+            return proposal
+
+        # --- Path B: flag ON, check availability ---
+        if not self._llm_caller.available():
+            logger.warning(
+                "TraderNodeLLM: LLMCaller not available (no API key); "
+                "falling back to v0.1 deterministic."
+            )
+            proposal = self._v01_node(research_plan, advisor_signal)
+            self._record_path("v02_llm_fallback_to_v01", proposal, reason="llm_not_available")
+            return proposal
+
+        # --- Path C: attempt LLM call ---
+        try:
+            system_prompt = _SYSTEM_PROMPT
+            user_prompt = _USER_PROMPT_TEMPLATE.format(
+                research_plan_json=_json.dumps(research_plan, default=str),
+                advisor_signal_json=_json.dumps(advisor_signal, default=str),
+            )
+            obj, raw = self._llm_caller.call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                schema=TraderProposal,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "TraderNodeLLM: LLM call raised unexpectedly (%s); "
+                "falling back to v0.1.",
+                exc,
+            )
+            proposal = self._v01_node(research_plan, advisor_signal)
+            self._record_path(
+                "v02_llm_fallback_to_v01", proposal, reason=f"llm_raised: {exc}"
+            )
+            return proposal
+
+        # --- Validate returned object ---
+        if isinstance(obj, TraderProposal):
+            logger.info("TraderNodeLLM: v0.2 LLM path succeeded.")
+            self._record_path("v02_llm_succeeded", obj)
+            return obj
+
+        # LLM returned None or non-TraderProposal — fall back
+        logger.warning(
+            "TraderNodeLLM: LLM returned %r (not a TraderProposal); "
+            "falling back to v0.1.",
+            type(obj).__name__,
+        )
+        proposal = self._v01_node(research_plan, advisor_signal)
+        self._record_path(
+            "v02_llm_fallback_to_v01",
+            proposal,
+            reason="llm_parse_failed",
+        )
+        return proposal
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _record_path(
+        self,
+        path: str,
+        proposal: TraderProposal,
+        reason: str = "",
+    ) -> None:
+        """Append a trader_llm_call audit event recording which path fired."""
+        from hermes_quant.agents.llm_caller import _audit_append
+
+        payload: dict[str, Any] = {
+            "path": path,
+            "reason": reason,
+            "action": proposal.action.value,
+            "size_fraction": proposal.size_fraction,
+            "confidence": proposal.confidence,
+            "warning_message": proposal.warning_message,
+        }
+        _audit_append(
+            kind="trader_llm_call",
+            source="hermes_quant.agents.trader.TraderNodeLLM",
+            payload=payload,
+        )
