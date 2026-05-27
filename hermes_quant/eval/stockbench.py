@@ -328,9 +328,13 @@ class STOCKBENCHHarness:
             window_start = window_end - timedelta(days=60)
 
         # --- Contamination guard ---
+        # Cross-model review (MoA C1): use `<=` not `<` for symmetry with the
+        # Oracle Fallacy guard (`tau_observable < asof` strict-exclusion).
+        # A model with knowledge cutoff = 2025-01-01 has indexed anything
+        # PUBLISHED on 2025-01-01, so window_start == cutoff is contaminated.
         cutoff = _get_knowledge_cutoff()
         contamination_guard_fired = False
-        if window_start < cutoff:
+        if window_start <= cutoff:
             contamination_guard_fired = True
             msg = (
                 f"STOCKBENCHHarness: window_start {window_start} is earlier than "

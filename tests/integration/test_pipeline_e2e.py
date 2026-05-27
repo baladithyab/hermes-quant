@@ -243,10 +243,22 @@ def test_full_pipeline_end_to_end(tmp_quant_home: Path) -> None:
     assert ("equity", "AAPL") in pos1
     assert pos1[("equity", "AAPL")].quantity == pytest.approx(0.05)
 
-    # idempotency guard — duplicate apply must be no-op
+    # idempotency guard — duplicate apply must be no-op (cross-model review C3+I3:
+    # confirm position quantity unchanged AND processed_fills count is exactly 1)
     ps.apply_execution(fill)
     pos2 = ps.get_positions("paper-default")
     assert pos2[("equity", "AAPL")].quantity == pytest.approx(0.05)
+    # Verify the processed_fills idempotency table has exactly 1 entry, not 2
+    import sqlite3
+    with sqlite3.connect(str(db_path)) as _conn:
+        n_processed = _conn.execute(
+            "SELECT COUNT(*) FROM processed_fills WHERE proposal_id = ?",
+            (fill["proposal_id"],),
+        ).fetchone()[0]
+    assert n_processed == 1, (
+        "idempotency guard: duplicate apply must NOT insert a second "
+        "processed_fills row (cross-model review C3 fix)"
+    )
 
     # ─── STAGE 7: TraderProposal via TraderNode (callable) ──────────────
     research_plan = {
@@ -279,7 +291,18 @@ def test_full_pipeline_end_to_end(tmp_quant_home: Path) -> None:
     assert 0.0 <= debate.silence_multiplier <= 1.0
 
     # ─── STAGE 9: TraderNodeWithRisk applies silence multiplier ─────────
+    # Cross-model review (MoA C1 convergent): exercise the wrapper, not just
+    # construct it. The wrapped call IS the canonical cross-wave composition
+    # point — TraderNode → RiskCommittee → silenced proposal.
     wrapped = TraderNodeWithRisk(trader_node=trader, risk_committee=risk_committee)
+    adjusted_proposal, wrapped_debate = wrapped(research_plan, advisor_signal)
+    assert isinstance(adjusted_proposal, TraderProposal)
+    # Silenced proposal MUST have size_fraction <= raw proposal's size_fraction
+    # (committee can only silence, never amplify — CV5 invariant)
+    assert abs(adjusted_proposal.size_fraction) <= abs(proposal.size_fraction) + 1e-9
+    # The returned debate is a fresh debate (different RNG / clock) but should
+    # still respect the multiplier bounds.
+    assert 0.0 <= wrapped_debate.silence_multiplier <= 1.0
 
     # ─── STAGE 10: DecisionLog persistence ──────────────────────────────
     decisions_path = tmp_quant_home / "memory" / "decisions.jsonl"
@@ -360,6 +383,61 @@ def test_full_pipeline_end_to_end(tmp_quant_home: Path) -> None:
         "excluded from retrieval"
     )
 
+    # Strengthen the guard test (cross-model review C4): inject a SECOND
+    # decision+reflection where the resolved context exists but tau_observable
+    # is exactly 1 second AFTER asof. The guard must STILL exclude it (the
+    # retriever's filter is strict-less-than: `tau_observable < asof`).
+    decision_id_2 = dlog.record_decision(
+        asof_decision="2025-04-01T16:00:00Z",
+        ticker="AAPL",
+        asset_class="equity",
+        rating="Buy",
+        direction=1,
+        confidence=0.7,
+        target_position_pct=0.10,
+        thesis_summary="Boundary test entry",
+        thesis_evidence_ids=[],
+    )
+    # Build a Reflection whose tau_observable is exactly 1 second past
+    # `boundary_asof` — this is the canonical strict-LT regression case.
+    boundary_asof = datetime(2025, 5, 1, 12, 0, 0, tzinfo=UTC)
+    boundary_tau = boundary_asof + timedelta(seconds=1)
+    boundary_reflection_path = reflections_path  # same file, append a row
+    import json as _json
+    with boundary_reflection_path.open("a") as _f:
+        _f.write(_json.dumps({
+            "schema_version": 1,
+            "reflection_id": "ref_boundary_001",
+            "decision_id": decision_id_2,
+            "asof_resolution": boundary_asof.isoformat(),
+            "tau_observable": boundary_tau.isoformat(),
+            "ticker": "AAPL",
+            "raw_return": 0.01,
+            "alpha_return": 0.005,
+            "benchmark": "SPY",
+            "holding_days": 30,
+            "outcome_quality": 4,
+            "reflection_text": "boundary test",
+            "lesson_category": "noise_trade_no_lesson",
+            "reflector_model": "stub-v0.1",
+            "reflector_prompt_hash": "stub:boundary",
+        }) + "\n")
+    dlog.record_resolution(decision_id=decision_id_2, reflection_id="ref_boundary_001")
+    # Boundary check: asof == boundary_asof. tau_observable = asof + 1s.
+    # Strict-LT: `tau < asof` → False → MUST be excluded.
+    ctx_boundary = get_past_context(
+        ticker="AAPL",
+        asof=boundary_asof,
+        reflections_path=reflections_path,
+        decisions_path=decisions_path,
+    )
+    boundary_ids = {r.reflection_id for r in ctx_boundary.same_ticker if hasattr(r, "reflection_id")}
+    assert "ref_boundary_001" not in boundary_ids, (
+        "ORACLE FALLACY STRICT-LT REGRESSION (boundary case): a reflection "
+        "with tau_observable = asof + 1s MUST be excluded. The retriever's "
+        "filter is `tau_observable < asof` (strict). MoA review C4 fix."
+    )
+
     # ─── STAGE 13: GroundTruthBlock + ClaimVerifier + HARD RULE ─────────
     bars_60d = []
     from hermes_quant.grounding.data_grounding import Bar
@@ -423,11 +501,13 @@ def test_full_pipeline_end_to_end(tmp_quant_home: Path) -> None:
     # Use the BuyAndHoldStrategy.decide() interface to verify Wave 6a
     # backtest substrate functions on synthetic data.
     bh = BuyAndHoldStrategy(universe=["AAPL"])
-    # Single decide step at the end-of-window — verifies the API runs
+    # Single decide step at the end-of-window — verifies the API runs.
+    # MoA review I4: was `>= 0` (vacuously true); BuyAndHoldStrategy enters
+    # on first call with a non-empty universe, so the decision count must
+    # be exactly 1.
     decisions = bh.decide(asof=ohlcv.index[-1], lookback_data=ohlcv)
     assert isinstance(decisions, list)
-    # BuyAndHold should always emit a position decision
-    assert len(decisions) >= 0  # may be 0 or 1 depending on impl
+    assert len(decisions) == 1, "BuyAndHoldStrategy emits exactly one BUY decision per asof"
 
     # ─── STAGE 15: STOCKBENCH contamination guard ───────────────────────
     harness = STOCKBENCHHarness(strict_contamination=True)
