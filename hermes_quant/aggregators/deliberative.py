@@ -118,7 +118,7 @@ class DeliberativeConfig:
 
     enable_llm_turns: bool = False
     enable_risk_mgmt: bool = False
-    quick_model: str = "anthropic/claude-haiku-4.6"
+    quick_model: str = "anthropic/claude-haiku-4.5"
     deep_model: str = "anthropic/claude-sonnet-4.6"
     max_tokens_per_turn: int = 800
     prompt_hash_in_journal: bool = True

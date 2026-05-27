@@ -628,6 +628,7 @@ def _run_committee_safe(
             exchange=None,
             bars=empty_bars,
             last_close=last_close or 1.0,
+            last_volume=0.0,
             asof=asof,
         )
 
@@ -637,10 +638,17 @@ def _run_committee_safe(
         views: list[AnalystView] = []
         for vd in analyst_view_dicts:
             try:
+                # NOTE: Direction is a Literal[-1, 0, 1], not an Enum/class.
+                # Don't `Direction(int(...))` — that raises TypeError because
+                # you can't call a Literal. Pass the int directly; Pydantic
+                # validates the Literal at construction time.
+                dir_int = int(vd["direction"])
+                if dir_int not in (-1, 0, 1):
+                    continue
                 views.append(
                     AnalystView(
                         analyst=str(vd["analyst"]),
-                        direction=Direction(int(vd["direction"])),
+                        direction=dir_int,  # type: ignore[arg-type]
                         magnitude=float(vd["magnitude"]),
                         confidence=float(vd["confidence"]),
                         confidence_raw=float(vd.get("confidence_raw", vd["confidence"])),
@@ -660,12 +668,16 @@ def _run_committee_safe(
             }
 
         # Reconstruct AggregatedSignal from the dict form.
+        # See note above re Direction Literal — pass int directly.
+        baseline_dir_int = int(sig_d.get("direction", 0))
+        if baseline_dir_int not in (-1, 0, 1):
+            baseline_dir_int = 0
         baseline_signal = AggregatedSignal(
             asset=str(sig_d.get("asset", symbol)),
             timeframe=timeframe,
             asset_class=asset_class,
             asof=asof,
-            direction=Direction(int(sig_d.get("direction", 0))),
+            direction=baseline_dir_int,  # type: ignore[arg-type]
             magnitude=float(sig_d.get("magnitude", 0.0)),
             confidence=float(sig_d.get("confidence", 0.0)),
             confidence_raw=float(sig_d.get("confidence_raw", sig_d.get("confidence", 0.0))),
@@ -681,7 +693,7 @@ def _run_committee_safe(
             enable_risk_mgmt=risk_mgmt_enabled,
             quick_model=os.environ.get(
                 "HERMES_QUANT_DELIBERATIVE_QUICK_MODEL",
-                "anthropic/claude-haiku-4.6",
+                "anthropic/claude-haiku-4.5",
             ),
             deep_model=os.environ.get(
                 "HERMES_QUANT_DELIBERATIVE_DEEP_MODEL",

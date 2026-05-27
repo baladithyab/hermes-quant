@@ -146,3 +146,125 @@ def test_run_committee_safe_returns_deferred_success(monkeypatch):
     assert out["turns"] == []
     assert out["decision"] is None
     assert "deferred_reason" in out
+
+
+def test_run_committee_safe_dataclass_reconstruction_does_not_raise(monkeypatch):
+    """REGRESSION GUARD (2026-05-26 smoke-test caught two latent bugs):
+
+    1. `MarketContext` requires `last_volume` — the committee shim was
+       constructing it without that field, raising TypeError that the
+       failure-closed envelope swallowed. The deliberative path was
+       silently non-functional.
+    2. `Direction` is a Literal[-1,0,1], not an Enum — calling
+       `Direction(int(...))` raises TypeError (can't call a Literal),
+       so AnalystView reconstruction silently dropped every view and
+       the function bailed at `no_reconstructable_analyst_views`.
+
+    This test exercises the FULL reconstruction path with
+    HERMES_QUANT_DELIBERATIVE=1 + a placeholder-shaped key + a mocked
+    `run_llm_committee` so we don't hit the network. If reconstruction
+    fails, the test catches it because we mock the LLM call to verify
+    it gets called with reconstructed dataclasses.
+    """
+    monkeypatch.setenv("HERMES_QUANT_DELIBERATIVE", "1")
+    # Use a non-placeholder shaped key so the env-key short-circuit
+    # doesn't fire. Real key is irrelevant — we mock the LLM call.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-deliberative-shim-not-real")
+    m = _load_tick_module(monkeypatch)
+
+    # Mock run_llm_committee so we capture what got passed to it,
+    # without making a real LLM call.
+    captured: dict = {}
+
+    def fake_run_llm_committee(*, market_context, analyst_views, baseline_signal, config):
+        captured["market_context"] = market_context
+        captured["analyst_views"] = analyst_views
+        captured["baseline_signal"] = baseline_signal
+        captured["config"] = config
+        return []  # empty turns — committee bailed
+
+    import hermes_quant.aggregators.llm_committee as llm_mod
+    monkeypatch.setattr(llm_mod, "run_llm_committee", fake_run_llm_committee)
+
+    out = m._run_committee_safe(
+        symbol="MDB",
+        advisor_result={
+            "aggregated_signal": {
+                "asset": "MDB",
+                "direction": 1,  # Literal[-1,0,1] — must NOT be Direction(int(...))
+                "magnitude": 0.012,
+                "confidence": 0.65,
+                "confidence_raw": 0.7,
+                "horizon": "1d",
+                "timeframe": "1d",
+                "asset_class": "equity",
+                "asof": "2026-05-26T20:00:00Z",
+            },
+            "analyst_views": [
+                {
+                    "analyst": "ta_classic",
+                    "direction": 1,  # Literal[-1,0,1]
+                    "magnitude": 0.012,
+                    "confidence": 0.65,
+                    "confidence_raw": 0.7,
+                    "horizon": "1d",
+                    "rationale": "bullish breakout",
+                },
+            ],
+            "last_close": 220.50,
+        },
+        risk_mgmt_enabled=False,
+    )
+
+    # Failure-closed envelope must capture no error.
+    assert out["error"] is None, (
+        f"reconstruction raised inside _run_committee_safe: {out['error']}"
+    )
+
+    # Reconstruction must have actually run (not bailed at a guard).
+    assert "market_context" in captured, (
+        "run_llm_committee was never called — reconstruction bailed early "
+        f"with deferred_reason={out.get('deferred_reason')!r}"
+    )
+
+    # MarketContext.last_volume must be present (regression #1).
+    mc = captured["market_context"]
+    assert hasattr(mc, "last_volume"), "MarketContext missing last_volume field"
+    assert mc.last_volume == 0.0  # placeholder value from reconstruction
+
+    # AnalystView reconstruction must NOT have silently dropped (regression #2).
+    views = captured["analyst_views"]
+    assert len(views) == 1, (
+        f"expected 1 reconstructed view, got {len(views)} — Direction Literal "
+        f"reconstruction may have silently dropped it"
+    )
+    assert views[0].analyst == "ta_classic"
+    assert views[0].direction == 1
+
+    # Baseline signal direction must be the int directly, not a TypeError.
+    bs = captured["baseline_signal"]
+    assert bs.direction == 1
+
+
+def test_run_committee_safe_default_quick_model_is_valid(monkeypatch):
+    """REGRESSION GUARD (2026-05-26 smoke test caught this):
+
+    DeliberativeConfig default quick_model was `claude-haiku-4.6` which
+    is not a real OpenRouter model — runs hit `BadRequestError: 400 -
+    not a valid model ID`, the committee bailed after 2 consecutive
+    failures, and `_run_committee_safe` returned turns=[] with no error.
+
+    Verify the default in the playbook-tick fallback is on the live
+    OpenRouter roster.
+    """
+    m = _load_tick_module(monkeypatch)
+    src = open(m.__file__).read()
+    # The playbook-tick uses haiku-4.5 (canonical) as the env-fallback.
+    assert "claude-haiku-4.5" in src, (
+        "playbook-tick.py must default quick_model to claude-haiku-4.5 "
+        "(haiku-4.6 is not a valid OpenRouter model ID)"
+    )
+    assert "claude-haiku-4.6" not in src, (
+        "playbook-tick.py must NOT reference claude-haiku-4.6 — that model "
+        "ID does not exist on OpenRouter and causes BadRequestError"
+    )
