@@ -905,6 +905,127 @@ def test_v03_factor_oracle_appends_verdict_history(tmp_quant_home: Path) -> None
         assert len(rows) >= 3, "FactorOracle.evaluate() MUST append, not overwrite"
 
 
+def test_v03_dual_llm_flag_composition_falls_through_when_caller_unavailable(
+    tmp_quant_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MoA review F3 (Sonnet IMP-1): with BOTH HERMES_QUANT_TRADER_LLM=1
+    AND HERMES_QUANT_RISK_COMMITTEE_LLM=1, but no LLMCaller available
+    (no API key), both paths must silently fall through to v0.1
+    deterministic logic. The composed flow TraderNodeLLM → RiskCommittee
+    must NOT crash and must produce a well-formed proposal+debate.
+    """
+    from hermes_quant.agents.risk_committee.committee import RiskCommittee
+    from hermes_quant.agents.trader import TraderNodeLLM, TraderProposal
+    from hermes_quant.agents.trader_node import TraderNodeWithRisk
+
+    # Set both flags ON
+    monkeypatch.setenv("HERMES_QUANT_TRADER_LLM", "1")
+    monkeypatch.setenv("HERMES_QUANT_RISK_COMMITTEE_LLM", "1")
+    # But no API key — so .available() returns False
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    research_plan = {"recommendation": "Buy", "confidence": 0.85, "rationale": "test"}
+    advisor_signal = {
+        "direction": 1,
+        "confidence": 0.85,
+        "magnitude": 0.02,
+        "metadata": {"atr_relative": 0.02, "close": 100.0},
+        "data_quality": {"bars_received": 60, "last_close": 100.0},
+    }
+
+    # Both v0.2 components fall through to v0.1
+    trader = TraderNodeLLM(llm_caller=None)
+    risk_committee = RiskCommittee()  # no llm_caller
+    wrapper = TraderNodeWithRisk(trader_node=trader, risk_committee=risk_committee)
+
+    # The full composed chain must produce a valid TraderProposal + RiskDebateSummary
+    proposal, debate = wrapper(research_plan, advisor_signal)
+    assert isinstance(proposal, TraderProposal)
+    assert proposal.action.value in ("BUY", "HOLD")
+    assert 0.0 <= debate.silence_multiplier <= 1.0  # CV5 invariant holds
+
+
+def test_v03_factor_oracle_with_ic_dedup_gate_excludes_duplicates(
+    tmp_quant_home: Path,
+) -> None:
+    """MoA review F4 (Sonnet IMP-2): FactorOracle with an ICDedupGate
+    correctly flags near-duplicate factors as `rejected` tier.
+    """
+    from hermes_quant.factors.alpha_zoo import AlphaFactor, AlphaZoo
+    from hermes_quant.factors.factor_oracle import FactorOracle
+    from hermes_quant.factors.ic_dedup import ICDedupGate
+    import numpy as np
+
+    ohlcv = _gbm_ohlcv(n_days=120)
+    factors_dir = tmp_quant_home / "factors_dedup"
+    zoo = AlphaZoo(base_dir=factors_dir)
+
+    # Register two factors that produce IDENTICAL output series
+    f1 = AlphaFactor(
+        name="alpha_close_minus_open_v1",
+        description="duplicate test",
+        source_code="bars['close'] - bars['open']",
+        author="aria",
+        created_at="2025-06-15T16:00:00Z",
+    )
+    f2 = AlphaFactor(
+        name="alpha_close_minus_open_v2",
+        description="duplicate test (clone)",
+        source_code="bars['close'] - bars['open']",  # identical
+        author="aria",
+        created_at="2025-06-15T16:00:00Z",
+    )
+    fid1 = zoo.register(f1)
+    fid2 = zoo.register(f2)
+
+    # Pre-register their factor returns into the dedup gate so the oracle
+    # can detect the duplicate
+    gate = ICDedupGate(threshold=0.99)
+    rng = np.random.default_rng(7)
+    series_1 = (ohlcv["close"] - ohlcv["open"]).values
+    series_2 = series_1 + rng.standard_normal(len(series_1)) * 1e-9  # near-perfect clone
+    gate.register(fid1, series_1)
+    gate.register(fid2, series_2)
+
+    verdicts_dir = tmp_quant_home / "factor_verdicts_dedup"
+    oracle = FactorOracle(alpha_zoo=zoo, ic_dedup_gate=gate, verdicts_dir=verdicts_dir)
+
+    # First factor evaluated alone — should be a normal verdict (no dedup hit yet)
+    v1 = oracle.evaluate(fid1, ohlcv)
+    assert v1 is not None
+    # Second factor — should be flagged by dedup
+    v2 = oracle.evaluate(fid2, ohlcv)
+    assert v2 is not None
+    # The dedup gate's verdict reasons should mention the dedup rejection
+    # (or the tier should be 'rejected')
+    reasons_text = " ".join(v2.reasons).lower() if v2.reasons else ""
+    # Either the tier is rejected OR the reasons explicitly mention dedup
+    assert v2.tier == "rejected" or "dedup" in reasons_text or "duplic" in reasons_text
+
+
+# ---------------------------------------------------------------------------
+# Targeted: Reflector v0.2 self-grade refusal handles provider-prefix variants
+# ---------------------------------------------------------------------------
+
+
+def test_v03_self_grade_refusal_normalized_across_provider_prefix() -> None:
+    """MoA review F1 (Claude I1): self-grade refusal must catch
+    provider-prefix asymmetry, case differences, and dated-suffix variants.
+    """
+    from hermes_quant.memory.reflector import _normalize_model_id
+
+    # Provider-prefix asymmetry
+    assert _normalize_model_id("openai/gpt-4.1") == _normalize_model_id("gpt-4.1")
+    # Case differences
+    assert _normalize_model_id("OpenAI/GPT-4.1") == _normalize_model_id("openai/gpt-4.1")
+    # Dated suffix
+    assert _normalize_model_id("openai/gpt-4.1-2025-04-14") == _normalize_model_id("openai/gpt-4.1")
+    assert _normalize_model_id("openai/gpt-4.1-20250414") == _normalize_model_id("openai/gpt-4.1")
+    # None / empty
+    assert _normalize_model_id(None) == ""
+    assert _normalize_model_id("") == ""
+
+
 def test_bma_n1_collapse_signature_caught_by_audit_predicate(tmp_quant_home: Path) -> None:
     """A simulated n=1 collapse (single analyst, conf=1.0, BMAAggregator)
     MUST be flagged by both is_bma_degenerate AND is_n1_collapse."""

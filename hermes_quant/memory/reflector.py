@@ -254,11 +254,52 @@ def _parse_dt(value: str | datetime | None) -> datetime:
 
 
 def _normalize_lesson_category(value: str) -> LessonCategory:
-    """Coerce an LLM-returned string into a LessonCategory, defaulting to unknown."""
+    """Coerce an LLM-returned string into a LessonCategory, defaulting to unknown.
+
+    MoA review F5 (Claude I3): unknown values are coerced to LessonCategory.unknown
+    but the caller logs `raw_lesson_category` separately so we have provenance
+    for prompt-injection / model-misbehavior detection.
+    """
     try:
         return LessonCategory(value)
-    except ValueError:
+    except (ValueError, KeyError, TypeError):
         return LessonCategory.unknown
+
+
+def _normalize_model_id(model_id: str | None) -> str:
+    """Normalize a model_id for self-grade-refusal comparison.
+
+    MoA review F1 (Claude I1): exact-string equality is fragile against:
+      - Provider-prefix asymmetry: "openai/gpt-4.1" vs "gpt-4.1"
+      - Case differences: "OpenAI/..." vs "openai/..."
+      - Dated-suffix variants: "openai/gpt-4.1-2025-04-14" vs "openai/gpt-4.1"
+
+    Normalization steps:
+      1. None / empty -> empty string
+      2. Lowercase
+      3. Strip provider prefix (everything before the last "/")
+      4. Strip dated suffix matching -YYYY-MM-DD or -YYYYMMDD
+
+    >>> _normalize_model_id("openai/gpt-4.1")
+    'gpt-4.1'
+    >>> _normalize_model_id("OpenAI/GPT-4.1-2025-04-14")
+    'gpt-4.1'
+    >>> _normalize_model_id("gpt-4.1")
+    'gpt-4.1'
+    >>> _normalize_model_id(None)
+    ''
+    """
+    if not model_id:
+        return ""
+    import re as _re
+    norm = model_id.strip().lower()
+    # Drop provider prefix
+    if "/" in norm:
+        norm = norm.rsplit("/", 1)[-1]
+    # Drop dated suffix
+    norm = _re.sub(r"-\d{4}-\d{2}-\d{2}$", "", norm)
+    norm = _re.sub(r"-\d{8}$", "", norm)
+    return norm
 
 
 # ---------------------------------------------------------------------------
@@ -526,21 +567,30 @@ class Reflector:
             return None
 
         # Self-grade refusal invariant ─────────────────────────────────────
+        # MoA review F1 (Claude I1): exact-string equality fails on:
+        #   - provider-prefix asymmetry ("openai/gpt-4.1" vs "gpt-4.1")
+        #   - case differences ("OpenAI/..." vs "openai/...")
+        #   - dated-suffix variants ("openai/gpt-4.1-2025-04-14" vs "openai/gpt-4.1")
+        # Normalize both sides via _normalize_model_id() before comparison.
         pm_model = decision.get("llm_committee_model_id", None)
         reflector_model = getattr(self._llm_caller, "model_id", None)
-        if pm_model and reflector_model and pm_model == reflector_model:
+        if pm_model and reflector_model and _normalize_model_id(pm_model) == _normalize_model_id(reflector_model):
             logger.warning(
                 "Reflector v0.2: SELF-GRADE REFUSED — decision was made by %s "
-                "which is also the reflector model.  Falling back to v0.1 stub. "
+                "which normalizes to the same model as the reflector (%s). "
+                "Falling back to v0.1 stub. "
                 "(ADR-0042 anti-patterns / ADR-0057 §4)",
                 pm_model,
+                reflector_model,
             )
             _audit_reflector_call(
                 "v02_self_grade_refused",
                 {
                     "decision_id": decision_id,
                     "pm_model": pm_model,
+                    "pm_model_normalized": _normalize_model_id(pm_model),
                     "reflector_model": reflector_model,
+                    "reflector_model_normalized": _normalize_model_id(reflector_model),
                 },
             )
             return None
