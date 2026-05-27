@@ -108,7 +108,11 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
     # data_quality may live on the signal itself or on the aggregator
     # metadata. Prefer the signal-level field if present; otherwise fall
     # back to metadata; otherwise None.
-    dq = getattr(signal, "data_quality", None) or md.get("data_quality")
+    # Cross-model review M5: explicit None-check rather than `or`, so that
+    # a legitimate falsy data_quality value (e.g. {"score": 0.0}) is not
+    # silently replaced by the metadata fallback.
+    sig_dq = getattr(signal, "data_quality", None)
+    dq = sig_dq if sig_dq is not None else md.get("data_quality")
 
     return {
         "n_views": len(components),

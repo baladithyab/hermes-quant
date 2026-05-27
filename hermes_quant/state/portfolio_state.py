@@ -112,9 +112,20 @@ CREATE TABLE IF NOT EXISTS cash (
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS executions_replayed (
-    id                   INTEGER PRIMARY KEY CHECK (id = 1),
-    last_replayed_asof   TEXT NOT NULL,
-    replayed_count       INTEGER NOT NULL DEFAULT 0
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_replayed_asof TEXT,
+    replayed_count INTEGER DEFAULT 0
+);
+
+-- Cross-model review C2: idempotency guard. Records (proposal_id, asof_execution)
+-- of every fill that has been applied. Prevents double-apply if PaperReactor
+-- crashes between executions.jsonl append and apply_execution, or if a
+-- reconstruct_from runs after partial incremental applies.
+CREATE TABLE IF NOT EXISTS processed_fills (
+    proposal_id    TEXT NOT NULL,
+    asof_execution TEXT NOT NULL,
+    applied_at     TEXT NOT NULL,
+    PRIMARY KEY (proposal_id, asof_execution)
 );
 """
 
@@ -176,7 +187,20 @@ class PortfolioState:
         self.db_path = state_db_path or DEFAULT_STATE_DB
         self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Cross-model review C4: lock down parent dir to 0o700 BEFORE we
+        # create the db file. State.db carries portfolio positions and is
+        # not safe as world-readable on multi-tenant hosts. Idempotent.
+        try:
+            os.chmod(self.db_path.parent, 0o700)
+        except OSError as exc:  # pragma: no cover - defensive on shared filesystems
+            logger.warning("could not chmod %s to 0o700: %s", self.db_path.parent, exc)
         self._init_schema()
+        # Same hardening on the db file itself; only after schema init so
+        # the file definitely exists.
+        try:
+            os.chmod(self.db_path, 0o600)
+        except OSError as exc:  # pragma: no cover
+            logger.warning("could not chmod %s to 0o600: %s", self.db_path, exc)
 
     # ------------------------------------------------------------------
     # Connection management (matches halt_state.py pattern)
@@ -246,7 +270,8 @@ class PortfolioState:
         latest_asof = _latest_asof(records)
 
         with self._lock, self._conn() as conn:
-            conn.execute("BEGIN")
+            # Cross-model review I2: BEGIN IMMEDIATE for write-lock-on-start.
+            conn.execute("BEGIN IMMEDIATE")
             try:
                 # Clear derived tables (not halts!)
                 conn.execute("DELETE FROM positions")
@@ -256,9 +281,13 @@ class PortfolioState:
                 for (acct, asset_class, symbol), pos in positions.items():
                     qty = pos["quantity"]
                     if abs(qty) < 1e-12:
-                        # Flat positions: still write them with qty=0 for
-                        # auditability. The get_positions() reader filters them.
-                        pass
+                        # Cross-model review (GPT-5.1 Critical #2): drop flat
+                        # positions instead of writing 0-quantity rows. Closed
+                        # positions live in executions.jsonl; state.db is the
+                        # OPEN-positions cache. Keeping flat rows confused
+                        # `positions_written` semantics and risked future
+                        # refactors removing the filter on the reader.
+                        continue
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO positions
@@ -323,8 +352,9 @@ class PortfolioState:
         """Apply a single execution record to the state incrementally.
 
         Called by PaperReactor.execute() after the JSONL append.
-        Failures are swallowed with a warning per ADR-0031 silence-by-default
-        (same as audit_log.append failure handling in halt_state.py).
+        Failures are logged AND emit a `state_reconstruction_failed`
+        audit event so the silent-divergence failure mode the cross-model
+        review flagged (C3) is visible in the canonical audit trail.
 
         Args:
             record: dict matching ExecutionRecord fields (as produced by
@@ -334,6 +364,30 @@ class PortfolioState:
             self._apply_execution_unsafe(record)
         except Exception as e:  # noqa: BLE001
             logger.warning("PortfolioState.apply_execution failed: %s", e)
+            # Cross-model review C3: emit audit event so silent state.db
+            # divergence is visible in the canonical audit log.
+            try:
+                from hermes_quant.governance import audit_log
+
+                audit_log.append(
+                    audit_log.GovernanceEvent(
+                        kind="state_reconstruction_failed",
+                        asof=datetime.now(UTC),
+                        source="state.portfolio_state",
+                        payload={
+                            "error_type": type(e).__name__,
+                            "error_message": str(e)[:512],
+                            "proposal_id": record.get("proposal_id"),
+                            "asset": record.get("asset"),
+                            "asof_execution": record.get("asof_execution"),
+                        },
+                    )
+                )
+            except Exception as audit_exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "could not emit state_reconstruction_failed audit event: %s",
+                    audit_exc,
+                )
 
     def _apply_execution_unsafe(self, record: dict[str, Any]) -> None:
         """Inner implementation — may raise; caller wraps in try/except."""
@@ -343,12 +397,56 @@ class PortfolioState:
         fill_size_pct = float(record.get("fill_size_pct", 0.0))
         fill_price = float(record.get("fill_price", 0.0))
         asof = record.get("asof_execution") or _utc_now_iso()
+        # Cross-model review C2 (Claude Opus): future-bound asof. A crafted
+        # asof of "9999-12-31..." would wedge the watermark and silently
+        # cause future delta-replays to skip every legitimate record.
+        # Reject anything more than 24h in the future of wall-clock-now.
+        now = datetime.now(UTC)
+        try:
+            asof_dt = datetime.fromisoformat(asof.replace("Z", "+00:00"))
+            if asof_dt.tzinfo is None:
+                asof_dt = asof_dt.replace(tzinfo=UTC)
+            if asof_dt > now and (asof_dt - now).total_seconds() > 86400:
+                raise ValueError(
+                    f"asof_execution {asof} is more than 24h in the future "
+                    f"of wall-clock {now.isoformat()}; refusing to apply"
+                )
+        except (TypeError, ValueError) as exc:
+            # Bad ISO format also lands here. We re-raise rather than
+            # silently using _utc_now_iso to avoid masking upstream bugs.
+            raise ValueError(f"unparseable or future-bound asof_execution: {asof!r}") from exc
 
         initial_cash = _default_initial_cash()
+        proposal_id = record.get("proposal_id") or ""
 
         with self._lock, self._conn() as conn:
-            conn.execute("BEGIN")
+            # Cross-model review I2 (Claude Opus): BEGIN IMMEDIATE acquires
+            # the write lock at transaction start, eliminating the
+            # read-then-write race when two processes apply concurrently.
+            conn.execute("BEGIN IMMEDIATE")
             try:
+                # Cross-model review C2: idempotency guard. If this
+                # (proposal_id, asof_execution) has already been applied,
+                # skip — INSERT into processed_fills will fail the UNIQUE,
+                # we use INSERT OR IGNORE and check changes() to detect.
+                if proposal_id:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO processed_fills "
+                        "(proposal_id, asof_execution, applied_at) VALUES (?, ?, ?)",
+                        (proposal_id, asof, _utc_now_iso()),
+                    )
+                    if cur.rowcount == 0:
+                        # Already applied — this is the duplicate-apply
+                        # case. Roll back this no-op transaction and
+                        # return cleanly.
+                        conn.execute("ROLLBACK")
+                        logger.info(
+                            "apply_execution: idempotency hit on (%s, %s); skipping",
+                            proposal_id,
+                            asof,
+                        )
+                        return
+
                 # ── load current position ────────────────────────────────
                 row = conn.execute(
                     "SELECT quantity, avg_entry_price FROM positions "
@@ -366,15 +464,24 @@ class PortfolioState:
                 new_qty, new_avg = _update_position(old_qty, old_avg, fill_size_pct, fill_price)
 
                 # ── upsert position ──────────────────────────────────────
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO positions
-                        (account_id, asset_class, symbol, quantity,
-                         avg_entry_price, last_update_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (acct, asset_class, symbol, new_qty, new_avg, asof),
-                )
+                if abs(new_qty) < 1e-12:
+                    # Position closed: delete the row (state.db caches
+                    # OPEN positions only — see reconstruct_from for the
+                    # symmetric flat-position drop).
+                    conn.execute(
+                        "DELETE FROM positions WHERE account_id=? AND asset_class=? AND symbol=?",
+                        (acct, asset_class, symbol),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO positions
+                            (account_id, asset_class, symbol, quantity,
+                             avg_entry_price, last_update_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (acct, asset_class, symbol, new_qty, new_avg, asof),
+                    )
 
                 # ── load / bootstrap cash ────────────────────────────────
                 crow = conn.execute(

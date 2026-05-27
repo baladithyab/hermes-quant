@@ -59,6 +59,12 @@ def is_bma_degenerate(event: dict[str, Any]) -> bool:
         the incident-response reference doc, not this predicate.
       - has any malformed/missing field — defensive: better to under-flag
         than over-flag in an incident-response context.
+
+    Note: `is_n1_collapse(event)` is the structurally-only sibling predicate
+    that ignores aggregator_class — recommended by cross-model review C1
+    because the aggregator string is a free-form upstream-supplied value
+    that future BMA-shaped aggregators with different naming would silently
+    evade.
     """
     if event.get("kind") != "gate_approval":
         return False
@@ -79,6 +85,48 @@ def is_bma_degenerate(event: dict[str, Any]) -> bool:
         return False
     try:
         return float(confidence) >= 0.999  # tolerate FP wobble around 1.0
+    except (TypeError, ValueError):
+        return False
+
+
+def is_n1_collapse(event: dict[str, Any]) -> bool:
+    """Structural-only n=1-collapse predicate (cross-model review C1).
+
+    Same as is_bma_degenerate but IGNORES aggregator_class. The 2026-05-26
+    incident wasn't fundamentally about the *string* "bma"; it was about
+    the structural condition (n=1 distinct analyst + saturated confidence).
+    Anchoring the discriminator on a free-form aggregator name lets a
+    future BMA-shaped aggregator with cosmetically different naming
+    silently evade detection.
+
+    For incident-response operators: prefer this predicate over
+    is_bma_degenerate when running forensic queries on a corpus of audit
+    events that may include multiple aggregator implementations.
+
+    Returns True iff:
+      - kind == "gate_approval"
+      - signal_provenance present
+      - n_distinct_analysts == 1
+      - confidence >= 0.999
+
+    Returns False on string-typed confidence (parse error). For
+    incident-response, an operator who suspects upstream serialization
+    drift should call coverage_summary() and inspect the without_provenance
+    bucket directly.
+    """
+    if event.get("kind") != "gate_approval":
+        return False
+    payload = event.get("payload") or {}
+    sp = payload.get("signal_provenance") or {}
+    if not sp:
+        return False
+    if sp.get("n_distinct_analysts") != 1:
+        return False
+    confidence = payload.get("confidence")
+    if confidence is None:
+        return False
+    try:
+        return float(confidence) >= 0.999
     except (TypeError, ValueError):
         return False
 
