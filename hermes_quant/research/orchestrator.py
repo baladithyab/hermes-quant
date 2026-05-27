@@ -241,6 +241,19 @@ class HypothesisRunner:
         metrics: dict[str, float] = {}
 
         # 3. Execute strategy
+        # MoA review F5 (Sonnet C1): catch LookaheadViolation explicitly so
+        # ADR-0048 §D5 contract holds — a contaminated run sets
+        # contamination_guard_fired=True and forces verdict='falsified'.
+        # Without this, the bare `except Exception` swallows it as a
+        # generic failure and emits 'inconclusive', which is silent harm.
+        try:
+            from hermes_quant.backtest.engine import LookaheadViolation as _LookaheadViolation
+        except ImportError:
+            try:
+                from hermes_quant.backtest import LookaheadViolation as _LookaheadViolation
+            except ImportError:
+                _LookaheadViolation = None  # type: ignore[assignment]
+
         try:
             raw_metrics = strategy(
                 universe=universe,
@@ -251,11 +264,20 @@ class HypothesisRunner:
             # Ensure all values are float
             metrics = {k: float(v) for k, v in raw_metrics.items()}
         except Exception as exc:
-            logger.warning(
-                "HypothesisRunner: strategy raised %s for %s; metrics will be empty.",
-                exc,
-                hypothesis_id,
-            )
+            # Detect LookaheadViolation to fire the contamination guard
+            if _LookaheadViolation is not None and isinstance(exc, _LookaheadViolation):
+                contamination_fired = True
+                logger.warning(
+                    "HypothesisRunner: LookaheadViolation in %s — "
+                    "contamination_guard_fired=True; verdict will be forced to 'falsified'.",
+                    hypothesis_id,
+                )
+            else:
+                logger.warning(
+                    "HypothesisRunner: strategy raised %s for %s; metrics will be empty.",
+                    exc,
+                    hypothesis_id,
+                )
             # Record failure metrics so the run card is still written
             metrics = {k: float("nan") for k in REQUIRED_METRIC_KEYS}
 
@@ -284,6 +306,16 @@ class HypothesisRunner:
             hyp.falsification_criteria,
             metrics,
         )
+
+        # MoA review F5 (Sonnet C1): if contamination guard fired, the
+        # verdict is forced to 'falsified' regardless of metrics. ADR-0048
+        # §D5 makes this a hard rule — a contaminated run cannot pass.
+        if contamination_fired:
+            verdict = "falsified"
+            reasons = [
+                "LookaheadViolation raised during run — contamination_guard_fired=True; "
+                "verdict forced to 'falsified' per ADR-0048 §D5."
+            ] + (reasons[:9] if reasons else [])
 
         # 7. Build RunCard
         run_id = _make_run_id(hypothesis_id)

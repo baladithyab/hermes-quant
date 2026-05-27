@@ -124,6 +124,14 @@ def apply_regime_weights(
     if table is None:
         table = DEFAULT_REGIME_WEIGHTS
 
+    # MoA review F3 (Claude C3): UNKNOWN regime MUST be a no-op identity
+    # (multipliers all 1.0). This invariant is documented in ADR-0047 but
+    # was previously enforced only by convention in DEFAULT_REGIME_WEIGHTS.
+    # A user-edited weights.json or a custom RegimeWeightTable could
+    # silently break the invariant. Short-circuit here for defense.
+    if regime == RegimeState.UNKNOWN:
+        return dict(base_weights)
+
     # Fallback: if regime not in table at all, use UNKNOWN row if present
     if regime not in table:
         regime_row: dict[str, float] = table.get(RegimeState.UNKNOWN, {})

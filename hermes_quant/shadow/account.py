@@ -231,11 +231,16 @@ class ShadowAccount:
 
         sign = 1 if decision.action == "buy" else -1
 
-        # Cost model: slippage + explicit cost_model_bps
-        # fill_price = market_price * (1 + sign * 0.0005) * (1 + sign * cost_bps / 10000)
+        # Cost model: slippage (directional) + cost_bps (non-directional drag).
+        # MoA review F4 (GPT C1): cost MUST be applied symmetrically. The
+        # original `sign * (cost_bps / 10000)` subsidized shorts because
+        # the negative-sign cost made the short entry price MORE favorable.
+        # Correct semantics:
+        #   - slippage tilts the fill price (book-side asymmetry)
+        #   - cost_bps is deducted from cash as a separate dollar drag
         slippage_fraction = sign * 0.0005  # 5 bps directional slippage
-        cost_fraction = sign * (self.cost_model_bps / 10_000.0)
-        fill_price = decision_price * (1.0 + slippage_fraction + cost_fraction)
+        cost_fraction = self.cost_model_bps / 10_000.0  # always positive — magnitude
+        fill_price = decision_price * (1.0 + slippage_fraction)
 
         with self._lock, self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -262,8 +267,12 @@ class ShadowAccount:
 
                 new_qty, new_avg = _update_position(old_qty, old_avg, shares, fill_price)
 
-                # Cash impact
-                new_cash = current_cash - (shares * fill_price)
+                # Cash impact: position notional + non-directional cost drag.
+                # The cost_fraction is positive; abs(shares) * fill_price gives
+                # the trade notional, which is multiplied by cost_fraction to
+                # get the dollar drag. This is symmetric across long/short.
+                cost_dollars = abs(shares) * fill_price * cost_fraction
+                new_cash = current_cash - (shares * fill_price) - cost_dollars
 
                 # Persist fill
                 conn.execute(

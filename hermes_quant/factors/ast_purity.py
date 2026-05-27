@@ -67,9 +67,27 @@ FORBIDDEN_ATTRIBUTES: frozenset[str] = frozenset(
         "dumps",
         "getattr",
         "setattr",
+        # Python sandbox-escape primitives — every standard escape primer
+        # walks one of these dunders to reach the loaded class table or
+        # frame globals. MoA review F1 (Claude C1) closes the full set.
         "__class__",
         "__bases__",
         "__subclasses__",
+        "__mro__",
+        "__base__",
+        "__globals__",
+        "__init__",
+        "__init_subclass__",
+        "__dict__",
+        "__builtins__",
+        "__getattribute__",
+        "__getattr__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__import__",
+        "__code__",
+        "__closure__",
+        "__func__",
     }
 )
 

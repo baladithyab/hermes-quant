@@ -158,6 +158,10 @@ class Hypothesis(BaseModel):
                 raise ValueError(
                     f"success_criteria[{i}] exceeds max_length=256 ({len(item)} chars)"
                 )
+            # MoA review F2 (Claude C2): criterion strings are eval()'d at
+            # run-time. Run them through the AST purity gate so an LLM-
+            # authored hypothesis cannot embed a sandbox escape.
+            cls._purity_check_criterion(item, kind="success_criteria")
         return v
 
     @field_validator("falsification_criteria")
@@ -170,7 +174,36 @@ class Hypothesis(BaseModel):
                 raise ValueError(
                     f"falsification_criteria[{i}] exceeds max_length=256 ({len(item)} chars)"
                 )
+            cls._purity_check_criterion(item, kind="falsification_criteria")
         return v
+
+    @staticmethod
+    def _purity_check_criterion(criterion: str, *, kind: str) -> None:
+        """Run AST purity check on an eval-able criterion string.
+
+        MoA review F2: criterion strings are user/LLM-supplied and reach
+        eval(). Same defense-in-depth pattern as AlphaZoo: parse the
+        expression and reject anything referencing forbidden names or
+        attributes (sandbox-escape primitives).
+        """
+        try:
+            from hermes_quant.factors.ast_purity import (
+                check_factor_purity,
+                PurityViolation,
+            )
+        except ImportError:
+            # If the purity module isn't available, fail closed.
+            raise ValueError(
+                f"{kind}: AST purity gate unavailable; "
+                f"refusing to accept criterion {criterion!r}"
+            )
+        result = check_factor_purity(criterion)
+        if not result.passes:
+            raise PurityViolation(
+                f"{kind} criterion {criterion!r} fails AST purity gate: "
+                f"{result.violations}",
+                violation_kind="hypothesis_criterion_purity",
+            )
 
     @field_validator("scope")
     @classmethod

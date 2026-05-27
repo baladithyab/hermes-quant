@@ -349,7 +349,10 @@ class AlphaZoo:
             "float": float,
             "str": str,
             "isinstance": isinstance,
-            "type": type,
+            # NOTE: `type` removed per MoA review F1 — `type(x).__mro__[-1]
+            # .__subclasses__()` is the canonical sandbox-escape root. The
+            # AST purity gate now also forbids __mro__/__bases__/__class__/
+            # __globals__/__init__/etc. as a defense-in-depth.
             "print": print,  # harmless for debugging
         }
         scope: dict[str, Any] = {
