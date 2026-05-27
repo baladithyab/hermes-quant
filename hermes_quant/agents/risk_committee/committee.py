@@ -11,16 +11,24 @@ Invariants:
   * The deterministic risk gate (ADR-0004) is the final authority; this
     committee runs BEFORE the gate and only ever reduces size.
 
-v0.1 deterministic — no LLM call. v0.2 LLM wiring is deferred behind the
-``llm_caller`` parameter (same pattern as Wave 4 Reflector).
+v0.1 deterministic — no LLM call. v0.2 LLM wiring is feature-flagged via
+HERMES_QUANT_RISK_COMMITTEE_LLM=1 (default OFF). Each persona's turn is
+routed through LLMCaller with structured RiskCommitteeTurn output. Partial
+fallback per persona: if one persona's LLM call fails, other personas can
+still go through LLM. CV5 anti-amplify invariant is enforced outside the
+LLM scope — the wrapper clamps silence_multiplier in [0.0, 1.0] regardless
+of what any LLM returns.
+
+See ADR-0056 for the full wiring decision record.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Optional, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
@@ -33,7 +41,24 @@ from hermes_quant.agents.risk_committee.personas import (
 )
 from hermes_quant.agents.trader import TraderProposal
 
+if TYPE_CHECKING:
+    from hermes_quant.agents.llm_caller import LLMCaller
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Module-level audit helper (lazily resolved — never crashes at import time)
+# ---------------------------------------------------------------------------
+
+
+def _audit_append(kind: str, source: str, payload: dict) -> None:
+    """Thin wrapper so tests can patch 'committee._audit_append' directly."""
+    try:
+        from hermes_quant.agents.llm_caller import _audit_append as _impl
+        _impl(kind, source, payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("RiskCommittee: _audit_append failed (%s); continuing.", exc)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -44,11 +69,17 @@ DEFAULT_MAX_ROUNDS: int = 1
 MAX_ALLOWED_ROUNDS: int = 3
 ROUNDS_ENV_VAR: str = "HERMES_QUANT_RISK_ROUNDS"
 
+# Feature flag for v0.2 LLM path (default OFF — same discipline as TraderNodeLLM).
+_LLM_FLAG_ENV_VAR: str = "HERMES_QUANT_RISK_COMMITTEE_LLM"
+
 # Each silence vote multiplies the silence_multiplier by this factor.
 _SILENCE_FACTOR: float = 0.5
 
 # Persona execution order within a round (TauricResearch convention).
 _PERSONA_ORDER: tuple[str, ...] = ("aggressive", "conservative", "neutral")
+
+# Audit-log event kind for risk committee LLM calls.
+_RISK_COMMITTEE_AUDIT_KIND: str = "risk_committee_llm_call"
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +133,11 @@ class RiskCommittee:
     Args:
         personas: Optional explicit (Aggressive, Conservative, Neutral) tuple.
             Defaults to fresh instances of each.
-        llm_caller: Optional callable for v0.2 LLM-driven debate. v0.1 is
-            deterministic and does NOT use this parameter — it is reserved
-            so that the public API does not change when LLM wiring lands.
-            Signature: (system_prompt, user_prompt) -> str (the persona's
-            critique text).
+        llm_caller: Optional LLMCaller instance for v0.2 LLM-driven debate.
+            v0.1 is deterministic and does NOT use this parameter.
+            When provided (and HERMES_QUANT_RISK_COMMITTEE_LLM=1), each
+            persona's turn is routed through the LLM; partial fallback to
+            v0.1 occurs per-persona on any LLM failure (ADR-0056).
 
     Usage:
         committee = RiskCommittee()
@@ -117,7 +148,7 @@ class RiskCommittee:
         self,
         personas: tuple[RiskPersona, RiskPersona, RiskPersona] | None = None,
         *,
-        llm_caller: Callable[[str, str], str] | None = None,
+        llm_caller: Optional["LLMCaller"] = None,
     ) -> None:
         if personas is None:
             personas = (
@@ -134,7 +165,7 @@ class RiskCommittee:
             raise ValueError(
                 f"RiskCommittee personas missing canonical names: {missing!r}"
             )
-        self._llm_caller = llm_caller  # reserved for v0.2
+        self._llm_caller = llm_caller  # None → v0.1 deterministic only
 
     # ------------------------------------------------------------------
 
@@ -148,6 +179,13 @@ class RiskCommittee:
     ) -> RiskDebateSummary:
         """Run the round-robin debate and return a RiskDebateSummary.
 
+        Routes to v0.2 LLM debate when:
+          (a) self._llm_caller is not None
+          (b) self._llm_caller.available() returns True
+          (c) HERMES_QUANT_RISK_COMMITTEE_LLM=1
+
+        Falls back to v0.1 deterministic when any condition is not met.
+
         Args:
             trader_proposal: The TraderProposal under critique.
             plan: The research plan dict (recommendation, confidence,
@@ -160,9 +198,38 @@ class RiskCommittee:
         rounds = self._resolve_max_rounds(max_rounds)
         pid = proposal_id or f"prop-{uuid.uuid4().hex[:12]}"
 
+        # Route to v0.2 LLM path when feature-flagged and caller is ready.
+        if self._should_use_llm():
+            return self._debate_with_llm(
+                trader_proposal,
+                plan,
+                max_rounds=rounds,
+                proposal_id=pid,
+            )
+
+        return self._debate_deterministic(
+            trader_proposal,
+            plan,
+            max_rounds=rounds,
+            proposal_id=pid,
+        )
+
+    # ------------------------------------------------------------------
+    # v0.1 deterministic debate
+    # ------------------------------------------------------------------
+
+    def _debate_deterministic(
+        self,
+        proposal: TraderProposal,
+        plan: dict[str, Any],
+        *,
+        max_rounds: int,
+        proposal_id: str,
+    ) -> RiskDebateSummary:
+        """Pure v0.1 deterministic round-robin debate."""
         turns: list[RiskCommitteeTurn] = []
         silence_multiplier: float = 1.0
-        max_turns = 3 * rounds  # TauricResearch should_continue_risk_analysis
+        max_turns = 3 * max_rounds  # TauricResearch should_continue_risk_analysis
         terminated_reason = "max_rounds_reached"
 
         # Round-robin loop.
@@ -173,7 +240,7 @@ class RiskCommittee:
                 persona = self._personas[persona_name]
                 decision = self._invoke_persona(
                     persona=persona,
-                    proposal=trader_proposal,
+                    proposal=proposal,
                     plan=plan,
                     prior_turns=turns,
                 )
@@ -215,7 +282,7 @@ class RiskCommittee:
         )
 
         return RiskDebateSummary(
-            trader_proposal_id=pid,
+            trader_proposal_id=proposal_id,
             turns=turns,
             silence_multiplier=silence_multiplier,
             final_recommendation=final_recommendation,
@@ -224,8 +291,289 @@ class RiskCommittee:
         )
 
     # ------------------------------------------------------------------
+    # v0.2 LLM debate
+    # ------------------------------------------------------------------
+
+    def _debate_with_llm(
+        self,
+        proposal: TraderProposal,
+        plan: dict[str, Any],
+        *,
+        max_rounds: int,
+        proposal_id: str,
+    ) -> RiskDebateSummary:
+        """v0.2 LLM-driven round-robin debate with per-persona partial fallback.
+
+        ADR-0056: Each persona's turn is independently routed to the LLM.
+        If a single persona's LLM call fails (returns None or raises),
+        only that persona falls back to v0.1 deterministic for THIS turn;
+        other personas continue on the LLM path.
+
+        CV5 anti-amplify invariant is enforced outside the LLM scope:
+        silence_multiplier is clamped in [0.0, 1.0] after every turn
+        regardless of which path produced the turn.
+        """
+        turns: list[RiskCommitteeTurn] = []
+        silence_multiplier: float = 1.0
+        max_turns = 3 * max_rounds
+        terminated_reason = "max_rounds_reached"
+
+        proposal_json = json.dumps(proposal.model_dump(), default=str)
+        plan_json = json.dumps(plan, default=str)
+
+        try:
+            count = 0
+            while count < max_turns:
+                persona_name = _PERSONA_ORDER[count % 3]
+                persona = self._personas[persona_name]
+
+                turn, turn_path = self._invoke_persona_llm(
+                    persona=persona,
+                    proposal=proposal,
+                    plan=plan,
+                    prior_turns=turns,
+                    turn_index=count,
+                    proposal_json=proposal_json,
+                    plan_json=plan_json,
+                )
+                turns.append(turn)
+
+                # CV5 anti-pattern guard — invariant lives HERE, outside LLM scope.
+                # The LLM cannot raise silence_multiplier above 1.0 because this
+                # structural enforcement is the only place it changes.
+                if turn.risk_assessment == "silence":
+                    silence_multiplier *= _SILENCE_FACTOR
+
+                # Per-turn audit record (ADR-0056).
+                _audit_append(
+                    kind=_RISK_COMMITTEE_AUDIT_KIND,
+                    source="hermes_quant.agents.risk_committee.committee",
+                    payload={
+                        "proposal_id": proposal_id,
+                        "persona": persona_name,
+                        "turn_index": count,
+                        "path": turn_path,
+                        "risk_assessment": turn.risk_assessment,
+                        "confidence": turn.confidence,
+                        "silence_multiplier_after": round(
+                            max(0.0, min(1.0, silence_multiplier)), 6
+                        ),
+                    },
+                )
+
+                count += 1
+
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "RiskCommittee._debate_with_llm aborted (%s) after %d turns; "
+                "returning partial summary.",
+                exc,
+                len(turns),
+                exc_info=True,
+            )
+            terminated_reason = f"exception:{type(exc).__name__}"
+
+        # CV5 invariant: final clamp — always enforced regardless of path.
+        silence_multiplier = max(0.0, min(1.0, silence_multiplier))
+
+        n_rounds_completed = len(turns) // 3 + (1 if len(turns) % 3 else 0)
+        n_rounds_completed = min(n_rounds_completed, MAX_ALLOWED_ROUNDS)
+
+        final_recommendation = self._compose_final_recommendation(
+            silence_multiplier=silence_multiplier,
+            turns=turns,
+        )
+
+        return RiskDebateSummary(
+            trader_proposal_id=proposal_id,
+            turns=turns,
+            silence_multiplier=silence_multiplier,
+            final_recommendation=final_recommendation,
+            n_rounds=n_rounds_completed,
+            terminated_reason=terminated_reason,
+        )
+
+    def _invoke_persona_llm(
+        self,
+        *,
+        persona: RiskPersona,
+        proposal: TraderProposal,
+        plan: dict[str, Any],
+        prior_turns: list[RiskCommitteeTurn],
+        turn_index: int,
+        proposal_json: str,
+        plan_json: str,
+    ) -> tuple[RiskCommitteeTurn, str]:
+        """Attempt the LLM call for one persona turn.
+
+        Returns (turn, path_label) where path_label is one of:
+          * 'v02_llm_succeeded'      — LLM returned a valid RiskCommitteeTurn
+          * 'v02_llm_fallback_to_v01' — LLM failed; fell back to persona.decide()
+
+        Partial-fallback contract (ADR-0056): failure here only affects THIS
+        persona's turn. The caller (_debate_with_llm) continues for remaining
+        personas regardless of what happens here.
+        """
+        persona_name = persona.name
+        template = getattr(persona, "LLM_PROMPT_TEMPLATE", "")
+
+        prior_turns_json = json.dumps(
+            [t.model_dump() for t in prior_turns], default=str
+        )
+        ticker = plan.get("ticker", plan.get("symbol", "UNKNOWN"))
+
+        # Render the LLM prompt.
+        try:
+            system_prompt = template.format(
+                ticker=ticker,
+                turn_index=turn_index,
+                proposal_json=proposal_json,
+                plan_json=plan_json,
+                prior_turns_json=prior_turns_json,
+            )
+        except (KeyError, IndexError, ValueError) as exc:
+            logger.warning(
+                "RiskCommittee: persona '%s' LLM_PROMPT_TEMPLATE render failed "
+                "(%s); falling back to v0.1.",
+                persona_name,
+                exc,
+            )
+            return self._v01_turn(
+                persona=persona,
+                proposal=proposal,
+                plan=plan,
+                prior_turns=prior_turns,
+                turn_index=turn_index,
+                path="v02_llm_fallback_to_v01",
+            )
+
+        user_prompt = (
+            f"Produce your RiskCommitteeTurn JSON for turn {turn_index}. "
+            "Do not include any prose outside the JSON object."
+        )
+
+        # Attempt LLM call.
+        try:
+            obj, _raw = self._llm_caller.call(  # type: ignore[union-attr]
+                system_prompt,
+                user_prompt,
+                schema=RiskCommitteeTurn,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "RiskCommittee: LLM call raised for persona '%s' turn %d (%s); "
+                "falling back to v0.1 for this turn only.",
+                persona_name,
+                turn_index,
+                exc,
+            )
+            return self._v01_turn(
+                persona=persona,
+                proposal=proposal,
+                plan=plan,
+                prior_turns=prior_turns,
+                turn_index=turn_index,
+                path="v02_llm_fallback_to_v01",
+            )
+
+        # Validate the returned object.
+        if isinstance(obj, RiskCommitteeTurn):
+            logger.debug(
+                "RiskCommittee: v0.2 LLM succeeded for persona '%s' turn %d.",
+                persona_name,
+                turn_index,
+            )
+            # Enforce persona/turn_index fields to be canonical regardless of LLM.
+            # Pydantic 'extra=forbid' means we rebuild to be safe.
+            try:
+                validated = RiskCommitteeTurn(
+                    persona=persona_name,
+                    turn_index=turn_index,
+                    critique_text=obj.critique_text,
+                    evidence_ids=obj.evidence_ids,
+                    risk_assessment=obj.risk_assessment,
+                    confidence=obj.confidence,
+                )
+                return validated, "v02_llm_succeeded"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "RiskCommittee: LLM turn validation failed for persona '%s' "
+                    "turn %d (%s); falling back to v0.1.",
+                    persona_name,
+                    turn_index,
+                    exc,
+                )
+
+        else:
+            logger.warning(
+                "RiskCommittee: LLM returned %r for persona '%s' turn %d; "
+                "falling back to v0.1 for this turn only.",
+                type(obj).__name__,
+                persona_name,
+                turn_index,
+            )
+
+        return self._v01_turn(
+            persona=persona,
+            proposal=proposal,
+            plan=plan,
+            prior_turns=prior_turns,
+            turn_index=turn_index,
+            path="v02_llm_fallback_to_v01",
+        )
+
+    def _v01_turn(
+        self,
+        *,
+        persona: RiskPersona,
+        proposal: TraderProposal,
+        plan: dict[str, Any],
+        prior_turns: list[RiskCommitteeTurn],
+        turn_index: int,
+        path: str,
+    ) -> tuple[RiskCommitteeTurn, str]:
+        """Run one persona's v0.1 deterministic decision and return (turn, path)."""
+        decision = self._invoke_persona(
+            persona=persona,
+            proposal=proposal,
+            plan=plan,
+            prior_turns=prior_turns,
+        )
+        turn = RiskCommitteeTurn(
+            persona=persona.name,
+            turn_index=turn_index,
+            critique_text=decision.critique_text,
+            evidence_ids=list(decision.evidence_ids),
+            risk_assessment=decision.risk_assessment,
+            confidence=decision.confidence,
+        )
+        return turn, path
+
+    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _should_use_llm(self) -> bool:
+        """Return True iff all three conditions for v0.2 LLM path are met.
+
+        Conditions (AND):
+          (a) self._llm_caller is not None
+          (b) self._llm_caller.available() returns True
+          (c) env var HERMES_QUANT_RISK_COMMITTEE_LLM=1
+        """
+        if self._llm_caller is None:
+            return False
+        flag = os.environ.get(_LLM_FLAG_ENV_VAR, "0").strip()
+        if flag != "1":
+            return False
+        if not self._llm_caller.available():
+            logger.warning(
+                "RiskCommittee: HERMES_QUANT_RISK_COMMITTEE_LLM=1 but "
+                "LLMCaller.available() is False (no API key); "
+                "falling back to v0.1 deterministic."
+            )
+            return False
+        return True
 
     @staticmethod
     def _resolve_max_rounds(explicit: int | None) -> int:
@@ -257,7 +605,7 @@ class RiskCommittee:
         plan: dict[str, Any],
         prior_turns: list[RiskCommitteeTurn],
     ) -> _PersonaDecision:
-        """v0.1: deterministic. v0.2 will branch on self._llm_caller."""
+        """v0.1: deterministic. v0.2 branches via _debate_with_llm."""
         # NOTE: self._llm_caller is reserved for v0.2; v0.1 always uses the
         # deterministic decision rule. We call persona.decide() directly so
         # that test doubles can subclass + override that single method.
@@ -292,3 +640,4 @@ class RiskCommittee:
             f"({n_amplify} amplify vote(s) recorded for audit but never "
             "raise the multiplier above 1.0 per ADR-0043)."
         )
+
