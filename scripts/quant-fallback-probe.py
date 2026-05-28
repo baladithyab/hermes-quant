@@ -65,8 +65,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         print(format_results_human(results))
 
-    # Exit 1 if any probe produced invalid output (silence-by-default broken)
-    if any(not r.output_valid for r in results):
+    # Exit code policy:
+    #   - 0  = all evaluated probes passed (silence-by-default holds)
+    #   - 1  = at least one evaluated probe failed (DO NOT activate v0.2 in prod)
+    #   - 2  = no probes were evaluated (all skipped — operator likely picked
+    #          a surface×mode combo with no overlap; not a silence-by-default failure)
+    #
+    # Skipped rows (mode not meaningful for surface) are excluded from the
+    # verdict per v0.4 MoA F5 — they were never executed and cannot vote.
+    evaluated = [r for r in results if not (r.notes or "").startswith("skipped:")]
+    if not evaluated:
+        return 2
+    if any(not r.output_valid for r in evaluated):
         return 1
     return 0
 

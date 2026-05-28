@@ -326,3 +326,53 @@ def test_format_human_summary_excludes_skipped_from_denominator() -> None:
             "Summary doesn't surface skipped count separately — "
             "operators may not realize some probes were never evaluated"
         )
+
+
+def test_cli_exit_code_2_when_all_probes_skipped() -> None:
+    """Per v0.4 verification harness fix: when every (surface, mode) combo is
+    skipped (e.g. user picks regime_hmm × rate_limit alone), exit 2 (NO-OP)
+    not 1 (FAIL). Skipped rows aren't a silence-by-default failure — they
+    just weren't evaluated.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    script = repo_root / "scripts" / "quant-fallback-probe.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--surface", "regime_hmm", "--failure-mode", "rate_limit"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(repo_root),
+    )
+    # The single (regime_hmm, rate_limit) combo is non-meaningful → all skipped.
+    # Exit 2 means NO-OP (operator picked an empty matrix). NOT 1 (failure).
+    assert result.returncode == 2, (
+        f"expected exit 2 (NO-OP) for all-skipped matrix, got {result.returncode}; "
+        f"stdout={result.stdout!r}, stderr={result.stderr!r}"
+    )
+    assert "NO-OP" in result.stdout, "stdout should mark RESULT: NO-OP"
+
+
+def test_cli_exit_code_0_when_all_evaluated_pass() -> None:
+    """Standard happy path: exit 0 when all evaluated probes pass."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    script = repo_root / "scripts" / "quant-fallback-probe.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--surface", "all", "--failure-mode", "all"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(repo_root),
+    )
+    assert result.returncode == 0, (
+        f"expected exit 0 (PASS), got {result.returncode}; "
+        f"stdout tail={result.stdout[-500:]!r}"
+    )
+    assert "RESULT: PASS" in result.stdout
