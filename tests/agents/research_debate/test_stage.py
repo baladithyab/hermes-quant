@@ -624,7 +624,11 @@ def test_backward_compat_legacy_flag_off(
 # T11 -----------------------------------------------------------------
 def test_label_stability_under_portfolio_rating_enum() -> None:
     """Each of the 5 valid label strings round-trips through ResearchPlan.
-    Lowercase / non-canonical strings must raise ValidationError."""
+
+    ADR-0065 v0.6.1-fix-C3: case-insensitive on the wire (mixed-case is
+    accepted via field_validator and normalised to UPPERCASE before enum
+    coercion). Truly non-canonical labels (e.g. ``STRONG_BUY``) still raise.
+    """
     base = {
         "confidence": 0.6,
         "rationale": "x",
@@ -635,12 +639,12 @@ def test_label_stability_under_portfolio_rating_enum() -> None:
         assert rp.recommendation.value == label
         # Re-serialise must yield the same label byte-for-byte
         assert json.loads(rp.model_dump_json())["recommendation"] == label
-    # lowercase rejected
+    # Mixed-case is now accepted (C3) — normalised to UPPERCASE.
+    rp_lower = ResearchPlan.model_validate({"recommendation": "buy", **base})
+    assert rp_lower.recommendation == PortfolioRating.BUY
+    # non-canonical still rejected
     from pydantic import ValidationError
 
-    with pytest.raises(ValidationError):
-        ResearchPlan.model_validate({"recommendation": "buy", **base})
-    # non-canonical rejected
     with pytest.raises(ValidationError):
         ResearchPlan.model_validate({"recommendation": "STRONG_BUY", **base})
 
@@ -810,3 +814,32 @@ def test_i2_journal_replay_round_trip(
     replayed = ResearchPlan.model_validate(persisted)
     assert state.judge_decision is not None
     assert replayed.model_dump_json() == state.judge_decision.model_dump_json()
+
+
+# C3 -----------------------------------------------------------------
+def test_research_plan_recommendation_case_insensitive() -> None:
+    """ADR-0065 v0.6.1-fix-C3: PortfolioRating accepts mixed-case strings.
+
+    Tauric-style LLM judges sometimes emit ``"Buy"`` instead of ``"BUY"``;
+    the field validator must normalise before enum coercion.
+    """
+    plan = ResearchPlan.model_validate(
+        {
+            "recommendation": "Buy",
+            "confidence": 0.5,
+            "rationale": "x",
+            "strategic_actions": "size up small",
+        }
+    )
+    assert plan.recommendation == PortfolioRating.BUY
+
+    # Lower-case must also round-trip.
+    plan_lower = ResearchPlan.model_validate(
+        {
+            "recommendation": "sell",
+            "confidence": 0.5,
+            "rationale": "x",
+            "strategic_actions": "size down",
+        }
+    )
+    assert plan_lower.recommendation == PortfolioRating.SELL

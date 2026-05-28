@@ -24,7 +24,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Re-export BullBearTurn from the existing module so callers of this stage have
 # one symbol-set for all debate-related types. Importing inside a TYPE_CHECKING
@@ -92,6 +92,15 @@ class ResearchPlan(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    @field_validator("recommendation", mode="before")
+    @classmethod
+    def _normalize_case(cls, v):  # noqa: ANN001
+        # ADR-0065 v0.6.1-fix-C3: accept case-insensitive PortfolioRating strings on the wire.
+        # Tauric-style LLM judges sometimes emit "Buy"/"buy"; PortfolioRating is upper-cased.
+        if isinstance(v, str):
+            return v.upper()
+        return v
 
     recommendation: PortfolioRating
     confidence: float = Field(..., ge=0.0, le=1.0)
