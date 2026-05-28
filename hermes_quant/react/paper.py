@@ -92,6 +92,46 @@ class PaperReactor:
         )
         bar_ts = adv.get("bar_ts") or adv.get("as_of")  # = old as_of for v1 records
 
+        # ADR-0070: opt-in slippage model. Default OFF (legacy passthrough,
+        # fill_price = decision_price) unless HERMES_QUANT_PAPER_SLIPPAGE_MODEL=v0.2.
+        # When enabled, we model spread + impact + latency drift + auction premium
+        # with a deterministic per-fill RNG seed so replays of the same fill
+        # produce the same slipped fill price.
+        slippage_mode = os.environ.get("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
+        slippage_breakdown: dict[str, float] | None = None
+        if slippage_mode == "v0.2":
+            from hermes_quant.react.slippage_model import (
+                apply_slippage,
+                is_late_session_equity,
+            )
+            is_late = (
+                is_late_session_equity(now)
+                if proposal.asset_class == "equity"
+                else False
+            )
+            try:
+                fill_price, slippage_breakdown = apply_slippage(
+                    decision_price=decision_price,
+                    target_pct=fill_size_pct,
+                    asof_execution=now,
+                    proposal_id=proposal.proposal_id,
+                    asset_class=proposal.asset_class,
+                    is_late_session=is_late,
+                )
+            except ValueError as exc:
+                # Bad input (e.g. decision_price <= 0) — degrade to passthrough
+                # rather than fail the fill. Surface in metadata for audit.
+                logger.warning(
+                    "paper-react: slippage_model rejected fill for %s: %s; "
+                    "degraded to passthrough",
+                    proposal.proposal_id,
+                    exc,
+                )
+                fill_price = decision_price
+                slippage_breakdown = {"error": str(exc)}
+        else:
+            fill_price = decision_price  # legacy passthrough
+
         record = ExecutionRecord(
             proposal_id=proposal.proposal_id,
             signal_id=signal_id,
@@ -102,7 +142,7 @@ class PaperReactor:
             asof_execution=now,
             target_position_pct=fill_size_pct,
             decision_price=decision_price,
-            fill_price=decision_price,  # paper: no slippage
+            fill_price=fill_price,  # ADR-0070: slipped when v0.2 enabled, else decision_price
             fill_size_pct=fill_size_pct,
             reactor_name=self.name,
             human_in_the_loop=True,
@@ -110,6 +150,8 @@ class PaperReactor:
             reactor_metadata={
                 "paper": True,
                 "advisor_caveats": (proposal.advisor_result or {}).get("caveats", []),
+                "slippage_model": slippage_mode,
+                "slippage_breakdown": slippage_breakdown,
             },
             bar_ts=bar_ts,
         )
@@ -122,11 +164,14 @@ class PaperReactor:
             os.write(fd, line.encode("utf-8"))
 
         logger.info(
-            "paper-react: %s asset=%s size=%+.4f decision_price=%.4f",
+            "paper-react: %s asset=%s size=%+.4f decision_price=%.4f "
+            "fill_price=%.4f slippage_model=%s",
             record.proposal_id,
             record.asset,
             record.fill_size_pct,
             record.decision_price,
+            record.fill_price,
+            slippage_mode,
         )
 
         # Wave 1c (ADR-0041): update PortfolioState incrementally.
