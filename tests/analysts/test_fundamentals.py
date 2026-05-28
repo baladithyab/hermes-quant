@@ -152,8 +152,8 @@ def test_equity_happy_path(
             free_cash_flow=9.5e10,
             fcf_yoy=0.25,  # FCF YoY +25% → buy
             revenue_yoy=0.18,  # > 0.15 → buy
-            eps_trailing=7.5,
-            eps_forward=7.0,  # actual / forward = 1.07 → beat
+            eps_trailing=7.0,
+            eps_forward=7.5,  # fwd / trail = 1.07 → analysts revising UP → +1
             sector="Tech",
         ),
     )
@@ -193,8 +193,8 @@ def test_equity_happy_path_short(
             free_cash_flow=-1e9,  # < 0 → cash-burning
             fcf_yoy=-0.30,  # ignored by `_score_fcf` (already short on level)
             revenue_yoy=-0.15,  # < -0.10 → declining
-            eps_trailing=2.0,
-            eps_forward=3.0,  # ratio 0.66 → miss
+            eps_trailing=3.0,
+            eps_forward=2.0,  # fwd / trail = 0.66 → analysts revising DOWN → -1
             sector="Tech",
         ),
     )
@@ -311,8 +311,8 @@ def test_cache_hit_skips_yfinance(
             debt_to_equity=0.2,
             fcf_yoy=0.25,
             revenue_yoy=0.18,
-            eps_trailing=7.5,
-            eps_forward=7.0,
+            eps_trailing=7.0,
+            eps_forward=7.5,
             sector="Tech",
         ),
     )
@@ -403,8 +403,8 @@ def test_sector_median_lookup_works_then_missing_still_emits(
             debt_to_equity=0.2,  # → +1
             fcf_yoy=0.25,  # → +1
             revenue_yoy=0.18,  # → +1
-            eps_trailing=7.5,
-            eps_forward=7.0,  # → +1
+            eps_trailing=7.0,
+            eps_forward=7.5,  # → +1
             sector="Tech",
         ),
     )
@@ -442,8 +442,8 @@ def test_confidence_clipping_to_0_20_0_80(
             debt_to_equity=0.1,  # → +1
             fcf_yoy=0.50,  # → +1
             revenue_yoy=0.30,  # → +1
-            eps_trailing=10.0,
-            eps_forward=8.0,  # ratio 1.25 → strong beat
+            eps_trailing=8.0,
+            eps_forward=10.0,  # ratio 1.25 → strong upward revision
             sector="Tech",
         ),
     )
@@ -483,8 +483,8 @@ def test_bma_integration_e2e(provider: FundamentalsProvider) -> None:
             debt_to_equity=0.2,
             fcf_yoy=0.25,
             revenue_yoy=0.18,
-            eps_trailing=7.5,
-            eps_forward=7.0,
+            eps_trailing=7.0,
+            eps_forward=7.5,
             sector="Tech",
         ),
     )
@@ -539,8 +539,8 @@ def test_charter_d8_no_training_invariant(
             debt_to_equity=0.2,
             fcf_yoy=0.25,
             revenue_yoy=0.18,
-            eps_trailing=7.5,
-            eps_forward=7.0,
+            eps_trailing=7.0,
+            eps_forward=7.5,
             sector="Tech",
         ),
     )

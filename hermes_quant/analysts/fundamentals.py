@@ -10,7 +10,7 @@ Six sub-signals derived from yfinance .info / .balance_sheet / .income_stmt
   3. _score_de                    — debt-to-equity buckets
   4. _score_fcf                   — Free Cash Flow level + YoY growth
   5. _score_revenue_growth        — Revenue YoY
-  6. _score_eps_surprise          — actual vs forward consensus proxy
+  6. _score_eps_surprise          — forward EPS vs trailing EPS (analyst-revision tilt)
 
 Equity-only — ETF / crypto / FX abstain (Protocol-clean None, NOT a
 zero-confidence view per ADR-0064 §D4 / silence-bias-gate footgun).
@@ -100,7 +100,7 @@ class FundamentalsAnalyst:
         "debt_equity_trend",
         "fcf_growth",
         "revenue_yoy",
-        "earnings_surprise",
+        "earnings_outlook",
     )
 
     # Per-horizon magnitude envelope (ADR-0064 §D6 table)
@@ -132,6 +132,13 @@ class FundamentalsAnalyst:
             or (Path.home() / ".hermes" / "quant" / "cache" / "fundamentals")
         )
         self.calibrator = ColdStartCalibrator()
+        if isinstance(self.calibrator, ColdStartCalibrator):
+            # ADR-0065 v0.6.1-fix-H3: surface cold-start collapse risk.
+            logger.warning(
+                "FundamentalsAnalyst: using ColdStartCalibrator. Confidence outputs will be "
+                "approximately constant ~0.31 until calibrated. Run "
+                "scripts/quant-bootstrap-calibrator.py to seed real calibration."
+            )
         self._n_views_emitted = 0
         self._last_view_at: pd.Timestamp | None = None
         self._error_count = 0
@@ -356,31 +363,41 @@ class FundamentalsAnalyst:
         return _SubSignal(0, 0.0, 0.0, "revenue_yoy", "flat")
 
     def _score_eps_surprise(self, snap: pd.Series) -> _SubSignal:
-        """Earnings 'surprise' proxy (actual EPS vs forward EPS).
+        """Earnings outlook proxy (forward EPS vs trailing EPS).
 
         v0.6.1 proxy: yfinance does not expose I/B/E/S consensus directly,
-        so we use the ratio of trailing EPS to forward EPS as a coarse
-        proxy. v0.7 will swap in true actual-vs-consensus from a feed
-        that exposes it (Alpha Vantage / FMP).
+        so we compare forward consensus EPS to trailing actual EPS as a
+        coarse proxy for analyst revisions.
+
+        v0.6.1-fix-M5: direction was inverted in v0.6.1's initial cut.
+        Forward EPS is the *forecast*; trailing EPS is the realised value.
+        ``forward / trailing > 1`` means analysts expect growth (bullish),
+        ``< 1`` means analysts expect contraction (bearish). The previous
+        ``trailing / forward`` ratio had the sign flipped. The label is
+        also renamed from ``earnings_surprise`` to ``earnings_outlook``
+        because this is not a true post-print surprise -- it's an
+        ex-ante analyst-revision tilt. v0.7 will swap in true
+        actual-vs-consensus from a feed that exposes it (Alpha Vantage / FMP).
         """
-        actual = _coerce_float(snap.get("eps_trailing"))
-        consensus = _coerce_float(snap.get("eps_forward"))
-        if np.isnan(actual) or np.isnan(consensus):
-            return _SubSignal(0, 0.0, 0.0, "earnings_surprise", "missing")
-        if consensus <= 0:
-            return _SubSignal(0, 0.0, 0.0, "earnings_surprise", "consensus <= 0")
-        ratio = actual / consensus
+        trailing = _coerce_float(snap.get("eps_trailing"))
+        forward = _coerce_float(snap.get("eps_forward"))
+        if np.isnan(trailing) or np.isnan(forward):
+            return _SubSignal(0, 0.0, 0.0, "earnings_outlook", "missing")
+        if trailing <= 0:
+            # Loss-makers: ratio is meaningless / sign-flipped. Skip.
+            return _SubSignal(0, 0.0, 0.0, "earnings_outlook", "trailing <= 0")
+        ratio = forward / trailing
         if ratio > 1.05:
             return _SubSignal(
-                +1, self._mag(0.7), 0.60, "earnings_surprise",
-                f"EPS ${actual:.2f} vs fwd ${consensus:.2f} (+{(ratio - 1):.1%})",
+                +1, self._mag(0.7), 0.60, "earnings_outlook",
+                f"fwd EPS ${forward:.2f} vs trail ${trailing:.2f} (+{(ratio - 1):.1%})",
             )
         if ratio < 0.95:
             return _SubSignal(
-                -1, self._mag(0.8), 0.65, "earnings_surprise",
-                f"EPS ${actual:.2f} vs fwd ${consensus:.2f} ({(ratio - 1):.1%})",
+                -1, self._mag(0.8), 0.65, "earnings_outlook",
+                f"fwd EPS ${forward:.2f} vs trail ${trailing:.2f} ({(ratio - 1):.1%})",
             )
-        return _SubSignal(0, 0.0, 0.0, "earnings_surprise", "in line")
+        return _SubSignal(0, 0.0, 0.0, "earnings_outlook", "in line")
 
     # ------------------------------------------------------------------
     # Public API (Analyst Protocol)
