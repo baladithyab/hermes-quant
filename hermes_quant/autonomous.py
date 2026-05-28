@@ -327,6 +327,28 @@ def tick(
     fires_this_tick = 0
     journal_lessons_cache: dict[str, list[dict]] = {}
 
+    # ADR-0071: portfolio-aware Stage-2 sizing. When the operator opts in
+    # via HERMES_QUANT_PORTFOLIO_CAPS=1, each fire is clipped greedily
+    # against running portfolio headroom (gross / net / cash caps). The
+    # default is OFF so this PR is observe-only on its first day; flip the
+    # env var on once the operator has reviewed a tick log post-merge.
+    portfolio_caps_enabled = os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") == "1"
+    portfolio_state = None
+    portfolio_caps = None
+    if portfolio_caps_enabled:
+        from hermes_quant.portfolio.state import reconstruct_portfolio_state
+        from hermes_quant.risk.portfolio_normalize import (
+            PortfolioCaps,
+            clip_one_to_remaining_headroom,
+            headroom_summary,
+        )
+        portfolio_state = reconstruct_portfolio_state()
+        portfolio_caps = PortfolioCaps()
+        logger.info(
+            "autonomous: portfolio-caps gate ENABLED. initial state: %s",
+            headroom_summary(portfolio_state, portfolio_caps),
+        )
+
     for entry in watchlist:
         try:
             advisor_result = advisor_recommend(
@@ -396,22 +418,65 @@ def tick(
             rg = (advisor_result or {}).get("risk_gate") or {}
             kelly = float(rg.get("kelly_fraction", 0.0))
             sig = (advisor_result or {}).get("aggregated_signal") or {}
+
+            # ADR-0071: portfolio-aware Stage-2 clip. Greedy first-come-first-served
+            # — earlier picks consume the budget, later picks see the residual room.
+            # Order-dependent but operationally simpler than batching the loop.
+            effective_size = kelly
+            portfolio_clip_meta: dict[str, float | str | bool] | None = None
+            if portfolio_caps_enabled and portfolio_state is not None and portfolio_caps is not None:
+                clipped = clip_one_to_remaining_headroom(
+                    asset=entry.symbol,
+                    per_symbol_target_pct=kelly,
+                    state=portfolio_state,
+                    caps=portfolio_caps,
+                )
+                effective_size = clipped.portfolio_target_pct
+                portfolio_clip_meta = {
+                    "per_symbol_kelly": kelly,
+                    "portfolio_target": clipped.portfolio_target_pct,
+                    "scale_factor": clipped.scale_factor,
+                    "fired": clipped.fired,
+                    "silence_reason": clipped.silence_reason or "",
+                }
+                if not clipped.fired:
+                    decision.gate = "SILENCE_PORTFOLIO_CAP"
+                    decision.details = {
+                        "reason": clipped.silence_reason or "portfolio_cap_bound",
+                        "would_have_fired": True,
+                        "original_gate": gate_result.decision.value,
+                        "per_symbol_kelly": kelly,
+                    }
+                    result.silences += 1
+                    result.decisions.append(decision)
+                    continue
+
             decision.action = {
-                "target_position_pct": kelly,
+                "target_position_pct": effective_size,
                 "reason": rg.get("reason", "autonomous_silence_bias_fire"),
                 "direction": int(sig.get("direction", 0)),
             }
+            if portfolio_clip_meta is not None:
+                decision.action["portfolio_clip"] = portfolio_clip_meta
 
             if not dry_run:
                 try:
                     execution_id = _react(
                         advisor_result,
                         entry,
-                        kelly,
+                        effective_size,
                         paper_zero_costs=bool(rails.get("paper_zero_costs", False)),
                     )
                     decision.execution_id = execution_id
                     fires_this_tick += 1
+                    # Update running portfolio state so the next pick sees the
+                    # post-fire headroom (the canonical state.db helper does
+                    # not reload mid-tick — we mutate here).
+                    if portfolio_state is not None:
+                        # `positions` dict is intentionally mutable here even though
+                        # PortfolioState is frozen — the dict is the inner mutable
+                        # container that we update without reconstructing the wrapper.
+                        portfolio_state.positions[entry.symbol] = effective_size
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "autonomous: React failed for %s: %s",
@@ -426,6 +491,10 @@ def tick(
                     continue
             else:
                 fires_this_tick += 1  # count even in dry-run for cap math
+                # In dry-run, simulate the state update so subsequent dry-run
+                # picks see headroom consumption.
+                if portfolio_state is not None:
+                    portfolio_state.positions[entry.symbol] = effective_size
 
             result.fires += 1
         else:
