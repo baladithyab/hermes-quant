@@ -819,13 +819,56 @@ def _run_research_manager_judge(
     role = "research_manager"
     model = _model_for_role(role, config)
 
+    # H2 fix (v0.6.2): thread bull/bear debate context into the judge's prompt
+    # by synthesizing CommitteeTurn entries from the BullBearTurn list.
+    # _render_prompt's _serialize_prior_turns will fold them into the prompt's
+    # "Prior committee turns" block (rationale + stance + confidence are
+    # preserved; metadata is dropped per existing _serialize_prior_turns).
+    # Without this, the judge previously ran blind: prior_turns=[] discarded
+    # all bull/bear content the debate stage produced.
+    synth_prior_turns: list[CommitteeTurn] = []
+    for bt in bull_turns or []:
+        synth_prior_turns.append(
+            CommitteeTurn(
+                role="bull_researcher",  # type: ignore[arg-type]
+                stance=bt.stance,
+                direction=_direction_from_role("bull_researcher"),  # type: ignore[arg-type]
+                confidence=bt.confidence,
+                rationale=bt.rationale,
+                model="llm:research_debate",
+                input_hash=None,
+                metadata={
+                    "from_research_debate": True,
+                    "structured": bt.model_dump(),
+                },
+                tier="quick",
+            )
+        )
+    for bt in bear_turns or []:
+        synth_prior_turns.append(
+            CommitteeTurn(
+                role="bear_researcher",  # type: ignore[arg-type]
+                stance=bt.stance,
+                direction=_direction_from_role("bear_researcher"),  # type: ignore[arg-type]
+                confidence=bt.confidence,
+                rationale=bt.rationale,
+                model="llm:research_debate",
+                input_hash=None,
+                metadata={
+                    "from_research_debate": True,
+                    "structured": bt.model_dump(),
+                },
+                tier="quick",
+            )
+        )
+
     try:
         system_text, user_text = _render_prompt(
             role=role,
             market_context=market_context,
             analyst_views=analyst_views,
             baseline_signal=baseline_signal,
-            prior_turns=[],
+            prior_turns=synth_prior_turns,
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to render research_manager prompt for judge")
