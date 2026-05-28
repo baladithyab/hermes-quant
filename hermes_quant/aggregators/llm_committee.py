@@ -238,6 +238,10 @@ def _render_prompt(
     analyst_views: list[AnalystView],
     baseline_signal: AggregatedSignal,
     prior_turns: list[CommitteeTurn],
+    current_response: str | None = None,
+    own_history: str | None = None,
+    round_index: int | None = None,
+    conversational_preamble: str | None = None,
 ) -> tuple[str, str]:
     """Render system + user messages for a role.
 
@@ -249,6 +253,18 @@ def _render_prompt(
     and outcomes:`` block populated from get_past_context().  Default OFF —
     bit-identical to pre-Wave-4 when the env var is absent.  Bull, bear, and
     risk debaters do NOT see the lessons block (ADR-0042 anti-pattern list).
+
+    ADR-0065 (v0.6.1): when called from ``run_research_debate`` (the
+    Bull/Bear adversarial stage), four extra placeholders may be supplied:
+    ``current_response`` (opponent's last argument verbatim),
+    ``own_history`` (caller's own running thread),
+    ``round_index`` (1-based debate round number),
+    ``conversational_preamble`` (style preamble shared with the risk committee).
+    Legacy callers (the parallel-emit ``run_llm_committee`` path) leave these
+    None and the renderer substitutes safe sentinels so the prompt template
+    formats without raising. The legacy path may produce a different
+    ``prompt_hash`` than v0.6.0 because the underlying ``bull_bear.md``
+    template was rewritten — see ADR-0065 §Test Plan T10.
     """
     template = _load_prompt(role)
     system_tmpl, user_tmpl = _split_system_user(template)
@@ -307,6 +323,25 @@ def _render_prompt(
         "baseline_signal_json": _serialize_signal(baseline_signal),
         "prior_turns_json": _serialize_prior_turns(prior_turns),
         "lessons_block": lessons_block,
+        # ADR-0065 conversational placeholders. Legacy callers (None) get safe
+        # sentinels so the format string resolves; stage callers pass real
+        # values that change the prompt hash per round (T6/T7 invariant).
+        "current_response": (
+            current_response
+            if current_response is not None
+            else "(no prior turn — open the debate)"
+        ),
+        "own_history": (
+            own_history
+            if own_history is not None
+            else "(no prior turns by you yet)"
+        ),
+        "round_index": round_index if round_index is not None else 1,
+        "conversational_preamble": (
+            conversational_preamble
+            if conversational_preamble is not None
+            else "Output conversationally as if you are speaking without any special formatting"
+        ),
     }
 
     # Use ``str.format_map`` with a defaultdict-like fallback so missing
