@@ -498,6 +498,18 @@ def test_audit_log_emission_one_row_per_stage(
     assert payload["bull_count"] == 1
     assert payload["bear_count"] == 1
     assert payload["final_recommendation"] == "BUY"
+    # H1 fix (v0.6.2): stage row carries summaries, not per-turn payloads.
+    # Per-turn forensics still live on the dispatch-side committee_turn rows.
+    assert "bull_turns_summary" in payload
+    assert "bear_turns_summary" in payload
+    assert "bull_turns" not in payload
+    assert "bear_turns" not in payload
+    assert isinstance(payload["bull_turns_summary"], list)
+    assert isinstance(payload["bear_turns_summary"], list)
+    assert len(payload["bull_turns_summary"]) == 1
+    assert len(payload["bear_turns_summary"]) == 1
+    bs = payload["bull_turns_summary"][0]
+    assert {"stance", "confidence", "rationale_chars"} == set(bs.keys())
     # research_plan dict must round-trip via ResearchPlan.model_validate
     rp = ResearchPlan.model_validate(payload["research_plan"])
     assert rp.recommendation == PortfolioRating.BUY

@@ -338,8 +338,22 @@ def run_research_debate(
                 if state.judge_decision is not None
                 else None
             ),
-            "bull_turns": [t.model_dump(mode="json") for t in state.bull_turns],
-            "bear_turns": [t.model_dump(mode="json") for t in state.bear_turns],
+            "bull_turns_summary": [
+                {
+                    "stance": t.stance,
+                    "confidence": t.confidence,
+                    "rationale_chars": len(t.rationale or ""),
+                }
+                for t in state.bull_turns
+            ],
+            "bear_turns_summary": [
+                {
+                    "stance": t.stance,
+                    "confidence": t.confidence,
+                    "rationale_chars": len(t.rationale or ""),
+                }
+                for t in state.bear_turns
+            ],
         },
     )
 
