@@ -646,6 +646,118 @@ def _run_one_turn(
 
 
 # ---------------------------------------------------------------------------
+# v0.6.2: ResearchDebateStage adapters (ADR-0066)
+# ---------------------------------------------------------------------------
+
+
+def _run_one_turn_with_history(
+    *,
+    role: str,
+    client: Any,
+    config: DeliberativeConfig,
+    market_context: MarketContext,
+    analyst_views: list[AnalystView],
+    baseline_signal: AggregatedSignal,
+    current_response: str,
+    own_history: str,
+    round_index: int,
+    conversational_preamble: str,
+) -> CommitteeTurn | None:
+    """Adversarial-debate adapter over `_run_one_turn` (ADR-0066, v0.6.2).
+
+    Thin adapter that forwards the conversational placeholders from
+    ``run_research_debate`` (ADR-0065) into ``_render_prompt``. Mirrors the
+    bull/bear branch of ``_run_one_turn`` (lines 528-556) with one difference:
+    ``prior_turns=[]`` (this stage is conversational; the legacy parallel-emit
+    path's ``prior_turns`` are not relevant).
+
+    Failure-closed: returns ``None`` on any exception, parse failure, or
+    role mismatch. Caller (the stage runner) is responsible for the
+    two-consecutive-failures bail-out.
+    """
+    if role not in _BULL_BEAR_ROLES:
+        logger.warning(
+            "_run_one_turn_with_history called with non-bull/bear role %r; "
+            "this adapter only handles the adversarial debate roles",
+            role,
+        )
+        return None
+
+    model = _model_for_role(role, config)
+    tier = _expected_tier_for_role(role)
+
+    try:
+        system_text, user_text = _render_prompt(
+            role=role,
+            market_context=market_context,
+            analyst_views=analyst_views,
+            baseline_signal=baseline_signal,
+            prior_turns=[],
+            current_response=current_response,
+            own_history=own_history,
+            round_index=round_index,
+            conversational_preamble=conversational_preamble,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to render conversational prompt for role %r round=%d",
+            role,
+            round_index,
+        )
+        return None
+
+    phash = _prompt_hash(system_text, user_text)
+
+    try:
+        raw = _call_llm_json(
+            client=client,
+            model=model,
+            system_text=system_text,
+            user_text=user_text,
+            max_tokens=config.max_tokens_per_turn,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "LLM call raised in _run_one_turn_with_history role=%r", role
+        )
+        return None
+    if raw is None:
+        return None
+
+    parsed = _parse_pydantic(raw, BullBearTurn)
+    if parsed is None or not isinstance(parsed, BullBearTurn):
+        return None
+    if parsed.role != role:
+        logger.warning(
+            "LLM returned role=%r but we asked for %r; dropping (with-history)",
+            parsed.role,
+            role,
+        )
+        return None
+
+    return CommitteeTurn(
+        role=role,  # type: ignore[arg-type]
+        stance=parsed.stance,
+        direction=_direction_from_role(role),  # type: ignore[arg-type]
+        confidence=parsed.confidence,
+        rationale=parsed.rationale,
+        model=f"llm:{model}",
+        input_hash=None,
+        metadata={
+            "tier": tier,
+            "model_id": model,
+            "prompt_hash": phash,
+            "round_index": round_index,
+            "from_research_debate": True,
+            "key_evidence": list(parsed.key_evidence),
+            "counterarguments": parsed.counterarguments,
+            "structured": parsed.model_dump(),
+        },
+        tier=tier,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
