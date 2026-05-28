@@ -74,6 +74,19 @@ dev = [
     "ruff>=0.1",
     "mypy>=1.7",
 ]
+# Test bundle: all optional extras the test suite touches.
+# Use `uv pip install -e '.[test]'` to set up a clean dev environment that
+# can run the full test suite without ModuleNotFoundError on optional deps.
+# v0.6.3 (ADR none): extracted from the implicit set the suite was depending on.
+test = [
+    "hermes-quant[dev]",
+    "hermes-quant[stacking]",
+    "hermes-quant[ccxt]",
+    "hermes-quant[alpaca]",
+    "hermes-quant[yfinance]",
+    "hermes-quant[backtest]",
+    "pyarrow>=15.0",
+]
 
 [project.entry-points."hermes_agent.plugins"]
 hermes-quant = "hermes_quant"

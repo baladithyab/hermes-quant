@@ -1,0 +1,43 @@
+name: pytest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.4.x"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Create venv and install editable + test extras
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -e '.[test]'
+
+      - name: Run pytest (excluding wave_d slow tests)
+        run: |
+          source .venv/bin/activate
+          pytest \
+            --ignore=tests/unit/wave_d \
+            -q --tb=line \
+            --maxfail=20 \
+            -o asyncio_mode=auto
+
+      - name: Run v0.4 verification harness
+        run: |
+          source .venv/bin/activate
+          bash scripts/v0.4-verify-end-to-end.sh
