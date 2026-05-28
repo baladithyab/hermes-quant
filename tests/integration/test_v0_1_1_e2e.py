@@ -112,7 +112,7 @@ class TestE2ETickEmits:
         bars = _make_bars(100)
         provider = _mock_provider(bars)
         analysts = [_mock_analyst(1, "a"), _mock_analyst(1, "b")]
-        agg = BMAAggregator()
+        agg = BMAAggregator(require_ensemble=False)
         gate = DefaultRiskGate(
             RiskConfig(
                 cost_multiple=0.5,
@@ -173,7 +173,7 @@ class TestE2ETickEmits:
         bars = _make_bars(100)
         provider = _mock_provider(bars)
         analysts = [_mock_analyst(1, "a")]
-        agg = BMAAggregator()
+        agg = BMAAggregator(require_ensemble=False)
         gate = DefaultRiskGate(RiskConfig(cost_multiple=0.5, min_trade_size=0.0))
         state = TickLoopState()
 
