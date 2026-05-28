@@ -27,6 +27,7 @@ import hashlib
 import logging
 import os
 from collections.abc import Callable
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -475,9 +476,14 @@ def _build_signal_record(
         f"{task.asset.replace('/', '-')}-{dedup_tail}"
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,  # ADR-0068: split bar_ts (replay anchor) from asof_decision (wall-clock)
         "id": sig_id,
         "asof": asof.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        # ADR-0068: explicit, named-honestly aliases. `asof` retains its
+        # historical meaning (= bar_ts) for backward compat with v1 readers.
+        # New consumers prefer the explicit fields below.
+        "bar_ts": bar_ts_iso,
+        "asof_decision": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "asset": task.asset,
         "exchange": task.exchange,
         "timeframe": task.timeframe,

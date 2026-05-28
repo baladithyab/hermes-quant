@@ -23,7 +23,7 @@ class ExecutionRecord:
     asset: str
     asset_class: str
     timeframe: str
-    asof_decision: str  # ISO UTC: when the advisor view was computed
+    asof_decision: str  # ISO UTC: when the advisor view was computed (wall-clock per ADR-0068)
     asof_execution: str  # ISO UTC: when React fired
     target_position_pct: float  # signed, e.g. +0.05 = 5% NAV long
     decision_price: float  # last_close at advisor time
@@ -33,6 +33,12 @@ class ExecutionRecord:
     human_in_the_loop: bool
     approver_user_id: str | None = None
     reactor_metadata: dict[str, Any] | None = None
+    # ADR-0068: bar-boundary anchor for replay equality. Optional for backward
+    # compatibility — old execution records persisted before ADR-0068 lack it
+    # and read back as None. New records carry it explicitly so consumers can
+    # distinguish "when did the model run" (asof_decision) from "what bar did
+    # the model see" (bar_ts).
+    bar_ts: str | None = None
 
 
 @runtime_checkable

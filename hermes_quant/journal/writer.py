@@ -215,7 +215,14 @@ def append_human_override(
 
     entry = SettlementEntry(
         entry_id=proposal.proposal_id,
-        asof_decision=_parse_iso_safe(advisor_result.get("as_of")) or _utc_now(),
+        # ADR-0068: prefer wall-clock `decision_wall_clock` (truthful "when did
+        # the model run"), fall back to `as_of` (= bar_ts, replay anchor) for
+        # advisor-result dicts produced before the ADR-0068 split.
+        asof_decision=(
+            _parse_iso_safe(advisor_result.get("decision_wall_clock"))
+            or _parse_iso_safe(advisor_result.get("as_of"))
+            or _utc_now()
+        ),
         symbol=proposal.symbol,
         asset_class=proposal.asset_class,
         direction=int(sig.get("direction", 0)),
