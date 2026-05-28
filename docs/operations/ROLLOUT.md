@@ -41,16 +41,16 @@ Run this section in order. **Do not advance to §1 until every box is ticked.**
   `~/.hermes/config.yaml`. Do **not** put the key in this repo. To smoke-test the caller in
   isolation:
   ```bash
-  python -c "from hermes_quant.llm.caller import LLMCaller; c=LLMCaller(); print('available=', c.available())"
+  python -c "from hermes_quant.agents.llm_caller import LLMCaller; c=LLMCaller(); print('available=', c.available())"
   ```
-- [ ] **Silence-by-default verified.** Until `quant fallback-probe` is implemented (v0.4-1
-  deliverable), manually confirm fallback paths by running the test suites for each surface:
+- [ ] **Silence-by-default verified.** The fallback probe (ADR-0060) is the canonical
+  pre-flight check; it intentionally fails the LLMCaller with timeout, rate-limit, server-error,
+  malformed-JSON, schema-invalid, and empty modes against every v0.2 surface and confirms each
+  one falls back to its deterministic v0.1 path:
   ```bash
-  pytest -q tests/agents/test_trader.py \
-            tests/agents/risk_committee/ \
-            tests/memory/test_reflector.py \
-            tests/regime/test_hmm_classifier.py
-  # Expect: 0 failures. Each suite includes a "fallback when LLM fails" test.
+  python scripts/quant-fallback-probe.py --surface all --failure-mode all
+  # Expect: RESULT: PASS — silence-by-default holds for all surfaces.
+  # Exit code 0 = safe; exit code 1 = DO NOT activate v0.2 LLM in production.
   ```
 - [ ] **Status report clean.** Run `hermes quant status` (or the equivalent CLI you have
   wired). The `StatusReport.warnings` list MUST be empty. If a `state_reconstruction_failed`
@@ -223,8 +223,11 @@ Expect: HMM status reports `hmm_wired=True`, `model_loaded=True`.
 ```bash
 pytest -q tests/memory/test_reflector.py
 HERMES_QUANT_REFLECTOR_LLM=1 python -c "
+import os
+print('reflector LLM enabled:', os.environ.get('HERMES_QUANT_REFLECTOR_LLM') == '1')
 from hermes_quant.memory.reflector import Reflector
-print('reflector LLM enabled:', Reflector().llm_enabled())
+r = Reflector()
+print('reflector instantiated OK:', type(r).__name__)
 "
 ```
 
@@ -233,9 +236,10 @@ print('reflector LLM enabled:', Reflector().llm_enabled())
 ```bash
 pytest -q tests/agents/risk_committee/
 HERMES_QUANT_RISK_COMMITTEE_LLM=1 python -c "
-from hermes_quant.agents.risk_committee.committee import RiskCommittee
-c = RiskCommittee()
-print('committee llm_enabled:', getattr(c, 'llm_enabled', lambda: 'n/a')())
+import os
+from hermes_quant.agents.risk_committee.committee import RiskCommittee, _LLM_FLAG_ENV_VAR
+print('committee llm flag set:', os.environ.get(_LLM_FLAG_ENV_VAR) == '1')
+print('committee instantiable:', type(RiskCommittee()).__name__)
 "
 ```
 
@@ -244,8 +248,8 @@ print('committee llm_enabled:', getattr(c, 'llm_enabled', lambda: 'n/a')())
 ```bash
 pytest -q tests/agents/test_trader.py
 HERMES_QUANT_TRADER_LLM=1 python -c "
-from hermes_quant.agents.trader import _llm_path_enabled
-print('trader llm enabled:', _llm_path_enabled())
+from hermes_quant.agents.trader import _trader_llm_enabled
+print('trader llm enabled:', _trader_llm_enabled())
 "
 ```
 

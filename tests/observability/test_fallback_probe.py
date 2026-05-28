@@ -133,13 +133,19 @@ def test_run_fallback_probe_default_returns_full_matrix() -> None:
 
 
 def test_run_fallback_probe_all_valid_silence_by_default_holds() -> None:
-    """Critical regression: silence-by-default MUST hold for all (surface, mode) combos."""
+    """Critical regression: silence-by-default MUST hold for all (surface, mode) combos
+    that are actually evaluated (excluding skipped non-meaningful combinations)."""
     results = run_fallback_probe()
-    invalid = [r for r in results if not r.output_valid]
+    # Skipped rows (mode not applicable to surface) do not count toward the
+    # silence-by-default verdict — they were never executed.
+    evaluated = [r for r in results if not (r.notes or "").startswith("skipped:")]
+    invalid = [r for r in evaluated if not r.output_valid]
     assert not invalid, (
         f"silence-by-default BROKEN for {len(invalid)} probes: "
         f"{[(r.surface_name, r.llm_failure_mode, r.error) for r in invalid]}"
     )
+    # Confirm at least 24 evaluated probes ran (4 surfaces * minimum-meaningful modes)
+    assert len(evaluated) >= 24, f"only {len(evaluated)} evaluated; expected >= 24"
 
 
 def test_run_fallback_probe_subset_surfaces() -> None:
@@ -284,3 +290,39 @@ def test_surfaces_constant_is_complete() -> None:
     """SURFACES contains the 4 LLM-wired surfaces."""
     expected = {"trader", "risk_committee", "reflector", "regime_hmm"}
     assert set(SURFACES) == expected
+
+
+# ---------------------------------------------------------------------------
+# F5 regression test — skipped rows do not inflate PASS rate (v0.4 MoA fix)
+# ---------------------------------------------------------------------------
+
+
+def test_skipped_rows_marked_invalid_not_counted_in_pass_rate() -> None:
+    """Per v0.4 MoA F5: 'skipped' rows for non-meaningful (surface, mode) pairs
+    must NOT be reported as output_valid=True. The fake-pass bug previously
+    inflated the silence-by-default summary."""
+    results = run_fallback_probe()
+    skipped = [r for r in results if (r.notes or "").startswith("skipped:")]
+    # If any HMM × non-meaningful modes are skipped, they must be invalid
+    for r in skipped:
+        assert r.output_valid is False, (
+            f"skipped row {r.surface_name}/{r.llm_failure_mode} "
+            f"reports output_valid=True — F5 fake-pass bug regressed"
+        )
+        assert r.output_matches_v0_1 is False, (
+            f"skipped row {r.surface_name}/{r.llm_failure_mode} "
+            f"reports output_matches_v0_1=True — F5 fake-pass bug regressed"
+        )
+
+
+def test_format_human_summary_excludes_skipped_from_denominator() -> None:
+    """The PASS summary line should report N/M where M = evaluated, not total."""
+    results = run_fallback_probe()
+    out = format_results_human(results)
+    # If any skipped, the summary should mention them separately
+    skipped = [r for r in results if (r.notes or "").startswith("skipped:")]
+    if skipped:
+        assert "skipped:" in out or f"({len(skipped)} skipped" in out, (
+            "Summary doesn't surface skipped count separately — "
+            "operators may not realize some probes were never evaluated"
+        )

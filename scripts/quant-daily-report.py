@@ -140,8 +140,20 @@ def main(argv: list[str] | None = None) -> int:
         if not rendered.endswith("\n"):
             sys.stdout.write("\n")
     else:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Per v0.4 MoA F7 (Claude I1): the report contains positions, cash,
+        # equity, and reflection content — same threat surface ROLLOUT.md §0
+        # enforces 0o600 for state.db. Apply matching mode here so reports
+        # are not world-readable.
+        out_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         out_path.write_text(rendered, encoding="utf-8")
+        try:
+            os.chmod(out_path, 0o600)
+        except OSError:
+            # WSL / certain filesystems may not support chmod; warn but don't fail.
+            sys.stderr.write(
+                f"warning: could not chmod 0o600 on {out_path} "
+                "(may be world-readable on this filesystem)\n"
+            )
         sys.stderr.write(f"daily report written to {out_path}\n")
         if args.also_print:
             sys.stdout.write(rendered)

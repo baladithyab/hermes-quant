@@ -666,15 +666,20 @@ def run_fallback_probe(
         meaningful = _SURFACE_MODES[surface]
         for mode in selected_modes:
             if mode not in meaningful:
-                # Skip modes that are not meaningful for this surface but
-                # still record a row so the cross-product is observable.
+                # Mode is not applicable for this surface (e.g. HMM has no per-call
+                # rate-limit semantics).  Record a row marked as 'skipped' so the
+                # cross-product is observable, but DO NOT count it as a pass —
+                # output_valid=False keeps the summary honest, and notes makes
+                # the reason for non-evaluation visible to operators.
+                # (Per v0.4 MoA F5 finding: previous version emitted output_valid=True
+                # for skipped rows, which fabricated successes in the PASS summary.)
                 results.append(
                     FallbackProbeResult(
                         surface_name=surface,
                         llm_enabled=True,
                         llm_failure_mode=mode,
-                        output_valid=True,
-                        output_matches_v0_1=True,
+                        output_valid=False,
+                        output_matches_v0_1=False,
                         latency_ms=0.0,
                         error=None,
                         notes="skipped: mode not meaningful for surface",
@@ -734,15 +739,24 @@ def format_results_human(results: list[FallbackProbeResult]) -> str:
             f"{r.latency_ms:<10.2f} {err:<40}"
         )
     lines.append(rule)
-    n_total = len(results)
-    n_valid = sum(1 for r in results if r.output_valid)
-    n_match = sum(1 for r in results if r.output_matches_v0_1)
+    # Skipped rows (mode not applicable to surface) are excluded from
+    # valid/match denominator AND numerator — counting them inflates PASS
+    # rate by construction (per v0.4 MoA F5).
+    skipped = [r for r in results if (r.notes or "").startswith("skipped:")]
+    evaluated = [r for r in results if r not in skipped]
+    n_total_evaluated = len(evaluated)
+    n_valid = sum(1 for r in evaluated if r.output_valid)
+    n_match = sum(1 for r in evaluated if r.output_matches_v0_1)
     lines.append(
-        f"summary: {n_valid}/{n_total} output_valid, "
-        f"{n_match}/{n_total} match v0.1 deterministic"
+        f"summary: {n_valid}/{n_total_evaluated} output_valid, "
+        f"{n_match}/{n_total_evaluated} match v0.1 deterministic"
+        + (f" ({len(skipped)} skipped: mode not meaningful)" if skipped else "")
     )
-    if n_valid == n_total:
+    # PASS is determined ONLY over evaluated probes — skipped rows do not vote.
+    if n_total_evaluated > 0 and n_valid == n_total_evaluated:
         lines.append("RESULT: PASS — silence-by-default holds for all surfaces.")
+    elif n_total_evaluated == 0:
+        lines.append("RESULT: NO-OP — no probes were evaluated (all skipped).")
     else:
         lines.append("RESULT: FAIL — at least one surface failed to fall back.")
     return "\n".join(lines)
@@ -750,12 +764,16 @@ def format_results_human(results: list[FallbackProbeResult]) -> str:
 
 def format_results_json(results: list[FallbackProbeResult]) -> str:
     """Render results as a JSON array (one object per row)."""
+    skipped = [r for r in results if (r.notes or "").startswith("skipped:")]
+    evaluated = [r for r in results if r not in skipped]
     return json.dumps(
         {
             "asof": datetime.now(UTC).isoformat(timespec="seconds"),
             "n_total": len(results),
-            "n_valid": sum(1 for r in results if r.output_valid),
-            "n_match_v01": sum(1 for r in results if r.output_matches_v0_1),
+            "n_evaluated": len(evaluated),
+            "n_skipped": len(skipped),
+            "n_valid": sum(1 for r in evaluated if r.output_valid),
+            "n_match_v01": sum(1 for r in evaluated if r.output_matches_v0_1),
             "results": [r.to_dict() for r in results],
         },
         indent=2,
