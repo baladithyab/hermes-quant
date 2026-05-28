@@ -32,3 +32,6 @@
 - [ADR-0060-fallback-probe.md](ADR-0060-fallback-probe.md) — ADR-0060: Fallback Probe — verifies silence-by-default holds for all v0.2 LLM-wired surfaces under synthetic failure injection
 - [ADR-0061-daily-report.md](ADR-0061-daily-report.md) — ADR-0061: Daily Markdown Report — single-file synthesis of audit log + decisions + reflections + factor verdicts, publishable to Telegram or archived to disk
 - [ADR-0062-rollout-playbook.md](ADR-0062-rollout-playbook.md) — ADR-0062: Production rollout playbook for v0.2 LLM surfaces (canonical `docs/operations/ROLLOUT.md` + lightweight consistency tests)
+- [ADR-0063-regime-in-marketcontext-extras.md](ADR-0063-regime-in-marketcontext-extras.md) — ADR-0063: Regime in MarketContext.extras (v0.6.0) — analysts read regime info via stable `volatility_tier` to avoid HMM label-mapping fragility
+- [ADR-0064-fundamentals-analyst.md](ADR-0064-fundamentals-analyst.md) — ADR-0064: FundamentalsAnalyst integration (v0.6.1) — closes equities balance-sheet/earnings/cashflow blind spot via yfinance with parquet snapshot cache
+- [ADR-0065-bull-bear-adversarial-debate.md](ADR-0065-bull-bear-adversarial-debate.md) — ADR-0065: Bull/Bear adversarial debate stage (v0.6.1) — true alternating debate with `current_response` feedback loop, ResearchPlan Pydantic schema, 5-tier PortfolioRating enum
