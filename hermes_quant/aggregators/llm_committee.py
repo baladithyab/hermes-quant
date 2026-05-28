@@ -139,10 +139,16 @@ class PortfolioDecision(BaseModel):
 
 
 def _direction_from_recommendation(rec: str) -> int:
-    """Map 5-tier recommendation to a -1/0/+1 Direction for CommitteeTurn."""
-    if rec in ("Buy", "Overweight"):
+    """Map 5-tier recommendation to a -1/0/+1 Direction for CommitteeTurn.
+
+    Accepts both Title-case (legacy local ResearchPlan, ``Buy``/``Hold``/...)
+    and UPPER-case (ADR-0058 PortfolioRating StrEnum, ``BUY``/``HOLD``/...)
+    so the v0.6.2 ResearchDebateStage dispatch path (ADR-0066) can pass
+    PortfolioRating values straight through.
+    """
+    if rec in ("Buy", "Overweight", "BUY", "OVERWEIGHT"):
         return 1
-    if rec in ("Sell", "Underweight"):
+    if rec in ("Sell", "Underweight", "SELL", "UNDERWEIGHT"):
         return -1
     return 0
 
@@ -906,15 +912,109 @@ def run_llm_committee(
     turns: list[CommitteeTurn] = []
     consecutive_failures = 0
 
-    # ADR-0065 (v0.6.1, G1): research debate stage dispatch.
-    # v0.6.1 ships behind HERMES_QUANT_RESEARCH_DEBATE=0 default. When ON, currently logs and falls through
-    # to legacy path because _run_one_turn_with_history / _run_research_manager_judge production helpers
-    # are not yet wired (deferred to v0.6.2). See ADR-0065 §Implementation Plan §7.
+    # ADR-0066 (v0.6.2, G1): research debate stage dispatch.
+    # When HERMES_QUANT_RESEARCH_DEBATE=1, run the alternating bull/bear
+    # debate stage with conversational history threading and a final
+    # ResearchManager judge, then translate the resulting state into
+    # CommitteeTurn envelopes for the deterministic aggregator. On any
+    # exception the path falls through to the legacy parallel-emit committee.
     if os.environ.get("HERMES_QUANT_RESEARCH_DEBATE", "0") == "1":
-        logger.warning(
-            "HERMES_QUANT_RESEARCH_DEBATE=1 set but production wiring deferred to v0.6.2. "
-            "Falling through to legacy bull/bear committee for this tick."
-        )
+        try:
+            from hermes_quant.agents.research_debate.stage import (
+                run_research_debate,
+            )
+
+            state = run_research_debate(
+                ctx=market_context,
+                baseline_signal=baseline_signal,
+                analyst_views=analyst_views,
+                config=config,
+                client=client,
+                run_one_turn=_run_one_turn_with_history,
+                run_judge=_run_research_manager_judge,
+            )
+
+            quick_model = config.quick_model
+            deep_model = config.deep_model
+
+            for bt in state.bull_turns:
+                turns.append(
+                    CommitteeTurn(
+                        role="bull_researcher",  # type: ignore[arg-type]
+                        stance=bt.stance,
+                        direction=_direction_from_role("bull_researcher"),  # type: ignore[arg-type]
+                        confidence=bt.confidence,
+                        rationale=bt.rationale,
+                        model=f"llm:research_debate:{quick_model}",
+                        input_hash=None,
+                        metadata={
+                            "tier": "quick",
+                            "model_id": quick_model,
+                            "from_research_debate": True,
+                            "key_evidence": list(bt.key_evidence),
+                            "counterarguments": bt.counterarguments,
+                            "structured": bt.model_dump(),
+                        },
+                        tier="quick",
+                    )
+                )
+            for bt in state.bear_turns:
+                turns.append(
+                    CommitteeTurn(
+                        role="bear_researcher",  # type: ignore[arg-type]
+                        stance=bt.stance,
+                        direction=_direction_from_role("bear_researcher"),  # type: ignore[arg-type]
+                        confidence=bt.confidence,
+                        rationale=bt.rationale,
+                        model=f"llm:research_debate:{quick_model}",
+                        input_hash=None,
+                        metadata={
+                            "tier": "quick",
+                            "model_id": quick_model,
+                            "from_research_debate": True,
+                            "key_evidence": list(bt.key_evidence),
+                            "counterarguments": bt.counterarguments,
+                            "structured": bt.model_dump(),
+                        },
+                        tier="quick",
+                    )
+                )
+
+            if state.judge_decision is not None:
+                jd = state.judge_decision
+                # PortfolioRating is a StrEnum; be defensive in case a future
+                # validator coerces to a plain str.
+                rec_value = getattr(jd.recommendation, "value", str(jd.recommendation))
+                turns.append(
+                    CommitteeTurn(
+                        role="portfolio_manager",  # type: ignore[arg-type]
+                        stance=f"judge:{rec_value}",
+                        direction=_direction_from_recommendation(rec_value),  # type: ignore[arg-type]
+                        confidence=jd.confidence,
+                        rationale=jd.rationale,
+                        model=f"llm:research_debate_judge:{deep_model}",
+                        input_hash=None,
+                        metadata={
+                            "tier": "deep",
+                            "model_id": deep_model,
+                            "logical_role": "research_manager",
+                            "recommendation": rec_value,
+                            "from_research_debate": True,
+                            "structured": jd.model_dump(mode="json"),
+                            "terminated_reason": state.terminated_reason,
+                        },
+                        tier="deep",
+                    )
+                )
+            return turns
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "ResearchDebateStage failed; falling back to legacy "
+                "committee path for this tick"
+            )
+            # Fall through to the existing legacy parallel-emit code below.
+            turns = []
+            consecutive_failures = 0
 
     def _emit(role: str) -> bool:
         nonlocal consecutive_failures
