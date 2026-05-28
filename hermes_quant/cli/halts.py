@@ -183,3 +183,65 @@ def cmd_emergency_stop(args: argparse.Namespace) -> int:
     print("To resume after the underlying issue is resolved:")
     print(f'  hermes quant resume {halt_account} --reason "<why are you resuming?>"')
     return 0
+
+
+# ---------------------------------------------------------------------------
+# argparse driver — `python -m hermes_quant.cli.halts {halt|resume|emergency-stop}`
+#
+# Fixes ROLLOUT.md §5 kill-switch invocation per v0.4 MoA F4 finding (GPT C1).
+# Without this driver, `python -m hermes_quant.cli.halts halt '*' --reason "..."`
+# was a silent no-op, leaving the operator believing a halt was installed when
+# it was not.
+# ---------------------------------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hermes_quant.cli.halts",
+        description=(
+            "Halt-management CLI. Subcommands: halt, resume, emergency-stop. "
+            "Halts are durable in SQLite and consulted by gate.py before any "
+            "approval (silence-by-default kill-switch)."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # halt <account> [<asset_class>] [<asset>] --reason TEXT
+    p_halt = sub.add_parser("halt", help="Install a durable halt for the given scope.")
+    p_halt.add_argument("account", help="Account scope ('*' for all accounts).")
+    p_halt.add_argument("asset_class", nargs="?", default=None, help="Optional asset class scope.")
+    p_halt.add_argument("asset", nargs="?", default=None, help="Optional asset (ticker) scope.")
+    p_halt.add_argument("--reason", required=True, help="Operator-supplied reason for the halt.")
+    p_halt.set_defaults(_handler=cmd_halt)
+
+    # resume <account> [<asset_class>] [<asset>] --reason TEXT
+    p_resume = sub.add_parser("resume", help="Lift an active halt for the given scope.")
+    p_resume.add_argument("account", help="Account scope.")
+    p_resume.add_argument("asset_class", nargs="?", default=None)
+    p_resume.add_argument("asset", nargs="?", default=None)
+    p_resume.add_argument("--reason", required=True, help="Operator-supplied reason for the resume.")
+    p_resume.set_defaults(_handler=cmd_resume)
+
+    # emergency-stop [--account ACCOUNT]
+    p_em = sub.add_parser(
+        "emergency-stop",
+        help="Halt EVERYTHING for the account (or all accounts if --account omitted).",
+    )
+    p_em.add_argument("--account", default=None, help="Optional account scope; default '*'.")
+    p_em.set_defaults(_handler=cmd_emergency_stop)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    handler = getattr(args, "_handler", None)
+    if handler is None:
+        parser.print_help()
+        return 2
+    return int(handler(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
