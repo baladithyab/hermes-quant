@@ -57,6 +57,13 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+# ADR-0065 (v0.6.1): TraderProposal is the consumer of the ResearchDebateStage's
+# ResearchPlan output. Importing PortfolioRating at module load is safe because
+# `hermes_quant.agents.research_debate.schemas` imports from
+# `hermes_quant.aggregators.llm_committee` (BullBearTurn), and llm_committee.py
+# does not import from trader.py — no cycle.
+from hermes_quant.agents.research_debate.schemas import PortfolioRating
+
 if TYPE_CHECKING:
     from hermes_quant.agents.llm_caller import LLMCaller
 
@@ -180,6 +187,29 @@ class TraderProposal(BaseModel):
         description=(
             "Non-None when graceful fallback was triggered. "
             "Callers should surface this in the brief."
+        ),
+    )
+
+    # ADR-0065 (v0.6.1): optional links back to the ResearchDebateStage's
+    # judge output. Both default to None so EVERY existing call-site (and the
+    # ``extra='forbid'`` posture) keeps working unchanged when the bull/bear
+    # debate flag is OFF. When the stage runs, the wiring layer (llm_committee
+    # dispatch site) is expected to populate these so the audit trail can join
+    # a TraderProposal back to the ResearchPlan that justified its sizing.
+    research_plan_recommendation: Optional[PortfolioRating] = Field(
+        default=None,
+        description=(
+            "5-tier rating produced by the ResearchManager judge in the "
+            "Bull/Bear debate stage (ADR-0065). None when the legacy parallel-"
+            "emit committee path is taken (HERMES_QUANT_RESEARCH_DEBATE unset)."
+        ),
+    )
+    research_plan_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Stable identifier joining this TraderProposal to the audit row "
+            "emitted by ``run_research_debate`` (kind='research_debate'). "
+            "Mirrors the ``proposal_id`` field on that audit payload."
         ),
     )
 
