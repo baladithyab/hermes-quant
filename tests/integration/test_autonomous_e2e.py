@@ -55,13 +55,14 @@ def isolate_config(tmp_path, monkeypatch):
     return cfg
 
 
-def _set_mode_autonomous(cfg_path: Path):
+def _set_mode_autonomous(cfg_path: Path, *, max_per_tick_opens: int = 1):
     import yaml
 
     cfg = {}
     if cfg_path.exists():
         cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     cfg.setdefault("quant", {}).setdefault("pdr", {})["mode"] = "autonomous"
+    cfg["quant"].setdefault("autonomous", {})["max_per_tick_opens"] = max_per_tick_opens
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
@@ -444,3 +445,119 @@ def test_react_failure_marks_decision_error_but_continues(
     assert result.errors == 1
     assert result.decisions[0].gate == "ERROR"
     assert "paper bus full" in (result.decisions[0].error or "")
+
+
+# ---------------------------------------------------------------------------
+# ADR-0071 portfolio-aware Stage-2 sizing
+# ---------------------------------------------------------------------------
+
+
+def test_portfolio_caps_disabled_by_default_no_clip(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    """Default behavior: HERMES_QUANT_PORTFOLIO_CAPS unset → no clipping."""
+    monkeypatch.delenv("HERMES_QUANT_PORTFOLIO_CAPS", raising=False)
+    _set_mode_autonomous(isolate_config)
+
+    fired_sizes = []
+
+    def fake_react(advisor_result, entry, kelly, paper_zero_costs):
+        fired_sizes.append(kelly)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        result = tick(
+            dry_run=False,
+            symbols=[
+                WatchlistEntry("AAPL", "equity", "1d"),
+                WatchlistEntry("MSFT", "equity", "1d"),
+            ],
+            advisor_recommend=lambda **kw: _make_advisor_result(kelly=0.20),
+        )
+
+    # No clipping: every fire passes through full Kelly
+    assert all(abs(s) == 0.20 for s in fired_sizes)
+    # No SILENCE_PORTFOLIO_CAP decisions
+    silenced_by_portfolio = [
+        d for d in result.decisions if d.gate == "SILENCE_PORTFOLIO_CAP"
+    ]
+    assert silenced_by_portfolio == []
+
+
+def test_portfolio_caps_enabled_clips_to_remaining_headroom(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    """With caps enabled and 4 picks at 20%, default cash floor binds before net."""
+    monkeypatch.setenv("HERMES_QUANT_PORTFOLIO_CAPS", "1")
+    _set_mode_autonomous(isolate_config, max_per_tick_opens=10)
+
+    # Force the autonomous loop to start with empty book (no executions.jsonl)
+    # — the isolate_quant_home fixture already redirects QUANT_HOME, but the
+    # PortfolioState reconstruction reads from a hard-coded path. Patch it.
+    from hermes_quant.portfolio.state import _DEFAULT_EXECUTIONS_PATH  # noqa: F401
+
+    monkeypatch.setattr(
+        "hermes_quant.portfolio.state._DEFAULT_EXECUTIONS_PATH",
+        isolate_quant_home / "executions.jsonl",
+    )
+
+    fired_sizes = []
+
+    def fake_react(advisor_result, entry, kelly, paper_zero_costs):
+        fired_sizes.append((entry.symbol, kelly))
+        return f"exec_{entry.symbol}"
+
+    # Six picks at 20% each → demand = 120% gross, default caps allow ≤ 80% (cash floor)
+    # Order: greedy first-come-first-served. Default kelly=0.20 (from _make_advisor_result).
+    syms = [WatchlistEntry(f"S{i}", "equity", "1d") for i in range(6)]
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        result = tick(
+            dry_run=False,
+            symbols=syms,
+            advisor_recommend=lambda **kw: _make_advisor_result(kelly=0.20),
+        )
+
+    # Total fired gross must not exceed 80% (1 - cash floor)
+    total_gross = sum(abs(k) for _, k in fired_sizes)
+    assert total_gross <= 0.80 + 1e-9, (
+        f"total fired gross {total_gross} > 80% cap; fired: {fired_sizes}"
+    )
+
+    # At least the first pick should fire at full size (greedy)
+    assert fired_sizes[0][1] == 0.20
+
+    # Picks beyond cash budget should be silenced as SILENCE_PORTFOLIO_CAP
+    portfolio_silences = [
+        d for d in result.decisions if d.gate == "SILENCE_PORTFOLIO_CAP"
+    ]
+    assert len(portfolio_silences) >= 1
+    assert all(
+        d.details and d.details.get("would_have_fired") is True
+        for d in portfolio_silences
+    )
+
+
+def test_portfolio_caps_dry_run_simulates_state_consumption(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    """Dry-run also updates the running state so downstream picks see consumption."""
+    monkeypatch.setenv("HERMES_QUANT_PORTFOLIO_CAPS", "1")
+    monkeypatch.setattr(
+        "hermes_quant.portfolio.state._DEFAULT_EXECUTIONS_PATH",
+        isolate_quant_home / "executions.jsonl",
+    )
+    _set_mode_autonomous(isolate_config, max_per_tick_opens=10)
+
+    syms = [WatchlistEntry(f"S{i}", "equity", "1d") for i in range(6)]
+    result = tick(
+        dry_run=True,
+        symbols=syms,
+        advisor_recommend=lambda **kw: _make_advisor_result(kelly=0.20),
+    )
+
+    # Even in dry-run, the cap should have silenced some picks.
+    portfolio_silences = [
+        d for d in result.decisions if d.gate == "SILENCE_PORTFOLIO_CAP"
+    ]
+    assert len(portfolio_silences) >= 1
