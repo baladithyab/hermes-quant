@@ -320,6 +320,14 @@ class MicrostructureLite:
         except Exception:  # noqa: BLE001
             calibrated = max(0.0, raw_confidence - 0.20)
 
+        # ADR-0063: regime-aware confidence multiplier (gated by env flag)
+        try:
+            from hermes_quant.regime.regime_aware_confidence import apply_regime_multiplier
+            _regime = ctx.extras.get("regime") if hasattr(ctx, "extras") else None
+            calibrated = apply_regime_multiplier(calibrated, _regime, "microstructure")
+        except Exception:  # noqa: BLE001
+            pass
+
         view = AnalystView(
             analyst=self.name,
             direction=composite_direction,
