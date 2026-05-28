@@ -113,7 +113,8 @@ class InvestDebateState(BaseModel):
 
 ## Migration
 
-- v0.6.1: Ship behind `HERMES_QUANT_RESEARCH_DEBATE=0` default. Existing flow bit-identical when flag off.
+- v0.6.1: Ship schemas + stage runner + audit kind + TraderProposal extension + `HERMES_QUANT_RESEARCH_DEBATE` flag (default OFF). When the flag is ON in v0.6.1 the dispatch site at `aggregators/llm_committee.py` logs a warning and falls through to the legacy bull/bear committee for-loop — production turn/judge wiring (`_run_one_turn_with_history`, `_run_research_manager_judge`) lands in v0.6.2. Tests inject explicit `run_one_turn=`/`run_judge=` kwargs to validate the stage end-to-end. Bit-identicality of `prompt_hash` across v0.6.0 → v0.6.1 is **NOT** guaranteed because `aggregators/prompts/bull_bear.md` was rewritten unconditionally to add the `{current_response}`/`{own_history}`/`{round_index}`/`{conversational_preamble}` placeholders required by the conversational debate. Audit consumers comparing `prompt_hash` across versions must regenerate fixtures. T10 pins post-rewrite hashes as a forward drift sentinel. The bit-identical guarantee is on the `CommitteeTurn` schema and the for-loop control flow when the flag is OFF, not on `prompt_hash`.
+- v0.6.2: Implement `_run_one_turn_with_history` and `_run_research_manager_judge` helpers in `aggregators/llm_committee.py`. Wire them into `run_research_debate`'s default-runner path. Flip `HERMES_QUANT_RESEARCH_DEBATE` default to ON after one observation week of clean staging-tick CI. The PortfolioRating field validator at `agents/research_debate/schemas.py` accepts mixed-case input from upstream prompts; this stays in place permanently as a defensive measure.
 - v0.6.2: Flip flag default ON after a week of observation.
 - v0.6.x: Tune `max_research_debate_rounds` based on observed value (likely 2 — diminishing returns past round 2).
 
