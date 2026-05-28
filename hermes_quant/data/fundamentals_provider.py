@@ -1,0 +1,598 @@
+"""hermes_quant.data.fundamentals_provider — yfinance fundamentals snapshot provider.
+
+Per ADR-0064 + design docs/design/v0.6.1-fundamentals-analyst.md §3-4:
+
+  * Hot path = parquet read + arithmetic. ~5-20 ms / call.
+  * Cold path (cron) = yfinance fetch + append. Called by
+    scripts/quant-fundamentals-prewarm-daily.py once per day, never on
+    the analyst hot path.
+
+Cache layout::
+
+    ~/.hermes/quant/cache/fundamentals/
+        yfinance/
+            AAPL.parquet     # one row per as_of_date snapshot
+            MSFT.parquet
+            ...
+        sector_medians/
+            Technology.parquet   # one row per as_of_date snapshot
+            Healthcare.parquet
+            ...
+
+Per-ticker schema (one parquet file per ticker, append-only)::
+
+    as_of_date           date          snapshot key (UTC, day-truncated)
+    fetched_at           datetime[UTC] wall-clock fetch time
+    source               str           "yfinance" / "yfinance_balance_sheet"
+    pe_trailing          float64       info["trailingPE"]
+    pe_forward           float64       info["forwardPE"]
+    debt_to_equity       float64       info["debtToEquity"] / 100  (yfinance scales)
+    free_cash_flow       float64       info["freeCashflow"]
+    revenue_ttm          float64       info["totalRevenue"]
+    eps_trailing         float64       info["trailingEps"]
+    eps_forward          float64       info["forwardEps"]
+    gross_margin_ttm     float64       derived from income_stmt
+    gross_margin_prior   float64       derived from income_stmt y-1
+    revenue_yoy          float64       derived from quarterly income_stmt
+    fcf_yoy              float64       derived from cashflow YoY
+    sector               str           info["sector"]
+    currency             str           info["currency"]
+    quote_type           str           info["quoteType"]
+
+Append discipline mirrors `OhlcvCache.write` (data/cache.py): read existing,
+append, dedupe on as_of_date keeping latest fetched_at, write to temp, atomic
+rename.
+
+Sector-median sibling cache holds rolling sector P/E benchmarks refreshed
+weekly via `refresh_sector_medians`.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache" / "fundamentals"
+
+# Per-ticker snapshot schema (column -> dtype)
+_SNAPSHOT_COLUMNS: dict[str, str] = {
+    "as_of_date": "datetime64[ns, UTC]",
+    "fetched_at": "datetime64[ns, UTC]",
+    "source": "string",
+    "pe_trailing": "float64",
+    "pe_forward": "float64",
+    "debt_to_equity": "float64",
+    "free_cash_flow": "float64",
+    "revenue_ttm": "float64",
+    "eps_trailing": "float64",
+    "eps_forward": "float64",
+    "gross_margin_ttm": "float64",
+    "gross_margin_prior": "float64",
+    "revenue_yoy": "float64",
+    "fcf_yoy": "float64",
+    "sector": "string",
+    "currency": "string",
+    "quote_type": "string",
+}
+
+# Sector-median snapshot schema
+_SECTOR_MEDIAN_COLUMNS: dict[str, str] = {
+    "as_of_date": "datetime64[ns, UTC]",
+    "fetched_at": "datetime64[ns, UTC]",
+    "sector": "string",
+    "median_pe_trailing": "float64",
+    "n_constituents": "int64",
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _safe_component(value: str) -> str:
+    """Sanitize a path component (mirror of data.cache._safe_component)."""
+    import re
+
+    value = (value or "").strip().replace("/", "_")
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    return value.strip("._") or "unknown"
+
+
+def _atomic_write_parquet(df: pd.DataFrame, target: Path) -> None:
+    """Atomic-rename parquet write."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        df.to_parquet(tmp, index=False)
+        tmp.replace(target)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _coerce_float(x: Any) -> float:
+    """Coerce yfinance value to float; NaN if missing/unparseable."""
+    if x is None:
+        return float("nan")
+    try:
+        f = float(x)
+        if not np.isfinite(f):
+            return float("nan")
+        return f
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _normalize_dte(raw: Any) -> float:
+    """yfinance debt-to-equity is reported as a percentage (e.g. 175 means 1.75x).
+
+    Heuristic: if value > 5 we assume yfinance percentage encoding and divide
+    by 100. Otherwise return as-is (already a ratio). NaN for missing.
+    """
+    f = _coerce_float(raw)
+    if np.isnan(f):
+        return f
+    if f > 5.0:
+        return f / 100.0
+    return f
+
+
+# ---------------------------------------------------------------------------
+# Provider
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FundamentalsProvider:
+    """Parquet-cached yfinance fundamentals provider.
+
+    Hot path methods (no network):
+      - read_latest(ticker, as_of)         -> latest snapshot row or None
+      - read_sector_median_pe(sector, as_of) -> float P/E median or None
+
+    Cold path methods (network, called by cron):
+      - refresh(tickers)                   -> per-ticker status dict
+      - refresh_sector_medians(universe)   -> writes per-sector parquet
+
+    Cache layout::
+
+        cache_root/
+            yfinance/<TICKER>.parquet
+            sector_medians/<SECTOR>.parquet
+
+    Sector-median staleness: 7d soft / 30d hard. read_sector_median_pe
+    returns None on >30d hard staleness so the analyst's pe_relative
+    sub-signal abstains while the others proceed (per ADR-0064 §D5).
+    """
+
+    cache_root: Path = field(default_factory=lambda: DEFAULT_CACHE_ROOT)
+    ttl_hours: int = 24
+    name: str = "yfinance_fundamentals"
+
+    # Sector-median hard staleness in days (per ADR-0064 §1.2 D5)
+    SECTOR_MEDIAN_STALE_HARD_DAYS: int = 30
+
+    def __post_init__(self) -> None:
+        # Cache root is only auto-created on write paths so a read-only
+        # filesystem (tests with tmp_path) never sees a stray mkdir.
+        self.cache_root = Path(self.cache_root)
+
+    # ------------------------------------------------------------------
+    # Path helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def yfinance_dir(self) -> Path:
+        return self.cache_root / "yfinance"
+
+    @property
+    def sector_medians_dir(self) -> Path:
+        return self.cache_root / "sector_medians"
+
+    def ticker_path(self, ticker: str) -> Path:
+        return self.yfinance_dir / f"{_safe_component(ticker)}.parquet"
+
+    def sector_median_path(self, sector: str) -> Path:
+        return self.sector_medians_dir / f"{_safe_component(sector)}.parquet"
+
+    # ------------------------------------------------------------------
+    # Hot path: reads
+    # ------------------------------------------------------------------
+
+    def read_latest(self, ticker: str, *, as_of: pd.Timestamp | None = None) -> pd.Series | None:
+        """Return the latest-by-fetched_at snapshot row for ticker, or None.
+
+        as_of (optional): if provided, only rows with as_of_date <= as_of
+        are considered (point-in-time semantics). Otherwise the most
+        recent row is returned.
+
+        Returns None if the parquet file does not exist or is empty.
+        Raises no exceptions on read failure; logs and returns None.
+        """
+        path = self.ticker_path(ticker)
+        if not path.exists():
+            return None
+        try:
+            df = pd.read_parquet(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("fundamentals: parquet read failed for %s: %s", ticker, exc)
+            return None
+        if df.empty:
+            return None
+
+        # Ensure timestamps are tz-aware UTC for safe comparison.
+        for col in ("as_of_date", "fetched_at"):
+            if col in df.columns:
+                ser = df[col]
+                if not pd.api.types.is_datetime64_any_dtype(ser):
+                    df[col] = pd.to_datetime(ser, utc=True)
+                elif getattr(ser.dt, "tz", None) is None:
+                    df[col] = ser.dt.tz_localize("UTC")
+
+        if as_of is not None:
+            asof_ts = pd.Timestamp(as_of)
+            if asof_ts.tzinfo is None:
+                asof_ts = asof_ts.tz_localize("UTC")
+            df = df[df["as_of_date"] <= asof_ts]
+            if df.empty:
+                return None
+
+        # Latest by fetched_at.
+        df = df.sort_values("fetched_at")
+        return df.iloc[-1]
+
+    def read_sector_median_pe(
+        self, sector: str | None, *, as_of: pd.Timestamp | None = None
+    ) -> float | None:
+        """Return latest median trailing P/E for sector, or None.
+
+        Returns None when:
+          - sector is None / empty / 'unknown'
+          - no parquet file
+          - file is empty
+          - latest row is older than SECTOR_MEDIAN_STALE_HARD_DAYS
+        """
+        if not sector or sector.lower() in {"unknown", "none", "—", "-", ""}:
+            return None
+        path = self.sector_median_path(sector)
+        if not path.exists():
+            return None
+        try:
+            df = pd.read_parquet(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "fundamentals: sector_median parquet read failed for %s: %s", sector, exc
+            )
+            return None
+        if df.empty:
+            return None
+
+        for col in ("as_of_date", "fetched_at"):
+            if col in df.columns:
+                ser = df[col]
+                if not pd.api.types.is_datetime64_any_dtype(ser):
+                    df[col] = pd.to_datetime(ser, utc=True)
+                elif getattr(ser.dt, "tz", None) is None:
+                    df[col] = ser.dt.tz_localize("UTC")
+
+        asof_ts: pd.Timestamp
+        if as_of is None:
+            asof_ts = pd.Timestamp.now(tz="UTC")
+        else:
+            asof_ts = pd.Timestamp(as_of)
+            if asof_ts.tzinfo is None:
+                asof_ts = asof_ts.tz_localize("UTC")
+
+        df = df[df["as_of_date"] <= asof_ts]
+        if df.empty:
+            return None
+        df = df.sort_values("fetched_at")
+        latest = df.iloc[-1]
+        age_days = (asof_ts - pd.Timestamp(latest["fetched_at"])).days
+        if age_days > self.SECTOR_MEDIAN_STALE_HARD_DAYS:
+            return None
+        val = _coerce_float(latest.get("median_pe_trailing"))
+        if np.isnan(val) or val <= 0:
+            return None
+        return val
+
+    # ------------------------------------------------------------------
+    # Cold path: writes (cron-driven)
+    # ------------------------------------------------------------------
+
+    def write_snapshot(self, ticker: str, snapshot: dict) -> Path:
+        """Append a snapshot dict to the per-ticker parquet (atomic).
+
+        Snapshot must include the columns in _SNAPSHOT_COLUMNS. Missing
+        columns are filled with NaN / pd.NA. Dedupe is on as_of_date,
+        keep latest fetched_at.
+
+        Used by the cron and by tests for fixture construction.
+        """
+        path = self.ticker_path(ticker)
+        new_row = self._normalize_snapshot_row(snapshot)
+        new_df = pd.DataFrame([new_row])
+
+        if path.exists():
+            try:
+                existing = pd.read_parquet(path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "fundamentals: corrupt parquet for %s, overwriting: %s",
+                    ticker,
+                    exc,
+                )
+                existing = pd.DataFrame(columns=list(_SNAPSHOT_COLUMNS.keys()))
+        else:
+            existing = pd.DataFrame(columns=list(_SNAPSHOT_COLUMNS.keys()))
+
+        merged = pd.concat([existing, new_df], ignore_index=True)
+        merged = self._normalize_snapshot_frame(merged)
+        # Dedupe on as_of_date keep latest fetched_at
+        merged = merged.sort_values(["as_of_date", "fetched_at"])
+        merged = merged.drop_duplicates(subset=["as_of_date"], keep="last")
+        merged = merged.sort_values("fetched_at").reset_index(drop=True)
+        _atomic_write_parquet(merged, path)
+        return path
+
+    def write_sector_median(self, sector: str, snapshot: dict) -> Path:
+        """Append a sector-median row (atomic, dedupe on as_of_date)."""
+        path = self.sector_median_path(sector)
+        row = self._normalize_sector_median_row(snapshot)
+        new_df = pd.DataFrame([row])
+
+        if path.exists():
+            try:
+                existing = pd.read_parquet(path)
+            except Exception:  # noqa: BLE001
+                existing = pd.DataFrame(columns=list(_SECTOR_MEDIAN_COLUMNS.keys()))
+        else:
+            existing = pd.DataFrame(columns=list(_SECTOR_MEDIAN_COLUMNS.keys()))
+
+        merged = pd.concat([existing, new_df], ignore_index=True)
+        merged = self._normalize_sector_median_frame(merged)
+        merged = merged.sort_values(["as_of_date", "fetched_at"])
+        merged = merged.drop_duplicates(subset=["as_of_date"], keep="last")
+        merged = merged.sort_values("fetched_at").reset_index(drop=True)
+        _atomic_write_parquet(merged, path)
+        return path
+
+    def refresh(self, tickers: list[str]) -> dict[str, str]:
+        """Cron entry: fetch yfinance fundamentals for each ticker; append.
+
+        Returns per-ticker status string for cron logging:
+          - "ok"            : refresh succeeded
+          - "skipped:fresh" : within ttl_hours of last fetch (no-op)
+          - "skipped:no_yf" : yfinance not installed
+          - "error:..."     : exception class + message snippet
+        """
+        result: dict[str, str] = {}
+        try:
+            import yfinance as yf  # noqa: F401
+        except ImportError:
+            for t in tickers:
+                result[t] = "skipped:no_yf"
+            return result
+
+        now = pd.Timestamp.now(tz="UTC")
+        for ticker in tickers:
+            try:
+                latest = self.read_latest(ticker)
+                if latest is not None:
+                    age_h = (now - pd.Timestamp(latest["fetched_at"])).total_seconds() / 3600.0
+                    if age_h < self.ttl_hours:
+                        result[ticker] = "skipped:fresh"
+                        continue
+                snapshot = self._fetch_yfinance_snapshot(ticker, now)
+                if snapshot is None:
+                    result[ticker] = "error:empty_info"
+                    continue
+                self.write_snapshot(ticker, snapshot)
+                result[ticker] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("fundamentals refresh: %s -> %r", ticker, exc)
+                result[ticker] = f"error:{type(exc).__name__}:{str(exc)[:80]}"
+        return result
+
+    def refresh_sector_medians(self, universe: list[str]) -> dict[str, Any]:
+        """Compute sector-median trailing P/E across cached snapshots.
+
+        Reads the latest snapshot for each ticker in `universe` from the
+        per-ticker parquet (does NOT call yfinance), groups by sector,
+        writes one row per sector to sector_medians/<SECTOR>.parquet.
+
+        Returns {sector: {"n": int, "median_pe": float}} for logging.
+        """
+        now = pd.Timestamp.now(tz="UTC")
+        rows: list[dict] = []
+        for ticker in universe:
+            snap = self.read_latest(ticker)
+            if snap is None:
+                continue
+            pe = _coerce_float(snap.get("pe_trailing"))
+            sector = snap.get("sector")
+            if not sector or pd.isna(sector):
+                continue
+            if np.isnan(pe) or pe <= 0 or pe > 1000:
+                continue
+            rows.append({"sector": str(sector), "pe": pe})
+        if not rows:
+            return {}
+        df = pd.DataFrame(rows)
+        out: dict[str, Any] = {}
+        # Day-truncate the snapshot date so any read with `as_of` later
+        # within the same UTC day can find the row (filter is `<=`).
+        as_of_date = now.normalize()
+        for sector, sub in df.groupby("sector"):
+            median = float(sub["pe"].median())
+            n = int(len(sub))
+            self.write_sector_median(
+                sector,
+                {
+                    "as_of_date": as_of_date,
+                    "fetched_at": now,
+                    "sector": sector,
+                    "median_pe_trailing": median,
+                    "n_constituents": n,
+                },
+            )
+            out[str(sector)] = {"n": n, "median_pe": median}
+        return out
+
+    # ------------------------------------------------------------------
+    # yfinance fetch (cold path internals)
+    # ------------------------------------------------------------------
+
+    def _fetch_yfinance_snapshot(
+        self, ticker: str, asof: pd.Timestamp
+    ) -> dict | None:
+        """Pull yfinance.Ticker fields and reduce to one snapshot row.
+
+        Returns None if yfinance returns an empty info dict (delisted or
+        thinly covered).
+        """
+        import yfinance as yf  # local import; yfinance is heavy
+
+        yt = yf.Ticker(ticker)
+        try:
+            info = dict(yt.info or {})
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("fundamentals: ticker.info failed for %s: %s", ticker, exc)
+            info = {}
+        if not info:
+            return None
+
+        # Derived YoY metrics from quarterly frames; tolerate missing data.
+        revenue_yoy = float("nan")
+        fcf_yoy = float("nan")
+        gross_margin_ttm = float("nan")
+        gross_margin_prior = float("nan")
+        try:
+            qf = yt.quarterly_income_stmt
+            if qf is not None and not qf.empty and "Total Revenue" in qf.index:
+                rev = qf.loc["Total Revenue"].dropna().astype(float)
+                if len(rev) >= 5:
+                    cur4 = float(rev.iloc[:4].sum())
+                    prev4 = float(rev.iloc[4:8].sum()) if len(rev) >= 8 else float("nan")
+                    if prev4 and not np.isnan(prev4) and prev4 != 0:
+                        revenue_yoy = (cur4 - prev4) / abs(prev4)
+            af = yt.income_stmt
+            if (
+                af is not None
+                and not af.empty
+                and "Total Revenue" in af.index
+                and "Gross Profit" in af.index
+            ):
+                rev = af.loc["Total Revenue"].dropna().astype(float)
+                gp = af.loc["Gross Profit"].dropna().astype(float)
+                if len(rev) >= 1 and len(gp) >= 1 and rev.iloc[0]:
+                    gross_margin_ttm = float(gp.iloc[0]) / float(rev.iloc[0])
+                if len(rev) >= 2 and len(gp) >= 2 and rev.iloc[1]:
+                    gross_margin_prior = float(gp.iloc[1]) / float(rev.iloc[1])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("fundamentals: derived income_stmt failed %s: %s", ticker, exc)
+        try:
+            cf = yt.quarterly_cashflow
+            if cf is not None and not cf.empty and "Free Cash Flow" in cf.index:
+                fcf = cf.loc["Free Cash Flow"].dropna().astype(float)
+                if len(fcf) >= 5:
+                    cur4 = float(fcf.iloc[:4].sum())
+                    prev4 = float(fcf.iloc[4:8].sum()) if len(fcf) >= 8 else float("nan")
+                    if prev4 and not np.isnan(prev4) and prev4 != 0:
+                        fcf_yoy = (cur4 - prev4) / abs(prev4)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("fundamentals: derived cashflow failed %s: %s", ticker, exc)
+
+        snapshot = {
+            "as_of_date": asof.normalize(),
+            "fetched_at": asof,
+            "source": "yfinance",
+            "pe_trailing": _coerce_float(info.get("trailingPE")),
+            "pe_forward": _coerce_float(info.get("forwardPE")),
+            "debt_to_equity": _normalize_dte(info.get("debtToEquity")),
+            "free_cash_flow": _coerce_float(info.get("freeCashflow")),
+            "revenue_ttm": _coerce_float(info.get("totalRevenue")),
+            "eps_trailing": _coerce_float(info.get("trailingEps")),
+            "eps_forward": _coerce_float(info.get("forwardEps")),
+            "gross_margin_ttm": gross_margin_ttm,
+            "gross_margin_prior": gross_margin_prior,
+            "revenue_yoy": revenue_yoy,
+            "fcf_yoy": fcf_yoy,
+            "sector": str(info.get("sector") or ""),
+            "currency": str(info.get("currency") or ""),
+            "quote_type": str(info.get("quoteType") or ""),
+        }
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # Schema normalization
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_snapshot_row(snap: dict) -> dict:
+        out: dict = {}
+        for col in _SNAPSHOT_COLUMNS:
+            out[col] = snap.get(col)
+        return out
+
+    @staticmethod
+    def _normalize_snapshot_frame(df: pd.DataFrame) -> pd.DataFrame:
+        for col in _SNAPSHOT_COLUMNS:
+            if col not in df.columns:
+                df[col] = pd.NA
+        df = df[list(_SNAPSHOT_COLUMNS.keys())]
+        # Ensure timestamps are tz-aware UTC
+        for col in ("as_of_date", "fetched_at"):
+            df[col] = pd.to_datetime(df[col], utc=True)
+        # Coerce floats
+        for col, dtype in _SNAPSHOT_COLUMNS.items():
+            if dtype == "float64":
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        # Strings -> string dtype
+        for col, dtype in _SNAPSHOT_COLUMNS.items():
+            if dtype == "string":
+                df[col] = df[col].astype("string")
+        return df
+
+    @staticmethod
+    def _normalize_sector_median_row(snap: dict) -> dict:
+        out: dict = {}
+        for col in _SECTOR_MEDIAN_COLUMNS:
+            out[col] = snap.get(col)
+        return out
+
+    @staticmethod
+    def _normalize_sector_median_frame(df: pd.DataFrame) -> pd.DataFrame:
+        for col in _SECTOR_MEDIAN_COLUMNS:
+            if col not in df.columns:
+                df[col] = pd.NA
+        df = df[list(_SECTOR_MEDIAN_COLUMNS.keys())]
+        for col in ("as_of_date", "fetched_at"):
+            df[col] = pd.to_datetime(df[col], utc=True)
+        df["median_pe_trailing"] = pd.to_numeric(df["median_pe_trailing"], errors="coerce")
+        df["n_constituents"] = pd.to_numeric(df["n_constituents"], errors="coerce").astype(
+            "Int64"
+        )
+        df["sector"] = df["sector"].astype("string")
+        return df
+
+
+__all__ = ["FundamentalsProvider", "DEFAULT_CACHE_ROOT"]
