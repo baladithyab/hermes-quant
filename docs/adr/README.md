@@ -28,3 +28,7 @@
 - [ADR-0039-robinhood-mcp-reactor.md](ADR-0039-robinhood-mcp-reactor.md) — ADR-0039: Robinhood Agentic Trading MCP Reactor — additive equity execution rail
 - [ADR-0041-signal-provenance-audit-trail.md](ADR-0041-signal-provenance-audit-trail.md) — ADR-0041: Signal provenance & audit-trail observability (renumbered from 0039 due to upstream conflict)
 - [ADR-0042-persistent-memory-reflection.md](ADR-0042-persistent-memory-reflection.md) — ADR-0042: Persistent memory & deferred reflection layer (renumbered from 0040)
+- [ADR-0059-unified-status-cli.md](ADR-0059-unified-status-cli.md) — ADR-0059: Unified `quant status` CLI for single-pane observability across event stores
+- [ADR-0060-fallback-probe.md](ADR-0060-fallback-probe.md) — ADR-0060: Fallback Probe — verifies silence-by-default holds for all v0.2 LLM-wired surfaces under synthetic failure injection
+- [ADR-0061-daily-report.md](ADR-0061-daily-report.md) — ADR-0061: Daily Markdown Report — single-file synthesis of audit log + decisions + reflections + factor verdicts, publishable to Telegram or archived to disk
+- [ADR-0062-rollout-playbook.md](ADR-0062-rollout-playbook.md) — ADR-0062: Production rollout playbook for v0.2 LLM surfaces (canonical `docs/operations/ROLLOUT.md` + lightweight consistency tests)
