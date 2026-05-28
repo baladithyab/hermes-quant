@@ -551,6 +551,19 @@ class KronosAnalyst:
         # ColdStart shrinkage (-0.20 until calibrator has 200+ samples)
         confidence = self.calibrator.calibrate(raw_confidence)
 
+        # ADR-0063: regime-aware confidence multiplier (gated by env flag).
+        # Kronos rule: dampen ×0.85 if regime label is UNKNOWN.
+        # Per Claude review H1 (2026-05-27): apply_regime_multiplier now clips
+        # to ADR-0018 §D8 hard band [0.30, 0.85] internally — the previous
+        # local [0,1] clip would have allowed sub-floor confidences that
+        # violated the Kairos overconfidence-guard charter.
+        try:
+            from hermes_quant.regime.regime_aware_confidence import apply_regime_multiplier
+            _regime = ctx.extras.get("regime") if hasattr(ctx, "extras") else None
+            confidence = apply_regime_multiplier(float(confidence), _regime, "kronos")
+        except Exception:  # noqa: BLE001
+            pass
+
         return AnalystView(
             analyst=self.name,
             direction=direction,

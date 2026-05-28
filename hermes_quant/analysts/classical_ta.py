@@ -298,6 +298,14 @@ class ClassicalTAAnalyst:
                 beta = 5.0
                 calibrated = (confidence_raw * 1.0 + alpha) / (1.0 + alpha + beta)
 
+            # ADR-0063: regime-aware confidence multiplier (gated by env flag)
+            try:
+                from hermes_quant.regime.regime_aware_confidence import apply_regime_multiplier
+                _regime = ctx.extras.get("regime") if hasattr(ctx, "extras") else None
+                calibrated = apply_regime_multiplier(calibrated, _regime, "classical_ta")
+            except Exception:  # noqa: BLE001 — never block analyst loop
+                pass
+
             view = AnalystView(
                 analyst=self.name,
                 direction=composite_direction,

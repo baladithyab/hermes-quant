@@ -121,6 +121,14 @@ class HermesSemanticAnalyst:
         }
         metadata.update(grounding_metadata)
 
+        # ADR-0063: regime-aware confidence multiplier (gated by env flag)
+        try:
+            from hermes_quant.regime.regime_aware_confidence import apply_regime_multiplier
+            _regime = ctx.extras.get("regime") if hasattr(ctx, "extras") else None
+            confidence = apply_regime_multiplier(float(confidence), _regime, "semantic")
+        except Exception:  # noqa: BLE001
+            pass
+
         view = AnalystView(
             analyst=self.name,
             direction=direction,  # type: ignore[arg-type]
