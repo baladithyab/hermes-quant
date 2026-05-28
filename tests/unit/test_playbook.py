@@ -373,3 +373,117 @@ def test_missing_quote_type_silenced_by_default() -> None:
     fit = score_covered_call(s)
     assert fit.pass_hard is False
     assert any("quote_type" in r for r in fit.failed_rules)
+
+
+
+# --------------------------------------------------------------------------- #
+# Regime gate tests (ADR-0035 amendment 2026-05-28)
+# --------------------------------------------------------------------------- #
+
+
+def test_regime_gate_deny_in_bear_for_covered_call() -> None:
+    """A good covered_call snapshot is forced ineligible in BEAR regime."""
+    s = _good_covered_call_snapshot()
+    s["regime"] = "bear"
+    fit = score_covered_call(s)
+    assert fit.eligible is False
+    assert fit.score == 0.0 or any("regime_gate" in r for r in fit.failed_rules)
+    assert any("regime=bear" in n.lower() or "bear" in n.lower() for n in fit.notes)
+
+
+def test_regime_gate_warn_in_volatile_for_covered_call() -> None:
+    """VOLATILE regime applies a 30% score penalty but does not deny."""
+    s_neutral = _good_covered_call_snapshot()
+    fit_neutral = score_covered_call(s_neutral)
+
+    s_vol = _good_covered_call_snapshot()
+    s_vol["regime"] = "volatile"
+    fit_vol = score_covered_call(s_vol)
+
+    # Score should be ~70% of the un-warned score.
+    assert fit_vol.score < fit_neutral.score
+    assert fit_vol.score == pytest.approx(fit_neutral.score * 0.7, rel=0.01)
+
+
+def test_regime_gate_allow_in_bull_is_no_op() -> None:
+    """BULL regime does not change the score vs no-regime baseline."""
+    s_neutral = _good_covered_call_snapshot()
+    fit_neutral = score_covered_call(s_neutral)
+
+    s_bull = _good_covered_call_snapshot()
+    s_bull["regime"] = "bull"
+    fit_bull = score_covered_call(s_bull)
+
+    assert fit_bull.score == fit_neutral.score
+    assert fit_bull.eligible == fit_neutral.eligible
+
+
+def test_regime_gate_no_regime_field_is_no_op() -> None:
+    """Snapshots without 'regime' field score identically to pre-2026-05-28 behavior."""
+    s = _good_covered_call_snapshot()
+    assert "regime" not in s  # baseline assumption
+    fit = score_covered_call(s)
+    assert fit.eligible is True
+
+
+def test_regime_gate_swing_unaffected_in_all_regimes() -> None:
+    """Swing's regime_gates is all-allow; behavior is identical regardless of regime."""
+    s_base = _good_swing_snapshot()
+    fit_base = score_swing(s_base)
+    for label in ("bull", "bear", "volatile", "unknown"):
+        s = _good_swing_snapshot()
+        s["regime"] = label
+        fit = score_swing(s)
+        assert fit.score == fit_base.score, f"swing score changed under {label!r}"
+        assert fit.eligible == fit_base.eligible
+
+
+def test_regime_gate_packet_with_label_attr() -> None:
+    """Snapshot regime can be a RegimePacket-like object with a .label attribute."""
+    class FakeRegimePacket:
+        def __init__(self, label: str) -> None:
+            self.label = label
+    s = _good_covered_call_snapshot()
+    s["regime"] = FakeRegimePacket("bear")
+    fit = score_covered_call(s)
+    assert fit.eligible is False  # bear → deny
+
+
+def test_regime_gate_dict_with_label_key() -> None:
+    """Snapshot regime can be a dict with a 'label' key (e.g. JSON-serialized RegimePacket)."""
+    s = _good_covered_call_snapshot()
+    s["regime"] = {"label": "bear", "volatility_tier": 0}
+    fit = score_covered_call(s)
+    assert fit.eligible is False
+
+
+def test_regime_gate_unknown_label_defaults_to_allow() -> None:
+    """A regime label not in profile.regime_gates defaults to allow (forward-compat)."""
+    s = _good_covered_call_snapshot()
+    s["regime"] = "transitional"  # not in our gate dict
+    fit = score_covered_call(s)
+    assert fit.eligible is True
+
+
+def test_regime_gate_csp_deny_in_bear() -> None:
+    """CSP in BEAR is a structural deny, parallel to CC."""
+    s = _good_csp_snapshot()
+    s["regime"] = "bear"
+    fit = score_csp(s)
+    assert fit.eligible is False
+
+
+def test_regime_gate_wheel_inherits_deny() -> None:
+    """Wheel = CC + CSP; deny in BEAR via inheritance through both legs."""
+    s = _good_csp_snapshot()
+    s["regime"] = "bear"
+    fit = score_wheel(s)
+    assert fit.eligible is False
+
+
+def test_regime_gate_leaps_deny_in_bear() -> None:
+    """LEAPS = long-call thesis; deny in BEAR (delta + theta both work against you)."""
+    s = _good_leaps_snapshot()
+    s["regime"] = "bear"
+    fit = score_leaps(s)
+    assert fit.eligible is False

@@ -23,7 +23,7 @@ rule evaluates True.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -35,12 +35,22 @@ class PlayProfile:
         hard_rules: dict[field_name, rule_tuple] — must all pass.
         soft_rules: dict[field_name, rule_tuple] — used for scoring.
         eviction_rules: dict[field_name, rule_tuple] — any True ⇒ drop symbol.
+        regime_gates: dict[regime_label, action] where regime_label is the
+            string value from RegimeState (`bull`, `bear`, `volatile`, `unknown`)
+            and action is one of {`allow`, `warn`, `deny`}. When the current
+            regime maps to `deny`, score_symbol() returns 0.0 with a
+            regime-related rationale; `warn` allows scoring but lowers
+            confidence by 30%; `allow` is a no-op. Missing labels default to
+            `allow` (backward-compat with pre-2026-05-28 profiles that have
+            no regime_gates field). Read by `score_symbol()` in scorers.py
+            after eviction-rule check, before final score computation.
     """
 
     name: str
     hard_rules: dict
     soft_rules: dict
     eviction_rules: dict
+    regime_gates: dict = field(default_factory=dict)
 
 
 # --- covered_call -----------------------------------------------------------
@@ -66,6 +76,9 @@ profile_covered_call = PlayProfile(
         "adv_too_thin": ("lt_field", "avg_dollar_volume_30d", 2e6),
         "price_too_low": ("lt_field", "last_close", 5.0),
     },
+    # In BEAR regime the underlying loses value faster than premium collected;
+    # in VOLATILE the premium is rich but assignment risk spikes. Bull/unknown OK.
+    regime_gates={"bull": "allow", "bear": "deny", "volatile": "warn", "unknown": "allow"},
 )
 
 
@@ -91,6 +104,9 @@ profile_csp = PlayProfile(
         "adv_too_thin": ("lt_field", "avg_dollar_volume_30d", 2e6),
         "price_too_low": ("lt_field", "last_close", 5.0),
     },
+    # In BEAR you'll get assigned at strikes that mark down further; VOLATILE
+    # is rich-premium but high pin-risk; BULL is the natural regime.
+    regime_gates={"bull": "allow", "bear": "deny", "volatile": "warn", "unknown": "allow"},
 )
 
 
@@ -120,6 +136,9 @@ profile_wheel = PlayProfile(
         "realized_vol_30d": ("between", 0.25, 0.50),
     },
     eviction_rules=_wheel_eviction,
+    # Wheel inherits the more restrictive gate of CC + CSP. Both are deny-on-BEAR
+    # so the wheel inherits deny-on-BEAR. Both are warn-on-VOLATILE → warn.
+    regime_gates={"bull": "allow", "bear": "deny", "volatile": "warn", "unknown": "allow"},
 )
 
 
@@ -146,6 +165,9 @@ profile_leaps = PlayProfile(
         "adv_too_thin": ("lt_field", "avg_dollar_volume_30d", 5e6),
         "leverage_too_high": ("gt_field", "debt_to_equity", 2.0),
     },
+    # LEAPS = long-call thesis on multi-year horizon. BEAR = lose theta + delta;
+    # VOLATILE = high IV is bad for long calls but thesis is multi-year so warn-not-deny.
+    regime_gates={"bull": "allow", "bear": "deny", "volatile": "warn", "unknown": "allow"},
 )
 
 
@@ -172,6 +194,10 @@ profile_swing = PlayProfile(
         "adv_too_thin": ("lt_field", "avg_dollar_volume_30d", 2e6),
         "vol_runaway": ("gt_field", "realized_vol_30d", 2.0),
     },
+    # Swing exists for both directions — the gate is on direction (handled
+    # downstream), NOT whether to swing. All regimes ALLOW. The deterministic
+    # risk gate handles direction-vs-regime alignment per ADR-0004.
+    regime_gates={"bull": "allow", "bear": "allow", "volatile": "allow", "unknown": "allow"},
 )
 
 
