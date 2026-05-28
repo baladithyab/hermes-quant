@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
 """Per-play evolving watchlist tick (CLI shim).
 
-Reads the universe at ~/.hermes/quant/universe/alpaca-daily-top100.json (top
-100 by dollar-volume), runs the play-fitness scorers against it in parallel,
-and atomic-writes the evolved watchlist state to
+Reads the universe at ~/.hermes/quant/universe/alpaca-daily.json (full Alpaca
+liquid universe, ~500 symbols), parallel-prewarms the per-symbol yfinance
+snapshot cache, then runs the play-fitness scorers against it via
+``evolve_watchlist``. Atomic-writes the evolved watchlist state to
 ~/.hermes/quant/watchlist/play-fit.json. Append-only audit log at
 ~/.hermes/quant/watchlist/journal.jsonl.
 
-PERFORMANCE FIX (Wave 1d, 2026-05-27)
---------------------------------------
-Root cause of 120s timeout: the original script used alpaca-daily.json (500
-symbols) × sequential yfinance calls (~1.5s/symbol) = ~750s worst-case.
+PERFORMANCE (2026-05-27)
+------------------------
+Root cause of the prior 120s timeouts: ``score_symbol`` calls
+``compute_play_snapshot``, which makes 3 yfinance HTTP requests per symbol.
+Run serially across 500 symbols that's ~3-5 minutes wall time.
 
-Fix:
-  1. Switch universe to alpaca-daily-top100.json (100 symbols).
-  2. Parallelize snapshot fetching via ThreadPoolExecutor(max_workers=20).
-  3. Expected runtime: ~10-20s for snapshots + <1s evolution logic = <30s total.
+Fix lives in the library — ``hermes_quant.playbook.scorers.prewarm_snapshot_cache``
+fans the same fetches across a thread pool (default 12 workers) so the cache
+is warm before ``evolve_watchlist``'s serial per-play loop starts. After
+prewarm, ``score_symbol`` lookups are pure dict reads.
 
-The top-100 universe covers >90% of the dollar-volume of the full 500-symbol
-universe. The watchlist evolution logic is unchanged; only the input universe
-is narrowed and the scorer is parallelized.
+Cron's ``script_timeout_seconds`` was also bumped 120→600 in
+``~/.hermes/config.yaml`` for headroom; under normal conditions the prewarm
+finishes in ~30-60s so the timeout is no longer the operational ceiling.
+
+History note: a 2026-05-27 sibling-agent patch landed a duplicate inline
+parallelization here AND silently narrowed the universe to top-100 symbols.
+The library prewarm replaces the inline path; the universe stays at full
+500 symbols (narrowing was a semantic policy change unrelated to the
+timeout problem). Sidecar backup at
+``quant-watchlist-evolve.py.sibling-2026-05-27.bak`` if the narrowed-universe
+path ever needs to be restored.
 
 CRON SUGGESTION
 ---------------
@@ -37,18 +47,18 @@ POSTURE
 Silence-by-default: if the universe file is missing the script logs a
 warning and exits 0 without modifying any state. The scorer is
 dependency-injected — when ``hermes_quant.playbook.scorers`` is available
-it is used; otherwise a stub-0.5 scorer keeps the loop running without
-onboarding anything (0.5 < 0.65 default floor).
+it is used; otherwise a stub keeps the loop running without onboarding
+anything (stub score < onboard floor).
 
 Stdout is silent when no events fire; only summary on changes.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -80,111 +90,89 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-# Wave 1d performance fix: use the top-100 universe (not the full 500-symbol one)
-# to stay well inside the 120s cron timeout. The top-100 covers >90% of dollar
-# volume and is the authoritative liquid-universe for play-fitness scoring.
-TOP100_UNIVERSE_PATH = Path.home() / ".hermes" / "quant" / "universe" / "alpaca-daily-top100.json"
-FULL_UNIVERSE_PATH = Path.home() / ".hermes" / "quant" / "universe" / "alpaca-daily.json"
-
-# Parallelism cap. 20 workers for 100 symbols → ~5 batches of 20; each batch
-# takes ~2s, total snapshot phase ≈ 10-15s. yfinance is IO-bound so threads
-# are fine (no GIL contention on network waits).
-_MAX_WORKERS = 20
-
 
 from hermes_quant.playbook.watchlist_evolution import evolve_watchlist  # noqa: E402
 
-# Try to import the real scorer. If the scorers module isn't ready yet, fall
-# back to None — evolve_watchlist will use its silent stub. This keeps the
-# cron green during the transition.
+# Try to import the real scorer + the parallel prewarm helper. If the scorers
+# module isn't ready yet (older hermes-quant install), fall back to None —
+# evolve_watchlist will use its silent stub. Keeps the cron green during any
+# in-flight library refactor.
 try:
     from hermes_quant.playbook.scorers import (  # type: ignore[attr-defined]
-        compute_play_snapshot,
-        score_all,
+        prewarm_snapshot_cache,
+        score_symbol,
     )
 
-    _HAS_SCORER = True
+    _scorer = score_symbol
 except (ImportError, AttributeError):
-    _HAS_SCORER = False
+    _scorer = None
+    prewarm_snapshot_cache = None  # type: ignore[assignment]
 
 
-def _parallel_score_symbol(symbol: str, play: str, snapshot_cache: dict) -> float:
-    """Score one symbol on one play using a pre-populated snapshot cache.
+def _read_universe_symbols(universe_path: Path) -> list[str]:
+    """Parse the universe JSON and return the list of tradable symbols.
 
-    The snapshot_cache must already be populated (by _prefetch_snapshots)
-    before this is called. This function is pure computation — no IO.
+    Returns [] on any parse error so the caller can fall through to
+    serial scoring rather than crash. evolve_watchlist re-reads the same
+    file and surfaces structural errors via its own logging path.
     """
-    if not _HAS_SCORER:
-        return 0.5  # stub: won't cross onboard floor, won't cross evict floor
-
-    snap = snapshot_cache.get(symbol.upper())
-    if snap is None:
-        return 0.0  # no data → treat as ineligible
-
+    if not universe_path.exists():
+        return []
     try:
-        all_fits = score_all(snap)
-        fitness = all_fits.get(play)
-        if fitness is None:
-            return 0.0
-        # Ineligible symbols (eviction or hard-rule fail) → 0.0 so evict_floor=0.45
-        # treats them as hard rejects (see scorers.score_symbol docstring).
-        if not fitness.eligible:
-            return 0.0
-        return float(fitness.score)
-    except Exception:  # noqa: BLE001
-        return 0.0
-
-
-def _prefetch_snapshots(symbols: list[str], max_workers: int = _MAX_WORKERS) -> dict:
-    """Fetch yfinance snapshots for all symbols in parallel.
-
-    Returns {SYMBOL_UPPER: snapshot_dict}. Any symbol that fails is omitted;
-    the scorer will return 0.0 for it (silence-by-default).
-    """
-    if not _HAS_SCORER:
-        return {}
-
-    cache: dict[str, dict] = {}
-
-    def _fetch(sym: str) -> tuple[str, dict | None]:
-        try:
-            return sym.upper(), compute_play_snapshot(sym)
-        except Exception:  # noqa: BLE001
-            return sym.upper(), None
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch, sym): sym for sym in symbols}
-        for future in as_completed(futures):
-            sym_upper, snap = future.result()
-            if snap is not None:
-                cache[sym_upper] = snap
-
-    return cache
-
-
-def _make_scorer(snapshot_cache: dict):
-    """Return a scorer callable that uses the pre-populated snapshot cache."""
-
-    def _scorer(symbol: str, play: str) -> float:
-        return _parallel_score_symbol(symbol, play, snapshot_cache)
-
-    return _scorer
-
-
-def _resolve_universe_path() -> Path:
-    """Prefer top-100 universe; fall back to full universe if top-100 missing."""
-    if TOP100_UNIVERSE_PATH.exists():
-        return TOP100_UNIVERSE_PATH
-    logging.getLogger(__name__).warning(
-        "watchlist-evolve: top-100 universe missing (%s), falling back to full (%s)",
-        TOP100_UNIVERSE_PATH,
-        FULL_UNIVERSE_PATH,
-    )
-    return FULL_UNIVERSE_PATH
+        payload = json.loads(universe_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out: list[str] = []
+    for entry in payload.get("symbols") or []:
+        if isinstance(entry, str):
+            out.append(entry)
+        elif isinstance(entry, dict) and "symbol" in entry:
+            out.append(str(entry["symbol"]))
+    return out
 
 
 def main() -> int:
-    universe_path = _resolve_universe_path()
+    # Full Alpaca liquid universe — ~500 symbols by default. The library
+    # prewarm + 600s cron timeout absorbs the wall time; do NOT silently
+    # narrow this without an explicit policy decision.
+    universe_path = Path.home() / ".hermes" / "quant" / "universe" / "alpaca-daily.json"
+
+    # Wall-clock budget guard (added 2026-05-28). The cron's
+    # script_timeout_seconds is 600s. If this script approaches that
+    # ceiling we emit a stderr warning so a perf regression is caught
+    # BEFORE the next cron run silently times out and corrupts the
+    # downstream watchlist.
+    import time
+    _start_ts = time.monotonic()
+
+    def _check_budget(stage: str, soft_warn_pct: float = 0.5, hard_warn_pct: float = 0.85) -> None:
+        """Emit stderr warnings if elapsed approaches the cron timeout.
+
+        soft_warn_pct (0.5 = 300s) — log info-level for trend tracking.
+        hard_warn_pct (0.85 = 510s) — log loud warning for operator attention.
+        """
+        # Read the active cron timeout from config (matches scheduler)
+        try:
+            from hermes_agent.config import load_config  # type: ignore
+            cfg = load_config() or {}
+            cron_to = int((cfg.get("cron") or {}).get("script_timeout_seconds") or 600)
+        except Exception:
+            cron_to = 600  # match scheduler default we ship today
+
+        elapsed = time.monotonic() - _start_ts
+        if elapsed >= cron_to * hard_warn_pct:
+            print(
+                f"BUDGET HARD WARN: stage={stage} elapsed={elapsed:.1f}s "
+                f"(>{int(hard_warn_pct*100)}% of {cron_to}s cron timeout). "
+                f"Bump script_timeout_seconds or fix perf regression.",
+                file=sys.stderr,
+            )
+        elif elapsed >= cron_to * soft_warn_pct:
+            print(
+                f"budget soft: stage={stage} elapsed={elapsed:.1f}s "
+                f"(>{int(soft_warn_pct*100)}% of {cron_to}s cron timeout)",
+                file=sys.stderr,
+            )
 
     # 2026-05-27 hardening (P0-3 from parallel-critique review): if the
     # upstream universe file is stale (>25h old) the entire downstream
@@ -204,32 +192,69 @@ def main() -> int:
             )
             return 1
 
-    # Wave 1d performance fix: pre-fetch all snapshots in parallel BEFORE
-    # calling evolve_watchlist, so the evolution loop's scorer has zero
-    # additional IO cost (pure dict lookup). This is what makes 100 symbols
-    # complete in ~15s instead of ~250s.
-    import json as _json
-
-    symbols: list[str] = []
-    if universe_path.exists():
+    # Parallel-prewarm the per-symbol yfinance snapshot cache before
+    # evolve_watchlist's serial loop runs. The cache lives in
+    # hermes_quant.playbook.scorers._SNAPSHOT_CACHE and is keyed by
+    # (SYMBOL, YYYY-MM-DD) in UTC — score_symbol reads it on every call.
+    # Prewarming converts the 500-symbol × 3-HTTP workload from ~3-5 min
+    # serial to ~30-60s parallel.
+    #
+    # Silence-by-default: if the helper isn't available (older hermes_quant
+    # install), or the universe failed to parse, we just skip prewarm and
+    # let score_symbol fall back to serial fetches. The cron's
+    # script_timeout_seconds: 600 in ~/.hermes/config.yaml gives that path
+    # enough headroom too.
+    universe_symbols = _read_universe_symbols(universe_path)
+    if universe_symbols and prewarm_snapshot_cache is not None:
         try:
-            payload = _json.loads(universe_path.read_text(encoding="utf-8"))
-            raw = payload.get("symbols") or []
-            for entry in raw:
-                if isinstance(entry, str):
-                    symbols.append(entry)
-                elif isinstance(entry, dict) and "symbol" in entry:
-                    symbols.append(str(entry["symbol"]))
-        except Exception:  # noqa: BLE001
-            pass  # evolve_watchlist will re-read and handle the error
+            summary = prewarm_snapshot_cache(universe_symbols)
+            # One-line breadcrumb on stderr — keeps stdout silent-by-default
+            # but surfaces perf data to the audit log.
+            if summary["prewarmed"] or summary["errors"]:
+                print(
+                    f"prewarm: warmed={summary['prewarmed']} "
+                    f"skipped={summary['skipped']} "
+                    f"errors={summary['errors']} "
+                    f"elapsed={summary['elapsed_s']}s",
+                    file=sys.stderr,
+                )
 
-    if symbols:
-        snapshot_cache = _prefetch_snapshots(symbols)
-        _scorer = _make_scorer(snapshot_cache)
-    else:
-        _scorer = None  # evolve_watchlist will use its stub scorer
+            # 2026-05-28 hardening: abort if upstream data feed is failing.
+            # Without this, a yfinance rate-limit (HTTP 401 "Invalid Crumb"
+            # from Yahoo's anti-bot) silently zeroes every score, causing
+            # evolve_watchlist to evict ~all plays. The fix: if the
+            # prewarm error rate exceeds a threshold, refuse to corrupt
+            # the watchlist — exit 1 and let the next cron retry.
+            #
+            # Threshold: if >50% of prewarm attempts errored AND fewer than
+            # 10% succeeded, the data feed is broken. Don't trust the
+            # downstream scoring.
+            if universe_symbols:
+                attempted = max(1, summary["prewarmed"] + summary["errors"])
+                error_rate = summary["errors"] / attempted
+                success_rate = summary["prewarmed"] / max(1, len(universe_symbols))
+                if error_rate > 0.5 and success_rate < 0.1:
+                    print(
+                        f"ABORT: data feed unreliable — "
+                        f"prewarm errors={summary['errors']} "
+                        f"prewarmed={summary['prewarmed']} "
+                        f"universe={len(universe_symbols)} "
+                        f"error_rate={error_rate:.1%} success_rate={success_rate:.1%}. "
+                        f"Refusing to corrupt watchlist with bad-data scores. "
+                        f"Likely yfinance rate-limit; next cron at 03:30 PT will retry.",
+                        file=sys.stderr,
+                    )
+                    return 2  # distinct from "stale universe" (1) and "ok" (0)
+        except Exception as exc:  # noqa: BLE001 — never let prewarm crash the cron
+            print(
+                f"WARNING: prewarm_snapshot_cache failed "
+                f"({type(exc).__name__}: {exc}); falling back to serial scoring",
+                file=sys.stderr,
+            )
+    _check_budget("after_prewarm")
 
     summary = evolve_watchlist(scorer=_scorer, universe_path=universe_path)
+    _check_budget("after_evolve")
 
     # Silence-by-default: only print if something happened.
     if summary["events_written"] == 0 and all(
