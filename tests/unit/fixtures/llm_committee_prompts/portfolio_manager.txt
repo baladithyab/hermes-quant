@@ -38,4 +38,7 @@ Analyst views (3 total, calibrated):
 All prior committee turns (bull, bear, judge, risk triumvirate):
 []
 
+Lessons from prior decisions and outcomes:
+(none)
+
 Render the final portfolio decision as a single JSON object per the schema.
