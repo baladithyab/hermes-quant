@@ -31,6 +31,7 @@ import dataclasses
 import logging
 import os
 from collections.abc import Iterable, Mapping
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -804,6 +805,19 @@ def recommend(
     if result.bars_received == 0:
         return _gated_no_data(result, "no_bars_returned")
 
+    # ADR-0069: drop the still-forming last bar for daily-timeframe equity reads
+    # mid-session. yfinance returns today's intraday-still-forming bar with a
+    # close that's the latest tick — not a settled bar close. Reading that as
+    # `last_close` breaks replay equality, calibration distributions, and
+    # downstream slippage attribution. Surface the dropped values in extras
+    # for analysts that explicitly opt in.
+    from hermes_quant.data.bar_alignment import drop_still_forming_bar
+    bars, _bar_alignment_info = drop_still_forming_bar(bars, timeframe, asset_class)
+    if _bar_alignment_info["still_forming_dropped"]:
+        result.bars_received = len(bars)
+        if result.bars_received == 0:
+            return _gated_no_data(result, "no_bars_after_still_forming_drop")
+
     # ---- Step 3: data-quality probe ----
     # validate_bars normalizes to tz-NAIVE UTC (per data/base.py L75). Convert
     # back to tz-aware UTC for arithmetic with asof_ts (which is tz-aware).
@@ -819,6 +833,14 @@ def recommend(
 
     # ---- Step 4: build MarketContext ----
     ctx_extras_base = dict(market_extras or {})
+    # ADR-0069: surface dropped still-forming bar values so analysts that
+    # genuinely want today's intraday tick can read them explicitly via extras.
+    # Default consumers see clean settled-bar `last_close`.
+    if _bar_alignment_info["still_forming_dropped"]:
+        ctx_extras_base["still_forming_close"] = _bar_alignment_info["still_forming_close"]
+        ctx_extras_base["still_forming_high"] = _bar_alignment_info["still_forming_high"]
+        ctx_extras_base["still_forming_low"] = _bar_alignment_info["still_forming_low"]
+        ctx_extras_base["still_forming_volume"] = _bar_alignment_info["still_forming_volume"]
     # Per ADR-0063: regime is canonical; merge OVER caller values
     try:
         from hermes_quant.regime.extras_builder import build_regime_extras
@@ -963,6 +985,17 @@ def recommend(
     # as top-level fields rather than burying them in analyst_views[0].metadata.
     final = result.to_dict()
     final["decision_price"] = float(ctx.last_close)
+    # Per ADR-0068: split bar-time (replay anchor) from decision wall-clock.
+    # `as_of` continues to mean the bar boundary (preserves replay equality).
+    # `bar_ts` is the new explicit alias (same value, named-honestly).
+    # `decision_wall_clock` is the wall-clock UTC at signal-emit time —
+    # what an outside observer would write down as "the model decided X at
+    # this moment." Downstream consumers that need decision-time honesty
+    # (audit trail, slippage attribution, holding-period math) should
+    # prefer `decision_wall_clock`; consumers that need replay-stable bar
+    # identity should prefer `bar_ts`. Schema bump tracked separately.
+    final["bar_ts"] = result.as_of.isoformat() if result.as_of is not None else None
+    final["decision_wall_clock"] = datetime.now(timezone.utc).isoformat()
     # signal_id is the proposal_id-equivalent for the daemon side; advisor
     # itself doesn't emit one, so this stays None until daemon-mode integrates.
     final["signal_id"] = None

@@ -78,7 +78,19 @@ class PaperReactor:
         decision_price = self._extract_decision_price(proposal)
         signal_id = self._extract_signal_id(proposal)
         now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        asof_decision = (proposal.advisor_result or {}).get("as_of") or now
+        # ADR-0068: prefer the wall-clock decision time emitted by the advisor.
+        # Fall back to `as_of` (= bar boundary) for advisor_result dicts produced
+        # before the ADR-0068 split, then to `now` if neither is available.
+        # The previous behavior (asof_decision = as_of) silently labeled every
+        # fill with the bar-boundary midnight, hiding the true decision-vs-fill
+        # latency.
+        adv = proposal.advisor_result or {}
+        asof_decision = (
+            adv.get("decision_wall_clock")
+            or adv.get("as_of")
+            or now
+        )
+        bar_ts = adv.get("bar_ts") or adv.get("as_of")  # = old as_of for v1 records
 
         record = ExecutionRecord(
             proposal_id=proposal.proposal_id,
@@ -99,6 +111,7 @@ class PaperReactor:
                 "paper": True,
                 "advisor_caveats": (proposal.advisor_result or {}).get("caveats", []),
             },
+            bar_ts=bar_ts,
         )
 
         # Append to the executions bus. Same flock pattern signal_bus uses.
@@ -219,4 +232,5 @@ def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
         "human_in_the_loop": record.human_in_the_loop,
         "approver_user_id": record.approver_user_id,
         "reactor_metadata": record.reactor_metadata or {},
+        "bar_ts": record.bar_ts,  # ADR-0068: explicit bar-boundary anchor
     }
