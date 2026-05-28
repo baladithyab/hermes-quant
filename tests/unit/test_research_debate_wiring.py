@@ -31,6 +31,22 @@ from hermes_quant.protocol import AggregatedSignal, AnalystView, MarketContext
 
 
 # ---------------------------------------------------------------------------
+# Test pollution fix (v0.6.2): isolate env-var state per test.
+# Previously full-suite runs leaked HERMES_QUANT_RESEARCH_DEBATE / _ROUNDS
+# from earlier tests, causing test_t4_run_research_manager_judge_happy_path
+# to fail in the full suite while passing in isolation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_research_debate_env(monkeypatch):
+    """Ensure each test sees clean env state for HERMES_QUANT_RESEARCH_DEBATE flags."""
+    monkeypatch.delenv("HERMES_QUANT_RESEARCH_DEBATE", raising=False)
+    monkeypatch.delenv("HERMES_QUANT_RESEARCH_DEBATE_ROUNDS", raising=False)
+    yield
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -472,4 +488,122 @@ def test_t9_run_llm_committee_falls_through_on_research_debate_exception(
     assert turns
     for t in turns:
         assert not (t.metadata or {}).get("from_research_debate", False)
+
+
+# ---------------------------------------------------------------------------
+# T10: dispatch preserves prompt_hash + round_index (C1+C3 regression).
+# ---------------------------------------------------------------------------
+
+
+def test_t10_dispatch_preserves_prompt_hash_and_round_index(monkeypatch):
+    """T10 (v0.6.2-fix-C1): dispatch path must carry prompt_hash + round_index
+    from the stage helper through state.bull_turns into CommitteeTurn metadata.
+
+    Pre-fix: state.bull_turns retained only the BullBearTurn (no helper
+    forensics), so the dispatch-side CommitteeTurn metadata had no
+    prompt_hash and no round_index — committee_turn audit rows lost both.
+    """
+    monkeypatch.setenv("HERMES_QUANT_RESEARCH_DEBATE", "1")
+    fake_call = _alternating_call_factory(
+        judge_payload=_judge_json("OVERWEIGHT", with_overrules=True)
+    )
+    monkeypatch.setattr(committee_mod, "_call_llm_json", fake_call)
+
+    turns = run_llm_committee(
+        market_context=_ctx(),
+        analyst_views=[_view()],
+        baseline_signal=_baseline(),
+        config=_config(),
+        client=MagicMock(),
+    )
+
+    assert turns
+    # Dispatch order: all bull_turns first, then bear_turns, then judge.
+    bull = next(t for t in turns if t.role == "bull_researcher")
+    bear = next(t for t in turns if t.role == "bear_researcher")
+
+    assert bull.metadata is not None
+    assert bear.metadata is not None
+
+    # prompt_hash is a non-empty 64-char hex per _prompt_hash convention.
+    bull_hash = bull.metadata.get("prompt_hash")
+    bear_hash = bear.metadata.get("prompt_hash")
+    assert isinstance(bull_hash, str) and len(bull_hash) == 64
+    assert isinstance(bear_hash, str) and len(bear_hash) == 64
+
+    # round_index reflects the stage-controlled value (1 with max_debate_rounds=1).
+    assert bull.metadata.get("round_index") == 1
+    assert bear.metadata.get("round_index") == 1
+
+    # Forge-resistance sanity: the structured payload's metadata.round (set by
+    # the helper) matches the round_index — even if the LLM stub returned a
+    # different value, the helper must overwrite it.
+    structured_meta = (bull.metadata.get("structured") or {}).get("metadata") or {}
+    assert structured_meta.get("round") == 1
+
+
+# ---------------------------------------------------------------------------
+# T11: judge sees bull/bear context (H2 regression).
+# ---------------------------------------------------------------------------
+
+
+def test_t11_judge_sees_debate_context(monkeypatch):
+    """T11 (v0.6.2-fix-H2): _run_research_manager_judge must thread bull/bear
+    rationales into the rendered prompt (via synthesized prior_turns).
+
+    Pre-fix: prior_turns=[] discarded all debate context; the judge ran blind.
+    Post-fix: bull/bear rationales appear verbatim in the user_text of the
+    rendered research_manager prompt (folded in via _serialize_prior_turns).
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_call(**kw: Any) -> str:
+        captured["system"] = kw["system_text"]
+        captured["user"] = kw["user_text"]
+        return _judge_json("HOLD", with_overrules=True)
+
+    monkeypatch.setattr(committee_mod, "_call_llm_json", fake_call)
+
+    bull_turns = [
+        BullBearTurn(
+            role="bull_researcher",
+            stance="long the breakout",
+            confidence=0.7,
+            rationale="bull-says-this",
+            key_evidence=["ta"],
+            counterarguments="bear noise",
+        )
+    ]
+    bear_turns = [
+        BullBearTurn(
+            role="bear_researcher",
+            stance="cautious",
+            confidence=0.4,
+            rationale="bear-says-that",
+            key_evidence=["macro"],
+            counterarguments="bull noise",
+        )
+    ]
+
+    plan = _run_research_manager_judge(
+        client=MagicMock(),
+        config=_config(),
+        market_context=_ctx(),
+        analyst_views=[_view()],
+        baseline_signal=_baseline(),
+        bull_turns=bull_turns,
+        bear_turns=bear_turns,
+    )
+
+    assert plan is not None  # judge returned a valid plan
+
+    # The bull/bear rationales must appear in the rendered user_text.
+    assert "user" in captured
+    user_text = captured["user"]
+    assert "bull-says-this" in user_text, (
+        "bull rationale not threaded into research_manager prompt"
+    )
+    assert "bear-says-that" in user_text, (
+        "bear rationale not threaded into research_manager prompt"
+    )
 
