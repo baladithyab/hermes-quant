@@ -17,7 +17,16 @@ from pathlib import Path
 import pytest
 
 
-SCRIPT_PATH = Path.home() / ".hermes" / "scripts" / "quant-playbook-weekly.py"
+SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "quant-playbook-weekly.py"
+if not SCRIPT_PATH.exists():
+    # Fallback to ~/.hermes/scripts/ for local dev installations that
+    # symlink scripts into the user home (legacy path).
+    SCRIPT_PATH = Path.home() / ".hermes" / "scripts" / "quant-playbook-weekly.py"
+
+pytestmark = pytest.mark.skipif(
+    not SCRIPT_PATH.exists(),
+    reason=f"quant-playbook-weekly.py not found at {SCRIPT_PATH}",
+)
 
 
 @pytest.fixture(scope="module")
