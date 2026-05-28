@@ -320,3 +320,156 @@ def test_t6b_run_research_manager_judge_strips_overrules_baseline(monkeypatch):
     # Verify the new schema does NOT carry the legacy field through.
     dumped = plan.model_dump()
     assert "overrules_baseline" not in dumped
+
+
+# ---------------------------------------------------------------------------
+# T7–T9: run_llm_committee dispatch integration tests
+# ---------------------------------------------------------------------------
+
+
+def _alternating_call_factory(judge_payload: str | None = None):
+    """Build a fake _call_llm_json that returns bull/bear/judge JSON in order.
+
+    Per the stage runner's loop, the call order under max_debate_rounds=1 is:
+      1. bull_researcher (round 1)
+      2. bear_researcher (round 1)
+      3. research_manager (judge)
+    """
+    sequence: list[str] = []
+
+    def factory(rounds: int = 1, judge: str | None = None) -> Any:
+        nonlocal sequence
+        sequence = []
+        for r in range(1, rounds + 1):
+            sequence.append(_bull_json(round_idx=r))
+            sequence.append(_bear_json(round_idx=r))
+        if judge is not None:
+            sequence.append(judge)
+        idx = {"i": 0}
+
+        def fake_call(**_: Any) -> str | None:
+            if idx["i"] >= len(sequence):
+                return None
+            out = sequence[idx["i"]]
+            idx["i"] += 1
+            return out
+
+        return fake_call
+
+    return factory(rounds=1, judge=judge_payload)
+
+
+def test_t7_run_llm_committee_dispatches_to_research_debate_when_flag_on(
+    monkeypatch,
+):
+    """T7: HERMES_QUANT_RESEARCH_DEBATE=1 → dispatch path runs end-to-end and
+    emits bull_researcher + bear_researcher + portfolio_manager(judge) turns
+    with the expected metadata shape.
+    """
+    monkeypatch.setenv("HERMES_QUANT_RESEARCH_DEBATE", "1")
+    fake_call = _alternating_call_factory(
+        judge_payload=_judge_json("OVERWEIGHT", with_overrules=True)
+    )
+    monkeypatch.setattr(committee_mod, "_call_llm_json", fake_call)
+
+    turns = run_llm_committee(
+        market_context=_ctx(),
+        analyst_views=[_view()],
+        baseline_signal=_baseline(),
+        config=_config(),
+        client=MagicMock(),
+    )
+
+    roles = [t.role for t in turns]
+    assert "bull_researcher" in roles
+    assert "bear_researcher" in roles
+    # The judge maps to the deep-tier portfolio_manager slot.
+    assert "portfolio_manager" in roles
+
+    bull = next(t for t in turns if t.role == "bull_researcher")
+    bear = next(t for t in turns if t.role == "bear_researcher")
+    judge = next(t for t in turns if t.role == "portfolio_manager")
+
+    assert bull.tier == "quick"
+    assert bear.tier == "quick"
+    assert judge.tier == "deep"
+
+    assert bull.metadata is not None
+    assert bull.metadata.get("from_research_debate") is True
+    assert bear.metadata is not None
+    assert bear.metadata.get("from_research_debate") is True
+    assert judge.metadata is not None
+    assert judge.metadata.get("from_research_debate") is True
+    assert judge.metadata.get("logical_role") == "research_manager"
+    assert judge.metadata.get("recommendation") == "OVERWEIGHT"
+    assert judge.stance == "judge:OVERWEIGHT"
+    # OVERWEIGHT → +1 direction (verifies the extended _direction_from_recommendation).
+    assert judge.direction == 1
+
+
+def test_t8_run_llm_committee_falls_through_when_flag_off(monkeypatch):
+    """T8: flag unset → legacy parallel-emit path runs (no research_debate
+    metadata flag on emitted turns).
+    """
+    monkeypatch.delenv("HERMES_QUANT_RESEARCH_DEBATE", raising=False)
+    # Legacy path also calls bull/bear/judge in order, so reuse the fixture.
+    fake_call = _alternating_call_factory(
+        judge_payload=_judge_json("HOLD", with_overrules=True)
+    )
+    monkeypatch.setattr(committee_mod, "_call_llm_json", fake_call)
+
+    turns = run_llm_committee(
+        market_context=_ctx(),
+        analyst_views=[_view()],
+        baseline_signal=_baseline(),
+        config=_config(),
+        client=MagicMock(),
+    )
+
+    # At least one turn should NOT carry from_research_debate.
+    assert turns
+    assert all(
+        not (t.metadata or {}).get("from_research_debate", False) for t in turns
+    )
+
+
+def test_t9_run_llm_committee_falls_through_on_research_debate_exception(
+    monkeypatch,
+):
+    """T9: flag ON but the stage raises → fall through to legacy emit path.
+
+    We force the dispatch to raise by monkey-patching run_research_debate
+    inside the lazily-imported stage module to a bomb. Since the import is
+    inside the try-block, patching the module attribute *after* the first
+    import works for subsequent calls.
+    """
+    monkeypatch.setenv("HERMES_QUANT_RESEARCH_DEBATE", "1")
+
+    # Force an exception inside the dispatch.
+    from hermes_quant.agents.research_debate import stage as stage_mod
+
+    def _bomb(*_a: Any, **_kw: Any):
+        raise RuntimeError("synthetic dispatch failure")
+
+    monkeypatch.setattr(stage_mod, "run_research_debate", _bomb)
+
+    # Legacy path will then take over and call _run_one_turn for each role.
+    fake_call = _alternating_call_factory(
+        judge_payload=_judge_json("HOLD", with_overrules=True)
+    )
+    monkeypatch.setattr(committee_mod, "_call_llm_json", fake_call)
+
+    turns = run_llm_committee(
+        market_context=_ctx(),
+        analyst_views=[_view()],
+        baseline_signal=_baseline(),
+        config=_config(),
+        client=MagicMock(),
+    )
+
+    # We should have legacy turns (no from_research_debate flag) — the
+    # dispatch crashed before it could append any debate turns.
+    assert turns
+    for t in turns:
+        assert not (t.metadata or {}).get("from_research_debate", False)
+
