@@ -741,6 +741,19 @@ def _run_one_turn_with_history(
         )
         return None
 
+    # C1/C3 fix (v0.6.2): persist prompt_hash + round_index into BullBearTurn.metadata
+    # so they round-trip through state.bull_turns / state.bear_turns and into the
+    # dispatch's CommitteeTurn metadata + audit row. The CommitteeTurn returned here
+    # also carries them, but the stage runner only retains the BullBearTurn objects;
+    # without this, the dispatch path (~lines 940-980) would lose prompt_hash and
+    # the stage-controlled round_index.
+    # Forge-resistance: overwrite any LLM-supplied 'round' value with the
+    # stage-controlled round_index.
+    if parsed.metadata is None:
+        parsed.metadata = {}
+    parsed.metadata["prompt_hash"] = phash
+    parsed.metadata["round"] = round_index
+
     return CommitteeTurn(
         role=role,  # type: ignore[arg-type]
         stance=parsed.stance,
@@ -938,6 +951,7 @@ def run_llm_committee(
             deep_model = config.deep_model
 
             for bt in state.bull_turns:
+                md = bt.metadata or {}
                 turns.append(
                     CommitteeTurn(
                         role="bull_researcher",  # type: ignore[arg-type]
@@ -951,6 +965,10 @@ def run_llm_committee(
                             "tier": "quick",
                             "model_id": quick_model,
                             "from_research_debate": True,
+                            # C1/C3 fix (v0.6.2): forensics persisted from the
+                            # helper via BullBearTurn.metadata.
+                            "prompt_hash": md.get("prompt_hash"),
+                            "round_index": md.get("round"),
                             "key_evidence": list(bt.key_evidence),
                             "counterarguments": bt.counterarguments,
                             "structured": bt.model_dump(),
@@ -959,6 +977,7 @@ def run_llm_committee(
                     )
                 )
             for bt in state.bear_turns:
+                md = bt.metadata or {}
                 turns.append(
                     CommitteeTurn(
                         role="bear_researcher",  # type: ignore[arg-type]
@@ -972,6 +991,10 @@ def run_llm_committee(
                             "tier": "quick",
                             "model_id": quick_model,
                             "from_research_debate": True,
+                            # C1/C3 fix (v0.6.2): forensics persisted from the
+                            # helper via BullBearTurn.metadata.
+                            "prompt_hash": md.get("prompt_hash"),
+                            "round_index": md.get("round"),
                             "key_evidence": list(bt.key_evidence),
                             "counterarguments": bt.counterarguments,
                             "structured": bt.model_dump(),
