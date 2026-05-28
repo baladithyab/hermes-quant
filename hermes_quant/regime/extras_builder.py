@@ -87,15 +87,13 @@ class _DetectorLike(Protocol):
 def _build_classifier() -> _DetectorLike:
     """Build the default classifier. Patchable seam for test 2.
 
-    Returns a RegimeDetector wrapping the HMM classifier when available, falling
-    back to rule-based otherwise. The detector itself handles HMM exceptions.
+    Per ADR-0058: HMM is opt-in via HERMES_QUANT_REGIME_HMM=1. This helper
+    delegates that decision to RegimeDetector.__init__ (which already honors
+    the env var). Previously this function unconditionally tried to wire HMM,
+    creating a helper↔aggregator divergence under the default rule-based
+    deployment (Claude review C1, 2026-05-27).
     """
-    try:
-        from hermes_quant.regime.hmm import build_default_classifier as _hmm
-        hmm = _hmm()
-        return RegimeDetector(hmm_classifier=lambda sv: hmm.classify(sv))
-    except Exception:  # noqa: BLE001 — fall back to rule-based silently
-        return RegimeDetector()
+    return RegimeDetector()
 
 
 def _classifier_kind(detector: _DetectorLike) -> str:
@@ -142,7 +140,7 @@ def build_regime_extras(
     bars: pd.DataFrame,
     *,
     asof: Optional[pd.Timestamp] = None,
-    min_bars: int = 60,
+    min_bars: int = 61,  # matches state_variables._MIN_BARS_FOR_VOL (61 closes = 60 log-returns)
     detector: Optional[_DetectorLike] = None,
 ) -> dict[str, Any]:
     """Classify the regime for ``symbol`` and return a dict for MarketContext.extras.
@@ -150,10 +148,12 @@ def build_regime_extras(
     Args:
         symbol: Ticker (used for logging only — classifier is symbol-agnostic).
         bars: OHLCV DataFrame with at least a ``close`` column. Need >= ``min_bars``
-            rows to compute realized vol percentile robustly.
+            rows. Default 61 matches ``state_variables._MIN_BARS_FOR_VOL``;
+            specifying < 61 will surface as a clean step-1 abstain rather than
+            a step-3 ValueError WARNING (Claude review H4, 2026-05-27).
         asof: Optional timestamp; defaults to last bar's timestamp via
             ``compute_state_variables``.
-        min_bars: Minimum bars required for classification (default 60).
+        min_bars: Minimum bars required for classification (default 61).
         detector: Optional dependency-injected detector for testing. When
             None, ``_build_classifier()`` is called.
 
@@ -164,10 +164,32 @@ def build_regime_extras(
         - ``regime_classifier_kind``: ``str`` (always populated; "unavailable"
           when classifier construction failed)
 
-    Per ADR-0036, this function never raises. Any exception in the classifier
-    path becomes a populated ``regime_failure`` with ``regime=None`` and a
-    WARNING log line.
+    Per ADR-0036 silence-by-default: this function never raises. The entire
+    body is wrapped in an outer try/except (Claude review H3, 2026-05-27);
+    inner per-step try/except blocks are retained for granular failure
+    attribution.
     """
+    try:
+        return _build_regime_extras_impl(symbol, bars, asof=asof, min_bars=min_bars, detector=detector)
+    except Exception as exc:  # noqa: BLE001 — ADR-0036 outer guard
+        logger.warning("build_regime_extras(%s): unexpected failure: %s",
+                       symbol, exc, exc_info=True)
+        return {
+            "regime": None,
+            "regime_failure": f"unexpected_error: {type(exc).__name__}: {exc}",
+            "regime_classifier_kind": "unavailable",
+        }
+
+
+def _build_regime_extras_impl(
+    symbol: str,
+    bars: pd.DataFrame,
+    *,
+    asof: Optional[pd.Timestamp] = None,
+    min_bars: int = 61,
+    detector: Optional[_DetectorLike] = None,
+) -> dict[str, Any]:
+    """Inner implementation; outer ``build_regime_extras`` wraps in try/except."""
     # ---- guard: insufficient bars ----
     if bars is None or len(bars) < min_bars:
         n = 0 if bars is None else len(bars)

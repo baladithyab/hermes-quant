@@ -3,7 +3,7 @@
 Per ADR-0063 §"Test Plan" and design v0.6.0-regime-in-state.md §6.7.
 
 The contract under test:
-  - build_regime_extras(symbol, bars, asof=None, min_bars=60) -> dict
+  - build_regime_extras(symbol, bars, asof=None, min_bars=61) -> dict
   - Returns dict with keys: "regime", "regime_failure", "regime_classifier_kind"
   - Never raises (silence-by-default per ADR-0036)
   - regime is RegimePacket | None
@@ -280,3 +280,40 @@ def test_e2e_advisor_with_regime_in_extras():
     regime_val = ctx.extras["regime"]
     assert regime_val is None or isinstance(regime_val, RegimePacket)
     assert "regime_classifier_kind" in ctx.extras
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — outer guard: pathological non-DataFrame input must not raise
+# (Claude review H3, 2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+def test_outer_guard_catches_len_failure_on_garbage_input():
+    """Pathological non-DataFrame input that fails len() must be caught
+    by the outer try/except per ADR-0036, not propagate to the caller."""
+
+    class _BadObj:
+        def __len__(self):
+            raise RuntimeError("len() raised")
+
+    extras = build_regime_extras("AAPL", _BadObj())  # type: ignore[arg-type]
+
+    assert extras["regime"] is None
+    assert extras["regime_failure"] is not None
+    assert extras["regime_failure"].startswith("unexpected_error")
+    assert "RuntimeError" in extras["regime_failure"]
+
+
+def test_outer_guard_catches_non_df_non_none_input():
+    """A truly weird input that fails len() in unexpected ways still produces
+    a clean failure dict — never raises."""
+
+    class _NonLenObj:
+        # No __len__ at all → TypeError
+        pass
+
+    extras = build_regime_extras("AAPL", _NonLenObj())  # type: ignore[arg-type]
+    assert extras["regime"] is None
+    assert extras["regime_failure"] is not None
+    # Could be either step-1 unexpected_error (TypeError on len) or some other path
+    assert extras["regime_classifier_kind"] in ("unavailable", "rule_based", "hmm", "custom")
