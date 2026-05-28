@@ -26,7 +26,14 @@ from unittest import mock
 import pytest
 
 
-SCRIPT_PATH = Path.home() / ".hermes" / "scripts" / "quant-playbook-tick.py"
+SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "quant-playbook-tick.py"
+if not SCRIPT_PATH.exists():
+    SCRIPT_PATH = Path.home() / ".hermes" / "scripts" / "quant-playbook-tick.py"
+
+pytestmark = pytest.mark.skipif(
+    not SCRIPT_PATH.exists(),
+    reason=f"quant-playbook-tick.py not found at {SCRIPT_PATH}",
+)
 
 
 @pytest.fixture

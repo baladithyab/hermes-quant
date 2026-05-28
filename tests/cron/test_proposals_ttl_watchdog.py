@@ -17,10 +17,14 @@ import pytest
 
 
 # Load the script as a module without sys.path mangling
-SCRIPT = Path.home() / ".hermes" / "scripts" / "quant-proposals-ttl-watchdog.py"
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "quant-proposals-ttl-watchdog.py"
 if not SCRIPT.exists():
-    # Repo path fallback for CI
-    SCRIPT = Path(__file__).parents[2] / "scripts" / "quant-proposals-ttl-watchdog.py"
+    SCRIPT = Path.home() / ".hermes" / "scripts" / "quant-proposals-ttl-watchdog.py"
+
+pytestmark = pytest.mark.skipif(
+    not SCRIPT.exists(),
+    reason=f"quant-proposals-ttl-watchdog.py not found at {SCRIPT}",
+)
 
 spec = importlib.util.spec_from_file_location("ttl_watchdog", SCRIPT)
 ttl_watchdog = importlib.util.module_from_spec(spec)

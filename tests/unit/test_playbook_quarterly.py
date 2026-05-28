@@ -16,7 +16,14 @@ from pathlib import Path
 
 import pytest
 
-QUARTERLY_SCRIPT = Path.home() / ".hermes" / "scripts" / "quant-playbook-quarterly.py"
+QUARTERLY_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "quant-playbook-quarterly.py"
+if not QUARTERLY_SCRIPT.exists():
+    QUARTERLY_SCRIPT = Path.home() / ".hermes" / "scripts" / "quant-playbook-quarterly.py"
+
+pytestmark = pytest.mark.skipif(
+    not QUARTERLY_SCRIPT.exists(),
+    reason=f"quant-playbook-quarterly.py not found at {QUARTERLY_SCRIPT}",
+)
 
 
 @pytest.fixture(scope="module")

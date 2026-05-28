@@ -182,7 +182,7 @@ def test_no_dry_run_calls_react_on_fire(
 
     react_calls = []
 
-    def fake_react(advisor_result, entry, kelly):
+    def fake_react(advisor_result, entry, kelly, **kwargs):
         react_calls.append((entry.symbol, kelly))
         return f"exec_{entry.symbol}"
 
@@ -424,7 +424,7 @@ def test_react_failure_marks_decision_error_but_continues(
 ):
     _set_mode_autonomous(isolate_config)
 
-    def fake_react(advisor_result, entry, kelly):
+    def fake_react(advisor_result, entry, kelly, **kwargs):
         if entry.symbol == "AAPL":
             raise RuntimeError("paper bus full")
         return f"exec_{entry.symbol}"
