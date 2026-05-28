@@ -172,6 +172,42 @@ def _eval_eviction(snapshot: dict, rule: tuple) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+def _eval_regime_gate(profile: PlayProfile, snapshot: dict) -> tuple[str, str | None]:
+    """Evaluate the play's regime gate against the current snapshot regime.
+
+    Returns:
+        (action, reason)
+        - action ∈ {"allow", "warn", "deny"} — derived from profile.regime_gates[label]
+          where label is the str-value of the snapshot's RegimeState. If the
+          profile has no regime_gates entries (legacy profiles), or the snapshot
+          has no regime info, returns ("allow", None) — bit-identical to
+          pre-2026-05-28 behavior.
+        - reason: short human-readable string when action != "allow"; else None.
+
+    The snapshot "regime" key MAY be a RegimePacket (post-ADR-0063) OR a plain
+    string label (legacy / synthetic snapshots). We normalize both.
+    """
+    if not profile.regime_gates:
+        return ("allow", None)
+    regime = snapshot.get("regime")
+    if regime is None:
+        return ("allow", None)
+    # Extract string label from RegimePacket OR plain string.
+    if hasattr(regime, "label"):
+        label = str(regime.label).lower()
+    elif isinstance(regime, str):
+        label = regime.lower()
+    elif isinstance(regime, dict):
+        label = str(regime.get("label", "")).lower()
+    else:
+        return ("allow", None)
+    action = profile.regime_gates.get(label, "allow")
+    if action == "allow":
+        return ("allow", None)
+    reason = f"regime={label} → {action} for play={profile.name}"
+    return (action, reason)
+
+
 def _score_against(profile: PlayProfile, snapshot: dict) -> PlayFitness:
     symbol = snapshot.get("symbol", "?")
     failed: list[str] = []
@@ -185,6 +221,19 @@ def _score_against(profile: PlayProfile, snapshot: dict) -> PlayFitness:
             evicted = True
     if evicted:
         notes.append("symbol marked for eviction; eligibility forced false")
+
+    # --- regime gate (ADR-0063 + ADR-0035 amendment 2026-05-28) ---------- #
+    # Read the regime classifier output from snapshot["regime"]. Profiles that
+    # don't define regime_gates (legacy) get bit-identical pre-2026-05-28 scoring.
+    regime_action, regime_reason = _eval_regime_gate(profile, snapshot)
+    regime_warned = False
+    if regime_action == "deny":
+        failed.append(f"regime_gate:{regime_reason}")
+        evicted = True  # treat as eviction — score 0, eligible False, with rationale
+        notes.append(regime_reason or "regime gate denied")
+    elif regime_action == "warn":
+        regime_warned = True
+        notes.append(regime_reason or "regime gate warning")
 
     # --- hard rules ------------------------------------------------------ #
     n_hard = len(profile.hard_rules)
@@ -222,6 +271,11 @@ def _score_against(profile: PlayProfile, snapshot: dict) -> PlayFitness:
     soft_frac = (n_soft_pass / n_soft) if n_soft else 1.0
     score = 0.6 * hard_frac + 0.4 * soft_frac
     score = max(0.0, min(1.0, score))
+
+    # Apply 30% score penalty for regime-warn (per ADR-0035 amendment 2026-05-28).
+    if regime_warned:
+        score = score * 0.7
+        notes.append(f"score reduced by 30% due to regime warn (final={score:.4f})")
 
     eligible = bool(pass_hard and score >= 0.65 and not evicted)
 
@@ -429,6 +483,19 @@ def compute_play_snapshot(symbol: str, asof: date | datetime | None = None) -> d
         snap["atr_14"] = atr
         if atr is not None and snap["last_close"]:
             snap["atr_pct_of_spot"] = atr / snap["last_close"]
+
+        # Regime classifier (ADR-0063 + ADR-0035 amendment 2026-05-28).
+        # Populates snap["regime"] with a RegimePacket so playbook scorers'
+        # regime_gates can deny/warn defensively. Failure-safe: any exception
+        # leaves snap["regime"] absent and scorer falls back to allow-everything.
+        try:
+            from hermes_quant.regime.extras_builder import build_regime_extras
+            import pandas as pd
+            regime_extras = build_regime_extras(symbol, hist, asof=pd.Timestamp(asof_dt))  # type: ignore[arg-type]
+            if regime_extras and regime_extras.get("regime") is not None:
+                snap["regime"] = regime_extras["regime"]
+        except Exception:
+            pass  # silence-by-default; scorer treats missing regime as "allow"
 
         # 52-week high distance
         try:
