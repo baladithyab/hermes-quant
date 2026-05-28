@@ -536,6 +536,22 @@ def recommend_multi_horizon(
         else:
             last_bar_ts_utc = last_bar_ts.tz_convert("UTC")
 
+        ctx_extras_base = dict(market_extras or {})
+        # Per ADR-0063: build canonical regime extras and merge OVER caller-supplied
+        # values so callers cannot shadow the regime key. build_regime_extras never
+        # raises (silence-by-default per ADR-0036); on classifier failure regime is
+        # None with regime_failure populated.
+        try:
+            from hermes_quant.regime.extras_builder import build_regime_extras
+            regime_extras = build_regime_extras(symbol, bars)
+            ctx_extras_base.update(regime_extras)
+        except Exception as exc:  # noqa: BLE001 — never block analyst loop
+            logger.warning("recommend_multi_horizon: regime extras build failed for %s: %s",
+                           symbol, exc, exc_info=True)
+            ctx_extras_base.setdefault("regime", None)
+            ctx_extras_base.setdefault("regime_failure", f"extras_builder_error: {exc}")
+            ctx_extras_base.setdefault("regime_classifier_kind", "unavailable")
+
         ctx = MarketContext(
             asset=symbol,
             timeframe=h,
@@ -545,7 +561,7 @@ def recommend_multi_horizon(
             last_close=float(bars["close"].iloc[-1]),
             last_volume=float(bars["volume"].iloc[-1]),
             asof=last_bar_ts_utc,
-            extras=dict(market_extras or {}),
+            extras=ctx_extras_base,
         )
 
         for analyst in analysts:
@@ -790,6 +806,19 @@ def recommend(
     result.as_of = last_bar_ts_utc  # actual data anchor, not wall clock
 
     # ---- Step 4: build MarketContext ----
+    ctx_extras_base = dict(market_extras or {})
+    # Per ADR-0063: regime is canonical; merge OVER caller values
+    try:
+        from hermes_quant.regime.extras_builder import build_regime_extras
+        regime_extras = build_regime_extras(symbol, bars)
+        ctx_extras_base.update(regime_extras)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recommend: regime extras build failed for %s: %s",
+                       symbol, exc, exc_info=True)
+        ctx_extras_base.setdefault("regime", None)
+        ctx_extras_base.setdefault("regime_failure", f"extras_builder_error: {exc}")
+        ctx_extras_base.setdefault("regime_classifier_kind", "unavailable")
+
     ctx = MarketContext(
         asset=symbol,
         timeframe=timeframe,
@@ -799,7 +828,7 @@ def recommend(
         last_close=float(bars["close"].iloc[-1]),
         last_volume=float(bars["volume"].iloc[-1]),
         asof=last_bar_ts_utc,
-        extras=dict(market_extras or {}),
+        extras=ctx_extras_base,
     )
 
     # ---- Step 5: run analysts ----
