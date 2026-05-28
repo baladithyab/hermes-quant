@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -353,6 +354,17 @@ def _build_default_analysts() -> list[Any]:
         analysts.append(KronosAnalyst())
     except ImportError:
         pass
+    # ADR-0064 (v0.6.1): equity FundamentalsAnalyst — default OFF until
+    # the FundamentalsProvider parquet cache is prewarmed in production
+    # (scripts/quant-fundamentals-prewarm-daily.py). Gate is read at
+    # call time so tests / cron flips take effect immediately.
+    if os.environ.get("HERMES_QUANT_FUNDAMENTALS_ENABLED", "0") == "1":
+        try:
+            from hermes_quant.analysts.fundamentals import FundamentalsAnalyst
+
+            analysts.append(FundamentalsAnalyst())
+        except ImportError:
+            pass
     return analysts
 
 
@@ -859,6 +871,15 @@ def recommend(
             # KronosAnalyst class import failed (shouldn't happen since
             # the module is in our own package), but defensive fallback
             pass
+        # ADR-0064 (v0.6.1): equity FundamentalsAnalyst — default OFF.
+        # See _build_default_analysts() comment for context.
+        if os.environ.get("HERMES_QUANT_FUNDAMENTALS_ENABLED", "0") == "1":
+            try:
+                from hermes_quant.analysts.fundamentals import FundamentalsAnalyst
+
+                analysts.append(FundamentalsAnalyst())
+            except ImportError:
+                pass
 
     views: list[AnalystView] = []
     for analyst in analysts:
