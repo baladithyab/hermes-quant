@@ -244,7 +244,7 @@ class TestRunOneTick:
         bars = _make_bars(100, drift=0.002)
         provider = _make_provider(bars)
         analysts = [_make_analyst(1)]
-        agg = BMAAggregator()
+        agg = BMAAggregator(require_ensemble=False)
         # Tight drawdown limit: 5% drawdown will trip
         gate = DefaultRiskGate(
             RiskConfig(
