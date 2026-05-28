@@ -139,10 +139,16 @@ class PortfolioDecision(BaseModel):
 
 
 def _direction_from_recommendation(rec: str) -> int:
-    """Map 5-tier recommendation to a -1/0/+1 Direction for CommitteeTurn."""
-    if rec in ("Buy", "Overweight"):
+    """Map 5-tier recommendation to a -1/0/+1 Direction for CommitteeTurn.
+
+    Accepts both Title-case (legacy local ResearchPlan, ``Buy``/``Hold``/...)
+    and UPPER-case (ADR-0058 PortfolioRating StrEnum, ``BUY``/``HOLD``/...)
+    so the v0.6.2 ResearchDebateStage dispatch path (ADR-0066) can pass
+    PortfolioRating values straight through.
+    """
+    if rec in ("Buy", "Overweight", "BUY", "OVERWEIGHT"):
         return 1
-    if rec in ("Sell", "Underweight"):
+    if rec in ("Sell", "Underweight", "SELL", "UNDERWEIGHT"):
         return -1
     return 0
 
@@ -646,6 +652,269 @@ def _run_one_turn(
 
 
 # ---------------------------------------------------------------------------
+# v0.6.2: ResearchDebateStage adapters (ADR-0066)
+# ---------------------------------------------------------------------------
+
+
+def _run_one_turn_with_history(
+    *,
+    role: str,
+    client: Any,
+    config: DeliberativeConfig,
+    market_context: MarketContext,
+    analyst_views: list[AnalystView],
+    baseline_signal: AggregatedSignal,
+    current_response: str,
+    own_history: str,
+    round_index: int,
+    conversational_preamble: str,
+) -> CommitteeTurn | None:
+    """Adversarial-debate adapter over `_run_one_turn` (ADR-0066, v0.6.2).
+
+    Thin adapter that forwards the conversational placeholders from
+    ``run_research_debate`` (ADR-0065) into ``_render_prompt``. Mirrors the
+    bull/bear branch of ``_run_one_turn`` (lines 528-556) with one difference:
+    ``prior_turns=[]`` (this stage is conversational; the legacy parallel-emit
+    path's ``prior_turns`` are not relevant).
+
+    Failure-closed: returns ``None`` on any exception, parse failure, or
+    role mismatch. Caller (the stage runner) is responsible for the
+    two-consecutive-failures bail-out.
+    """
+    if role not in _BULL_BEAR_ROLES:
+        logger.warning(
+            "_run_one_turn_with_history called with non-bull/bear role %r; "
+            "this adapter only handles the adversarial debate roles",
+            role,
+        )
+        return None
+
+    model = _model_for_role(role, config)
+    tier = _expected_tier_for_role(role)
+
+    try:
+        system_text, user_text = _render_prompt(
+            role=role,
+            market_context=market_context,
+            analyst_views=analyst_views,
+            baseline_signal=baseline_signal,
+            prior_turns=[],
+            current_response=current_response,
+            own_history=own_history,
+            round_index=round_index,
+            conversational_preamble=conversational_preamble,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to render conversational prompt for role %r round=%d",
+            role,
+            round_index,
+        )
+        return None
+
+    phash = _prompt_hash(system_text, user_text)
+
+    try:
+        raw = _call_llm_json(
+            client=client,
+            model=model,
+            system_text=system_text,
+            user_text=user_text,
+            max_tokens=config.max_tokens_per_turn,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "LLM call raised in _run_one_turn_with_history role=%r", role
+        )
+        return None
+    if raw is None:
+        return None
+
+    parsed = _parse_pydantic(raw, BullBearTurn)
+    if parsed is None or not isinstance(parsed, BullBearTurn):
+        return None
+    if parsed.role != role:
+        logger.warning(
+            "LLM returned role=%r but we asked for %r; dropping (with-history)",
+            parsed.role,
+            role,
+        )
+        return None
+
+    # C1/C3 fix (v0.6.2): persist prompt_hash + round_index into BullBearTurn.metadata
+    # so they round-trip through state.bull_turns / state.bear_turns and into the
+    # dispatch's CommitteeTurn metadata + audit row. The CommitteeTurn returned here
+    # also carries them, but the stage runner only retains the BullBearTurn objects;
+    # without this, the dispatch path (~lines 940-980) would lose prompt_hash and
+    # the stage-controlled round_index.
+    # Forge-resistance: overwrite any LLM-supplied 'round' value with the
+    # stage-controlled round_index.
+    if parsed.metadata is None:
+        parsed.metadata = {}
+    parsed.metadata["prompt_hash"] = phash
+    parsed.metadata["round"] = round_index
+
+    return CommitteeTurn(
+        role=role,  # type: ignore[arg-type]
+        stance=parsed.stance,
+        direction=_direction_from_role(role),  # type: ignore[arg-type]
+        confidence=parsed.confidence,
+        rationale=parsed.rationale,
+        model=f"llm:{model}",
+        input_hash=None,
+        metadata={
+            "tier": tier,
+            "model_id": model,
+            "prompt_hash": phash,
+            "round_index": round_index,
+            "from_research_debate": True,
+            "key_evidence": list(parsed.key_evidence),
+            "counterarguments": parsed.counterarguments,
+            "structured": parsed.model_dump(),
+        },
+        tier=tier,
+    )
+
+
+def _run_research_manager_judge(
+    *,
+    client: Any,
+    config: DeliberativeConfig,
+    market_context: MarketContext,
+    analyst_views: list[AnalystView],
+    baseline_signal: AggregatedSignal,
+    bull_turns: list[BullBearTurn],
+    bear_turns: list[BullBearTurn],
+):
+    """ResearchManager judge adapter (ADR-0066, v0.6.2).
+
+    Renders the ``research_manager`` prompt, calls the deep-tier LLM, and
+    parses the response into the *new* ``ResearchPlan`` schema from
+    ``hermes_quant.agents.research_debate.schemas`` (the one with the
+    ``PortfolioRating`` StrEnum, NOT the legacy local ``ResearchPlan`` with
+    the ``overrules_baseline`` bool).
+
+    Workaround for prompt-template drift: the existing ``research_manager.md``
+    template still asks for an ``overrules_baseline`` field. The new schema
+    has ``extra='forbid'`` so that field would otherwise reject the entire
+    payload. We strip it from the parsed JSON dict before validation. This
+    keeps the prompt template stable until v0.6.3 rewrites it.
+
+    Failure-closed: returns ``None`` on any failure (LLM exception, JSON
+    parse error, Pydantic validation error). The stage runner inspects the
+    return value and records ``state.judge_decision = None`` on None.
+
+    Note: ``bull_turns`` / ``bear_turns`` are part of the ADR-0066 signature
+    so the stage runner can pass debate context. The current
+    ``research_manager.md`` template renders from analyst_views +
+    baseline_signal; future iterations may inject a debate-summary section
+    that consumes these. Today they are accepted but unused at the prompt
+    layer (the renderer pulls debate context from history threads upstream).
+    """
+    # Lazy import — avoids a circular dep at module import time.
+    from hermes_quant.agents.research_debate.schemas import (
+        ResearchPlan as _ResearchDebateResearchPlan,
+    )
+
+    role = "research_manager"
+    model = _model_for_role(role, config)
+
+    # H2 fix (v0.6.2): thread bull/bear debate context into the judge's prompt
+    # by synthesizing CommitteeTurn entries from the BullBearTurn list.
+    # _render_prompt's _serialize_prior_turns will fold them into the prompt's
+    # "Prior committee turns" block (rationale + stance + confidence are
+    # preserved; metadata is dropped per existing _serialize_prior_turns).
+    # Without this, the judge previously ran blind: prior_turns=[] discarded
+    # all bull/bear content the debate stage produced.
+    synth_prior_turns: list[CommitteeTurn] = []
+    for bt in bull_turns or []:
+        synth_prior_turns.append(
+            CommitteeTurn(
+                role="bull_researcher",  # type: ignore[arg-type]
+                stance=bt.stance,
+                direction=_direction_from_role("bull_researcher"),  # type: ignore[arg-type]
+                confidence=bt.confidence,
+                rationale=bt.rationale,
+                model="llm:research_debate",
+                input_hash=None,
+                metadata={
+                    "from_research_debate": True,
+                    "structured": bt.model_dump(),
+                },
+                tier="quick",
+            )
+        )
+    for bt in bear_turns or []:
+        synth_prior_turns.append(
+            CommitteeTurn(
+                role="bear_researcher",  # type: ignore[arg-type]
+                stance=bt.stance,
+                direction=_direction_from_role("bear_researcher"),  # type: ignore[arg-type]
+                confidence=bt.confidence,
+                rationale=bt.rationale,
+                model="llm:research_debate",
+                input_hash=None,
+                metadata={
+                    "from_research_debate": True,
+                    "structured": bt.model_dump(),
+                },
+                tier="quick",
+            )
+        )
+
+    try:
+        system_text, user_text = _render_prompt(
+            role=role,
+            market_context=market_context,
+            analyst_views=analyst_views,
+            baseline_signal=baseline_signal,
+            prior_turns=synth_prior_turns,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to render research_manager prompt for judge")
+        return None
+
+    try:
+        raw = _call_llm_json(
+            client=client,
+            model=model,
+            system_text=system_text,
+            user_text=user_text,
+            max_tokens=config.max_tokens_per_turn,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("LLM call raised in _run_research_manager_judge")
+        return None
+    if raw is None:
+        return None
+
+    # ADR-0066: strip legacy `overrules_baseline` from the JSON body before
+    # parsing into the new schema (extra='forbid' would otherwise reject).
+    cleaned = raw
+    try:
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+            if text.endswith("```"):
+                text = text[:-3].strip()
+        raw_dict = json.loads(text)
+        if isinstance(raw_dict, dict):
+            raw_dict.pop("overrules_baseline", None)
+            cleaned = json.dumps(raw_dict)
+    except Exception:  # noqa: BLE001
+        # Let _parse_pydantic surface the JSON error consistently.
+        pass
+
+    parsed = _parse_pydantic(cleaned, _ResearchDebateResearchPlan)
+    if parsed is None or not isinstance(parsed, _ResearchDebateResearchPlan):
+        return None
+    return parsed
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -699,15 +968,119 @@ def run_llm_committee(
     turns: list[CommitteeTurn] = []
     consecutive_failures = 0
 
-    # ADR-0065 (v0.6.1, G1): research debate stage dispatch.
-    # v0.6.1 ships behind HERMES_QUANT_RESEARCH_DEBATE=0 default. When ON, currently logs and falls through
-    # to legacy path because _run_one_turn_with_history / _run_research_manager_judge production helpers
-    # are not yet wired (deferred to v0.6.2). See ADR-0065 §Implementation Plan §7.
+    # ADR-0066 (v0.6.2, G1): research debate stage dispatch.
+    # When HERMES_QUANT_RESEARCH_DEBATE=1, run the alternating bull/bear
+    # debate stage with conversational history threading and a final
+    # ResearchManager judge, then translate the resulting state into
+    # CommitteeTurn envelopes for the deterministic aggregator. On any
+    # exception the path falls through to the legacy parallel-emit committee.
     if os.environ.get("HERMES_QUANT_RESEARCH_DEBATE", "0") == "1":
-        logger.warning(
-            "HERMES_QUANT_RESEARCH_DEBATE=1 set but production wiring deferred to v0.6.2. "
-            "Falling through to legacy bull/bear committee for this tick."
-        )
+        try:
+            from hermes_quant.agents.research_debate.stage import (
+                run_research_debate,
+            )
+
+            state = run_research_debate(
+                ctx=market_context,
+                baseline_signal=baseline_signal,
+                analyst_views=analyst_views,
+                config=config,
+                client=client,
+                run_one_turn=_run_one_turn_with_history,
+                run_judge=_run_research_manager_judge,
+            )
+
+            quick_model = config.quick_model
+            deep_model = config.deep_model
+
+            for bt in state.bull_turns:
+                md = bt.metadata or {}
+                turns.append(
+                    CommitteeTurn(
+                        role="bull_researcher",  # type: ignore[arg-type]
+                        stance=bt.stance,
+                        direction=_direction_from_role("bull_researcher"),  # type: ignore[arg-type]
+                        confidence=bt.confidence,
+                        rationale=bt.rationale,
+                        model=f"llm:research_debate:{quick_model}",
+                        input_hash=None,
+                        metadata={
+                            "tier": "quick",
+                            "model_id": quick_model,
+                            "from_research_debate": True,
+                            # C1/C3 fix (v0.6.2): forensics persisted from the
+                            # helper via BullBearTurn.metadata.
+                            "prompt_hash": md.get("prompt_hash"),
+                            "round_index": md.get("round"),
+                            "key_evidence": list(bt.key_evidence),
+                            "counterarguments": bt.counterarguments,
+                            "structured": bt.model_dump(),
+                        },
+                        tier="quick",
+                    )
+                )
+            for bt in state.bear_turns:
+                md = bt.metadata or {}
+                turns.append(
+                    CommitteeTurn(
+                        role="bear_researcher",  # type: ignore[arg-type]
+                        stance=bt.stance,
+                        direction=_direction_from_role("bear_researcher"),  # type: ignore[arg-type]
+                        confidence=bt.confidence,
+                        rationale=bt.rationale,
+                        model=f"llm:research_debate:{quick_model}",
+                        input_hash=None,
+                        metadata={
+                            "tier": "quick",
+                            "model_id": quick_model,
+                            "from_research_debate": True,
+                            # C1/C3 fix (v0.6.2): forensics persisted from the
+                            # helper via BullBearTurn.metadata.
+                            "prompt_hash": md.get("prompt_hash"),
+                            "round_index": md.get("round"),
+                            "key_evidence": list(bt.key_evidence),
+                            "counterarguments": bt.counterarguments,
+                            "structured": bt.model_dump(),
+                        },
+                        tier="quick",
+                    )
+                )
+
+            if state.judge_decision is not None:
+                jd = state.judge_decision
+                # PortfolioRating is a StrEnum; be defensive in case a future
+                # validator coerces to a plain str.
+                rec_value = getattr(jd.recommendation, "value", str(jd.recommendation))
+                turns.append(
+                    CommitteeTurn(
+                        role="portfolio_manager",  # type: ignore[arg-type]
+                        stance=f"judge:{rec_value}",
+                        direction=_direction_from_recommendation(rec_value),  # type: ignore[arg-type]
+                        confidence=jd.confidence,
+                        rationale=jd.rationale,
+                        model=f"llm:research_debate_judge:{deep_model}",
+                        input_hash=None,
+                        metadata={
+                            "tier": "deep",
+                            "model_id": deep_model,
+                            "logical_role": "research_manager",
+                            "recommendation": rec_value,
+                            "from_research_debate": True,
+                            "structured": jd.model_dump(mode="json"),
+                            "terminated_reason": state.terminated_reason,
+                        },
+                        tier="deep",
+                    )
+                )
+            return turns
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "ResearchDebateStage failed; falling back to legacy "
+                "committee path for this tick"
+            )
+            # Fall through to the existing legacy parallel-emit code below.
+            turns = []
+            consecutive_failures = 0
 
     def _emit(role: str) -> bool:
         nonlocal consecutive_failures
