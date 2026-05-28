@@ -699,6 +699,16 @@ def run_llm_committee(
     turns: list[CommitteeTurn] = []
     consecutive_failures = 0
 
+    # ADR-0065 (v0.6.1, G1): research debate stage dispatch.
+    # v0.6.1 ships behind HERMES_QUANT_RESEARCH_DEBATE=0 default. When ON, currently logs and falls through
+    # to legacy path because _run_one_turn_with_history / _run_research_manager_judge production helpers
+    # are not yet wired (deferred to v0.6.2). See ADR-0065 §Implementation Plan §7.
+    if os.environ.get("HERMES_QUANT_RESEARCH_DEBATE", "0") == "1":
+        logger.warning(
+            "HERMES_QUANT_RESEARCH_DEBATE=1 set but production wiring deferred to v0.6.2. "
+            "Falling through to legacy bull/bear committee for this tick."
+        )
+
     def _emit(role: str) -> bool:
         nonlocal consecutive_failures
         try:
