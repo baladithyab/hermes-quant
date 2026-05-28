@@ -757,6 +757,101 @@ def _run_one_turn_with_history(
     )
 
 
+def _run_research_manager_judge(
+    *,
+    client: Any,
+    config: DeliberativeConfig,
+    market_context: MarketContext,
+    analyst_views: list[AnalystView],
+    baseline_signal: AggregatedSignal,
+    bull_turns: list[BullBearTurn],
+    bear_turns: list[BullBearTurn],
+):
+    """ResearchManager judge adapter (ADR-0066, v0.6.2).
+
+    Renders the ``research_manager`` prompt, calls the deep-tier LLM, and
+    parses the response into the *new* ``ResearchPlan`` schema from
+    ``hermes_quant.agents.research_debate.schemas`` (the one with the
+    ``PortfolioRating`` StrEnum, NOT the legacy local ``ResearchPlan`` with
+    the ``overrules_baseline`` bool).
+
+    Workaround for prompt-template drift: the existing ``research_manager.md``
+    template still asks for an ``overrules_baseline`` field. The new schema
+    has ``extra='forbid'`` so that field would otherwise reject the entire
+    payload. We strip it from the parsed JSON dict before validation. This
+    keeps the prompt template stable until v0.6.3 rewrites it.
+
+    Failure-closed: returns ``None`` on any failure (LLM exception, JSON
+    parse error, Pydantic validation error). The stage runner inspects the
+    return value and records ``state.judge_decision = None`` on None.
+
+    Note: ``bull_turns`` / ``bear_turns`` are part of the ADR-0066 signature
+    so the stage runner can pass debate context. The current
+    ``research_manager.md`` template renders from analyst_views +
+    baseline_signal; future iterations may inject a debate-summary section
+    that consumes these. Today they are accepted but unused at the prompt
+    layer (the renderer pulls debate context from history threads upstream).
+    """
+    # Lazy import — avoids a circular dep at module import time.
+    from hermes_quant.agents.research_debate.schemas import (
+        ResearchPlan as _ResearchDebateResearchPlan,
+    )
+
+    role = "research_manager"
+    model = _model_for_role(role, config)
+
+    try:
+        system_text, user_text = _render_prompt(
+            role=role,
+            market_context=market_context,
+            analyst_views=analyst_views,
+            baseline_signal=baseline_signal,
+            prior_turns=[],
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to render research_manager prompt for judge")
+        return None
+
+    try:
+        raw = _call_llm_json(
+            client=client,
+            model=model,
+            system_text=system_text,
+            user_text=user_text,
+            max_tokens=config.max_tokens_per_turn,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("LLM call raised in _run_research_manager_judge")
+        return None
+    if raw is None:
+        return None
+
+    # ADR-0066: strip legacy `overrules_baseline` from the JSON body before
+    # parsing into the new schema (extra='forbid' would otherwise reject).
+    cleaned = raw
+    try:
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+            if text.endswith("```"):
+                text = text[:-3].strip()
+        raw_dict = json.loads(text)
+        if isinstance(raw_dict, dict):
+            raw_dict.pop("overrules_baseline", None)
+            cleaned = json.dumps(raw_dict)
+    except Exception:  # noqa: BLE001
+        # Let _parse_pydantic surface the JSON error consistently.
+        pass
+
+    parsed = _parse_pydantic(cleaned, _ResearchDebateResearchPlan)
+    if parsed is None or not isinstance(parsed, _ResearchDebateResearchPlan):
+        return None
+    return parsed
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
