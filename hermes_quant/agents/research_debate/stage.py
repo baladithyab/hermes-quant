@@ -172,16 +172,16 @@ def run_research_debate(
     pid = proposal_id or f"rdp-{uuid.uuid4().hex[:12]}"
     state = InvestDebateState()
 
-    # Lazy import to avoid cycles: schemas.py → llm_committee → schemas (BullBearTurn).
+    # ADR-0065 §Implementation Plan §7: production turn/judge wiring is deferred to v0.6.2.
+    # The helpers `_run_one_turn_with_history` and `_run_research_manager_judge` are referenced
+    # in design docs but not yet defined in `llm_committee.py`. Until v0.6.2 lands the wiring,
+    # callers (including tests) MUST inject `run_one_turn=` and `run_judge=` explicitly.
     if run_one_turn is None or run_judge is None:
-        from hermes_quant.aggregators.llm_committee import (
-            _run_one_turn_with_history,
-            _run_research_manager_judge,
+        raise NotImplementedError(
+            "run_research_debate: production turn/judge wiring not yet implemented in llm_committee.py. "
+            "_run_one_turn_with_history and _run_research_manager_judge are referenced but not defined. "
+            "See ADR-0065 §Implementation Plan §7. Tests must pass run_one_turn=, run_judge= kwargs explicitly."
         )
-        if run_one_turn is None:
-            run_one_turn = _run_one_turn_with_history
-        if run_judge is None:
-            run_judge = _run_research_manager_judge
 
     consecutive_failures = 0
     asset_str = getattr(ctx, "asset", None) or "unknown"
