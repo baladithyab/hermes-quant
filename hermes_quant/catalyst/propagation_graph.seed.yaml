@@ -1,0 +1,60 @@
+# Catalyst Sense — curated propagation graph (ADR-0074, D74.2)
+#
+# The "butterfly engine" edge set: how a catalyst on a SOURCE entity propagates
+# to touched SYMBOLS. Operator-editable. Falls back to the built-in seed in
+# hermes_quant/catalyst/propagation.py if this file is missing/malformed.
+#
+# effect_sign = sign of the propagated effect for a NEGATIVE catalyst on the
+#   source. A POSITIVE catalyst flips it automatically.
+#     -1  negative catalyst on source -> BEARISH for target (sector contagion)
+#     +1  negative catalyst on source -> BULLISH for target (competitor relief)
+# weight = 0..1 linkage strength -> drives packet CONFIDENCE (not magnitude).
+#
+# *** EDGE SIGN IS THE HIGHEST-RISK FIELD — REVIEW IT. *** A competitor's failure
+# can be read as bearish (sector confidence shock, the empirically dominant
+# short-horizon effect for catastrophic events) OR bullish (less competition).
+# v1 encodes the contagion reading; every propagation is logged so a learned
+# graph can correct signs later.
+
+aliases:
+  blue origin: blue origin
+  new glenn: blue origin
+  bezos: blue origin
+  jeff bezos: blue origin
+  rocket lab: rocket lab
+  spacex: spacex
+  opec: opec
+  taiwan earthquake: taiwan earthquake
+  tsmc: tsmc
+
+edges:
+  blue origin:
+    - {target: RKLB, relation: competitor,     effect_sign: -1, weight: 0.85}
+    - {target: LUNR, relation: competitor,     effect_sign: -1, weight: 0.75}
+    - {target: ASTS, relation: sector_member,  effect_sign: -1, weight: 0.70}
+    - {target: RDW,  relation: sector_member,  effect_sign: -1, weight: 0.60}
+
+  rocket lab:
+    - {target: RKLB, relation: self,           effect_sign: -1, weight: 0.95}
+    - {target: LUNR, relation: sector_member,  effect_sign: -1, weight: 0.45}
+    - {target: ASTS, relation: sector_member,  effect_sign: -1, weight: 0.40}
+
+  spacex:
+    # SpaceX is private; its events propagate to the public space basket.
+    - {target: RKLB, relation: competitor,     effect_sign: -1, weight: 0.60}
+    - {target: ASTS, relation: sector_member,  effect_sign: -1, weight: 0.55}
+
+  opec:
+    # Supply-cut / production headlines: bearish-on-OPEC-supply -> bullish energy.
+    - {target: XOM, relation: commodity,       effect_sign: +1, weight: 0.70}
+    - {target: CVX, relation: commodity,       effect_sign: +1, weight: 0.70}
+    - {target: OXY, relation: commodity,       effect_sign: +1, weight: 0.60}
+
+  taiwan earthquake:
+    - {target: TSM,  relation: supply_chain,   effect_sign: -1, weight: 0.80}
+    - {target: NVDA, relation: supply_chain,   effect_sign: -1, weight: 0.50}
+    - {target: AMD,  relation: supply_chain,   effect_sign: -1, weight: 0.45}
+
+  tsmc:
+    - {target: TSM,  relation: self,           effect_sign: -1, weight: 0.95}
+    - {target: NVDA, relation: supply_chain,   effect_sign: -1, weight: 0.55}
