@@ -342,6 +342,7 @@ def tick(
             clip_one_to_remaining_headroom,
             headroom_summary,
         )
+
         portfolio_state = reconstruct_portfolio_state()
         portfolio_caps = PortfolioCaps()
         logger.info(
@@ -424,7 +425,11 @@ def tick(
             # Order-dependent but operationally simpler than batching the loop.
             effective_size = kelly
             portfolio_clip_meta: dict[str, float | str | bool] | None = None
-            if portfolio_caps_enabled and portfolio_state is not None and portfolio_caps is not None:
+            if (
+                portfolio_caps_enabled
+                and portfolio_state is not None
+                and portfolio_caps is not None
+            ):
                 clipped = clip_one_to_remaining_headroom(
                     asset=entry.symbol,
                     per_symbol_target_pct=kelly,
@@ -450,6 +455,40 @@ def tick(
                     result.silences += 1
                     result.decisions.append(decision)
                     continue
+
+            # ADR-0077 pre-trade admissibility (DEFAULT-OFF, HERMES_QUANT_ADMISSIBILITY).
+            # A hard, fail-closed precondition UPSTREAM of the ADR-0004 gate: it can only
+            # REJECT a proposed short (-> SILENCE), never amplify or override. With the flag
+            # OFF this block is skipped entirely -> behavior is bit-for-bit identical to today.
+            if os.environ.get("HERMES_QUANT_ADMISSIBILITY", "0") == "1" and effective_size < 0:
+                from hermes_quant.admissibility import (
+                    AdmissibilityContext,
+                    apply_verdict_to_target,
+                    select_oracle,
+                )
+
+                oracle = select_oracle()
+                # Live oracle populates ctx from get_asset(); the empty ctx here means
+                # the oracle resolves shortability itself (fail-closed on error).
+                asof_decision_dt = datetime.now(tz=UTC)
+                verdict = oracle.verdict(
+                    entry.symbol,
+                    "short",
+                    abs(effective_size),
+                    asof_decision_dt,
+                    AdmissibilityContext(),
+                )
+                adj = apply_verdict_to_target(effective_size, verdict)
+                if adj.adjusted_target_pct == 0.0:
+                    decision.gate = "SILENCE_ADMISSIBILITY"
+                    decision.details = {
+                        "reason": verdict.reason,
+                        "admissibility_state": verdict.state.value,
+                    }
+                    result.silences += 1
+                    result.decisions.append(decision)
+                    continue
+                effective_size = adj.adjusted_target_pct
 
             decision.action = {
                 "target_position_pct": effective_size,
