@@ -113,34 +113,19 @@ def recommend_one(symbol: str, asset_class: str = "equity", timeframe: str = "1d
     """
     try:
         from hermes_quant.advisor import recommend
-        # ADR-0074: load lookahead-honest semantic packets for this symbol and
-        # forward them via market_extras. The catalyst subsystem writes packets
-        # (asof=publication time); load_packets_for validates non-future +
-        # freshness against now, and the HermesSemanticAnalyst (gated by
-        # HERMES_QUANT_SEMANTIC_ENABLED) re-validates against ctx.asof. Empty
-        # list when the subsystem is off / has no packets -> advisor unchanged.
-        market_extras = None
-        try:
-            import os as _os
-            if _os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "0") == "1":
-                from datetime import datetime as _dt, timezone as _tz
-                from hermes_quant.catalyst.synthesize import load_packets_for
-                packets = load_packets_for(symbol, _dt.now(_tz.utc), horizon=timeframe)
-                if packets:
-                    # decision_asof = wall-clock now so the semantic analyst
-                    # validates packets against decision time, not the last
-                    # daily bar (ADR-0074/0068). Live news IS available now.
-                    market_extras = {
-                        "semantic_packets": packets,
-                        "decision_asof": _dt.now(_tz.utc).isoformat(),
-                    }
-        except Exception:
-            market_extras = None  # never block the recommend on packet loading
-        if market_extras is not None:
-            result = recommend(symbol=symbol, asset_class=asset_class,
-                               timeframe=timeframe, market_extras=market_extras)
-        else:
-            result = recommend(symbol=symbol, asset_class=asset_class, timeframe=timeframe)
+        # ADR-0074 / C2-2: load lookahead-honest semantic packets for this symbol
+        # and forward them via market_extras through the SINGLE catalyst->advisor
+        # wiring seam (hermes_quant.catalyst.wiring.semantic_market_extras). The
+        # catalyst subsystem writes packets (asof=publication time); the helper
+        # validates non-future + freshness against decision time (wall-clock now,
+        # so the live path doesn't reject today's news against a stale daily bar —
+        # ADR-0074/0068), and the HermesSemanticAnalyst re-validates against
+        # ctx.asof. Returns None when the subsystem is off / has no packets, and
+        # recommend(market_extras=None) is the existing no-op -> advisor unchanged.
+        from hermes_quant.catalyst.wiring import semantic_market_extras
+        market_extras = semantic_market_extras(symbol, horizon=timeframe)
+        result = recommend(symbol=symbol, asset_class=asset_class,
+                           timeframe=timeframe, market_extras=market_extras)
         agg = result.get("aggregated_signal") or {}
         gate = result.get("risk_gate") or {}
         dq = result.get("data_quality") or {}

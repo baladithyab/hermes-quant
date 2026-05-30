@@ -91,3 +91,34 @@ immediately instead of silently producing unconsumed packets.
   when the flag is on.
 - Retro attribution: `admitted_via=catalyst` trades reported as a distinct
   bucket in the weekly strategy retro.
+
+## Implementation status (Wave C2 — 2026-05-30)
+
+The onboarding mechanism is **built and merged behind the default-OFF flag**,
+but the flag **remains OFF** (header stays *Proposed*) until the eval-gate axis
+below is green. Shipped this wave:
+
+- `hermes_quant/catalyst/onboarding.py` — `catalyst_admissions(universe, tradeable=…)`
+  (≤3 cap via `MAX_ADMISSIONS`, `TAU_CONF=0.60`/`TAU_MAG=0.04` thresholds, ranks by
+  `confidence*magnitude`, derives direction from stance, fail-closed tradeability
+  gate). Returns `[]` unless **both** `HERMES_QUANT_CATALYST_ONBOARDING=1` AND
+  `HERMES_QUANT_SEMANTIC_ENABLED=1` are set; never raises (silence-by-default).
+- `default_tradeable(symbol)` reuses the ADR-0077 oracle via a new read-only
+  `AlpacaShortabilityOracle.is_tradeable_long(symbol)` (`tradable AND fractionable`),
+  fail-closed to `False` when the oracle is absent/raises (no duplicate `get_asset`).
+- Seam A wiring (`ops/scripts/quant-watchlist-evolve.py` → `evolve_watchlist`): new
+  default-`None` kwargs `fast_track_symbols` (same-day onboard, `sticky_onboard_days=0`),
+  `admission_extras` (stamps `admitted_via=catalyst`/horizon/asof on the onboarded
+  `WatchlistEntry.extras`), `extra_universe_symbols` (unions admitted out-of-universe
+  names into the scored set), and `position_lookup` (sticky-removal protection —
+  Nautilus #3359 / LEAN `CanRemoveMember`: a catalyst row with an open position is not
+  slow-evicted before its horizon closes; fail-safe to hold when unknown). With the
+  kwargs `None`, `evolve_watchlist` output is bit-for-bit identical to today.
+- `admitted_via=catalyst` rides `play-fit.json` → the autonomous-tick decision audit
+  row (`quant-autonomous-tick.py`) for distinct retro attribution.
+
+**Eval-gate axis (gating artifact — do NOT flip the flag without this):** add the
+labeled out-of-universe case (the real `LUNR` Blue-Origin move) to the catalyst eval
+so it must produce (1) an admission, (2) correct direction, (3) a fillable simulated
+order. The flag stays OFF and this ADR stays *Proposed* until that axis is green; flip
+to *Accepted* only after.

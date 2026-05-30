@@ -68,6 +68,11 @@ AUDIT_LOG_PATH = QUANT_HOME / "autonomous-tick.jsonl"
 ET = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
+# ADR-0075: per-symbol admitted_via tag captured from play-fit.json extras during
+# watchlist load, copied into each decision audit row for catalyst attribution.
+# Empty when no catalyst-onboarded names are active (today's default behavior).
+_ADMITTED_VIA: dict[str, str] = {}
+
 
 # ---------- utilities ----------
 def utcnow_iso() -> str:
@@ -133,6 +138,13 @@ def load_active_watchlist() -> list[tuple[str, str, str, list[str]]]:
             if not sym:
                 continue
             by_sym.setdefault(sym, []).append(play)
+            # ADR-0075: capture the admitted_via tag (rides WatchlistEntry.extras
+            # -> play-fit.json) so the decision audit row attributes catalyst-
+            # onboarded trades distinctly. Absent extras -> no tag (today's rows).
+            extras = e.get("extras") or {}
+            via = extras.get("admitted_via")
+            if via:
+                _ADMITTED_VIA[sym] = via
 
     return [
         (sym, "equity", "1d", sorted(plays))
@@ -320,6 +332,18 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
         plays. Neutralization sets risk_gate.pass=False so auto.tick never fires
         the React — the order is genuinely prevented, not relabeled after the
         fact. No-op (returns the advisor result untouched) when the flag is OFF."""
+        # C2-2: inject lookahead-honest semantic packets via the single
+        # catalyst->advisor wiring seam so HERMES_QUANT_SEMANTIC_ENABLED takes
+        # effect on this path too (gap G3). Lazy import keeps the module import
+        # surface unchanged; the helper returns None (advisor unchanged) when
+        # semantic is OFF / no packets. Only inject when the caller hasn't
+        # already supplied market_extras (don't clobber an explicit override).
+        _inj_sym = kwargs.get("symbol")
+        if _inj_sym and "market_extras" not in kwargs:
+            from hermes_quant.catalyst.wiring import semantic_market_extras
+            _me = semantic_market_extras(_inj_sym, horizon=kwargs.get("timeframe", "1d"))
+            if _me is not None:
+                kwargs = {**kwargs, "market_extras": _me}
         res = _base_recommend(**kwargs)
         if not _direction_bias_gate_on:
             return res
@@ -432,6 +456,11 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
             rec["execution_id"] = d.execution_id
         if d.error is not None:
             rec["error"] = d.error
+        # ADR-0075: attribute catalyst-onboarded trades distinctly in the audit
+        # trail. Only present when the symbol carries an admitted_via tag.
+        via = _ADMITTED_VIA.get(sym)
+        if via:
+            rec["admitted_via"] = via
         append_audit(rec)
 
     # Append the tick summary itself to close the audit picture.

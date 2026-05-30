@@ -461,8 +461,19 @@ def call_advisor(symbol: str) -> dict[str, Any]:
     horizons, dropped = _parse_horizons(horizons_env) if horizons_env else (["1d"], [])
     primary_timeframe = horizons[-1] if horizons else "1d"
 
+    # C2-2: inject lookahead-honest semantic packets via the single
+    # catalyst->advisor wiring seam so HERMES_QUANT_SEMANTIC_ENABLED takes effect
+    # on this path too (gap G3). Returns None (advisor unchanged — recommend
+    # treats market_extras=None as the existing no-op) when semantic is OFF /
+    # no packets. The _mock_recommend path above never reaches here.
     try:
-        result = _recommend(symbol, asset_class="equity", timeframe=primary_timeframe)
+        from hermes_quant.catalyst.wiring import semantic_market_extras
+        _me = semantic_market_extras(symbol, horizon=primary_timeframe)
+    except Exception:  # noqa: BLE001 — never block the tick on packet loading
+        _me = None
+    try:
+        result = _recommend(symbol, asset_class="equity",
+                            timeframe=primary_timeframe, market_extras=_me)
     except Exception as e:
         return {"gate": {"action": "ERROR", "reason": f"advisor_exception: {type(e).__name__}: {e}"},
                 "caveats": [traceback.format_exc()]}

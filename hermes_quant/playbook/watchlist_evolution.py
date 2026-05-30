@@ -257,12 +257,22 @@ def _evolve_one_play(
     sticky_onboard_days: int,
     max_per_play: int,
     eviction_rules: Callable[[WatchlistEntry, float], str | None] | None,
+    fast_track_symbols: set[str] | None = None,
+    admission_extras: dict[str, dict] | None = None,
+    position_lookup: Callable[[str], bool] | None = None,
 ) -> tuple[list[WatchlistEntry], list[dict[str, Any]]]:
     """Run one evolution step for one play.
 
     Returns the new ranked entry list and the journal events emitted by
     this step.
     """
+
+    # ADR-0075 catalyst onboarding: fast-track symbols onboard same-day
+    # (sticky_onboard_days=0) and carry admission_extras (admitted_via=catalyst,
+    # horizon, asof) to disk. Both default to empty -> all existing callers are
+    # bit-for-bit identical.
+    fast_track = fast_track_symbols or set()
+    admission_extras = admission_extras or {}
 
     # Index existing rows by symbol so we can update in place (logically; the
     # dataclass is frozen, so each "update" is a `replace`).
@@ -322,7 +332,17 @@ def _evolve_one_play(
         evict_reason: str | None = None
         if score < evict_floor:
             evict_reason = f"score<{evict_floor:.2f} (fast)"
-        elif row.state == STATE_ACTIVE and row.consecutive_days_below_onboard >= SLOW_EVICT_RUNS:
+        elif (
+            row.state == STATE_ACTIVE
+            and row.consecutive_days_below_onboard >= SLOW_EVICT_RUNS
+            and not _catalyst_eviction_protected(row, asof, position_lookup)
+        ):
+            # Sticky-removal protection (ADR-0075 §1.4; Nautilus #3359 /
+            # LEAN CanRemoveMember): a catalyst-admitted row with an open position
+            # whose horizon hasn't closed is NOT slow-evicted — let the position
+            # close out over the catalyst's horizon first. _catalyst_eviction_protected
+            # returns True (protect) only for admitted_via=catalyst rows within
+            # horizon; non-catalyst rows fall through to the normal slow-evict.
             evict_reason = f"score<{onboard_floor:.2f} for {SLOW_EVICT_RUNS} runs (slow)"
         elif eviction_rules is not None:
             try:
@@ -363,26 +383,37 @@ def _evolve_one_play(
                 )
 
         # ---- Onboard rule (only if not evicted this run) ----------------
+        # ADR-0075: a catalyst-fast-tracked symbol needs 0 consecutive runs (a
+        # 1-day catalyst must be actionable that day); universe names keep the
+        # configured sticky window.
+        effective_sticky = 0 if symbol in fast_track else sticky_onboard_days
         if (
             row.state != STATE_EVICTED
             and row.state != STATE_ACTIVE
-            and row.consecutive_days_above_floor >= sticky_onboard_days
+            and row.consecutive_days_above_floor >= effective_sticky
             and active_count < max_per_play
         ):
+            onboard_extras = admission_extras.get(symbol)
             row = replace(
                 row,
                 state=STATE_ACTIVE,
                 onboarded_at=asof,
                 eviction_reason=None,
+                extras=dict(onboard_extras) if onboard_extras else row.extras,
             )
             active_count += 1
+            reason = (
+                f"catalyst fast-track >= {onboard_floor:.2f}"
+                if symbol in fast_track
+                else f"sticky({sticky_onboard_days}) >= {onboard_floor:.2f}"
+            )
             events.append(
                 _event(
                     asof=asof,
                     play=play,
                     symbol=symbol,
                     action=ACTION_ONBOARD,
-                    reason=f"sticky({sticky_onboard_days}) >= {onboard_floor:.2f}",
+                    reason=reason,
                     score_before=prev_score,
                     score_after=score,
                 )
@@ -428,6 +459,55 @@ def _evolve_one_play(
     return new_rows, events
 
 
+def _horizon_to_days(horizon: str | None) -> int:
+    """Coarse horizon -> trading-day window for sticky-removal protection.
+
+    Catalyst horizons are short (days-to-weeks). Conservative mapping; an
+    unknown/unparseable horizon defaults to 1 day (the catalyst's minimum).
+    """
+    if not horizon:
+        return 1
+    h = str(horizon).strip().lower()
+    table = {"1d": 1, "1w": 7, "2w": 14, "1m": 30, "1q": 90}
+    return table.get(h, 1)
+
+
+def _catalyst_eviction_protected(
+    row: WatchlistEntry,
+    asof: pd.Timestamp,
+    position_lookup: Callable[[str], bool] | None,
+) -> bool:
+    """True iff `row` is a catalyst-admitted name that must NOT be slow-evicted yet.
+
+    Protection holds for an ``admitted_via=catalyst`` row whose catalyst horizon
+    window has NOT elapsed AND that has a live position. Position lookup is
+    best-effort: if it is unavailable or raises, we fail SAFE toward holding (treat
+    as having a position) so a catalyst's horizon isn't cut short by a missing
+    position feed. A non-catalyst row is never protected (returns False -> normal
+    slow-evict). Once the horizon elapses, protection lifts and the row evicts
+    normally on the next qualifying run.
+    """
+    extras = row.extras or {}
+    if extras.get("admitted_via") != "catalyst":
+        return False
+    # Horizon window check: protect only while inside the catalyst horizon.
+    onboarded = row.onboarded_at
+    if onboarded is not None and onboarded is not pd.NaT:
+        try:
+            elapsed_days = (asof - onboarded).days
+            if elapsed_days >= _horizon_to_days(extras.get("catalyst_horizon")):
+                return False  # horizon elapsed -> protection lifts
+        except (TypeError, ValueError):
+            pass  # unparseable timestamps -> fall through to fail-safe hold
+    # Live-position check: fail-safe toward holding when unknown.
+    if position_lookup is None:
+        return True
+    try:
+        return bool(position_lookup(row.symbol))
+    except Exception:  # noqa: BLE001 — missing position feed -> fail-safe hold
+        return True
+
+
 def _event(
     *,
     asof: pd.Timestamp,
@@ -468,6 +548,10 @@ def evolve_watchlist(
     eviction_rules: Callable[[WatchlistEntry, float], str | None] | None = None,
     asof: pd.Timestamp | None = None,
     plays: tuple[str, ...] = PLAY_NAMES,
+    fast_track_symbols: set[str] | None = None,
+    admission_extras: dict[str, dict] | None = None,
+    position_lookup: Callable[[str], bool] | None = None,
+    extra_universe_symbols: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run one evolution step over the universe + current watchlist state.
 
@@ -477,6 +561,18 @@ def evolve_watchlist(
     journal events.
 
     On missing universe (silence-by-default), returns an empty summary.
+
+    ADR-0075 catalyst onboarding (all default ``None`` -> existing callers
+    bit-for-bit identical):
+      * ``fast_track_symbols`` — symbols that onboard same-day
+        (``sticky_onboard_days=0``) rather than after the usual sticky window.
+      * ``admission_extras`` — ``{symbol: extras_dict}`` stamped onto the
+        ``WatchlistEntry.extras`` of an onboarded admitted name (carries
+        ``admitted_via=catalyst`` / horizon / asof to disk).
+      * ``position_lookup`` — best-effort ``symbol -> has_open_position`` used by
+        the sticky-removal protection (a catalyst-admitted name with an open
+        position is not slow-evicted before its horizon closes; fail-safe to hold
+        when unknown).
 
     Returns
     -------
@@ -504,6 +600,14 @@ def evolve_watchlist(
         asof = ts if ts.tzinfo is not None else ts.tz_localize("UTC")
 
     universe = _read_universe(universe_path)
+    # ADR-0075: union catalyst-admitted out-of-universe names into the scored
+    # universe (append, dedup, preserve order). Empty/None -> bit-identical.
+    if extra_universe_symbols:
+        _seen = set(universe)
+        for s in extra_universe_symbols:
+            if s and s not in _seen:
+                universe.append(s)
+                _seen.add(s)
     if not universe:
         # Silence-by-default — return an empty-but-valid summary.
         return {
@@ -541,6 +645,9 @@ def evolve_watchlist(
             sticky_onboard_days=sticky_onboard_days,
             max_per_play=max_per_play,
             eviction_rules=eviction_rules,
+            fast_track_symbols=fast_track_symbols,
+            admission_extras=admission_extras,
+            position_lookup=position_lookup,
         )
         new_state[play] = new_rows
         all_events.extend(events)
