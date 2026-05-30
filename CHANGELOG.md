@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **ADR-0076**: social-arbitrage integration — consumer-trend entity class, sized fusion, profitability-verification loop.
+- **Consumer-trend entity class** (`brand_self` edges CELH/CROX/DIIBF/TPR/NWL) in the live propagation graph + consumer-trend catalyst lexicon (`viral`, `craze`, `sells out`, `frenzy`, `shortage`, …) in `classify.py`.
+- **Confidence-haircut sizing** (`CONSUMER_TREND_CONFIDENCE_HAIRCUT = 0.5` in `synthesize.py`) — weak-eval social-arb signal enters BMA as a deliberately weak peer view; `require_ensemble` already prevents it firing alone.
+- **Social producers** (`hermes_quant/catalyst/social.py`): stdlib-only Reddit + Google Trends, mirroring the GN-RSS ingester (injectable fetcher, silence-by-default, same `CatalystItem`). Reddit needs OAuth/residential IP in production (403s datacenter IPs).
+- **Profitability-verification loop** (`hermes_quant/catalyst/profitability.py` + `ops/scripts/quant-catalyst-profitability.py`): joins the propagation log against realized forward returns by relation class, emits PROFITABLE / UNPROFITABLE_CONSIDER_PRUNE / INSUFFICIENT_SAMPLE verdicts — the data-driven gate on raising the consumer-trend weight.
+- **Learned-graph log persistence** (`propagation.log_propagations`) wired into the deployed ingester (per-item, with `asof`) — the corpus the profitability loop + future learned graph mine.
+- **PMCC shadow tracker** (`hermes_quant/shadow/pmcc.py`, design doc `docs/design/pmcc-shadow-tracker.md`): marks a deep-ITM-LEAPS + rolling-short structure to model against the ADR-0029 multi-leg gap.
+- **Wave-3 candidate sleeve** wiring (`ops/scripts/quant-wave3-candidates.py`).
+- **Phase-0 social-arb eval runners** (`ops/scripts/quant-catalyst-socialarb-{labels,eval}.py`): the measure-first edge proof (knife-edge 0.60 pass on n=5).
+
+### Changed
+
+- Deployed `quant-catalyst-ingest.py`: added 4 consumer-trend GN-RSS queries; now persists the propagation log per-item.
+- `docs/adr/README.md` index backfilled (ADR-0066, 0068–0076 were missing).
+
+### Safety posture
+
+- Social-arb signal is sized DOWN (0.5 haircut), not granted weight; raising it is gated on the profitability loop clearing MIN_SAMPLE=20 at ≥0.60 hit-rate on live returns.
+- 4/5 consumer targets are out-of-universe (un-actable) until catalyst-driven onboarding (ADR-0075); edges kept, gap surfaced via `coverage_against_universe`.
+
 ## [0.4.4] — 2026-05-14
 
 ### Summary
