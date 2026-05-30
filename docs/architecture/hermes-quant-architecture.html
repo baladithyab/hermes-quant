@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>hermes-quant Architecture (v0.6.3)</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'JetBrains Mono', monospace;
+      background: #020617;
+      min-height: 100vh;
+      padding: 2rem;
+      color: white;
+    }
+    .container { max-width: 1400px; margin: 0 auto; }
+    .header { margin-bottom: 2rem; }
+    .header-row {
+      display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem;
+    }
+    .pulse-dot {
+      width: 12px; height: 12px; background: #22d3ee;
+      border-radius: 50%; animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.025em; }
+    .subtitle { color: #94a3b8; font-size: 0.875rem; margin-left: 1.75rem; }
+    .version-badge {
+      display: inline-block; padding: 2px 10px; border-radius: 4px;
+      background: rgba(34, 211, 238, 0.15); color: #22d3ee;
+      font-size: 0.75rem; margin-left: 1.75rem; margin-top: 4px;
+      border: 1px solid rgba(34, 211, 238, 0.3);
+    }
+    .diagram-container {
+      background: rgba(15, 23, 42, 0.5);
+      border-radius: 1rem;
+      border: 1px solid #1e293b;
+      padding: 1.5rem;
+      overflow-x: auto;
+    }
+    svg { width: 100%; min-width: 1200px; display: block; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+      margin-top: 2rem;
+    }
+    .card {
+      background: rgba(15, 23, 42, 0.5);
+      border-radius: 0.75rem;
+      border: 1px solid #1e293b;
+      padding: 1.25rem;
+    }
+    .card-header {
+      display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;
+    }
+    .card-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .card-dot.cyan { background: #22d3ee; }
+    .card-dot.emerald { background: #34d399; }
+    .card-dot.violet { background: #a78bfa; }
+    .card-dot.amber { background: #fbbf24; }
+    .card-dot.rose { background: #fb7185; }
+    .card-dot.orange { background: #fb923c; }
+    .card h3 { font-size: 0.875rem; font-weight: 600; }
+    .card ul { list-style: none; color: #94a3b8; font-size: 0.75rem; }
+    .card li { margin-bottom: 0.375rem; }
+    .footer {
+      text-align: center; margin-top: 1.5rem; color: #475569; font-size: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <div class="header-row">
+        <div class="pulse-dot"></div>
+        <h1>hermes-quant Architecture</h1>
+      </div>
+      <p class="subtitle">Multi-analyst BMA-aggregated trading system with research debate, risk gating, and reflective memory</p>
+      <span class="version-badge">v0.6.3 · 67 ADRs · CI green · 2,128 tests passing</span>
+    </div>
+
+    <!-- Main Diagram -->
+    <div class="diagram-container">
+      <svg viewBox="0 0 1300 1620">
+        <!-- Definitions -->
+        <defs>
+          <marker id="arrow-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee" />
+          </marker>
+          <marker id="arrow-emerald" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#34d399" />
+          </marker>
+          <marker id="arrow-amber" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#fbbf24" />
+          </marker>
+          <marker id="arrow-violet" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa" />
+          </marker>
+          <marker id="arrow-rose" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#fb7185" />
+          </marker>
+          <marker id="arrow-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#fb923c" />
+          </marker>
+          <marker id="arrow-slate" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
+          </marker>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+          </pattern>
+        </defs>
+
+        <!-- Background Grid -->
+        <rect width="100%" height="100%" fill="url(#grid)" />
+
+        <!-- ============================================================
+             TITLE BANDS
+             ============================================================ -->
+        <text x="650" y="30" fill="#22d3ee" font-size="13" font-weight="700" text-anchor="middle">
+          DATA-IN  →  ANALYSIS  →  AGGREGATION  →  RESEARCH  →  RISK  →  EXECUTION  →  STATE-OUT
+        </text>
+
+        <!-- ============================================================
+             LANE 1: GOVERNANCE / OBSERVABILITY (left rail)
+             ============================================================ -->
+        <rect x="20" y="60" width="180" height="1480" rx="12"
+              fill="rgba(136, 19, 55, 0.08)" stroke="#fb7185"
+              stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="32" y="80" fill="#fb7185" font-size="11" font-weight="700">GOVERNANCE</text>
+        <text x="32" y="95" fill="#94a3b8" font-size="8">cross-cutting</text>
+
+        <!-- audit_log -->
+        <rect x="40" y="115" width="140" height="60" rx="6"
+              fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="110" y="135" fill="white" font-size="11" font-weight="600" text-anchor="middle">audit_log</text>
+        <text x="110" y="150" fill="#94a3b8" font-size="8" text-anchor="middle">JSONL append-only</text>
+        <text x="110" y="163" fill="#fb7185" font-size="7" text-anchor="middle">signal_provenance</text>
+
+        <!-- audit_log_query -->
+        <rect x="40" y="195" width="140" height="60" rx="6"
+              fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="110" y="215" fill="white" font-size="11" font-weight="600" text-anchor="middle">audit_log_query</text>
+        <text x="110" y="230" fill="#94a3b8" font-size="8" text-anchor="middle">is_bma_degenerate</text>
+        <text x="110" y="243" fill="#94a3b8" font-size="8" text-anchor="middle">is_n1_collapse</text>
+
+        <!-- approvals (HITL) -->
+        <rect x="40" y="275" width="140" height="60" rx="6"
+              fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="110" y="295" fill="white" font-size="11" font-weight="600" text-anchor="middle">Proposals (HITL)</text>
+        <text x="110" y="310" fill="#94a3b8" font-size="8" text-anchor="middle">24h TTL · approve &lt;ID&gt;</text>
+        <text x="110" y="323" fill="#fb7185" font-size="7" text-anchor="middle">human-in-the-loop</text>
+
+        <!-- kill_switch -->
+        <rect x="40" y="355" width="140" height="50" rx="6"
+              fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="110" y="375" fill="white" font-size="11" font-weight="600" text-anchor="middle">kill_switch</text>
+        <text x="110" y="390" fill="#94a3b8" font-size="8" text-anchor="middle">halt + cmd_resume</text>
+
+        <!-- invariants -->
+        <rect x="40" y="420" width="140" height="50" rx="6"
+              fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="110" y="440" fill="white" font-size="11" font-weight="600" text-anchor="middle">invariants</text>
+        <text x="110" y="455" fill="#94a3b8" font-size="8" text-anchor="middle">runtime contracts</text>
+
+        <!-- promotion -->
+        <rect x="40" y="485" width="140" height="50" rx="6"
+              fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="110" y="505" fill="white" font-size="11" font-weight="600" text-anchor="middle">promotion</text>
+        <text x="110" y="520" fill="#94a3b8" font-size="8" text-anchor="middle">paper → live gates</text>
+
+        <!-- evidence/lookahead_gate -->
+        <rect x="40" y="555" width="140" height="60" rx="6"
+              fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="110" y="575" fill="white" font-size="11" font-weight="600" text-anchor="middle">evidence</text>
+        <text x="110" y="590" fill="#94a3b8" font-size="8" text-anchor="middle">lookahead_gate</text>
+        <text x="110" y="603" fill="#94a3b8" font-size="8" text-anchor="middle">store + audit</text>
+
+        <!-- observability -->
+        <rect x="40" y="635" width="140" height="50" rx="6"
+              fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="110" y="655" fill="white" font-size="11" font-weight="600" text-anchor="middle">observability</text>
+        <text x="110" y="670" fill="#94a3b8" font-size="8" text-anchor="middle">metrics + traces</text>
+
+        <!-- regime detector (gov-side because it gates analysts) -->
+        <rect x="40" y="715" width="140" height="80" rx="6"
+              fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="110" y="735" fill="white" font-size="11" font-weight="600" text-anchor="middle">regime/</text>
+        <text x="110" y="752" fill="#94a3b8" font-size="8" text-anchor="middle">HMM · detector</text>
+        <text x="110" y="765" fill="#94a3b8" font-size="8" text-anchor="middle">extras_builder</text>
+        <text x="110" y="778" fill="#94a3b8" font-size="8" text-anchor="middle">per_regime_weights</text>
+        <text x="110" y="790" fill="#fb7185" font-size="7" text-anchor="middle">ADR-0063</text>
+
+        <!-- governance pulse -->
+        <text x="110" y="830" fill="#fb7185" font-size="9" font-weight="600" text-anchor="middle">↓ writes events ↓</text>
+        <text x="110" y="845" fill="#94a3b8" font-size="7" text-anchor="middle">every stage</text>
+
+        <!-- ============================================================
+             LANE 2: PIPELINE (center)
+             ============================================================ -->
+
+        <!-- DATA-IN: Universe + Data Sources -->
+        <rect x="220" y="115" width="220" height="180" rx="8"
+              fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="330" y="138" fill="white" font-size="13" font-weight="700" text-anchor="middle">DATA SOURCES</text>
+        <text x="330" y="155" fill="#94a3b8" font-size="8" text-anchor="middle">universe/ + data/</text>
+
+        <!-- yfinance -->
+        <rect x="235" y="170" width="90" height="34" rx="4"
+              fill="rgba(15,23,42,0.7)" stroke="#94a3b8" stroke-width="1"/>
+        <text x="280" y="187" fill="white" font-size="9" font-weight="600" text-anchor="middle">yfinance</text>
+        <text x="280" y="198" fill="#94a3b8" font-size="7" text-anchor="middle">OHLCV+fund.</text>
+        <!-- Polygon -->
+        <rect x="335" y="170" width="90" height="34" rx="4"
+              fill="rgba(15,23,42,0.7)" stroke="#94a3b8" stroke-width="1"/>
+        <text x="380" y="187" fill="white" font-size="9" font-weight="600" text-anchor="middle">Polygon</text>
+        <text x="380" y="198" fill="#94a3b8" font-size="7" text-anchor="middle">tick + bars</text>
+        <!-- alpaca -->
+        <rect x="235" y="210" width="90" height="34" rx="4"
+              fill="rgba(15,23,42,0.7)" stroke="#94a3b8" stroke-width="1"/>
+        <text x="280" y="227" fill="white" font-size="9" font-weight="600" text-anchor="middle">alpaca</text>
+        <text x="280" y="238" fill="#94a3b8" font-size="7" text-anchor="middle">[extras]</text>
+        <!-- ccxt -->
+        <rect x="335" y="210" width="90" height="34" rx="4"
+              fill="rgba(15,23,42,0.7)" stroke="#94a3b8" stroke-width="1"/>
+        <text x="380" y="227" fill="white" font-size="9" font-weight="600" text-anchor="middle">ccxt</text>
+        <text x="380" y="238" fill="#94a3b8" font-size="7" text-anchor="middle">[extras]</text>
+        <!-- universe scanner -->
+        <rect x="235" y="252" width="190" height="32" rx="4"
+              fill="rgba(15,23,42,0.7)" stroke="#94a3b8" stroke-width="1"/>
+        <text x="330" y="265" fill="white" font-size="9" font-weight="600" text-anchor="middle">universe/scanner</text>
+        <text x="330" y="277" fill="#94a3b8" font-size="7" text-anchor="middle">watchlist evolution</text>
+
+        <!-- MarketContext envelope -->
+        <rect x="475" y="115" width="220" height="180" rx="8"
+              fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="585" y="138" fill="white" font-size="13" font-weight="700" text-anchor="middle">MarketContext</text>
+        <text x="585" y="155" fill="#22d3ee" font-size="8" text-anchor="middle">envelope passed downstream</text>
+        <text x="495" y="180" fill="#94a3b8" font-size="9">• ohlcv (DataFrame)</text>
+        <text x="495" y="195" fill="#94a3b8" font-size="9">• fundamentals dict</text>
+        <text x="495" y="210" fill="#94a3b8" font-size="9">• sector siblings cache</text>
+        <text x="495" y="225" fill="#94a3b8" font-size="9">• news / semantic raw</text>
+        <text x="495" y="240" fill="#94a3b8" font-size="9">• microstructure tape</text>
+        <text x="495" y="255" fill="#94a3b8" font-size="9">• extras["regime"]  ← ADR-0063</text>
+        <text x="495" y="270" fill="#94a3b8" font-size="9">• asof timestamp</text>
+        <text x="495" y="285" fill="#22d3ee" font-size="8">grounding/data_grounding pre-stamp</text>
+
+        <!-- Grounding sidecar -->
+        <rect x="730" y="115" width="160" height="180" rx="8"
+              fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="810" y="138" fill="white" font-size="12" font-weight="700" text-anchor="middle">grounding/</text>
+        <text x="810" y="155" fill="#fbbf24" font-size="8" text-anchor="middle">verifies data freshness</text>
+        <text x="745" y="180" fill="#94a3b8" font-size="9">• data_grounding</text>
+        <text x="745" y="195" fill="#94a3b8" font-size="9">• verifier (cite-or-die)</text>
+        <text x="745" y="210" fill="#94a3b8" font-size="9">• current_clear node</text>
+        <text x="745" y="240" fill="#fbbf24" font-size="8">HKUDS Vibe-Trading</text>
+        <text x="745" y="255" fill="#fbbf24" font-size="8">"Citation HARD RULE"</text>
+        <text x="745" y="278" fill="#94a3b8" font-size="8">Wave 5 · default OFF</text>
+
+        <!-- ANALYSTS row (5 specialist analysts) -->
+        <rect x="220" y="335" width="900" height="160" rx="8"
+              fill="rgba(8, 51, 68, 0.25)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="670" y="358" fill="white" font-size="13" font-weight="700" text-anchor="middle">ANALYSTS · 5 specialist signal generators (regime-aware via extras["regime"])</text>
+
+        <!-- classical_ta -->
+        <rect x="240" y="378" width="160" height="100" rx="6"
+              fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="320" y="397" fill="white" font-size="11" font-weight="600" text-anchor="middle">classical_ta</text>
+        <text x="320" y="415" fill="#94a3b8" font-size="8" text-anchor="middle">RSI · MACD · BB</text>
+        <text x="320" y="427" fill="#94a3b8" font-size="8" text-anchor="middle">trend + momentum</text>
+        <text x="320" y="442" fill="#22d3ee" font-size="7" text-anchor="middle">deterministic</text>
+        <text x="320" y="463" fill="#94a3b8" font-size="7" text-anchor="middle">→ AnalystSignal</text>
+
+        <!-- microstructure -->
+        <rect x="420" y="378" width="160" height="100" rx="6"
+              fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="500" y="397" fill="white" font-size="11" font-weight="600" text-anchor="middle">microstructure</text>
+        <text x="500" y="415" fill="#94a3b8" font-size="8" text-anchor="middle">spread · depth · OFI</text>
+        <text x="500" y="427" fill="#94a3b8" font-size="8" text-anchor="middle">tape reading</text>
+        <text x="500" y="442" fill="#22d3ee" font-size="7" text-anchor="middle">deterministic</text>
+        <text x="500" y="463" fill="#94a3b8" font-size="7" text-anchor="middle">→ AnalystSignal</text>
+
+        <!-- semantic / news -->
+        <rect x="600" y="378" width="160" height="100" rx="6"
+              fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="680" y="397" fill="white" font-size="11" font-weight="600" text-anchor="middle">semantic</text>
+        <text x="680" y="415" fill="#94a3b8" font-size="8" text-anchor="middle">news + sentiment</text>
+        <text x="680" y="427" fill="#94a3b8" font-size="8" text-anchor="middle">forced-tool-call</text>
+        <text x="680" y="442" fill="#22d3ee" font-size="7" text-anchor="middle">LLM-backed</text>
+        <text x="680" y="463" fill="#94a3b8" font-size="7" text-anchor="middle">→ AnalystSignal</text>
+
+        <!-- kronos (LLM forecaster) -->
+        <rect x="780" y="378" width="160" height="100" rx="6"
+              fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="860" y="397" fill="white" font-size="11" font-weight="600" text-anchor="middle">kronos</text>
+        <text x="860" y="415" fill="#94a3b8" font-size="8" text-anchor="middle">LLM forecaster</text>
+        <text x="860" y="427" fill="#94a3b8" font-size="8" text-anchor="middle">price-path reasoning</text>
+        <text x="860" y="442" fill="#22d3ee" font-size="7" text-anchor="middle">LLM-backed</text>
+        <text x="860" y="463" fill="#94a3b8" font-size="7" text-anchor="middle">→ AnalystSignal</text>
+
+        <!-- fundamentals (NEW v0.6.1) -->
+        <rect x="960" y="378" width="160" height="100" rx="6"
+              fill="rgba(8, 51, 68, 0.6)" stroke="#22d3ee" stroke-width="2"/>
+        <text x="1040" y="397" fill="white" font-size="11" font-weight="600" text-anchor="middle">fundamentals</text>
+        <text x="1040" y="415" fill="#94a3b8" font-size="8" text-anchor="middle">6 sub-signals</text>
+        <text x="1040" y="427" fill="#94a3b8" font-size="8" text-anchor="middle">P/E · margin · growth</text>
+        <text x="1040" y="442" fill="#94a3b8" font-size="8" text-anchor="middle">vs sector siblings</text>
+        <text x="1040" y="455" fill="#22d3ee" font-size="7" text-anchor="middle">deterministic · v0.6.1</text>
+        <text x="1040" y="468" fill="#fbbf24" font-size="7" text-anchor="middle">ADR-0064 · NEW</text>
+
+        <!-- BMA Aggregator -->
+        <rect x="220" y="535" width="900" height="120" rx="8"
+              fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="670" y="560" fill="white" font-size="14" font-weight="700" text-anchor="middle">BMA AGGREGATOR · aggregators/bma.py</text>
+        <text x="670" y="580" fill="#34d399" font-size="9" text-anchor="middle">Bayesian Model Averaging across N≥2 distinct analysts</text>
+
+        <text x="270" y="610" fill="#94a3b8" font-size="9">• require_ensemble=True (default)</text>
+        <text x="270" y="624" fill="#94a3b8" font-size="9">• n_distinct_analysts ≥ 2</text>
+        <text x="270" y="638" fill="#94a3b8" font-size="9">• per-regime weights (ADR-0063)</text>
+
+        <text x="640" y="610" fill="#94a3b8" font-size="9">• regime_aware_confidence shrinkage</text>
+        <text x="640" y="624" fill="#94a3b8" font-size="9">• vote_share + consensus metric</text>
+        <text x="640" y="638" fill="#94a3b8" font-size="9">• alternates: deliberative · llm_committee</text>
+
+        <text x="950" y="610" fill="#fb7185" font-size="9">↳ refuses N=1 collapse</text>
+        <text x="950" y="624" fill="#fb7185" font-size="9">↳ guards 2026-05-26 incident</text>
+        <text x="950" y="638" fill="#fb7185" font-size="9">↳ writes signal_provenance</text>
+
+        <!-- Research Debate (NEW v0.6.2) -->
+        <rect x="220" y="695" width="900" height="160" rx="8"
+              fill="rgba(251, 146, 60, 0.2)" stroke="#fb923c" stroke-width="1.5"/>
+        <text x="670" y="720" fill="white" font-size="14" font-weight="700" text-anchor="middle">RESEARCH DEBATE · agents/research_debate · ADR-0065 + ADR-0066</text>
+        <text x="670" y="738" fill="#fb923c" font-size="9" text-anchor="middle">flag-gated: HERMES_QUANT_RESEARCH_DEBATE=1 · Tauric parity stage</text>
+
+        <!-- Bull -->
+        <rect x="240" y="755" width="160" height="80" rx="6"
+              fill="rgba(251, 146, 60, 0.35)" stroke="#fb923c" stroke-width="1.5"/>
+        <text x="320" y="775" fill="white" font-size="11" font-weight="600" text-anchor="middle">Bull Researcher</text>
+        <text x="320" y="790" fill="#94a3b8" font-size="8" text-anchor="middle">advocates LONG case</text>
+        <text x="320" y="803" fill="#94a3b8" font-size="8" text-anchor="middle">conversational turns</text>
+        <text x="320" y="820" fill="#fb923c" font-size="8" text-anchor="middle">Pydantic schema</text>
+
+        <!-- Bear -->
+        <rect x="420" y="755" width="160" height="80" rx="6"
+              fill="rgba(251, 146, 60, 0.35)" stroke="#fb923c" stroke-width="1.5"/>
+        <text x="500" y="775" fill="white" font-size="11" font-weight="600" text-anchor="middle">Bear Researcher</text>
+        <text x="500" y="790" fill="#94a3b8" font-size="8" text-anchor="middle">advocates SHORT case</text>
+        <text x="500" y="803" fill="#94a3b8" font-size="8" text-anchor="middle">conversational turns</text>
+        <text x="500" y="820" fill="#fb923c" font-size="8" text-anchor="middle">Pydantic schema</text>
+
+        <!-- Judge -->
+        <rect x="600" y="755" width="160" height="80" rx="6"
+              fill="rgba(251, 146, 60, 0.5)" stroke="#fb923c" stroke-width="2"/>
+        <text x="680" y="775" fill="white" font-size="11" font-weight="600" text-anchor="middle">Research Manager</text>
+        <text x="680" y="790" fill="#94a3b8" font-size="8" text-anchor="middle">reads full debate</text>
+        <text x="680" y="803" fill="#94a3b8" font-size="8" text-anchor="middle">judges + decides</text>
+        <text x="680" y="820" fill="#fb923c" font-size="8" text-anchor="middle">cannot run blind (T11)</text>
+
+        <!-- Trader Node -->
+        <rect x="780" y="755" width="160" height="80" rx="6"
+              fill="rgba(251, 146, 60, 0.35)" stroke="#fb923c" stroke-width="1.5"/>
+        <text x="860" y="775" fill="white" font-size="11" font-weight="600" text-anchor="middle">Trader Node</text>
+        <text x="860" y="790" fill="#94a3b8" font-size="8" text-anchor="middle">intermediary</text>
+        <text x="860" y="803" fill="#94a3b8" font-size="8" text-anchor="middle">sizing + horizon</text>
+        <text x="860" y="820" fill="#fb923c" font-size="8" text-anchor="middle">Wave 3 · plumbed</text>
+
+        <!-- audit_kind label -->
+        <rect x="960" y="755" width="160" height="80" rx="6"
+              fill="rgba(15,23,42,0.7)" stroke="#fb923c" stroke-width="1" stroke-dasharray="3,3"/>
+        <text x="1040" y="775" fill="white" font-size="10" font-weight="600" text-anchor="middle">research_debate</text>
+        <text x="1040" y="790" fill="#94a3b8" font-size="8" text-anchor="middle">audit kind</text>
+        <text x="1040" y="803" fill="#94a3b8" font-size="8" text-anchor="middle">prompt_hash</text>
+        <text x="1040" y="820" fill="#94a3b8" font-size="8" text-anchor="middle">turns + verdict</text>
+
+        <!-- Risk Gate -->
+        <rect x="220" y="895" width="900" height="160" rx="8"
+              fill="rgba(136, 19, 55, 0.25)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="670" y="918" fill="white" font-size="14" font-weight="700" text-anchor="middle">RISK GATE · risk/gate.py + risk/kelly.py</text>
+        <text x="670" y="935" fill="#fb7185" font-size="9" text-anchor="middle">approve · reject · request_clarification (writes signal_provenance audit event)</text>
+
+        <!-- Pre-checks -->
+        <rect x="240" y="950" width="200" height="90" rx="6"
+              fill="rgba(136, 19, 55, 0.45)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="340" y="970" fill="white" font-size="10" font-weight="600" text-anchor="middle">Pre-checks</text>
+        <text x="340" y="987" fill="#94a3b8" font-size="8" text-anchor="middle">• confidence floor</text>
+        <text x="340" y="999" fill="#94a3b8" font-size="8" text-anchor="middle">• data_quality (None-check)</text>
+        <text x="340" y="1011" fill="#94a3b8" font-size="8" text-anchor="middle">• cost_multiple ratio</text>
+        <text x="340" y="1023" fill="#94a3b8" font-size="8" text-anchor="middle">• kelly cap</text>
+
+        <!-- Risk Committee -->
+        <rect x="460" y="950" width="200" height="90" rx="6"
+              fill="rgba(136, 19, 55, 0.45)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="560" y="970" fill="white" font-size="10" font-weight="600" text-anchor="middle">Risk Committee</text>
+        <text x="560" y="987" fill="#94a3b8" font-size="8" text-anchor="middle">3-way round-robin</text>
+        <text x="560" y="999" fill="#94a3b8" font-size="8" text-anchor="middle">• Aggressive</text>
+        <text x="560" y="1011" fill="#94a3b8" font-size="8" text-anchor="middle">• Conservative</text>
+        <text x="560" y="1023" fill="#94a3b8" font-size="8" text-anchor="middle">• Neutral</text>
+
+        <!-- Sizing -->
+        <rect x="680" y="950" width="200" height="90" rx="6"
+              fill="rgba(136, 19, 55, 0.45)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="780" y="970" fill="white" font-size="10" font-weight="600" text-anchor="middle">Sizing</text>
+        <text x="780" y="987" fill="#94a3b8" font-size="8" text-anchor="middle">Kelly fraction</text>
+        <text x="780" y="999" fill="#94a3b8" font-size="8" text-anchor="middle">portfolio limit</text>
+        <text x="780" y="1011" fill="#94a3b8" font-size="8" text-anchor="middle">drawdown cap</text>
+        <text x="780" y="1023" fill="#94a3b8" font-size="8" text-anchor="middle">cost-adjusted</text>
+
+        <!-- Output -->
+        <rect x="900" y="950" width="200" height="90" rx="6"
+              fill="rgba(136, 19, 55, 0.45)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="1000" y="970" fill="white" font-size="10" font-weight="600" text-anchor="middle">→ Decision</text>
+        <text x="1000" y="987" fill="#94a3b8" font-size="8" text-anchor="middle">approve → Proposal</text>
+        <text x="1000" y="999" fill="#94a3b8" font-size="8" text-anchor="middle">reject → audit only</text>
+        <text x="1000" y="1011" fill="#94a3b8" font-size="8" text-anchor="middle">clarify → re-run</text>
+        <text x="1000" y="1024" fill="#fb7185" font-size="8" text-anchor="middle">HITL: 24h TTL</text>
+
+        <!-- Reactor (paper / live) -->
+        <rect x="220" y="1095" width="900" height="160" rx="8"
+              fill="rgba(120, 53, 15, 0.25)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="670" y="1118" fill="white" font-size="14" font-weight="700" text-anchor="middle">REACTOR · react/paper.py + react/live.py</text>
+        <text x="670" y="1135" fill="#fbbf24" font-size="9" text-anchor="middle">executes approved Proposals · idempotent · writes executions.jsonl</text>
+
+        <!-- PaperReactor -->
+        <rect x="240" y="1155" width="280" height="80" rx="6"
+              fill="rgba(120, 53, 15, 0.4)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="380" y="1175" fill="white" font-size="11" font-weight="600" text-anchor="middle">PaperReactor</text>
+        <text x="380" y="1192" fill="#94a3b8" font-size="8" text-anchor="middle">simulated fills @ asof_execution</text>
+        <text x="380" y="1205" fill="#94a3b8" font-size="8" text-anchor="middle">paper_zero_costs flag</text>
+        <text x="380" y="1218" fill="#94a3b8" font-size="8" text-anchor="middle">→ PortfolioState.apply_execution</text>
+
+        <!-- LiveReactor -->
+        <rect x="540" y="1155" width="280" height="80" rx="6"
+              fill="rgba(120, 53, 15, 0.4)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="680" y="1175" fill="white" font-size="11" font-weight="600" text-anchor="middle">LiveReactor</text>
+        <text x="680" y="1192" fill="#94a3b8" font-size="8" text-anchor="middle">consumers/freqtrade · alpaca · ccxt</text>
+        <text x="680" y="1205" fill="#94a3b8" font-size="8" text-anchor="middle">requires explicit promotion gate</text>
+        <text x="680" y="1218" fill="#94a3b8" font-size="8" text-anchor="middle">cite Robinhood MCP (ADR-0039)</text>
+
+        <!-- Idempotency -->
+        <rect x="840" y="1155" width="260" height="80" rx="6"
+              fill="rgba(120, 53, 15, 0.4)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="970" y="1175" fill="white" font-size="11" font-weight="600" text-anchor="middle">processed_fills</text>
+        <text x="970" y="1192" fill="#94a3b8" font-size="8" text-anchor="middle">UNIQUE(proposal_id, asof_exec)</text>
+        <text x="970" y="1205" fill="#94a3b8" font-size="8" text-anchor="middle">prevents double-apply</text>
+        <text x="970" y="1218" fill="#fbbf24" font-size="8" text-anchor="middle">cross-model review C2</text>
+
+        <!-- STATE OUT -->
+        <rect x="220" y="1295" width="900" height="220" rx="8"
+              fill="rgba(76, 29, 149, 0.25)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="670" y="1318" fill="white" font-size="14" font-weight="700" text-anchor="middle">STATE · state/portfolio_state.py + journal · 0o600 file mode</text>
+        <text x="670" y="1335" fill="#a78bfa" font-size="9" text-anchor="middle">canonical truth: executions.jsonl · derived: state.db (positions+cash, BEGIN IMMEDIATE)</text>
+
+        <!-- positions -->
+        <rect x="240" y="1355" width="200" height="80" rx="6"
+              fill="rgba(76, 29, 149, 0.45)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="340" y="1375" fill="white" font-size="11" font-weight="600" text-anchor="middle">positions</text>
+        <text x="340" y="1392" fill="#94a3b8" font-size="8" text-anchor="middle">DELETE on flat</text>
+        <text x="340" y="1405" fill="#94a3b8" font-size="8" text-anchor="middle">qty · avg_cost · asof</text>
+        <text x="340" y="1420" fill="#a78bfa" font-size="8" text-anchor="middle">OPEN positions only</text>
+
+        <!-- cash -->
+        <rect x="460" y="1355" width="200" height="80" rx="6"
+              fill="rgba(76, 29, 149, 0.45)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="560" y="1375" fill="white" font-size="11" font-weight="600" text-anchor="middle">cash</text>
+        <text x="560" y="1392" fill="#94a3b8" font-size="8" text-anchor="middle">single-row scalar</text>
+        <text x="560" y="1405" fill="#94a3b8" font-size="8" text-anchor="middle">net of costs</text>
+        <text x="560" y="1420" fill="#a78bfa" font-size="8" text-anchor="middle">future-bound asof guard</text>
+
+        <!-- halts table -->
+        <rect x="680" y="1355" width="200" height="80" rx="6"
+              fill="rgba(76, 29, 149, 0.45)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="780" y="1375" fill="white" font-size="11" font-weight="600" text-anchor="middle">halts</text>
+        <text x="780" y="1392" fill="#94a3b8" font-size="8" text-anchor="middle">circuit breakers</text>
+        <text x="780" y="1405" fill="#94a3b8" font-size="8" text-anchor="middle">cmd_resume lifts</text>
+        <text x="780" y="1420" fill="#a78bfa" font-size="8" text-anchor="middle">drawdown · NaN · invariant</text>
+
+        <!-- regime cache -->
+        <rect x="900" y="1355" width="200" height="80" rx="6"
+              fill="rgba(76, 29, 149, 0.45)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1000" y="1375" fill="white" font-size="11" font-weight="600" text-anchor="middle">regime cache</text>
+        <text x="1000" y="1392" fill="#94a3b8" font-size="8" text-anchor="middle">HMM state vars</text>
+        <text x="1000" y="1405" fill="#94a3b8" font-size="8" text-anchor="middle">last_regime + ts</text>
+        <text x="1000" y="1420" fill="#a78bfa" font-size="8" text-anchor="middle">v0.6.0 ADR-0063</text>
+
+        <!-- state_reconstruction_failed event -->
+        <rect x="240" y="1450" width="860" height="50" rx="6"
+              fill="rgba(15,23,42,0.7)" stroke="#a78bfa" stroke-width="1" stroke-dasharray="4,3"/>
+        <text x="670" y="1470" fill="white" font-size="10" font-weight="600" text-anchor="middle">state_reconstruction_failed audit event</text>
+        <text x="670" y="1485" fill="#94a3b8" font-size="8" text-anchor="middle">divergence between executions.jsonl and state.db is observable in canonical audit log (cross-model review C3)</text>
+
+        <!-- ============================================================
+             LANE 3: MEMORY / REFLECTION (right rail)
+             ============================================================ -->
+        <rect x="1140" y="60" width="140" height="1480" rx="12"
+              fill="rgba(76, 29, 149, 0.08)" stroke="#a78bfa"
+              stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="1152" y="80" fill="#a78bfa" font-size="11" font-weight="700">MEMORY</text>
+        <text x="1152" y="95" fill="#94a3b8" font-size="8">cross-cutting</text>
+
+        <!-- decisions log -->
+        <rect x="1155" y="115" width="110" height="80" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="135" fill="white" font-size="10" font-weight="600" text-anchor="middle">decisions</text>
+        <text x="1210" y="150" fill="#94a3b8" font-size="8" text-anchor="middle">decisions.jsonl</text>
+        <text x="1210" y="163" fill="#94a3b8" font-size="8" text-anchor="middle">pre-trade snapshot</text>
+        <text x="1210" y="180" fill="#a78bfa" font-size="7" text-anchor="middle">ADR-0042</text>
+
+        <!-- retriever (BM25) -->
+        <rect x="1155" y="215" width="110" height="80" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="235" fill="white" font-size="10" font-weight="600" text-anchor="middle">retriever</text>
+        <text x="1210" y="250" fill="#94a3b8" font-size="8" text-anchor="middle">BM25 over</text>
+        <text x="1210" y="263" fill="#94a3b8" font-size="8" text-anchor="middle">past decisions</text>
+        <text x="1210" y="280" fill="#a78bfa" font-size="7" text-anchor="middle">cross-ticker</text>
+
+        <!-- reflector -->
+        <rect x="1155" y="315" width="110" height="100" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="335" fill="white" font-size="10" font-weight="600" text-anchor="middle">reflector</text>
+        <text x="1210" y="350" fill="#94a3b8" font-size="8" text-anchor="middle">post-trade</text>
+        <text x="1210" y="363" fill="#94a3b8" font-size="8" text-anchor="middle">rubric scoring</text>
+        <text x="1210" y="376" fill="#94a3b8" font-size="8" text-anchor="middle">alpha vs bench</text>
+        <text x="1210" y="395" fill="#a78bfa" font-size="7" text-anchor="middle">Oracle Fallacy</text>
+        <text x="1210" y="406" fill="#a78bfa" font-size="7" text-anchor="middle">guard test</text>
+
+        <!-- reflections.jsonl -->
+        <rect x="1155" y="435" width="110" height="60" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="455" fill="white" font-size="10" font-weight="600" text-anchor="middle">reflections</text>
+        <text x="1210" y="470" fill="#94a3b8" font-size="8" text-anchor="middle">reflections.jsonl</text>
+        <text x="1210" y="483" fill="#a78bfa" font-size="7" text-anchor="middle">lessons learned</text>
+
+        <!-- shadow / counterfactual -->
+        <rect x="1155" y="515" width="110" height="80" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="535" fill="white" font-size="10" font-weight="600" text-anchor="middle">shadow/</text>
+        <text x="1210" y="550" fill="#94a3b8" font-size="8" text-anchor="middle">counterfactual</text>
+        <text x="1210" y="563" fill="#94a3b8" font-size="8" text-anchor="middle">backtest of</text>
+        <text x="1210" y="576" fill="#94a3b8" font-size="8" text-anchor="middle">rejected paths</text>
+        <text x="1210" y="590" fill="#a78bfa" font-size="7" text-anchor="middle">Wave 8</text>
+
+        <!-- backtest -->
+        <rect x="1155" y="615" width="110" height="80" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="635" fill="white" font-size="10" font-weight="600" text-anchor="middle">backtest/</text>
+        <text x="1210" y="650" fill="#94a3b8" font-size="8" text-anchor="middle">walk-forward</text>
+        <text x="1210" y="663" fill="#94a3b8" font-size="8" text-anchor="middle">CostTracker</text>
+        <text x="1210" y="676" fill="#94a3b8" font-size="8" text-anchor="middle">STOCKBENCH</text>
+        <text x="1210" y="690" fill="#a78bfa" font-size="7" text-anchor="middle">Wave 6</text>
+
+        <!-- evaluation -->
+        <rect x="1155" y="715" width="110" height="60" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="735" fill="white" font-size="10" font-weight="600" text-anchor="middle">evaluation</text>
+        <text x="1210" y="750" fill="#94a3b8" font-size="8" text-anchor="middle">model · sweep</text>
+        <text x="1210" y="763" fill="#94a3b8" font-size="8" text-anchor="middle">+ training/</text>
+
+        <!-- daemon / cli -->
+        <rect x="1155" y="795" width="110" height="80" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="815" fill="white" font-size="10" font-weight="600" text-anchor="middle">daemon/cli</text>
+        <text x="1210" y="830" fill="#94a3b8" font-size="8" text-anchor="middle">cron pipelines</text>
+        <text x="1210" y="843" fill="#94a3b8" font-size="8" text-anchor="middle">approve · halt</text>
+        <text x="1210" y="856" fill="#94a3b8" font-size="8" text-anchor="middle">resume</text>
+
+        <!-- factors / playbook / runs / reporting / journal -->
+        <rect x="1155" y="895" width="110" height="60" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="915" fill="white" font-size="10" font-weight="600" text-anchor="middle">factors/</text>
+        <text x="1210" y="930" fill="#94a3b8" font-size="8" text-anchor="middle">Alpha Zoo</text>
+        <text x="1210" y="943" fill="#a78bfa" font-size="7" text-anchor="middle">research</text>
+
+        <rect x="1155" y="975" width="110" height="60" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="995" fill="white" font-size="10" font-weight="600" text-anchor="middle">playbook/</text>
+        <text x="1210" y="1010" fill="#94a3b8" font-size="8" text-anchor="middle">weekly · quarterly</text>
+        <text x="1210" y="1023" fill="#a78bfa" font-size="7" text-anchor="middle">cron entries</text>
+
+        <rect x="1155" y="1055" width="110" height="60" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="1075" fill="white" font-size="10" font-weight="600" text-anchor="middle">runs/</text>
+        <text x="1210" y="1090" fill="#94a3b8" font-size="8" text-anchor="middle">Run Card</text>
+        <text x="1210" y="1103" fill="#a78bfa" font-size="7" text-anchor="middle">artifacts</text>
+
+        <rect x="1155" y="1135" width="110" height="60" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="1155" fill="white" font-size="10" font-weight="600" text-anchor="middle">reporting/</text>
+        <text x="1210" y="1170" fill="#94a3b8" font-size="8" text-anchor="middle">brief · render</text>
+        <text x="1210" y="1183" fill="#a78bfa" font-size="7" text-anchor="middle">markdown</text>
+
+        <rect x="1155" y="1215" width="110" height="60" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="1235" fill="white" font-size="10" font-weight="600" text-anchor="middle">journal/</text>
+        <text x="1210" y="1250" fill="#94a3b8" font-size="8" text-anchor="middle">human notes</text>
+        <text x="1210" y="1263" fill="#a78bfa" font-size="7" text-anchor="middle">pinned facts</text>
+
+        <!-- options pricing -->
+        <rect x="1155" y="1295" width="110" height="60" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1210" y="1315" fill="white" font-size="10" font-weight="600" text-anchor="middle">options/</text>
+        <text x="1210" y="1330" fill="#94a3b8" font-size="8" text-anchor="middle">pricing models</text>
+        <text x="1210" y="1343" fill="#a78bfa" font-size="7" text-anchor="middle">extension</text>
+
+        <!-- ============================================================
+             ARROWS - main pipeline flow (top to bottom, center)
+             ============================================================ -->
+
+        <!-- Universe → MarketContext -->
+        <line x1="440" y1="205" x2="473" y2="205" stroke="#22d3ee" stroke-width="2"
+              marker-end="url(#arrow-cyan)"/>
+
+        <!-- MarketContext → grounding (sidecar) -->
+        <line x1="695" y1="205" x2="728" y2="205" stroke="#fbbf24" stroke-width="2"
+              stroke-dasharray="5,3" marker-end="url(#arrow-amber)"/>
+
+        <!-- MarketContext → Analysts -->
+        <line x1="585" y1="295" x2="585" y2="333" stroke="#22d3ee" stroke-width="2.5"
+              marker-end="url(#arrow-cyan)"/>
+        <text x="600" y="320" fill="#22d3ee" font-size="9">fan-out</text>
+
+        <!-- Analysts → BMA -->
+        <line x1="320" y1="478" x2="540" y2="533" stroke="#34d399" stroke-width="1.5"
+              marker-end="url(#arrow-emerald)"/>
+        <line x1="500" y1="478" x2="600" y2="533" stroke="#34d399" stroke-width="1.5"
+              marker-end="url(#arrow-emerald)"/>
+        <line x1="680" y1="478" x2="670" y2="533" stroke="#34d399" stroke-width="1.5"
+              marker-end="url(#arrow-emerald)"/>
+        <line x1="860" y1="478" x2="740" y2="533" stroke="#34d399" stroke-width="1.5"
+              marker-end="url(#arrow-emerald)"/>
+        <line x1="1040" y1="478" x2="800" y2="533" stroke="#34d399" stroke-width="1.5"
+              marker-end="url(#arrow-emerald)"/>
+
+        <!-- BMA → Research Debate -->
+        <line x1="670" y1="655" x2="670" y2="693" stroke="#fb923c" stroke-width="2.5"
+              marker-end="url(#arrow-orange)"/>
+        <text x="685" y="680" fill="#fb923c" font-size="9">flag-gated</text>
+
+        <!-- Research Debate → Risk -->
+        <line x1="670" y1="855" x2="670" y2="893" stroke="#fb7185" stroke-width="2.5"
+              marker-end="url(#arrow-rose)"/>
+
+        <!-- Internal arrows in research debate (Bull ↔ Bear, both → Judge) -->
+        <line x1="400" y1="795" x2="418" y2="795" stroke="#fb923c" stroke-width="1"
+              marker-end="url(#arrow-orange)"/>
+        <line x1="418" y1="800" x2="400" y2="800" stroke="#fb923c" stroke-width="1"
+              marker-end="url(#arrow-orange)"/>
+        <line x1="580" y1="795" x2="598" y2="795" stroke="#fb923c" stroke-width="1.5"
+              marker-end="url(#arrow-orange)"/>
+        <line x1="760" y1="795" x2="778" y2="795" stroke="#fb923c" stroke-width="1.5"
+              marker-end="url(#arrow-orange)"/>
+
+        <!-- Pre-checks → Committee → Sizing → Decision -->
+        <line x1="440" y1="995" x2="458" y2="995" stroke="#fb7185" stroke-width="1.5"
+              marker-end="url(#arrow-rose)"/>
+        <line x1="660" y1="995" x2="678" y2="995" stroke="#fb7185" stroke-width="1.5"
+              marker-end="url(#arrow-rose)"/>
+        <line x1="880" y1="995" x2="898" y2="995" stroke="#fb7185" stroke-width="1.5"
+              marker-end="url(#arrow-rose)"/>
+
+        <!-- Risk → Reactor -->
+        <line x1="670" y1="1055" x2="670" y2="1093" stroke="#fbbf24" stroke-width="2.5"
+              marker-end="url(#arrow-amber)"/>
+        <text x="685" y="1080" fill="#fbbf24" font-size="9">approved Proposal</text>
+
+        <!-- Reactor → State -->
+        <line x1="670" y1="1255" x2="670" y2="1293" stroke="#a78bfa" stroke-width="2.5"
+              marker-end="url(#arrow-violet)"/>
+        <text x="690" y="1280" fill="#a78bfa" font-size="9">apply_execution</text>
+
+        <!-- ============================================================
+             CROSS-CUTTING: governance writes (left rail → center)
+             ============================================================ -->
+        <line x1="180" y1="145" x2="218" y2="200" stroke="#fb7185" stroke-width="1"
+              stroke-dasharray="3,3" marker-end="url(#arrow-rose)"/>
+        <line x1="180" y1="225" x2="218" y2="565" stroke="#fb7185" stroke-width="1"
+              stroke-dasharray="3,3" marker-end="url(#arrow-rose)"/>
+        <line x1="180" y1="305" x2="218" y2="980" stroke="#fb7185" stroke-width="1"
+              stroke-dasharray="3,3" marker-end="url(#arrow-rose)"/>
+        <line x1="180" y1="755" x2="218" y2="430" stroke="#fb7185" stroke-width="1"
+              stroke-dasharray="3,3" marker-end="url(#arrow-rose)"/>
+
+        <!-- Memory: pre-trade write from Risk -->
+        <line x1="1100" y1="990" x2="1153" y2="155" stroke="#a78bfa" stroke-width="1"
+              stroke-dasharray="3,3" marker-end="url(#arrow-violet)"/>
+        <text x="1115" y="1000" fill="#a78bfa" font-size="8">→ decisions</text>
+
+        <!-- Memory: retriever read into Analysts/Research -->
+        <line x1="1153" y1="245" x2="1120" y2="780" stroke="#a78bfa" stroke-width="1"
+              stroke-dasharray="3,3" marker-end="url(#arrow-violet)"/>
+        <text x="1100" y="260" fill="#a78bfa" font-size="8">retrieve past</text>
+
+        <!-- Memory: post-trade write from State -->
+        <line x1="1100" y1="1395" x2="1153" y2="365" stroke="#a78bfa" stroke-width="1"
+              stroke-dasharray="3,3" marker-end="url(#arrow-violet)"/>
+        <text x="1110" y="1410" fill="#a78bfa" font-size="8">→ reflect</text>
+
+        <!-- ============================================================
+             LEGEND (bottom)
+             ============================================================ -->
+        <rect x="220" y="1545" width="900" height="60" rx="6"
+              fill="rgba(15,23,42,0.6)" stroke="#475569" stroke-width="1"/>
+
+        <text x="240" y="1565" fill="white" font-size="10" font-weight="700">Legend</text>
+
+        <rect x="240" y="1575" width="14" height="9" rx="2" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1"/>
+        <text x="260" y="1583" fill="#94a3b8" font-size="8">Data / Analyst</text>
+
+        <rect x="345" y="1575" width="14" height="9" rx="2" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="365" y="1583" fill="#94a3b8" font-size="8">Aggregator</text>
+
+        <rect x="445" y="1575" width="14" height="9" rx="2" fill="rgba(251, 146, 60, 0.4)" stroke="#fb923c" stroke-width="1"/>
+        <text x="465" y="1583" fill="#94a3b8" font-size="8">Research debate</text>
+
+        <rect x="565" y="1575" width="14" height="9" rx="2" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1"/>
+        <text x="585" y="1583" fill="#94a3b8" font-size="8">Risk / governance</text>
+
+        <rect x="690" y="1575" width="14" height="9" rx="2" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1"/>
+        <text x="710" y="1583" fill="#94a3b8" font-size="8">Reactor / grounding</text>
+
+        <rect x="820" y="1575" width="14" height="9" rx="2" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="840" y="1583" fill="#94a3b8" font-size="8">State / memory</text>
+
+        <line x1="940" y1="1580" x2="960" y2="1580" stroke="#fb7185" stroke-width="1" stroke-dasharray="3,3"/>
+        <text x="965" y="1583" fill="#94a3b8" font-size="8">audit write</text>
+
+        <line x1="1040" y1="1580" x2="1060" y2="1580" stroke="#a78bfa" stroke-width="1" stroke-dasharray="3,3"/>
+        <text x="1065" y="1583" fill="#94a3b8" font-size="8">memory r/w</text>
+
+        <text x="240" y="1597" fill="#64748b" font-size="7">Solid arrow = primary data flow · Dashed = cross-cutting writes/reads · Bold border = newly added in v0.6.x</text>
+
+      </svg>
+    </div>
+
+    <!-- Info Cards -->
+    <div class="cards">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot cyan"></div>
+          <h3>Data flow contract</h3>
+        </div>
+        <ul>
+          <li>• Universe (yfinance, polygon, alpaca, ccxt) feeds OHLCV + fundamentals</li>
+          <li>• <strong>MarketContext</strong> envelope passed to every analyst — single source of truth</li>
+          <li>• <strong>extras["regime"]</strong> populated by HMM detector before analyst dispatch (ADR-0063)</li>
+          <li>• <strong>grounding/</strong> stamps freshness + cite-or-die before LLM analysts touch it</li>
+          <li>• 5 analysts run in parallel: classical_ta, microstructure, semantic, kronos, fundamentals</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot emerald"></div>
+          <h3>Aggregation guarantees</h3>
+        </div>
+        <ul>
+          <li>• <strong>BMA</strong> requires N≥2 distinct analysts (anti-degeneracy guard from 2026-05-26 incident)</li>
+          <li>• Per-regime weights — bull-trend ≠ bear-chop weights</li>
+          <li>• Confidence shrinkage when regime-disagreement is high</li>
+          <li>• <strong>vote_share + consensus</strong> metric written into signal_provenance</li>
+          <li>• Alternates: deliberative (LLM) and llm_committee (multi-model)</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot orange"></div>
+          <h3>Research Debate (v0.6.2)</h3>
+        </div>
+        <ul>
+          <li>• Bull/Bear conversational debate over BMA-aggregated signal</li>
+          <li>• Research Manager judges debate (cannot run blind — T11 regression test)</li>
+          <li>• Trader Node intermediary sets sizing and time-horizon</li>
+          <li>• Fully audited as <code>research_debate</code> kind with <code>prompt_hash</code></li>
+          <li>• Flag-gated: <code>HERMES_QUANT_RESEARCH_DEBATE=1</code> · default OFF</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot rose"></div>
+          <h3>Risk + governance</h3>
+        </div>
+        <ul>
+          <li>• Pre-checks: confidence floor, data_quality (None-checked), cost_multiple, kelly cap</li>
+          <li>• 3-way risk committee round-robin: Aggressive / Conservative / Neutral</li>
+          <li>• Outputs Proposal with 24h TTL — HITL approves via <code>approve &lt;PROPOSAL_ID&gt;</code></li>
+          <li>• Every gate event writes <strong>signal_provenance</strong> to audit_log</li>
+          <li>• Kill switch + invariants + lookahead_gate run silently (ADR-0031)</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot amber"></div>
+          <h3>Execution + state</h3>
+        </div>
+        <ul>
+          <li>• <strong>PaperReactor</strong> + <strong>LiveReactor</strong> share base contract</li>
+          <li>• <code>processed_fills(proposal_id, asof_execution)</code> is UNIQUE — idempotent on crash</li>
+          <li>• executions.jsonl is canonical, state.db is derived cache</li>
+          <li>• <code>state_reconstruction_failed</code> audit event surfaces divergence</li>
+          <li>• state.db chmod <code>0o600</code>, parent dir <code>0o700</code> — no world-readable financials</li>
+          <li>• <code>BEGIN IMMEDIATE</code> — write-lock-on-start eliminates read-then-write race</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot violet"></div>
+          <h3>Memory + reflection</h3>
+        </div>
+        <ul>
+          <li>• <strong>decisions.jsonl</strong> snapshots every pre-trade reasoning bundle</li>
+          <li>• BM25 retriever surfaces relevant past decisions cross-ticker</li>
+          <li>• Post-trade <strong>reflector</strong> rubric: alpha vs benchmark, prediction error, lesson</li>
+          <li>• Oracle Fallacy guard test prevents self-justifying loops</li>
+          <li>• Shadow account counterfactual = backtest of rejected paths (Wave 8)</li>
+          <li>• 62 memory tests passing — module shipped, awaiting dogfood activation</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <p class="footer">
+      hermes-quant v0.6.3 · 67 ADRs · CI green (2m31s) · 2,128 tests · paper-only until promotion gate · HITL-by-design
+    </p>
+  </div>
+</body>
+</html>

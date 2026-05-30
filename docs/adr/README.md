@@ -36,3 +36,13 @@
 - [ADR-0064-fundamentals-analyst.md](ADR-0064-fundamentals-analyst.md) — ADR-0064: FundamentalsAnalyst integration (v0.6.1) — closes equities balance-sheet/earnings/cashflow blind spot via yfinance with parquet snapshot cache
 - [ADR-0065-bull-bear-adversarial-debate.md](ADR-0065-bull-bear-adversarial-debate.md) — ADR-0065: Bull/Bear adversarial debate stage (v0.6.1) — true alternating debate with `current_response` feedback loop, ResearchPlan Pydantic schema, 5-tier PortfolioRating enum
 - [ADR-0067-robinhood-mcp-usage-research-amendment.md](ADR-0067-robinhood-mcp-usage-research-amendment.md) — ADR-0067: Robinhood MCP usage-research amendment to ADR-0039 — adds D7.8–D7.13 (mode flag, default-ro until 2026-06-26, live-confirm token, secondary-account guidance, deposit-gate hardening) based on 24-hour-post-launch research
+- [ADR-0066-research-debate-production-wiring.md](ADR-0066-research-debate-production-wiring.md) — ADR-0066: Production Wiring for ResearchDebateStage (v0.6.2)
+- [ADR-0068-decision-time-vs-bar-time-honesty.md](ADR-0068-decision-time-vs-bar-time-honesty.md) — ADR-0068: Decision-time vs bar-time honesty — `asof_decision` semantics
+- [ADR-0069-still-forming-bar-discipline.md](ADR-0069-still-forming-bar-discipline.md) — ADR-0069: Still-forming-bar discipline for daily timeframe mid-session
+- [ADR-0070-paper-execution-fidelity.md](ADR-0070-paper-execution-fidelity.md) — ADR-0070: Paper-execution fidelity — slippage, queue delay, and fill realism
+- [ADR-0071-portfolio-aware-dynamic-kelly.md](ADR-0071-portfolio-aware-dynamic-kelly.md) — ADR-0071: Portfolio-aware dynamic Kelly sizing and exposure caps
+- [ADR-0072-advisor-intraday-open-guard.md](ADR-0072-advisor-intraday-open-guard.md) — ADR-0072: Advisor-layer intraday open-guard (cross-run per-symbol-per-day dedup)
+- [ADR-0073-event-catalyst-awareness.md](ADR-0073-event-catalyst-awareness.md) — ADR-0073: Event/catalyst awareness — universe onboarding, semantic analyst activation, intraday cadence
+- [ADR-0074-catalyst-sense-semantic-fusion.md](ADR-0074-catalyst-sense-semantic-fusion.md) — ADR-0074: Catalyst Sense — semantic-numerical fusion via parallel catalyst detection
+- [ADR-0075-catalyst-driven-universe-onboarding.md](ADR-0075-catalyst-driven-universe-onboarding.md) — ADR-0075: Catalyst-driven universe onboarding
+- [ADR-0076-social-arbitrage-integration.md](ADR-0076-social-arbitrage-integration.md) — ADR-0076: Social-arbitrage integration — consumer-trend entity class, sized fusion, profitability-verification loop
