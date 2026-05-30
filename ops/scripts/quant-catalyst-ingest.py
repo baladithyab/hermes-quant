@@ -35,6 +35,9 @@ QUERIES = {
     "space": '(Blue Origin OR "Rocket Lab" OR SpaceX OR "New Glenn" OR "space stocks") when:1d',
     "energy": '(OPEC OR "oil prices" OR crude OR "production cut") when:1d',
     "semis": '(TSMC OR Taiwan OR "chip supply" OR semiconductor) when:1d',
+    "aero": '(Boeing OR "737" OR "aircraft grounding" OR "FAA") when:1d',
+    "ev": '(Tesla OR "EV recall" OR "electric vehicle" OR Rivian OR Lucid) when:1d',
+    "banks": '("bank failure" OR "bank collapse" OR "banking crisis" OR contagion) when:1d',
 }
 
 
