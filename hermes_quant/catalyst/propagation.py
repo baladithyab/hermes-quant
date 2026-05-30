@@ -249,8 +249,9 @@ def propagate(
                 symbol_sign = edge.effect_sign
             else:
                 symbol_sign = -edge.effect_sign
-            slot = acc.setdefault(edge.target_symbol, {"signed": 0.0, "noisy_or": 1.0, "contribs": []})
+            slot = acc.setdefault(edge.target_symbol, {"signed": 0.0, "abs": 0.0, "noisy_or": 1.0, "contribs": []})
             slot["signed"] += symbol_sign * edge.weight
+            slot["abs"] += abs(edge.weight)
             slot["noisy_or"] *= (1.0 - edge.weight)
             contrib = {
                 "source": ent, "relation": edge.relation,
@@ -263,7 +264,14 @@ def propagate(
 
     for sym, slot in acc.items():
         signed = slot["signed"]
-        confidence = round(1.0 - slot["noisy_or"], 4)  # noisy-OR, in [0,1)
+        abs_total = slot["abs"] or 1.0
+        # Directional agreement in [0,1]: 1.0 when every edge agrees on direction,
+        # → 0 when opposing edges cancel. Confidence is the noisy-OR linkage scaled
+        # by agreement, so a near-cancelling coin-flip net (e.g. -0.8 +0.75 = -0.05)
+        # does NOT emit a high-confidence packet just because the linkage is strong.
+        agreement = abs(signed) / abs_total
+        linkage = 1.0 - slot["noisy_or"]  # noisy-OR, in [0,1)
+        confidence = round(linkage * agreement, 4)
         sign = 1 if signed > 1e-9 else (-1 if signed < -1e-9 else 0)
         results[sym] = PropagationResult(
             symbol=sym,
