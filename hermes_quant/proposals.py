@@ -359,7 +359,17 @@ class ProposalStore:
                 # (no terminating "\n", e.g. a crash mid-write) is handled by
                 # the same json-decode skip as any other corrupt line.
                 raw = self.bus_path.read_bytes()
-                for lineno, line in enumerate(raw.split(b"\n"), start=1):
+                # Index of the LAST non-empty line: a malformed line THERE is the
+                # benign writer-crash-mid-write case (tolerate + skip). A malformed
+                # line ANYWHERE EARLIER is mid-file corruption that could drop a
+                # terminal event (approve/reject/expire) and silently resurrect a
+                # closed HITL proposal as `pending` — that must FAIL LOUD, not skip
+                # (Codex Facet-2 P2). Money-software: never misrepresent HITL state.
+                _lines = raw.split(b"\n")
+                _last_nonempty = max(
+                    (i for i, ln in enumerate(_lines) if ln.strip()), default=-1
+                )
+                for lineno, line in enumerate(_lines, start=1):
                     if not line.strip():
                         continue  # blank / trailing newline
                     try:
@@ -370,17 +380,28 @@ class ProposalStore:
                         KeyError,
                         TypeError,
                     ) as e:
-                        # Partial/corrupt line — fail closed: log + skip, never
-                        # crash the run. A trailing partial write is the common
-                        # benign case (writer crashed mid-line).
-                        logger.warning(
-                            "proposals: skipping malformed JSONL line %d in %s "
-                            "during index reconciliation: %s",
-                            lineno,
-                            self.bus_path,
-                            e,
-                        )
-                        continue
+                        is_trailing = (lineno - 1) == _last_nonempty
+                        if is_trailing:
+                            # Benign: a partial trailing write (writer crashed
+                            # mid-line). Log + skip; the rest reconciles cleanly.
+                            logger.warning(
+                                "proposals: skipping malformed TRAILING JSONL line "
+                                "%d in %s during index reconciliation: %s",
+                                lineno,
+                                self.bus_path,
+                                e,
+                            )
+                            continue
+                        # Mid-file corruption — a terminal event may be lost,
+                        # which could make a closed proposal look approvable.
+                        # Fail loud rather than silently resurrect it.
+                        raise ProposalLogCorruptionError(
+                            f"malformed non-trailing JSONL line {lineno} in "
+                            f"{self.bus_path} during index reconciliation: {e} — "
+                            "refusing to rebuild the index from a corrupt log "
+                            "(a terminal approve/reject/expire event may be lost). "
+                            "Inspect/repair the log before retrying."
+                        ) from e
                     # Append-only log: later events for the same id supersede
                     # earlier ones (pending -> approved/rejected/expired).
                     latest[proposal.proposal_id] = proposal
@@ -576,6 +597,18 @@ class ProposalStateError(Exception):
 
 class ProposalExpiredError(ProposalStateError):
     """The proposal's TTL has elapsed; auto-expired."""
+
+
+class ProposalLogCorruptionError(Exception):
+    """The proposal JSONL bus is corrupt mid-file during index reconciliation.
+
+    Raised by ``ProposalStore._reconcile_index`` when a malformed line is found
+    that is NOT the trailing line. A trailing partial write (writer crashed
+    mid-line) is benign and tolerated; a malformed line earlier in the log could
+    drop a terminal event (approve/reject/expire) and silently resurrect a closed
+    HITL proposal as ``pending`` — so we fail loud and refuse to rebuild the index
+    from a corrupt log, rather than misrepresent HITL state. Inspect/repair first.
+    """
 
 
 # ---------------------------------------------------------------------------

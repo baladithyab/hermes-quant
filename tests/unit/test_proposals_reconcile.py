@@ -15,8 +15,11 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 from hermes_quant.proposals import (
     Proposal,
+    ProposalLogCorruptionError,
     ProposalStore,
     _iso,
     _proposal_to_dict,
@@ -193,3 +196,60 @@ def test_reconcile_drops_stale_rows_not_in_jsonl(tmp_path):
     n = store._reconcile_index()
     assert n == len(expected)
     assert not _ghost_in_index()  # dropped: not in the authoritative log
+
+
+def test_reconcile_raises_on_midfile_corruption_not_resurrect_closed(tmp_path):
+    """A malformed NON-trailing line must FAIL LOUD, not silently skip.
+
+    Codex Facet-2 P2: skipping a mid-file malformed line can drop a terminal
+    event (approve/reject/expire) and rebuild the index from an earlier `pending`
+    record — silently resurrecting a closed HITL proposal as approvable. Money-
+    software: refuse to rebuild from a corrupt log; the operator must inspect it.
+    Contrast with the trailing-partial-write case, which stays a benign skip.
+    """
+    store = _build_store(tmp_path)
+    now = _utc_now()
+    future = _iso(now + timedelta(hours=1))
+
+    def line(*, pid, state, symbol, event, **extra) -> str:
+        rec = _proposal_to_dict(
+            _mk(pid=pid, state=state, symbol=symbol, expires_at=future, **extra)
+        )
+        rec["_event"] = event
+        rec["_event_at"] = _iso(now)
+        return json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n"
+
+    text = ""
+    text += line(pid="p_closed", state="pending", symbol="MSFT", event="create")
+    # The terminal approve event for p_closed is CORRUPTED mid-file:
+    text += '{"proposal_id":"p_closed","state":"appr<<<TRUNCATED-MIDFILE\n'
+    # A well-formed line AFTER the corruption proves it is non-trailing:
+    text += line(pid="p_other", state="pending", symbol="NVDA", event="create")
+    store.bus_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ProposalLogCorruptionError):
+        store._reconcile_index()
+
+
+def test_reconcile_tolerates_trailing_partial_after_valid_lines(tmp_path):
+    """Sanity counter-test: a malformed TRAILING line is still skipped benignly
+    (writer crashed mid-write) — the common case must NOT raise."""
+    store = _build_store(tmp_path)
+    now = _utc_now()
+    future = _iso(now + timedelta(hours=1))
+
+    def line(*, pid, state, symbol, event) -> str:
+        rec = _proposal_to_dict(
+            _mk(pid=pid, state=state, symbol=symbol, expires_at=future)
+        )
+        rec["_event"] = event
+        rec["_event_at"] = _iso(now)
+        return json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n"
+
+    text = line(pid="p_ok", state="pending", symbol="AAPL", event="create")
+    text += '{"proposal_id":"p_trunc","state":"pend'  # trailing partial write
+    store.bus_path.write_text(text, encoding="utf-8")
+
+    n = store._reconcile_index()  # must NOT raise
+    assert n == 1
+    assert store.get("p_ok") is not None
