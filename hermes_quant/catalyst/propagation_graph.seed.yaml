@@ -23,7 +23,6 @@ aliases:
   jeff bezos: blue origin
   rocket lab: rocket lab
   spacex: spacex
-  opec: opec
   taiwan earthquake: taiwan earthquake
   tsmc: tsmc
   taiwan semiconductor: tsmc
@@ -31,6 +30,21 @@ aliases:
   tesla: tesla
   bank failure: bank failure
   bank collapse: bank failure
+  # --- consumer-trend entity class (ADR-0074 Phase-1, social-arbitrage) ---
+  # Brand/product surfaces -> canonical entity. ENTITY aliases ONLY — never person
+  # names (the person-alias-contamination lesson: a founder spans sectors and
+  # creates false correlations). A viral trend = positive demand catalyst on maker.
+  celsius: celsius energy
+  celsius energy: celsius energy
+  crocs: crocs
+  dorel: dorel bicycle
+  dorel bicycle: dorel bicycle
+  coach: coach handbag
+  coach handbag: coach handbag
+  tapestry: coach handbag
+  elmer: elmer glue
+  elmer glue: elmer glue
+  slime: elmer glue
 
 edges:
   # --- space / launch ---
@@ -49,11 +63,12 @@ edges:
     - {target: RKLB, relation: competitor,     effect_sign: -1, weight: 0.60}
     - {target: ASTS, relation: sector_member,  effect_sign: -1, weight: 0.55}
 
-  # --- energy / commodity (supply-cut headline -> bullish energy) ---
-  opec:
-    - {target: XOM, relation: commodity,       effect_sign: +1, weight: 0.70}
-    - {target: CVX, relation: commodity,       effect_sign: +1, weight: 0.70}
-    - {target: OXY, relation: commodity,       effect_sign: +1, weight: 0.60}
+  # --- energy / commodity ---
+  # REMOVED 2026-05-29: OPEC commodity edge was structurally unsignable by this
+  # framework (oil-producer direction depends on SUPPLY direction, not event
+  # polarity — "output surge crashes prices" mis-signed XOM bullish). The D74.7
+  # sign-consistency check caught it. Re-add only with a supply-direction
+  # classifier (LLM tier), never via the contagion mechanism.
 
   # --- semis / supply chain ---
   taiwan earthquake:
@@ -84,3 +99,27 @@ edges:
     - {target: BAC,  relation: sector_member,  effect_sign: -1, weight: 0.50}
     - {target: WFC,  relation: sector_member,  effect_sign: -1, weight: 0.50}
     - {target: SCHW, relation: sector_member,  effect_sign: -1, weight: 0.55}
+
+  # --- consumer-trend entity class (ADR-0074 Phase-1, social-arbitrage) ---
+  # A NEW entity class: brand/product -> the public maker. effect_sign=-1 means a
+  # NEGATIVE brand event (recall/scandal) is BEARISH for the maker, AND (since a
+  # positive catalyst flips the sign) a VIRAL/positive trend is BULLISH — exactly
+  # the social-arb thesis. brand_self weight is high (the trend IS the product).
+  #
+  # *** PHASE-0 EVAL CAVEAT (read before trusting these) ***
+  # The D74.7 gate PASSED at exactly 0.60 hit-rate (3/5 cases): CELH/CROX/DIIBF
+  # directionally correct, TPR/NWL were FALSE POSITIVES (the trend surfaced but the
+  # stock fell over the forward window). This is a KNIFE-EDGE pass on n=5 — enough
+  # to justify building the producer, NOT enough to grant live weight. The flag
+  # HERMES_QUANT_SEMANTIC_ENABLED already gates this; do not raise consumer-trend
+  # confidence weights without a larger labeled set passing a HIGHER threshold.
+  celsius energy:
+    - {target: CELH, relation: brand_self,     effect_sign: -1, weight: 0.90}
+  crocs:
+    - {target: CROX, relation: brand_self,     effect_sign: -1, weight: 0.90}
+  dorel bicycle:
+    - {target: DIIBF, relation: brand_self,    effect_sign: -1, weight: 0.85}
+  coach handbag:
+    - {target: TPR,  relation: brand_self,     effect_sign: -1, weight: 0.88}
+  elmer glue:
+    - {target: NWL,  relation: brand_self,     effect_sign: -1, weight: 0.85}

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -33,7 +33,6 @@ from hermes_quant.catalyst.propagation import (
 )
 from hermes_quant.semantic import (
     SemanticPacket,
-    SemanticSource,
     semantic_packet_from_dict,
     validate_semantic_packet,
 )
@@ -41,6 +40,30 @@ from hermes_quant.semantic import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_STORE = Path.home() / ".hermes" / "quant" / "catalyst" / "packets.jsonl"
+
+# "Properly size" the social-arbitrage signal: consumer-trend (brand_self) edges
+# passed the D74.7 gate at exactly 0.60 hit-rate on n=5 (TPR/NWL were false
+# positives). That is enough to ENTER the ensemble, not enough to carry full
+# weight. We multiply the propagation confidence of any packet whose contributions
+# are dominated by the consumer-trend relation by this haircut, so it enters BMA as
+# a DELIBERATELY WEAK peer view. BMA + require_ensemble already prevent it firing
+# alone; this caps its pull on the blend until a larger labeled set earns more.
+# Raise toward 1.0 only when a bigger eval clears a higher threshold.
+_CONSUMER_TREND_RELATIONS = {"brand_self"}
+CONSUMER_TREND_CONFIDENCE_HAIRCUT = 0.5
+
+
+def _consumer_trend_haircut(result) -> float:
+    """Return the confidence multiplier for a propagation result.
+
+    1.0 for established sector edges; CONSUMER_TREND_CONFIDENCE_HAIRCUT when the
+    result is driven by consumer-trend (brand_self) edges — the weak-eval social-arb
+    class. Keyed on the contribution relations so it survives graph edits.
+    """
+    contribs = getattr(result, "contributions", None) or []
+    if contribs and all(c.get("relation") in _CONSUMER_TREND_RELATIONS for c in contribs):
+        return CONSUMER_TREND_CONFIDENCE_HAIRCUT
+    return 1.0
 
 
 def synthesize_packets(
@@ -77,13 +100,19 @@ def synthesize_packets(
         for sym, res in results.items():
             if res.stance == "neutral" or res.confidence <= 0.0:
                 continue
+            # "Properly size": haircut consumer-trend (weak-eval social-arb) edges so
+            # they enter BMA as a deliberately weak peer view.
+            haircut = _consumer_trend_haircut(res)
+            sized_confidence = round(min(1.0, res.confidence * haircut), 4)
+            if sized_confidence <= 0.0:
+                continue
             packet = semantic_packet_from_dict({
                 "schema_version": 1,
                 "asset": sym,
-                "asof": item.published_at.astimezone(timezone.utc).isoformat(),  # PUB TIME
+                "asof": item.published_at.astimezone(UTC).isoformat(),  # PUB TIME
                 "horizon": horizon,
                 "stance": res.stance,
-                "confidence": round(min(1.0, res.confidence), 4),  # linkage score
+                "confidence": sized_confidence,                     # linkage score × size haircut
                 "magnitude": round(float(cls.severity), 4),         # headline severity
                 "summary": (
                     f"{item.title[:180]} — propagated {res.stance} to {sym} "
@@ -101,6 +130,9 @@ def synthesize_packets(
                     "source_entities": sorted(ents),
                     "n_contributions": len(res.contributions),
                     "feed_source": item.source,
+                    "relations": sorted(str(c["relation"]) for c in res.contributions if c.get("relation")),
+                    "confidence_haircut": haircut,
+                    "confidence_pre_haircut": round(res.confidence, 4),
                 },
             })
             packets.append(packet)

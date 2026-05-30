@@ -70,6 +70,17 @@ _POSITIVE_SEVERITY: dict[str, float] = {
     # medium
     "gains": 0.015, "gained": 0.015, "rises": 0.015, "rose": 0.015,
     "growth": 0.015, "optimism": 0.015,
+    # --- consumer-trend / social-arbitrage vocabulary (ADR-0074 Phase-1) ---
+    # A viral consumer trend is a positive DEMAND catalyst on the brand's maker.
+    # Without these the base lexicon only fires on incidental price-verbs
+    # ("surge"/"soar"), missing the social signal itself ("goes viral", "craze",
+    # "sells out"). Severity is the headline's strongest single term (MAX, not sum).
+    "viral": 0.04, "craze": 0.045, "fad": 0.03, "trending": 0.03, "trend": 0.02,
+    "sells out": 0.045, "sold out": 0.045, "sellout": 0.045, "stockout": 0.04,
+    "shortage": 0.035, "frenzy": 0.045, "buzz": 0.025, "hype": 0.025,
+    "obsession": 0.035, "phenomenon": 0.03,
+    "skyrocket": 0.05, "skyrockets": 0.05, "skyrocketing": 0.05,
+    "soaring": 0.05, "surging": 0.045, "booming": 0.04,
 }
 
 

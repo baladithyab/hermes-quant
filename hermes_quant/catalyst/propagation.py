@@ -131,6 +131,20 @@ _BUILTIN_GRAPH: dict[str, list[PropagationEdge]] = {
         PropagationEdge("bank failure", "WFC", "sector_member", -1, 0.50),
         PropagationEdge("bank failure", "SCHW", "sector_member", -1, 0.55),
     ],
+    # --- consumer-trend entity class (ADR-0074 Phase-1, social-arbitrage) ---
+    # A NEW class: brand/product -> the public maker. effect_sign=-1 means a
+    # NEGATIVE brand event (recall/scandal) is BEARISH for the maker AND (positive
+    # catalyst flips the sign) a VIRAL/positive trend is BULLISH — the social-arb
+    # thesis. PHASE-0 EVAL CAVEAT: the D74.7 gate passed at exactly 0.60 hit-rate
+    # (3/5; TPR/NWL were false positives). Confidence is further haircut at synth
+    # time (CONSUMER_TREND_CONFIDENCE_HAIRCUT) so this enters BMA as a deliberately
+    # WEAK peer view until a larger labeled set clears a higher bar. relation tag
+    # "brand_self" is what synthesize.py keys the haircut on.
+    "celsius energy": [PropagationEdge("celsius energy", "CELH", "brand_self", -1, 0.90)],
+    "crocs": [PropagationEdge("crocs", "CROX", "brand_self", -1, 0.90)],
+    "dorel bicycle": [PropagationEdge("dorel bicycle", "DIIBF", "brand_self", -1, 0.85)],
+    "coach handbag": [PropagationEdge("coach handbag", "TPR", "brand_self", -1, 0.88)],
+    "elmer glue": [PropagationEdge("elmer glue", "NWL", "brand_self", -1, 0.85)],
 }
 
 # Entity gazetteer: surface alias -> canonical source key. NER would produce
@@ -149,9 +163,63 @@ _BUILTIN_ALIASES: dict[str, str] = {
     "tesla": "tesla",
     "bank failure": "bank failure",
     "bank collapse": "bank failure",
+    # --- consumer-trend entity class (ENTITY aliases only — no person names) ---
+    "celsius": "celsius energy",
+    "celsius energy": "celsius energy",
+    "crocs": "crocs",
+    "dorel": "dorel bicycle",
+    "dorel bicycle": "dorel bicycle",
+    "coach": "coach handbag",
+    "coach handbag": "coach handbag",
+    "tapestry": "coach handbag",
+    "elmer": "elmer glue",
+    "elmer glue": "elmer glue",
+    "slime": "elmer glue",
 }
 
 _SIGN_TO_STANCE = {1: "bullish", -1: "bearish", 0: "neutral"}
+
+# Append-only corpus of every propagation, for the future LEARNED graph. Mining
+# sign/weight from real news→return co-movement is the moat (spike 001 caveat #3:
+# "instrument v1 to log every propagation so the corpus accumulates"). Each row is
+# one (entity→symbol) edge fire with its curated sign/weight + the catalyst sign,
+# so a later job can join against realized forward returns and learn corrected
+# signs/weights without re-deriving the curated graph.
+_DEFAULT_LEARNED_LOG = Path.home() / ".hermes" / "quant" / "catalyst" / "propagation-log.jsonl"
+
+
+def log_propagations(
+    entries: list[dict],
+    *,
+    asof: str | None = None,
+    path: Path | None = None,
+) -> int:
+    """Append propagation-log entries to the learned-graph corpus JSONL.
+
+    ``entries`` is the list produced by ``propagate(..., log=entries)`` — one dict
+    per (symbol, source, relation, effect_sign, weight, symbol_sign, catalyst_sign).
+    ``asof`` (the headline publication time) is stamped on each row so the corpus is
+    join-able against forward returns lookahead-honestly. Returns count written.
+    Never raises fatally (silence-by-default; logging must not break the daily run).
+    """
+    if not entries:
+        return 0
+    p = path or _DEFAULT_LEARNED_LOG
+    p.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    try:
+        import json
+        with p.open("a", encoding="utf-8") as f:
+            for e in entries:
+                row = dict(e)
+                if asof is not None:
+                    row["asof"] = asof
+                f.write(json.dumps(row, default=str) + "\n")
+                n += 1
+            f.flush()
+    except OSError as e:  # noqa: BLE001
+        logger.warning("catalyst.propagation: learned-log write failed: %s", e)
+    return n
 
 
 def graph_path() -> Path:
