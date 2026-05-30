@@ -38,13 +38,11 @@ import time
 from datetime import UTC, datetime
 from typing import Any, Optional, Type
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from hermes_quant.agents.structured_output import (
-    _detect_provider,
     bind_structured,
-    _parse_freetext_json,
-    _parse_response,
+    parse_structured_or_freetext,
 )
 
 logger = logging.getLogger(__name__)
@@ -230,10 +228,12 @@ class LLMCaller:
         parsed_dump: dict[str, Any] | None = None
 
         if error_msg is None and schema is not None and raw_text:
-            provider = _detect_provider(self.model_id)
-            parsed_obj = _parse_response(raw_text, raw_response, schema, provider)
-            if parsed_obj is None:
-                parsed_obj = _parse_freetext_json(raw_text, schema)
+            # Route through the single canonical parse ladder shared with
+            # invoke_structured_or_freetext so the two structured-output entry
+            # points cannot drift (ADR-0044 / Wave C G11).
+            parsed_obj = parse_structured_or_freetext(
+                raw_text, raw_response, schema, self.model_id
+            )
             if parsed_obj is None:
                 logger.warning(
                     "LLMCaller.call: structured parse failed for %s; returning (None, raw).",

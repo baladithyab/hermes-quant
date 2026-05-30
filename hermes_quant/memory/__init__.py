@@ -19,6 +19,10 @@ from hermes_quant.memory.decisions import (
     AppendOnlyViolation,
     DecisionLog,
 )
+from hermes_quant.memory.decisions_render import (
+    render_decision_block,
+    render_decisions_md,
+)
 from hermes_quant.memory.reflector import (
     LessonCategory,
     Reflection,
@@ -35,6 +39,8 @@ __all__ = [
     # decisions
     "AppendOnlyViolation",
     "DecisionLog",
+    "render_decision_block",
+    "render_decisions_md",
     # reflector
     "LessonCategory",
     "Reflection",

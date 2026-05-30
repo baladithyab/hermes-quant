@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Optional, Type, TypeVar
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -86,7 +86,7 @@ def _detect_provider(model_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def bind_structured(model_id: str, schema: Type[BaseModel]) -> dict[str, Any]:
+def bind_structured(model_id: str, schema: type[BaseModel]) -> dict[str, Any]:
     """Return provider-specific kwargs for structured output binding.
 
     These kwargs should be passed as **kwargs (or merged into the call dict)
@@ -180,12 +180,12 @@ def _bind_anthropic(schema_name: str, json_schema: dict[str, Any]) -> dict[str, 
 def invoke_structured_or_freetext(
     client: Any,
     prompt: list[dict[str, str]],
-    schema: Type[T],
+    schema: type[T],
     model_id: str,
     *,
-    system: Optional[str] = None,
-    extra_kwargs: Optional[dict[str, Any]] = None,
-) -> tuple[Optional[T], dict[str, Any]]:
+    system: str | None = None,
+    extra_kwargs: dict[str, Any] | None = None,
+) -> tuple[T | None, dict[str, Any]]:
     """Invoke the LLM client and parse the structured response.
 
     Attempts provider-native structured output first; on any failure
@@ -213,7 +213,6 @@ def invoke_structured_or_freetext(
           - raw_response is a dict with at least a 'text' key containing
             the raw LLM output (or an 'error' key on hard failure).
     """
-    provider = _detect_provider(model_id)
     struct_kwargs = bind_structured(model_id, schema)
     if extra_kwargs:
         struct_kwargs.update(extra_kwargs)
@@ -238,7 +237,54 @@ def invoke_structured_or_freetext(
         raw_response["error"] = f"{type(exc).__name__}: {exc}"
         return None, raw_response
 
-    # --- Parse structured response ---
+    # --- Parse via the single canonical ladder (shared with LLMCaller.call) ---
+    parsed = parse_structured_or_freetext(
+        raw_text=raw_text,
+        raw_response=raw_response,
+        schema=schema,
+        model_id=model_id,
+    )
+    if parsed is None:
+        logger.warning(
+            "invoke_structured_or_freetext: all parse attempts failed for %s. "
+            "Returning (None, raw_response) for graceful fallback.",
+            schema.__name__,
+        )
+    return parsed, raw_response
+
+
+# ---------------------------------------------------------------------------
+# Canonical parse ladder — the ONE entry point both call sites route through
+# ---------------------------------------------------------------------------
+
+
+def parse_structured_or_freetext(
+    raw_text: str,
+    raw_response: dict[str, Any],
+    schema: type[T],
+    model_id: str,
+) -> T | None:
+    """The single canonical parse ladder for structured LLM output.
+
+    provider-native parse → free-text JSON fallback. Returns the validated
+    schema instance or None on total failure.
+
+    ``invoke_structured_or_freetext`` and ``LLMCaller.call`` BOTH route through
+    this helper so the two structured-output entry points cannot drift.
+
+    Args:
+        raw_text:     The raw assistant text extracted from the LLM response.
+        raw_response: The full provider response dict (used for the provider's
+                      tool-call path on Anthropic).
+        schema:       Pydantic v2 BaseModel subclass to parse into.
+        model_id:     Full model identifier for provider detection.
+
+    Returns:
+        A validated schema instance, or None if every parse attempt fails.
+    """
+    provider = _detect_provider(model_id)
+
+    # 1) provider-native structured-output parse
     parsed = _parse_response(
         raw_text=raw_text,
         raw_response=raw_response,
@@ -246,24 +292,19 @@ def invoke_structured_or_freetext(
         provider=provider,
     )
     if parsed is not None:
-        return parsed, raw_response
+        return parsed
 
-    # --- Graceful fallback: try manual json.loads() on the raw text ---
+    # 2) graceful fallback: manual json.loads() on free-text (fenced/embedded)
     parsed = _parse_freetext_json(raw_text, schema)
     if parsed is not None:
         logger.info(
-            "invoke_structured_or_freetext: structured output failed; "
+            "parse_structured_or_freetext: structured output failed; "
             "fell back to free-text JSON parse for %s.",
             schema.__name__,
         )
-        return parsed, raw_response
+        return parsed
 
-    logger.warning(
-        "invoke_structured_or_freetext: all parse attempts failed for %s. "
-        "Returning (None, raw_response) for graceful fallback.",
-        schema.__name__,
-    )
-    return None, raw_response
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -346,9 +387,9 @@ def _response_to_dict(response: Any) -> dict[str, Any]:
 def _parse_response(
     raw_text: str,
     raw_response: dict[str, Any],
-    schema: Type[T],
+    schema: type[T],
     provider: str,
-) -> Optional[T]:
+) -> T | None:
     """Try to parse provider-specific structured output into schema.
 
     Returns the parsed object or None on failure.
@@ -374,7 +415,7 @@ def _parse_response(
     return None
 
 
-def _parse_freetext_json(raw_text: str, schema: Type[T]) -> Optional[T]:
+def _parse_freetext_json(raw_text: str, schema: type[T]) -> T | None:
     """Try to extract and validate JSON from free-text LLM output.
 
     Handles common patterns:

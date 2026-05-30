@@ -401,3 +401,55 @@ def test_audit_event_has_required_fields(monkeypatch):
     }
     assert required_fields.issubset(set(payload.keys()))
     assert payload["model_id"] == "openai/gpt-4o"
+
+
+# ---------------------------------------------------------------------------
+# G11 (Wave C): consolidated parse path — LLMCaller.call routes through the
+# single shared parse_structured_or_freetext ladder.
+# ---------------------------------------------------------------------------
+
+
+def test_caller_uses_shared_parser(monkeypatch):
+    """A fenced-JSON HTTP body is parsed via the consolidated free-text ladder."""
+    from hermes_quant.agents.trader import TraderAction, TraderProposal
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+
+    proposal_json = json.dumps(
+        {
+            "action": "BUY",
+            "size_fraction": 0.10,
+            "confidence": 0.7,
+            "rationale": "shared-parser path",
+        }
+    )
+    fenced = "Here you go:\n```json\n" + proposal_json + "\n```"
+    oai_resp = _make_oai_response(fenced)
+    mock_resp = _mock_http_response(200, body=oai_resp)
+
+    with patch("hermes_quant.agents.llm_caller._audit_append"):
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client.post.return_value = mock_resp
+            mock_client_cls.return_value = mock_client
+
+            caller = LLMCaller(api_key="sk-test", model_id="openai/gpt-4o")
+            obj, raw = caller.call("sys", "user", schema=TraderProposal)
+
+    assert isinstance(obj, TraderProposal)
+    assert obj.action == TraderAction.BUY
+
+
+def test_caller_no_api_key_silent(monkeypatch):
+    """With OPENROUTER_API_KEY unset, .call returns (None, {error}) and never raises."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    with patch("hermes_quant.agents.llm_caller._audit_append"):
+        caller = LLMCaller()  # no constructor key either
+        obj, raw = caller.call("sys", "user", schema=_SimpleSchema)
+
+    assert obj is None
+    assert "error" in raw
+    assert "no_api_key" in raw["error"]

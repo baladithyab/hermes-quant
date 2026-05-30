@@ -483,3 +483,85 @@ def format_context_block(ctx: PastContext, max_chars: int = 2048) -> str:
     if len(result) > max_chars:
         result = result[:max_chars - 3] + "..."
     return result
+
+
+def format_context_block_split(
+    ctx: PastContext,
+    *,
+    max_chars: int = 2048,
+    rich_lesson_chars: int = 400,
+    lean: bool = True,
+) -> str:
+    """Render PastContext with ASYMMETRIC verbosity (Wave C G15).
+
+    The retrieval split (same_ticker / cross_ticker / cross_sector) already
+    exists upstream in ``get_past_context``; this renderer differentiates how
+    much of each bucket is surfaced so the most-relevant (same-ticker) context
+    stays rich while weaker analogs are bounded to one line each:
+
+      same_ticker  → RICH: fact line + full lesson (truncated to
+                     ``rich_lesson_chars``) + lesson_category + outcome_quality.
+      cross_ticker → LEAN (when ``lean``): single line
+                     ``[date|TICKER|RATING|+alpha%]`` (no lesson).
+      cross_sector → LEAN (when ``lean``): same one-line form.
+
+    Section order is unchanged (same → cross-ticker → cross-sector). Empty
+    context → ``"(none)"``. Output is clipped to ``max_chars`` with the same
+    trailing-``"..."`` rule as ``format_context_block``.
+
+    ``format_context_block`` is intentionally left UNCHANGED for back-compat;
+    the existing ``llm_committee.py`` caller is not touched by this function.
+    """
+    lines: list[str] = []
+
+    def _fact_line(item: ResolvedDecision) -> str:
+        date_str = item.asof[:10] if len(item.asof) >= 10 else item.asof
+        return (
+            f"[{date_str} | {item.ticker} | {item.rating} | "
+            f"{item.raw_return:+.1%} | {item.alpha_return:+.1%} | {item.holding_days}d]"
+        )
+
+    def _lean_line(item: ResolvedDecision) -> str:
+        date_str = item.asof[:10] if len(item.asof) >= 10 else item.asof
+        return (
+            f"[{date_str}|{item.ticker}|{item.rating}|{item.alpha_return:+.1%}]"
+        )
+
+    def _render_rich(items: list[ResolvedDecision], header: str) -> None:
+        if not items:
+            return
+        lines.append(header)
+        for item in items:
+            lines.append(_fact_line(item))
+            lesson = item.lesson or ""
+            if len(lesson) > rich_lesson_chars:
+                lesson = lesson[:rich_lesson_chars] + "..."
+            lines.append(lesson)
+            tail_bits = []
+            if item.lesson_category:
+                tail_bits.append(f"category={item.lesson_category}")
+            tail_bits.append(f"quality={item.outcome_quality}")
+            lines.append(" ".join(tail_bits))
+
+    def _render_lean(items: list[ResolvedDecision], header: str) -> None:
+        if not items:
+            return
+        lines.append(header)
+        for item in items:
+            if lean:
+                lines.append(_lean_line(item))
+            else:
+                lines.append(_fact_line(item))
+                lines.append(item.lesson)
+
+    _render_rich(ctx.same_ticker, "--- Same-ticker history ---")
+    _render_lean(ctx.cross_ticker, "--- Cross-ticker analogs ---")
+    _render_lean(ctx.cross_sector, "--- Cross-sector analogs ---")
+
+    if not lines:
+        return "(none)"
+
+    result = "\n".join(lines)
+    if len(result) > max_chars:
+        result = result[:max_chars - 3] + "..."
+    return result

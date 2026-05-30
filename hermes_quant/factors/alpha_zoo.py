@@ -24,9 +24,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -40,6 +40,12 @@ from hermes_quant.factors.lookahead_sentinel import (
     LookaheadDetected,
     check_no_lookahead,
 )
+
+if TYPE_CHECKING:
+    from hermes_quant.factors.ic_dedup import ICDedupGate, ICDedupResult
+
+# Env flag (read at call time, not import time, so tests can monkeypatch).
+_IC_DEDUP_FLAG_ENV = "HERMES_QUANT_IC_DEDUP_AT_INGEST"
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +85,21 @@ class FactorExecutionError(RuntimeError):
 
 class AppendOnlyViolation(RuntimeError):
     """Raised when caller tries to mutate or truncate the append-only registry."""
+
+
+class RedundantFactorError(RuntimeError):
+    """Raised when the IC-dedup gate rejects a factor as a near-duplicate.
+
+    Carries the :class:`~hermes_quant.factors.ic_dedup.ICDedupResult` so callers
+    can introspect ``max_corr`` and ``correlated_with``.
+    """
+
+    def __init__(self, factor_id: str, result: ICDedupResult) -> None:
+        super().__init__(
+            f"Factor {factor_id!r} rejected by IC-dedup gate: {result.reason}"
+        )
+        self.factor_id = factor_id
+        self.result = result
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +145,7 @@ class AlphaFactor(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _fill_defaults(self) -> "AlphaFactor":
+    def _fill_defaults(self) -> AlphaFactor:
         if not self.factor_id:
             # Deterministic ID from name + source_code
             digest = hashlib.sha256(
@@ -135,7 +156,7 @@ class AlphaFactor(BaseModel):
             object.__setattr__(
                 self,
                 "created_at",
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
             )
         return self
 
@@ -172,14 +193,32 @@ class AlphaZoo:
                   Defaults to ``~/.hermes/quant/factors/``.
     """
 
-    def __init__(self, base_dir: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        base_dir: str | Path | None = None,
+        *,
+        ic_dedup_gate: ICDedupGate | None = None,
+    ) -> None:
         self._dir = Path(base_dir) if base_dir is not None else _DEFAULT_DIR
         self._dir.mkdir(parents=True, exist_ok=True)
         self._jsonl_path = self._dir / "alpha_zoo.jsonl"
         self._registry_path = self._dir / "registry.json"
         # In-memory cache: factor_id -> AlphaFactor
         self._cache: dict[str, AlphaFactor] = {}
+        # Optional IC-dedup gate (B38). When None, one is lazily created on
+        # first use so the gate owns its own threshold env. An injected gate is
+        # used as-is so callers can share / inspect its library.
+        self._ic_dedup_gate = ic_dedup_gate
         self._load_existing()
+
+    @property
+    def _ic_gate(self) -> ICDedupGate:
+        """Lazily own an ICDedupGate (its own threshold env) when none injected."""
+        if self._ic_dedup_gate is None:
+            from hermes_quant.factors.ic_dedup import ICDedupGate
+
+            self._ic_dedup_gate = ICDedupGate()
+        return self._ic_dedup_gate
 
     # ------------------------------------------------------------------
     # Internal persistence helpers
@@ -250,25 +289,51 @@ class AlphaZoo:
     # Public API
     # ------------------------------------------------------------------
 
-    def register(self, factor: AlphaFactor) -> str:
+    def register(
+        self,
+        factor: AlphaFactor,
+        *,
+        factor_returns: np.ndarray | None = None,
+    ) -> str:
         """Validate, gate-check, and register *factor*.
 
         Runs the AST purity gate and lookahead sentinel before accepting.
         The registry is APPEND-ONLY; re-registering the same factor_id
         logs a warning and overwrites the in-memory cache but appends to JSONL.
 
+        IC-dedup gate (B38, DEFAULT-OFF):
+            Only runs when (a) ``HERMES_QUANT_IC_DEDUP_AT_INGEST == "1"`` AND
+            (b) ``factor_returns`` is supplied. Otherwise behavior is
+            bit-identical to the prior two-gate path (silence-by-default for the
+            new path; never breaks existing call-sites that pass no returns).
+            On reject, raises :class:`RedundantFactorError` BEFORE any append so
+            a rejected factor pollutes neither the JSONL nor the gate library.
+            On pass, the returns are registered into the gate library AFTER the
+            JSONL append succeeds, so the gate library tracks the persisted one.
+
         Args:
-            factor: The :class:`AlphaFactor` to register.
+            factor:         The :class:`AlphaFactor` to register.
+            factor_returns: Optional return series for the IC-dedup gate.
 
         Returns:
             The ``factor_id`` assigned to (or already held by) the factor.
 
         Raises:
-            PurityViolation:   If the AST purity gate rejects the source.
-            LookaheadDetected: If the lookahead sentinel rejects the source.
+            PurityViolation:      If the AST purity gate rejects the source.
+            LookaheadDetected:    If the lookahead sentinel rejects the source.
+            RedundantFactorError: If the IC-dedup gate (when active) rejects the
+                                  factor as a near-duplicate.
         """
         self._run_purity_gate(factor)
         self._run_lookahead_gate(factor)
+
+        # IC-dedup gate (read flag at call time so tests can monkeypatch env).
+        ic_flag_on = _os.environ.get(_IC_DEDUP_FLAG_ENV) == "1"
+        run_ic_gate = ic_flag_on and factor_returns is not None
+        if run_ic_gate:
+            result = self._ic_gate.check(factor_returns)
+            if not result.passes:
+                raise RedundantFactorError(factor.factor_id, result)
 
         if factor.factor_id in self._cache:
             logger.warning(
@@ -278,6 +343,11 @@ class AlphaZoo:
 
         self._cache[factor.factor_id] = factor
         self._append_record(factor)
+        # Register returns into the gate library AFTER the JSONL append succeeds
+        # so a rejected factor never pollutes the gate library and the gate
+        # library tracks exactly what is persisted.
+        if run_ic_gate:
+            self._ic_gate.register(factor.name, factor_returns)
         logger.debug("AlphaZoo: registered factor %r (%s)", factor.factor_id, factor.name)
         return factor.factor_id
 
@@ -395,7 +465,7 @@ class AlphaZoo:
     # FactorOracle convenience bridge
     # ------------------------------------------------------------------
 
-    def verdict_for(self, factor_id: str) -> "FactorVerdict | None":
+    def verdict_for(self, factor_id: str) -> FactorVerdict | None:
         """Return the latest production-readiness verdict for *factor_id*.
 
         Reads directly from the append-only ``factor_verdicts.jsonl`` log
@@ -411,7 +481,6 @@ class AlphaZoo:
         """
         from hermes_quant.factors.factor_oracle import (  # noqa: PLC0415
             FactorOracle,
-            FactorVerdict,
         )
 
         oracle = FactorOracle(self)
