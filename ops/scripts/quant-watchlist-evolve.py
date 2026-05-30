@@ -253,7 +253,50 @@ def main() -> int:
             )
     _check_budget("after_prewarm")
 
-    summary = evolve_watchlist(scorer=_scorer, universe_path=universe_path)
+    # ADR-0075 catalyst onboarding (Seam A). DEFAULT-OFF: catalyst_admissions
+    # returns [] unless BOTH HERMES_QUANT_CATALYST_ONBOARDING=1 AND
+    # HERMES_QUANT_SEMANTIC_ENABLED=1 are set, so with the flags off the kwargs
+    # below are all empty -> evolve_watchlist output is bit-for-bit identical to
+    # today. When on, <=3 strong out-of-universe catalyst names that pass the
+    # fail-closed tradeability gate are unioned into the scored universe,
+    # fast-tracked (same-day onboard), and tagged admitted_via=catalyst.
+    fast_track: set[str] = set()
+    admission_extras: dict[str, dict] = {}
+    extra_universe: list[str] = []
+    try:
+        from hermes_quant.catalyst.onboarding import catalyst_admissions, default_tradeable
+
+        admissions = catalyst_admissions(
+            set(universe_symbols), tradeable=default_tradeable
+        )
+        for a in admissions:
+            extra_universe.append(a.symbol)
+            fast_track.add(a.symbol)
+            admission_extras[a.symbol] = {
+                "admitted_via": a.admitted_via,
+                "catalyst_horizon": a.horizon,
+                "catalyst_asof": a.packet_asof,
+                "catalyst_stance": a.stance,
+            }
+        if admissions:
+            print(
+                "catalyst-onboard: admitted "
+                + ", ".join(f"{a.symbol}({a.stance})" for a in admissions),
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001 — never let onboarding crash the cron
+        print(
+            f"WARNING: catalyst onboarding skipped ({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+
+    summary = evolve_watchlist(
+        scorer=_scorer,
+        universe_path=universe_path,
+        fast_track_symbols=fast_track or None,
+        admission_extras=admission_extras or None,
+        extra_universe_symbols=extra_universe or None,
+    )
     _check_budget("after_evolve")
 
     # Silence-by-default: only print if something happened.

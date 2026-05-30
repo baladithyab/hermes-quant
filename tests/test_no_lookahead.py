@@ -508,6 +508,37 @@ def test_semantic_analyst_future_packet_under_decision_asof_extra():
     assert view_both.metadata["packet_asof"] == live_past["asof"]
 
 
+def test_semantic_analyst_only_future_packet_abstains_future_packet():
+    """A context whose ONLY packet is published after the decision boundary
+    must abstain with the explicit future_packet reason (silence-by-default,
+    not a silent zero-influence) — pins the abstain-reason observability keys on
+    (analysts/semantic.py)."""
+    decision = "2026-01-01T12:00:00Z"
+    future = _semantic_packet(
+        asof="2026-01-01T13:00:00Z", stance="bearish", confidence=0.95, magnitude=0.05
+    )
+    view = HermesSemanticAnalyst().analyze(
+        _semantic_ctx(asof=decision, extras={"semantic_packets": [future]})
+    )
+    assert view is not None
+    assert view.direction == 0
+    assert view.metadata.get("abstain_reason") == "future_packet"
+
+
+def test_semantic_analyst_admits_packet_at_decision_boundary():
+    """asof == decision_time is admissible: publication exactly at the boundary
+    is lookahead-honest (<=, not <). Backtest path (no decision_asof => ctx.asof)."""
+    decision = "2026-01-01T12:00:00Z"
+    at_boundary = _semantic_packet(
+        asof=decision, stance="bullish", confidence=0.70, magnitude=0.01
+    )
+    view = HermesSemanticAnalyst().analyze(
+        _semantic_ctx(asof=decision, extras={"semantic_packets": [at_boundary]})
+    )
+    assert view is not None and view.direction == 1
+    assert view.metadata.get("abstain_reason") is None
+
+
 # ---------------------------------------------------------------------------
 # Invariant 6 — Kronos (heavy/optional): view at T is independent of future
 # bars. Guarded by importorskip so CI without the model still passes green.
