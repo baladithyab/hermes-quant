@@ -329,6 +329,108 @@ class ProposalStore:
         return [_proposal_from_json(row["record_json"]) for row in rows]
 
     # -----------------------------------------------------------------
+    # Index reconciliation (JSONL is authoritative; rebuild SQLite)
+    # -----------------------------------------------------------------
+
+    def _reconcile_index(self) -> int:
+        """Rebuild the SQLite index by replaying the JSONL from disk.
+
+        The JSONL bus is the source of truth (append-only event log). If the
+        SQLite index drifts — e.g. a crash between the JSONL append and the
+        SQLite upsert in ``_persist``, or the .db file was deleted — this
+        replays every event in file order and reduces to the latest record
+        per ``proposal_id`` (the JSONL is append-only, so the last write for a
+        given id wins).
+
+        Money-software discipline (AGENTS.md §1 silence-by-default):
+        idempotent, and tolerant of a partial/corrupt trailing line — a daily
+        run must NEVER crash on one bad line. Malformed lines are logged and
+        skipped; the rest of the file still reconciles. Reconciliation runs
+        inside a single ``BEGIN IMMEDIATE`` transaction so a concurrent reader
+        never observes a half-rebuilt index.
+
+        Returns:
+            Number of distinct proposals written into the index.
+        """
+        with self._lock:
+            latest: dict[str, Proposal] = {}
+            if self.bus_path.exists():
+                # Read bytes and split on newline so a partial trailing line
+                # (no terminating "\n", e.g. a crash mid-write) is handled by
+                # the same json-decode skip as any other corrupt line.
+                raw = self.bus_path.read_bytes()
+                for lineno, line in enumerate(raw.split(b"\n"), start=1):
+                    if not line.strip():
+                        continue  # blank / trailing newline
+                    try:
+                        proposal = _proposal_from_json(line.decode("utf-8"))
+                    except (
+                        UnicodeDecodeError,
+                        json.JSONDecodeError,
+                        KeyError,
+                        TypeError,
+                    ) as e:
+                        # Partial/corrupt line — fail closed: log + skip, never
+                        # crash the run. A trailing partial write is the common
+                        # benign case (writer crashed mid-line).
+                        logger.warning(
+                            "proposals: skipping malformed JSONL line %d in %s "
+                            "during index reconciliation: %s",
+                            lineno,
+                            self.bus_path,
+                            e,
+                        )
+                        continue
+                    # Append-only log: later events for the same id supersede
+                    # earlier ones (pending -> approved/rejected/expired).
+                    latest[proposal.proposal_id] = proposal
+
+            # Rebuild the index atomically: a single immediate transaction so a
+            # concurrent reader sees either the old or the fully-rebuilt index,
+            # never a partial one.
+            with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute("DELETE FROM proposals")
+                    for proposal in latest.values():
+                        record = _proposal_to_dict(proposal)
+                        conn.execute(
+                            """
+                            INSERT INTO proposals
+                              (proposal_id, state, symbol, asset_class, timeframe,
+                               created_at, expires_at, approved_at, rejected_at,
+                               expired_at, record_json)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                proposal.proposal_id,
+                                proposal.state,
+                                proposal.symbol,
+                                proposal.asset_class,
+                                proposal.timeframe,
+                                proposal.created_at,
+                                proposal.expires_at,
+                                proposal.approved_at,
+                                proposal.rejected_at,
+                                proposal.expired_at,
+                                json.dumps(
+                                    record, separators=(",", ":"), sort_keys=True
+                                ),
+                            ),
+                        )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    logger.warning(
+                        "proposals: SQLite index reconciliation failed for %s; "
+                        "index left unchanged (JSONL remains authoritative)",
+                        self.bus_path,
+                        exc_info=True,
+                    )
+                    raise
+            return len(latest)
+
+    # -----------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------
 
@@ -359,9 +461,9 @@ class ProposalStore:
     def _persist(self, proposal: Proposal, *, event: str) -> None:
         """Atomic dual-write: JSONL append (truth), SQLite upsert (index).
 
-        JSONL is written first; if SQLite write fails, the next read will
-        reconstruct from JSONL via _reconcile_index() (not yet implemented;
-        v0.1.2 surfaces a warning).
+        JSONL is written first; if SQLite write fails, the index can be
+        rebuilt from JSONL via _reconcile_index() (replays the append-only
+        log, latest-event-per-id wins, tolerant of corrupt trailing lines).
         """
         record = _proposal_to_dict(proposal)
         record["_event"] = event  # "create" | "approve" | "reject" | "expire"

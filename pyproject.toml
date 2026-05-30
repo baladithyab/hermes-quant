@@ -99,7 +99,14 @@ hermes_semantic = "hermes_quant.analysts.semantic:HermesSemanticAnalyst"
 
 [project.entry-points."hermes_quant.aggregators"]
 bma = "hermes_quant.aggregators.bma:BMAAggregator"
-stacking = "hermes_quant.aggregators.stacking:StackingAggregator"
+# NOTE: the `stacking` aggregator is planned (ADR-0003 reserves a logistic
+# stacking aggregator; bma.py references StackingAggregator; scheduled v0.1.3).
+# Its entry point is intentionally NOT declared until aggregators/stacking.py
+# lands — a dangling `stacking = ...:StackingAggregator` line makes
+# discover_aggregators() log a "failed to load entry point" warning on every
+# daemon boot (ModuleNotFoundError). Re-add this line in the same commit that
+# adds the module. The `[stacking]` dependency extra below stays — scikit-learn
+# and scipy are already used (calibrators.py, factors/, options/pricing/gbs.py).
 deliberative_committee = "hermes_quant.aggregators.deliberative:DeliberativeCommitteeAggregator"
 
 [project.entry-points."hermes_quant.data_providers"]

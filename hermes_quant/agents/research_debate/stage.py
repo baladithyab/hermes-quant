@@ -172,16 +172,34 @@ def run_research_debate(
     pid = proposal_id or f"rdp-{uuid.uuid4().hex[:12]}"
     state = InvestDebateState()
 
-    # ADR-0065 §Implementation Plan §7: production turn/judge wiring is deferred to v0.6.2.
-    # The helpers `_run_one_turn_with_history` and `_run_research_manager_judge` are referenced
-    # in design docs but not yet defined in `llm_committee.py`. Until v0.6.2 lands the wiring,
-    # callers (including tests) MUST inject `run_one_turn=` and `run_judge=` explicitly.
+    # ADR-0066 (v0.6.2): production turn/judge wiring is live. The default
+    # injection points are the helpers in ``llm_committee``:
+    # ``_run_one_turn_with_history`` (the bull/bear turn adapter) and
+    # ``_run_research_manager_judge`` (the ResearchManager judge adapter). The
+    # dispatch site (llm_committee.run_llm_committee, under
+    # HERMES_QUANT_RESEARCH_DEBATE=1) passes both explicitly; here we default
+    # them via lazy import so direct callers get the production wiring for free
+    # while tests can still inject stubs. The import is lazy to avoid a circular
+    # dependency (``llm_committee`` lazily imports this module at its dispatch
+    # site). The ``NotImplementedError`` below now fires only if those helpers
+    # cannot be imported at all — a genuine guard, not a "not yet built" stub.
     if run_one_turn is None or run_judge is None:
-        raise NotImplementedError(
-            "run_research_debate: production turn/judge wiring not yet implemented in llm_committee.py. "
-            "_run_one_turn_with_history and _run_research_manager_judge are referenced but not defined. "
-            "See ADR-0065 §Implementation Plan §7. Tests must pass run_one_turn=, run_judge= kwargs explicitly."
-        )
+        try:
+            from hermes_quant.aggregators.llm_committee import (
+                _run_one_turn_with_history,
+                _run_research_manager_judge,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise NotImplementedError(
+                "run_research_debate: could not import the production turn/judge "
+                "helpers (_run_one_turn_with_history, _run_research_manager_judge) "
+                "from hermes_quant.aggregators.llm_committee. Pass run_one_turn=, "
+                "run_judge= kwargs explicitly to use custom wiring."
+            ) from exc
+        if run_one_turn is None:
+            run_one_turn = _run_one_turn_with_history
+        if run_judge is None:
+            run_judge = _run_research_manager_judge
 
     consecutive_failures = 0
     asset_str = getattr(ctx, "asset", None) or "unknown"

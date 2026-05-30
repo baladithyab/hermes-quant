@@ -347,6 +347,96 @@ def test_research_plan_validation_failure_yields_none_judge(
     assert rows[0]["payload"]["final_recommendation"] is None
 
 
+# T4b (B49) ----------------------------------------------------------
+def test_default_injection_points_use_production_helpers(
+    _isolate_governance_audit_log: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B49 clarity fix: omitting ``run_one_turn``/``run_judge`` must NOT raise
+    NotImplementedError. The stage now defaults to the production helpers in
+    ``llm_committee`` (PR #15/ADR-0066 wiring), so the debate runs end-to-end
+    with only ``_call_llm_json`` stubbed. This pins the corrected behaviour: the
+    stale 'not yet implemented' raise is gone; the helpers ARE defined and ARE
+    the defaults.
+    """
+    from hermes_quant.aggregators import llm_committee as committee_mod
+
+    def _fake_call(**kw: Any) -> str:
+        system = kw["system_text"].lower()
+        # Judge prompt is the research_manager role ("You are the Research
+        # Manager — the deep-tier judge ..."); emit a ResearchPlan JSON.
+        if "research manager" in system or "deep-tier judge" in system:
+            return json.dumps(
+                {
+                    "recommendation": "OVERWEIGHT",
+                    "confidence": 0.6,
+                    "rationale": "Bull case nets out ahead of bear case.",
+                    "strategic_actions": "Scale in above the prior high.",
+                    "horizon_emphasis": "1d",
+                }
+            )
+        # Otherwise it's a bull/bear turn ("You are the Bull/Bear Researcher").
+        role = "bear_researcher" if "bear researcher" in system else "bull_researcher"
+        return json.dumps(
+            {
+                "role": role,
+                "stance": "long the breakout" if role == "bull_researcher" else "cautious",
+                "confidence": 0.7 if role == "bull_researcher" else 0.4,
+                "rationale": f"{role} structured rationale for the tick.",
+                "key_evidence": ["ta"],
+                "counterarguments": "noted",
+            }
+        )
+
+    monkeypatch.setattr(committee_mod, "_call_llm_json", _fake_call)
+
+    # No run_one_turn=, no run_judge=  → must default, NOT raise.
+    state = run_research_debate(
+        ctx=_ctx(),
+        baseline_signal=_baseline(),
+        analyst_views=[_view()],
+        config=_config(),
+        client=MagicMock(),
+        max_rounds=1,
+    )
+
+    assert len(state.bull_turns) == 1
+    assert len(state.bear_turns) == 1
+    assert state.judge_decision is not None
+    assert state.judge_decision.recommendation == PortfolioRating.OVERWEIGHT
+
+
+# T4c (B49) ----------------------------------------------------------
+def test_default_injection_guard_raises_when_helpers_unimportable(
+    _isolate_governance_audit_log: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The NotImplementedError now only guards the genuine failure mode: the
+    production helpers cannot be imported. We simulate that by making the lazy
+    import inside ``run_research_debate`` fail, and assert the guard fires with
+    the corrected message (no false 'not yet implemented' claim)."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _boom_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hermes_quant.aggregators.llm_committee":
+            raise ImportError("simulated unimportable helpers")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _boom_import)
+
+    with pytest.raises(NotImplementedError, match="could not import the production turn/judge"):
+        run_research_debate(
+            ctx=_ctx(),
+            baseline_signal=_baseline(),
+            analyst_views=[_view()],
+            config=_config(),
+            client=MagicMock(),
+            max_rounds=1,
+        )
+
+
 # T5 ------------------------------------------------------------------
 def test_portfolio_rating_enum_round_trip() -> None:
     # value identity

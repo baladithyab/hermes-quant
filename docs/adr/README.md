@@ -46,3 +46,5 @@
 - [ADR-0074-catalyst-sense-semantic-fusion.md](ADR-0074-catalyst-sense-semantic-fusion.md) — ADR-0074: Catalyst Sense — semantic-numerical fusion via parallel catalyst detection
 - [ADR-0075-catalyst-driven-universe-onboarding.md](ADR-0075-catalyst-driven-universe-onboarding.md) — ADR-0075: Catalyst-driven universe onboarding
 - [ADR-0076-social-arbitrage-integration.md](ADR-0076-social-arbitrage-integration.md) — ADR-0076: Social-arbitrage integration — consumer-trend entity class, sized fusion, profitability-verification loop
+- [ADR-0077-pretrade-admissibility-shortability.md](ADR-0077-pretrade-admissibility-shortability.md) — ADR-0077: Pre-trade admissibility engine + ShortabilityOracle (paper→live fidelity foundation)
+- [ADR-0078-order-lifecycle-fills-idempotency.md](ADR-0078-order-lifecycle-fills-idempotency.md) — ADR-0078: Order-lifecycle state machine + fill realism + exactly-once idempotency

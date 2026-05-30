@@ -264,6 +264,181 @@ def test_gate_rejection_carries_signal_provenance(audit_path: Path, halt_state) 
 
 
 # ---------------------------------------------------------------------------
+# Fix A6: BMA discriminator must be observable in the audit trail.
+#
+# These exercise the END-TO-END path through a real BMAAggregator (not a
+# hand-built signal) so the n_distinct_analysts / contributing_analysts
+# discriminator is provably written through to the approval audit record,
+# and a degenerate single-source case is distinguishable from the audit
+# trail alone.
+# ---------------------------------------------------------------------------
+
+
+def _ensemble_av(
+    analyst: str, *, direction: int = 1, confidence: float = 0.9, horizon: str = "1d"
+) -> AnalystView:
+    """Like _av but with a magnitude (0.05) large enough that the gate's
+    cost-gate is cleared once an identity calibrator preserves confidence —
+    so a real BMA aggregate yields an actual gate_approval to audit."""
+    return AnalystView(
+        analyst=analyst,
+        direction=direction,
+        magnitude=0.05,
+        confidence=confidence,
+        confidence_raw=max(confidence, 0.85),
+        horizon=horizon,
+    )
+
+
+def _make_context(asset: str = "BTC/USDT"):
+    """Minimal MarketContext for driving a real BMAAggregator.aggregate()."""
+    from hermes_quant.protocol import MarketContext
+
+    bars = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-05-26", periods=3, freq="1h", tz="UTC"),
+            "open": [100.0, 101.0, 102.0],
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [101.0, 102.0, 103.0],
+            "volume": [1000.0, 1100.0, 1200.0],
+        }
+    )
+    return MarketContext(
+        asset=asset,
+        timeframe="1h",
+        asset_class="crypto",
+        exchange="binance",
+        bars=bars,
+        last_close=103.0,
+        last_volume=1200.0,
+        asof=pd.Timestamp("2026-05-26T02:00:00Z"),
+    )
+
+
+def test_approval_audit_carries_non_none_discriminator_for_real_bma_ensemble(
+    audit_path: Path, halt_state
+) -> None:
+    """Fix A6: an approval driven by a REAL BMA aggregate with >=2 distinct
+    analysts must carry non-None n_distinct_analysts / contributing_analysts
+    on the gate_approval audit record. The require_ensemble gate fired
+    (n_distinct >= 2) and that MUST be queryable from the audit trail.
+    """
+    from hermes_quant.aggregators.bma import BMAAggregator
+    from hermes_quant.calibrators import IdentityCalibrator
+
+    views = [
+        _ensemble_av("ClassicalTA", direction=1, confidence=0.9),
+        _ensemble_av("Microstructure", direction=1, confidence=0.85),
+    ]
+    agg = BMAAggregator()  # require_ensemble=True (default)
+    # Identity calibrator: keep calibrated confidence high enough that the
+    # gate's cost-gate doesn't silence (cold-start shrinkage would otherwise
+    # cap confidence at 0.375 and never produce an approval to audit).
+    agg.calibrator = IdentityCalibrator()
+    signal = agg.aggregate(views, _make_context())
+    # Two distinct analysts agreeing → BMA emits a live (non-flat) signal.
+    assert signal.direction != 0, "two agreeing analysts should clear require_ensemble"
+    assert signal.aggregator == "bma"
+
+    g = DefaultRiskGate()
+    action = g.gate(signal, _make_market(), _make_portfolio(), halt_state)
+    assert action is not None and action.target_position_pct > 0
+
+    payloads = _read_payloads(audit_path, "gate_approval")
+    assert len(payloads) == 1, f"expected 1 gate_approval, got {len(payloads)}"
+    sp = payloads[0].get("signal_provenance")
+    assert sp is not None, "signal_provenance MUST be on the gate_approval payload"
+    # The discriminator fields must NEVER be None when the aggregator
+    # produced them — this is the entire point of Fix A6.
+    assert sp["n_distinct_analysts"] is not None
+    assert sp["n_distinct_analysts"] == 2
+    assert sp["contributing_analysts"] is not None
+    assert sorted(sp["contributing_analysts"]) == ["ClassicalTA", "Microstructure"]
+    assert sp["n_views"] == 2
+
+
+def test_audit_trail_distinguishes_single_source_from_ensemble(
+    audit_path: Path, halt_state
+) -> None:
+    """Fix A6: a degenerate single-source case is distinguishable in the
+    audit trail from a genuine multi-analyst ensemble.
+
+    A lone analyst run through BMA with require_ensemble=False passes
+    through; its approval audit record carries n_distinct_analysts == 1,
+    which is exactly the signature is_bma_degenerate / is_n1_collapse can
+    query — and which is NOT confusable with the n_distinct >= 2 ensemble.
+    """
+    from hermes_quant.aggregators.bma import BMAAggregator
+    from hermes_quant.calibrators import IdentityCalibrator
+    from hermes_quant.governance.audit_log_query import is_n1_collapse
+
+    # Single source: one distinct analyst. require_ensemble=False so BMA
+    # passes it through rather than silencing (research/degenerate config).
+    lone_view = [_ensemble_av("Kronos", direction=1, confidence=0.95)]
+    agg = BMAAggregator(require_ensemble=False)
+    agg.calibrator = IdentityCalibrator()
+    signal = agg.aggregate(lone_view, _make_context())
+    assert signal.direction != 0
+
+    g = DefaultRiskGate()
+    g.gate(signal, _make_market(), _make_portfolio(), halt_state)
+
+    payloads = _read_payloads(audit_path, "gate_approval")
+    assert len(payloads) == 1
+    sp = payloads[0]["signal_provenance"]
+    # Single-source signature: explicitly n_distinct == 1, NOT None and NOT 2.
+    assert sp["n_distinct_analysts"] == 1
+    assert sp["contributing_analysts"] == ["Kronos"]
+    assert sp["n_distinct_analysts"] != 2
+
+    # And it is forensically distinguishable: reconstruct the event shape
+    # that is_n1_collapse consumes. (We don't assert it fires unless conf
+    # saturated — we assert the DISCRIMINATOR is present and usable.)
+    ev = {"kind": "gate_approval", "payload": payloads[0]}
+    # The predicate is well-defined (returns a bool, not erroring on None).
+    assert isinstance(is_n1_collapse(ev), bool)
+
+
+def test_provenance_falls_back_to_metadata_when_components_stripped() -> None:
+    """Fix A6 root-cause: a signal carrying authoritative aggregator metadata
+    counts but EMPTY components must still produce non-None discriminator
+    fields. The old implementation recomputed solely from components and
+    silently wrote n_distinct_analysts=0 / contributing_analysts=[] — the
+    blind spot that surfaced as None in the audit trail.
+    """
+    signal = _make_signal(
+        direction=1,
+        components=(),  # stripped (e.g. serialized-then-reconstructed signal)
+        metadata={
+            "weights": {"ClassicalTA": 0.6, "Kronos": 0.4},
+            "n_views": 2,
+            "n_contributing": 2,
+            "vote_share": 1.0,
+        },
+    )
+    sp = _build_signal_provenance(signal)
+    assert sp["n_distinct_analysts"] == 2
+    assert sp["contributing_analysts"] == ["ClassicalTA", "Kronos"]
+    assert sp["n_views"] == 2
+    # Aggregator metadata still propagates as before.
+    assert sp["vote_share"] == 1.0
+    assert sp["n_contributing"] == 2
+
+
+def test_provenance_none_when_neither_components_nor_metadata_counts() -> None:
+    """Honest None: when an aggregator produced NEITHER components NOR
+    countable metadata, the discriminator is None (not a misleading 0).
+    is_pre_provenance_schema / operators can treat that as 'unknown'.
+    """
+    signal = _make_signal(direction=1, components=(), metadata={"reason": "flat"})
+    sp = _build_signal_provenance(signal)
+    assert sp["n_distinct_analysts"] is None
+    assert sp["contributing_analysts"] == []
+    assert sp["n_views"] is None
+
+
+# ---------------------------------------------------------------------------
 # is_bma_degenerate canonical predicate
 # ---------------------------------------------------------------------------
 

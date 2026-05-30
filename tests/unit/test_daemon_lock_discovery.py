@@ -97,6 +97,38 @@ class TestDiscovery:
         d = discover_aggregators()
         assert isinstance(d, dict)
 
+    def test_discover_aggregators_no_dangling_stacking_warning(self, caplog):
+        """Regression (FIX A1): the `stacking` aggregator entry point was
+        declared in pyproject.toml but aggregators/stacking.py never landed,
+        so discover_aggregators() logged a "failed to load entry point
+        stacking ... No module named ..." warning on every daemon boot.
+
+        Assert (a) no warning mentions a failed/missing 'stacking' load, and
+        (b) every discovered aggregator name resolves to an importable module
+        (i.e. the entry-point set is exactly the modules that exist).
+
+        Skips gracefully if the package isn't installed (no entry points).
+        """
+        import importlib
+
+        with caplog.at_level("WARNING", logger="hermes_quant.daemon.discovery"):
+            discovered = discover_aggregators()
+
+        for record in caplog.records:
+            msg = record.getMessage().lower()
+            assert not ("failed to load entry point" in msg and "stacking" in msg), (
+                "dangling 'stacking' entry point regressed: " + record.getMessage()
+            )
+
+        if not discovered:
+            pytest.skip("package not installed; no aggregator entry points registered")
+
+        # Every discovered class must come from a module that actually imports.
+        assert "stacking" not in discovered
+        for name, cls in discovered.items():
+            module = importlib.import_module(cls.__module__)
+            assert module is not None, name
+
     def test_discover_data_providers_returns_dict(self):
         d = discover_data_providers()
         assert isinstance(d, dict)

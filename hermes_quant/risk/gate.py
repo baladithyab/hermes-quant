@@ -85,6 +85,20 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
     contributing_analysts, aggregator_class) MUST be populated and are not
     nullable. Tests guard this contract.
 
+    Fix A6 (BMA discriminator observability): the discriminative counts
+    (n_views, n_distinct_analysts, contributing_analysts) are derived from
+    `signal.components` when those are present, and otherwise fall back to
+    the aggregator's authoritative metadata counts (BMA stores `n_views`
+    and per-analyst `weights` on `signal.metadata`). The previous
+    implementation recomputed SOLELY from `components`, so a signal that
+    carried metadata counts but stripped/empty components (e.g. a
+    serialized-then-reconstructed signal, or any aggregator that doesn't
+    round-trip components) wrote a degenerate `n_distinct_analysts=0` /
+    `contributing_analysts=[]` into the audit trail — surfacing downstream
+    as the "n_distinct_analysts=None" blind spot the BMA degeneracy
+    predicate can't query. Preferring metadata-on-fallback guarantees these
+    fields are never None/degenerate whenever the aggregator produced them.
+
     Per ADR-0041: this is the canonical predicate input. The
     `is_bma_degenerate(event)` helper in
     `hermes_quant.governance.audit_log_query` consumes this block.
@@ -92,7 +106,6 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
     components = signal.components or ()
     md = dict(signal.metadata or {})
 
-    contributing_analysts = sorted({v.analyst for v in components})
     analyst_view_ids: list[str] = []
     for v in components:
         v_md = dict(v.metadata or {})
@@ -105,6 +118,36 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
         else:
             analyst_view_ids.append(f"{v.analyst}:{v.horizon}")
 
+    # Discriminative counts. PREFER signal.components (richest source —
+    # carries per-view IDs and exact analyst names). When components is
+    # empty but the aggregator stashed authoritative counts on metadata,
+    # fall back to those so the audit record reflects what the aggregator
+    # actually produced rather than a degenerate zero.
+    #
+    # BMAAggregator metadata contract (hermes_quant.aggregators.bma):
+    #   metadata["weights"]  -> {analyst_name: weight}  (distinct analysts)
+    #   metadata["n_views"]  -> int  (count of views entering aggregation)
+    if components:
+        contributing_analysts = sorted({v.analyst for v in components})
+        n_distinct_analysts: int | None = len(set(contributing_analysts))
+        n_views: int | None = len(components)
+    else:
+        weights = md.get("weights")
+        if isinstance(weights, dict) and weights:
+            contributing_analysts = sorted({str(a) for a in weights})
+            n_distinct_analysts = len(contributing_analysts)
+        else:
+            contributing_analysts = []
+            n_distinct_analysts = None
+        md_n_views = md.get("n_views")
+        if isinstance(md_n_views, int):
+            n_views = md_n_views
+        elif n_distinct_analysts is not None:
+            # Best-effort: at least as many views as distinct analysts.
+            n_views = n_distinct_analysts
+        else:
+            n_views = None
+
     # data_quality may live on the signal itself or on the aggregator
     # metadata. Prefer the signal-level field if present; otherwise fall
     # back to metadata; otherwise None.
@@ -115,8 +158,8 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
     dq = sig_dq if sig_dq is not None else md.get("data_quality")
 
     return {
-        "n_views": len(components),
-        "n_distinct_analysts": len(set(contributing_analysts)),
+        "n_views": n_views,
+        "n_distinct_analysts": n_distinct_analysts,
         "contributing_analysts": contributing_analysts,
         "vote_share": md.get("vote_share"),
         "n_contributing": md.get("n_contributing"),

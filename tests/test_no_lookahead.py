@@ -25,6 +25,7 @@ import pytest
 from hermes_quant.advisor import recommend
 from hermes_quant.analysts.classical_ta import ClassicalTAAnalyst
 from hermes_quant.analysts.microstructure import MicrostructureLite
+from hermes_quant.analysts.semantic import HermesSemanticAnalyst
 from hermes_quant.protocol import MarketContext
 
 
@@ -340,3 +341,222 @@ def test_shuffle_timestamps_invariant_via_evaluation_module(analyst_factory):
     # with a hard threshold.
     assert 0.0 <= result.p_value <= 1.0
     assert len(result.shuffled_scores) == 8
+
+
+# ---------------------------------------------------------------------------
+# Invariant 5 — SemanticAnalyst: a packet with asof > decision_time has ZERO
+# influence (ADR-0074 "asof = publication time" is the #1 honesty rule).
+# ---------------------------------------------------------------------------
+# The catalyst pipeline is LIVE: synthesize.py stamps each SemanticPacket with
+# asof = the headline's PUBLICATION time, then the advisor feeds packets into
+# MarketContext.extras["semantic_packets"]. HermesSemanticAnalyst consumes those
+# packets (NOT bars). Its lookahead invariant therefore lives in packet-time
+# space, not bar-position space, so the bar-based fences above can't reach it.
+# The contract: a packet published AFTER the decision boundary MUST be dropped
+# (validate_semantic_packet -> "future_packet") and contribute nothing to the
+# view. We prove zero influence by differencing against the future-absent case.
+
+
+def _semantic_packet(*, asof: str, stance: str, confidence: float, magnitude: float):
+    """Build a hash-attached SemanticPacket dict for BTC/USDT @ 1h.
+
+    Mirrors the shape synthesize.synthesize_packets emits (asof = publication
+    time) and the fixtures in tests/unit/test_semantic_analyst.py.
+    """
+    from hermes_quant.semantic import semantic_packet_from_dict
+
+    return semantic_packet_from_dict(
+        {
+            "schema_version": 1,
+            "asset": "BTC/USDT",
+            "asof": asof,
+            "horizon": "1h",
+            "stance": stance,
+            "confidence": confidence,
+            "magnitude": magnitude,
+            "summary": f"semantic packet asof={asof} stance={stance}",
+            "sources": [{"type": "note", "ref": "no-lookahead-fence"}],
+            "model": "hermes:lookahead-test",
+        }
+    ).to_dict()
+
+
+def _semantic_ctx(*, asof: str, extras: dict):
+    """MarketContext at decision time `asof`. Bars are inert filler — the
+    semantic analyst reads packets from extras, not bars."""
+    ts = pd.date_range("2026-01-01", periods=5, freq="1h", tz="UTC")
+    bars = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "high": [101.0, 102.0, 103.0, 104.0, 105.0],
+            "low": [99.0, 100.0, 101.0, 102.0, 103.0],
+            "close": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "volume": [1000.0] * 5,
+        }
+    )
+    return MarketContext(
+        asset="BTC/USDT",
+        timeframe="1h",
+        asset_class="crypto",
+        exchange="kraken",
+        bars=bars,
+        last_close=104.0,
+        last_volume=1000.0,
+        asof=pd.Timestamp(asof),
+        extras=extras,
+    )
+
+
+def _views_equal(a, b) -> bool:
+    """View-equality on the load-bearing fields (ignoring rationale prose,
+    which deliberately echoes the selected packet's asof)."""
+    if (a is None) != (b is None):
+        return False
+    if a is None and b is None:
+        return True
+    return (
+        a.direction == b.direction
+        and a.magnitude == pytest.approx(b.magnitude, rel=1e-9)
+        and a.confidence == pytest.approx(b.confidence, rel=1e-9)
+        and a.confidence_raw == pytest.approx(b.confidence_raw, rel=1e-9)
+        and a.metadata.get("semantic_stance") == b.metadata.get("semantic_stance")
+        and a.metadata.get("packet_asof") == b.metadata.get("packet_asof")
+    )
+
+
+def test_semantic_analyst_future_packet_has_zero_influence():
+    """A packet published AFTER ctx.asof must be dropped, leaving the view
+    byte-identical to the case where that future packet was never present.
+
+    The future packet is deliberately the LOUDER one (opposite stance, higher
+    confidence, later asof) so that ANY leak flips direction and confidence —
+    a silent no-op leak can't hide.
+    """
+    decision = "2026-01-01T12:00:00Z"
+    past = _semantic_packet(
+        asof="2026-01-01T11:00:00Z", stance="bullish", confidence=0.70, magnitude=0.010
+    )
+    future = _semantic_packet(
+        asof="2026-01-01T13:00:00Z", stance="bearish", confidence=0.95, magnitude=0.050
+    )
+
+    # Case A: both packets present. The future packet MUST be dropped.
+    view_with_future = HermesSemanticAnalyst().analyze(
+        _semantic_ctx(asof=decision, extras={"semantic_packets": [past, future]})
+    )
+    # Case B: future packet never existed.
+    view_without_future = HermesSemanticAnalyst().analyze(
+        _semantic_ctx(asof=decision, extras={"semantic_packets": [past]})
+    )
+
+    assert view_with_future is not None and view_without_future is not None
+    assert _views_equal(view_with_future, view_without_future), (
+        "future-asof semantic packet influenced the view — ADR-0074 "
+        "publication-time lookahead violation"
+    )
+    # And concretely: the surviving view reflects the PAST (bullish) packet,
+    # never the louder future (bearish) one.
+    assert view_with_future.direction == 1
+    assert view_with_future.confidence_raw == pytest.approx(0.70)
+    assert view_with_future.metadata["semantic_stance"] == "bullish"
+    assert view_with_future.metadata["packet_asof"] == past["asof"]
+
+
+def test_semantic_analyst_future_packet_under_decision_asof_extra():
+    """Live path (ADR-0074/ADR-0068): when ctx.extras['decision_asof'] is the
+    wall-clock decision time, the future cutoff is decision_asof, not the bar
+    asof. A packet published after decision_asof still has zero influence,
+    and a packet published before decision_asof (but after the stale bar time)
+    is correctly admitted."""
+    bar_asof = "2026-01-01T00:00:00Z"  # stale daily-bar close
+    decision = "2026-01-01T12:00:00Z"  # live wall-clock decision time
+
+    # Published after the bar close but BEFORE the decision -> admissible live.
+    live_past = _semantic_packet(
+        asof="2026-01-01T09:00:00Z", stance="bullish", confidence=0.70, magnitude=0.010
+    )
+    # Published AFTER the decision -> must be dropped even with decision_asof.
+    future = _semantic_packet(
+        asof="2026-01-01T15:00:00Z", stance="bearish", confidence=0.95, magnitude=0.050
+    )
+
+    extras_both = {
+        "semantic_packets": [live_past, future],
+        "decision_asof": decision,
+    }
+    extras_past_only = {
+        "semantic_packets": [live_past],
+        "decision_asof": decision,
+    }
+
+    view_both = HermesSemanticAnalyst().analyze(
+        _semantic_ctx(asof=bar_asof, extras=extras_both)
+    )
+    view_past_only = HermesSemanticAnalyst().analyze(
+        _semantic_ctx(asof=bar_asof, extras=extras_past_only)
+    )
+
+    assert view_both is not None and view_past_only is not None
+    assert _views_equal(view_both, view_past_only), (
+        "future-asof packet leaked under decision_asof live path — lookahead "
+        "violation in the wall-clock decision-time branch"
+    )
+    # The admitted packet IS the live_past one (proves decision_asof widened
+    # the window past the stale bar time without admitting the future packet).
+    assert view_both.direction == 1
+    assert view_both.metadata["packet_asof"] == live_past["asof"]
+
+
+# ---------------------------------------------------------------------------
+# Invariant 6 — Kronos (heavy/optional): view at T is independent of future
+# bars. Guarded by importorskip so CI without the model still passes green.
+# ---------------------------------------------------------------------------
+
+
+def test_kronos_view_at_t_independent_of_future_bars():
+    """Same no-lookahead fence as Invariant 1, but for the optional Kronos
+    foundation-model analyst. Skipped when the `kronos` package isn't
+    installed (heavy/optional dependency) so a model-free CI stays green."""
+    pytest.importorskip("kronos", reason="kronos model package not installed")
+
+    from hermes_quant.analysts.kronos import KronosAnalyst, KronosConfig
+
+    bars = _make_bars(120, trend=0.5, seed=42)
+
+    # Truncated-at-79 context.
+    ctx_truncated = _ctx_at(bars, asof_idx=79)
+
+    # Polluted-then-sliced: blow up the out-of-window rows so any leak shifts
+    # the forecast dramatically, then slice to the same [0..79] window.
+    polluted = bars.copy()
+    polluted.loc[80:, "close"] = polluted.loc[80:, "close"] * 100
+    polluted.loc[80:, "high"] = polluted.loc[80:, "high"] * 100
+    sliced_polluted = polluted.iloc[:80].reset_index(drop=True)
+    ctx_polluted_but_sliced = MarketContext(
+        asset="TEST",
+        timeframe="1d",
+        asset_class="equity",
+        exchange=None,
+        bars=sliced_polluted,
+        last_close=float(sliced_polluted["close"].iloc[-1]),
+        last_volume=float(sliced_polluted["volume"].iloc[-1]),
+        asof=sliced_polluted["timestamp"].iloc[-1],
+        extras={},
+    )
+
+    # deterministic_seed pins Kronos's stochastic path sampling so the two
+    # runs are comparable (charter replayability invariant).
+    cfg = KronosConfig(deterministic_seed=42)
+    v1 = KronosAnalyst(cfg).analyze(ctx_truncated)
+    v2 = KronosAnalyst(cfg).analyze(ctx_polluted_but_sliced)
+
+    if v1 is None and v2 is None:
+        return
+    assert v1 is not None and v2 is not None, (
+        "kronos behavior differs based on out-of-window data presence — "
+        "no-lookahead violation"
+    )
+    assert v1.direction == v2.direction
+    assert v1.confidence_raw == pytest.approx(v2.confidence_raw, rel=1e-9)
+    assert v1.magnitude == pytest.approx(v2.magnitude, rel=1e-9)
