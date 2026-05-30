@@ -22,7 +22,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timezone
 
-from hermes_quant.catalyst.eval import EvalCase, eval_gate
+from hermes_quant.catalyst.eval import EvalCase, SignCase, eval_gate
 from hermes_quant.catalyst.ingest import CatalystItem
 
 UTC = timezone.utc
@@ -75,6 +75,27 @@ BENIGN = [
     _item("TSMC holds annual shareholder meeting in Taipei", datetime(2026,5,20,14,0,tzinfo=UTC)),
 ]
 
+# Edge-sign consistency cases — one+ per sector the graph reaches. Deterministic
+# (no market data); guards the highest-risk field across ALL sectors, where the
+# precision axis only reaches space. A wrong contagion sign fails here loudly.
+SIGN_CASES = [
+    # space
+    SignCase("Blue Origin New Glenn rocket explodes during test", "RKLB", "negative", "bearish"),
+    SignCase("Blue Origin New Glenn rocket explodes during test", "ASTS", "negative", "bearish"),
+    # aerospace
+    SignCase("Boeing 737 fleet grounded after defect found", "BA", "negative", "bearish"),
+    SignCase("Boeing 737 fleet grounded after defect found", "RTX", "negative", "bearish"),
+    # EV / autos
+    SignCase("Tesla recall affects thousands of vehicles", "TSLA", "negative", "bearish"),
+    SignCase("Tesla recall affects thousands of vehicles", "RIVN", "negative", "bearish"),
+    # banks
+    SignCase("Regional bank failure sparks contagion fears", "JPM", "negative", "bearish"),
+    SignCase("Regional bank failure sparks contagion fears", "BAC", "negative", "bearish"),
+    # semis / supply chain
+    SignCase("TSMC output halted after anomaly at fab", "TSM", "negative", "bearish"),
+    SignCase("TSMC output halted after anomaly at fab", "NVDA", "negative", "bearish"),
+]
+
 
 def main() -> int:
     print("=" * 72)
@@ -91,10 +112,11 @@ def main() -> int:
         if mv == mv:  # not nan
             cases.append(EvalCase(_item(title, when), sym, mv))
 
-    print(f"\nBuilt {len(cases)} precision cases + {len(BENIGN)} benign controls.")
+    print(f"\nBuilt {len(cases)} precision cases + {len(BENIGN)} benign controls "
+          f"+ {len(SIGN_CASES)} edge-sign cases.")
     print("\nRunning eval_gate (min_hit_rate=0.6)...\n")
 
-    passed, neg, prec = eval_gate(BENIGN, cases, min_hit_rate=0.6)
+    passed, neg, prec, sign = eval_gate(BENIGN, cases, min_hit_rate=0.6, sign_cases=SIGN_CASES)
 
     print("--- NEGATIVE CONTROL ---")
     print(f"  benign items: {neg.n_benign_items}")
@@ -102,12 +124,18 @@ def main() -> int:
     if neg.spurious:
         print(f"  spurious symbols: {neg.spurious}")
 
-    print("\n--- DIRECTIONAL PRECISION ---")
+    print("\n--- DIRECTIONAL PRECISION (real returns; space sector) ---")
     print(f"  cases scored: {prec.n_scored}/{prec.n_cases}")
     print(f"  hits: {prec.hits}  hit_rate: {prec.hit_rate:.2%}  "
           f"{'✅ PASS' if prec.passed else '❌ FAIL'}")
     for m in prec.misses:
         print(f"    miss: {m}")
+
+    print("\n--- EDGE-SIGN CONSISTENCY (deterministic; all sectors) ---")
+    print(f"  cases: {sign.n_correct}/{sign.n_cases} correct  "
+          f"{'✅ PASS' if sign.passed else '❌ FAIL'}")
+    for m in sign.mismatches:
+        print(f"    mismatch: {m}")
 
     print("\n" + "=" * 72)
     if passed:

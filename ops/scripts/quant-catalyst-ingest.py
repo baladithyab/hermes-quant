@@ -33,11 +33,15 @@ from hermes_quant.catalyst.synthesize import synthesize_packets, write_packets
 # propagation graph grows. when:1d keeps it fresh; the ingester runs frequently.
 QUERIES = {
     "space": '(Blue Origin OR "Rocket Lab" OR SpaceX OR "New Glenn" OR "space stocks") when:1d',
-    "energy": '(OPEC OR "oil prices" OR crude OR "production cut") when:1d',
     "semis": '(TSMC OR Taiwan OR "chip supply" OR semiconductor) when:1d',
     "aero": '(Boeing OR "737" OR "aircraft grounding" OR "FAA") when:1d',
     "ev": '(Tesla OR "EV recall" OR "electric vehicle" OR Rivian OR Lucid) when:1d',
     "banks": '("bank failure" OR "bank collapse" OR "banking crisis" OR contagion) when:1d',
+    # NOTE: the "energy" query was dropped 2026-05-29 — the OPEC/commodity edge was
+    # removed (severity classifier can't extract supply direction, so it mis-signed
+    # oil producers). Re-add the query when the energy edge returns with a
+    # supply-direction classifier. Querying it now would fetch items that produce
+    # zero packets (no graph edge) — wasted fetch.
 }
 
 

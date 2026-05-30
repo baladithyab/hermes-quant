@@ -120,15 +120,105 @@ def run_precision(
     )
 
 
+@dataclass(frozen=True)
+class SignCase:
+    """One edge-sign expectation: a catalyst of ``polarity`` on ``source_text``
+    must propagate ``expected_stance`` to ``symbol``. Market-data-free — this
+    validates the GRAPH'S SIGN (the highest-risk modeling field) deterministically,
+    so every sector can be guarded even when real forward-return labels aren't
+    available for a precision case.
+    """
+
+    source_text: str  # a headline that names the source entity + a catalyst word
+    symbol: str
+    polarity: str  # "negative" | "positive" — the catalyst polarity in source_text
+    expected_stance: str  # "bullish" | "bearish"
+
+
+@dataclass(frozen=True)
+class SignConsistencyResult:
+    n_cases: int
+    n_correct: int
+    passed: bool
+    mismatches: tuple[str, ...]
+    unvalidated_sectors: tuple[str, ...]
+
+
+def run_sign_consistency(
+    cases: list[SignCase],
+    *,
+    graph: dict[str, list[PropagationEdge]] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> SignConsistencyResult:
+    """Deterministic edge-sign check across sectors (no market data needed).
+
+    For each case, synthesize packets from the headline and confirm the packet
+    for ``symbol`` carries ``expected_stance``. A wrong sign here is the
+    catastrophic failure the ADR warns about (a sector-contagion edge that
+    propagates bullish on a disaster). Unlike precision, this needs no realized
+    returns — it asserts the graph encodes the defensible short-horizon reading.
+    A case that produces NO packet for the symbol is a mismatch (the edge or the
+    classifier word is missing — the silent-miss class found live 2026-05-29).
+    """
+    correct = 0
+    mismatches: list[str] = []
+    for c in cases:
+        packets = synthesize_packets([_sign_item(c.source_text)], graph=graph, aliases=aliases)
+        sym_packets = [p for p in packets if p.asset == c.symbol]
+        if not sym_packets:
+            mismatches.append(f"{c.symbol}: no packet from {c.source_text!r} (missing edge or catalyst word)")
+            continue
+        pkt = max(sym_packets, key=lambda p: p.confidence)
+        if pkt.stance == c.expected_stance:
+            correct += 1
+        else:
+            mismatches.append(
+                f"{c.symbol}: got {pkt.stance}, expected {c.expected_stance} from {c.source_text!r}"
+            )
+    return SignConsistencyResult(
+        n_cases=len(cases),
+        n_correct=correct,
+        passed=(len(cases) > 0 and correct == len(cases)),
+        mismatches=tuple(mismatches),
+        unvalidated_sectors=(),
+    )
+
+
+def _sign_item(text: str) -> CatalystItem:
+    from datetime import datetime, timezone
+    return CatalystItem(
+        title=text,
+        published_at=datetime.now(timezone.utc),
+        source="sign-eval",
+        link="n/a",
+    )
+
+
 def eval_gate(
     benign_items: list[CatalystItem],
     precision_cases: list[EvalCase],
     *,
     min_hit_rate: float = 0.6,
+    sign_cases: list[SignCase] | None = None,
     graph: dict[str, list[PropagationEdge]] | None = None,
     aliases: dict[str, str] | None = None,
-) -> tuple[bool, NegControlResult, PrecisionResult]:
-    """The combined live-gate: BOTH negative-control and precision must pass."""
+) -> tuple[bool, NegControlResult, PrecisionResult, SignConsistencyResult]:
+    """The combined live-gate: negative-control + precision + edge-sign consistency.
+
+    Three axes (all must pass when supplied):
+      * negative control — benign headlines produce ZERO packets.
+      * directional precision — synthesized stance matches REAL forward returns
+        (needs labeled return data; typically covers a subset of sectors).
+      * edge-sign consistency — every sector's curated edge propagates the
+        DEFENSIBLE stance under a known catalyst polarity (deterministic, no
+        market data; covers the sectors precision can't reach).
+
+    ``sign_cases`` is optional for backwards compatibility, but SHOULD be supplied
+    so the gate covers every sector the graph reaches — precision alone validating
+    one sector is "encouraging, not proof" for an N-sector graph.
+    """
     neg = run_negative_control(benign_items, graph=graph, aliases=aliases)
     prec = run_precision(precision_cases, min_hit_rate=min_hit_rate, graph=graph, aliases=aliases)
-    return (neg.passed and prec.passed), neg, prec
+    sign = run_sign_consistency(sign_cases or [], graph=graph, aliases=aliases)
+    sign_ok = sign.passed if sign_cases else True
+    return (neg.passed and prec.passed and sign_ok), neg, prec, sign
