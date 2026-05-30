@@ -169,6 +169,43 @@ def test_propagate_positive_catalyst_flips_sign():
 
 
 # ---------------------------------------------------------------------------
+# expanded multi-sector graph (ADR-0074 graph expansion) + false-correlation guards
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("headline,expect_symbol", [
+    ("Boeing 737 grounded after mid-air door blowout", "BA"),
+    ("Tesla recalls 2 million vehicles over safety defect", "TSLA"),
+    ("Regional bank collapse sparks contagion fears", "BAC"),
+    ("TSMC fab halted after Taiwan earthquake", "TSM"),
+])
+def test_expanded_sectors_fire(headline, expect_symbol):
+    pkts = synthesize_packets([_item(headline)])
+    assert any(p.asset == expect_symbol and p.stance == "bearish" for p in pkts), \
+        f"{expect_symbol} not bearish-flagged: {[(p.asset, p.stance) for p in pkts]}"
+
+
+def test_no_person_alias_cross_sector_contamination():
+    # A SpaceX/Musk rocket event must NOT bleed into Tesla/EV — person-aliases
+    # were removed precisely to avoid this false correlation.
+    pkts = synthesize_packets([_item("Elon Musk's SpaceX Starship explodes during launch test")])
+    syms = {p.asset for p in pkts}
+    assert not (syms & {"TSLA", "RIVN", "LCID"}), f"EV contamination: {sorted(syms)}"
+    # it SHOULD still tag the space basket via the 'spacex' alias
+    assert "RKLB" in syms
+
+
+def test_expanded_negative_control():
+    benign = [
+        _item("Tesla holds annual shareholder meeting"),
+        _item("Boeing delivers planes on schedule this quarter"),
+        _item("JPMorgan reports earnings in line with estimates"),
+        _item("TSMC opens new training center"),
+    ]
+    res = run_negative_control(benign)
+    assert res.passed, f"spurious: {res.spurious}"
+
+
+# ---------------------------------------------------------------------------
 # synthesize -> SemanticPacket (asof = pub time)
 # ---------------------------------------------------------------------------
 
