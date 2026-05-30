@@ -21,6 +21,7 @@ from hermes_quant.catalyst.ingest import (
     parse_gn_rss,
 )
 from hermes_quant.catalyst.propagation import (
+    PropagationEdge,
     extract_entities,
     load_graph,
     propagate,
@@ -378,3 +379,114 @@ def test_semantic_analyst_on_when_enabled(monkeypatch):
     assert "HermesSemanticAnalyst" in names
     # still a PEER — the numerical analysts are present alongside it
     assert "ClassicalTAAnalyst" in names
+
+
+# ===========================================================================
+# Deep-review regression suite (2026-05-29) — four latent bugs found by audit.
+# Each test fails against the pre-fix code and passes after the fix.
+# ===========================================================================
+
+# --- BUG B: substring false-positives in classify (word-boundary fix) ---
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("headline", [
+    "SpaceX completes successful mission to ISS",   # 'miss' in 'mission'
+    "Company dismisses CEO amid restructuring",     # 'miss' in 'dismisses'
+    "New emissions standards announced for autos",  # 'miss' in 'emissions'
+    "Apple unveils ideal new product lineup",       # 'deal' in 'ideal'
+])
+def test_classify_no_substring_false_positive(headline):
+    """Short catalyst words must not match as substrings of benign words."""
+    c = classify_headline(headline)
+    assert not c.is_catalyst, f"{headline!r} wrongly classified {c.polarity} via {c.matched_terms}"
+
+
+def test_classify_word_boundary_still_matches_real_tokens():
+    """The boundary fix must not break legitimate standalone-token matches."""
+    assert classify_headline("Stock misses earnings estimates").polarity == "negative"
+    assert classify_headline("Company strikes deal with partner").polarity == "positive"
+    assert classify_headline("Tesla recall affects 50000 vehicles").polarity == "negative"
+    assert classify_headline("Boeing 737 grounded after inspection").polarity == "negative"
+
+
+@_pytest.mark.parametrize("headline,expect", [
+    ("Hyundai is recalling nearly 600,000 vehicles", "negative"),   # recalling
+    ("Volkswagen recalled 44,000 electric vehicles", "negative"),   # recalled
+    ("Blue Origin rocket mishap during launch", "negative"),        # mishap outweighs launch
+    ("Stock plunged on weak guidance", "negative"),                 # plunged
+    ("Shares tumbled after the report", "negative"),                # tumbled
+    ("Firm downgraded by analysts", "negative"),                    # downgraded
+    ("Earnings missed expectations badly", "negative"),             # missed
+    ("Company soared on the news", "positive"),                     # soared
+    ("Bank stock sank on contagion fears", "negative"),             # sank + contagion
+])
+def test_classify_inflected_catalyst_forms_fire(headline, expect):
+    """Inflected forms (recalling/plunged/missed/soared/mishap) must classify.
+
+    Regression for the 2026-05-29 live finding: the word-boundary fix initially
+    dropped 'recalling'/'recalled' (vehicle recalls — exactly the EV catalysts we
+    want) and a rocket 'mishap' read POSITIVE because only 'launch' fired. The
+    fix enumerates inflections explicitly rather than reverting to substring.
+    """
+    assert classify_headline(headline).polarity == expect
+
+
+# --- BUG C: _parse_pubdate mishandled named timezones ---
+
+def test_parse_pubdate_named_timezones():
+    """PST/EST must convert correctly (not be silently treated as UTC or dropped)."""
+    from hermes_quant.catalyst.ingest import _parse_pubdate
+    # 14:30 PST == 22:30 UTC (pre-fix: wrongly 14:30 UTC)
+    pst = _parse_pubdate("Wed, 27 May 2026 14:30:00 PST")
+    assert pst is not None and pst.hour == 22 and pst.minute == 30
+    # 14:30 EST == 19:30 UTC (pre-fix: returned None -> item dropped)
+    est = _parse_pubdate("Wed, 27 May 2026 14:30:00 EST")
+    assert est is not None and est.hour == 19
+    # numeric offset
+    off = _parse_pubdate("Sat, 31 May 2026 09:00:00 -0400")
+    assert off is not None and off.hour == 13
+    # GMT (the common GN form) unchanged
+    gmt = _parse_pubdate("Thu, 28 May 2026 21:05:00 GMT")
+    assert gmt is not None and gmt.hour == 21
+    # garbage still None
+    assert _parse_pubdate("garbage") is None
+
+
+# --- BUG A: dedup must be deterministic (earliest-published survives) ---
+
+def test_dedupe_keeps_earliest_published_deterministically():
+    """Near-dup cluster -> earliest published_at survives regardless of input order."""
+    early = _item("Blue Origin New Glenn explodes during hotfire test",
+                  when=datetime(2026, 5, 28, 21, 0, tzinfo=timezone.utc))
+    late = _item("Blue Origin New Glenn explodes during hotfire test at Cape",
+                 when=datetime(2026, 5, 28, 22, 0, tzinfo=timezone.utc))
+    for order in ([early, late], [late, early]):
+        kept = dedupe_items(order, thresh=0.6)
+        assert len(kept) == 1
+        assert kept[0].published_at.hour == 21, "earliest copy must survive in both orders"
+
+
+# --- BUG D: confidence must reflect directional agreement, not just linkage ---
+
+def test_propagate_conflicting_edges_collapse_confidence():
+    """Opposing-sign edges that near-cancel must NOT emit a high-confidence packet."""
+    graph = {
+        "entA": [PropagationEdge("entA", "SYM", "competitor", -1, 0.80)],
+        "entB": [PropagationEdge("entB", "SYM", "competitor", +1, 0.75)],
+    }
+    res = propagate({"entA", "entB"}, -1, graph)["SYM"]
+    # signed = -0.05 (coin-flip net); confidence must collapse toward 0, not stay ~0.95
+    assert res.confidence < 0.10, f"near-cancel net emitted conf={res.confidence}"
+
+
+def test_propagate_agreeing_edges_preserve_confidence():
+    """All-agree edges keep the noisy-OR linkage (agreement factor == 1.0)."""
+    # single edge: confidence == weight
+    g1 = {"e": [PropagationEdge("e", "SYM", "x", -1, 0.85)]}
+    assert propagate({"e"}, -1, g1)["SYM"].confidence == _pytest.approx(0.85, abs=1e-3)
+    # two agreeing edges: noisy-OR(0.6, 0.5) = 0.80, agreement 1.0
+    g2 = {"a": [PropagationEdge("a", "SYM", "x", -1, 0.6)],
+          "b": [PropagationEdge("b", "SYM", "x", -1, 0.5)]}
+    assert propagate({"a", "b"}, -1, g2)["SYM"].confidence == _pytest.approx(0.80, abs=1e-3)

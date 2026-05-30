@@ -16,6 +16,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -45,19 +46,38 @@ class CatalystItem:
 
 
 def _parse_pubdate(s: str) -> datetime | None:
-    """Parse an RFC-822 pubDate to tz-aware UTC. Returns None on failure."""
+    """Parse an RFC-822/2822 pubDate to tz-aware UTC. Returns None on failure.
+
+    Uses ``email.utils.parsedate_to_datetime`` — the stdlib's purpose-built
+    RFC-2822 parser — rather than ``strptime`` with ``%Z``. ``strptime`` only
+    recognizes a tiny fixed set of zone names and SILENTLY misparses the rest:
+    "PST" was parsed but treated as UTC (an 8-hour asof error → lookahead
+    corruption), and "EST"/"UT" returned None (item silently dropped). Since
+    packet.asof is the fidelity anchor, a wrong-by-hours timestamp is worse than
+    a dropped item. ``parsedate_to_datetime`` handles numeric offsets and
+    obsolete zone names per RFC-2822, falling back to a manual offset parse.
+    """
     s = (s or "").strip()
     if not s:
         return None
-    for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except ValueError:
-            continue
-    return None
+    try:
+        dt = parsedate_to_datetime(s)
+    except (TypeError, ValueError):
+        dt = None
+    if dt is None:
+        # last-resort: numeric-offset and explicit GMT/UTC forms
+        for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S GMT",
+                    "%a, %d %b %Y %H:%M:%S UTC"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except ValueError:
+                continue
+    if dt is None:
+        return None
+    if dt.tzinfo is None:  # naive -> assume UTC (GN pubDate is GMT)
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _jaccard(a: str, b: str) -> float:
@@ -68,9 +88,18 @@ def _jaccard(a: str, b: str) -> float:
 
 
 def dedupe_items(items: list[CatalystItem], thresh: float = 0.6) -> list[CatalystItem]:
-    """Collapse near-duplicate syndicated copies by title Jaccard similarity."""
+    """Collapse near-duplicate syndicated copies by title Jaccard similarity.
+
+    Among a near-duplicate cluster the EARLIEST-published copy survives. This is
+    deterministic (input order no longer decides the winner) and lookahead-honest:
+    packet.asof is the surviving item's published_at, and the first report is when
+    the information actually became public — a later re-syndication's timestamp
+    would push asof forward in time. Stable sort preserves original order among
+    equal timestamps.
+    """
+    ordered = sorted(items, key=lambda it: it.published_at)
     kept: list[CatalystItem] = []
-    for it in items:
+    for it in ordered:
         if any(_jaccard(it.title, k.title) >= thresh for k in kept):
             continue
         kept.append(it)
