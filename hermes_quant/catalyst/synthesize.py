@@ -130,6 +130,7 @@ def load_packets_for(
     horizon: str = "1d",
     max_age_minutes: float = 24 * 60,
     path: Path | None = None,
+    collapse: bool = True,
 ) -> list[dict]:
     """Load valid (lookahead-honest, fresh) packets for ``symbol`` at ``asof``.
 
@@ -141,6 +142,13 @@ def load_packets_for(
     ``asof`` — so they're guaranteed non-future and within freshness. The
     advisor's analyst re-validates too (defense in depth). Returns [] on any
     error (silence-by-default). This is the ONLY coupling point to the advisor.
+
+    When ``collapse`` is True (default) and many packets describe the same event
+    (a common case: dozens of syndicated headlines about one catalyst), the
+    result is collapsed to the BEST packet per stance — highest confidence,
+    tie-broken by most-recent asof. This keeps the advisor's per-recommend load
+    small and principled (vs. feeding 80+ near-duplicate packets and letting the
+    analyst's latest-wins pick ignore confidence).
     """
     p = path or _DEFAULT_STORE
     if not p.exists():
@@ -148,7 +156,7 @@ def load_packets_for(
     asof_ts = pd.Timestamp(asof)
     if asof_ts.tzinfo is None:
         asof_ts = asof_ts.tz_localize("UTC")
-    out: list[dict] = []
+    valid: list[dict] = []
     try:
         for line in p.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -169,8 +177,24 @@ def load_packets_for(
                 max_age_minutes=max_age_minutes, verify_hash=False,
             )
             if ok:
-                out.append(raw)
+                valid.append(raw)
     except OSError as e:
         logger.warning("catalyst.synthesize: packet load failed: %s", e)
         return []
-    return out
+
+    if not collapse or len(valid) <= 1:
+        return valid
+
+    # Collapse to best-per-stance: highest confidence, tie-break latest asof.
+    best: dict[str, dict] = {}
+    for raw in valid:
+        stance = raw.get("stance", "neutral")
+        cur = best.get(stance)
+        if cur is None:
+            best[stance] = raw
+            continue
+        c_new = (float(raw.get("confidence", 0.0)), str(raw.get("asof", "")))
+        c_cur = (float(cur.get("confidence", 0.0)), str(cur.get("asof", "")))
+        if c_new > c_cur:
+            best[stance] = raw
+    return list(best.values())

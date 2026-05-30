@@ -227,6 +227,62 @@ def test_load_packets_for_missing_store(tmp_path):
     assert load_packets_for("RKLB", "2026-05-29T13:30:00+00:00", path=tmp_path / "nope.jsonl") == []
 
 
+def test_load_packets_for_collapses_duplicates(tmp_path):
+    # Many syndicated headlines about one event -> many packets for RKLB.
+    store = tmp_path / "packets.jsonl"
+    items = [
+        _item("Blue Origin New Glenn explodes during test"),
+        _item("Blue Origin rocket explodes on launchpad"),
+        _item("Bezos Blue Origin suffers anomaly, rocket destroyed"),
+    ]
+    write_packets(synthesize_packets(items), path=store)
+    # collapse (default) -> at most one packet per stance for RKLB
+    collapsed = load_packets_for("RKLB", "2026-05-29T13:30:00+00:00", path=store)
+    stances = [p["stance"] for p in collapsed]
+    assert len(collapsed) == len(set(stances))  # one per stance
+    assert all(s == "bearish" for s in stances)
+    # uncollapsed -> all of them
+    raw = load_packets_for("RKLB", "2026-05-29T13:30:00+00:00", path=store, collapse=False)
+    assert len(raw) >= len(collapsed)
+
+
+# ---------------------------------------------------------------------------
+# decision_asof: live news validates against decision time, not bar time
+# ---------------------------------------------------------------------------
+
+def test_semantic_analyst_decision_asof_vs_bar_asof():
+    """A packet published today must be REJECTED against a yesterday bar-asof
+    (backtest safety) but ACCEPTED when decision_asof=now is supplied (live)."""
+    from datetime import timedelta
+    from hermes_quant.analysts.semantic import HermesSemanticAnalyst
+    from hermes_quant.protocol import MarketContext
+
+    now = datetime(2026, 5, 29, 18, 0, tzinfo=UTC)
+    packet = synthesize_packets([_item("Blue Origin New Glenn explodes",
+                                        when=datetime(2026, 5, 29, 14, 0, tzinfo=UTC))])
+    rklb = next(p.to_dict(include_hash=True) for p in packet if p.asset == "RKLB")
+    analyst = HermesSemanticAnalyst()
+
+    bar_asof = now - timedelta(days=1)  # last daily bar = yesterday
+    _bars = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    # bar-time only -> packet is "future" relative to yesterday -> abstain
+    ctx_bar = MarketContext(asset="RKLB", timeframe="1d", asset_class="equity",
+                            exchange=None, bars=_bars, last_close=10.0, last_volume=1.0,
+                            asof=pd.Timestamp(bar_asof),
+                            extras={"semantic_packets": [rklb]})
+    v_bar = analyst.analyze(ctx_bar)
+    assert v_bar.direction == 0  # abstained (future_packet vs bar time)
+
+    # decision_asof=now -> packet is in the past relative to decision -> used
+    ctx_live = MarketContext(asset="RKLB", timeframe="1d", asset_class="equity",
+                             exchange=None, bars=_bars, last_close=10.0, last_volume=1.0,
+                             asof=pd.Timestamp(bar_asof),
+                             extras={"semantic_packets": [rklb], "decision_asof": now.isoformat()})
+    v_live = analyst.analyze(ctx_live)
+    assert v_live.direction == -1  # bearish semantic view now contributes
+
+
 # ---------------------------------------------------------------------------
 # eval gate — negative control + precision
 # ---------------------------------------------------------------------------
