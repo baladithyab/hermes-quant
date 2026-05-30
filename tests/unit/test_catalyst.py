@@ -356,9 +356,46 @@ def test_eval_gate_combined():
         EvalCase(_item("Blue Origin New Glenn rocket explodes"), "RKLB", -3.07),
         EvalCase(_item("Blue Origin New Glenn rocket explodes"), "LUNR", -4.09),
     ]
-    passed, neg, prec = eval_gate(_BENIGN, cases, min_hit_rate=0.6)
+    passed, neg, prec, sign = eval_gate(_BENIGN, cases, min_hit_rate=0.6)
     assert passed
     assert neg.passed and prec.passed
+    # no sign_cases supplied -> sign axis is a no-op pass (backwards compat)
+    assert sign.n_cases == 0
+
+
+def test_eval_gate_sign_consistency_all_sectors():
+    """Edge-sign consistency across every sector the graph reaches (no market data).
+
+    Guards the highest-risk modeling field — a sector-contagion edge that
+    propagates BULLISH on a disaster would pass precision (which only covers
+    space today) but fail here. Covers aero/EV/banks/semis/energy that precision
+    cannot reach without labeled returns.
+    """
+    from hermes_quant.catalyst.eval import SignCase, run_sign_consistency
+    sign_cases = [
+        # space — negative catalyst -> bearish basket
+        SignCase("Blue Origin New Glenn rocket explodes during test", "RKLB", "negative", "bearish"),
+        SignCase("Blue Origin New Glenn rocket explodes during test", "ASTS", "negative", "bearish"),
+        # aerospace — Boeing grounding -> bearish BA + supplier
+        SignCase("Boeing 737 fleet grounded after defect found", "BA", "negative", "bearish"),
+        SignCase("Boeing 737 fleet grounded after defect found", "RTX", "negative", "bearish"),
+        # EV — Tesla recall -> bearish EV basket
+        SignCase("Tesla recall affects thousands of vehicles", "TSLA", "negative", "bearish"),
+        SignCase("Tesla recall affects thousands of vehicles", "RIVN", "negative", "bearish"),
+        # banks — failure/contagion -> bearish sector
+        SignCase("Regional bank failure sparks contagion fears", "JPM", "negative", "bearish"),
+        SignCase("Regional bank failure sparks contagion fears", "BAC", "negative", "bearish"),
+        # semis — TSMC supply shock -> bearish chain
+        SignCase("TSMC output halted after anomaly at fab", "TSM", "negative", "bearish"),
+        SignCase("TSMC output halted after anomaly at fab", "NVDA", "negative", "bearish"),
+        # NOTE: energy/OPEC edges were REMOVED (2026-05-29) — oil-producer direction
+        # depends on supply direction, which the severity classifier can't extract,
+        # so the commodity edge mis-signed XOM/CVX/OXY systematically. This sign
+        # check is what caught it. Re-add with a supply-direction classifier.
+    ]
+    res = run_sign_consistency(sign_cases)
+    assert res.passed, f"sign mismatches: {res.mismatches}"
+    assert res.n_correct == res.n_cases == 10
 
 
 # ---------------------------------------------------------------------------
@@ -490,3 +527,32 @@ def test_propagate_agreeing_edges_preserve_confidence():
     g2 = {"a": [PropagationEdge("a", "SYM", "x", -1, 0.6)],
           "b": [PropagationEdge("b", "SYM", "x", -1, 0.5)]}
     assert propagate({"a", "b"}, -1, g2)["SYM"].confidence == _pytest.approx(0.80, abs=1e-3)
+
+
+# --- GAP-2 (2026-05-29): graph↔universe coverage check ---
+
+def test_coverage_against_universe_flags_dead_edges():
+    """A graph target not in the universe is dead-on-arrival and must be flagged."""
+    from hermes_quant.catalyst.propagation import coverage_against_universe, PropagationEdge
+    graph = {
+        "src": [
+            PropagationEdge("src", "INUNIV", "x", -1, 0.8),
+            PropagationEdge("src", "DEADSYM", "x", -1, 0.7),
+        ],
+    }
+    cov = coverage_against_universe({"INUNIV", "OTHER"}, graph)
+    assert cov["covered"] == ["INUNIV"]
+    assert cov["dead_on_arrival"] == ["DEADSYM"]
+    assert cov["by_source"]["DEADSYM"] == ["src"]
+
+
+def test_coverage_full_universe_no_dead_edges():
+    """When every target is in the universe, nothing is dead-on-arrival."""
+    from hermes_quant.catalyst.propagation import (
+        coverage_against_universe, graph_target_symbols, load_graph,
+    )
+    g, _ = load_graph()
+    universe = graph_target_symbols(g)  # universe == exactly the targets
+    cov = coverage_against_universe(universe, g)
+    assert cov["dead_on_arrival"] == []
+    assert set(cov["covered"]) == universe

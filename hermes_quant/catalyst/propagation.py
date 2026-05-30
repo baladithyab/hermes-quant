@@ -91,11 +91,16 @@ _BUILTIN_GRAPH: dict[str, list[PropagationEdge]] = {
         PropagationEdge("spacex", "ASTS", "sector_member", -1, 0.55),
     ],
     # --- energy / commodity ---
-    "opec": [
-        PropagationEdge("opec", "XOM", "commodity", 1, 0.70),
-        PropagationEdge("opec", "CVX", "commodity", 1, 0.70),
-        PropagationEdge("opec", "OXY", "commodity", 1, 0.60),
-    ],
+    # REMOVED 2026-05-29: the OPEC commodity edge was structurally unsignable by
+    # this framework. Oil-producer direction depends on SUPPLY direction (output
+    # cut -> price up -> XOM up; output surge -> price down -> XOM down), but the
+    # severity-keyword classifier only extracts event POLARITY, not supply
+    # direction — so every realistic OPEC headline mis-signed XOM/CVX/OXY
+    # (verified: "output surge crashes prices" -> bullish XOM, exactly backwards).
+    # A commodity-transmission edge needs a supply-direction classifier (LLM tier
+    # / dedicated commodity module), not the contagion mechanism. Re-add only with
+    # that machinery + sign-consistency coverage. The sign-eval check (D74.7)
+    # caught this; it would otherwise have shipped inverted energy signals.
     # --- semis / supply chain ---
     "taiwan earthquake": [
         PropagationEdge("taiwan earthquake", "TSM", "supply_chain", -1, 0.80),
@@ -137,7 +142,6 @@ _BUILTIN_ALIASES: dict[str, str] = {
     "jeff bezos": "blue origin",
     "rocket lab": "rocket lab",
     "spacex": "spacex",
-    "opec": "opec",
     "taiwan earthquake": "taiwan earthquake",
     "tsmc": "tsmc",
     "taiwan semiconductor": "tsmc",
@@ -195,6 +199,39 @@ def load_graph(path: Path | None = None) -> tuple[dict[str, list[PropagationEdge
     if not graph:
         return dict(_BUILTIN_GRAPH), dict(_BUILTIN_ALIASES)
     return graph, (aliases or dict(_BUILTIN_ALIASES))
+
+
+def graph_target_symbols(graph: dict[str, list[PropagationEdge]]) -> set[str]:
+    """All distinct target symbols the graph can propagate to."""
+    return {e.target_symbol for edges in graph.values() for e in edges}
+
+
+def coverage_against_universe(
+    universe_symbols: set[str],
+    graph: dict[str, list[PropagationEdge]] | None = None,
+) -> dict[str, object]:
+    """Which graph targets are tradeable vs dead-on-arrival.
+
+    A catalyst on a symbol the advisor's universe doesn't contain produces a
+    packet that is never consumed (the advisor only recommends in-universe
+    names) — a silent dead edge. This surfaces the gap so graph edits can't add
+    dead edges unnoticed, and so the operator can decide per-symbol: keep (the
+    universe screen is transiently missing a liquid name), prune (the edge isn't
+    worth a universe slot), or onboard (admit strong-catalyst names to the
+    tradeable set — the ADR-0073 catalyst-driven onboarding, not yet built).
+
+    Returns {"covered": [...], "dead_on_arrival": [...], "by_source": {sym: [src,...]}}.
+    """
+    g = graph if graph is not None else _BUILTIN_GRAPH
+    targets = graph_target_symbols(g)
+    covered = sorted(t for t in targets if t in universe_symbols)
+    dead = sorted(t for t in targets if t not in universe_symbols)
+    by_source: dict[str, list[str]] = {}
+    for src, edges in g.items():
+        for e in edges:
+            if e.target_symbol in dead:
+                by_source.setdefault(e.target_symbol, []).append(src)
+    return {"covered": covered, "dead_on_arrival": dead, "by_source": by_source}
 
 
 def extract_entities(title: str, aliases: dict[str, str]) -> set[str]:
