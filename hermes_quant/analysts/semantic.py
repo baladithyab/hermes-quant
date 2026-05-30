@@ -154,6 +154,22 @@ class HermesSemanticAnalyst:
 
         valid: list[SemanticPacket] = []
         last_reason = "no_semantic_packets"
+        # ADR-0074/ADR-0068: validate packets against the DECISION time, not the
+        # bar time. In a live run ctx.asof is the last daily-bar close (e.g.
+        # yesterday), so a packet published today would be rejected as
+        # future_packet even though the news IS available at decision time. When
+        # the caller supplies ctx.extras["decision_asof"] (wall-clock decision
+        # time), use it; otherwise fall back to ctx.asof (backtests, where bar
+        # time IS the decision boundary and lookahead safety must hold).
+        validate_asof = ctx.asof
+        if ctx.extras:
+            _dec = ctx.extras.get("decision_asof")
+            if _dec is not None:
+                try:
+                    import pandas as _pd
+                    validate_asof = _pd.Timestamp(_dec)
+                except Exception:  # noqa: BLE001
+                    validate_asof = ctx.asof
         for raw in raw_packets or []:
             try:
                 packet = parse_semantic_packet(raw)
@@ -164,7 +180,7 @@ class HermesSemanticAnalyst:
             ok, reason = validate_semantic_packet(
                 packet,
                 asset=ctx.asset,
-                asof=ctx.asof,
+                asof=validate_asof,
                 horizon=ctx.timeframe if self.require_horizon_match else None,
                 max_age_minutes=self.max_age_minutes,
                 verify_hash=self.verify_hash,
