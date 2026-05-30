@@ -11,7 +11,6 @@ Validates the contract:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -32,7 +31,6 @@ from hermes_quant.protocol import (
     Portfolio,
 )
 from hermes_quant.risk.gate import DefaultRiskGate, _build_signal_provenance
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

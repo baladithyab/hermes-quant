@@ -56,8 +56,8 @@ class TestDaemonLock:
 
         # Hold the lock from a child process
         def hold_lock():
-            l = DaemonLock(account_id="test", lock_dir=tmp_path)
-            l.acquire()
+            lock = DaemonLock(account_id="test", lock_dir=tmp_path)
+            lock.acquire()
             time.sleep(2)
 
         proc = multiprocessing.Process(target=hold_lock)

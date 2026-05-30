@@ -89,7 +89,6 @@ def test_analyst_view_at_t_independent_of_future_bars(analyst_factory):
     # If the analyst peeks at "future" rows (rows > index 79), the two
     # outputs will differ.
     ctx_truncated = _ctx_at(bars, asof_idx=79)
-    ctx_full_sliced = _ctx_at(bars, asof_idx=79)  # identical to truncated by construction
 
     # Build a "polluted" context with future data in trailing rows.
     # We swap the analyst.analyze input to manually include rows beyond

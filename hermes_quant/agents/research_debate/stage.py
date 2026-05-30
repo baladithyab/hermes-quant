@@ -71,8 +71,11 @@ def _audit_append(kind: str, source: str, payload: dict[str, Any]) -> None:
     """
     try:
         from datetime import UTC, datetime
+
         from hermes_quant.governance.audit_log import (
             GovernanceEvent,
+        )
+        from hermes_quant.governance.audit_log import (
             append as _append,
         )
         evt = GovernanceEvent(
