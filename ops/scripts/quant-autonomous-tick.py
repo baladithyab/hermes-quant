@@ -193,6 +193,7 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
         "abstained": 0,
         "errors": 0,
         "skipped_idempotent": 0,
+        "direction_bias_mismatch": 0,
         "halt_aborted": False,
         "watchlist_size": 0,
     }
@@ -248,6 +249,20 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
 
     from hermes_quant.watchlist import WatchlistEntry  # type: ignore
 
+    # B04 / A5 direction-vs-play-bias guard. The advisor's signal is propagated
+    # through whichever play the symbol is ELIGIBLE for, but the plays are not
+    # all direction-agnostic: covered_call / csp / wheel / leaps are BULLISH-bias
+    # structures. A SHORT signal routed through e.g. csp is structurally
+    # incoherent (the live AXP defect). We screen direction-vs-bias BEFORE any
+    # React fires by neutralizing the advisor result for incompatible symbols.
+    try:
+        from hermes_quant.playbook.direction_bias import direction_play_compatible
+    except Exception:  # noqa: BLE001
+        # Silence-by-default: if the predicate can't be imported, treat ALL
+        # signals as incompatible so nothing fires through a possibly-wrong play.
+        def direction_play_compatible(direction: int, plays: list[str]) -> bool:  # type: ignore[misc]
+            return False
+
     entries: list[Any] = []
     play_map: dict[str, list[str]] = {}
     for sym, asset_class, tf, plays in watchlist:
@@ -281,10 +296,73 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
         })
         return summary
 
+    # --- Direction-vs-play-bias screen (B04 / A5) ---
+    # Sentinel that tags a recommendation neutralized purely because the
+    # advisor's direction was incompatible with EVERY eligible play's bias.
+    # The downstream advisor risk_gate uses this as gated_reason; the audit
+    # loop maps it to gate=DIRECTION_BIAS_MISMATCH (NOT a generic silence).
+    direction_bias_gated_reason = "direction_bias_mismatch"
+
+    # DEFAULT-OFF behind a flag, matching the repo pattern for restrictive gates
+    # (cf. HERMES_QUANT_PORTFOLIO_CAPS in autonomous.py). The screen can only
+    # abstain MORE (never fires/widens/flips), so it is money-safe either way —
+    # but flagging it gives an instant observe-only rollout + rollback switch and
+    # keeps the AXP-style fix reversible if it ever over-abstains in production.
+    _direction_bias_gate_on = (
+        os.environ.get("HERMES_QUANT_DIRECTION_BIAS_GATE", "0") == "1"
+    )
+
+    from hermes_quant.advisor import recommend as _base_recommend
+
+    def _direction_screened_recommend(**kwargs: Any) -> dict[str, Any]:
+        """advisor.recommend wrapper that neutralizes a recommendation when its
+        direction can't structurally route through any of the symbol's eligible
+        plays. Neutralization sets risk_gate.pass=False so auto.tick never fires
+        the React — the order is genuinely prevented, not relabeled after the
+        fact. No-op (returns the advisor result untouched) when the flag is OFF."""
+        res = _base_recommend(**kwargs)
+        if not _direction_bias_gate_on:
+            return res
+        sym = kwargs.get("symbol")
+        plays = play_map.get(sym, [])
+        sig = (res or {}).get("aggregated_signal") or {}
+        try:
+            direction = int(sig.get("direction", 0))
+        except (TypeError, ValueError):
+            direction = 0
+        # Only screen signals the advisor would actually act on. If direction is
+        # 0 or the advisor already gated, leave the result untouched (it won't
+        # fire anyway) so we don't mislabel an unrelated silence.
+        prior_gate = (res or {}).get("risk_gate") or {}
+        already_gated = prior_gate.get("pass") is False
+        if direction != 0 and not already_gated and not direction_play_compatible(direction, plays):
+            res["risk_gate"] = {
+                "pass": False,
+                "gated_reason": direction_bias_gated_reason,
+                "direction": direction,
+                "eligible_plays": plays,
+            }
+        elif direction != 0 and already_gated and not direction_play_compatible(direction, plays):
+            # Already silenced upstream for another reason AND bias-incompatible:
+            # preserve the upstream cause so the audit trail records both, rather
+            # than masking the original silence with the bias label.
+            res["risk_gate"] = {
+                **prior_gate,
+                "gated_reason": direction_bias_gated_reason,
+                "prior_gated_reason": prior_gate.get("gated_reason"),
+                "direction": direction,
+                "eligible_plays": plays,
+            }
+        return res
+
     # --- Run the canonical PDR pipeline tick ---
     # dry_run flips REACT — when True, no PaperReactor.execute call.
     try:
-        result = auto.tick(dry_run=not armed, symbols=entries)
+        result = auto.tick(
+            dry_run=not armed,
+            symbols=entries,
+            advisor_recommend=_direction_screened_recommend,
+        )
     except Exception as exc:  # noqa: BLE001
         summary["errors"] += 1
         append_audit({
@@ -303,14 +381,29 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
     for d in result.decisions:
         sym = d.symbol
         gate = d.gate or "UNKNOWN"
+        details = d.details or {}
+        # B04 / A5: a signal neutralized purely because its direction was
+        # incompatible with every eligible play's bias surfaces from auto.tick
+        # as SILENCE_GATED_BY_ADVISOR with our sentinel gated_reason. Relabel it
+        # so the audit trail names the real cause, distinct from generic silence.
+        direction_bias_mismatch = (
+            gate == "SILENCE_GATED_BY_ADVISOR"
+            and details.get("gated_reason") == direction_bias_gated_reason
+        )
+        if direction_bias_mismatch:
+            audit_gate = "DIRECTION_BIAS_MISMATCH"
         # Normalize the gate label so dry-run is unambiguous in the audit log.
-        if gate == "FIRE" and not armed:
+        elif gate == "FIRE" and not armed:
             audit_gate = "DRY_RUN_FIRE"
         else:
             audit_gate = gate
 
         # Counters
-        if audit_gate == "FIRE":
+        if audit_gate == "DIRECTION_BIAS_MISMATCH":
+            # Did NOT fire and won't — count as abstained + a dedicated tally.
+            summary["abstained"] += 1
+            summary["direction_bias_mismatch"] += 1
+        elif audit_gate == "FIRE":
             summary["placed"] += 1
         elif audit_gate == "DRY_RUN_FIRE":
             # Counted as "would have placed" — still increment placed for the
@@ -330,7 +423,7 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
             "timeframe": d.timeframe,
             "plays": play_map.get(sym, []),
             "gate": audit_gate,
-            "details": d.details or {},
+            "details": details,
             "armed": armed,
         }
         if d.action is not None:
@@ -389,11 +482,13 @@ def main() -> int:
             suffix = " (dry-run)"
         skipped = summary.get("skipped_idempotent", 0)
         skip_str = f" skipped_idempotent={skipped}" if skipped else ""
+        dbm = summary.get("direction_bias_mismatch", 0)
+        dbm_str = f" direction_bias_mismatch={dbm}" if dbm else ""
         err = summary.get("errors", 0)
         err_str = f" errors={err}" if err else ""
         print(
             f"tick: scanned={scanned} decided={decided} placed={placed} "
-            f"abstained={abstained}{skip_str}{err_str}{suffix}",
+            f"abstained={abstained}{skip_str}{dbm_str}{err_str}{suffix}",
             flush=True,
         )
     return 0

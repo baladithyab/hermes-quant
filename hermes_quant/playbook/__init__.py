@@ -25,6 +25,12 @@ This package is **watchlist scoring only**. It does not size positions or
 generate orders. Silence-by-default: missing inputs fail hard rules.
 """
 
+from hermes_quant.playbook.direction_bias import (
+    bias_allows_direction,
+    compatible_plays,
+    direction_play_compatible,
+    play_bias,
+)
 from hermes_quant.playbook.profiles import (
     PROFILES,
     PlayProfile,
@@ -59,6 +65,11 @@ __all__ = [
     "WatchlistEntry",
     "evolve_watchlist",
     "get_active_watchlist",
+    # direction-vs-play-bias compatibility (B04 / A5)
+    "bias_allows_direction",
+    "compatible_plays",
+    "direction_play_compatible",
+    "play_bias",
     # fitness scoring
     "PROFILES",
     "PlayFitness",

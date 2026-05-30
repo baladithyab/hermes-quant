@@ -32,6 +32,17 @@ class PlayProfile:
 
     Attributes:
         name: One of {'covered_call','csp','wheel','leaps','swing'}.
+        bias: Directional bias of the play's STRUCTURE — one of
+            {'bullish','bearish','agnostic'}. A SHORT (direction<0) advisor
+            signal may ONLY route through an 'agnostic' or 'bearish' play; a
+            LONG (direction>0) signal may ONLY route through a 'bullish' or
+            'agnostic' play. covered_call / csp / wheel / leaps are all
+            bullish-bias structures (you profit when the underlying holds or
+            rises); swing is direction-agnostic (the entry can be long or
+            short). Defaults to 'bullish' — the cautious default: an unknown
+            or mis-specified play is treated as bullish-only so a SHORT signal
+            can never silently route through it (silence-by-default). Read by
+            ``direction_play_compatible()`` BEFORE any signal is propagated.
         hard_rules: dict[field_name, rule_tuple] — must all pass.
         soft_rules: dict[field_name, rule_tuple] — used for scoring.
         eviction_rules: dict[field_name, rule_tuple] — any True ⇒ drop symbol.
@@ -51,12 +62,19 @@ class PlayProfile:
     soft_rules: dict
     eviction_rules: dict
     regime_gates: dict = field(default_factory=dict)
+    # Cautious default: an unspecified play is bullish-only, so a SHORT signal
+    # can never silently route through it (silence-by-default). Each concrete
+    # profile below sets this explicitly.
+    bias: str = "bullish"
 
 
 # --- covered_call -----------------------------------------------------------
 
 profile_covered_call = PlayProfile(
     name="covered_call",
+    # Bullish-bias: you own the underlying and sell upside calls — you profit
+    # when the underlying holds or rises. A SHORT signal must never route here.
+    bias="bullish",
     hard_rules={
         "quote_type": ("eq", "EQUITY"),
         "market_cap_usd": ("between", 2e9, 1e11),
@@ -86,6 +104,10 @@ profile_covered_call = PlayProfile(
 
 profile_csp = PlayProfile(
     name="csp",
+    # Bullish-bias: a cash-secured put is willingness to BUY the underlying at
+    # the strike — you profit when it holds or rises. A SHORT signal must never
+    # route here (this is the AXP B04 bug: SHORT fired through 'csp').
+    bias="bullish",
     hard_rules={
         "quote_type": ("eq", "EQUITY"),
         "market_cap_usd": ("ge", 1e9),
@@ -130,6 +152,8 @@ for k, v in profile_csp.eviction_rules.items():
 
 profile_wheel = PlayProfile(
     name="wheel",
+    # Bullish-bias: wheel = CSP then covered_call, both bullish legs.
+    bias="bullish",
     hard_rules=_wheel_hard,
     soft_rules={
         # Sweet spot for both legs: enough vol to pay premium, not so high it whipsaws.
@@ -146,6 +170,9 @@ profile_wheel = PlayProfile(
 
 profile_leaps = PlayProfile(
     name="leaps",
+    # Bullish-bias: a LEAPS long-call thesis profits when the underlying rises
+    # over a multi-year horizon. A SHORT signal must never route here.
+    bias="bullish",
     hard_rules={
         "quote_type": ("eq", "EQUITY"),
         "market_cap_usd": ("ge", 1e10),
@@ -175,6 +202,10 @@ profile_leaps = PlayProfile(
 
 profile_swing = PlayProfile(
     name="swing",
+    # Direction-agnostic: a swing entry can be long OR short. Both LONG and
+    # SHORT advisor signals may route here; the deterministic risk gate handles
+    # direction-vs-regime alignment per ADR-0004.
+    bias="agnostic",
     hard_rules={
         "quote_type": ("eq", "EQUITY"),
         "avg_dollar_volume_30d": ("ge", 1e7),
