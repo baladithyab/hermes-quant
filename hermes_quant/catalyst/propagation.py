@@ -62,7 +62,14 @@ class PropagationResult:
 
 # Built-in default graph (general domain knowledge; the seed the operator edits).
 # Keyed by canonical source entity. This is what ships if no YAML override exists.
+#
+# effect_sign = sign of the propagated effect for a NEGATIVE catalyst on the
+#   source. A POSITIVE catalyst flips it. THIS IS THE HIGHEST-RISK FIELD — every
+#   edge below encodes a defensible short-horizon reading; the eval gate
+#   (catalyst.eval) guards against wrong signs, and every propagation is logged
+#   for the future learned graph.
 _BUILTIN_GRAPH: dict[str, list[PropagationEdge]] = {
+    # --- space / launch ---
     "blue origin": [
         PropagationEdge("blue origin", "RKLB", "competitor", -1, 0.85),
         PropagationEdge("blue origin", "LUNR", "competitor", -1, 0.75),
@@ -74,13 +81,50 @@ _BUILTIN_GRAPH: dict[str, list[PropagationEdge]] = {
         PropagationEdge("new glenn", "LUNR", "competitor", -1, 0.70),
         PropagationEdge("new glenn", "ASTS", "sector_member", -1, 0.65),
     ],
+    "rocket lab": [
+        PropagationEdge("rocket lab", "RKLB", "self", -1, 0.95),
+        PropagationEdge("rocket lab", "LUNR", "sector_member", -1, 0.45),
+        PropagationEdge("rocket lab", "ASTS", "sector_member", -1, 0.40),
+    ],
+    "spacex": [
+        PropagationEdge("spacex", "RKLB", "competitor", -1, 0.60),
+        PropagationEdge("spacex", "ASTS", "sector_member", -1, 0.55),
+    ],
+    # --- energy / commodity ---
     "opec": [
         PropagationEdge("opec", "XOM", "commodity", 1, 0.70),
         PropagationEdge("opec", "CVX", "commodity", 1, 0.70),
+        PropagationEdge("opec", "OXY", "commodity", 1, 0.60),
     ],
+    # --- semis / supply chain ---
     "taiwan earthquake": [
         PropagationEdge("taiwan earthquake", "TSM", "supply_chain", -1, 0.80),
         PropagationEdge("taiwan earthquake", "NVDA", "supply_chain", -1, 0.50),
+        PropagationEdge("taiwan earthquake", "AMD", "supply_chain", -1, 0.45),
+    ],
+    "tsmc": [
+        PropagationEdge("tsmc", "TSM", "self", -1, 0.95),
+        PropagationEdge("tsmc", "NVDA", "supply_chain", -1, 0.55),
+        PropagationEdge("tsmc", "AMD", "supply_chain", -1, 0.45),
+    ],
+    # --- aerospace / airlines (a crash/grounding is sector + Boeing-supplier shock) ---
+    "boeing": [
+        PropagationEdge("boeing", "BA", "self", -1, 0.95),
+        PropagationEdge("boeing", "SPR", "supply_chain", -1, 0.70),  # Spirit AeroSystems
+        PropagationEdge("boeing", "RTX", "sector_member", -1, 0.30),
+    ],
+    # --- EV / autos (a recall/safety event on a leader hits the EV basket) ---
+    "tesla": [
+        PropagationEdge("tesla", "TSLA", "self", -1, 0.95),
+        PropagationEdge("tesla", "RIVN", "sector_member", -1, 0.50),
+        PropagationEdge("tesla", "LCID", "sector_member", -1, 0.45),
+    ],
+    # --- banks (a failure is contagion across the sector) ---
+    "bank failure": [
+        PropagationEdge("bank failure", "JPM", "sector_member", -1, 0.40),
+        PropagationEdge("bank failure", "BAC", "sector_member", -1, 0.50),
+        PropagationEdge("bank failure", "WFC", "sector_member", -1, 0.50),
+        PropagationEdge("bank failure", "SCHW", "sector_member", -1, 0.55),
     ],
 }
 
@@ -91,8 +135,16 @@ _BUILTIN_ALIASES: dict[str, str] = {
     "new glenn": "new glenn",
     "bezos": "blue origin",
     "jeff bezos": "blue origin",
+    "rocket lab": "rocket lab",
+    "spacex": "spacex",
     "opec": "opec",
     "taiwan earthquake": "taiwan earthquake",
+    "tsmc": "tsmc",
+    "taiwan semiconductor": "tsmc",
+    "boeing": "boeing",
+    "tesla": "tesla",
+    "bank failure": "bank failure",
+    "bank collapse": "bank failure",
 }
 
 _SIGN_TO_STANCE = {1: "bullish", -1: "bearish", 0: "neutral"}

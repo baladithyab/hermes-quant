@@ -14,7 +14,7 @@
 # can be read as bearish (sector confidence shock, the empirically dominant
 # short-horizon effect for catastrophic events) OR bullish (less competition).
 # v1 encodes the contagion reading; every propagation is logged so a learned
-# graph can correct signs later.
+# graph can correct signs later. The eval gate (catalyst.eval) guards precision.
 
 aliases:
   blue origin: blue origin
@@ -26,8 +26,14 @@ aliases:
   opec: opec
   taiwan earthquake: taiwan earthquake
   tsmc: tsmc
+  taiwan semiconductor: tsmc
+  boeing: boeing
+  tesla: tesla
+  bank failure: bank failure
+  bank collapse: bank failure
 
 edges:
+  # --- space / launch ---
   blue origin:
     - {target: RKLB, relation: competitor,     effect_sign: -1, weight: 0.85}
     - {target: LUNR, relation: competitor,     effect_sign: -1, weight: 0.75}
@@ -40,16 +46,16 @@ edges:
     - {target: ASTS, relation: sector_member,  effect_sign: -1, weight: 0.40}
 
   spacex:
-    # SpaceX is private; its events propagate to the public space basket.
     - {target: RKLB, relation: competitor,     effect_sign: -1, weight: 0.60}
     - {target: ASTS, relation: sector_member,  effect_sign: -1, weight: 0.55}
 
+  # --- energy / commodity (supply-cut headline -> bullish energy) ---
   opec:
-    # Supply-cut / production headlines: bearish-on-OPEC-supply -> bullish energy.
     - {target: XOM, relation: commodity,       effect_sign: +1, weight: 0.70}
     - {target: CVX, relation: commodity,       effect_sign: +1, weight: 0.70}
     - {target: OXY, relation: commodity,       effect_sign: +1, weight: 0.60}
 
+  # --- semis / supply chain ---
   taiwan earthquake:
     - {target: TSM,  relation: supply_chain,   effect_sign: -1, weight: 0.80}
     - {target: NVDA, relation: supply_chain,   effect_sign: -1, weight: 0.50}
@@ -58,3 +64,23 @@ edges:
   tsmc:
     - {target: TSM,  relation: self,           effect_sign: -1, weight: 0.95}
     - {target: NVDA, relation: supply_chain,   effect_sign: -1, weight: 0.55}
+    - {target: AMD,  relation: supply_chain,   effect_sign: -1, weight: 0.45}
+
+  # --- aerospace (crash/grounding = sector + Boeing-supplier shock) ---
+  boeing:
+    - {target: BA,   relation: self,           effect_sign: -1, weight: 0.95}
+    - {target: SPR,  relation: supply_chain,   effect_sign: -1, weight: 0.70}
+    - {target: RTX,  relation: sector_member,  effect_sign: -1, weight: 0.30}
+
+  # --- EV / autos (recall/safety on a leader -> EV basket) ---
+  tesla:
+    - {target: TSLA, relation: self,           effect_sign: -1, weight: 0.95}
+    - {target: RIVN, relation: sector_member,  effect_sign: -1, weight: 0.50}
+    - {target: LCID, relation: sector_member,  effect_sign: -1, weight: 0.45}
+
+  # --- banks (failure = sector contagion) ---
+  bank failure:
+    - {target: JPM,  relation: sector_member,  effect_sign: -1, weight: 0.40}
+    - {target: BAC,  relation: sector_member,  effect_sign: -1, weight: 0.50}
+    - {target: WFC,  relation: sector_member,  effect_sign: -1, weight: 0.50}
+    - {target: SCHW, relation: sector_member,  effect_sign: -1, weight: 0.55}

@@ -23,7 +23,9 @@ _NEGATIVE_SEVERITY: dict[str, float] = {
     # critical (large move)
     "explodes": 0.05, "explosion": 0.05, "blast": 0.05, "fireball": 0.05,
     "destroyed": 0.05, "crash": 0.05, "crashes": 0.05, "bankruptcy": 0.06,
-    "fraud": 0.06, "halted": 0.05, "recall": 0.04,
+    "fraud": 0.06, "halted": 0.05, "recall": 0.04, "recalls": 0.04,
+    "collapse": 0.05, "collapses": 0.05, "grounded": 0.045, "grounding": 0.045,
+    "blowout": 0.045, "defect": 0.035, "contagion": 0.04,
     # high
     "anomaly": 0.035, "failure": 0.035, "fails": 0.035, "plunge": 0.04,
     "plunges": 0.04, "tumble": 0.035, "tumbles": 0.035, "probe": 0.03,
