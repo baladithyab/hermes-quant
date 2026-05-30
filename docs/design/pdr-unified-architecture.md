@@ -89,25 +89,34 @@ gate can re-introduce a silenced signal.
                                    │                       DECISION  (DELIBERATION + RISKING)       │
                                    │             — the deterministic risk gate is FINAL authority — │
                                    └─────────────────────────────────────────────────────────────┘
+   [SATURATE] saturation/edge-decay multiplier ∈ (0,1]  (FUTURE, GAP-C)   semantic view conf ↓ ONLY
+           applied to HermesSemanticAnalyst.AnalystView.confidence BEFORE fuse —
+           NOT to the aggregate (a stale social trend must not veto TA/Kronos). post<=pre.
+                                     │  views (semantic peer possibly quieter)
+                                     ▼
+              ┌──────── optional, default-OFF — LLM is EVIDENCE, UPSTREAM of the gate ────────┐
+              │ deliberative/risk committee + trader contribute turns that shape the          │
+              │ AggregatedSignal BEFORE the gate. NEVER a post-gate actuator. Any post-gate    │
+              │ role is TIGHTEN-ONLY (quieter or unchanged, never re-select). ADR-0079 D79.6a  │
+              │ HERMES_QUANT_{DELIBERATIVE,TRADER_LLM,...}                                      │
+              └──────────────────────────────────────────────────────────────────────────────┘
+                                     │  views + committee evidence
+                                     ▼
    [FUSE]  BMAAggregator.aggregate(views, ctx) -> AggregatedSignal     bma.py:305
            require_ensemble: n_distinct_analysts >= 2 else SILENCE      bma.py:498-519
            dissent shrinks confidence; never synthesizes unanimity
                                      │  AggregatedSignal
                                      ▼
-   [SATURATE] saturation/edge-decay multiplier ∈ (0,1]  (FUTURE, GAP-C)   confidence ↓ only
-                                     │  AggregatedSignal (confidence possibly reduced)
+   [ADMIT]  pre-trade admissibility (ADR-0077, FUTURE/Wave B) — PRECONDITION, REJECT/flatten only
+            runs BEFORE sizing (ADR-0077 D77.4): inadmissible short -> target 0 pre-gate
+                                     │  AggregatedSignal (admissible only)
                                      ▼
    [GATE]  DefaultRiskGate.gate(signal, market, portfolio, halt) -> Action | None    risk/gate.py
-           computes the LEGAL discrete sizing envelope (drawdown, cost, Kelly, caps)
+           computes the final LEGAL discrete sizing (drawdown, cost, Kelly, caps)
            None = SILENCE.  THIS IS THE FINAL AUTHORITY.
                                      │  Action  (signed target_size_pct ∈ ladder)  or None
-              ┌──────── optional, default-OFF ────────┐
-              │ committee/trader LLM picks WITHIN the  │  (envelope-then-select; LLM cannot exceed)
-              │ already-computed envelope only         │  HERMES_QUANT_{DELIBERATIVE,TRADER_LLM,...}
-              └────────────────────────────────────────┘
-                                     │
+                                     ▼
    [SILENCE-BIAS] silence_bias_gate (autonomous only)  4 dims, ALL must pass    autonomous.py:386
-   [ADMIT]  pre-trade admissibility (ADR-0077, FUTURE/Wave B) — REJECT or flatten only
                                      │  Action  (survivors only)
 ═════════════════════════════════════▼═══════════════════════════════════════════════════════════
                                    ┌─────────────────────────────────────────────────────────────┐
@@ -220,18 +229,23 @@ That is **not** the Camillo DETECT primitive. Three primitives are missing; each
   edge-time*. No `saturation` / `edge_decay` / `information_parity` field exists anywhere (grep: 0 hits in
   `hermes_quant/`). The system can perceive a trend but has no idea whether it is early or already mainstream.
 - **Where it lives in PDR:** a `saturation` estimate added to `SemanticPacket.metadata` at PERCEPTION (e.g. trend
-  age past its velocity peak, or "earnings / credit-card confirm date has passed"), then consumed at the
-  **DECISION→REACTION boundary** as a **confidence multiplier that can only shrink toward 0.0**.
+  age past its velocity peak, or "earnings / credit-card confirm date has passed"), then consumed at the start of
+  DECISION as a **confidence multiplier on the social/semantic peer view that can only shrink toward 0.0**.
 
   **How it interacts with the deterministic gate WITHOUT becoming authority** (this is the load-bearing design
-  point):
-  - It is applied as a multiplier `m ∈ (0, 1]` on the `AggregatedSignal.confidence` **before** the gate, in the
-    `[SATURATE]` step of the §1.1 diagram. `m=1` early in the trend; `m→0` as it saturates.
-  - It is **silence-only by construction**: it can pull conviction toward 0 (decaying edge → quieter → eventually
-    silenced by the gate's cost/edge floor) but it can **never raise** confidence. A property test pins this
-    forever: post-saturation confidence ≤ pre-saturation confidence, for every input. This is the *exact* same
-    authority boundary as the catalyst-as-evidence-never-authority rail and the ADR-0077 admissibility boundary
-    (target magnitude monotonically non-increasing).
+  point — corrected per Codex Facet-5 P1):
+  - It is applied as a multiplier `m ∈ (0, 1]` on the **`HermesSemanticAnalyst`'s own `AnalystView.confidence`,
+    BEFORE BMA fuses the views** — NOT on the post-BMA `AggregatedSignal`. `m=1` early in the trend; `m→0` as it
+    saturates. **Why view-level, not aggregate-level:** `SaturationScore` is derived from *social/catalyst*
+    evidence; applying it to the aggregate would let a stale *social* trend shrink/flatten an unrelated
+    TA+Kronos+fundamentals consensus — perception silently vetoing other analysts. Decaying the semantic view
+    only means a saturated social signal becomes a quieter peer (and, under `require_ensemble`, simply stops
+    corroborating), while the numerical analysts are untouched.
+  - It is **silence-only by construction**, with TWO property tests: (a) post-saturation semantic confidence ≤
+    pre-saturation, for every input (never raises); (b) for every NON-semantic view, the contribution is
+    bit-identical with saturation on vs off (never touches another analyst). This is the *exact* same authority
+    boundary as the catalyst-as-evidence-never-authority rail and the ADR-0077 admissibility boundary
+    (target magnitude monotonically non-increasing) — evidence can only quiet *itself*.
   - It is **not** a new sizing ladder. The discrete ladder is untouched; saturation only moves conviction down
     the *existing* ladder (e.g. a `0.20` candidate decays to `0.10`, then to `0` = silence) and can trigger a
     flatten on a held position when the trend has fully saturated — the Camillo exit-on-parity, expressed as

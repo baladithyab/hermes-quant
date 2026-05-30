@@ -91,10 +91,10 @@ Replace the deterministic pipeline with a multi-agent DAG executor in the style 
 | PDR phase | Operator stage(s) | What happens | Authority |
 |---|---|---|---|
 | **PERCEPTION** | SCANNING + ANALYSIS | Sense the world: select symbols, fetch bars, build regime, detect trends, validate across sources, read each analyst's view. Emit a `PerceptionFrame` of *evidence*. | none (pure sensing) |
-| **DECISION** | DELIBERATION + RISKING | Fuse evidence into one signal (BMA), apply the saturation multiplier, then the deterministic gate computes the legal discrete sizing envelope. An optional LLM committee may select *within* the envelope. | **deterministic gate is FINAL** |
-| **REACTION** | ACTING | Convert the gated Action into a (paper) order, fill it with live fidelity (incl. ADR-0077 admissibility), record it. | deterministic; paper for now |
+| **DECISION** | DELIBERATION + RISKING | Apply the saturation multiplier *to the social/semantic view only* (not the aggregate — D79.4); the optional LLM committee contributes as an evidence signal *upstream* of the gate (never a post-gate actuator — D79.6a); BMA fuses peer views under `require_ensemble`; ADR-0077 admissibility runs as a precondition; then the deterministic gate computes the final discrete Action. | **deterministic gate is FINAL** |
+| **REACTION** | ACTING | Convert the already-authorized, already-admissible gated Action into a (paper) order, fill it with live fidelity, record it. | mechanical only; paper for now |
 
-**The defining invariant:** authority *concentrates monotonically* from PERCEPTION (no authority — everything is evidence) → DECISION (the gate is the single authority) → REACTION (mechanical execution of an already-authorized Action). Evidence can only *subtract* (silence). Nothing downstream of the gate can re-introduce a silenced signal. This invariant is the architecture's contract; it is the formal statement of D-1, D-2, D-6.
+**The defining invariant:** authority *concentrates monotonically* from PERCEPTION (no authority — everything is evidence) → DECISION (the gate is the single authority) → REACTION (mechanical execution of an already-authorized Action). Evidence can only *subtract* (silence), **and only its own view** — no perception-layer score may shrink an *unrelated* analyst's contribution (D79.4). Nothing downstream of the gate can re-introduce a silenced signal, and nothing downstream of the gate may *select* direction or size (D79.6a). This invariant is the architecture's contract; it is the formal statement of D-1, D-2, D-6.
 
 ### D79.2 Perception emits a typed `PerceptionFrame`; Decision and Reaction are unchanged in authority
 
@@ -109,9 +109,11 @@ The two roles are kept explicitly distinct:
 
 Conflating these is the root cause of GAP-A/GAP-B. The fix builds the *perception* side honestly **without** changing the *decision* side. **Two independent ensemble requirements result, at two layers:** cross-SOURCE convergence at perception (*is this trend real?*) and cross-ANALYST agreement at decision (*do my independent models concur?*). A social-arb signal must clear *both* to fire. Authority never moves to the social signal.
 
-### D79.4 Information-saturation is silence-only, applied before the gate
+### D79.4 Information-saturation is silence-only, applied to the social/semantic view (NOT the aggregate)
 
-The Camillo EXIT-on-parity is expressed as a `SaturationScore` confidence multiplier `m ∈ (0, 1]` applied to `AggregatedSignal.confidence` in a `[SATURATE]` step **before** the gate. It can only pull conviction toward 0 (decaying edge → quieter → eventually silenced/flattened by the gate's cost/edge floor) and can **never raise** confidence — pinned forever by a property test (post-saturation ≤ pre-saturation, for every input). It is **not** a new sizing ladder: it only moves conviction *down* the existing discrete ladder (e.g. `0.20` decays to `0.10`, then to `0` = silence/flatten). This is the *exact* same authority boundary as catalyst-as-evidence-never-authority and as the ADR-0077 admissibility monotonicity (target magnitude monotonically non-increasing).
+The Camillo EXIT-on-parity is expressed as a `SaturationScore` confidence multiplier `m ∈ (0, 1]`. **Where it applies is load-bearing (Codex Facet-5 P1 correction).** `SaturationScore` is derived from *social/catalyst* evidence (trend age past its velocity peak, earnings/credit-card confirm-date passed). If it were applied to the post-BMA `AggregatedSignal.confidence`, a stale *social* trend could shrink or flatten a TA+Kronos+fundamentals consensus that has nothing to do with that trend — perception silently vetoing unrelated analysts. The `post ≤ pre` property would still hold, yet the boundary would be violated, because non-amplification is *not* the same guarantee as "no cross-view veto."
+
+Therefore the multiplier is applied to the **`HermesSemanticAnalyst`'s own `AnalystView.confidence` BEFORE it enters BMA** — `[SATURATE]` decays the *social/semantic peer view only*. A saturated social signal becomes a quieter peer (and, with `require_ensemble`, simply stops corroborating); the numerical analysts' contributions are untouched. It can **never raise** confidence (property test: post ≤ pre, for every input) and **never touches a view other than its own** (property test: for all non-semantic views, contribution is bit-identical with saturation on vs off). It is **not** a new sizing ladder. This makes the boundary identical to catalyst-as-evidence-never-authority and ADR-0077 admissibility monotonicity: evidence can only quiet *itself*.
 
 ### D79.5 Migration is default-OFF and eval-gated; nothing new is built in this ADR
 
@@ -124,6 +126,15 @@ The four new abstractions (`PerceptionFrame`, `TrendVelocity`, `ConvergenceValid
 - **TradingAgents:** adopt the **5-phase shape as a mental map** for the deliberation sub-stages and the structured-output discipline. **Reject** the trader/PM LLM as final authority and the free-text / string-grep decision contracts.
 
 **Convergent rejection:** every reference repo lets an LLM be the final execution authority somewhere; the deterministic-gate + HITL pattern is the inverse of that failure mode, and this ADR makes that inversion the explicit, ratified architecture.
+
+### D79.6a Where the LLM committee sits relative to the gate (Codex Facet-5 P1 correction)
+
+The ai-hedge-fund "envelope-then-select" precedent is adopted *only* in a form that keeps ADR-0004's contract intact. ADR-0004 defines the gate as `AggregatedSignal → Action | None` and the **last** action-emission authority. A literal "LLM selects the final direction/size *after* the gate" would make the LLM the final actuator on that path — the exact anti-pattern this ADR rejects. So in hermes-quant:
+
+- **Primary placement — LLM committee output is an evidence signal UPSTREAM of the gate.** The deliberative/risk committee (ADR-0023/0037/0043, ADR-0056/0057) contributes turns that shape the `AggregatedSignal` *before* `DefaultRiskGate.gate()` runs. The gate then emits the Action. The LLM never sees a post-gate envelope to pick from.
+- **If any post-gate role is ever wired, it is TIGHTEN-ONLY.** A post-gate committee step may only return the gate's Action *unchanged* or a strictly *quieter* one (same direction, magnitude on the discrete ladder ≤ the gate's, or silence). It can never re-select direction, never increase magnitude, never resurrect a silenced signal — property-tested identically to the saturation and admissibility monotonicity guards. Today no post-gate LLM step exists; this rule pre-commits the boundary before one is built.
+
+This resolves the apparent contradiction: "envelope-then-select" is reframed as "evidence-before-gate, plus optional tighten-only-after-gate," never "LLM is the final actuator."
 
 ---
 
