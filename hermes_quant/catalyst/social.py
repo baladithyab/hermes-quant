@@ -12,15 +12,17 @@ Two free producers:
     descriptive User-Agent is required by Reddit's API rules. Each post becomes a
     CatalystItem with published_at = post ``created_utc`` (the fidelity anchor).
 
-  * Google Trends — the public ``trends/api/dailytrends`` + ``explore`` widgets
-    return JSON (with a leading ``)]}',`` XSSI guard that we strip). We surface a
-    *rising-interest* signal as a synthetic catalyst headline ("<term> trending /
-    interest surging") timestamped at the trend's observation date, so a velocity
-    spike enters the same classify->propagate path as a news headline.
+  * Google Trends — the public ``trending/rss`` feed returns RSS 2.0 (the old
+    ``trends/api/dailytrends`` JSON endpoint was removed and now 404s). We parse it
+    with the same ``xml.etree`` + RFC-822 ``_parse_pubdate`` approach as the GN-RSS
+    ingester and surface a *rising-interest* signal as a synthetic catalyst headline
+    ("<term> trending / interest surging") timestamped at the trend's ``<pubDate>``
+    observation time, so a velocity spike enters the same classify->propagate path
+    as a news headline.
 
 FIDELITY: every CatalystItem.published_at is a real observation timestamp (Reddit
-post time / Trends date), NEVER wall-clock-now — same rule as GN pubDate. This is
-what keeps any social-driven backtest lookahead-honest (ADR-0074 D74.4).
+post time / Trends ``<pubDate>``), NEVER wall-clock-now — same rule as GN pubDate.
+This is what keeps any social-driven backtest lookahead-honest (ADR-0074 D74.4).
 """
 from __future__ import annotations
 
@@ -29,9 +31,10 @@ import logging
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
 
-from hermes_quant.catalyst.ingest import CatalystItem, dedupe_items
+from hermes_quant.catalyst.ingest import CatalystItem, _parse_pubdate, dedupe_items
 
 logger = logging.getLogger(__name__)
 
@@ -131,61 +134,54 @@ def ingest_reddit(
 # --------------------------------------------------------------------------- #
 # Google Trends producer (rising-interest -> synthetic catalyst headline)
 # --------------------------------------------------------------------------- #
-_TRENDS_DAILY = (
-    "https://trends.google.com/trends/api/dailytrends"
-    "?hl=en-US&tz=0&geo={geo}&ns=15"
-)
-_XSSI_GUARD = b")]}',"
-
-
-def _strip_xssi(raw: bytes) -> bytes:
-    """Google JSON APIs prefix a ``)]}',`` XSSI guard; strip it before json.loads."""
-    s = raw.lstrip()
-    if s.startswith(_XSSI_GUARD):
-        s = s[len(_XSSI_GUARD):]
-    return s
+# The legacy trends/api/dailytrends JSON endpoint was removed (404s). The public
+# trending/rss feed returns RSS 2.0 with the ht: namespace; we parse it like GN-RSS.
+_TRENDS_DAILY = "https://trends.google.com/trending/rss?geo={geo}"
 
 
 def _trends_to_items(raw: bytes, *, geo: str, watch_terms: set[str] | None) -> list[CatalystItem]:
-    """Parse Google daily-trends JSON into rising-interest CatalystItems.
+    """Parse Google trending-searches RSS into rising-interest CatalystItems.
 
     Each trending search becomes a synthetic catalyst headline so a velocity spike
-    enters the classify->propagate path. published_at = the trend day (observation
-    time), NOT now. If ``watch_terms`` is given, only emit trends whose query
-    contains one of the watched brand terms (keeps it targeted; a firehose of every
-    trending search is noise the propagation graph would ignore anyway).
+    enters the classify->propagate path. published_at = the trend's ``<pubDate>``
+    (observation time), parsed via the same RFC-822 parser the GN-RSS ingester uses
+    — NEVER wall-clock now. An item with a missing/unparseable pubDate is SKIPPED
+    (defaulting to now would fabricate freshness and corrupt packet.asof). If
+    ``watch_terms`` is given, only emit trends whose term (the ``<title>``) contains
+    one of the watched brand terms (keeps it targeted; a firehose of every trending
+    search is noise the propagation graph would ignore anyway).
     """
     items: list[CatalystItem] = []
     try:
-        data = json.loads(_strip_xssi(raw))
-    except (json.JSONDecodeError, TypeError) as e:
-        logger.warning("catalyst.social: trends JSON parse error: %s", e)
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        logger.warning("catalyst.social: trends RSS parse error: %s", e)
         return items
-    days = (data.get("default") or {}).get("trendingSearchesDays") or []
     wt = {w.lower() for w in (watch_terms or set())}
-    for day in days:
-        date_str = day.get("date") or ""  # YYYYMMDD
-        try:
-            pub = datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=UTC)
-        except (ValueError, TypeError):
-            pub = datetime.now(UTC)
-        for tr in day.get("trendingSearches") or []:
-            q = ((tr.get("title") or {}).get("query") or "").strip()
-            if not q:
-                continue
-            if wt and not any(w in q.lower() for w in wt):
-                continue
-            traffic = (tr.get("formattedTraffic") or "").strip()
-            # synthetic headline framed as a positive demand catalyst so the
-            # consumer-trend lexicon ("trending"/"surging") fires.
-            title = f"{q} trending with surging search interest ({traffic} searches)"
-            items.append(CatalystItem(
-                title=title,
-                published_at=pub,
-                source=f"google_trends/{geo}",
-                link=f"https://trends.google.com/trends/explore?q={urllib.parse.quote(q)}&geo={geo}",
-                query="google-trends-daily",
-            ))
+    for item in root.iter("item"):
+        term = (item.findtext("title") or "").strip()
+        pub = _parse_pubdate(item.findtext("pubDate") or "")
+        if not term or pub is None:
+            continue  # no term, or no parseable timestamp to anchor packet.asof
+        if wt and not any(w in term.lower() for w in wt):
+            continue
+        # approx_traffic is ht:-namespaced (xmlns:ht=trending/rss). Match by local
+        # tag name so we don't depend on the namespace URI string staying stable.
+        traffic = ""
+        for child in item:
+            if child.tag.rsplit("}", 1)[-1] == "approx_traffic":
+                traffic = (child.text or "").strip()
+                break
+        # synthetic headline framed as a positive demand catalyst so the
+        # consumer-trend lexicon ("trending"/"surging") fires.
+        title = f"{term} trending with surging search interest ({traffic} searches)"
+        items.append(CatalystItem(
+            title=title,
+            published_at=pub,
+            source=f"google_trends/{geo}",
+            link=f"https://trends.google.com/trends/explore?q={urllib.parse.quote(term)}&geo={geo}",
+            query="google-trends-daily",
+        ))
     return items
 
 
@@ -199,7 +195,8 @@ def ingest_google_trends(
 ) -> tuple[list[CatalystItem], float]:
     """Ingest Google daily trending searches, filtered to watched brand terms.
 
-    Returns (items, latency_seconds). Never raises (silence-by-default).
+    Returns (items, latency_seconds). Never raises (silence-by-default) — any fetch
+    OR parse failure (incl. a malformed feed) returns ([], latency).
     """
     url = _TRENDS_DAILY.format(geo=urllib.parse.quote(geo))
     fetch = fetcher or _fetch_raw

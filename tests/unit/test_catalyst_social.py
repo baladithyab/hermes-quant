@@ -37,15 +37,57 @@ _REDDIT_PAYLOAD = json.dumps({
     ]}
 }).encode()
 
-_TRENDS_PAYLOAD = b")]}',\n" + json.dumps({
-    "default": {"trendingSearchesDays": [
-        {"date": "20210301", "trendingSearches": [
-            {"title": {"query": "Celsius energy drink"}, "formattedTraffic": "200K+"},
-            {"title": {"query": "weather today"}, "formattedTraffic": "1M+"},  # noise
-            {"title": {"query": "Crocs sale"}, "formattedTraffic": "100K+"},
-        ]},
-    ]}
-}).encode()
+# Captured-real shape of the live trending/rss feed (https://trends.google.com/
+# trending/rss?geo=US): RSS 2.0, ht:-namespaced approx_traffic/news_item children,
+# unnamespaced <title> (the search term) / <pubDate> (RFC-822) / <link>.
+# pubDate is a FIXED PAST date with a -0700 offset, so the parsed UTC asof is
+# 2021-03-01 20:10:00Z — proving published_at comes from pubDate, never now.
+# Items: one matches "celsius", one is noise ("weather today"), one matches "crocs".
+_TRENDS_PAYLOAD = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:ht="https://trends.google.com/trending/rss" version="2.0">
+  <channel>
+    <title>Daily Search Trends</title>
+    <description>Recent searches</description>
+    <link>https://trends.google.com/trending/rss?geo=US</link>
+    <item>
+      <title>Celsius energy drink</title>
+      <ht:approx_traffic>200000+</ht:approx_traffic>
+      <description/>
+      <link>https://trends.google.com/trending/rss?geo=US</link>
+      <pubDate>Mon, 01 Mar 2021 13:10:00 -0700</pubDate>
+      <ht:picture>https://example.invalid/pic1.jpg</ht:picture>
+      <ht:picture_source>Some Source</ht:picture_source>
+      <ht:news_item>
+        <ht:news_item_title>Celsius sales jump as drink goes viral</ht:news_item_title>
+        <ht:news_item_snippet/>
+        <ht:news_item_url>https://example.invalid/celsius</ht:news_item_url>
+        <ht:news_item_source>Example News</ht:news_item_source>
+      </ht:news_item>
+    </item>
+    <item>
+      <title>weather today</title>
+      <ht:approx_traffic>1000000+</ht:approx_traffic>
+      <description/>
+      <link>https://trends.google.com/trending/rss?geo=US</link>
+      <pubDate>Mon, 01 Mar 2021 13:10:00 -0700</pubDate>
+      <ht:picture>https://example.invalid/pic2.jpg</ht:picture>
+      <ht:picture_source>Weather Co</ht:picture_source>
+    </item>
+    <item>
+      <title>Crocs sale</title>
+      <ht:approx_traffic>100000+</ht:approx_traffic>
+      <description/>
+      <link>https://trends.google.com/trending/rss?geo=US</link>
+      <pubDate>Mon, 01 Mar 2021 13:10:00 -0700</pubDate>
+      <ht:picture>https://example.invalid/pic3.jpg</ht:picture>
+      <ht:picture_source>Retail Daily</ht:picture_source>
+    </item>
+  </channel>
+</rss>
+"""
+
+# 2021-03-01 13:10:00 -0700 == 2021-03-01 20:10:00 UTC
+_TRENDS_PUB_UTC = datetime(2021, 3, 1, 20, 10, 0, tzinfo=UTC)
 
 
 def _reddit_fetcher(url, timeout):
@@ -91,12 +133,24 @@ def test_reddit_silences_on_feed_failure():
 
 
 # --- google trends -----------------------------------------------------------
-def test_trends_strips_xssi_and_parses_dates():
+def test_trends_parses_rss_with_pubdate_timestamps():
     items, _ = ingest_google_trends(fetcher=_trends_fetcher, dedupe=False)
     # no watch filter -> all 3 trends become items
     assert len(items) == 3
-    assert all(it.published_at == datetime(2021, 3, 1, tzinfo=UTC) for it in items)
+    # published_at comes from <pubDate> (a fixed PAST date), NEVER now
+    assert all(it.published_at == _TRENDS_PUB_UTC for it in items)
+    now = datetime.now(UTC)
+    assert all(it.published_at < now for it in items)
     assert all("trending" in it.title.lower() for it in items)
+    # the search term (the <title>) is carried into the synthetic headline
+    titles = " ".join(it.title for it in items)
+    assert "Celsius energy drink" in titles
+    assert "weather today" in titles
+    assert "Crocs sale" in titles
+    # approx_traffic (ht:-namespaced) is folded into the headline
+    assert any("200000+" in it.title for it in items)
+    # source tag preserved exactly (PDR-3 taxonomy keys on the google_trends prefix)
+    assert all(it.source == "google_trends/US" for it in items)
 
 
 def test_trends_watch_term_filter():
@@ -113,6 +167,15 @@ def test_trends_watch_term_filter():
 def test_trends_silences_on_feed_failure():
     items, lat = ingest_google_trends(fetcher=_boom_fetcher)
     assert items == []
+    assert lat >= 0.0
+
+
+def test_trends_silences_on_malformed_feed():
+    """A malformed (non-XML) feed must not crash — returns ([], latency)."""
+    def _garbage(url, timeout):
+        return b"<<<not valid xml at all >>> )]}',{broken"
+    items, lat = ingest_google_trends(fetcher=_garbage)
+    assert items == []  # parse failure is silent, never raises
     assert lat >= 0.0
 
 
