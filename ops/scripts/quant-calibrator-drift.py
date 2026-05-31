@@ -13,6 +13,15 @@ Posture (preserved from AGENTS.md):
 - Auto-refit is DEFAULT-OFF behind HERMES_QUANT_CALIBRATOR_AUTO_REFIT=1. When
   the flag is unset the cron ONLY alerts and never touches the live pickle.
 - Silence-by-default: any exception → log + exit 0. The cron NEVER crashes.
+- no_agent silence contract (scheduler: empty stdout ⇒ silent run, no delivery).
+  As a weekly watchdog this cron must NOT spam the operator every Monday with
+  zero drift. It is a state-baseline change-detecting watchdog (mirrors the
+  sibling quant-catalyst-coverage.py / quant-catalyst-profitability.py probes):
+  it emits NOTHING unless the alert state TRANSITIONS (clean→drift or drift→
+  clean) vs the persisted baseline. Standing-clean and standing-drift both stay
+  silent. --verbose forces the full picture for on-demand operator pulls. The
+  drift computation, the durable drift-log append, and the auto-refit behavior
+  ALL run unconditionally every tick — only the stdout EMIT is change-gated.
 
 ADR refs: ADR-0009 §P0-2 (calibration drift surfaced in quant_doctor).
 """
@@ -38,6 +47,28 @@ ALPACA_ENV = Path.home() / ".hermes" / "secrets" / "alpaca.env"
 DEFAULT_CALIBRATOR = Path.home() / ".hermes" / "quant" / "calibrators" / "isotonic.pkl"
 
 _AUTO_REFIT_ENV = "HERMES_QUANT_CALIBRATOR_AUTO_REFIT"
+
+# State baseline for the change-detecting no_agent watchdog (mirrors the coverage
+# / profitability probes). Persists the last observed alert state so the cron can
+# emit ONLY on a transition (clean<->drift), never on a standing state.
+_BASELINE = Path.home() / ".hermes" / "quant" / "calibrators" / "drift-baseline.json"
+
+
+def _load_baseline() -> dict:
+    """Load the watchdog baseline. Missing/corrupt -> {} (treated as first run)."""
+    try:
+        return json.loads(_BASELINE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_baseline(state: dict) -> None:
+    """Persist the watchdog baseline. Best-effort (never raises)."""
+    try:
+        _BASELINE.parent.mkdir(parents=True, exist_ok=True)
+        _BASELINE.write_text(json.dumps(state, sort_keys=True))
+    except OSError:
+        pass
 
 
 def _source_alpaca_env() -> None:
@@ -117,7 +148,11 @@ def main() -> int:
     parser.add_argument("--horizon-bars", type=int, default=4)
     parser.add_argument("--threshold", type=float, default=0.05)
     parser.add_argument("--calibrator", type=Path, default=DEFAULT_CALIBRATOR)
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="force the full DRIFT RESULT picture even when nothing changed "
+             "(on-demand operator pull; bypasses the change-detection gate)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -133,10 +168,11 @@ def main() -> int:
         from hermes_quant.training.calibrator_drift import run_drift_check
 
         symbols = _load_universe(args.top)
-        print(f"drift-check: collecting pairs over {len(symbols)} symbols, {args.days}d")
         raw_scores, correct = _collect_pairs(symbols, args.days, args.horizon_bars)
-        print(f"drift-check: collected {len(raw_scores)} (raw, correct) pairs")
 
+        # The drift computation + durable drift-log append + (gated) auto-refit
+        # ALWAYS run — only the stdout EMIT below is change-gated. run_drift_check
+        # appends the audit row to drift-log.jsonl regardless of what we print.
         result = run_drift_check(
             calibrator_path=args.calibrator,
             pairs=(raw_scores, correct),
@@ -145,19 +181,66 @@ def main() -> int:
             refit_kwargs={"symbols": symbols, "days": args.days,
                           "horizon_bars": args.horizon_bars},
         )
-        print("=" * 60)
-        print("DRIFT RESULT")
-        print("=" * 60)
-        from dataclasses import asdict
-        print(json.dumps(asdict(result), indent=2, default=str))
-        print(f"auto_refit flag ({_AUTO_REFIT_ENV}): {'ON' if auto_refit else 'OFF'}")
-        if result.should_alert:
-            print(f"ALERT: calibrator drift {result.drift:.4f} exceeds "
-                  f"threshold {result.threshold:.4f}")
+        return _emit(result, verbose=args.verbose, auto_refit=auto_refit)
     except Exception as exc:  # noqa: BLE001
         logging.warning("drift-check failed (%s); exiting 0 (silence-by-default).", exc)
         return 0
 
+
+def _full_report(result, *, auto_refit: bool) -> str:
+    """Render the headline + full DRIFT RESULT JSON block."""
+    from dataclasses import asdict
+    lines = [
+        "=" * 60,
+        "DRIFT RESULT",
+        "=" * 60,
+        json.dumps(asdict(result), indent=2, default=str),
+        f"auto_refit flag ({_AUTO_REFIT_ENV}): {'ON' if auto_refit else 'OFF'}",
+    ]
+    if result.should_alert:
+        lines.append(
+            f"ALERT: calibrator drift {result.drift:.4f} exceeds "
+            f"threshold {result.threshold:.4f}"
+        )
+    return "\n".join(lines)
+
+
+def _emit(result, *, verbose: bool, auto_refit: bool) -> int:
+    """no_agent change-detection gate over the stdout EMIT only.
+
+    Emits the headline + full DRIFT RESULT JSON ONLY when the alert state
+    TRANSITIONS vs the persisted baseline:
+      * clean -> drift  (should_alert flips True): the headline + table.
+      * drift -> clean  (should_alert flips False): one "drift cleared" note.
+    Standing-clean and standing-drift both stay SILENT (empty stdout ⇒ no
+    Discord message; don't cry wolf every Monday). --verbose forces the full
+    picture regardless (on-demand operator pull). The 'no_samples' /
+    'no_calibrator' degraded paths are never an alert and are silent unless
+    --verbose. The baseline is updated every run so a transition fires once.
+    """
+    prev = _load_baseline()
+    prev_alert = bool(prev.get("should_alert", False)) if prev else None
+    cur_alert = bool(result.should_alert)
+    _save_baseline({"should_alert": cur_alert})
+
+    if verbose:
+        print(_full_report(result, auto_refit=auto_refit))
+        return 0
+
+    # No state change since last run -> silent (no_agent contract).
+    if prev_alert is not None and prev_alert == cur_alert:
+        return 0
+
+    if cur_alert:
+        # clean -> drift (or first-ever run that is already drifting): full picture.
+        print(_full_report(result, auto_refit=auto_refit))
+    elif prev_alert:
+        # drift -> clean: one transition note, then silent on subsequent clean runs.
+        print(
+            f"✅ calibrator-drift: drift {result.drift:.4f} back within "
+            f"threshold {result.threshold:.4f} (was alerting) — cleared."
+        )
+    # else: first-ever run that is already clean -> silent (no transition to report).
     return 0
 
 
