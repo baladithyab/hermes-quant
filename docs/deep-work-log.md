@@ -131,3 +131,20 @@ Ran THREE concurrent workflows (execution + Hermes-research + a concurrent meta-
 **Continuation end. +10 commits (223983f → see git log). The deployed-script drift + the
 plugin-not-enabled findings are the two things that make "enable everything" an operator
 sequence, not an agent flag-flip — both now fully documented with exact commands.**
+
+### WF1 hardening — formal completion + the finding I missed (post-hoc)
+
+The hardening workflow's adversarial review landed AFTER I'd committed H1-H4 on my own
+verification, and it caught a **BLOCKING fail-open my verification missed**: the options-gate
+greek caps (gamma/theta/vega/net-delta) were checked at `structural_contracts` (=1 for every
+covered-call/CSP) but `_size_contracts` admits MORE lots — so a 2-lot CC whose 1-lot gamma is
+under the cap but whose true 2-lot footprint is 1.8x the cap was ADMITTED. Fixed: re-check all
+size-scaling caps at the ADMITTED contract count (`850c474`), with a calibrated regression test
+(probing `aggregate_net_greeks` revealed the short-gamma sign + ×100 contract multiplier I'd
+gotten wrong twice). WF1 also found the REAL #12 root cause — `test_smoke.py` evicting
+`sys.modules` without restore — fixed (`278f87c`); full single-process run 61→39 failures, all
+9 order-dependent gone. WF1's remaining findings (live account-context plumbing, CSP sizing
+denominator, PIL datetime-key robustness, greeks try/except narrowing) are flag-OFF
+pre-go-live items → task #19. Lesson: "evidence before assertions" applies to my own fixes —
+confirming a fix LANDED is not confirming it CLOSED the hole. 166/166 final hardening+deploy+
+catalyst tests pass.
