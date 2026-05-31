@@ -386,6 +386,41 @@ def test_cc_overlay_sizes_against_held_shares() -> None:
     assert res.contracts == 2  # min(by_shares=3, by_nav=2); never the buggy 3
 
 
+def test_gamma_cap_rechecked_at_admitted_size_not_one_lot() -> None:
+    """REGRESSION (Codex #11 / Facet-4 BLOCKING): the greek caps must be evaluated
+    against the ADMITTED contract count, not the 1-lot structural footprint.
+
+    Setup: a covered call that sizes to contracts=2 (structural_contracts=1).
+    Portfolio gamma is preloaded just under the cap so the PRE-sizing check (1 lot)
+    passes, but the admitted 2-lot footprint breaches it. Pre-fix, the gate
+    ADMITTED this cap-breaching order (it only ever checked 1 lot). Post-fix, the
+    at-size re-check silences it.
+
+      cap            = 0.05 * 1M = 50,000 dollar-gamma
+      dollar-gamma   = gamma_units * spot^2 = gamma_units * 22_500
+      per-lot net gamma = -1.0 (0.01 * 100 contract-multiplier, SHORT sign=-1)
+      admitted contracts = 2 ; cap = 0.05 * 1M = 50,000 ; dollar = |net.gamma|*22_500
+      preload gamma=-0.5 -> 1-lot: |−0.5−1.0|*22500 = 33,750 < 50,000  (pre-check PASSES)
+                         -> 2-lot: |−0.5−2.0|*22500 = 56,250 > 50,000  (at-size REJECTS)
+    (Short options are short gamma, so more lots push |net gamma| further from zero
+    when the book is already net-short gamma — the realistic cap-breach direction.)
+    """
+    preload = NetGreeks(gamma=-0.5)
+    res = options_gate(
+        [
+            StockLeg(underlying="NVDA", qty=1000, basis_per_share=100.0),
+            _short_call("NVDA260612C00160000", delta=0.25),
+        ],
+        **_base_kwargs(
+            nav=1_000_000.0, held_shares=1000, strike=160.0, basis_per_share=100.0,
+            min_dte=30, premium_received=250.0, portfolio_net_greeks=preload,
+        ),
+    )
+    # The order sizes to 2 lots, whose true gamma footprint breaches the cap.
+    assert res.admitted is False, "cap-breaching 2-lot order must be REJECTED, not admitted"
+    assert res.reason == "portfolio_gamma_cap_at_size"
+
+
 # ---------------------------------------------------------------------------
 # REJECT-only invariant
 # ---------------------------------------------------------------------------

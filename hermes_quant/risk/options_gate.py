@@ -590,6 +590,46 @@ def options_gate(
             bpr_estimate=bpr, max_loss=max_loss,
         )
 
+    # ---- O3/O4/O5/net-delta RE-CHECK at the ADMITTED contract count. ----
+    # The earlier cap checks ran against `structural_contracts` (the short-leg
+    # ratio sum = 1 for every covered_call / cash_secured_put), but `_size_contracts`
+    # routinely admits MORE lots (e.g. 2). The greek footprint scales with the
+    # admitted size, so a 2-lot CC whose 1-lot gamma is under the cap can breach it
+    # at 2 lots. A gate that admits a cap-breaching order violates the rail
+    # "deterministic gate is FINAL authority; gates can only REJECT". So we
+    # re-aggregate at the admitted `contracts` and re-run every size-scaling cap;
+    # any breach silences. The admitted-size aggregate is the authoritative
+    # net_greeks reported. (Fail-closed on missing greeks, as above.)
+    if contracts != structural_contracts:
+        try:
+            admitted_net = aggregate_net_greeks(legs, order_qty=contracts)
+        except (GreekComputationError, TypeError) as exc:
+            return OptionsGateResult.silence(
+                bucket, f"greeks_unavailable: {exc}", bpr_estimate=bpr, max_loss=max_loss,
+            )
+        portfolio_admitted = portfolio_net_greeks + admitted_net
+        if abs(portfolio_admitted.gamma * spot * spot) > cfg.gamma_cap_pct_nav * nav:
+            return OptionsGateResult.silence(
+                bucket, "portfolio_gamma_cap_at_size", net_greeks=admitted_net,
+                bpr_estimate=bpr, max_loss=max_loss,
+            )
+        if admitted_net.theta < 0 and abs(admitted_net.theta) > cfg.theta_budget_pct_nav_per_day * nav:
+            return OptionsGateResult.silence(
+                bucket, "theta_budget_at_size", net_greeks=admitted_net,
+                bpr_estimate=bpr, max_loss=max_loss,
+            )
+        if abs(portfolio_admitted.vega) > cfg.vega_cap_pct_nav * nav / 100.0:
+            return OptionsGateResult.silence(
+                bucket, "portfolio_vega_cap_at_size", net_greeks=admitted_net,
+                bpr_estimate=bpr, max_loss=max_loss,
+            )
+        if abs(portfolio_admitted.delta * spot) > cfg.max_net_delta_pct_nav * nav:
+            return OptionsGateResult.silence(
+                bucket, "net_delta_cap_at_size", net_greeks=admitted_net,
+                bpr_estimate=bpr, max_loss=max_loss,
+            )
+        candidate_net = admitted_net  # report the true admitted-size footprint
+
     return OptionsGateResult(
         admitted=True,
         bucket=bucket,
