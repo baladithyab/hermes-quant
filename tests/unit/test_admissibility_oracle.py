@@ -13,6 +13,8 @@ from hermes_quant.admissibility import (
     REASON_EQUITY_BELOW_2K,
     REASON_FRACTIONAL_SHORT,
     REASON_INSUFFICIENT_BPR,
+    REASON_MISSING_ACCOUNT_CONTEXT,
+    REASON_MISSING_QUOTE,
     REASON_NOT_ETB,
     REASON_NOT_MARGINABLE,
     REASON_NOT_SHORTABLE,
@@ -116,10 +118,79 @@ def test_ptp_no_exception_rejected():
 
 
 # --------------------------------------------------------------------------- #
+# FAIL-CLOSED: shortability resolved, but account/quote context missing => REJECT.
+# Money-software: a missing hard-precondition input is never an implicit pass.
+# --------------------------------------------------------------------------- #
+def test_missing_account_equity_rejects_etb_short():
+    # The headline: a perfectly-ETB whole-share short with UNKNOWN account_equity must
+    # REJECT (not ACCEPT). Before the fix this fell through to ACCEPTED (fail-open bug).
+    ctx = _etb_ctx(account_equity=None, current_ask=100.0, available_bp=1_000_000.0)
+    v = evaluate_admissibility("AAPL", "short", 100, T, ctx)
+    assert v.state is AdmissibilityState.REJECTED
+    assert v.reason == REASON_MISSING_ACCOUNT_CONTEXT
+
+
+def test_missing_quote_rejects_etb_short():
+    # Equity present + sufficient, but no ask to value the short => cannot prove BP fits.
+    ctx = _etb_ctx(account_equity=100_000.0, current_ask=None, available_bp=1_000_000.0)
+    v = evaluate_admissibility("AAPL", "short", 100, T, ctx)
+    assert v.state is AdmissibilityState.REJECTED
+    assert v.reason == REASON_MISSING_QUOTE
+
+
+def test_missing_buying_power_rejects_etb_short():
+    # Quote present, but available_bp unknown => cannot prove the order fits => REJECT.
+    ctx = _etb_ctx(account_equity=100_000.0, current_ask=100.0, available_bp=None)
+    v = evaluate_admissibility("AAPL", "short", 100, T, ctx)
+    assert v.state is AdmissibilityState.REJECTED
+    assert v.reason == REASON_MISSING_ACCOUNT_CONTEXT
+
+
+def test_alpaca_oracle_fail_closed_on_missing_account_context():
+    # Live oracle resolves shortability from get_asset, but the caller supplied no
+    # account/quote context => REJECT (MISSING_ACCOUNT_CONTEXT), never ACCEPT.
+    oracle = AlpacaShortabilityOracle(get_asset=lambda sym: _FakeAsset())
+    v = oracle.verdict("AAPL", "short", 100, T, AdmissibilityContext())
+    assert v.state is AdmissibilityState.REJECTED
+    assert v.reason == REASON_MISSING_ACCOUNT_CONTEXT
+
+
+def test_etb_short_accepts_only_with_full_context_and_sufficient_bp():
+    # Counterpart to the missing-context REJECT: full context + sufficient BP => ACCEPT.
+    ctx = _etb_ctx(account_equity=100_000.0, current_ask=100.0, available_bp=1_000_000.0)
+    v = evaluate_admissibility("AAPL", "short", 100, T, ctx)
+    assert v.state is AdmissibilityState.ACCEPTED
+    assert v.reason is None
+    assert 0.0 < v.annual_cbr < 0.02
+
+
+def test_audit_mode_scopes_out_missing_account_context_but_live_default_rejects():
+    # The require_account_context flag is the ONLY difference between the live precondition
+    # (fail-closed default) and the offline shortability audit. Same ETB ctx with no account
+    # context: live default REJECTS, audit mode ACCEPTS (shortability resolved).
+    ctx = _etb_ctx(account_equity=None)  # also drops current_ask / available_bp
+    live = evaluate_admissibility("AAPL", "short", 100, T, ctx)
+    assert live.state is AdmissibilityState.REJECTED
+    assert live.reason == REASON_MISSING_ACCOUNT_CONTEXT
+
+    audit = evaluate_admissibility(
+        "AAPL", "short", 100, T, ctx, require_account_context=False
+    )
+    assert audit.state is AdmissibilityState.ACCEPTED
+    assert audit.reason is None
+
+
+# --------------------------------------------------------------------------- #
 # PARTIAL + ACCEPT cases
 # --------------------------------------------------------------------------- #
 def test_ssr_marketable_short_partial():
-    ctx = _etb_ctx(ssr_active=True, is_marketable=True)
+    # Full account context: SSR is reached only once the BP+equity preconditions clear.
+    ctx = _etb_ctx(
+        ssr_active=True,
+        is_marketable=True,
+        current_ask=100.0,
+        available_bp=1_000_000.0,
+    )
     v = evaluate_admissibility("AAPL", "short", 100, T, ctx)
     assert v.state is AdmissibilityState.PARTIAL
     assert v.reason == REASON_SSR_MARKETABLE_SHORT
@@ -158,7 +229,11 @@ class _FakeAsset:
 
 def test_alpaca_oracle_accepts_etb_short():
     oracle = AlpacaShortabilityOracle(get_asset=lambda sym: _FakeAsset())
-    v = oracle.verdict("AAPL", "short", 100, T, AdmissibilityContext())
+    # Live ACCEPT requires the account/quote context the BP+equity preconditions need.
+    ctx = AdmissibilityContext(
+        account_equity=100_000.0, current_ask=100.0, available_bp=1_000_000.0
+    )
+    v = oracle.verdict("AAPL", "short", 100, T, ctx)
     assert v.state is AdmissibilityState.ACCEPTED
     assert 0.0 < v.annual_cbr < 0.02
 
@@ -193,6 +268,17 @@ def test_null_oracle_accepts_everything():
     assert v.annual_cbr == 0.0
 
 
+def test_null_oracle_accepts_missing_account_context():
+    # Flag-OFF bit-for-bit no-op: even an ETB short with NO account/quote context
+    # (which the live path now REJECTS) is still ACCEPTED by the NullOracle. The
+    # fail-closed account-context hardening must not leak into flag-OFF behavior.
+    null = NullShortabilityOracle()
+    v = null.verdict("AAPL", "short", 100, T, AdmissibilityContext())
+    assert v.state is AdmissibilityState.ACCEPTED
+    assert v.reason is None
+    assert v.annual_cbr == 0.0
+
+
 def test_select_oracle_flag_off_is_null(monkeypatch):
     monkeypatch.delenv("HERMES_QUANT_ADMISSIBILITY", raising=False)
     assert isinstance(select_oracle(), NullShortabilityOracle)
@@ -220,9 +306,31 @@ def test_static_allowlist_accepts_etb_for_matching_asof():
         )
     }
     oracle = StaticETBAllowlistOracle(snap)
+    # Offline shortability audit: ACCEPTS short-eligible names WITHOUT live quote/BP context
+    # (the audit scopes itself to shortability; the live path requires the account context).
     v = oracle.verdict("AAPL", "short", 100, T, AdmissibilityContext())
     assert v.state is AdmissibilityState.ACCEPTED
     assert v.annual_cbr == pytest.approx(0.0030)
+
+
+def test_static_allowlist_still_rejects_present_failing_bp():
+    # The audit-mode relaxation only SKIPS missing inputs; a PRESENT-and-failing BP still
+    # REJECTS (the audit must not under-report a real collateral breach).
+    snap = {
+        "AAPL": ETBSnapshotEntry(
+            symbol="AAPL",
+            asof="2026-05-30",
+            easy_to_borrow=True,
+            shortable=True,
+            marginable=True,
+            annual_cbr=0.0030,
+        )
+    }
+    oracle = StaticETBAllowlistOracle(snap)
+    ctx = AdmissibilityContext(current_ask=100.0, available_bp=1_000.0)  # 1.03*100*1000 >> 1k
+    v = oracle.verdict("AAPL", "short", 1000, T, ctx)
+    assert v.state is AdmissibilityState.REJECTED
+    assert v.reason == REASON_INSUFFICIENT_BPR
 
 
 def test_static_allowlist_missing_snapshot_rejects():

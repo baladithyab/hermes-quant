@@ -30,7 +30,13 @@ def test_live_aapl_etb_short_accepted():
     )
 
     oracle = AlpacaShortabilityOracle()
-    v = oracle.verdict("AAPL", "short", 1, datetime.now(tz=UTC), AdmissibilityContext())
+    # The live oracle fails-closed on missing account context (ADR-0077 fail-closed
+    # precondition); supply sufficient synthetic quote/BP/equity so we exercise the real
+    # get_asset() shortability resolution rather than the MISSING_ACCOUNT_CONTEXT reject.
+    ctx = AdmissibilityContext(
+        account_equity=100_000.0, current_ask=200.0, available_bp=1_000_000.0
+    )
+    v = oracle.verdict("AAPL", "short", 1, datetime.now(tz=UTC), ctx)
     # AAPL is a perennial ETB name; a 1-share short should be admissible.
     assert v.state is AdmissibilityState.ACCEPTED
     assert 0.0 < v.annual_cbr < 0.02

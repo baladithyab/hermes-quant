@@ -71,6 +71,49 @@ def test_accrue_sums_over_held_days_and_divs():
     assert accrual.symbol == "AAPL"
 
 
+def test_pil_only_when_ex_div_in_held_window():
+    """ADR-0077: PIL only accrues for shorts open ACROSS the ex-div date.
+
+    Short held Mon..Wed. An ex-div on Friday (outside the held window) => ZERO PIL;
+    an ex-div on Tuesday (inside the held window) => PIL debited.
+    """
+    held_mon_wed = {
+        date(2026, 5, 25): 100.0,  # Mon
+        date(2026, 5, 26): 100.0,  # Tue
+        date(2026, 5, 27): 100.0,  # Wed
+    }
+    # Friday ex-div is outside the Mon..Wed held window -> no PIL.
+    div_friday = {date(2026, 5, 29): 0.30}  # Fri
+    accrual_fri = accrue_borrow_carry("AAPL", -1000, held_mon_wed, 0.02, div_friday)
+    assert accrual_fri.total_pil == 0.0
+    assert accrual_fri.days_held == 3
+
+    # Tuesday ex-div is inside the held window -> PIL debited.
+    div_tuesday = {date(2026, 5, 26): 0.30}  # Tue
+    accrual_tue = accrue_borrow_carry("AAPL", -1000, held_mon_wed, 0.02, div_tuesday)
+    assert accrual_tue.total_pil == pytest.approx(1000 * 0.30)
+    assert accrual_tue.days_held == 3
+
+    # Borrow fee is independent of the dividend window: identical for both runs.
+    assert accrual_fri.total_borrow_fee == pytest.approx(accrual_tue.total_borrow_fee)
+
+
+def test_pil_mixed_divs_only_held_ones_count():
+    """A dividend dict spanning both in- and out-of-window ex-div dates accrues PIL
+    ONLY for the ex-div date inside the held window."""
+    held_mon_wed = {
+        date(2026, 5, 25): 100.0,  # Mon
+        date(2026, 5, 26): 100.0,  # Tue
+        date(2026, 5, 27): 100.0,  # Wed
+    }
+    dividends = {
+        date(2026, 5, 26): 0.30,  # Tue -> held -> counts
+        date(2026, 5, 29): 0.50,  # Fri -> not held -> ignored
+    }
+    accrual = accrue_borrow_carry("AAPL", -1000, held_mon_wed, 0.02, dividends)
+    assert accrual.total_pil == pytest.approx(1000 * 0.30)
+
+
 def test_accrue_long_position_zero_carry():
     close_by_date = {date(2026, 5, 27): 100.0}
     accrual = accrue_borrow_carry("AAPL", +1000, close_by_date, 0.02)

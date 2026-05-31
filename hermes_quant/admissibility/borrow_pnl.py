@@ -56,16 +56,23 @@ def accrue_borrow_carry(
     dividends: dict[date, float] | None = None,  # ex-div date -> cash dividend/share
 ) -> BorrowAccrual:
     """Sum daily_borrow_fee over each held UTC date in close_by_date, plus PIL on any ex-div
-    date present in `dividends`. The total carry is a positive number to SUBTRACT from short P&L."""
+    date the short was actually open ACROSS (ADR-0077: PIL only for shorts held across ex-div).
+    The total carry is a positive number to SUBTRACT from short P&L."""
     total_fee = 0.0
     days_held = 0
     for on, close_price in close_by_date.items():
         days_held += 1
         total_fee += daily_borrow_fee(short_shares, close_price, annual_cbr, on)
 
+    # held_dates are the UTC dates the short position was open (the marks we iterate above).
+    # A dividend whose ex-div date falls OUTSIDE this window did not touch the short and
+    # contributes ZERO PIL — never debit for a dividend the position did not straddle.
+    held_dates = close_by_date.keys()
     total_pil = 0.0
     if dividends:
-        for div_per_share in dividends.values():
+        for ex_div_date, div_per_share in dividends.items():
+            if ex_div_date not in held_dates:
+                continue
             total_pil += payment_in_lieu(short_shares, div_per_share)
 
     return BorrowAccrual(

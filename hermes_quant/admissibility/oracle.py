@@ -53,6 +53,10 @@ REASON_EQUITY_BELOW_2K = "EQUITY_BELOW_2K"
 REASON_PTP_BLOCKED = "PTP_BLOCKED"
 REASON_SSR_MARKETABLE_SHORT = "SSR_MARKETABLE_SHORT"
 REASON_UNKNOWN_SHORTABILITY = "UNKNOWN_SHORTABILITY"  # fail-closed: ctx/oracle could not determine
+# fail-closed: shortability resolved, but the account/quote inputs the BP+equity hard
+# checks REQUIRE are absent -> we cannot prove the order fits, so we REJECT (never assume).
+REASON_MISSING_ACCOUNT_CONTEXT = "MISSING_ACCOUNT_CONTEXT"  # account_equity / available_bp absent
+REASON_MISSING_QUOTE = "MISSING_QUOTE"  # current_ask absent (cannot value the short)
 
 
 @dataclass(frozen=True)
@@ -122,7 +126,13 @@ def _is_whole_share(qty: float) -> bool:
 
 
 def evaluate_admissibility(
-    symbol: str, side: str, qty: float, asof: datetime, ctx: AdmissibilityContext
+    symbol: str,
+    side: str,
+    qty: float,
+    asof: datetime,
+    ctx: AdmissibilityContext,
+    *,
+    require_account_context: bool = True,
 ) -> ShortabilityVerdict:
     """The shared deterministic core all oracles delegate to once ctx is populated.
 
@@ -133,12 +143,29 @@ def evaluate_admissibility(
       2. any required ctx field None  -> REJECTED, UNKNOWN_SHORTABILITY   (FAIL-CLOSED)
       3. not tradable/shortable/ETB   -> REJECTED, NOT_SHORTABLE / NOT_ETB
       4. not marginable               -> REJECTED, NOT_MARGINABLE
-      5. account_equity < $2,000      -> REJECTED, EQUITY_BELOW_2K
+      5. account_equity unknown        -> REJECTED, MISSING_ACCOUNT_CONTEXT  (FAIL-CLOSED*)
+      5b. account_equity < $2,000      -> REJECTED, EQUITY_BELOW_2K
       6. not whole-share              -> REJECTED, FRACTIONAL_SHORT
       7. ptp_no_exception in attrs    -> REJECTED, PTP_BLOCKED
-      8. insufficient BP              -> REJECTED, INSUFFICIENT_BPR
+      8. current_ask unknown          -> REJECTED, MISSING_QUOTE             (FAIL-CLOSED*)
+      8b. available_bp unknown         -> REJECTED, MISSING_ACCOUNT_CONTEXT  (FAIL-CLOSED*)
+      8c. insufficient BP              -> REJECTED, INSUFFICIENT_BPR
       9. ssr_active and is_marketable -> PARTIAL,  SSR_MARKETABLE_SHORT
       10. else                         -> ACCEPTED, cbr = ctx.annual_cbr or ETB_DEFAULT_ANNUAL_CBR
+
+    The BP+equity hard checks (5, 8) are LIVE-ORDER PRECONDITIONS, not optional refinements:
+    on the live path an opening short whose account/quote context is unknown is REJECTED (we
+    never fabricate sufficiency / never "assume admissible"). This is the fail-closed default
+    (``require_account_context=True``), used by the live AlpacaShortabilityOracle and any
+    direct caller.
+
+    (*) ``require_account_context=False`` is for the OFFLINE shortability AUDIT only (the
+    StaticETBAllowlistOracle restatement): it answers the narrower question "is this name
+    short-ELIGIBLE as of the snapshot?" and has no per-position live quote/BP. In that mode a
+    missing equity/quote/BP input is SKIPPED rather than treated as a precondition failure —
+    but a PRESENT-and-failing input (equity < $2k, BP < required) still REJECTS. This never
+    relaxes the live path; it only scopes the audit to shortability. The NullShortabilityOracle
+    (flag OFF) does NOT call this core at all, so flag-OFF behavior is unchanged bit-for-bit.
     """
     # 1. Longs / buys are never constrained by the short-admissibility predicate.
     if not _is_short_side(side):
@@ -163,8 +190,16 @@ def evaluate_admissibility(
     if not ctx.marginable:
         return ShortabilityVerdict(AdmissibilityState.REJECTED, REASON_NOT_MARGINABLE, 0.0)
 
-    # 5. Account equity floor for any short capability.
-    if ctx.account_equity is not None and ctx.account_equity < MIN_SHORT_ACCOUNT_EQUITY_USD:
+    # 5. Account equity floor for any short capability. FAIL-CLOSED on the live path: unknown
+    # equity is a missing hard-precondition input, not an implicit pass -> REJECT (never assume
+    # capable). The offline audit (require_account_context=False) scopes itself to shortability
+    # and skips this precondition when equity is absent — but still REJECTS a PRESENT sub-floor.
+    if ctx.account_equity is None:
+        if require_account_context:
+            return ShortabilityVerdict(
+                AdmissibilityState.REJECTED, REASON_MISSING_ACCOUNT_CONTEXT, 0.0
+            )
+    elif ctx.account_equity < MIN_SHORT_ACCOUNT_EQUITY_USD:
         return ShortabilityVerdict(AdmissibilityState.REJECTED, REASON_EQUITY_BELOW_2K, 0.0)
 
     # 6. Whole-share enforcement (no fractional shorts; live HTTP 422).
@@ -175,19 +210,28 @@ def evaluate_admissibility(
     if "ptp_no_exception" in ctx.attributes:
         return ShortabilityVerdict(AdmissibilityState.REJECTED, REASON_PTP_BLOCKED, 0.0)
 
-    # 8. Buying-power check (only when we have a price to value the order with).
-    if ctx.current_ask is not None:
-        # If a price is supplied but BP is not, we do NOT fabricate sufficiency.
-        if ctx.available_bp is None:
+    # 8. Buying-power check. FAIL-CLOSED on the live path: the BP hard check is a PRECONDITION
+    # for an opening short, not an optional refinement we skip when inputs are absent. Without a
+    # quote we cannot value the order; without BP we cannot prove it fits. Either unknown =>
+    # REJECT. The offline audit skips the check ONLY when an input is missing; a PRESENT-and-
+    # -failing BP still REJECTS (INSUFFICIENT_BPR), so the audit never under-reports a breach.
+    if ctx.current_ask is None:
+        if require_account_context:
+            return ShortabilityVerdict(AdmissibilityState.REJECTED, REASON_MISSING_QUOTE, 0.0)
+    elif ctx.available_bp is None:
+        if require_account_context:
             return ShortabilityVerdict(
-                AdmissibilityState.REJECTED, REASON_UNKNOWN_SHORTABILITY, 0.0
+                AdmissibilityState.REJECTED, REASON_MISSING_ACCOUNT_CONTEXT, 0.0
             )
+    else:
         order_value = max(ctx.limit_price or 0.0, ALPACA_SHORT_ASK_MULT * ctx.current_ask) * qty
         reg_t_required = (ctx.margin_requirement_short or REG_T_SHORT_INITIAL_BPR_MULT) * (
             ctx.current_ask * qty
         )
         if ctx.available_bp < max(order_value, reg_t_required):
-            return ShortabilityVerdict(AdmissibilityState.REJECTED, REASON_INSUFFICIENT_BPR, 0.0)
+            return ShortabilityVerdict(
+                AdmissibilityState.REJECTED, REASON_INSUFFICIENT_BPR, 0.0
+            )
 
     # 9. SSR: a marketable short during an SSR window is not immediately fillable.
     if ctx.ssr_active and ctx.is_marketable:
@@ -294,12 +338,19 @@ class AlpacaShortabilityOracle:
 
 
 class StaticETBAllowlistOracle:
-    """Offline / backtest. A point-in-time ETB set + per-name CBR table keyed by `asof`,
-    so historical admissibility uses the value as of decision time (D-5). Honest about the
-    limitation: a name with NO snapshot for `asof` => REJECT(NOT_ETB) (fail-closed, not 'assume').
+    """Offline / backtest SHORTABILITY AUDIT. A point-in-time ETB set + per-name CBR table keyed
+    by `asof`, so historical admissibility uses the value as of decision time (D-5). Honest about
+    the limitation: a name with NO snapshot for `asof` => REJECT(NOT_ETB) (fail-closed, not
+    'assume').
 
     `snapshot` maps SYMBOL -> ETBSnapshotEntry. The entry's `asof` (an ISO date) must match the
     requested decision date; a snapshot for a different date does NOT apply (no look-ahead).
+
+    This oracle answers "is this name short-ELIGIBLE as of the snapshot?" — it has no per-position
+    live quote/BP, so it delegates with ``require_account_context=False``: a MISSING account/quote
+    input is scoped out (not a precondition failure), while a PRESENT-and-failing one (equity<$2k,
+    BP<required) still REJECTS. The LIVE path (AlpacaShortabilityOracle / select_oracle when the
+    flag is ON) uses the fail-closed default and REJECTS on any missing account context.
     """
 
     def __init__(self, snapshot: dict[str, ETBSnapshotEntry]) -> None:
@@ -331,7 +382,11 @@ class StaticETBAllowlistOracle:
             ssr_active=ctx.ssr_active,
             is_marketable=ctx.is_marketable,
         )
-        return evaluate_admissibility(symbol, side, qty, asof, populated)
+        # Offline shortability audit: missing live quote/BP is scoped out, not a precondition
+        # failure. The live oracle (above) keeps the fail-closed default.
+        return evaluate_admissibility(
+            symbol, side, qty, asof, populated, require_account_context=False
+        )
 
 
 def _parse_float(value) -> float | None:

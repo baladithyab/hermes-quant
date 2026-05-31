@@ -108,6 +108,65 @@ def _read_safety_rails() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Admissibility sizing inputs (ADR-0077 unit-bridge)
+# ---------------------------------------------------------------------------
+
+
+def _decision_price_from_advisor(advisor_result: dict | None) -> float | None:
+    """Pull the decision-time price out of an advisor_result.
+
+    Mirrors PaperReactor._extract_decision_price so the admissibility share
+    conversion uses the SAME price the reactor would fill at. Returns None
+    (not 0.0) when no usable price is present so the caller can fail-closed
+    instead of dividing NAV by a zero/garbage price.
+    """
+    ar = advisor_result or {}
+    top_dp = ar.get("decision_price")
+    if top_dp is not None:
+        try:
+            dp = float(top_dp)
+            if dp > 0:
+                return dp
+        except (TypeError, ValueError):
+            pass
+    for view in ar.get("analyst_views") or []:
+        md = view.get("metadata") or {}
+        if "last_close" in md:
+            try:
+                lc = float(md["last_close"])
+                if lc > 0:
+                    return lc
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _account_nav_usd() -> float | None:
+    """Best-available NAV (account equity in USD) for the paper account.
+
+    Source priority:
+      1. state.db cash.equity_total (materialized NAV after fills) — the truth.
+      2. HERMES_QUANT_PAPER_INITIAL_CASH / paper bootstrap (no fills yet).
+    Returns None on any failure so the caller fails-closed (no fabricated NAV).
+    """
+    try:
+        from hermes_quant.state.portfolio_state import (
+            _default_initial_cash,
+            get_portfolio_state,
+        )
+
+        cash = get_portfolio_state().get_cash("paper-default")
+        if cash is not None and cash.equity_total > 0:
+            return float(cash.equity_total)
+        # No fills yet -> the account is still the bootstrap cash balance.
+        boot = _default_initial_cash()
+        return float(boot) if boot > 0 else None
+    except Exception as exc:  # noqa: BLE001 — fail-closed: unknown NAV => None.
+        logger.warning("autonomous: NAV lookup failed (admissibility fail-closed): %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Kill-switch state
 # ---------------------------------------------------------------------------
 
@@ -465,18 +524,37 @@ def tick(
                     AdmissibilityContext,
                     apply_verdict_to_target,
                     select_oracle,
+                    target_pct_to_shares,
                 )
 
                 oracle = select_oracle()
-                # Live oracle populates ctx from get_asset(); the empty ctx here means
-                # the oracle resolves shortability itself (fail-closed on error).
                 asof_decision_dt = datetime.now(tz=UTC)
+
+                # UNIT BRIDGE (ADR-0077): the oracle's whole-share check expects a SHARE
+                # count, not a NAV fraction. Convert effective_size (signed NAV fraction)
+                # to whole shares using the decision price + account NAV — the same price
+                # PaperReactor would fill at. Fail-closed: missing/non-positive NAV or
+                # price yields 0 shares, which the oracle REJECTs (never a fabricated qty).
+                nav = _account_nav_usd()
+                price = _decision_price_from_advisor(advisor_result)
+                signed_shares = (
+                    target_pct_to_shares(effective_size, nav, price)
+                    if nav is not None and price is not None
+                    else 0
+                )
+                qty_shares = abs(signed_shares)
+
+                # ctx carries what IS available at this seam (the decision price as the
+                # quote). account_equity / available_bp are NOT plumbed here yet, so the
+                # live oracle fails-closed (MISSING_ACCOUNT_CONTEXT) until the broker
+                # account-fetch seam is wired — documented gap, not a fabricated pass.
+                ctx = AdmissibilityContext(current_ask=price)
                 verdict = oracle.verdict(
                     entry.symbol,
                     "short",
-                    abs(effective_size),
+                    qty_shares,
                     asof_decision_dt,
-                    AdmissibilityContext(),
+                    ctx,
                 )
                 adj = apply_verdict_to_target(effective_size, verdict)
                 if adj.adjusted_target_pct == 0.0:
@@ -484,6 +562,7 @@ def tick(
                     decision.details = {
                         "reason": verdict.reason,
                         "admissibility_state": verdict.state.value,
+                        "qty_shares": qty_shares,
                     }
                     result.silences += 1
                     result.decisions.append(decision)

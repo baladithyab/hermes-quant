@@ -36,8 +36,19 @@ def restate_mod():
     return _load_script()
 
 
+_NAV = 100_000.0  # account equity_total backing the NAV-fraction -> share conversion
+
+
 def _make_state_db(tmp_path: Path) -> Path:
-    """Create a state.db with the positions schema (per AGENTS §1.3) + 4 shorts + 1 long."""
+    """Create a state.db with positions + cash (per AGENTS §1.3) + 4 shorts + 1 long.
+
+    position.quantity is a NAV FRACTION (cumulative fill_size_pct), NOT shares
+    (portfolio_state §D7). With NAV=100k each fraction converts to whole shares:
+      AAPL -0.20 @ 200  -> floor(0.20*100k/200)  = 100 shares
+      SMALLCAP -0.10 @ 12 -> floor(0.10*100k/12) = 833 shares
+      MEMECO -0.05 @ 8   -> floor(0.05*100k/8)   = 625 shares
+      NOSHORT -0.05 @ 50 -> floor(0.05*100k/50)  = 100 shares
+    """
     db = tmp_path / "state.db"
     conn = sqlite3.connect(db)
     conn.execute(
@@ -53,17 +64,31 @@ def _make_state_db(tmp_path: Path) -> Path:
         ) WITHOUT ROWID;
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE cash (
+            account_id     TEXT PRIMARY KEY,
+            balance_usd    REAL NOT NULL,
+            last_update_at TEXT NOT NULL,
+            equity_total   REAL NOT NULL
+        ) WITHOUT ROWID;
+        """
+    )
     ts = "2026-05-25T14:00:00Z"
     rows = [
-        ("paper-default", "equity", "AAPL", -50.0, 200.0, ts),  # ETB short
-        ("paper-default", "equity", "SMALLCAP", -100.0, 12.0, ts),  # non-ETB short
-        ("paper-default", "equity", "MEMECO", -30.0, 8.0, ts),  # absent from snapshot
-        ("paper-default", "equity", "NOSHORT", -25.0, 50.0, ts),  # shortable=False
-        ("paper-default", "equity", "MSFT", +40.0, 300.0, ts),  # long (ignored)
+        ("paper-default", "equity", "AAPL", -0.20, 200.0, ts),  # ETB short
+        ("paper-default", "equity", "SMALLCAP", -0.10, 12.0, ts),  # non-ETB short
+        ("paper-default", "equity", "MEMECO", -0.05, 8.0, ts),  # absent from snapshot
+        ("paper-default", "equity", "NOSHORT", -0.05, 50.0, ts),  # shortable=False
+        ("paper-default", "equity", "MSFT", +0.20, 300.0, ts),  # long (ignored)
     ]
     conn.executemany(
         "INSERT INTO positions VALUES (?,?,?,?,?,?)",
         rows,
+    )
+    conn.execute(
+        "INSERT INTO cash VALUES (?,?,?,?)",
+        ("paper-default", _NAV, ts, _NAV),
     )
     conn.commit()
     conn.close()
@@ -157,6 +182,58 @@ def test_restate_json_shape(restate_mod, tmp_path):
     assert result["n_accepted"] == 1
     assert result["n_rejected"] == 3
     assert result["n_rejected_not_etb"] == 2
+
+
+def test_restate_converts_nav_fraction_to_whole_shares(restate_mod, tmp_path):
+    """The unit bug: positions are NAV fractions, not shares. Passing the fraction as
+    qty made every short fail the whole-share check -> blanket FRACTIONAL_SHORT. After
+    the fix, qty_shares is a non-fractional integer = floor(|fraction|*NAV/price), and the
+    ETB short is ACCEPTED (NOT FRACTIONAL_SHORT)."""
+    db = _make_state_db(tmp_path)
+    snapshot = _snapshot()
+    oracle = StaticETBAllowlistOracle(snapshot)
+    result = restate_mod.restate_book(
+        db, "paper-default", snapshot, oracle, asof_snapshot="2026-05-25"
+    )
+    by_symbol = {r["symbol"]: r for r in result["rows"]}
+
+    # Conversion is exact whole shares (floor of magnitude, sign preserved).
+    assert by_symbol["AAPL"]["qty_shares"] == -100  # floor(0.20*100k/200)
+    assert by_symbol["SMALLCAP"]["qty_shares"] == -833  # floor(0.10*100k/12)
+    assert by_symbol["MEMECO"]["qty_shares"] == -625  # floor(0.05*100k/8)
+    assert by_symbol["NOSHORT"]["qty_shares"] == -100  # floor(0.05*100k/50)
+    for row in result["rows"]:
+        assert isinstance(row["qty_shares"], int)
+
+    # The ETB whole-share short is ACCEPTED — NOT silenced as FRACTIONAL_SHORT.
+    assert by_symbol["AAPL"]["state"] == "ACCEPTED"
+    assert by_symbol["AAPL"]["reason"] != "FRACTIONAL_SHORT"
+    assert by_symbol["AAPL"]["reason"] is None
+    # No short reports FRACTIONAL_SHORT anymore (the bug's signature).
+    assert all(r["reason"] != "FRACTIONAL_SHORT" for r in result["rows"])
+
+
+def test_restate_fail_closed_when_nav_unknown(restate_mod, tmp_path):
+    """No cash row => NAV unknown => fail-closed: zero shares + MISSING_ACCOUNT_CONTEXT,
+    NEVER an assumed-admissible ETB short. The ETB AAPL short must NOT be ACCEPTED."""
+    db = _make_state_db(tmp_path)
+    # Drop the cash row so equity_total is unknown.
+    conn = sqlite3.connect(db)
+    conn.execute("DELETE FROM cash WHERE account_id=?", ("paper-default",))
+    conn.commit()
+    conn.close()
+
+    snapshot = _snapshot()
+    oracle = StaticETBAllowlistOracle(snapshot)
+    result = restate_mod.restate_book(
+        db, "paper-default", snapshot, oracle, asof_snapshot="2026-05-25"
+    )
+    by_symbol = {r["symbol"]: r for r in result["rows"]}
+
+    # Zero NAV -> zero shares -> the ETB name is NOT admitted (fail-closed).
+    assert by_symbol["AAPL"]["qty_shares"] == 0
+    assert by_symbol["AAPL"]["state"] == "REJECTED"
+    assert result["n_accepted"] == 0  # nothing assumed admissible
 
 
 def test_restate_main_json_runs(restate_mod, tmp_path, capsys):

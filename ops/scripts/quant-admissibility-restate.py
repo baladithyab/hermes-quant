@@ -89,12 +89,20 @@ def restate_book(
     (now - last_update_at, calendar days). This is NOT a daily mark-to-market (we lack the historical
     bar series here); the JSON `restated_note` documents the caveat.
     """
+    from hermes_quant.admissibility import target_pct_to_shares
     from hermes_quant.admissibility.borrow_pnl import DAY_COUNT_BASIS
     from hermes_quant.state.portfolio_state import PortfolioState
 
     now = now or datetime.now(tz=UTC)
     state = PortfolioState(state_db_path=Path(book))
     positions = state.get_positions(account_id)
+
+    # Account NAV (equity_total) is the basis for the NAV-fraction -> share conversion.
+    # state.db stores position.quantity as a NAV FRACTION (cumulative fill_size_pct), NOT
+    # shares (portfolio_state §D7). Without NAV we cannot value any short -> fail-closed
+    # (every short would report MISSING_ACCOUNT_CONTEXT). 0.0 sentinel makes that explicit.
+    cash = state.get_cash(account_id)
+    account_nav = float(cash.equity_total) if cash is not None else 0.0
 
     rows: list[dict] = []
     n_rejected = 0
@@ -106,14 +114,25 @@ def restate_book(
     for pos in shorts:
         asof = _parse_asof(pos.last_update_at)
         snap = snapshot.get(pos.symbol)
+        # Convert the stored NAV-fraction position to a whole-share count using the
+        # account NAV + avg_entry_price (our only offline price; documented proxy). The
+        # oracle's whole-share check needs SHARES, not a fraction — passing abs(quantity)
+        # (the fraction) made every short fractional -> blanket FRACTIONAL_SHORT.
+        signed_shares = target_pct_to_shares(pos.quantity, account_nav, pos.avg_entry_price)
+        qty = abs(signed_shares)
+        # Populate the account/quote context the hardened oracle now REQUIRES for an
+        # opening short. avg_entry_price is the only offline quote we have (proxy);
+        # equity_total fills both account_equity and available_bp for a coarse audit.
         ctx = AdmissibilityContext(
             tradable=True if snap else None,
             marginable=snap.marginable if snap else None,
             shortable=snap.shortable if snap else None,
             easy_to_borrow=snap.easy_to_borrow if snap else None,
             annual_cbr=snap.annual_cbr if snap else None,
+            current_ask=pos.avg_entry_price,
+            account_equity=account_nav,
+            available_bp=account_nav,
         )
-        qty = abs(pos.quantity)
         verdict = oracle.verdict(pos.symbol, "short", qty, asof, ctx)
 
         if verdict.state.value == "REJECTED":
@@ -123,16 +142,18 @@ def restate_book(
         elif verdict.state.value == "ACCEPTED":
             n_accepted += 1
 
-        # Coarse one-mark borrow estimate (audit only, see caveat).
+        # Coarse one-mark borrow estimate (audit only, see caveat). Notional is
+        # shares*price (quantity is a NAV fraction, NOT shares — see conversion above).
         cbr = verdict.annual_cbr or (snap.annual_cbr if snap else ETB_DEFAULT_ANNUAL_CBR)
         days_held = max(0, (now - asof).days)
-        est_carry = abs(pos.quantity) * pos.avg_entry_price * cbr / DAY_COUNT_BASIS * days_held
+        est_carry = qty * pos.avg_entry_price * cbr / DAY_COUNT_BASIS * days_held
         total_carry += est_carry
 
         rows.append(
             {
                 "symbol": pos.symbol,
                 "qty": pos.quantity,
+                "qty_shares": signed_shares,
                 "state": verdict.state.value,
                 "reason": verdict.reason,
                 "annual_cbr": round(cbr, 6),
@@ -151,9 +172,13 @@ def restate_book(
         "total_est_borrow_carry_usd": round(total_carry, 4),
         "rows": rows,
         "restated_note": (
-            "Coarse one-mark borrow estimate: avg_entry_price used as a daily-close proxy over "
-            "calendar days held; NOT a daily mark-to-market. Admissibility uses the asof-snapshot "
-            "(or live get_asset); names absent from the snapshot are fail-closed REJECT(NOT_ETB)."
+            "Positions are NAV fractions (cumulative fill_size_pct), converted to whole shares "
+            "via target_pct_to_shares(quantity, account_equity_total, avg_entry_price); "
+            "avg_entry_price is the offline quote proxy and equity_total backs both account_equity "
+            "and available_bp. Coarse one-mark borrow estimate over calendar days held; NOT a daily "
+            "mark-to-market. Admissibility uses the asof-snapshot (or live get_asset); names absent "
+            "from the snapshot are fail-closed REJECT(NOT_ETB). With no cash row (NAV unknown) every "
+            "short is fail-closed REJECT (zero shares / MISSING_ACCOUNT_CONTEXT)."
         ),
     }
 
@@ -180,12 +205,13 @@ def _format_text(result: dict) -> str:
         f"rejected={result['n_rejected']}  rejected_not_etb={result['n_rejected_not_etb']}",
         f"  total_est_borrow_carry_usd={result['total_est_borrow_carry_usd']}",
         "",
-        f"  {'SYMBOL':<10} {'QTY':>10} {'STATE':<10} {'REASON':<22} {'CBR':>8} {'EST_CARRY':>12}",
+        f"  {'SYMBOL':<10} {'QTY%NAV':>10} {'SHARES':>8} {'STATE':<10} "
+        f"{'REASON':<22} {'CBR':>8} {'EST_CARRY':>12}",
     ]
     for row in result["rows"]:
         lines.append(
-            f"  {row['symbol']:<10} {row['qty']:>10.4f} {row['state']:<10} "
-            f"{str(row['reason'] or '-'):<22} {row['annual_cbr']:>8.4f} "
+            f"  {row['symbol']:<10} {row['qty']:>10.4f} {row['qty_shares']:>8d} "
+            f"{row['state']:<10} {str(row['reason'] or '-'):<22} {row['annual_cbr']:>8.4f} "
             f"{row['est_borrow_carry_usd']:>12.4f}"
         )
     lines.append("")
