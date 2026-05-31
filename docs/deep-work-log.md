@@ -170,3 +170,34 @@ Operator: "walk me through what's left and start working on the rest."
 
 **S1 makes HERMES_QUANT_ADMISSIBILITY safe to flip — it no longer lets an inadmissible short
 fire through the HITL path. The enablement critical path's step-1 code is now done.**
+
+### Wave D+E — multi-leg reactor + PerceptionFrame BUILT (2026-05-30, +2 commits)
+
+Operator: "keep going" + enabled the plugin live (gateway restart confirmed:
+`hermes_quant plugin v0.6.4 registered` at 21:17).
+
+- **PDR-1 PerceptionFrame** (`8c8cb1d`, CONFIRMED): the carrier collapsing the 3 semantic-
+  injection seams into one; recommend(perception_frame=None) byte-identical to today; closes the
+  M17 tool-path decoupling. Eval gate PASS (byte-identical replay + no-lookahead incl. producing
+  path). 46 tests.
+- **Multi-leg PAPER reactor** (`dedc8d0`, the headline vision unlock): CC/CSP/wheel FIRE on paper,
+  HITL-only (quant_approve dispatch), options-gate-as-precondition, PMCC-shadow-validated, all
+  default-OFF behind HERMES_QUANT_MULTILEG_REACTOR. Eval gate PASS 7/7.
+- **P0 caught by review, NOT the eval gate** (the session's most consequential catch): the
+  legacy-state.db idempotency migration did a bare ALTER (can't change a SQLite PK), so a covered
+  call's 2nd leg shared the 2-col key and was SILENTLY DROPPED from state.db while landing on the
+  bus — the exact bus/state divergence the fidelity effort exists to prevent. The LIVE
+  ~/.hermes/quant/state.db is that legacy shape (435 rows). Fixed: _migrate_processed_fills now
+  rebuilds to the 4-col PK; dry-run on a copy of the real DB migrates clean + preserves all 435
+  rows. Eval gates use fresh DBs so they structurally couldn't catch it — adversarial review on
+  the un-testable input did. Lesson reinforced: eval-gate-green ≠ correct.
+
+**Environment migration (this turn):** repaired 124 broken hermes shebangs (venv.uv→venv;
+`hermes` was failing "required file not found"), finished conda→uv (commented .bashrc conda block,
+exported 4 env specs to ~/conda-env-backups/, deleted ~/miniconda3 reclaiming 16G), and enabled
+hermes-quant in the gateway via the config.yaml allow-list (NOT `hermes plugins enable`, which
+errors on entry-point plugins). Gateway restarted → plugin LIVE with all 16 tools.
+
+**Remaining (next loops, all flag-OFF / operator):** PDR-2/3/4 perception primitives; the
+reactor's recipe->proposal producer (PR-5); deploy-sync reconciliation of the 9 DRIFT scripts;
+operator flag-flips per FEATURE-ENABLEMENT.md (the GATED flags still wait on their evals).
