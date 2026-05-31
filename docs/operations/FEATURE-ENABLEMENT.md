@@ -332,6 +332,46 @@ side-by-side audit step · rollback · classification.
 - **Rollback:** `sed -i '/HERMES_QUANT_WEEKLY_RETRO=/d' ~/.hermes/.env`
 - **Classification: GATED.**
 
+### 2.11 `MONTHLY_META_RETRO` — GATED (W3 / ADR-0080 / ADR-0081 §3, advisory-plane only)
+
+- **Enables:** the monthly meta-retro (the T3 tier, `memory/meta_retro.py`). The
+  `quant-monthly-meta-retro` cron aggregates the trailing W2 weekly belief digests
+  (`beliefs.jsonl`), the `research_debate` audit rows (O7, write-only today —
+  `agents/research_debate/stage.py:345`), and `promotion_event` records into three advisory
+  artifacts: (1) a meta-retro **report** (`memory/meta_retros.jsonl`, recommendations-only),
+  (2) novelty/dedup-gated **candidate** hypotheses registered `status="open"`,
+  `author="quant-monthly-meta-retro"` (closes O8 — a human/`HypothesisRunner` W6 must move
+  them `open→running`), and (3) **persona-calibration telemetry** carried inside the report
+  (`telemetry_only=true`). It also applies the deterministic weekly→monthly belief
+  promote/expire (ADR-0081 §4).
+- **Advisory-plane only / propose-only:** writes ONLY `meta_retros.jsonl`, `beliefs.jsonl`,
+  and `status="open"` rows in the hypothesis registry. The proposed persona weights are
+  **TELEMETRY-ONLY** — `aggregators/deliberative.py` and `.../bma.py` never read
+  `persona_calibration` (grep-guarded). It NEVER imports or mutates the risk gate, the hard
+  limits, the discrete sizing ladder `{0,±0.05,±0.10,±0.15,±0.20}`, the kill-switch, or the
+  seed catalyst YAML. **Zero auto-promotion to live** — candidate→live still requires W6 +
+  `PromotionOrchestrator` + operator sign-off (ADR-0052).
+- **Precondition (the W3 eval gate — necessary-not-sufficient):** run the hard gate and
+  confirm `GATE: ✅ PASS`:
+  ```bash
+  python ops/scripts/quant-monthly-meta-retro-eval-gate.py
+  pytest tests/memory/test_meta_retro.py tests/research/test_hypothesis_novelty.py \
+         tests/unit/test_monthly_meta_retro_offstate.py -q
+  ```
+  The four conditions: (1) reproduces byte-identically given `config_hash`; (2) every
+  candidate passes the novelty/dedup gate; (3) persona deltas are telemetry-only and
+  `|delta| ≤ 0.10` with no aggregator reading them; (4) Oracle provenance preserved + the
+  debate-row `asof<asof` guard + byte-identical off-state + nothing-live-mutated.
+- **Enable (operator, after the eval gate + an audit-log diff):**
+  ```bash
+  echo 'HERMES_QUANT_MONTHLY_META_RETRO=1' >> ~/.hermes/.env
+  ```
+- **Off-state:** flag unset/`0` is a bit-for-bit no-op — the cron returns 0 with empty stdout,
+  no `meta_retros.jsonl` write, no candidate registered.
+  (`test_monthly_meta_retro_offstate.py::test_offstate_is_noop`.)
+- **Rollback:** `sed -i '/HERMES_QUANT_MONTHLY_META_RETRO=/d' ~/.hermes/.env`
+- **Classification: GATED.**
+
 ---
 
 ## 3. Quick reference
@@ -348,6 +388,7 @@ side-by-side audit step · rollback · classification.
 | `MULTILEG_REACTOR` | GATED (stays OFF) | **not yet — no order rail** | n/a |
 | `CATALYST_ONBOARDING` | GATED | after ADR-0075 (+ SEMANTIC already on) | watchlist-evolve OFF vs ON |
 | `WEEKLY_RETRO` (+`MEMORY_INJECT`) | GATED | after the W2 eval gate (held-out + plateau) | weekly-retro test suite; flag-OFF = byte-identical no-op |
+| `MONTHLY_META_RETRO` | GATED | after the W3 eval gate (4 conditions) | `quant-monthly-meta-retro-eval-gate.py` → `GATE: ✅ PASS`; flag-OFF = byte-identical no-op |
 
 **Reminder:** the agent cannot flip any of these. Every `echo ... >> ~/.hermes/.env` is an
 operator action on a tool-guarded file. The agent runs the probes and reports; the human flips.
