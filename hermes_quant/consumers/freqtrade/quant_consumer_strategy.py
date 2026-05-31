@@ -127,9 +127,12 @@ def _read_jsonl_tail(path: Path, n: int = 1000, max_chunk: int = 4_194_304) -> l
         if not line:
             continue
         try:
-            out.append(json.loads(line))
+            rec = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(rec, dict):
+            continue  # valid JSON but not an object (corrupt/partial append) — skip
+        out.append(rec)
     return out[-n:]
 
 

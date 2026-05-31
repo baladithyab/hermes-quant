@@ -271,9 +271,12 @@ def load_executions(path: Path | None = None) -> list[dict[str, Any]]:
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(row, dict):
+                continue  # valid JSON but not an object (corrupt/partial append) — skip
+            rows.append(row)
     except OSError as e:
         logger.warning("open_guard: could not read %s: %s", p, e)
         return []

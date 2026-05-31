@@ -180,10 +180,14 @@ def read_jsonl_tail(path: Path, n: int, *, max_chunk: int = 1_048_576) -> list[d
         if not line:
             continue
         try:
-            records.append(json.loads(line))
+            rec = json.loads(line)
         except json.JSONDecodeError:
             # Mid-write partial OR corrupted record; skip.
             continue
+        if not isinstance(rec, dict):
+            # Valid JSON but not an object (corrupt/partial append); skip.
+            continue
+        records.append(rec)
     return records[-n:]
 
 
@@ -260,7 +264,11 @@ def iter_jsonl_follow(path: Path, *, poll_seconds: float = 1.0) -> Iterator[dict
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    rec = json.loads(line)
                 except json.JSONDecodeError:
                     # Skip malformed records
                     continue
+                if not isinstance(rec, dict):
+                    # Valid JSON but not an object (corrupt/partial append); skip.
+                    continue
+                yield rec

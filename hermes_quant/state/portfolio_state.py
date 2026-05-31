@@ -722,9 +722,13 @@ def _read_all_jsonl(path: Path) -> list[dict[str, Any]]:
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                rec = json.loads(line)
             except json.JSONDecodeError:
                 logger.warning("_read_all_jsonl: skipping malformed line")
+                continue
+            if not isinstance(rec, dict):
+                continue  # valid JSON but not an object (corrupt/partial append) — skip
+            records.append(rec)
     return records
 
 

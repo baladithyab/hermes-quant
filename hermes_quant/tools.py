@@ -62,9 +62,12 @@ def _read_jsonl_tail(path: Path, n: int) -> list[dict]:
         if not line:
             continue
         try:
-            records.append(json.loads(line))
+            rec = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(rec, dict):
+            continue  # valid JSON but not an object (corrupt/partial append) — skip
+        records.append(rec)
     return records[-n:]
 
 

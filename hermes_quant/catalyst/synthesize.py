@@ -282,6 +282,8 @@ def load_packets_for(
                 raw = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(raw, dict):
+                continue  # valid JSON but not an object (corrupt/partial append) — skip
             if raw.get("asset") != symbol:
                 continue
             try:

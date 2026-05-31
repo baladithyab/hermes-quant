@@ -58,6 +58,8 @@ def interest_timestamps_by_symbol(
                 raw = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(raw, dict):
+                continue  # valid JSON but not an object (corrupt/partial append) — skip
             asset = raw.get("asset")
             asof_raw = raw.get("asof")
             if not asset or not asof_raw:

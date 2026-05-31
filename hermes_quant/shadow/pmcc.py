@@ -199,6 +199,8 @@ def load_pmcc_positions(*, path: Path | None = None) -> list[PMCCPosition]:
             if not line:
                 continue
             raw = json.loads(line)
+            if not isinstance(raw, dict):
+                continue  # valid JSON but not an object (corrupt/partial append) — skip
             out.append(PMCCPosition(
                 symbol=raw["symbol"],
                 opened_at=raw["opened_at"],

@@ -158,9 +158,13 @@ def iter_events(path: Path = DEFAULT_AUDIT_LOG_PATH) -> Iterator[dict[str, Any]]
             if not line:
                 continue
             try:
-                yield json.loads(line)
+                obj = json.loads(line)
             except json.JSONDecodeError as exc:
                 logger.warning("audit_log_query: skipping malformed line: %s", exc)
+                continue
+            if not isinstance(obj, dict):
+                continue  # valid JSON but not an object (corrupt/partial append) — skip
+            yield obj
 
 
 def find_degenerate(

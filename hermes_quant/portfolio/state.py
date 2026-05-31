@@ -89,6 +89,8 @@ def reconstruct_portfolio_state(
             rec = json.loads(line)
         except (ValueError, TypeError):
             continue
+        if not isinstance(rec, dict):
+            continue  # valid JSON but not an object (corrupt/partial append) — skip
 
         if reactor_filter is not None:
             if rec.get("reactor_name") != reactor_filter:
