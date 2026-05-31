@@ -94,3 +94,43 @@ live flips remain correctly blocked — now with the precise reason (producer au
    (or a web-traffic alternative), keeping the injected-fetcher seam + offline tests.
 3. Once producers return items live → flip `HERMES_QUANT_SOCIAL_INGEST=1`, observe the feed go
    multi-source in the packet store → THEN PDR-3 (`CONVERGENCE`) becomes safe to flip.
+
+---
+
+## Addendum 2 — B08 fully unblocked (agent-side), SOCIAL_INGEST FLIPPED, CONVERGENCE held (2026-05-31)
+
+Both social producers were fixed to public no-auth feeds (no operator OAuth needed after all):
+- **Trends:** `trends/api/dailytrends` (404) → `trending/rss` RSS-2.0 (commit cac3af0). Live: 6 items.
+- **Reddit:** `.json` (403) → public Atom `.rss` `/new.rss` + `/search.rss` (commit 42f6cb4). Live:
+  49 items from /r/stocks/new.rss, 50 from search. source_family('reddit/r/stocks (rss)') = 'reddit'.
+- **Cron reconciled + deployed** (commit 4a29cc3): the deployed copy had diverged features
+  (consumer-trend sweeps + per-item log_propagations) the repo lacked; merged both with the social
+  wiring so a redeploy wouldn't regress live behavior, then deployed (DEPLOYED == REPO).
+
+### FLIPPED: `HERMES_QUANT_SOCIAL_INGEST=1` (.env:440)
+Verified safe + effective: the deployed cron with the flag ON produced a genuinely MULTI-SOURCE feed
+(508 items = 148 reddit + 360 news → 309 packets, 356 propagations). Live store now has TSLA/RIVN/LCID
+with packets from BOTH news_rss AND reddit. A live TSLA recommend runs clean (no crash; the
+deterministic gate + consumer-trend haircut + BMA require_ensemble still govern). This flag is pure
+upside — it only ADDS evidence; it drops nothing. Backup: ~/.hermes/.env.pre-selfevolve-enable.
+
+### HELD OFF: `HERMES_QUANT_CONVERGENCE` (PDR-3) — precondition met, but value-gate not yet
+The structural precondition (multi-source feed) is now satisfied, BUT with SEMANTIC_ENABLED=1 the
+ingest-time drop is consequential, and a measured impact check shows flipping CONVERGENCE now would:
+- **KEEP** 3 symbols (TSLA/RIVN/LCID — mega-cap EV, the only names with Reddit chatter this pull)
+- **DROP** 16 single-source symbols — *including CELH and CROX*, the exact Camillo consumer-trend
+  names the social-arb thesis is built on. They appear in news + consumer-sweeps but not in the
+  current 3-sub Reddit query set, so PDR-3 would silence its own best signals.
+
+That is not PDR-3 being wrong — it is the Reddit coverage being too narrow (3 subs, one thin pull)
+for mid-cap consumer brands to reliably show up. **The honest gate for the CONVERGENCE flip:** Reddit
+coverage broad enough (more subreddits + accumulated over time) that consumer-brand trends (CELH/CROX/
+TPR) reliably appear in ≥2 families — verified by re-running this kept-vs-dropped check and seeing the
+consumer names in the KEPT set, not dropped. Until then CONVERGENCE stays OFF (flipping it would
+silence the thesis). Next concrete step: widen SOCIAL_REDDIT_QUERIES (add r/CrocsCrocs-style brand
+subs, r/StockMarket, r/options) and let the store accumulate, then re-measure.
+
+### Net flag state after this session
+- **ON:** REFLECTION, MEMORY_INJECT (W1, pre-existing), SEMANTIC_ENABLED (pre-existing), **SOCIAL_INGEST (NEW)**.
+- **OFF (correctly, precondition-gated):** CONVERGENCE (needs broader Reddit coverage), SATURATION
+  (needs B09 audit), TREND_VELOCITY (decision-inert + costly), W2-W7 crons (undeployed/RESEARCH_DEBATE off).
