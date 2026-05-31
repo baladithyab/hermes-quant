@@ -20,7 +20,7 @@
 
 1. We ship as a **pip entry-point plugin** (`hermes_agent.plugins :: hermes-quant = hermes_quant`), `kind: standalone`. Hermes **discovers** it from `importlib.metadata` entry points — no `~/.hermes/plugins/` directory needed.
 2. `register(ctx)` is **shape-correct** for the installed `PluginContext` (all five `ctx.register_*` methods match), runs in <50 ms, spawns no daemon. It wires **16 read-only tools**, a `/quant` slash command, a `hermes quant` CLI control plane, the `pre_gateway_dispatch` hook (Discord slash install), and the bundled skill.
-3. **LIVE BLOCKER:** `standalone` entry-point plugins are **opt-in** — they load only if their name is in `~/.hermes/config.yaml` `plugins.enabled`. `hermes-quant` is **NOT** in that list today, so it is discovered but **never loaded**. Fix: `hermes plugins enable hermes-quant` + gateway restart. See §5.
+3. **~~LIVE BLOCKER~~ RESOLVED 2026-05-30:** `standalone` entry-point plugins are **opt-in** — they load only if their name is in `~/.hermes/config.yaml` `plugins.enabled`. `hermes-quant` has now been **added to that list** and the gateway's plugin manager confirms it loads (16 quant tools + `quant` command + `hermes-quant` skill). **NOTE:** `hermes plugins enable hermes-quant` does NOT work for entry-point plugins — it manages only bundled/git-installed plugins and prints `"Plugin 'hermes-quant' is not installed or bundled."` (harmless). The real enable is the config.yaml allow-list (§1.3 step 2). A gateway restart is still needed for an already-running gateway to pick it up. See §5.
 4. **Money is CLI-only.** Hermes does not distinguish "money" from "read-only" tools — *we* enforce it by registering only read/propose/approve-a-record tools (no execution tool exists), and putting `start/stop/backtest` under `register_cli_command`. `quant_approve` fires the **`PaperReactor`** against an already-human-approved proposal record, never a live broker.
 5. The PDR pipeline (ADR-0079) runs **under Hermes** not inside `register()`: **DB-backed crons** drive the Perception→Decision→Reaction ticks (the deployed `~/.hermes/scripts/quant-*.py`), tools are read-only views into the state those crons write, and the gateway chat / Discord `/quant` is the advisor + HITL surface.
 6. Manifest drift to fix (§6 checklist): `provides_tools` undercounts (`quant_recipes` missing → 15 declared vs 16 registered); `provides_hooks` over-declares `on_session_start` (never wired); `version: "0.4.4"` lags the v0.6.x feature work. All cosmetic — none block loading.
@@ -64,11 +64,28 @@ $ ~/.hermes/hermes-agent/venv/bin/python3 -c "import importlib.metadata as m; \
 ~/.hermes/hermes-agent/venv/bin/python3 -m pip install -e '/mnt/e/CS/github/hermes-quant[all]'
 
 # 2. Enable it (opt-in — REQUIRED for standalone entry-point plugins; see §5)
-~/.hermes/hermes-agent/venv/bin/hermes plugins enable hermes-quant
-#    (equivalently: add `- hermes-quant` under `plugins.enabled` in ~/.hermes/config.yaml)
+#    For an ENTRY-POINT plugin (hermes-quant is one), the `hermes plugins enable`
+#    CLI does NOT work — it only manages bundled / git-installed plugins and will
+#    print "Plugin 'hermes-quant' is not installed or bundled." (harmless, ignore).
+#    The real mechanism is the config.yaml allow-list: add the name there.
+python3 - <<'PY'   # idempotent: add hermes-quant to plugins.enabled
+import pathlib, re
+cfg = pathlib.Path.home() / ".hermes" / "config.yaml"
+t = cfg.read_text()
+if "- hermes-quant" not in t:
+    t = t.replace("  - hermes-s2s\n", "  - hermes-s2s\n  - hermes-quant\n", 1)
+    cfg.write_text(t)
+    print("added hermes-quant to plugins.enabled")
+else:
+    print("already enabled")
+PY
 
 # 3. Restart the gateway so register(ctx) runs once at startup
 #    (do NOT pkill from inside the gateway — self-kill; restart via your service manager)
+#    Verify it loaded:
+#    ~/.hermes/hermes-agent/venv/bin/python3 -c "from hermes_cli import plugins as P; \
+#      pm=P.get_plugin_manager(); pm.discover_and_load(force=True); \
+#      print('hermes-quant' in pm._plugins, sorted(t for t in pm._plugin_tool_names if t.startswith('quant')))"
 ```
 
 There is **no host-version handshake**: `PluginManifest` has no "compatible host version" field, so nothing version-checks plugin `0.4.4` against host `0.15.1`. The two version numbers are independent.
@@ -246,20 +263,36 @@ $ ~/.hermes/hermes-agent/venv/bin/python3 -c "import yaml,os; \
     print(yaml.safe_load(open(os.path.expanduser('~/.hermes/config.yaml')))['plugins']['enabled'])"
 ['discord-session-link', 'discord-triage', 'disk-cleanup', 'hermes-discord-plugin', 'hermes-s2s']
 ```
-`hermes-quant` is **absent** → none of the 16 tools, the `/quant` slash, the `hermes quant` CLI, the skill, or the `pre_gateway_dispatch` hook are active in the running gateway right now.
+**UPDATE 2026-05-30: DONE.** `hermes-quant` has been added to `plugins.enabled` (now
+`[discord-session-link, discord-triage, disk-cleanup, hermes-discord-plugin, hermes-s2s, hermes-quant]`).
+The gateway plugin manager confirms it loads: `hermes-quant` ∈ `pm._plugins`; all 16 quant tools
+∈ `pm._plugin_tool_names`; `quant` ∈ `pm._plugin_commands`; `hermes-quant:hermes-quant` ∈
+`pm._plugin_skills`. A running gateway must be **restarted** to pick it up (new processes/crons
+already do).
 
-**Fix:**
+**The fix (do NOT use `hermes plugins enable` — it errors on entry-point plugins):**
 ```bash
-~/.hermes/hermes-agent/venv/bin/hermes plugins enable hermes-quant   # then restart the gateway
+# add hermes-quant under plugins.enabled in ~/.hermes/config.yaml (idempotent):
+python3 - <<'PY'
+import pathlib
+cfg = pathlib.Path.home()/".hermes"/"config.yaml"; t = cfg.read_text()
+if "- hermes-quant" not in t:
+    cfg.write_text(t.replace("  - hermes-s2s\n", "  - hermes-s2s\n  - hermes-quant\n", 1))
+PY
+# then restart the gateway. Verify:
+~/.hermes/hermes-agent/venv/bin/python3 -c "from hermes_cli import plugins as P; \
+  pm=P.get_plugin_manager(); pm.discover_and_load(force=True); \
+  print('loaded:', 'hermes-quant' in pm._plugins, '| quant tools:', \
+  sorted(t for t in pm._plugin_tool_names if t.startswith('quant')))"
 ```
-Note: the config-schema grandfathering rule only auto-enables plugins already present under `~/.hermes/plugins/`. **Entry-point plugins are never grandfathered** — this opt-in is required and expected.
+Note: the config-schema grandfathering rule only auto-enables plugins already present under `~/.hermes/plugins/`. **Entry-point plugins are never grandfathered** — this config.yaml opt-in is required and expected. The `hermes plugins enable` CLI subcommand only manages bundled/git-installed plugins; for an entry-point plugin it prints `"not installed or bundled"` and does nothing — that error is expected and irrelevant to whether the plugin loads.
 
 > Caveat: the **crons are already live and firing** (they are registered directly in the cron scheduler and run the deployed scripts, independent of plugin-enable state). So the PDR pipeline runs today; what is dark is the **chat/Discord tool + slash surface** until the plugin is enabled.
 
 ### 5.2 Manifest / version drift checklist
 
-- [ ] **[MINOR] `provides_tools` undercount.** `plugin.yaml` lists **15**; `register()` registers **16** (`quant_recipes` is missing from the YAML). Introspection-only field; no functional impact. **Fix:** add `quant_recipes` to `provides_tools`.
-- [ ] **[MINOR] `provides_hooks` over-declares.** `plugin.yaml` declares `on_session_start`, but `register()` never calls `register_hook("on_session_start", ...)`. **Fix:** either wire an `on_session_start` callback or drop it from `provides_hooks`. (`pre_gateway_dispatch` is correctly wired.)
+- [x] **[FIXED 2026-05-30] `provides_tools` undercount.** Added `quant_recipes` → manifest now lists 16, matching `register()`. (commit `0bde804`)
+- [x] **[FIXED 2026-05-30] `provides_hooks` over-declares.** Dropped the unwired `on_session_start` → manifest declares only `pre_gateway_dispatch`, which `register()` wires. (commit `0bde804`)
 - [ ] **[ADVISORY] `version: "0.4.4"` lags the feature work.** The brief's premise "system at v0.6.x" refers to the **plugin's own** internal v0.6.x feature line (regime-in-state, bull/bear debate, fundamentals, ADR-0079 PDR), **not** the host. There is **no host-version compatibility field** in `PluginManifest`, so no handshake can fail — the host is `hermes-agent` **v0.15.1** and is unrelated. The drift is purely *release hygiene*: `plugin.yaml` `version` and `hermes_quant.__version__` both say `0.4.4` while the design docs are at v0.6.x. **Fix (non-blocking):** bump both `plugin.yaml:version` and `__init__.py:__version__` to the current v0.6.x line for honesty, and keep them in sync.
 - [ ] **[NON-ISSUE] `manifest_version: 1`.** Not a recognized field; silently dropped. Keep or remove freely.
 - [ ] **[GOOD — keep]** `optional_env` (not `requires_env`); no per-tool `requires_env`. Correct: install is never gated, yfinance bootstrap needs zero credentials.
