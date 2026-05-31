@@ -82,21 +82,43 @@ def test_no_eager_heavy_imports():
     """
     import sys
 
-    # Reset modules that might be cached from earlier tests
-    for mod in list(sys.modules):
-        if mod.startswith("hermes_quant") or mod in ("torch", "sklearn"):
-            sys.modules.pop(mod, None)
+    def _is_managed(name: str) -> bool:
+        return name.startswith("hermes_quant") or name in ("torch", "sklearn")
 
-    from unittest.mock import MagicMock
+    # Snapshot every module object we are about to evict so we can restore the
+    # exact same objects afterward. Without this, popping hermes_quant.* from
+    # sys.modules leaks: any module that lazy-imports a hermes_quant submodule
+    # AFTER this test gets a *fresh* module object whose classes have a
+    # different identity than the ones other test modules imported at
+    # collection time (e.g. research_debate.schemas.ResearchPlan), and whose
+    # module-level state (e.g. catalyst.synthesize._DEFAULT_STORE) is no longer
+    # the one those tests monkeypatched — silently breaking order-dependent
+    # tests downstream (issue #12). This test must observe a fresh import but
+    # MUST leave sys.modules byte-identical for everyone after it.
+    _saved = {name: mod for name, mod in sys.modules.items() if _is_managed(name)}
 
-    import hermes_quant
+    for name in _saved:
+        sys.modules.pop(name, None)
 
-    ctx = MagicMock()
-    hermes_quant.register(ctx)
+    try:
+        from unittest.mock import MagicMock
 
-    # These MUST not be loaded just by register()
-    assert "torch" not in sys.modules, "torch eagerly loaded; lazy-load in analyst code"
-    # Note: sklearn may be pulled in by other things; we mainly care about torch
+        import hermes_quant
+
+        ctx = MagicMock()
+        hermes_quant.register(ctx)
+
+        # These MUST not be loaded just by register()
+        assert "torch" not in sys.modules, (
+            "torch eagerly loaded; lazy-load in analyst code"
+        )
+        # Note: sklearn may be pulled in by other things; we mainly care about torch
+    finally:
+        # Drop anything the fresh import (re)created, then restore the original
+        # objects. This makes the test a no-op on global module identity.
+        for name in [n for n in sys.modules if _is_managed(n)]:
+            sys.modules.pop(name, None)
+        sys.modules.update(_saved)
 
 
 def test_canonical_cli_surface():
