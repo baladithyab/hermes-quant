@@ -114,3 +114,70 @@ Items that the docs (roadmap / gap matrix / older ADR headers) imply are pending
 
 **Top P0:** B01 — ADR-0029 multi-leg options reactor (the single biggest gap vs operator vision; covered-call/CSP/wheel cannot fire; gated behind B02+B03).
 **Top P1:** B05 — ADR-0075 catalyst-driven universe onboarding (perceive-but-can't-act gap; the catalyst feature's signal is dead-on-arrival for the exact high-beta small-caps it targets).
+
+---
+
+## Reconciliation pass — 2026-05-30 (post deep-work-loop + concurrent meta-review)
+
+This backlog was mined at `e7abf50`, BEFORE the session's execution + ADR-0079 capstone +
+the concurrent meta-review. The meta-review (`docs/reviews/2026-05-30-concurrent-meta-review.md`)
+graded `backlog_complete = FALSE`. This section reconciles status drift and enrolls the net-new
+items so the backlog can safely drive the next loop. (Source for every M-item: the meta-review.)
+
+### Status corrections (items whose state drifted)
+
+| Item | Was | Now | Evidence |
+|---|---|---|---|
+| B02 / B03 options data-layer + gate | proposed | **built, default-OFF (gated)** | `6b1c05d` |
+| B04 direction-vs-play-bias gate | open | **shipped default-OFF** (but NOT live — deploy drift M01) | `73d7ed4` |
+| B06 catalyst profitability cron | gated | **built as change-detecting watchdog; NOT deployed/registered** (M10) | `2e84f28` |
+| B11 calibrator drift | open | **built; NOT deployed; violates silence contract** (M11) | `4f27d19` |
+| B16 / B18 render layer | open | **built-but-UNWIRED** (orphaned modules, M18) | `4f27d19` |
+| B12 portfolio-caps + slippage | gated | **silently LIVE in deployed armed wrappers** (M09) | deploy (outside git) |
+| B47 proposals `_reconcile_index` | open | **shipped + hardened fail-loud** | `0aebd88` |
+| ADR-0077 admissibility | (absent) | **shipped default-OFF — NEW gated item** | `ee75811` |
+
+### Net-new items enrolled (from the meta-review — full detail in the review doc)
+
+**P0 (must precede live enablement):**
+- **N1 (M01/M02)** deploy-sync + anti-drift — ✅ TOOL+TEST+RUNBOOK SHIPPED this round (`6fdb2ed`); operator reconciliation/redeploy still pending.
+- **N2 (plugin-enable)** `hermes plugins enable hermes-quant` — manifest fixed `0bde804`; operator config.yaml edit pending.
+- **N3 (M03/B01)** build + wire the ADR-0029 multi-leg reactor — THE single biggest vision unlock; foundation (B02/B03) now shipped.
+- **N4 (M04)** B04 ships dormant even after redeploy — armed wrapper must also set `HERMES_QUANT_DIRECTION_BIAS_GATE=1`.
+
+**P1 (blocks a specific feature's safe enablement):**
+- **N5 (M05)** admissibility gates ONLY the autonomous-tick seam — daily-interim brief / HITL `quant_approve` / PaperReactor are NOT admissibility-aware → an inadmissible short still fires on paper when the flag flips.
+- **N6 (M06)** live admissibility seam runs POST-gate, contradicting ADR-0077 D77.4 + the corrected ADR-0079 ADMIT-before-GATE ordering.
+- **N7 (M07)** account context (`account_equity`/`available_bp`) not plumbed → live oracle fail-closed-silences EVERY short; AND the 38-short premise is unasserted by any eval.
+- **N8 (M08)** the "fix #11 before flipping ADMISSIBILITY" ordering lived only in a review artifact — now in FEATURE-ENABLEMENT.md.
+- **N9 (M10)** the 2 new crons are neither deployed nor registered → B06/B07/B11 feedback loops dead-on-arrival.
+- **N10 (M11)** calibrator-drift cron prints every run → violates the no_agent silence contract → operator spam.
+- **N11 (M12)** ADR-0075 onboarding eval-gate axis is named-but-unbuilt; only the flag separates the live scanning seam from firing.
+- **N12 (M13)** **PerceptionFrame + PDR-1..4 are 100% aspirational and absent from this backlog** — enroll PDR-1 (PerceptionFrame, first; also fixes M06 ordering + M17 tool-path decoupling), PDR-2 (TrendVelocity), PDR-3 (ConvergenceValidator), PDR-4 (SaturationScore + M24 property tests), in dependency order, each behind its eval gate.
+- **N13 (M16)** social-arb / AMZN-OOS evals read/write `/tmp` + live yfinance → promote the labeled set to a versioned `tests/fixtures` before B07/B09 can be trusted.
+
+**P2 (correctness/coverage to close before the relevant flip):**
+- **N14 (M14)** weekly-pattern-mining retro + monthly meta-retro crons (the self-improving loop) don't exist.
+- **N15 (M17)** the `quant_autonomous_tick` TOOL path never injects semantic packets even with the flag ON (only the cron wrapper does) — PDR-1 closes this.
+- **N16 (M18)** wire `render_decisions_md` / schema renderers into a cron/tool/CLI (currently orphaned).
+- **N17 (M19)** test the profitability verdict at the `MIN_HIT_RATE=0.60` boundary + `MARGINAL_HOLD` band (the exact B07 decision line).
+- **N18 (M20)** the autonomous-tick wiring regression test reconstructs the wrapper inline — load the real shipped script instead.
+- **N19 (M21)** extend the no-lookahead release-blocker gate to the wiring/onboarding PRODUCING path (a PDR-1 precondition).
+- **N20 (M22)** run the live-broker integration tests (Alpaca admissibility, options chain) with recorded output as a mandatory pre-flip gate.
+
+**P3 (record-only, attached to the named future gate):**
+- **N21 (M24)** the saturation "can-only-subtract" + "never-touches-non-semantic-views" property tests are the named eval gate for `HERMES_QUANT_SATURATION` (PDR-4).
+
+### The enablement critical path (the load-bearing sequence — see DEPLOY-SYNC.md + FEATURE-ENABLEMENT.md)
+
+0. deploy + anti-drift reconcile (N1) → 1. fix #11 hardening + plumb account context (N7) →
+2. run live-broker tests (N20) → 3. flip PORTFOLIO_CAPS+SLIPPAGE (reconcile M09) →
+4. redeploy + flip DIRECTION_BIAS_GATE (N4) → 5. fix brief/reactor admissibility seam (N5) +
+ordering (N6), then flip ADMISSIBILITY → 6. build+wire B01 multi-leg reactor (N3) →
+7. deploy+register the 2 crons after fixing calibrator silence (N9/N10) →
+8. build ADR-0075 eval axis (N11), flip CATALYST_ONBOARDING →
+9. fix tool-path decoupling (N15) + extend no-lookahead gate (N19), flip SEMANTIC_ENABLED on all paths →
+10. land PDR-1 PerceptionFrame (N12), then PDR-2→3→4.
+
+**Verdict:** backlog now reconciled. Open items are sequenced behind explicit gates; none are
+silently dropped. The next loop's headline is **N3 (multi-leg reactor)** once N1 (deploy) lands.
