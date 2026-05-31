@@ -113,6 +113,20 @@ def test_replay_byte_identical_flag_off(monkeypatch, seed, trend):
     _assert_replay_identical("TEST", "equity", asof, bars)
 
 
+@pytest.mark.parametrize("trend", [0.5, -0.4, 0.0])
+def test_replay_byte_identical_convergence_off(monkeypatch, trend):
+    """PDR-3 (HERMES_QUANT_CONVERGENCE) absent => the full-pipeline recommend()
+    replay is byte-identical no-frame vs frame-built (no live-path divergence from
+    the builder's Step 5c convergence stamp when the flag is OFF)."""
+    monkeypatch.delenv("HERMES_QUANT_SEMANTIC_ENABLED", raising=False)
+    monkeypatch.delenv("HERMES_QUANT_CONVERGENCE", raising=False)
+    bars = _make_bars(120, trend=trend, seed=42)
+    asof = bars["timestamp"].iloc[60].isoformat()
+    _, _, frame = _assert_replay_identical("TEST", "equity", asof, bars)
+    # Convergence slot stays empty when the flag is OFF (container, not authority).
+    assert frame is None or frame.convergence is None
+
+
 def test_replay_byte_identical_full_history(monkeypatch):
     monkeypatch.delenv("HERMES_QUANT_SEMANTIC_ENABLED", raising=False)
     bars = _make_bars(120, trend=0.5, seed=42)

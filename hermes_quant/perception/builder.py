@@ -217,6 +217,38 @@ def build_perception_frame(
                 "build_perception_frame(%s): velocity build failed: %s", symbol, exc
             )
 
+    # ---- Step 5c: PDR-3 convergence evidence (HERMES_QUANT_CONVERGENCE) ----
+    # Container-only: stamps frame.convergence for provenance/audit. The EMISSION
+    # gate lives in synthesize.py (single-source packets were already dropped at
+    # write time when the flag is ON); here we just record what the loaded packets
+    # converged on. Silence-by-default: OFF / no packets / any error -> None.
+    # Packets are DICTs (load_packets_for returns dicts), so use .get().
+    frame_convergence: Mapping[str, Any] | None = None
+    if semantic_packets and os.environ.get("HERMES_QUANT_CONVERGENCE", "0") == "1":
+        try:
+            from hermes_quant.perception.convergence import (
+                CONVERGENCE_MIN_FAMILIES,
+                source_family,
+            )
+
+            # packets carry their feed family in metadata.feed_source (synthesize.py)
+            fams = sorted(
+                {
+                    source_family((p.get("metadata") or {}).get("feed_source", ""))
+                    for p in semantic_packets
+                }
+                - {"unknown"}
+            )
+            frame_convergence = {
+                "families": fams,
+                "n_independent": len(fams),
+                "validated": len(fams) >= CONVERGENCE_MIN_FAMILIES,
+            }
+        except Exception as exc:  # noqa: BLE001 — never block frame build
+            logger.debug(
+                "build_perception_frame(%s): convergence stamp failed: %s", symbol, exc
+            )
+
     # ---- Step 6: last_close (advisor.py:877) ----
     last_close = float(bars["close"].iloc[-1])
 
@@ -229,7 +261,7 @@ def build_perception_frame(
         regime=frame_regime,
         semantic_packets=semantic_packets,
         trend_velocity=frame_trend_velocity,
-        convergence=None,
+        convergence=frame_convergence,
         saturation=None,
         provenance=(),
         extras=frame_extras,

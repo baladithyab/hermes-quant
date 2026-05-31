@@ -1,0 +1,100 @@
+{
+  "_doc": "PDR-3 ConvergenceValidator eval input (plan §2.5). Per Camillo case: the multi-SOURCE CatalystItem set the cross-source require_ensemble validates. Validated (>=2 independent families) cases carry a reddit + google_trends + news item each; the negative cases carry a single-source set so they are dropped (not scored) when HERMES_QUANT_CONVERGENCE=1. Synthetic per-family framings of each case headline (mirroring how social.py frames reddit/trends headlines), so the eval is offline + deterministic. The realized forward returns the precision gate scores against live in camillo_labels.json; here we only encode the source SET that decides validation. B08 will replace these with live reddit/trends/web-traffic producers; the mechanism + taxonomy + this unit eval build and pass NOW.",
+  "cases": [
+    {
+      "label": "Celsius TikTok energy-drink craze (validated: 3 families)",
+      "ticker": "CELH",
+      "date": "2021-03-01",
+      "validated_expected": true,
+      "items": [
+        {
+          "title": "Celsius energy drink goes viral on TikTok as sales surge among Gen Z",
+          "source": "reddit/r/stocks (score=812 c=143)",
+          "link": "https://reddit.com/r/stocks/celh-viral"
+        },
+        {
+          "title": "Celsius energy drink search interest surges as sales soar",
+          "source": "google_trends/US",
+          "link": "https://trends.google.com/celh"
+        },
+        {
+          "title": "Celsius sales surge as energy drink demand soars among young consumers",
+          "source": "Reuters",
+          "link": "https://reuters.com/celh-sales-surge"
+        }
+      ]
+    },
+    {
+      "label": "Crocs pandemic resurgence (validated: 3 families)",
+      "ticker": "CROX",
+      "date": "2020-06-01",
+      "validated_expected": true,
+      "items": [
+        {
+          "title": "Crocs sales soar as healthcare workers and celebrity collabs drive viral demand",
+          "source": "reddit/r/stocks (score=540 c=92)",
+          "link": "https://reddit.com/r/stocks/crox-viral"
+        },
+        {
+          "title": "Crocs search interest soars as viral demand drives sales",
+          "source": "google_trends/US",
+          "link": "https://trends.google.com/crox"
+        },
+        {
+          "title": "Crocs demand soars as sales surge on celebrity collaborations",
+          "source": "CNBC",
+          "link": "https://cnbc.com/crox-demand-soars"
+        }
+      ]
+    },
+    {
+      "label": "Dorel bike shortage (validated: 3 families)",
+      "ticker": "DIIBF",
+      "date": "2020-04-15",
+      "validated_expected": true,
+      "items": [
+        {
+          "title": "Pandemic bike shortage sends demand soaring for bicycle maker Dorel",
+          "source": "reddit/r/investing (score=312 c=58)",
+          "link": "https://reddit.com/r/investing/diibf-bikes"
+        },
+        {
+          "title": "Bicycle search interest soars as pandemic bike demand surges for Dorel",
+          "source": "google_trends/US",
+          "link": "https://trends.google.com/diibf"
+        },
+        {
+          "title": "Dorel demand soars as pandemic bike shortage drives bicycle sales",
+          "source": "Bloomberg",
+          "link": "https://bloomberg.com/diibf-bike-demand"
+        }
+      ]
+    },
+    {
+      "label": "Tapestry / Coach bag demand (negative: single source)",
+      "ticker": "TPR",
+      "date": "2023-08-01",
+      "validated_expected": false,
+      "items": [
+        {
+          "title": "Coach handbags surge in popularity on social media driving Tapestry sales",
+          "source": "reddit/r/stocks (score=88 c=12)",
+          "link": "https://reddit.com/r/stocks/tpr-coach"
+        }
+      ]
+    },
+    {
+      "label": "Newell / Elmer's slime craze (negative: single source)",
+      "ticker": "NWL",
+      "date": "2017-09-01",
+      "validated_expected": false,
+      "items": [
+        {
+          "title": "Elmer's glue sales jump as DIY slime craze goes viral with kids",
+          "source": "reddit/r/stocks (score=64 c=9)",
+          "link": "https://reddit.com/r/stocks/nwl-slime"
+        }
+      ]
+    }
+  ]
+}

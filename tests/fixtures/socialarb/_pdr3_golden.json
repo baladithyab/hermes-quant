@@ -1,0 +1,500 @@
+{
+  "golden_output": [
+    {
+      "schema_version": 1,
+      "asset": "CELH",
+      "asof": "2021-03-01T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.45,
+      "magnitude": 0.045,
+      "summary": "Celsius energy drink goes viral on TikTok as sales surge among Gen Z \u2014 propagated bullish to CELH via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://reddit.com/r/stocks/celh-viral",
+          "title": "Celsius energy drink goes viral on TikTok as sales surge among Gen Z"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "ed355c3dff941894e966d482da9984a9d43a3297d51a0c11740510ec6c6abeaa",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "surge",
+          "viral"
+        ],
+        "source_entities": [
+          "celsius energy"
+        ],
+        "n_contributions": 1,
+        "feed_source": "reddit/r/stocks (score=812 c=143)",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.9
+      }
+    },
+    {
+      "schema_version": 1,
+      "asset": "CELH",
+      "asof": "2021-03-01T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.45,
+      "magnitude": 0.05,
+      "summary": "Celsius energy drink search interest surges as sales soar \u2014 propagated bullish to CELH via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://trends.google.com/celh",
+          "title": "Celsius energy drink search interest surges as sales soar"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "a1ff1b0cc6652350243b4e823dc560f166ebf93fcdb5a520a2ba094056c09c44",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "soar",
+          "surges"
+        ],
+        "source_entities": [
+          "celsius energy"
+        ],
+        "n_contributions": 1,
+        "feed_source": "google_trends/US",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.9
+      }
+    },
+    {
+      "schema_version": 1,
+      "asset": "CELH",
+      "asof": "2021-03-01T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.45,
+      "magnitude": 0.05,
+      "summary": "Celsius sales surge as energy drink demand soars among young consumers \u2014 propagated bullish to CELH via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://reuters.com/celh-sales-surge",
+          "title": "Celsius sales surge as energy drink demand soars among young consumers"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "0820e2e659edf7635238749495538682689d71358ebd3082397faa0115c3adc2",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "soars",
+          "surge"
+        ],
+        "source_entities": [
+          "celsius energy"
+        ],
+        "n_contributions": 1,
+        "feed_source": "Reuters",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.9
+      }
+    },
+    {
+      "schema_version": 1,
+      "asset": "CROX",
+      "asof": "2020-06-01T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.45,
+      "magnitude": 0.05,
+      "summary": "Crocs sales soar as healthcare workers and celebrity collabs drive viral demand \u2014 propagated bullish to CROX via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://reddit.com/r/stocks/crox-viral",
+          "title": "Crocs sales soar as healthcare workers and celebrity collabs drive viral demand"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "428b7a343efd047dfd2fc9b2d426ce1ccf09d7aa878788e9e429d55a87f14ebe",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "soar",
+          "viral"
+        ],
+        "source_entities": [
+          "crocs"
+        ],
+        "n_contributions": 1,
+        "feed_source": "reddit/r/stocks (score=540 c=92)",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.9
+      }
+    },
+    {
+      "schema_version": 1,
+      "asset": "CROX",
+      "asof": "2020-06-01T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.45,
+      "magnitude": 0.05,
+      "summary": "Crocs search interest soars as viral demand drives sales \u2014 propagated bullish to CROX via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://trends.google.com/crox",
+          "title": "Crocs search interest soars as viral demand drives sales"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "64625b387cdb8334a230aac6d7bf81bc7cf375b2e228a693321e179c4b5b1ccb",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "soars",
+          "viral"
+        ],
+        "source_entities": [
+          "crocs"
+        ],
+        "n_contributions": 1,
+        "feed_source": "google_trends/US",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.9
+      }
+    },
+    {
+      "schema_version": 1,
+      "asset": "CROX",
+      "asof": "2020-06-01T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.45,
+      "magnitude": 0.05,
+      "summary": "Crocs demand soars as sales surge on celebrity collaborations \u2014 propagated bullish to CROX via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://cnbc.com/crox-demand-soars",
+          "title": "Crocs demand soars as sales surge on celebrity collaborations"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "9f167bcbbffdd5d17a7ebcb5ecb68db82db101396066f5087ad50f6dc3958266",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "soars",
+          "surge"
+        ],
+        "source_entities": [
+          "crocs"
+        ],
+        "n_contributions": 1,
+        "feed_source": "CNBC",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.9
+      }
+    },
+    {
+      "schema_version": 1,
+      "asset": "DIIBF",
+      "asof": "2020-04-15T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.425,
+      "magnitude": 0.05,
+      "summary": "Pandemic bike shortage sends demand soaring for bicycle maker Dorel \u2014 propagated bullish to DIIBF via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://reddit.com/r/investing/diibf-bikes",
+          "title": "Pandemic bike shortage sends demand soaring for bicycle maker Dorel"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "07a3c5553c90e105345eaf7c04efcd855609dcca760800429b9b9a63cba26007",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "shortage",
+          "soaring"
+        ],
+        "source_entities": [
+          "dorel bicycle"
+        ],
+        "n_contributions": 1,
+        "feed_source": "reddit/r/investing (score=312 c=58)",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.85
+      }
+    },
+    {
+      "schema_version": 1,
+      "asset": "DIIBF",
+      "asof": "2020-04-15T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.425,
+      "magnitude": 0.05,
+      "summary": "Bicycle search interest soars as pandemic bike demand surges for Dorel \u2014 propagated bullish to DIIBF via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://trends.google.com/diibf",
+          "title": "Bicycle search interest soars as pandemic bike demand surges for Dorel"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "f3f5ddeda8578cd01a3584a65f92154793fa69f460b1796eb8dc918222ea08ee",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "soars",
+          "surges"
+        ],
+        "source_entities": [
+          "dorel bicycle"
+        ],
+        "n_contributions": 1,
+        "feed_source": "google_trends/US",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.85
+      }
+    },
+    {
+      "schema_version": 1,
+      "asset": "DIIBF",
+      "asof": "2020-04-15T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.425,
+      "magnitude": 0.05,
+      "summary": "Dorel demand soars as pandemic bike shortage drives bicycle sales \u2014 propagated bullish to DIIBF via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://bloomberg.com/diibf-bike-demand",
+          "title": "Dorel demand soars as pandemic bike shortage drives bicycle sales"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "bd0536e4fd7f6224aa0acb63a17b89df8eb68a5ccbb6324671cc2997199cda30",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "soars",
+          "shortage"
+        ],
+        "source_entities": [
+          "dorel bicycle"
+        ],
+        "n_contributions": 1,
+        "feed_source": "Bloomberg",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.85
+      }
+    },
+    {
+      "schema_version": 1,
+      "asset": "TPR",
+      "asof": "2023-08-01T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.44,
+      "magnitude": 0.045,
+      "summary": "Coach handbags surge in popularity on social media driving Tapestry sales \u2014 propagated bullish to TPR via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://reddit.com/r/stocks/tpr-coach",
+          "title": "Coach handbags surge in popularity on social media driving Tapestry sales"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "eb467b953a4d63496e39197f256890345d0d9c55ddfd45f7352516d5fcebd6cb",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "surge"
+        ],
+        "source_entities": [
+          "coach handbag"
+        ],
+        "n_contributions": 1,
+        "feed_source": "reddit/r/stocks (score=88 c=12)",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.88
+      }
+    },
+    {
+      "schema_version": 1,
+      "asset": "NWL",
+      "asof": "2017-09-01T00:00:00+00:00",
+      "horizon": "1d",
+      "stance": "bullish",
+      "confidence": 0.425,
+      "magnitude": 0.045,
+      "summary": "Elmer's glue sales jump as DIY slime craze goes viral with kids \u2014 propagated bullish to NWL via brand_self.",
+      "sources": [
+        {
+          "type": "google_news_rss",
+          "ref": "https://reddit.com/r/stocks/nwl-slime",
+          "title": "Elmer's glue sales jump as DIY slime craze goes viral with kids"
+        }
+      ],
+      "model": "catalyst-sense:v1",
+      "packet_hash": "059a913e56c99d0a60cd256bcf520faebd82d330427e9803717c6336d964ddbb",
+      "metadata": {
+        "catalyst_polarity": "positive",
+        "matched_terms": [
+          "viral",
+          "craze"
+        ],
+        "source_entities": [
+          "elmer glue"
+        ],
+        "n_contributions": 1,
+        "feed_source": "reddit/r/stocks (score=64 c=9)",
+        "relations": [
+          "brand_self"
+        ],
+        "confidence_haircut": 0.5,
+        "confidence_pre_haircut": 0.85
+      }
+    }
+  ],
+  "golden_prop_log": [
+    {
+      "symbol": "CELH",
+      "source": "celsius energy",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.9,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    },
+    {
+      "symbol": "CELH",
+      "source": "celsius energy",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.9,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    },
+    {
+      "symbol": "CELH",
+      "source": "celsius energy",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.9,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    },
+    {
+      "symbol": "CROX",
+      "source": "crocs",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.9,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    },
+    {
+      "symbol": "CROX",
+      "source": "crocs",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.9,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    },
+    {
+      "symbol": "CROX",
+      "source": "crocs",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.9,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    },
+    {
+      "symbol": "DIIBF",
+      "source": "dorel bicycle",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.85,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    },
+    {
+      "symbol": "DIIBF",
+      "source": "dorel bicycle",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.85,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    },
+    {
+      "symbol": "DIIBF",
+      "source": "dorel bicycle",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.85,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    },
+    {
+      "symbol": "TPR",
+      "source": "coach handbag",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.88,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    },
+    {
+      "symbol": "NWL",
+      "source": "elmer glue",
+      "relation": "brand_self",
+      "effect_sign": -1,
+      "weight": 0.85,
+      "symbol_sign": 1,
+      "catalyst_sign": 1
+    }
+  ]
+}

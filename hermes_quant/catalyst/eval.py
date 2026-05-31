@@ -198,6 +198,82 @@ def _sign_item(text: str) -> CatalystItem:
     )
 
 
+def run_precision_with_convergence(
+    case_item_sets: list[tuple[EvalCase, list[CatalystItem]]],
+    *,
+    min_hit_rate: float = 0.65,
+    require_convergence: bool = True,
+    graph: dict[str, list[PropagationEdge]] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> PrecisionResult:
+    """Directional precision with the PDR-3 cross-SOURCE require_ensemble ON.
+
+    The sibling of :func:`run_precision` for the convergence eval (ADR-0079 PDR-3,
+    plan §4). ``run_precision`` synthesizes ONE packet per case *item* and cannot
+    exercise multi-source convergence (each case has one item). This runner takes
+    ``(EvalCase, item SET)`` pairs and synthesizes from the FULL set, so the
+    ``ConvergenceValidator`` can VALIDATE the trend across families:
+
+      * validated (>=2 independent source families) cases SURVIVE and are scored
+        for directional correctness vs the case's realized forward return.
+      * un-validated single-source cases are DROPPED at emission (no packet) and
+        are therefore NOT scored — the higher bar (default 0.65, the ADR-0079
+        Rollout PDR-3 promise, vs the 0.60 D74.7 floor) is cleared by the
+        surviving validated set, not by counting the dropped cases as misses.
+
+    Runs with ``HERMES_QUANT_CONVERGENCE`` ON for the duration (read at call time
+    inside ``synthesize_packets``); the prior value is restored on exit so the
+    runner is side-effect-free. External truth (realized returns), never
+    self-graded. Complementary to BMA cross-ANALYST require_ensemble, never a
+    replacement (a validated packet must still find a corroborator in BMA).
+    """
+    import os
+
+    prev = os.environ.get("HERMES_QUANT_CONVERGENCE")
+    if require_convergence:
+        os.environ["HERMES_QUANT_CONVERGENCE"] = "1"
+    try:
+        hits = 0
+        scored = 0
+        misses: list[str] = []
+        for case, items in case_item_sets:
+            packets = synthesize_packets(items, graph=graph, aliases=aliases)
+            sym_packets = [p for p in packets if p.asset == case.symbol]
+            if not sym_packets:
+                # dropped by convergence (single-source) or produced no packet:
+                # not scored (the require_ensemble default is abstain, not a miss).
+                continue
+            realized_dir = 1 if case.realized_forward_return > 0 else (
+                -1 if case.realized_forward_return < 0 else 0)
+            if realized_dir == 0:
+                continue
+            pkt = max(sym_packets, key=lambda p: p.confidence)
+            pkt_dir = {"bullish": 1, "bearish": -1, "neutral": 0}[pkt.stance]
+            scored += 1
+            if pkt_dir == realized_dir:
+                hits += 1
+            else:
+                misses.append(
+                    f"{case.symbol}: predicted {pkt.stance} "
+                    f"({pkt_dir:+d}), realized {case.realized_forward_return:+.2f}%"
+                )
+    finally:
+        if prev is None:
+            os.environ.pop("HERMES_QUANT_CONVERGENCE", None)
+        else:
+            os.environ["HERMES_QUANT_CONVERGENCE"] = prev
+
+    hit_rate = (hits / scored) if scored else 0.0
+    return PrecisionResult(
+        n_cases=len(case_item_sets),
+        n_scored=scored,
+        hits=hits,
+        hit_rate=round(hit_rate, 4),
+        passed=(scored > 0 and hit_rate >= min_hit_rate),
+        misses=tuple(misses),
+    )
+
+
 def eval_gate(
     benign_items: list[CatalystItem],
     precision_cases: list[EvalCase],

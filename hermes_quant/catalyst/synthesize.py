@@ -32,6 +32,11 @@ from hermes_quant.catalyst.propagation import (
     load_graph,
     propagate,
 )
+from hermes_quant.perception.convergence import (
+    CONVERGENCE_MIN_FAMILIES,
+    ConvergenceResult,
+    validate_convergence,
+)
 from hermes_quant.semantic import (
     SemanticPacket,
     semantic_packet_from_dict,
@@ -52,6 +57,15 @@ _DEFAULT_STORE = Path.home() / ".hermes" / "quant" / "catalyst" / "packets.jsonl
 # Raise toward 1.0 only when a bigger eval clears a higher threshold.
 _CONSUMER_TREND_RELATIONS = {"brand_self"}
 CONSUMER_TREND_CONFIDENCE_HAIRCUT = 0.5
+
+# PDR-3 (GAP-B): cross-SOURCE require_ensemble. A single-source social-arb signal
+# has not been VALIDATED (Camillo: a real trend shows across >=2 independent
+# sources). With HERMES_QUANT_CONVERGENCE=1, an un-validated packet is dropped
+# (haircut 0.0) so it cannot fire. Set to a partial multiplier (e.g. 0.5) only if a
+# larger labeled set (B09) earns a softer policy. DEFAULT-OFF: flag absent => no
+# source-count requirement (byte-identical to today). Complementary to BMA's
+# cross-ANALYST require_ensemble (bma.py:498-519), never a replacement.
+CONVERGENCE_SINGLE_SOURCE_HAIRCUT = 0.0  # 0.0 = drop/abstain (the require_ensemble default)
 
 
 def _consumer_trend_haircut(result) -> float:
@@ -88,17 +102,50 @@ def synthesize_packets(
         graph = graph or g
         aliases = aliases or a
 
-    packets: list[SemanticPacket] = []
+    from hermes_quant.catalyst.classify import polarity_sign
+
+    # PDR-3 (GAP-B): cross-SOURCE require_ensemble, read at CALL time (default-OFF
+    # => byte-identical to today: the two-pass split still classifies/extracts/
+    # propagates ONCE per item in the same order, and the emission policy is the
+    # identity transform — no haircut, no drop, no metadata["convergence"] key).
+    convergence_on = os.environ.get("HERMES_QUANT_CONVERGENCE", "0") == "1"
+
+    # -- Pass 1: classify + extract + propagate ONCE per item (same calls, same
+    # order as today so propagation_log is appended exactly once per item); group
+    # the items that touch each emitting symbol so convergence can be scored over
+    # the symbol's item SET (a per-item loop cannot see the set). --
+    prepared: list[tuple[CatalystItem, object, set[str], dict]] = []  # (item, cls, ents, results)
+    symbol_items: dict[str, list[CatalystItem]] = {}
     for item in items:
         cls = classify_headline(item.title)
         if not cls.is_catalyst:
             continue
-        from hermes_quant.catalyst.classify import polarity_sign
         sign = polarity_sign(cls.polarity)
         ents = extract_entities(item.title, aliases)
         if not ents:
             continue
         results = propagate(ents, sign, graph, log=propagation_log)
+        prepared.append((item, cls, ents, results))
+        for sym, res in results.items():
+            if res.stance == "neutral" or res.confidence <= 0.0:
+                continue
+            symbol_items.setdefault(sym, []).append(item)
+
+    # -- Pass 1.5: convergence per symbol (only when the flag is ON; OFF => never
+    # computed, never consulted, so output is byte-identical to today). --
+    convergence_by_symbol: dict[str, ConvergenceResult] = {}
+    if convergence_on:
+        for sym, its in symbol_items.items():
+            convergence_by_symbol[sym] = validate_convergence(
+                its, min_families=CONVERGENCE_MIN_FAMILIES
+            )
+
+    # -- Pass 2: the existing emission loop (same item + results iteration order),
+    # now applying the convergence policy (flag ON only). PDR-2's velocity magnitude
+    # logic is preserved VERBATIM below — PDR-3 only gates EMISSION, never sources
+    # magnitude (orthogonal). --
+    packets: list[SemanticPacket] = []
+    for item, cls, ents, results in prepared:
         for sym, res in results.items():
             if res.stance == "neutral" or res.confidence <= 0.0:
                 continue
@@ -106,6 +153,16 @@ def synthesize_packets(
             # they enter BMA as a deliberately weak peer view.
             haircut = _consumer_trend_haircut(res)
             sized_confidence = round(min(1.0, res.confidence * haircut), 4)
+
+            # PDR-3 (GAP-B): un-validated single-source signal => haircut/drop. Read
+            # at call time; only applied when the flag is ON (else identity). It can
+            # only SUBTRACT — complementary to BMA cross-ANALYST require_ensemble.
+            conv = convergence_by_symbol.get(sym)
+            if convergence_on and conv is not None and not conv.validated:
+                sized_confidence = round(
+                    sized_confidence * CONVERGENCE_SINGLE_SOURCE_HAIRCUT, 4
+                )
+
             if sized_confidence <= 0.0:
                 continue
             # PDR-2 (GAP-A): source magnitude from trend VELOCITY when the flag is
@@ -138,6 +195,10 @@ def synthesize_packets(
             if vmag is not None:
                 metadata["magnitude_source"] = "velocity"
                 metadata["velocity_score"] = velocity_by_symbol.get(sym)
+            # PDR-3 provenance: stamp the convergence evidence ONLY when the flag is
+            # ON (so the flag-OFF metadata + packet hash stay byte-identical, rail #1).
+            if convergence_on and conv is not None:
+                metadata["convergence"] = conv.as_evidence()
             packet = semantic_packet_from_dict({
                 "schema_version": 1,
                 "asset": sym,
