@@ -109,6 +109,13 @@ class ResearchPlan(BaseModel):
     horizon_emphasis: Literal["1d", "1w", "1M"] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    # ADR-0080 W7 (default-OFF): the reserved ADR-0002/0003 counterarguments
+    # field, left UNFILLED until W7. Populated from the standing Socratic
+    # devil's-advocate turn (advisory plane only — never mutates direction,
+    # magnitude, confidence, the gate, or any limit). Defaults to None so the
+    # off-state is byte-identical (extra='forbid' requires it be declared).
+    counterarguments: str | None = Field(default=None, max_length=4000)
+
 
 class InvestDebateState(BaseModel):
     """Mirrors TauricResearch's InvestDebateState as a Pydantic model.
@@ -141,3 +148,16 @@ class InvestDebateState(BaseModel):
     # ``"exception:<TypeName>"`` for unexpected aborts without blowing the
     # whole stage up.
     terminated_reason: str = "max_rounds_reached"
+
+    # ADR-0080 W7 (default-OFF): standing Socratic devil's-advocate turn outcome
+    # (the ADVISORY PLANE only — beliefs/telemetry, never direction/size/gate).
+    # The red-team turn attacks the REASONING of the leading view AFTER the
+    # judge forms it. ``red_team_turn`` is the BullBearTurn-shaped critique;
+    # ``dissent_surfaced`` is a deterministic (NOT a vote) flag the operator/
+    # daily-report can see; ``dissent_reason`` carries the strongest objection.
+    # All three default to the off-state (None / False / "") so when the flag
+    # is OFF the dumped state is byte-identical except these defaulted keys, and
+    # the audit row only emits the red_team block when the turn actually ran.
+    red_team_turn: BullBearTurn | None = None
+    dissent_surfaced: bool = False
+    dissent_reason: str = ""

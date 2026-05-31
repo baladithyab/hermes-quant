@@ -43,6 +43,9 @@ def _isolate_research_debate_env(monkeypatch):
     """Ensure each test sees clean env state for HERMES_QUANT_RESEARCH_DEBATE flags."""
     monkeypatch.delenv("HERMES_QUANT_RESEARCH_DEBATE", raising=False)
     monkeypatch.delenv("HERMES_QUANT_RESEARCH_DEBATE_ROUNDS", raising=False)
+    # W7 (ADR-0080): keep the red-team turn OFF so T1–T11 stay byte-identical
+    # (off-state) regardless of suite ordering.
+    monkeypatch.delenv("HERMES_QUANT_REDTEAM_TURN", raising=False)
     yield
 
 

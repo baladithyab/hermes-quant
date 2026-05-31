@@ -49,6 +49,17 @@ RESEARCH_ROUNDS_ENV_VAR: str = "HERMES_QUANT_RESEARCH_DEBATE_ROUNDS"
 RESEARCH_DEBATE_FLAG_ENV_VAR: str = "HERMES_QUANT_RESEARCH_DEBATE"
 RESEARCH_DEBATE_AUDIT_KIND: str = "research_debate"
 
+# ADR-0080 W7 (default-OFF): the standing Socratic devil's-advocate turn flag.
+# Mirror of the dispatch flag idiom (llm_committee.py). Default OFF; flag-unset
+# is bit-for-bit identical to today (no red-team turn runs, byte-stable audit).
+REDTEAM_FLAG_ENV_VAR: str = "HERMES_QUANT_REDTEAM_TURN"
+
+
+def _redteam_enabled() -> bool:
+    """Mirror of the dispatch flag idiom (``llm_committee.py``). Default OFF."""
+    return os.environ.get(REDTEAM_FLAG_ENV_VAR, "0") == "1"
+
+
 # Imported verbatim into prompts to keep the two adversarial subsystems'
 # style identical (G17 uniformity).
 CONVERSATIONAL_PREAMBLE: str = (
@@ -141,6 +152,7 @@ def run_research_debate(
     proposal_id: str | None = None,
     run_one_turn: Any = None,
     run_judge: Any = None,
+    run_red_team: Any = None,
 ) -> InvestDebateState:
     """Run the bull/bear adversarial debate stage and return the final state.
 
@@ -333,6 +345,50 @@ def run_research_debate(
 
     state.judge_decision = judge_plan
 
+    # ------------------------------------------------------------------
+    # W7 (ADR-0080): standing Socratic devil's-advocate turn. Default-OFF.
+    # Attacks the REASONING of the leading view; surfaces dissent; fills the
+    # reserved ADR-0002 counterarguments field. Propose-only — it never
+    # changes direction/magnitude/confidence. Off-state byte-identical.
+    # ------------------------------------------------------------------
+    if _redteam_enabled() and state.judge_decision is not None:
+        if run_red_team is None:
+            try:
+                from hermes_quant.aggregators.llm_committee import (
+                    _run_red_team_turn,
+                )
+                run_red_team = _run_red_team_turn
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "W7: could not import _run_red_team_turn (%s); skipping", exc
+                )
+                run_red_team = None
+        if run_red_team is not None:
+            try:
+                rt = run_red_team(
+                    client=client,
+                    config=config,
+                    market_context=ctx,
+                    analyst_views=analyst_views or [],
+                    baseline_signal=baseline_signal,
+                    leading_view=state.judge_decision,
+                )
+            except Exception:  # noqa: BLE001 — failure-closed; no dissent on failure
+                logger.exception("W7: red-team turn raised; treating as no-dissent")
+                rt = None
+            if rt is not None:
+                state.red_team_turn = rt
+                # Deterministic dissent rule (NOT a vote): a critique with
+                # confidence >= threshold surfaces dissent to the operator.
+                from hermes_quant.aggregators.llm_committee import (
+                    RED_TEAM_DISSENT_THRESHOLD,
+                )
+                state.dissent_surfaced = rt.confidence >= RED_TEAM_DISSENT_THRESHOLD
+                state.dissent_reason = (rt.counterarguments or rt.stance or "")[:4000]
+                # Fill the reserved ADR-0002 plan-level counterarguments field.
+                if state.judge_decision.counterarguments is None:
+                    state.judge_decision.counterarguments = state.dissent_reason
+
     # Single audit row per stage invocation.
     final_rec_value: str | None = None
     if state.judge_decision is not None:
@@ -375,6 +431,35 @@ def run_research_debate(
                 }
                 for t in state.bear_turns
             ],
+            # ADR-0080 W7 (default-OFF): the W3-mineable red-team sub-block (O7).
+            # When the flag is OFF (state.red_team_turn is None) this carries only
+            # the byte-stable off-state record {"ran": False, "dissent_surfaced":
+            # False}. Reuses the existing ``research_debate`` audit kind (no
+            # VALID_KINDS migration).
+            "red_team": (
+                {
+                    "ran": state.red_team_turn is not None,
+                    "dissent_surfaced": state.dissent_surfaced,
+                    "dissent_reason": state.dissent_reason,
+                    "confidence": (
+                        state.red_team_turn.confidence
+                        if state.red_team_turn is not None
+                        else None
+                    ),
+                    "rationale_chars": (
+                        len(state.red_team_turn.rationale or "")
+                        if state.red_team_turn is not None
+                        else 0
+                    ),
+                    "prompt_hash": (
+                        (state.red_team_turn.metadata or {}).get("prompt_hash")
+                        if state.red_team_turn is not None
+                        else None
+                    ),
+                }
+                if state.red_team_turn is not None
+                else {"ran": False, "dissent_surfaced": False}
+            ),
         },
     )
 
