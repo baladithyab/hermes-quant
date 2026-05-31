@@ -699,6 +699,33 @@ def run_cli(argv: list[str] | None = None) -> int:
         help="Output format.",
     )
     parser.add_argument(
+        "--decisions-md",
+        action="store_true",
+        help=(
+            "Render the committee decision log (memory/decisions.jsonl) to "
+            "operator-readable markdown and exit. Read-only; never mutates "
+            "the log (ADR-0042 / Wave C G3)."
+        ),
+    )
+    parser.add_argument(
+        "--decisions-md-limit",
+        type=int,
+        default=None,
+        help=(
+            "With --decisions-md, render only the most-recent N decisions "
+            "(default: all)."
+        ),
+    )
+    parser.add_argument(
+        "--decisions-md-state",
+        choices=("pending", "resolved"),
+        default=None,
+        help=(
+            "With --decisions-md, restrict to pending or resolved decisions "
+            "(default: all)."
+        ),
+    )
+    parser.add_argument(
         "--store",
         action="append",
         choices=(
@@ -719,6 +746,25 @@ def run_cli(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    # ── Decision-log markdown (read-only) ────────────────────────────────
+    # ADR-0042 / Wave C G3: materialize the append-only committee decision log
+    # into operator-readable markdown. Pure read-only surface — render_decisions_md
+    # never writes to the log. Short-circuits before the status snapshot so the
+    # flag is a focused, single-purpose view.
+    if args.decisions_md:
+        from hermes_quant.memory.decisions_render import render_decisions_md
+
+        quant_home = args.quant_home or DEFAULT_QUANT_HOME
+        decisions_path = Path(quant_home).joinpath(*_DECISIONS_REL)
+        md = render_decisions_md(
+            path=decisions_path,
+            limit=args.decisions_md_limit,
+            state_filter=args.decisions_md_state,
+        )
+        print(md)
+        return 0
+
     stores = args.store or ["all"]
     window = timedelta(hours=int(args.window_hours))
     report = quant_status(asof_window=window, quant_home=args.quant_home)

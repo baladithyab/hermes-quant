@@ -629,6 +629,42 @@ def test_wheel_capped_by_nav_target_not_held_shares() -> None:
     assert res.contracts < 1000 // 100  # the NAV cap strictly subtracted
 
 
+def test_csp_sizing_uses_full_strike_collateral_not_premium_netted() -> None:
+    """Bug 6 (S3 reconciliation): the CSP sizing denominator MUST be the FULL
+    per-contract collateral (strike*100), consistent with the classifier's
+    full-assignment-cash requirement (strike*100*contracts, premium NOT netted).
+
+    The pre-fix denominator `strike*100 - premium_received/contracts` was SMALLER
+    than the reserved collateral, so it could admit ONE extra contract relative to
+    the cash actually set aside — sizing UP past the collateral. The full
+    denominator can only size the same or fewer (the gate never sizes up).
+
+    Construction (every value pins the boundary):
+      strike=100  -> full collateral_per_contract = 100*100 = 10_000
+      premium_received=1000, structural_contracts=1
+                  -> buggy denom = 10_000 - 1000/1 = 9_000
+      nav=720_000 -> kelly_target = 720_000 * 0.25 * 0.10 = 18_000
+                     (action_step flooring -> 0, falls back to the un-stepped target)
+      full:  floor(18_000 / 10_000) = 1
+      buggy: floor(18_000 /  9_000) = 2   (the rejected over-sizing)
+    """
+    res = options_gate(
+        [_short_put("NVDA260612P00100000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            nav=720_000.0,
+            strike=100.0,
+            options_buying_power=1_000_000.0,  # >> full collateral; admits the CSP
+            premium_received=1000.0,
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is True
+    assert res.bucket == StructureBucket.CASH_SECURED_PUT
+    assert res.contracts == 1  # full strike*100 denominator
+    assert res.contracts != 2  # the premium-netted (smaller-denominator) over-size
+
+
 def test_missing_greeks_returns_silence_not_raise() -> None:
     """Bug 5: a leg missing greeks must yield a deterministic silence (reject),
     never abort the tick by raising out of options_gate()."""
@@ -649,3 +685,33 @@ def test_missing_greeks_returns_silence_not_raise() -> None:
     assert res.admitted is False
     assert res.contracts == 0
     assert (res.reason or "").startswith("greeks_unavailable")
+
+
+def test_non_greeks_exception_silences_with_distinct_reason_not_mislabeled(caplog) -> None:
+    """Bug 7 (S3): an UNEXPECTED exception during greek aggregation (e.g. an
+    unsupported leg type raising TypeError, or an arithmetic/coding bug) must NOT
+    be masked as `greeks_unavailable` (the missing-greeks silence path). It must
+    still fail closed (silence, never admit), but with a DISTINCT
+    `greeks_aggregation_error` reason and a logged error, so a real defect surfaces
+    instead of hiding behind the silence rail."""
+    import logging
+
+    class _BogusLeg:
+        """Not an OptionLeg/StockLeg -> aggregate_net_greeks raises TypeError."""
+
+    with caplog.at_level(logging.ERROR, logger="hermes_quant.risk.options_gate"):
+        res = options_gate(
+            [_BogusLeg()],  # type: ignore[list-item]
+            **_base_kwargs(strike=160.0, min_dte=30),
+        )
+    assert isinstance(res, OptionsGateResult)
+    assert res.admitted is False
+    assert res.contracts == 0
+    # Distinct reason: NOT mislabeled as missing greeks.
+    assert (res.reason or "").startswith("greeks_aggregation_error")
+    assert not (res.reason or "").startswith("greeks_unavailable")
+    assert "TypeError" in (res.reason or "")
+    # The unexpected error was logged (not silently swallowed).
+    assert any(
+        "unexpected error aggregating" in rec.getMessage() for rec in caplog.records
+    )

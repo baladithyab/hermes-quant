@@ -18,6 +18,7 @@ authority).
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from collections.abc import Sequence
@@ -32,6 +33,8 @@ from hermes_quant.options.data import (
     aggregate_net_greeks,
 )
 from hermes_quant.options.occ import OccParseError
+
+logger = logging.getLogger(__name__)
 
 
 class OptionsGateDisabled(RuntimeError):  # noqa: N818 — plan/ADR-0027-mandated name
@@ -392,10 +395,28 @@ def options_gate(
     # deterministic silence (reject) rather than aborting the tick (ADR-0027 D6).
     try:
         candidate_net = aggregate_net_greeks(legs, order_qty=structural_contracts)
-    except (GreekComputationError, TypeError) as exc:
+    except GreekComputationError as exc:
+        # GENUINELY missing/incomplete greeks => deterministic silence (reject),
+        # the intended fail-closed path (ADR-0027 D6).
         return OptionsGateResult.silence(
             StructureBucket.NAKED,
             f"greeks_unavailable: {exc}",
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-closed but DON'T mislabel
+        # Any OTHER exception (e.g. an unsupported leg type raising TypeError, or
+        # an arithmetic/coding bug) is NOT "missing greeks". Masking it as
+        # `greeks_unavailable` would hide a real defect behind the silence rail.
+        # Still fail closed (silence, never admit), but LOG it with a distinct
+        # reason so the bug surfaces instead of being silently swallowed.
+        logger.error(
+            "options_gate: unexpected error aggregating candidate greeks "
+            "(underlying=%s): %r",
+            underlying,
+            exc,
+        )
+        return OptionsGateResult.silence(
+            StructureBucket.NAKED,
+            f"greeks_aggregation_error: {type(exc).__name__}",
         )
     portfolio_after = portfolio_net_greeks + candidate_net
 
@@ -568,9 +589,17 @@ def options_gate(
     if bucket == StructureBucket.COVERED_CALL and basis_per_share:
         collateral_per_contract = basis_per_share * 100
     elif bucket == StructureBucket.CASH_SECURED_PUT:
-        collateral_per_contract = max(strike * 100 - premium_received / max(
-            structural_contracts, 1
-        ), 0.0) or strike * 100
+        # FULL assignment cash per contract = strike*100. This MUST match the
+        # classifier's collateral requirement (_classify_structure admits a CSP
+        # only when options_buying_power >= strike*100*contracts, premium NOT
+        # netted — on assignment the operator buys the shares outright at the
+        # strike). Netting the premium here (the pre-fix `strike*100 -
+        # premium/contracts`) would use a SMALLER denominator than the cash the
+        # classifier actually requires, sizing UP one extra contract relative to
+        # the reserved collateral. A larger (full) denominator can only size the
+        # same or fewer contracts — never widen (ADR-0027 D3/D4; the gate never
+        # sizes up).
+        collateral_per_contract = strike * 100
 
     contracts = _size_contracts(
         bucket,
@@ -603,9 +632,23 @@ def options_gate(
     if contracts != structural_contracts:
         try:
             admitted_net = aggregate_net_greeks(legs, order_qty=contracts)
-        except (GreekComputationError, TypeError) as exc:
+        except GreekComputationError as exc:
             return OptionsGateResult.silence(
                 bucket, f"greeks_unavailable: {exc}", bpr_estimate=bpr, max_loss=max_loss,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-closed but DON'T mislabel
+            logger.error(
+                "options_gate: unexpected error aggregating admitted-size greeks "
+                "(underlying=%s, contracts=%d): %r",
+                underlying,
+                contracts,
+                exc,
+            )
+            return OptionsGateResult.silence(
+                bucket,
+                f"greeks_aggregation_error: {type(exc).__name__}",
+                bpr_estimate=bpr,
+                max_loss=max_loss,
             )
         portfolio_admitted = portfolio_net_greeks + admitted_net
         if abs(portfolio_admitted.gamma * spot * spot) > cfg.gamma_cap_pct_nav * nav:

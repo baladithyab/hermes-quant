@@ -18,6 +18,10 @@ the shuffle/futures invariant blocks the next version tag.
 
 from __future__ import annotations
 
+import json
+import pathlib
+from datetime import UTC, datetime
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -536,6 +540,203 @@ def test_semantic_analyst_admits_packet_at_decision_boundary():
     )
     assert view is not None and view.direction == 1
     assert view.metadata.get("abstain_reason") is None
+
+
+# ---------------------------------------------------------------------------
+# Invariant 7 — Perception-PRODUCING path is lookahead-honest (M21, PDR-1 precond)
+# ---------------------------------------------------------------------------
+# Invariant 5 proves the SemanticAnalyst (the CONSUMER of packets) drops a
+# future-asof packet. But the analyst is only honest if the code that PRODUCES
+# its input is honest too: catalyst/wiring.py:semantic_market_extras() injects
+# the packets, and catalyst/onboarding.py:catalyst_admissions() selects symbols
+# to onboard on the basis of packets. Both call load_packets_for(symbol, asof);
+# both default `asof` to wall-clock now on the live path. The release-blocker
+# gate must assert the SCAN->onboard->recommend seam can't pull a wider data
+# window than the decision asof justifies — i.e. a packet published AFTER the
+# decision boundary is excluded by the PRODUCING seam, not just re-dropped later
+# by the analyst. (Meta-review M21 / ADR-0079 D-4 lookahead honesty, the PDR-1
+# eval-gate precondition "no-lookahead gate green" on the frame/onboarding path.)
+#
+# Deterministic, no network: packets live in a tmp JSONL the seams read via
+# load_packets_for; the propagation graph and tradeable() are injected.
+
+
+def _write_store_packet(
+    store: pathlib.Path,
+    *,
+    asset: str,
+    asof: str,
+    stance: str = "bullish",
+    confidence: float = 0.70,
+    magnitude: float = 0.05,
+    horizon: str = "1d",
+) -> None:
+    """Append one SemanticPacket dict to a JSONL store (synthesize shape:
+    asof = publication time)."""
+    from hermes_quant.semantic import semantic_packet_from_dict
+
+    pkt = semantic_packet_from_dict(
+        {
+            "schema_version": 1,
+            "asset": asset,
+            "asof": asof,
+            "horizon": horizon,
+            "stance": stance,
+            "confidence": confidence,
+            "magnitude": magnitude,
+            "summary": f"no-lookahead producing-path packet {asset} {stance} {asof}",
+            "sources": [{"type": "note", "ref": "no-lookahead-producing-fence"}],
+            "model": "hermes:lookahead-producing-test",
+        }
+    )
+    store.parent.mkdir(parents=True, exist_ok=True)
+    with store.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(pkt.to_dict(include_hash=True), default=str) + "\n")
+
+
+def test_semantic_market_extras_excludes_future_asof_packet(monkeypatch, tmp_path):
+    """wiring.semantic_market_extras(symbol, decision_asof=T) must inject ONLY
+    packets with asof <= T. A packet published AFTER T must be excluded by the
+    PRODUCING seam — proving the wiring seam is lookahead-honest, not just the
+    consuming analyst (M21). The future packet is the LOUDER one (opposite
+    stance, higher confidence, later asof) so any leak is unmistakable."""
+    from hermes_quant.catalyst import synthesize, wiring
+
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "1")
+    store = tmp_path / "packets.jsonl"
+    monkeypatch.setattr(synthesize, "_DEFAULT_STORE", store)
+
+    decision = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _write_store_packet(  # published BEFORE the decision -> admissible
+        store, asset="AAPL", asof="2026-01-01T09:00:00Z",
+        stance="bullish", confidence=0.70, magnitude=0.01,
+    )
+    _write_store_packet(  # published AFTER the decision -> MUST be excluded
+        store, asset="AAPL", asof="2026-01-01T15:00:00Z",
+        stance="bearish", confidence=0.95, magnitude=0.05,
+    )
+
+    out = wiring.semantic_market_extras("AAPL", decision_asof=decision)
+    assert out is not None, "expected packets to be injected at decision asof"
+    asofs = [pd.Timestamp(p["asof"]) for p in out["semantic_packets"]]
+    assert asofs, "wiring seam injected no packets despite a valid past packet"
+    cutoff = pd.Timestamp(decision)
+    for a in asofs:
+        a_utc = a.tz_localize("UTC") if a.tzinfo is None else a.tz_convert("UTC")
+        assert a_utc <= cutoff, (
+            f"semantic_market_extras injected a future packet asof={a_utc} > "
+            f"decision_asof={cutoff} — PRODUCING-path lookahead leak (M21)"
+        )
+    # Concretely: the surviving packet is the PAST (bullish) one, never the
+    # louder future (bearish) one.
+    stances = {p["stance"] for p in out["semantic_packets"]}
+    assert stances == {"bullish"}, (
+        f"future bearish packet leaked into the injected extras: stances={stances}"
+    )
+
+
+def test_semantic_market_extras_only_future_packet_injects_nothing(monkeypatch, tmp_path):
+    """When the ONLY stored packet is published after the decision asof, the
+    wiring seam injects NOTHING (returns None) — the producing path silences by
+    default rather than handing a future packet to the analyst to re-drop."""
+    from hermes_quant.catalyst import synthesize, wiring
+
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "1")
+    store = tmp_path / "packets.jsonl"
+    monkeypatch.setattr(synthesize, "_DEFAULT_STORE", store)
+
+    decision = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _write_store_packet(
+        store, asset="AAPL", asof="2026-01-01T15:00:00Z",
+        stance="bearish", confidence=0.95, magnitude=0.05,
+    )
+    assert wiring.semantic_market_extras("AAPL", decision_asof=decision) is None, (
+        "wiring seam injected a future-only packet — PRODUCING-path lookahead leak"
+    )
+
+
+def test_catalyst_admissions_excludes_future_asof_packet(monkeypatch, tmp_path):
+    """onboarding.catalyst_admissions at asof=T must NOT admit a symbol on the
+    basis of a packet whose asof > T. The SCAN->onboard seam reads packets via
+    load_packets_for(sym, asof) — selecting an onboarding candidate from a
+    future packet would let an onboarded symbol pull a window its admitting
+    packet's asof can't justify (M21). The future packet is again the LOUDER one
+    (well above both thresholds) so a leak would admit; honest behavior abstains."""
+    from hermes_quant.catalyst import onboarding, propagation, synthesize
+    from hermes_quant.catalyst.propagation import PropagationEdge
+
+    monkeypatch.setenv("HERMES_QUANT_CATALYST_ONBOARDING", "1")
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "1")
+    store = tmp_path / "packets.jsonl"
+    monkeypatch.setattr(synthesize, "_DEFAULT_STORE", store)
+    monkeypatch.setattr(
+        propagation,
+        "load_graph",
+        lambda *a, **k: (
+            {"src": [PropagationEdge("src", "RKLB", "sector_member", -1, 0.80)]},
+            {},
+        ),
+    )
+
+    decision = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    # The ONLY packet for the out-of-universe target is published AFTER the asof.
+    _write_store_packet(
+        store, asset="RKLB", asof="2026-01-01T15:00:00Z",
+        stance="bullish", confidence=0.95, magnitude=0.06,
+    )
+    admitted = onboarding.catalyst_admissions(
+        set(), tradeable=lambda _s: True, asof=decision
+    )
+    assert admitted == [], (
+        "catalyst_admissions onboarded a symbol on a future-asof packet "
+        f"(asof=15:00 > decision=12:00): {[a.symbol for a in admitted]} — "
+        "SCAN->onboard PRODUCING-path lookahead leak (M21)"
+    )
+
+
+def test_catalyst_admissions_admitted_packet_asof_not_after_decision(monkeypatch, tmp_path):
+    """When a past AND a (louder) future packet both exist, admission may fire,
+    but the admission it carries must be backed by the PAST packet — its
+    packet_asof must be <= the decision asof. Pins that the onboarded symbol
+    can't justify its window with a future packet's asof."""
+    from hermes_quant.catalyst import onboarding, propagation, synthesize
+    from hermes_quant.catalyst.propagation import PropagationEdge
+
+    monkeypatch.setenv("HERMES_QUANT_CATALYST_ONBOARDING", "1")
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "1")
+    store = tmp_path / "packets.jsonl"
+    monkeypatch.setattr(synthesize, "_DEFAULT_STORE", store)
+    monkeypatch.setattr(
+        propagation,
+        "load_graph",
+        lambda *a, **k: (
+            {"src": [PropagationEdge("src", "RKLB", "sector_member", -1, 0.80)]},
+            {},
+        ),
+    )
+
+    decision = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _write_store_packet(  # past, eligible
+        store, asset="RKLB", asof="2026-01-01T09:00:00Z",
+        stance="bullish", confidence=0.80, magnitude=0.06,
+    )
+    _write_store_packet(  # future, LOUDER (higher conf) — must not be selected
+        store, asset="RKLB", asof="2026-01-01T15:00:00Z",
+        stance="bullish", confidence=0.99, magnitude=0.06,
+    )
+    admitted = onboarding.catalyst_admissions(
+        set(), tradeable=lambda _s: True, asof=decision
+    )
+    assert [a.symbol for a in admitted] == ["RKLB"], (
+        "expected RKLB admitted on the strength of its PAST packet"
+    )
+    cutoff = pd.Timestamp(decision)
+    pa = pd.Timestamp(admitted[0].packet_asof)
+    pa_utc = pa.tz_localize("UTC") if pa.tzinfo is None else pa.tz_convert("UTC")
+    assert pa_utc <= cutoff, (
+        f"admission carries a future packet_asof={pa_utc} > decision={cutoff} — "
+        "the louder future packet was selected (PRODUCING-path lookahead leak)"
+    )
 
 
 # ---------------------------------------------------------------------------

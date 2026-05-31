@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -112,6 +112,46 @@ def test_pil_mixed_divs_only_held_ones_count():
     }
     accrual = accrue_borrow_carry("AAPL", -1000, held_mon_wed, 0.02, dividends)
     assert accrual.total_pil == pytest.approx(1000 * 0.30)
+
+
+def test_pil_datetime_keyed_ex_div_in_window_still_debits():
+    """A datetime-keyed (not pure-date) ex-div inside the held window MUST still
+    debit PIL. `datetime` is a subclass of `date`; exact-key membership against a
+    pure-`date` mark series would never match a datetime key, silently dropping a
+    genuinely-owed PIL (understating short cost = wrong direction). The held-window
+    predicate normalizes both sides to `date`, so the debit is preserved."""
+    held_mon_wed = {
+        date(2026, 5, 25): 100.0,  # Mon
+        date(2026, 5, 26): 100.0,  # Tue
+        date(2026, 5, 27): 100.0,  # Wed
+    }
+    # Ex-div keyed as a datetime (with a wall-clock time) on the Tuesday in-window.
+    div_dt = {datetime(2026, 5, 26, 13, 30, 0): 0.30}
+    accrual = accrue_borrow_carry("AAPL", -1000, held_mon_wed, 0.02, div_dt)
+    assert accrual.total_pil == pytest.approx(1000 * 0.30)
+    assert accrual.days_held == 3
+
+
+def test_pil_ex_div_on_unmarked_day_bracketed_by_held_marks_still_debits():
+    """An ex-div on a trading day MISSING from close_by_date but BRACKETED by the
+    held marks (a daily-mark gap) MUST still debit PIL. Pre-fix exact-key membership
+    dropped it (the date isn't a key), understating cost. The min/max held-window
+    predicate debits it because the position was demonstrably open across that date."""
+    # Marks recorded Mon and Wed only; Tuesday's mark is missing (data gap), yet
+    # the short was clearly open across Tuesday (it is between Mon and Wed marks).
+    held_with_gap = {
+        date(2026, 5, 25): 100.0,  # Mon
+        date(2026, 5, 27): 100.0,  # Wed  (Tuesday mark absent)
+    }
+    div_tuesday = {date(2026, 5, 26): 0.30}  # ex-div on the unmarked Tuesday
+    accrual = accrue_borrow_carry("AAPL", -1000, held_with_gap, 0.02, div_tuesday)
+    assert accrual.total_pil == pytest.approx(1000 * 0.30)
+    assert accrual.days_held == 2  # only the two recorded marks accrue borrow fee
+
+    # And an ex-div strictly OUTSIDE the [Mon, Wed] window still contributes zero.
+    div_after = {date(2026, 5, 29): 0.30}  # Friday, after max(held)
+    accrual_after = accrue_borrow_carry("AAPL", -1000, held_with_gap, 0.02, div_after)
+    assert accrual_after.total_pil == 0.0
 
 
 def test_accrue_long_position_zero_carry():

@@ -11,9 +11,23 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 DAY_COUNT_BASIS: int = 360  # stock-loan money-market convention (research §3)
+
+
+def _as_date(value: date) -> date:
+    """Coerce a date-or-datetime to a pure UTC calendar date.
+
+    `datetime` is a SUBCLASS of `date`, so a `datetime` key in `close_by_date` /
+    `dividends` would (a) never match a pure-`date` key via `in`, and (b) raise
+    `TypeError` when compared against pure `date` bounds. Normalizing both sides
+    to `.date()` makes the held-window predicate type-robust so a datetime-keyed
+    ex-div can NEVER silently drop a genuinely-owed PIL (understating cost is the
+    wrong-direction error this guard exists to prevent)."""
+    if isinstance(value, datetime):
+        return value.date()
+    return value
 
 
 def borrow_cost_enabled() -> bool:
@@ -60,20 +74,31 @@ def accrue_borrow_carry(
     The total carry is a positive number to SUBTRACT from short P&L."""
     total_fee = 0.0
     days_held = 0
+    held_dates: list[date] = []
     for on, close_price in close_by_date.items():
         days_held += 1
-        total_fee += daily_borrow_fee(short_shares, close_price, annual_cbr, on)
+        on_date = _as_date(on)
+        held_dates.append(on_date)
+        total_fee += daily_borrow_fee(short_shares, close_price, annual_cbr, on_date)
 
-    # held_dates are the UTC dates the short position was open (the marks we iterate above).
-    # A dividend whose ex-div date falls OUTSIDE this window did not touch the short and
-    # contributes ZERO PIL — never debit for a dividend the position did not straddle.
-    held_dates = close_by_date.keys()
+    # The short was open across the CONTIGUOUS interval [min(held), max(held)] of the
+    # daily marks. PIL is owed for any ex-div date the position spanned. Exact-key
+    # membership (`ex_div_date in close_by_date`) was wrong-direction unsafe: an ex-div
+    # falling on a date the daily-mark series simply did not record (a market-data gap,
+    # or an ex-div on a non-marked calendar day) would silently drop a genuinely-owed
+    # PIL and UNDERSTATE short cost. We instead test true held-across-ex-div bracketing
+    # against the [min, max] window, with both sides normalized to pure `date` so a
+    # datetime-keyed dividend cannot slip past on a type mismatch (FAIL-CLOSED toward
+    # debiting the owed PIL). A dividend whose ex-div date falls OUTSIDE this window did
+    # not touch the short and contributes ZERO PIL.
     total_pil = 0.0
-    if dividends:
+    if dividends and held_dates:
+        window_start = min(held_dates)
+        window_end = max(held_dates)
         for ex_div_date, div_per_share in dividends.items():
-            if ex_div_date not in held_dates:
-                continue
-            total_pil += payment_in_lieu(short_shares, div_per_share)
+            ex_date = _as_date(ex_div_date)
+            if window_start <= ex_date <= window_end:
+                total_pil += payment_in_lieu(short_shares, div_per_share)
 
     return BorrowAccrual(
         symbol=symbol,

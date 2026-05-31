@@ -135,12 +135,18 @@ def test_daily_interim_path_injects_packets(monkeypatch, tmp_path):
 
 
 def test_autonomous_tick_path_injects_packets(monkeypatch, tmp_path):
-    """quant-autonomous-tick _direction_screened_recommend injects packets.
+    """quant-autonomous-tick's shipped _direction_screened_recommend injects packets.
 
-    We reconstruct the wrapper exactly as run_tick builds it: it closes over
-    _base_recommend (= advisor.recommend) and the flag. The bias gate is OFF
-    by default, so the wrapper returns the base result untouched — but it must
-    still have injected market_extras before calling the base recommend.
+    Loads the REAL ops/scripts/quant-autonomous-tick.py (like the daily-interim +
+    playbook siblings) and drives run_tick() so the actual shipped wrapper closure
+    runs — removing the wiring call from the real script would now fail this test.
+
+    The wrapper is built inside run_tick and handed to auto.tick as advisor_recommend.
+    We stub auto.tick to invoke that callback exactly as the real pipeline does
+    (autonomous.py: advisor_recommend(symbol=..., asset_class=..., timeframe=...,
+    include_lessons=True)) so the wrapper executes against the spied advisor.recommend.
+    The bias gate is OFF by default, so the wrapper returns the base result untouched
+    — but it must still have injected market_extras before calling the base recommend.
     """
     _arm_store(monkeypatch, tmp_path, "AAPL")
     advisor = __import__("hermes_quant.advisor", fromlist=["recommend"])
@@ -153,23 +159,39 @@ def test_autonomous_tick_path_injects_packets(monkeypatch, tmp_path):
 
     monkeypatch.setattr(advisor, "recommend", _spy)
 
-    # Build the wrapper the same way the script does (flag OFF -> bias screen no-op).
-    _base_recommend = advisor.recommend
-    _direction_bias_gate_on = False
+    tick_mod = _load_script("quant-autonomous-tick.py")
 
-    def _direction_screened_recommend(**kwargs):
-        _inj_sym = kwargs.get("symbol")
-        if _inj_sym and "market_extras" not in kwargs:
-            from hermes_quant.catalyst.wiring import semantic_market_extras
-            _me = semantic_market_extras(_inj_sym, horizon=kwargs.get("timeframe", "1d"))
-            if _me is not None:
-                kwargs = {**kwargs, "market_extras": _me}
-        res = _base_recommend(**kwargs)
-        if not _direction_bias_gate_on:
-            return res
-        return res
+    # Deterministic, filesystem-independent run: no halt, one active symbol,
+    # audit writes redirected away from the real ~/.hermes home.
+    monkeypatch.setattr(tick_mod, "read_active_halts", lambda: [])
+    monkeypatch.setattr(
+        tick_mod, "load_active_watchlist", lambda: [("AAPL", "equity", "1d", ["swing"])]
+    )
+    monkeypatch.setattr(tick_mod, "AUDIT_LOG_PATH", tmp_path / "autonomous-tick.jsonl")
 
-    _direction_screened_recommend(symbol="AAPL", asset_class="equity", timeframe="1d")
+    import hermes_quant.autonomous as auto
+
+    def _fake_tick(*, dry_run, symbols, advisor_recommend):
+        # Mirror the real pipeline's advisor invocation so the SHIPPED wrapper
+        # closure executes (autonomous.py calls it with these kwargs).
+        for entry in symbols:
+            advisor_recommend(
+                symbol=entry.symbol,
+                asset_class=entry.asset_class,
+                timeframe=entry.timeframe,
+                include_lessons=True,
+            )
+        return auto.TickResult(
+            asof="2026-01-01T00:00:00Z",
+            mode="autonomous",
+            dry_run=dry_run,
+            watchlist_size=len(symbols),
+        )
+
+    monkeypatch.setattr(auto, "tick", _fake_tick)
+
+    tick_mod.run_tick(armed=False)
+
     me = captured.get("market_extras")
     assert me is not None and me.get("semantic_packets"), (
         "autonomous-tick did not inject semantic_packets via the wiring helper"

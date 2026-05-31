@@ -98,6 +98,34 @@ def test_verdict_requires_min_sample():
     assert s3.verdict == "UNPROFITABLE_CONSIDER_PRUNE"
 
 
+def test_verdict_boundary_hit_rate_060_is_profitable():
+    """hr == MIN_HIT_RATE (0.60) with positive return is the PROFITABLE edge.
+
+    This is the exact knife-edge B07 turns on: a brand_self class clears the
+    consumer-trend haircut only when it reaches the 0.60 bar. n=20==MIN_SAMPLE,
+    hits=12 -> hit_rate == 0.60 exactly (>= MIN_HIT_RATE).
+    """
+    from hermes_quant.catalyst.profitability import MIN_HIT_RATE
+
+    s = RelationStats(relation="brand_self", n_scored=MIN_SAMPLE, hits=12, sum_signed_return=30.0)
+    assert s.hit_rate == MIN_HIT_RATE  # 12/20 == 0.60
+    assert s.mean_signed_return > 0
+    assert s.verdict == "PROFITABLE"
+
+
+def test_verdict_boundary_hit_rate_059_is_marginal_hold():
+    """hr just under 0.60 (0.59) with positive return is MARGINAL_HOLD, not PROFITABLE.
+
+    The B07 decision line: at hr=0.59 the class is in the 0.5<=hr<0.6 band with a
+    non-negative mean return, so it holds the 0.5 haircut (accumulate more data),
+    it does NOT clear the bar to raise the weight. n=100, hits=59 -> hr == 0.59.
+    """
+    s = RelationStats(relation="brand_self", n_scored=100, hits=59, sum_signed_return=15.0)
+    assert s.hit_rate == 0.59  # strictly below MIN_HIT_RATE, at/above 0.5
+    assert s.mean_signed_return > 0
+    assert s.verdict == "MARGINAL_HOLD"
+
+
 def test_profitability_empty_log_is_silent(tmp_path):
     assert measure_profitability(lambda s, d: 1.0, path=tmp_path / "none.jsonl") == {}
     assert "no scored propagations" in format_report({})
