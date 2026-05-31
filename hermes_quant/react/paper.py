@@ -242,8 +242,16 @@ class PaperReactor:
         if _os.environ.get("HERMES_QUANT_REFLECTION", "0") == "1":
             try:
                 from hermes_quant.memory._paper_reflection_hook import (
+                    maybe_record_decision_on_open,
                     maybe_reflect_on_close,
                 )
+                # W1 (capability-map O1): record the pending decision on an OPENING
+                # fill so the reflection loop has source-water. Symmetric with the
+                # close hook; the open recorder defers to the close hook for fills
+                # that close an existing position. This ignites the one closed-in-code
+                # feedback edge (reflection→retriever→PM prompt) that was dark because
+                # record_decision() had zero production callers.
+                maybe_record_decision_on_open(record, proposal)
                 maybe_reflect_on_close(record, proposal)
             except Exception as _re:  # pragma: no cover — non-blocking
                 logger.warning("Wave4 reflection hook failed (non-blocking): %s", _re)
