@@ -235,3 +235,28 @@ climbed from R1-dark to the R4 threshold: per-trade→weekly→monthly distillat
 factor/graph/hypothesis evolution — all PROPOSE-only, the deterministic gate + operator the sole
 path to live. The advisory plane evolves; the risk gate / sizing ladder / kill-switch are immutable
 by it. Follow-ups (tasks #28, #23, #22, #19) are non-blocking pre-flip hardening.
+
+### SELF-EVOLUTION ARC — COMPLETE + hardened + operator-runbook (2026-05-31)
+
+Closing state of the /goal "newbie → full self-evolving quant researcher":
+- Waves W1-W7 built + hardened (11 commits this arc); 155/155 self-evolution+reactor+admissibility
+  tests green together; live default path byte-identical (no flag hard-enabled).
+- Flippable-hardening (dda7805/e6e9e1d): W4 now has a REAL time-ordered held-out OOS split
+  (proposer-blind, no-lookahead test-proven) so it can actually promote — was a never-promoting
+  stub; admissibility account-context plumbed + 3 paths unified to one seam; options BPR/collateral
+  re-checked at admitted size.
+- Live-cron robustness (edee1be): non-dict-line silence guard on the 4 live no_agent readers +
+  W4 holdout off-by-one.
+- Operator runbook: docs/operations/SELFEVOLVE-ENABLEMENT.md (7 flags, dependency order, per-flag
+  eval gate + .env one-liner + cronjob registration + rollback).
+
+The system now sits at the R4 threshold: per-trade→weekly→monthly distillation (W1/W2/W3),
+self-critique via a Socratic devil's-advocate (W7), factor/graph/hypothesis evolution (W4/W5/W6) —
+ALL propose-only into an advisory plane; the deterministic gate / sizing ladder / kill-switch are
+immutable by the loop; promotion to live is always a human act. Adversarial review caught a real
+money-path bug in EVERY build wave (legacy-DB covered-call leg-drop; W4 never-promoting stub) —
+the discipline that made eval-gate-green trustworthy.
+
+Remaining (next loops, none blocking): PDR-2/3/4 perception primitives (#18); cosmetic nits (#31);
+full-suite env test-pollution (torch/ccxt/sklearn, #12); operator enablement (flip flags per the
+runbooks after each eval gate).
