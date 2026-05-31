@@ -565,3 +565,125 @@ def format_context_block_split(
     if len(result) > max_chars:
         result = result[:max_chars - 3] + "..."
     return result
+
+
+# ---------------------------------------------------------------------------
+# W2 weekly-retro belief injection (ADR-0081 §2 — selective propagation)
+# ---------------------------------------------------------------------------
+
+_BELIEF_ROLE_TAG: dict[str, str] = {
+    "portfolio_manager": "PM",
+    "research_manager": "RM",
+    "bull_researcher": "BULL",
+    "bear_researcher": "BEAR",
+    "risk_aggressive": "RISK_AGG",
+    "risk_conservative": "RISK_CON",
+    "risk_neutral": "RISK_NEU",
+}
+
+
+def load_active_beliefs(
+    role: str,
+    asof: datetime,
+    *,
+    beliefs_path: Path | None = None,
+) -> list[dict]:
+    """Return active beliefs for `role` whose oracle_provenance.tau_observable_max < asof.
+
+    Belief-level Oracle Fallacy guard — the SAME rule applied to reflections at
+    line 351-362, lifted to the belief level so a distilled belief never surfaces an
+    outcome that was not knowable at the decision asof. Reads beliefs.jsonl via
+    weekly_retro.materialize_active. Returns [] when the file is absent (the
+    default-OFF path is byte-identical).
+
+    Also bumps the FINMEM access-counter for each surfaced belief
+    (weekly_retro.access_touch) — best-effort, wrapped so a write failure never breaks
+    retrieval.
+    """
+    from hermes_quant.memory import weekly_retro
+
+    if asof.tzinfo is None:
+        asof = asof.replace(tzinfo=UTC)
+    else:
+        asof = asof.astimezone(UTC)
+
+    bpath = beliefs_path or weekly_retro.BELIEFS_PATH
+    if not bpath.exists():
+        return []
+
+    try:
+        rows = weekly_retro.load_belief_rows(path=bpath)
+        active = weekly_retro.materialize_active(rows, asof)
+    except Exception:
+        logger.warning("load_active_beliefs: belief store read failed; returning []")
+        return []
+
+    out: list[dict] = []
+    for b in active:
+        if b.role != role:
+            continue  # selective propagation: only this role's beliefs
+        out.append(
+            {
+                "belief_id": b.belief_id,
+                "role": b.role,
+                "tier": b.tier,
+                "lesson_category": b.lesson_category,
+                "ticker": _belief_ticker(b),
+                "verbal_delta": b.verbal_delta,
+                "alpha_evidence": b.alpha_evidence,
+                "support_n": b.support_n,
+            }
+        )
+        # FINMEM access bump — best-effort, never raises.
+        try:
+            weekly_retro.access_touch(b.belief_id, path=bpath)
+        except Exception:
+            logger.warning(
+                "load_active_beliefs: access_touch failed for %s (non-blocking)",
+                b.belief_id,
+            )
+    return out
+
+
+def _belief_ticker(belief: Any) -> str:
+    """Best-effort ticker recovery from a Belief for the digest header.
+
+    The ticker is encoded in the belief_id (bel_<tier>_<role>_<TICKER>_<hash>); the
+    verbal_delta also opens with it. Recover from the id token before the hash.
+    """
+    parts = str(getattr(belief, "belief_id", "")).split("_")
+    if len(parts) >= 5:
+        return parts[-2]
+    return ""
+
+
+def format_beliefs_digest(beliefs: list[dict], *, max_chars: int = 768) -> str:
+    """Render active beliefs as a compact digest block.
+
+    Format::
+
+        --- Distilled beliefs (weekly retro) ---
+        [PM | thesis_invalidation_at_earnings | AAPL | +1.8% alpha | n=5]
+        {verbal_delta}
+
+    Empty -> "" (so the caller can cleanly skip prepending). Clipped to max_chars.
+    """
+    if not beliefs:
+        return ""
+
+    lines = ["--- Distilled beliefs (weekly retro) ---"]
+    for b in beliefs:
+        role_tag = _BELIEF_ROLE_TAG.get(str(b.get("role", "")), str(b.get("role", "")))
+        ticker = str(b.get("ticker", "")) or "*"
+        category = str(b.get("lesson_category", ""))
+        alpha = float(b.get("alpha_evidence", 0.0) or 0.0)
+        n = int(b.get("support_n", 0) or 0)
+        lines.append(
+            f"[{role_tag} | {category} | {ticker} | {alpha:+.1%} alpha | n={n}]"
+        )
+        lines.append(str(b.get("verbal_delta", "")))
+
+    result = "\n".join(lines)
+    if len(result) > max_chars:
+        result = result[:max_chars - 3] + "..."
+    return result

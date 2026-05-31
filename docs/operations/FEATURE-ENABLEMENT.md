@@ -304,6 +304,34 @@ side-by-side audit step · rollback · classification.
 - **Rollback:** `sed -i '/HERMES_QUANT_CATALYST_ONBOARDING=/d' ~/.hermes/.env`
 - **Classification: GATED.**
 
+### 2.10 `WEEKLY_RETRO` — GATED (W2 / ADR-0081, advisory-plane only)
+
+- **Enables:** the weekly CVRF pattern-mining retro (`memory/weekly_retro.py`). The
+  `quant-weekly-retro` cron distills winners-vs-losers (split by realized **alpha**, not raw
+  P&L) from `reflections.jsonl` into a bounded, decaying, Oracle-tagged set of verbal
+  belief-deltas in `beliefs.jsonl`, and — on a successful under-budget pass — emits the
+  `weekly_retro_promotion_readiness` producer that un-blocks the gate field at
+  `governance/promotion.py:158` (closes O3). Under the flag, the PM `lessons_block` is
+  prepended with the role-selective beliefs digest.
+- **Advisory-plane only / propose-only:** writes ONLY `beliefs.jsonl` + a `promotion_event`
+  audit row. It NEVER imports or mutates the risk gate, the hard limits, the discrete sizing
+  ladder `{0,±0.05,±0.10,±0.15,±0.20}`, or the kill-switch (regression-guarded by
+  `tests/memory/test_weekly_retro_eval_gate.py::test_propose_only_never_touches_gate_or_ladder`).
+- **Precondition (the eval gate, necessary-not-sufficient):** the W2 eval gate must be green —
+  `pytest tests/memory/test_weekly_retro.py tests/memory/test_weekly_retro_eval_gate.py
+  tests/governance/test_promotion.py -q`. The held-out OOS digest must not regress
+  hit-rate/alpha vs the no-digest baseline; belief count under cap; half-life plateau-stable
+  under ±20% jitter. Operator promotion stays the sole path to live (ADR-0052).
+- **Enable (operator, after the eval gate + an audit-log diff):**
+  ```bash
+  echo 'HERMES_QUANT_WEEKLY_RETRO=1' >> ~/.hermes/.env
+  echo 'HERMES_QUANT_MEMORY_INJECT=1' >> ~/.hermes/.env   # required for the digest to reach the PM prompt
+  ```
+- **Off-state:** flag unset/`0` is a bit-for-bit no-op — no `beliefs.jsonl` read, no digest,
+  the cron exits 0 with empty stdout. (`test_weekly_retro_injection.py::test_flag_off_is_byte_identical_noop`.)
+- **Rollback:** `sed -i '/HERMES_QUANT_WEEKLY_RETRO=/d' ~/.hermes/.env`
+- **Classification: GATED.**
+
 ---
 
 ## 3. Quick reference
@@ -319,6 +347,7 @@ side-by-side audit step · rollback · classification.
 | `OPTIONS_LIVE_CHAIN` | GATED | after #11 + data eval | live vs fixture chain |
 | `MULTILEG_REACTOR` | GATED (stays OFF) | **not yet — no order rail** | n/a |
 | `CATALYST_ONBOARDING` | GATED | after ADR-0075 (+ SEMANTIC already on) | watchlist-evolve OFF vs ON |
+| `WEEKLY_RETRO` (+`MEMORY_INJECT`) | GATED | after the W2 eval gate (held-out + plateau) | weekly-retro test suite; flag-OFF = byte-identical no-op |
 
 **Reminder:** the agent cannot flip any of these. Every `echo ... >> ~/.hermes/.env` is an
 operator action on a tool-guarded file. The agent runs the probes and reports; the human flips.

@@ -62,6 +62,8 @@ _PROMPT_FILES: dict[str, str] = {
     "risk_conservative": "risk_conservative.md",
     "risk_neutral": "risk_neutral.md",
     "portfolio_manager": "portfolio_manager.md",
+    # ADR-0080 W7 (default-OFF): standing Socratic devil's-advocate turn.
+    "devils_advocate": "devils_advocate.md",
 }
 
 
@@ -248,6 +250,7 @@ def _render_prompt(
     own_history: str | None = None,
     round_index: int | None = None,
     conversational_preamble: str | None = None,
+    leading_view: Any = None,
 ) -> tuple[str, str]:
     """Render system + user messages for a role.
 
@@ -283,6 +286,7 @@ def _render_prompt(
         "risk_conservative": "Conservative Risk Manager",
         "risk_neutral": "Neutral Risk Manager",
         "portfolio_manager": "Portfolio Manager",
+        "devils_advocate": "Devil's Advocate",
     }.get(role, role)
     role_direction = "bullish" if role == "bull_researcher" else "bearish"
 
@@ -312,6 +316,33 @@ def _render_prompt(
                 logger.warning(
                     "Memory injection failed for role=%r (non-blocking); "
                     "using '(none)'",
+                    role,
+                )
+
+        # W2 weekly-retro beliefs digest (HERMES_QUANT_WEEKLY_RETRO=1, default OFF).
+        # PREPENDED above the raw per-trade lessons. Selective: only the role the
+        # belief was distilled FOR. Belief-level Oracle guard applied in the retriever.
+        if os.environ.get("HERMES_QUANT_WEEKLY_RETRO", "0") == "1":
+            try:
+                from datetime import UTC, datetime
+
+                from hermes_quant.memory.retriever import (
+                    format_beliefs_digest,
+                    load_active_beliefs,
+                )
+                _asof_b = (
+                    market_context.asof
+                    if isinstance(market_context.asof, datetime)
+                    else datetime.now(UTC)
+                )
+                _beliefs = load_active_beliefs(role, _asof_b)
+                _digest = format_beliefs_digest(_beliefs)
+                if _digest:
+                    lessons_block = _digest + "\n\n" + lessons_block
+            except Exception:
+                logger.warning(
+                    "Weekly-retro belief injection failed for role=%r "
+                    "(non-blocking); using raw lessons only",
                     role,
                 )
 
@@ -347,6 +378,27 @@ def _render_prompt(
             conversational_preamble
             if conversational_preamble is not None
             else "Output conversationally as if you are speaking without any special formatting"
+        ),
+        # ADR-0080 W7: the judge's leading view, rendered for the devil's-advocate
+        # to attack. Legacy callers (None) get a sentinel so str.format resolves.
+        "leading_view_json": (
+            json.dumps(
+                {
+                    "recommendation": getattr(
+                        getattr(leading_view, "recommendation", None),
+                        "value",
+                        str(getattr(leading_view, "recommendation", "")),
+                    ),
+                    "confidence": round(
+                        float(getattr(leading_view, "confidence", 0.0)), 4
+                    ),
+                    "rationale": (getattr(leading_view, "rationale", "") or "")[:2000],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if leading_view is not None
+            else "(no leading view)"
         ),
     }
 
@@ -915,6 +967,97 @@ def _run_research_manager_judge(
 
 
 # ---------------------------------------------------------------------------
+# W7: Devil's-advocate / red-team adapter (ADR-0080 W7, default-OFF)
+# ---------------------------------------------------------------------------
+
+# The conversational-preamble fallback inlined at ``_render_prompt`` (the same
+# string substituted when a caller passes ``conversational_preamble=None``).
+# Kept as a module constant so the red-team adapter renders an identical style.
+CONVERSATIONAL_PREAMBLE_FALLBACK: str = (
+    "Output conversationally as if you are speaking without any special formatting"
+)
+
+# The role key registered in ``_PROMPT_FILES`` for the devil's-advocate prompt.
+RED_TEAM_ROLE: str = "devils_advocate"
+
+# Deterministic dissent rule (NOT a vote): a critique with confidence >= this
+# fixed, non-optimized threshold surfaces dissent to the operator. Robustness-
+# not-peak (ADR-0080 D80.3 item 3): a single fixed constant, no per-decimal
+# tuning. This NEVER subtracts a ballot from the leading view or flips
+# direction; it only sets a telemetry flag.
+RED_TEAM_DISSENT_THRESHOLD: float = 0.5  # confidence >= this => dissent surfaced
+
+
+def _run_red_team_turn(
+    *,
+    client: Any,
+    config: DeliberativeConfig,
+    market_context: MarketContext,
+    analyst_views: list[AnalystView],
+    baseline_signal: AggregatedSignal,
+    leading_view: Any,  # the judge's ResearchPlan (research_debate schema)
+) -> BullBearTurn | None:
+    """Run ONE Socratic devil's-advocate turn attacking the leading view's
+    REASONING (ADR-0080 W7). Returns a ``BullBearTurn``-shaped critique or None.
+
+    Propose-only: the returned turn carries direction-agnostic critique. The
+    caller (``run_research_debate``) NEVER routes it into bull/bear_turns and the
+    dispatch site forces direction=0. This turn cannot change the committee's
+    direction, magnitude, or final confidence — it only surfaces dissent and
+    fills the plan-level counterarguments (advisory plane only, ADR-0080 D80.5).
+
+    Failure-closed: returns None on any LLM exception, parse failure, or empty
+    ``leading_view``. The stage runner treats None as "no dissent surfaced" — the
+    off-state — so a red-team failure can NEVER block or flip a decision.
+
+    The semantic role is established by ``metadata.red_team=True`` (stage-owned,
+    forge-resistant — overwritten here regardless of LLM output), NOT by the
+    ``role`` literal, which is overloaded to ``"bear_researcher"`` purely so the
+    existing ``BullBearTurn`` parser accepts the payload without a new schema.
+    """
+    if leading_view is None:
+        return None
+    # Quick-tier model (same selection as the bear researcher). The semantic
+    # role is carried by metadata.red_team, not the role string.
+    model = _model_for_role("bear_researcher", config)
+    try:
+        system_text, user_text = _render_prompt(
+            role=RED_TEAM_ROLE,
+            market_context=market_context,
+            analyst_views=analyst_views,
+            baseline_signal=baseline_signal,
+            prior_turns=[],
+            leading_view=leading_view,
+            conversational_preamble=CONVERSATIONAL_PREAMBLE_FALLBACK,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to render devils_advocate prompt")
+        return None
+    phash = _prompt_hash(system_text, user_text)
+    try:
+        raw = _call_llm_json(
+            client=client,
+            model=model,
+            system_text=system_text,
+            user_text=user_text,
+            max_tokens=config.max_tokens_per_turn,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("LLM call raised in _run_red_team_turn")
+        return None
+    if raw is None:
+        return None
+    parsed = _parse_pydantic(raw, BullBearTurn)
+    if parsed is None or not isinstance(parsed, BullBearTurn):
+        return None
+    if parsed.metadata is None:
+        parsed.metadata = {}
+    parsed.metadata["prompt_hash"] = phash
+    parsed.metadata["red_team"] = True  # forge-resistant: stage owns this flag
+    return parsed
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -1068,6 +1211,22 @@ def run_llm_committee(
                             "from_research_debate": True,
                             "structured": jd.model_dump(mode="json"),
                             "terminated_reason": state.terminated_reason,
+                            # ADR-0080 W7 (default-OFF): red-team dissent surfaced
+                            # to the operator as METADATA ONLY. The red-team turn
+                            # is deliberately NOT appended to ``turns`` as a
+                            # directional CommitteeTurn, so deliberative.py's
+                            # direction/magnitude/confidence math is byte-unchanged
+                            # (the structural guarantee that W7 cannot flip a
+                            # decision, ADR-0080 D80.1). When the flag is OFF these
+                            # default to False/""/None/False.
+                            "dissent_surfaced": state.dissent_surfaced,
+                            "dissent_reason": state.dissent_reason,
+                            "red_team_ran": state.red_team_turn is not None,
+                            "counterarguments": (
+                                jd.counterarguments
+                                if jd.counterarguments is not None
+                                else None
+                            ),
                         },
                         tier="deep",
                     )
