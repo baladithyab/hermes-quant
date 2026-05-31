@@ -409,13 +409,33 @@ def tick(
             headroom_summary(portfolio_state, portfolio_caps),
         )
 
+    # ADR-0079 PDR-1 / M17: build the ONE PerceptionFrame here (inside tick), the
+    # producer BOTH the cron and the quant_autonomous_tick TOOL path reach — so
+    # the tool path perceives the same frame the cron does (closes the GAP-D /
+    # M17 tool-vs-cron semantic decoupling structurally, not via a second
+    # monkey-patch). Only build when semantic is ON: with the flag OFF there are
+    # no packets to carry, perception_frame=None is byte-identical to today, and
+    # we skip the redundant fetch. build_perception_frame_live never raises
+    # (returns None on any error) and a None frame is identical to not passing one.
+    _inject_frame = os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "0") == "1"
+
     for entry in watchlist:
         try:
+            _frame = None
+            if _inject_frame:
+                from hermes_quant.perception import build_perception_frame_live
+
+                _frame = build_perception_frame_live(
+                    entry.symbol,
+                    asset_class=entry.asset_class,
+                    timeframe=entry.timeframe,
+                )
             advisor_result = advisor_recommend(
                 symbol=entry.symbol,
                 asset_class=entry.asset_class,
                 timeframe=entry.timeframe,
                 include_lessons=True,
+                perception_frame=_frame,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(

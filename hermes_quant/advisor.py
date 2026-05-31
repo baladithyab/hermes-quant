@@ -645,6 +645,7 @@ def recommend(
     recipe: Any = None,
     recipe_id: str | None = None,
     market_extras: Mapping[str, Any] | None = None,
+    perception_frame: Any = None,
 ) -> dict[str, Any]:
     """Synchronous recommendation for a single symbol. Read-only (ADR-0014).
 
@@ -673,6 +674,14 @@ def recommend(
             per ADR-0005 amendment). For backtest-mode replay queries.
         provider / analysts / aggregator / risk_gate: dependency injection
             for tests. All default to canonical implementations when None.
+        perception_frame: optional ADR-0079 PDR-1 PerceptionFrame built ONCE
+            upstream by build_perception_frame(). When None (the default, and
+            every backtest), the ctx is built internally — byte-identical to
+            today. When provided, the frame is projected into MarketContext via
+            the pure frame_to_context adapter (Steps 5-8 are identical on both
+            branches; M06 ADMIT-before-GATE ordering preserved). When BOTH
+            perception_frame and market_extras are passed, the frame wins (it
+            already absorbed the semantic slice) and a caveat is appended.
 
     Returns:
         Structured dict per ADR-0014 §D1 return-shape table. Never raises
@@ -738,147 +747,176 @@ def recommend(
     result.caveats.append("No portfolio risk context (single-symbol view, ADR-0014 v0.1.2)")
     result.caveats.append("Calibration not updated from this read")
 
-    # ---- Step 1: fetch bars ----
-    if provider is None:
-        try:
-            provider = _get_default_provider(asset_class)
-        except NotImplementedError as exc:
-            result.caveats.append(str(exc))
-            result.data_provider_alive = False
-            return _gated_no_data(result, "asset_class_unsupported")
+    # ---- Steps 1-4: build the MarketContext ----
+    # ADR-0079 PDR-1: when a PerceptionFrame is handed in (built ONCE upstream by
+    # build_perception_frame), just PROJECT it — the frame already did the
+    # fetch -> as_of filter -> still-forming drop -> regime/semantic build. When
+    # no frame is passed (the default, and every backtest), build ctx internally
+    # below — byte-identical to today. A None frame is identical to not passing
+    # one (the simplest contract: crons always build a frame and forward the
+    # possibly-None result without branching).
+    if perception_frame is not None:
+        # Frame-wins precedence (recon §3.3): the frame already absorbed the
+        # semantic slice, so a separately-passed market_extras is ignored.
+        # Silence-by-default posture — caveat, never raise.
+        if market_extras is not None:
+            result.caveats.append("market_extras ignored: perception_frame present")
+        from hermes_quant.perception.adapter import frame_to_context
 
-    # Lookback window (provider's start/end semantics; the per-tf delta
-    # is conservative — extra bars are fine, validate_bars trims to the
-    # requested window if needed).
-    end = asof_ts
-    if timeframe == "1d":
-        start = end - pd.Timedelta(days=lookback_bars * 2)
-    elif timeframe == "1h":
-        start = end - pd.Timedelta(hours=lookback_bars * 3)
-    else:
-        # intraday — yfinance has tight lookback windows; widen by 2x
-        start = end - pd.Timedelta(minutes=lookback_bars * 2 * _tf_minutes(timeframe))
-
-    # Pass `as_of` to the provider for leaf-level lookahead enforcement
-    # (ADR-0005 amendment, Wave C.1). The provider filters bars before
-    # returning; the redundant filter below is kept for fallback safety
-    # in case a custom provider doesn't honor as_of.
-    def _fetch_with_as_of():
-        try:
-            return provider.fetch_bars(symbol, timeframe, start, end, as_of=asof_ts)
-        except TypeError as exc:
-            # Backwards-compat: older providers (or test doubles) without
-            # the as_of kwarg. Only swallow TypeError when the message
-            # matches a kwarg-related signature mismatch — otherwise
-            # propagate (a provider that genuinely raises TypeError from
-            # its body should not be silently retried).
-            if "as_of" in str(exc) or "unexpected keyword" in str(exc):
-                return provider.fetch_bars(symbol, timeframe, start, end)
-            raise
-
-    try:
-        bars = _fetch_with_as_of()
-    except RateLimitError as exc:
-        result.caveats.append(f"Provider rate-limited: {exc}")
-        result.data_provider_alive = False
-        return _gated_no_data(result, "rate_limited")
-    except DataProviderError as exc:
-        result.caveats.append(f"Data provider error: {exc}")
-        result.data_provider_alive = False
-        return _gated_no_data(result, "data_provider_error")
-    except DataQualityError as exc:
-        result.caveats.append(f"Data quality error: {exc}")
-        return _gated_no_data(result, "data_quality_error")
-    except Exception as exc:  # noqa: BLE001 — advisor degrades gracefully
-        result.caveats.append(f"Unexpected provider error: {exc}")
-        result.data_provider_alive = False
-        logger.warning(
-            "advisor: unexpected provider failure for %s: %s",
-            symbol,
-            exc,
-            exc_info=True,
+        ctx = frame_to_context(
+            perception_frame, timeframe=timeframe, asset_class=asset_class
         )
-        return _gated_no_data(result, "unexpected_provider_error")
+        last_bar_ts_utc = perception_frame.asof  # bar-asof = replay anchor (== :856)
+        result.as_of = last_bar_ts_utc
+        result.bars_received = len(perception_frame.bars)
+        # last_bar_age_minutes is wall-clock-derived and excluded from the
+        # replay-compared keys; derive it identically to the None branch so any
+        # consumer that reads it sees the same value.
+        if asof_ts is not None:
+            age_seconds = (asof_ts - last_bar_ts_utc).total_seconds()
+            result.last_bar_age_minutes = max(0.0, age_seconds / 60.0)
+    else:
+        # ---- Step 1: fetch bars ----
+        if provider is None:
+            try:
+                provider = _get_default_provider(asset_class)
+            except NotImplementedError as exc:
+                result.caveats.append(str(exc))
+                result.data_provider_alive = False
+                return _gated_no_data(result, "asset_class_unsupported")
 
-    # ---- Step 2: as_of filter (lookahead enforcement) ----
-    # Cheap empty-check first — empty-bars DataFrame from a test fixture
-    # may have no datetime dtype on the timestamp column, which would
-    # crash the `.dt.tz` access below.
-    if len(bars) == 0:
-        return _gated_no_data(result, "no_bars_returned")
-
-    if asof_ts is not None and "timestamp" in bars.columns:
-        # Compare-safe even when bars timestamps are tz-naive
-        bar_ts = bars["timestamp"]
-        if bar_ts.dt.tz is None:
-            cutoff = asof_ts.tz_convert(None) if asof_ts.tzinfo else asof_ts
+        # Lookback window (provider's start/end semantics; the per-tf delta
+        # is conservative — extra bars are fine, validate_bars trims to the
+        # requested window if needed).
+        end = asof_ts
+        if timeframe == "1d":
+            start = end - pd.Timedelta(days=lookback_bars * 2)
+        elif timeframe == "1h":
+            start = end - pd.Timedelta(hours=lookback_bars * 3)
         else:
-            cutoff = asof_ts
-        bars = bars[bar_ts <= cutoff].copy()
+            # intraday — yfinance has tight lookback windows; widen by 2x
+            start = end - pd.Timedelta(minutes=lookback_bars * 2 * _tf_minutes(timeframe))
 
-    result.bars_received = len(bars)
-    if result.bars_received == 0:
-        return _gated_no_data(result, "no_bars_returned")
+        # Pass `as_of` to the provider for leaf-level lookahead enforcement
+        # (ADR-0005 amendment, Wave C.1). The provider filters bars before
+        # returning; the redundant filter below is kept for fallback safety
+        # in case a custom provider doesn't honor as_of.
+        def _fetch_with_as_of():
+            try:
+                return provider.fetch_bars(symbol, timeframe, start, end, as_of=asof_ts)
+            except TypeError as exc:
+                # Backwards-compat: older providers (or test doubles) without
+                # the as_of kwarg. Only swallow TypeError when the message
+                # matches a kwarg-related signature mismatch — otherwise
+                # propagate (a provider that genuinely raises TypeError from
+                # its body should not be silently retried).
+                if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+                    return provider.fetch_bars(symbol, timeframe, start, end)
+                raise
 
-    # ADR-0069: drop the still-forming last bar for daily-timeframe equity reads
-    # mid-session. yfinance returns today's intraday-still-forming bar with a
-    # close that's the latest tick — not a settled bar close. Reading that as
-    # `last_close` breaks replay equality, calibration distributions, and
-    # downstream slippage attribution. Surface the dropped values in extras
-    # for analysts that explicitly opt in.
-    from hermes_quant.data.bar_alignment import drop_still_forming_bar
-    bars, _bar_alignment_info = drop_still_forming_bar(bars, timeframe, asset_class)
-    if _bar_alignment_info["still_forming_dropped"]:
+        try:
+            bars = _fetch_with_as_of()
+        except RateLimitError as exc:
+            result.caveats.append(f"Provider rate-limited: {exc}")
+            result.data_provider_alive = False
+            return _gated_no_data(result, "rate_limited")
+        except DataProviderError as exc:
+            result.caveats.append(f"Data provider error: {exc}")
+            result.data_provider_alive = False
+            return _gated_no_data(result, "data_provider_error")
+        except DataQualityError as exc:
+            result.caveats.append(f"Data quality error: {exc}")
+            return _gated_no_data(result, "data_quality_error")
+        except Exception as exc:  # noqa: BLE001 — advisor degrades gracefully
+            result.caveats.append(f"Unexpected provider error: {exc}")
+            result.data_provider_alive = False
+            logger.warning(
+                "advisor: unexpected provider failure for %s: %s",
+                symbol,
+                exc,
+                exc_info=True,
+            )
+            return _gated_no_data(result, "unexpected_provider_error")
+
+        # ---- Step 2: as_of filter (lookahead enforcement) ----
+        # Cheap empty-check first — empty-bars DataFrame from a test fixture
+        # may have no datetime dtype on the timestamp column, which would
+        # crash the `.dt.tz` access below.
+        if len(bars) == 0:
+            return _gated_no_data(result, "no_bars_returned")
+
+        if asof_ts is not None and "timestamp" in bars.columns:
+            # Compare-safe even when bars timestamps are tz-naive
+            bar_ts = bars["timestamp"]
+            if bar_ts.dt.tz is None:
+                cutoff = asof_ts.tz_convert(None) if asof_ts.tzinfo else asof_ts
+            else:
+                cutoff = asof_ts
+            bars = bars[bar_ts <= cutoff].copy()
+
         result.bars_received = len(bars)
         if result.bars_received == 0:
-            return _gated_no_data(result, "no_bars_after_still_forming_drop")
+            return _gated_no_data(result, "no_bars_returned")
 
-    # ---- Step 3: data-quality probe ----
-    # validate_bars normalizes to tz-NAIVE UTC (per data/base.py L75). Convert
-    # back to tz-aware UTC for arithmetic with asof_ts (which is tz-aware).
-    last_bar_ts = bars["timestamp"].iloc[-1]
-    last_bar_ts = pd.Timestamp(last_bar_ts)
-    if last_bar_ts.tzinfo is None:
-        last_bar_ts_utc = last_bar_ts.tz_localize("UTC")
-    else:
-        last_bar_ts_utc = last_bar_ts.tz_convert("UTC")
-    age_seconds = (asof_ts - last_bar_ts_utc).total_seconds()
-    result.last_bar_age_minutes = max(0.0, age_seconds / 60.0)
-    result.as_of = last_bar_ts_utc  # actual data anchor, not wall clock
+        # ADR-0069: drop the still-forming last bar for daily-timeframe equity reads
+        # mid-session. yfinance returns today's intraday-still-forming bar with a
+        # close that's the latest tick — not a settled bar close. Reading that as
+        # `last_close` breaks replay equality, calibration distributions, and
+        # downstream slippage attribution. Surface the dropped values in extras
+        # for analysts that explicitly opt in.
+        from hermes_quant.data.bar_alignment import drop_still_forming_bar
+        bars, _bar_alignment_info = drop_still_forming_bar(bars, timeframe, asset_class)
+        if _bar_alignment_info["still_forming_dropped"]:
+            result.bars_received = len(bars)
+            if result.bars_received == 0:
+                return _gated_no_data(result, "no_bars_after_still_forming_drop")
 
-    # ---- Step 4: build MarketContext ----
-    ctx_extras_base = dict(market_extras or {})
-    # ADR-0069: surface dropped still-forming bar values so analysts that
-    # genuinely want today's intraday tick can read them explicitly via extras.
-    # Default consumers see clean settled-bar `last_close`.
-    if _bar_alignment_info["still_forming_dropped"]:
-        ctx_extras_base["still_forming_close"] = _bar_alignment_info["still_forming_close"]
-        ctx_extras_base["still_forming_high"] = _bar_alignment_info["still_forming_high"]
-        ctx_extras_base["still_forming_low"] = _bar_alignment_info["still_forming_low"]
-        ctx_extras_base["still_forming_volume"] = _bar_alignment_info["still_forming_volume"]
-    # Per ADR-0063: regime is canonical; merge OVER caller values
-    try:
-        from hermes_quant.regime.extras_builder import build_regime_extras
-        regime_extras = build_regime_extras(symbol, bars)
-        ctx_extras_base.update(regime_extras)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("recommend: regime extras build failed for %s: %s",
-                       symbol, exc, exc_info=True)
-        ctx_extras_base.setdefault("regime", None)
-        ctx_extras_base.setdefault("regime_failure", f"extras_builder_error: {exc}")
-        ctx_extras_base.setdefault("regime_classifier_kind", "unavailable")
+        # ---- Step 3: data-quality probe ----
+        # validate_bars normalizes to tz-NAIVE UTC (per data/base.py L75). Convert
+        # back to tz-aware UTC for arithmetic with asof_ts (which is tz-aware).
+        last_bar_ts = bars["timestamp"].iloc[-1]
+        last_bar_ts = pd.Timestamp(last_bar_ts)
+        if last_bar_ts.tzinfo is None:
+            last_bar_ts_utc = last_bar_ts.tz_localize("UTC")
+        else:
+            last_bar_ts_utc = last_bar_ts.tz_convert("UTC")
+        age_seconds = (asof_ts - last_bar_ts_utc).total_seconds()
+        result.last_bar_age_minutes = max(0.0, age_seconds / 60.0)
+        result.as_of = last_bar_ts_utc  # actual data anchor, not wall clock
 
-    ctx = MarketContext(
-        asset=symbol,
-        timeframe=timeframe,
-        asset_class=asset_class,
-        exchange=None,  # yfinance equity has no notion of exchange
-        bars=bars,
-        last_close=float(bars["close"].iloc[-1]),
-        last_volume=float(bars["volume"].iloc[-1]),
-        asof=last_bar_ts_utc,
-        extras=ctx_extras_base,
-    )
+        # ---- Step 4: build MarketContext ----
+        ctx_extras_base = dict(market_extras or {})
+        # ADR-0069: surface dropped still-forming bar values so analysts that
+        # genuinely want today's intraday tick can read them explicitly via extras.
+        # Default consumers see clean settled-bar `last_close`.
+        if _bar_alignment_info["still_forming_dropped"]:
+            ctx_extras_base["still_forming_close"] = _bar_alignment_info["still_forming_close"]
+            ctx_extras_base["still_forming_high"] = _bar_alignment_info["still_forming_high"]
+            ctx_extras_base["still_forming_low"] = _bar_alignment_info["still_forming_low"]
+            ctx_extras_base["still_forming_volume"] = _bar_alignment_info["still_forming_volume"]
+        # Per ADR-0063: regime is canonical; merge OVER caller values
+        try:
+            from hermes_quant.regime.extras_builder import build_regime_extras
+            regime_extras = build_regime_extras(symbol, bars)
+            ctx_extras_base.update(regime_extras)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("recommend: regime extras build failed for %s: %s",
+                           symbol, exc, exc_info=True)
+            ctx_extras_base.setdefault("regime", None)
+            ctx_extras_base.setdefault("regime_failure", f"extras_builder_error: {exc}")
+            ctx_extras_base.setdefault("regime_classifier_kind", "unavailable")
+
+        ctx = MarketContext(
+            asset=symbol,
+            timeframe=timeframe,
+            asset_class=asset_class,
+            exchange=None,  # yfinance equity has no notion of exchange
+            bars=bars,
+            last_close=float(bars["close"].iloc[-1]),
+            last_volume=float(bars["volume"].iloc[-1]),
+            asof=last_bar_ts_utc,
+            extras=ctx_extras_base,
+        )
 
     # ---- Step 5: run analysts ----
     if analysts is None:

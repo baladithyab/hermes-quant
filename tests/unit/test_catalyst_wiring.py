@@ -5,11 +5,14 @@ The single catalyst->advisor wiring seam. These pin:
   * no-packets / error -> None (silence-by-default, never raises),
   * flag-ON + a packet in the store -> dict with semantic_packets + decision_asof
     stamped (and base_extras preserved),
-  * the regression test for gap G3: all three live decision paths route packets
-    through this helper so a flipped flag takes effect on every path.
+  * the regression test for gap G3 / M17: all three live decision paths route
+    packets to the advisor so a flipped flag takes effect on every path. Post
+    ADR-0079 PDR-1 the helper is now an INTERNAL of build_perception_frame, and
+    the 3 crons hand the advisor a PerceptionFrame carrying semantic_packets
+    (the single producer) instead of three bespoke market_extras dicts.
 
 No network: the packet store is a tmp_path JSONL the helper reads via
-load_packets_for; advisor.recommend is monkeypatched to a spy.
+load_packets_for; the default provider + advisor.recommend are monkeypatched.
 """
 
 from __future__ import annotations
@@ -18,7 +21,47 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
 from hermes_quant.catalyst import synthesize, wiring
+
+
+class _RecordingProvider:
+    """Canned-bars provider so build_perception_frame_live never hits network."""
+
+    name = "recording"
+    asset_classes = ["equity"]
+    timeframes = ["1d"]
+    requires_credentials = False
+
+    def __init__(self, n: int = 120):
+        rng = np.random.default_rng(seed=42)
+        ts = pd.date_range("2026-01-01", periods=n, freq="1D", tz="UTC")
+        closes = 100.0 + np.arange(n) * 0.5 + rng.normal(0, 0.5, n)
+        self._bars = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "open": closes - 0.1,
+                "high": closes + 0.4,
+                "low": closes - 0.4,
+                "close": closes,
+                "volume": rng.uniform(1e6, 5e6, n),
+            }
+        )
+
+    def fetch_bars(self, asset, timeframe, start, end, *, use_cache=True, as_of=None):
+        out = self._bars.copy()
+        if as_of is not None:
+            cutoff = as_of if as_of.tzinfo else as_of.tz_localize("UTC")
+            out = out[out["timestamp"] <= cutoff].reset_index(drop=True)
+        return out
+
+
+def _patch_default_provider(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_quant.advisor._get_default_provider", lambda asset_class: _RecordingProvider()
+    )
 
 
 def _write_packet(
@@ -114,9 +157,11 @@ def _arm_store(monkeypatch, tmp_path, symbol: str) -> Path:
 
 
 def test_daily_interim_path_injects_packets(monkeypatch, tmp_path):
-    """quant-daily-interim recommend_one routes packets through the helper."""
+    """quant-daily-interim recommend_one hands the advisor a PerceptionFrame
+    carrying semantic_packets (PDR-1: the single producer, not market_extras)."""
     advisor = __import__("hermes_quant.advisor", fromlist=["recommend"])
     _arm_store(monkeypatch, tmp_path, "AAPL")
+    _patch_default_provider(monkeypatch)
 
     captured: dict = {}
 
@@ -128,84 +173,81 @@ def test_daily_interim_path_injects_packets(monkeypatch, tmp_path):
 
     import_mod = _load_script("quant-daily-interim.py")
     import_mod.recommend_one("AAPL", "equity", "1d")
-    me = captured.get("market_extras")
-    assert me is not None and me.get("semantic_packets"), (
-        "daily-interim did not inject semantic_packets via the wiring helper"
+    frame = captured.get("perception_frame")
+    assert frame is not None and frame.semantic_packets, (
+        "daily-interim did not hand the advisor a frame carrying semantic_packets"
     )
 
 
 def test_autonomous_tick_path_injects_packets(monkeypatch, tmp_path):
-    """quant-autonomous-tick's shipped _direction_screened_recommend injects packets.
+    """The autonomous path hands the advisor a PerceptionFrame carrying packets.
 
-    Loads the REAL ops/scripts/quant-autonomous-tick.py (like the daily-interim +
-    playbook siblings) and drives run_tick() so the actual shipped wrapper closure
-    runs — removing the wiring call from the real script would now fail this test.
-
-    The wrapper is built inside run_tick and handed to auto.tick as advisor_recommend.
-    We stub auto.tick to invoke that callback exactly as the real pipeline does
-    (autonomous.py: advisor_recommend(symbol=..., asset_class=..., timeframe=...,
-    include_lessons=True)) so the wrapper executes against the spied advisor.recommend.
-    The bias gate is OFF by default, so the wrapper returns the base result untouched
-    — but it must still have injected market_extras before calling the base recommend.
+    Post ADR-0079 PDR-1 / M17, the producer moved OUT of the cron's
+    _direction_screened_recommend wrapper and INTO autonomous.tick itself (so the
+    quant_autonomous_tick TOOL path perceives the same frame). This drives the
+    REAL autonomous.tick with the flag ON; the frame it builds must reach the
+    spied advisor as perception_frame carrying semantic_packets.
     """
     _arm_store(monkeypatch, tmp_path, "AAPL")
+    _patch_default_provider(monkeypatch)
     advisor = __import__("hermes_quant.advisor", fromlist=["recommend"])
 
     captured: dict = {}
 
     def _spy(**kwargs):
         captured.update(kwargs)
-        return {"aggregated_signal": {"direction": 0}, "risk_gate": {}}
+        return {
+            "as_of": "2026-01-01T00:00:00Z",
+            "decision_price": 100.0,
+            "signal_id": "sig",
+            "aggregated_signal": {"direction": 0, "confidence": 0.5, "magnitude": 0.01},
+            "risk_gate": {"pass": False, "kelly_fraction": 0.0, "gated_reason": "flat"},
+            "analyst_views": [],
+            "lessons": [],
+        }
 
     monkeypatch.setattr(advisor, "recommend", _spy)
 
-    tick_mod = _load_script("quant-autonomous-tick.py")
-
-    # Deterministic, filesystem-independent run: no halt, one active symbol,
-    # audit writes redirected away from the real ~/.hermes home.
-    monkeypatch.setattr(tick_mod, "read_active_halts", lambda: [])
-    monkeypatch.setattr(
-        tick_mod, "load_active_watchlist", lambda: [("AAPL", "equity", "1d", ["swing"])]
-    )
-    monkeypatch.setattr(tick_mod, "AUDIT_LOG_PATH", tmp_path / "autonomous-tick.jsonl")
+    import yaml
 
     import hermes_quant.autonomous as auto
+    from hermes_quant.watchlist import WatchlistEntry
 
-    def _fake_tick(*, dry_run, symbols, advisor_recommend):
-        # Mirror the real pipeline's advisor invocation so the SHIPPED wrapper
-        # closure executes (autonomous.py calls it with these kwargs).
-        for entry in symbols:
-            advisor_recommend(
-                symbol=entry.symbol,
-                asset_class=entry.asset_class,
-                timeframe=entry.timeframe,
-                include_lessons=True,
-            )
-        return auto.TickResult(
-            asof="2026-01-01T00:00:00Z",
-            mode="autonomous",
-            dry_run=dry_run,
-            watchlist_size=len(symbols),
-        )
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        yaml.safe_dump({"quant": {"pdr": {"mode": "autonomous"}}}), encoding="utf-8"
+    )
+    monkeypatch.setattr("hermes_quant.watchlist.get_config_path", lambda: cfg)
+    qhome = tmp_path / "quant"
+    qhome.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("hermes_quant.autonomous.QUANT_HOME", qhome)
+    monkeypatch.setattr(
+        "hermes_quant.autonomous.KILL_SWITCH_PATH", qhome / "autonomous_kill_switch.json"
+    )
 
-    monkeypatch.setattr(auto, "tick", _fake_tick)
+    auto.tick(
+        dry_run=True,
+        symbols=[WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d")],
+        advisor_recommend=_spy,
+    )
 
-    tick_mod.run_tick(armed=False)
-
-    me = captured.get("market_extras")
-    assert me is not None and me.get("semantic_packets"), (
-        "autonomous-tick did not inject semantic_packets via the wiring helper"
+    frame = captured.get("perception_frame")
+    assert frame is not None and frame.semantic_packets, (
+        "autonomous.tick did not hand the advisor a frame carrying semantic_packets "
+        "(M17: producer must live inside tick so the tool path perceives it too)"
     )
 
 
 def test_playbook_tick_path_injects_packets(monkeypatch, tmp_path):
-    """quant-playbook-tick call_advisor routes packets through the helper.
+    """quant-playbook-tick call_advisor hands the advisor a PerceptionFrame
+    carrying semantic_packets (PDR-1: the single producer, not market_extras).
 
-    Mock mode short-circuits before the wiring seam, so we run the real
-    advisor path with advisor.recommend monkeypatched to a spy.
+    Mock mode short-circuits before the seam, so we run the real advisor path
+    with advisor.recommend monkeypatched to a spy.
     """
     monkeypatch.delenv("HERMES_QUANT_PLAYBOOK_TICK_MOCK", raising=False)
     _arm_store(monkeypatch, tmp_path, "AAPL")
+    _patch_default_provider(monkeypatch)
     advisor = __import__("hermes_quant.advisor", fromlist=["recommend"])
 
     captured: dict = {}
@@ -219,9 +261,9 @@ def test_playbook_tick_path_injects_packets(monkeypatch, tmp_path):
 
     pt = _load_script("quant-playbook-tick.py")
     pt.call_advisor("AAPL")
-    me = captured.get("market_extras")
-    assert me is not None and me.get("semantic_packets"), (
-        "playbook-tick did not inject semantic_packets via the wiring helper"
+    frame = captured.get("perception_frame")
+    assert frame is not None and frame.semantic_packets, (
+        "playbook-tick did not hand the advisor a frame carrying semantic_packets"
     )
 
 

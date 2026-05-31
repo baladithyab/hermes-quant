@@ -461,19 +461,23 @@ def call_advisor(symbol: str) -> dict[str, Any]:
     horizons, dropped = _parse_horizons(horizons_env) if horizons_env else (["1d"], [])
     primary_timeframe = horizons[-1] if horizons else "1d"
 
-    # C2-2: inject lookahead-honest semantic packets via the single
-    # catalyst->advisor wiring seam so HERMES_QUANT_SEMANTIC_ENABLED takes effect
-    # on this path too (gap G3). Returns None (advisor unchanged — recommend
-    # treats market_extras=None as the existing no-op) when semantic is OFF /
-    # no packets. The _mock_recommend path above never reaches here.
+    # ADR-0079 PDR-1: build the ONE PerceptionFrame and hand it to
+    # recommend(perception_frame=). The frame absorbs the semantic slice (the old
+    # catalyst->advisor wiring seam), so HERMES_QUANT_SEMANTIC_ENABLED=1 takes
+    # effect through the single producer on this path. build_perception_frame_live
+    # never raises (returns None on any error); a None frame is identical to not
+    # passing one — recommend's None branch behaves exactly as today. The
+    # _mock_recommend path above never reaches here.
     try:
-        from hermes_quant.catalyst.wiring import semantic_market_extras
-        _me = semantic_market_extras(symbol, horizon=primary_timeframe)
-    except Exception:  # noqa: BLE001 — never block the tick on packet loading
-        _me = None
+        from hermes_quant.perception import build_perception_frame_live
+        _frame = build_perception_frame_live(
+            symbol, asset_class="equity", timeframe=primary_timeframe
+        )
+    except Exception:  # noqa: BLE001 — never block the tick on frame building
+        _frame = None
     try:
         result = _recommend(symbol, asset_class="equity",
-                            timeframe=primary_timeframe, market_extras=_me)
+                            timeframe=primary_timeframe, perception_frame=_frame)
     except Exception as e:
         return {"gate": {"action": "ERROR", "reason": f"advisor_exception: {type(e).__name__}: {e}"},
                 "caveats": [traceback.format_exc()]}

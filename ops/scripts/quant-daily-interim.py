@@ -113,19 +113,19 @@ def recommend_one(symbol: str, asset_class: str = "equity", timeframe: str = "1d
     """
     try:
         from hermes_quant.advisor import recommend
-        # ADR-0074 / C2-2: load lookahead-honest semantic packets for this symbol
-        # and forward them via market_extras through the SINGLE catalyst->advisor
-        # wiring seam (hermes_quant.catalyst.wiring.semantic_market_extras). The
-        # catalyst subsystem writes packets (asof=publication time); the helper
-        # validates non-future + freshness against decision time (wall-clock now,
-        # so the live path doesn't reject today's news against a stale daily bar —
-        # ADR-0074/0068), and the HermesSemanticAnalyst re-validates against
-        # ctx.asof. Returns None when the subsystem is off / has no packets, and
-        # recommend(market_extras=None) is the existing no-op -> advisor unchanged.
-        from hermes_quant.catalyst.wiring import semantic_market_extras
-        market_extras = semantic_market_extras(symbol, horizon=timeframe)
+        # ADR-0079 PDR-1: build the ONE PerceptionFrame for this symbol and hand
+        # it to recommend(perception_frame=). The frame absorbs the semantic slice
+        # (the old catalyst->advisor wiring seam, semantic_market_extras), so
+        # HERMES_QUANT_SEMANTIC_ENABLED=1 takes effect through the single producer
+        # on this path. build_perception_frame returns None on any no-data / error
+        # outcome; a None frame is identical to not passing one (recommend's None
+        # branch re-fetches and behaves exactly as today — byte-identical).
+        from hermes_quant.perception import build_perception_frame_live
+        frame = build_perception_frame_live(
+            symbol, asset_class=asset_class, timeframe=timeframe
+        )
         result = recommend(symbol=symbol, asset_class=asset_class,
-                           timeframe=timeframe, market_extras=market_extras)
+                           timeframe=timeframe, perception_frame=frame)
         agg = result.get("aggregated_signal") or {}
         gate = result.get("risk_gate") or {}
         dq = result.get("data_quality") or {}

@@ -331,19 +331,14 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
         direction can't structurally route through any of the symbol's eligible
         plays. Neutralization sets risk_gate.pass=False so auto.tick never fires
         the React — the order is genuinely prevented, not relabeled after the
-        fact. No-op (returns the advisor result untouched) when the flag is OFF."""
-        # C2-2: inject lookahead-honest semantic packets via the single
-        # catalyst->advisor wiring seam so HERMES_QUANT_SEMANTIC_ENABLED takes
-        # effect on this path too (gap G3). Lazy import keeps the module import
-        # surface unchanged; the helper returns None (advisor unchanged) when
-        # semantic is OFF / no packets. Only inject when the caller hasn't
-        # already supplied market_extras (don't clobber an explicit override).
-        _inj_sym = kwargs.get("symbol")
-        if _inj_sym and "market_extras" not in kwargs:
-            from hermes_quant.catalyst.wiring import semantic_market_extras
-            _me = semantic_market_extras(_inj_sym, horizon=kwargs.get("timeframe", "1d"))
-            if _me is not None:
-                kwargs = {**kwargs, "market_extras": _me}
+        fact. No-op (returns the advisor result untouched) when the flag is OFF.
+
+        ADR-0079 PDR-1 / M17: this wrapper is now a PURE post-processor — it no
+        longer injects semantic packets. The PerceptionFrame is built ONCE inside
+        autonomous.tick (the producer BOTH this cron and the quant_autonomous_tick
+        TOOL path reach), so the tool path perceives the same frame the cron does.
+        kwargs (including any perception_frame=) are forwarded to recommend
+        verbatim."""
         res = _base_recommend(**kwargs)
         if not _direction_bias_gate_on:
             return res

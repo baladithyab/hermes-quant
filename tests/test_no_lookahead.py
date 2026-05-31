@@ -740,6 +740,178 @@ def test_catalyst_admissions_admitted_packet_asof_not_after_decision(monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# Invariant 7b — PerceptionFrame PRODUCING path is lookahead-honest (S5/M21,
+# PDR-1 frame-path extension; ADR-0079 D-4 / Rollout PDR-1 "no-lookahead gate
+# green" on the frame path).
+# ---------------------------------------------------------------------------
+# The frame builder (build_perception_frame) is now the PRODUCER of
+# decision_asof + semantic_packets (it absorbed catalyst/wiring.py's
+# semantic_market_extras). So the ADR-0074 publication-time honesty must hold
+# THROUGH the frame path: a packet published after the decision asof must be
+# excluded by the builder (not just re-dropped later by the consuming analyst),
+# and the projected ctx must carry decision_asof verbatim so the SemanticAnalyst's
+# `<=` cutoff (semantic.py:161-172) is unchanged.
+
+
+class _InertProvider:
+    """Returns canned bars with an as_of cutoff (mirrors _RecordingProvider).
+    Bars are inert filler — the producing-path honesty under test is in
+    packet-time space, not bar-position space."""
+
+    name = "inert"
+    asset_classes = ["equity"]
+    timeframes = ["1d"]
+    requires_credentials = False
+
+    def __init__(self, bars: pd.DataFrame):
+        self._bars = bars
+
+    def fetch_bars(self, asset, timeframe, start, end, *, use_cache: bool = True, as_of=None):
+        out = self._bars.copy()
+        if as_of is not None:
+            cutoff = as_of if as_of.tzinfo else as_of.tz_localize("UTC")
+            out = out[out["timestamp"] <= cutoff].reset_index(drop=True)
+        return out
+
+
+def test_build_perception_frame_excludes_future_asof_packet(monkeypatch, tmp_path):
+    """build_perception_frame(symbol, decision_asof=T) must absorb ONLY packets
+    with asof <= T. A packet published AFTER T must be excluded by the PRODUCING
+    (frame-builder) seam — proving the frame path is lookahead-honest, not just
+    the consuming analyst (S5/M21). The future packet is the LOUDER one so any
+    leak is unmistakable."""
+    from hermes_quant.catalyst import synthesize
+    from hermes_quant.perception.builder import build_perception_frame
+
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "1")
+    store = tmp_path / "packets.jsonl"
+    monkeypatch.setattr(synthesize, "_DEFAULT_STORE", store)
+
+    decision = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _write_store_packet(  # published BEFORE the decision -> admissible
+        store, asset="AAPL", asof="2026-01-01T09:00:00Z",
+        stance="bullish", confidence=0.70, magnitude=0.01,
+    )
+    _write_store_packet(  # published AFTER the decision -> MUST be excluded
+        store, asset="AAPL", asof="2026-01-01T15:00:00Z",
+        stance="bearish", confidence=0.95, magnitude=0.05,
+    )
+
+    bars = _make_bars(120, trend=0.5, seed=42)
+    asof_ts = pd.Timestamp(bars["timestamp"].iloc[-1])
+    frame = build_perception_frame(
+        "AAPL",
+        timeframe="1d",
+        asset_class="equity",
+        provider=_InertProvider(bars),
+        asof_ts=asof_ts,
+        lookback_bars=200,
+        decision_asof=decision,
+    )
+    assert frame is not None
+    assert frame.semantic_packets, "frame absorbed no packets despite a valid past packet"
+    asofs = [pd.Timestamp(p["asof"]) for p in frame.semantic_packets]
+    cutoff = pd.Timestamp(decision)
+    for a in asofs:
+        a_utc = a.tz_localize("UTC") if a.tzinfo is None else a.tz_convert("UTC")
+        assert a_utc <= cutoff, (
+            f"build_perception_frame absorbed a future packet asof={a_utc} > "
+            f"decision_asof={cutoff} — FRAME PRODUCING-path lookahead leak (M21)"
+        )
+    stances = {p["stance"] for p in frame.semantic_packets}
+    assert stances == {"bullish"}, (
+        f"future bearish packet leaked into the frame: stances={stances}"
+    )
+
+
+def test_build_perception_frame_only_future_packet_absorbs_nothing(monkeypatch, tmp_path):
+    """When the ONLY stored packet is published after the decision asof, the
+    frame builder absorbs NOTHING (empty semantic_packets, no decision_asof) —
+    the producing path silences by default rather than handing a future packet on."""
+    from hermes_quant.catalyst import synthesize
+    from hermes_quant.perception.builder import build_perception_frame
+
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "1")
+    store = tmp_path / "packets.jsonl"
+    monkeypatch.setattr(synthesize, "_DEFAULT_STORE", store)
+
+    decision = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _write_store_packet(
+        store, asset="AAPL", asof="2026-01-01T15:00:00Z",
+        stance="bearish", confidence=0.95, magnitude=0.05,
+    )
+    bars = _make_bars(120, trend=0.5, seed=42)
+    frame = build_perception_frame(
+        "AAPL",
+        timeframe="1d",
+        asset_class="equity",
+        provider=_InertProvider(bars),
+        asof_ts=pd.Timestamp(bars["timestamp"].iloc[-1]),
+        lookback_bars=200,
+        decision_asof=decision,
+    )
+    assert frame is not None
+    assert frame.semantic_packets == (), (
+        "frame absorbed a future-only packet — FRAME PRODUCING-path lookahead leak"
+    )
+    assert "decision_asof" not in frame.extras
+
+
+def test_frame_to_context_preserves_decision_asof_cutoff():
+    """The frame carries decision_asof in extras verbatim; after projection the
+    SemanticAnalyst's `<=` cutoff (semantic.py:161-172) is unchanged — a packet
+    with asof > decision_asof has ZERO influence post-projection. We prove this by
+    differencing the projected-ctx view against the future-absent case."""
+    from hermes_quant.perception.adapter import frame_to_context
+    from hermes_quant.perception.frame import PerceptionFrame
+
+    bar_asof = "2026-01-01T00:00:00Z"  # stale daily-bar close
+    decision = "2026-01-01T12:00:00Z"  # live wall-clock decision time
+    live_past = _semantic_packet(
+        asof="2026-01-01T09:00:00Z", stance="bullish", confidence=0.70, magnitude=0.010
+    )
+    future = _semantic_packet(
+        asof="2026-01-01T15:00:00Z", stance="bearish", confidence=0.95, magnitude=0.050
+    )
+
+    bars = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=5, freq="1h", tz="UTC"),
+            "open": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "high": [101.0, 102.0, 103.0, 104.0, 105.0],
+            "low": [99.0, 100.0, 101.0, 102.0, 103.0],
+            "close": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "volume": [1000.0] * 5,
+        }
+    )
+
+    def _frame(packets):
+        return PerceptionFrame(
+            symbol="BTC/USDT",
+            asof=pd.Timestamp(bar_asof),
+            bars=bars,
+            last_close=104.0,
+            semantic_packets=tuple(packets),
+            extras={"decision_asof": decision},
+        )
+
+    ctx_both = frame_to_context(_frame([live_past, future]), timeframe="1h", asset_class="crypto")
+    ctx_past_only = frame_to_context(_frame([live_past]), timeframe="1h", asset_class="crypto")
+
+    view_both = HermesSemanticAnalyst().analyze(ctx_both)
+    view_past_only = HermesSemanticAnalyst().analyze(ctx_past_only)
+
+    assert view_both is not None and view_past_only is not None
+    assert _views_equal(view_both, view_past_only), (
+        "future-asof packet influenced the view AFTER frame projection — the "
+        "adapter failed to pass decision_asof through verbatim (S5/M21 frame-path)"
+    )
+    # Concretely: the admitted packet is the PAST (bullish) one, never the future.
+    assert view_both.direction == 1
+    assert view_both.metadata["packet_asof"] == live_past["asof"]
+
+
+# ---------------------------------------------------------------------------
 # Invariant 6 — Kronos (heavy/optional): view at T is independent of future
 # bars. Guarded by importorskip so CI without the model still passes green.
 # ---------------------------------------------------------------------------
