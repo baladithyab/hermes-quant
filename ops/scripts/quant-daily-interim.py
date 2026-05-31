@@ -534,6 +534,8 @@ def _compute_research_section_inner() -> str:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(row, dict):
+            continue  # silence-by-default: a valid-JSON non-dict line (corrupt append)
         hid = row.get("hypothesis_id") or ""
         if not hid:
             continue

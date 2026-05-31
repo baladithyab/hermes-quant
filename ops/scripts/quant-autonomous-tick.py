@@ -174,6 +174,8 @@ def fired_today() -> set[str]:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(row, dict):
+                    continue  # silence-by-default: a valid-JSON non-dict line (corrupt append)
                 if row.get("event") != "decision":
                     continue
                 if row.get("date_et") != today:

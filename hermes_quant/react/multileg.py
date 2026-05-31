@@ -303,6 +303,8 @@ class MultiLegPaperReactor:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(rec, dict):
+                continue  # silence-by-default: a valid-JSON non-dict line (corrupt append)
             meta = rec.get("reactor_metadata") or {}
             if meta.get("multi_leg_id") == multi_leg_id and meta.get("role") == "parent":
                 return _dict_to_record(rec)

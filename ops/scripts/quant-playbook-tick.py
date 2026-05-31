@@ -183,6 +183,8 @@ def fired_today_pairs() -> set[tuple[str, str]]:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(row, dict):
+                    continue  # silence-by-default: a valid-JSON non-dict line (corrupt append)
                 if row.get("date_et") != today:
                     continue
                 if row.get("decision") != "fire":

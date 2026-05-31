@@ -226,7 +226,10 @@ def main() -> int:
     # NO-LOOKAHEAD: split TIME-ORDERED into TRAIN/HOLDOUT *before* the proposer runs. The proposer
     # (evaluate_all → propose_weights) sees TRAIN bars ONLY; the HOLDOUT is a strictly-later window.
     train, holdout = _split_train_holdout(bars)
-    if len(train) < 60 or len(holdout) < 30:
+    # holdout needs >= 31 bars: score_holdout's .shift(-1) (next-bar return) consumes 1 bar, so a
+    # 30-bar holdout yields only 29 usable obs < MIN_OBSERVATIONS=30 and would always
+    # conservative-fail. Require 31 so a holdout clearing this gate has >= 30 scored observations.
+    if len(train) < 60 or len(holdout) < 31:
         return 0  # silence-by-default: not enough bars for an honest train/holdout split
 
     proposal_set, zoo = _build_proposal_set(train)
