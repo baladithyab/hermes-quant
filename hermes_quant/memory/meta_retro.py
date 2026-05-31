@@ -304,9 +304,13 @@ def _default_realized_alpha_lookup() -> Callable[[str], float | None]:
         # decision_id suffix in this codebase's id scheme).
         if proposal_id in alpha_by_decision:
             return alpha_by_decision[proposal_id]
-        for did, alpha in alpha_by_decision.items():
+        # Iterate in a stable, file-order-independent order so the substring
+        # join's tie-break (when >1 decision_id substring-matches) is
+        # deterministic. Without sorted() the "first match wins" outcome would
+        # depend on the reflections-file line order (insertion order).
+        for did in sorted(alpha_by_decision):
             if did and (did in proposal_id or proposal_id in did):
-                return alpha
+                return alpha_by_decision[did]
         return None
 
     return _lookup

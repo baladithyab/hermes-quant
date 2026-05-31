@@ -358,3 +358,84 @@ def test_slippage_asymmetry(enabled, state_db, tmp_path, monkeypatch) -> None:
     # Equity leg slipped (fill_price != decision basis 160.0); option passthrough.
     assert eq["fill_price"] != 160.0
     assert opt["fill_price"] == 4.50  # passthrough at the broker mid
+
+
+# --------------------------------------------------------------------------- #
+# Determinism UNDER the v0.2 slippage model (#23.4)
+# --------------------------------------------------------------------------- #
+# The eval gate (ops/scripts/quant-multileg-eval.py) proves byte-replay-equality
+# with the slippage model OFF (v0.1 passthrough). This closes the complementary
+# contract: with the v0.2 envelope ON, the SAME inputs must still produce the
+# SAME slipped output across two runs. The v0.2 model is deterministic-given-seed
+# where seed = sha256(proposal_id | asof_execution) (slippage_model.seed_for_fill),
+# so the ONLY entropy source that could leak is the reactor's wall-clock
+# datetime.now() (multileg.py step 3 -> asof_execution). We pin that clock to a
+# fixed instant for both runs; byte-equal families then prove no Date.now/random
+# leak survives into the slipped fill. The v0.2 model is implemented in
+# hermes_quant/react/slippage_model.py, so this runs as a hard assertion; the
+# importorskip guard keeps it honest (becomes skip, never a false PASS, if the
+# model is ever removed).
+def _normalized_family(bus) -> str:
+    """Serialize a bus family with the wall-clock asof_execution stripped (it is
+    pinned identically across runs here, but stripping mirrors the eval gate's
+    _normalized_bus so the comparison is on the structural FILL content)."""
+    recs = []
+    for ln in bus.read_text().splitlines():
+        if not ln.strip():
+            continue
+        rec = json.loads(ln)
+        rec.pop("asof_execution", None)
+        recs.append(rec)
+    return json.dumps(recs, separators=(",", ":"), sort_keys=True)
+
+
+def _run_slipped_cc(workdir, monkeypatch) -> str:
+    """One isolated v0.2-slipped CC execution; returns the normalized family.
+
+    Each call gets its own bus + state.db singleton so the two runs are fully
+    independent (not an idempotency no-op on a shared bus)."""
+    import hermes_quant.state.portfolio_state as ps_mod
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    bus = workdir / "executions.jsonl"
+    ps = PortfolioState(state_db_path=workdir / "state.db")
+    monkeypatch.setattr(ps_mod, "_singleton", ps, raising=False)
+
+    reactor = MultiLegPaperReactor(executions_path=bus)
+    reactor.execute(_cc(), fill_size_pct=0.20)
+    return _normalized_family(bus)
+
+
+def test_slippage_v02_determinism_across_two_runs(enabled, tmp_path, monkeypatch) -> None:
+    """v0.2 slippage ON: two runs of identical inputs are byte-identical (no
+    Date.now/random leak into the slipped fill). Complements the eval gate's
+    slippage-OFF replay-equality assertion (#23.4)."""
+    # The v0.2 model must exist for this to be a real assertion (not a fabricated
+    # contract). Import-guard so a future removal surfaces as skip, not a false PASS.
+    pytest.importorskip("hermes_quant.react.slippage_model")
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.2")
+
+    # Pin the reactor's wall-clock so asof_execution (the slippage RNG seed input)
+    # is identical across both runs — isolating the slippage model as the only
+    # thing under test for determinism.
+    import hermes_quant.react.multileg as mleg_mod
+
+    fixed = datetime(2026, 5, 30, 18, 0, 0, tzinfo=UTC)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: D102 - matches datetime.now signature
+            return fixed if tz is None else fixed.astimezone(tz)
+
+    monkeypatch.setattr(mleg_mod, "datetime", _FrozenDatetime)
+
+    run_a = _run_slipped_cc(tmp_path / "a", monkeypatch)
+    run_b = _run_slipped_cc(tmp_path / "b", monkeypatch)
+
+    assert run_a == run_b, "v0.2 slippage fill is non-deterministic across runs"
+
+    # Sanity: the slippage actually fired (equity leg moved off the 160.0 basis),
+    # so the determinism assertion is exercising the SLIPPED path, not passthrough.
+    a_family = _read_family(tmp_path / "a" / "executions.jsonl")
+    eq = next(r for r in a_family if r["asset_class"] == "equity")
+    assert eq["fill_price"] != 160.0

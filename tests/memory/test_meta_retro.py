@@ -377,3 +377,65 @@ def test_report_is_telemetry_only(tmp_path) -> None:
     assert report.telemetry_only is True
     for p in report.persona_calibration:
         assert p["telemetry_only"] is True
+
+
+# ---------------------------------------------------------------------------
+# DETERMINISM — _default_realized_alpha_lookup is file-order independent
+# ---------------------------------------------------------------------------
+
+
+def _write_reflections(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, default=str) + "\n")
+
+
+def test_default_alpha_lookup_is_deterministic(tmp_path, monkeypatch) -> None:
+    """Two independent builds of the default lookup over the SAME corpus return
+    identical results, AND the substring-join tie-break is independent of the
+    reflections-file line order (sorted-by-decision_id, not insertion order).
+
+    Corpus: two decision_ids both substring-matching the same proposal_id but
+    carrying DIFFERENT realized alpha. The lookup must resolve the same one in
+    sorted key order regardless of which line came first in the file.
+    """
+    from hermes_quant.memory import reflector as reflector_mod
+    from hermes_quant.memory.meta_retro import _default_realized_alpha_lookup
+
+    # Both "dec_aaa" and "dec_bbb" are substrings of this proposal_id.
+    proposal_id = "rdp-dec_aaa-dec_bbb-tail"
+    rows_order_1 = [
+        {"decision_id": "dec_bbb", "alpha_return": 0.07},
+        {"decision_id": "dec_aaa", "alpha_return": -0.03},
+    ]
+    rows_order_2 = list(reversed(rows_order_1))
+
+    p1 = tmp_path / "reflections1.jsonl"
+    p2 = tmp_path / "reflections2.jsonl"
+    _write_reflections(p1, rows_order_1)
+    _write_reflections(p2, rows_order_2)
+
+    # Build A over file-order 1; build B over the REVERSED file-order.
+    monkeypatch.setattr(reflector_mod, "REFLECTIONS_PATH", p1)
+    lookup_a = _default_realized_alpha_lookup()
+    a1 = lookup_a(proposal_id)
+    a2 = lookup_a(proposal_id)  # two calls on the same build are identical
+
+    monkeypatch.setattr(reflector_mod, "REFLECTIONS_PATH", p2)
+    lookup_b = _default_realized_alpha_lookup()
+    b1 = lookup_b(proposal_id)
+
+    # Same build → identical across calls.
+    assert a1 == a2
+    # Reversed file order → still identical (sorted tie-break: "dec_aaa" wins).
+    assert a1 == b1
+    assert a1 == -0.03  # dec_aaa (sorts before dec_bbb), NOT 0.07
+
+    # Direct exact-id match still wins over the substring path, deterministically.
+    monkeypatch.setattr(reflector_mod, "REFLECTIONS_PATH", p1)
+    lookup_c = _default_realized_alpha_lookup()
+    assert lookup_c("dec_bbb") == 0.07
+    # Unresolvable proposal_id → None (that debate row is simply not scored).
+    assert lookup_c("totally-unrelated-id") is None
+    assert lookup_c("") is None

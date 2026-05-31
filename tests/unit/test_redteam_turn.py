@@ -675,3 +675,52 @@ def test_advisory_plane_only_no_risk_imports_clean_subprocess():
         f"stdout={proc.stdout}\nstderr={proc.stderr}"
     )
     assert "CLEAN" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# W7 off-state key-set bit-identity (ADR-0080 D80.8): with the red-team flag
+# UNSET, the research_debate audit payload's KEY-SET is bit-identical to the
+# same flag-unset run — the off-state red-team turn adds NO new top-level keys
+# (the ``red_team`` sub-block is ALWAYS present, in both states, carrying only
+# the off-state record {"ran": False, "dissent_surfaced": False}).
+# ---------------------------------------------------------------------------
+
+
+def _capture_audit_payload(monkeypatch, *, redteam_flag_on: bool) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+
+    def _capture(kind: str, source: str, payload: dict[str, Any]) -> None:
+        captured["payload"] = payload
+
+    monkeypatch.setattr(stage_mod, "_audit_append", _capture)
+    # No red-team turn is wired (redteam=None) so the flag being ON or OFF makes
+    # no behavioural difference here — that is exactly the off-state we pin.
+    _run_stage(monkeypatch, flag_on=redteam_flag_on, redteam=None)
+    return captured["payload"]
+
+
+def test_offstate_audit_keyset_bit_identical_to_redteam_unset(monkeypatch):
+    """REDTEAM_TURN flag UNSET vs explicit-but-no-turn → the audit payload's
+    top-level key-set is bit-identical, and the nested ``red_team`` block's
+    key-set is bit-identical too. The off-state of the red-team turn introduces
+    NO keys relative to a plain research_debate run.
+    """
+    # Plain research_debate (red-team flag UNSET). _isolate_env already delenv'd
+    # HERMES_QUANT_REDTEAM_TURN, so flag_on=False leaves it unset.
+    payload_plain = _capture_audit_payload(monkeypatch, redteam_flag_on=False)
+
+    # Flag SET but the red-team turn does not run (redteam=None): the judge still
+    # produces a leading view, the adapter is invoked, returns no turn → off-state.
+    payload_flag_no_turn = _capture_audit_payload(monkeypatch, redteam_flag_on=True)
+
+    assert set(payload_plain.keys()) == set(payload_flag_no_turn.keys()), (
+        "off-state red-team turn must add NO top-level audit keys"
+    )
+    # The red_team sub-block is present in BOTH and carries the identical
+    # off-state key-set (no dissent_reason/confidence/etc. leak into off-state).
+    assert "red_team" in payload_plain
+    assert payload_plain["red_team"] == {"ran": False, "dissent_surfaced": False}
+    assert (
+        payload_plain["red_team"].keys() == payload_flag_no_turn["red_team"].keys()
+    )
+    assert payload_plain["red_team"] == payload_flag_no_turn["red_team"]
