@@ -78,6 +78,8 @@ def admit_or_reject(
     asof: datetime,
     *,
     existing_position_qty: float = 0.0,
+    account_equity: float | None = None,
+    available_bp: float | None = None,
 ) -> AdmissibilityVerdict:
     """The ONE pre-trade admissibility seam — pure, fail-closed, REJECT-only.
 
@@ -93,11 +95,23 @@ def admit_or_reject(
             the sign of `target_pct`; a SHORT requires either to indicate short so a
             caller can't accidentally route a negative target through the long path.
         target_pct: signed NAV fraction (e.g. -0.20 = 20% NAV short).
-        nav: account NAV (USD). None / non-positive => fail-closed (0 shares -> REJECT).
+        nav: account NAV (USD) used ONLY for the NAV-fraction -> whole-share UNIT
+            BRIDGE. None / non-positive => fail-closed (0 shares -> REJECT).
         price: decision/quote price the order would fill at. None / non-positive =>
             fail-closed (0 shares + no quote -> REJECT).
         asof: decision time (UTC) — passed through to the oracle for snapshot honesty.
         existing_position_qty: signed held qty; a held inadmissible short flattens to 0.
+        account_equity: account equity (USD) for the live oracle's hard checks (the
+            < $2,000 short-capability floor, step 5). None => the live oracle
+            fails-closed (MISSING_ACCOUNT_CONTEXT) — never an assumed pass. For the
+            paper account this IS the NAV (`equity_total`); pass `account_equity=nav`.
+        available_bp: account buying power (USD) for the live oracle's Reg-T / Alpaca
+            BP hard check (step 8b). None => the live oracle fails-closed
+            (MISSING_ACCOUNT_CONTEXT). This is NOT cheaply available at the paper
+            seam (the materialized paper state tracks equity_total, not buying power;
+            a true value needs a live broker account fetch), so the autonomous /
+            paper callers leave it None and the short fails-closed on it — a
+            documented gap, never a fabricated sufficiency.
 
     Returns:
         AdmissibilityVerdict. `admitted=True` with `adjusted_target_pct == target_pct`
@@ -123,11 +137,18 @@ def admit_or_reject(
     qty_shares = abs(signed_shares)
 
     oracle = select_oracle()
-    # ctx carries what IS available at this seam (the decision price as the quote).
-    # account_equity / available_bp are not plumbed here yet — the live oracle then
-    # fails-closed (MISSING_ACCOUNT_CONTEXT) for shorts until that broker seam lands.
-    # This mirrors the documented gap in autonomous.py; it is fail-closed, not assume-safe.
-    ctx = AdmissibilityContext(current_ask=price if (price is not None and price > 0) else None)
+    # ctx carries what IS available at this seam: the decision price as the quote, plus
+    # whatever account context the caller could resolve. `account_equity` (= the paper
+    # NAV, `equity_total`) is now plumbed so an ETB whole-share short can clear the
+    # equity floor (step 5) instead of fail-closing on MISSING_ACCOUNT_CONTEXT.
+    # `available_bp` is NOT cheaply available at the paper seam (the materialized state
+    # tracks equity, not buying power), so callers leave it None; the live oracle then
+    # fails-closed on the BP hard check (step 8b) — a documented gap, not assume-safe.
+    ctx = AdmissibilityContext(
+        current_ask=price if (price is not None and price > 0) else None,
+        account_equity=account_equity,
+        available_bp=available_bp,
+    )
     verdict: ShortabilityVerdict = oracle.verdict(
         symbol, effective_side, qty_shares, asof, ctx
     )

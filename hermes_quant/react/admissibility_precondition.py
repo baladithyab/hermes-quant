@@ -85,7 +85,14 @@ def admissibility_reject_equity(
     asof_dt = _parse_utc(asof_decision) or datetime.now(tz=UTC)
     price = decision_price if decision_price > 0 else None
 
-    verdict = admit_or_reject(symbol, "short", fill_size_pct, nav, price, asof_dt)
+    # For the paper account, equity == NAV (`equity_total`), so plumb it as
+    # `account_equity` to clear the live oracle's < $2,000 floor (step 5). `available_bp`
+    # is left None (not tracked in the materialized paper state — needs a live broker
+    # fetch), so a short still fails-closed on the BP hard check (step 8b): documented
+    # gap, never a fabricated pass. Bit-for-bit no-op when the flag is OFF (short-circuited above).
+    verdict = admit_or_reject(
+        symbol, "short", fill_size_pct, nav, price, asof_dt, account_equity=nav
+    )
     if verdict.admitted:
         return None
 

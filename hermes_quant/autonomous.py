@@ -539,55 +539,47 @@ def tick(
             # A hard, fail-closed precondition UPSTREAM of the ADR-0004 gate: it can only
             # REJECT a proposed short (-> SILENCE), never amplify or override. With the flag
             # OFF this block is skipped entirely -> behavior is bit-for-bit identical to today.
+            #
+            # Unified seam (H-adm #2): this calls the SAME shared
+            # `admissibility.gate_order.admit_or_reject` seam the PaperReactor + HITL paths
+            # use, instead of an inline select_oracle + target_pct_to_shares + apply_verdict
+            # copy. One seam, no drift. The shared function honors the flag THROUGH
+            # select_oracle(); we keep the flag check + the `effective_size < 0` short-circuit
+            # here so the NAV / price lookups never run for a flag-OFF or non-short tick
+            # (bit-for-bit no-op when OFF, asserted by tests).
             if os.environ.get("HERMES_QUANT_ADMISSIBILITY", "0") == "1" and effective_size < 0:
-                from hermes_quant.admissibility import (
-                    AdmissibilityContext,
-                    apply_verdict_to_target,
-                    select_oracle,
-                    target_pct_to_shares,
-                )
+                from hermes_quant.admissibility import admit_or_reject
 
-                oracle = select_oracle()
-                asof_decision_dt = datetime.now(tz=UTC)
-
-                # UNIT BRIDGE (ADR-0077): the oracle's whole-share check expects a SHARE
-                # count, not a NAV fraction. Convert effective_size (signed NAV fraction)
-                # to whole shares using the decision price + account NAV — the same price
-                # PaperReactor would fill at. Fail-closed: missing/non-positive NAV or
-                # price yields 0 shares, which the oracle REJECTs (never a fabricated qty).
+                # nav: the paper account NAV (`equity_total`), sourced the SAME way the
+                # reactor does. It is used BOTH for the NAV-fraction->whole-share UNIT
+                # BRIDGE and (as `account_equity`) for the live oracle's < $2,000 floor.
+                # `available_bp` is NOT cheaply available here (the materialized paper
+                # state tracks equity, not buying power -> needs a live broker fetch), so
+                # it stays None and the short fails-closed on the BP hard check:
+                # documented gap (H-adm #1), never a fabricated sufficiency.
+                # Fail-closed: missing/non-positive NAV or price -> 0 shares -> REJECT.
                 nav = _account_nav_usd()
                 price = _decision_price_from_advisor(advisor_result)
-                signed_shares = (
-                    target_pct_to_shares(effective_size, nav, price)
-                    if nav is not None and price is not None
-                    else 0
-                )
-                qty_shares = abs(signed_shares)
-
-                # ctx carries what IS available at this seam (the decision price as the
-                # quote). account_equity / available_bp are NOT plumbed here yet, so the
-                # live oracle fails-closed (MISSING_ACCOUNT_CONTEXT) until the broker
-                # account-fetch seam is wired — documented gap, not a fabricated pass.
-                ctx = AdmissibilityContext(current_ask=price)
-                verdict = oracle.verdict(
+                verdict = admit_or_reject(
                     entry.symbol,
                     "short",
-                    qty_shares,
-                    asof_decision_dt,
-                    ctx,
+                    effective_size,
+                    nav,
+                    price,
+                    datetime.now(tz=UTC),
+                    account_equity=nav,
                 )
-                adj = apply_verdict_to_target(effective_size, verdict)
-                if adj.adjusted_target_pct == 0.0:
+                if not verdict.admitted:
                     decision.gate = "SILENCE_ADMISSIBILITY"
                     decision.details = {
                         "reason": verdict.reason,
                         "admissibility_state": verdict.state.value,
-                        "qty_shares": qty_shares,
+                        "qty_shares": verdict.qty_shares,
                     }
                     result.silences += 1
                     result.decisions.append(decision)
                     continue
-                effective_size = adj.adjusted_target_pct
+                effective_size = verdict.adjusted_target_pct
 
             decision.action = {
                 "target_position_pct": effective_size,

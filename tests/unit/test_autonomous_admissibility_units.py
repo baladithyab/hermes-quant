@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-import hermes_quant.admissibility as admissibility_pkg
+import hermes_quant.admissibility.gate_order as gate_order
 import hermes_quant.autonomous as auto
 from hermes_quant.admissibility import (
     AdmissibilityContext,
@@ -124,7 +124,7 @@ def test_etb_whole_share_short_not_rejected_as_fractional(autonomous_env, monkey
     monkeypatch.setenv("HERMES_QUANT_ADMISSIBILITY", "1")
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100_000.0)
     oracle = _RecordingOracle()
-    monkeypatch.setattr(admissibility_pkg, "select_oracle", lambda: oracle)
+    monkeypatch.setattr(gate_order, "select_oracle", lambda: oracle)
 
     result = auto.tick(dry_run=True, symbols=_WL, advisor_recommend=_short_advisor())
 
@@ -134,8 +134,11 @@ def test_etb_whole_share_short_not_rejected_as_fractional(autonomous_env, monkey
     assert qty == 100, f"expected 100 shares (0.20*100k/200), got {qty!r}"
     assert isinstance(qty, int)
     assert qty != pytest.approx(0.20)  # NOT the fraction the bug passed
-    # The decision-price quote we DO have is plumbed into ctx.
+    # The decision-price quote we DO have is plumbed into ctx, as is account_equity
+    # (= the paper NAV) — the H-adm #1 fix. available_bp stays None (documented gap).
     assert oracle.calls[0]["ctx"].current_ask == 200.0
+    assert oracle.calls[0]["ctx"].account_equity == 100_000.0
+    assert oracle.calls[0]["ctx"].available_bp is None
 
     # And the ETB whole-share short FIREd — not silenced as FRACTIONAL_SHORT.
     gme = [d for d in result.decisions if d.symbol == "GME"]
@@ -151,7 +154,7 @@ def test_fail_closed_when_nav_missing(autonomous_env, monkeypatch):
     short). The decision is SILENCE_ADMISSIBILITY, not FIRE — fail-closed."""
     monkeypatch.setenv("HERMES_QUANT_ADMISSIBILITY", "1")
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: None)  # NAV unknown
-    monkeypatch.setattr(admissibility_pkg, "select_oracle", lambda: _RealCoreOracle())
+    monkeypatch.setattr(gate_order, "select_oracle", lambda: _RealCoreOracle())
 
     result = auto.tick(dry_run=True, symbols=_WL, advisor_recommend=_short_advisor())
 
@@ -167,7 +170,7 @@ def test_fail_closed_when_price_missing(autonomous_env, monkeypatch):
     """Missing decision price => 0 shares + no quote => fail-closed REJECT, never FIRE."""
     monkeypatch.setenv("HERMES_QUANT_ADMISSIBILITY", "1")
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100_000.0)
-    monkeypatch.setattr(admissibility_pkg, "select_oracle", lambda: _RealCoreOracle())
+    monkeypatch.setattr(gate_order, "select_oracle", lambda: _RealCoreOracle())
 
     # No decision_price and no analyst last_close -> price is None -> 0 shares.
     def _no_price_advisor(**kwargs: Any) -> dict[str, Any]:
@@ -195,7 +198,7 @@ def test_flag_off_is_bitwise_noop(autonomous_env, monkeypatch):
     def _boom_select():
         raise AssertionError("select_oracle must NOT be called when flag is OFF")
 
-    monkeypatch.setattr(admissibility_pkg, "select_oracle", _boom_select)
+    monkeypatch.setattr(gate_order, "select_oracle", _boom_select)
 
     result = auto.tick(dry_run=True, symbols=_WL, advisor_recommend=_short_advisor())
 

@@ -665,6 +665,97 @@ def test_csp_sizing_uses_full_strike_collateral_not_premium_netted() -> None:
     assert res.contracts != 2  # the premium-netted (smaller-denominator) over-size
 
 
+def test_csp_collateral_rechecked_at_admitted_size_not_one_lot() -> None:
+    """BLOCKING (H-opt+pil #1): the CSP cash-collateral requirement must be
+    re-validated against the ADMITTED contract count, not the 1-lot structural
+    footprint. The classifier admits a CSP when options_buying_power covers the
+    1-lot full assignment cash (strike*100*structural_contracts, structural=1),
+    but `_size_contracts` routinely sizes UP (here to 2 lots). Full assignment
+    cash scales linearly, so buying power that covers ONE lot but not TWO would,
+    pre-fix, admit an under-collateralized (effectively naked) 2-lot short put —
+    the exact admission this gate exists to reject.
+
+    Construction (every value pins the boundary):
+      strike=100 -> collateral_per_contract = strike*100 = 10_000
+      nav=800_000 -> kelly_target = 800_000 * 0.25 * 0.10 = 20_000
+                     (action_step 0.05*nav=40_000 floors to 0 -> falls back to
+                     the un-stepped 20_000)
+      contracts  = floor(20_000 / 10_000) = 2  (> structural_contracts=1)
+      options_buying_power = 15_000:
+        1-lot classifier needs strike*100*1 = 10_000 -> 15_000 >= 10_000 PASSES
+        2-lot admitted    needs strike*100*2 = 20_000 -> 15_000 <  20_000 REJECTS
+    BPR at 2 lots (20_000 - premium) is far below the 0.80*nav=640_000 buffer, so
+    the collateral check (not BPR) is the binding reject. The short put carries
+    zero gamma/vega so the (earlier) greeks-at-size re-check passes cleanly and
+    the collateral re-check is demonstrably what silences.
+    """
+    flat_put = OptionLeg(
+        symbol="NVDA260612P00100000",
+        side="sell",
+        position_intent="sell_to_open",
+        greeks_at_decision=OptionGreeksSnapshot(
+            delta=-0.25, gamma=0.0, theta=0.05, vega=0.0, rho=-0.01
+        ),
+    )
+    res = options_gate(
+        [flat_put],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            nav=800_000.0,
+            strike=100.0,
+            options_buying_power=15_000.0,  # covers 1 lot (10k) but not 2 (20k)
+            premium_received=250.0,
+            total_bpr=0.0,
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, "under-collateralized 2-lot CSP must be REJECTED"
+    assert res.reason == "csp_collateral_at_size"
+    assert res.contracts == 0
+
+
+def test_csp_bpr_buffer_rechecked_at_admitted_size_not_one_lot() -> None:
+    """BLOCKING (H-opt+pil #1): the O6 BPR buffer must be re-validated against the
+    ADMITTED contract count, not the 1-lot structural footprint. The pre-sizing O6
+    check ran against structural_contracts (=1); BPR scales linearly with lots, so
+    a 2-lot order whose 1-lot BPR fits the buffer can breach it at 2 lots. Pre-fix
+    the gate admitted the buffer-breaching order (it never re-checked at size).
+
+    Construction:
+      strike=100, premium=250 -> BPR/lot = strike*100 - premium = 9_750
+      nav=800_000 -> buffer = 0.80 * 800_000 = 640_000 ; contracts = 2 (as above)
+      total_bpr = 625_000:
+        1-lot: 625_000 + 9_750  = 634_750 <= 640_000  PASSES
+        2-lot: 625_000 + 19_750 = 644_750 >  640_000  REJECTS
+      options_buying_power = 1_000_000 covers 2-lot collateral (20_000), so BPR
+      (not collateral) is the binding reject. Zero gamma/vega so the greeks-at-size
+      re-check passes and the O6-at-size BPR check is demonstrably what silences.
+    """
+    flat_put = OptionLeg(
+        symbol="NVDA260612P00100000",
+        side="sell",
+        position_intent="sell_to_open",
+        greeks_at_decision=OptionGreeksSnapshot(
+            delta=-0.25, gamma=0.0, theta=0.05, vega=0.0, rho=-0.01
+        ),
+    )
+    res = options_gate(
+        [flat_put],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            nav=800_000.0,
+            strike=100.0,
+            options_buying_power=1_000_000.0,  # >> 2-lot collateral; isolates BPR
+            premium_received=250.0,
+            total_bpr=625_000.0,
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, "buffer-breaching 2-lot CSP must be REJECTED"
+    assert res.reason == "bpr_buffer_at_size"
+    assert res.contracts == 0
+
+
 def test_missing_greeks_returns_silence_not_raise() -> None:
     """Bug 5: a leg missing greeks must yield a deterministic silence (reject),
     never abort the tick by raising out of options_gate()."""

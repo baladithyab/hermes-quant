@@ -673,6 +673,44 @@ def options_gate(
             )
         candidate_net = admitted_net  # report the true admitted-size footprint
 
+    # ---- O6 BPR + CSP cash-collateral RE-CHECK at the ADMITTED contract count. ----
+    # The earlier O6 BPR check (line ~534) and the classifier's CSP cash-collateral
+    # gate (_classify_structure, called with structural_contracts) both validated
+    # against `structural_contracts` (= 1 for every covered_call / cash_secured_put).
+    # But `_size_contracts` routinely admits MORE lots (e.g. 2). Both BPR and the
+    # full assignment cash scale LINEARLY with the admitted lot count, so a 2-lot CSP
+    # whose 1-lot BPR is under the buffer (and whose 1-lot collateral the operator
+    # has) can breach the buffer / be under-collateralized at 2 lots. The greeks were
+    # already re-checked at size; BPR and collateral were NOT — leaving the exact
+    # naked/over-leveraged admission this gate exists to reject. Mirror the greeks
+    # re-check: recompute BPR at the admitted `contracts`, re-run O6, and (for a CSP)
+    # re-validate the full strike*100*contracts cash requirement. Any breach silences
+    # (fail-closed; the gate can only REJECT, never size up).
+    if contracts != structural_contracts:
+        bpr = _bpr(
+            bucket,
+            strike=strike,
+            contracts=contracts,
+            premium_received=premium_received,
+            premium_paid=premium_paid,
+            width=width,
+            net_credit=net_credit,
+        )
+        if total_bpr + bpr > cfg.bpr_buffer_pct_nav * nav:
+            return OptionsGateResult.silence(
+                bucket, "bpr_buffer_at_size", net_greeks=candidate_net,
+                bpr_estimate=bpr, max_loss=max_loss,
+            )
+        if bucket == StructureBucket.CASH_SECURED_PUT:
+            # Full assignment cash at the admitted size (premium NOT netted —
+            # identical to _classify_structure's requirement, just at `contracts`).
+            required = strike * 100 * contracts
+            if options_buying_power < required:
+                return OptionsGateResult.silence(
+                    bucket, "csp_collateral_at_size", net_greeks=candidate_net,
+                    bpr_estimate=bpr, max_loss=max_loss,
+                )
+
     return OptionsGateResult(
         admitted=True,
         bucket=bucket,
