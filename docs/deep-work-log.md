@@ -201,3 +201,37 @@ errors on entry-point plugins). Gateway restarted → plugin LIVE with all 16 to
 **Remaining (next loops, all flag-OFF / operator):** PDR-2/3/4 perception primitives; the
 reactor's recipe->proposal producer (PR-5); deploy-sync reconciliation of the 9 DRIFT scripts;
 operator flag-flips per FEATURE-ENABLEMENT.md (the GATED flags still wait on their evals).
+
+### SELF-EVOLUTION ARC — R1→R4 ladder, waves W1-W7 BUILT (2026-05-30/31)
+
+Operator goal (/goal): evolve hermes-quant from a newbie trading system into a full self-evolving
+quantitative researcher (reflect / critique / deliberate / self-evolve), using the reference
+repos + papers in ~/wiki. Worked autonomously: research → architect → plan → build → review, in waves.
+
+**Research+architecture (committed 0eb757d, 9f4d581):** R0→R4 capability map (hermes-quant was
+R1-reflective-but-DARK + R2-deliberative at the R3 threshold); 9 ranked open loops; rails-preserving
+SOTA mechanisms (FINCON CVRF, SkillOpt held-out gate, QuantAgent inner/outer, FINMEM decay,
+RedDebate). ADR-0080 self-evolution framework (advisory plane vs outer standard-of-truth —
+concentrates authority at the gate in the BACKWARD/learning direction as ADR-0079 does forward;
+multi-rate T0-T3 tiers; universal held-out eval-gate contract; propose-only) + ADR-0081 bounded
+decaying belief store (CVRF weekly / FINMEM monthly distillation).
+
+**Waves built (all default-OFF, held-out-eval-gated, advisory-plane-only, adversarially reviewed):**
+- W1 (08326e1) — IGNITE the dark loop: record_decision on open (O1). The keystone — the whole
+  reflect→retrieve→PM-prompt edge could never fire because record_decision had zero prod callers.
+- W2 (0bf0008) — weekly pattern-mining retro, T2 distillation (O2) + writes the dangling
+  weekly_retro_promotion_readiness producer (O3). The literal M14 gap.
+- W4/W5/W7 (fbc0516) — factor-weight proposer (O4, silence-only) + B10 graph miner (O5) +
+  Socratic devil's-advocate red-team turn (CRITIQUE axis ◐→●).
+- W3/W6 (0273149) — monthly meta-retro, the missing T3 tier (O7/O8) + hypothesis→backtest→promote
+  research-loop cron with INDEPENDENTLY-TRACED zero-auto-promotion.
+
+**Verification:** 138/138 self-evolution tests together (no cross-wave interference); 58+ live-path
+regression green; grep-verified NO self-evolution flag is hard-enabled anywhere — the live default
+path is byte-identical, so this lands inert until the operator flips each flag after its eval gate.
+
+**Net:** every open loop O1-O8 now has a closing component built behind a flag. The system has
+climbed from R1-dark to the R4 threshold: per-trade→weekly→monthly distillation, self-critique,
+factor/graph/hypothesis evolution — all PROPOSE-only, the deterministic gate + operator the sole
+path to live. The advisory plane evolves; the risk gate / sizing ladder / kill-switch are immutable
+by it. Follow-ups (tasks #28, #23, #22, #19) are non-blocking pre-flip hardening.
