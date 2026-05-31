@@ -107,3 +107,29 @@ def _autouse_dummy_third_party_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     for key, val in placeholders.items():
         if key not in os.environ:
             monkeypatch.setenv(key, val)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hermes_quant_flags():
+    """Snapshot every ``HERMES_QUANT_*`` feature flag before a test and restore
+    it after — so a test that flips a flag via raw ``os.environ[...] = "1"``
+    (which ``monkeypatch.setenv`` would auto-undo, but a direct assignment does
+    NOT) cannot leak that flag into a later test.
+
+    This closes the order-dependent test-pollution class the 2026-05-30 meta-review
+    (#12) flagged: the catalyst onboarding/wiring tests read
+    ``HERMES_QUANT_SEMANTIC_ENABLED`` / ``HERMES_QUANT_CATALYST_ONBOARDING`` and so
+    are sensitive to any earlier test that sets one without cleanup. Snapshot/restore
+    makes those tests order-independent regardless of who the upstream leaker is.
+    Defensive and cheap — it neither sets nor unsets any flag a test didn't touch.
+    """
+    saved = {k: v for k, v in os.environ.items() if k.startswith("HERMES_QUANT_")}
+    try:
+        yield
+    finally:
+        # Remove any HERMES_QUANT_* the test ADDED, and restore any it CHANGED/removed.
+        current = {k for k in os.environ if k.startswith("HERMES_QUANT_")}
+        for k in current - saved.keys():
+            del os.environ[k]
+        for k, v in saved.items():
+            os.environ[k] = v
