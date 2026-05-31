@@ -148,3 +148,25 @@ denominator, PIL datetime-key robustness, greeks try/except narrowing) are flag-
 pre-go-live items → task #19. Lesson: "evidence before assertions" applies to my own fixes —
 confirming a fix LANDED is not confirming it CLOSED the hole. 166/166 final hardening+deploy+
 catalyst tests pass.
+
+### Wave S — pre-enablement safety + reactor/PDR-1 architecture (2026-05-30, +5 commits)
+
+Operator: "walk me through what's left and start working on the rest."
+
+- **Wave S (5 items, all CONFIRMED, default-OFF):** S1 admissibility now gates the PaperReactor
+  on ALL paths (brief/HITL, not just autonomous-tick) via the shared admit_or_reject seam +
+  fixed quant_approve to honestly report admissibility-rejected (was rubber-stamping a 0-fill
+  reject as approved) [`632ea61`]; S2 calibrator-drift change-detecting silence contract so it's
+  registerable without weekly spam [`d261a09`]; S3 options CSP-denominator/greeks-except + borrow
+  PIL interval predicate, S4 wired the orphaned decisions renderer into `quant status` + profit
+  boundary tests, S5 extended the no-lookahead release-blocker to the perception-PRODUCING path
+  [`d7e3ff8`]. 149 tests pass.
+- **Architected (docs, next-loop builds) [`2b5b802`]:** wave-d-multileg-reactor.md (N3/B01 — the
+  vision unlock: CC/CSP/wheel FIRE on paper, HITL-only, gate-precondition, PMCC-shadow-validated)
+  + wave-e-perceptionframe.md (PDR-1 carrier collapsing the 3 injection seams) — each with a
+  concrete eval gate.
+- **Wave S review follow-ups → task #22** (unify autonomous admissibility seam, CSP/BPR at
+  admitted size, atomic baseline, cron-test-loader hardening). None blocking; all flag-OFF.
+
+**S1 makes HERMES_QUANT_ADMISSIBILITY safe to flip — it no longer lets an inadmissible short
+fire through the HITL path. The enablement critical path's step-1 code is now done.**
