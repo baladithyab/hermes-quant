@@ -40,7 +40,7 @@ from .protocol import (
     Timeframe,
 )
 
-__version__ = "0.4.4"
+__version__ = "0.6.4"
 
 __all__ = [
     "Action",

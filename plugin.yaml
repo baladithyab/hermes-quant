@@ -1,5 +1,5 @@
 name: hermes-quant
-version: "0.4.4"
+version: "0.6.4"
 description: ARIA-powered multi-analyst algorithmic trading framework — sidecar daemon emits signals to a JSONL bus that freqtrade (or NautilusTrader) consumes for execution.
 author: Codeseys
 license: Apache-2.0
@@ -13,6 +13,7 @@ provides_tools:
   - quant_show_signals
   - quant_show_views
   - quant_recommend
+  - quant_recipes
   - quant_propose
   - quant_approve
   - quant_reject
@@ -26,7 +27,9 @@ provides_tools:
   - quant_doctor
 
 provides_hooks:
-  - on_session_start
+  # pre_gateway_dispatch installs the Discord /quant slash command (register() wires
+  # this one only). on_session_start was declared historically but never registered —
+  # dropped to keep the manifest truthful (HERMES-INTEGRATION.md §6 checklist).
   - pre_gateway_dispatch
 
 # Optional API keys — plugin still works without all of these set.
