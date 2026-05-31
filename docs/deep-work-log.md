@@ -82,3 +82,52 @@ waves) — none are blockers, each documented.
 **Run end. Baseline e4ecad5 → final HEAD (see git log). 23 commits this session.**
 Two independent sign-offs: execution team (all waves committed + tested) + review team (Codex:
 every HIGH is flag-gated; build-wave reviewers: all waves CONFIRMED post-fix).
+
+---
+
+## Run 2026-05-30 17:00 PT — continuation: enablement + Hermes integration + backlog-to-zero
+
+**Operator prompt:** address the backlog; enable the new features + register the trading crons;
+deep-dive Hermes-agent docs to confirm plugin/architecture compatibility + document plugin install.
+
+Ran THREE concurrent workflows (execution + Hermes-research + a concurrent meta-review team).
+
+### Backlog resolution (#11 + #12) ✅
+- **#11 pre-go-live hardening** — fixed the 10 Codex findings so admissibility/options can be
+  safely enabled: H1 NAV-fraction→share-qty unit bug + H2 fail-closed account context
+  (`09ecb6c`); H3 options-gate covering-leg/min-DTE/CSP-collateral/greek-scaling (`2ac69dd`);
+  H4 PIL ex-div guard. 142 tests; ruff clean. All still default-OFF.
+- **#12 test pollution** — investigated (no raw-os.environ leaker found; affected tests pass in
+  isolation); added an autouse HERMES_QUANT_* flag snapshot/restore fixture (`8949d2b`) that
+  makes the catalyst tests order-independent regardless of upstream leaker.
+
+### Hermes integration deep-dive (tavily/exa/deepwiki + live probes) ✅
+- **KEY FINDING:** hermes-quant is discovered (pip entry-point) but NOT in
+  `~/.hermes/config.yaml plugins.enabled` → the 16 tools + /quant slash + CLI are DORMANT. The
+  16 crons run independently and ARE live. Fix = `hermes plugins enable hermes-quant` + restart.
+- Fixed manifest drift (`0bde804`): version 0.4.4→0.6.4, +quant_recipes, −unwired
+  on_session_start. register() smoke now clean (16 tools == registered).
+- Docs: `docs/operations/HERMES-INTEGRATION.md`, `CRON-REGISTRY.md`, `FEATURE-ENABLEMENT.md`
+  (`6aa5198`).
+
+### Concurrent meta-review (5 lenses, 31 findings, 17 net-new) ✅
+- `docs/reviews/2026-05-30-concurrent-meta-review.md`. **Critical discoveries:** deployed
+  `~/.hermes/scripts/` are STALE + drifted both ways (session fixes NOT live; 4 live scripts
+  never vendored) → built the deploy-audit tool + anti-drift test + reconciliation runbook
+  (`6fdb2ed`, `docs/operations/DEPLOY-SYNC.md`); B12 is silently LIVE in deployed armed wrappers
+  (repo≠deploy posture); PerceptionFrame/PDR-1..4 + #11 were absent from the backlog of record.
+- Backlog reconciled (`b8789c7`): 8 status corrections + 21 net-new items (N1-N21) with the
+  10-step enablement critical path.
+
+### Enablement status (honest)
+- **The agent CANNOT flip flags (.env tool-guarded), register Hermes crons (no cronjob tool
+  here), or edit config.yaml.** All such steps are documented as exact operator commands in the
+  ops docs. Flipping ADMISSIBILITY before #11 would have silenced every short — #11 is now fixed,
+  so the GATED flags are correct, but still require their eval gates + the operator's flip.
+- **SAFE-NOW flags** (abstain-only, post dry-run): DIRECTION_BIAS_GATE (needs redeploy + wrapper
+  flag, M04), CALIBRATOR_AUTO_REFIT (after silence-contract fix N10), IC_DEDUP_AT_INGEST.
+- **#17 plugin-enable + #18 PDR-1..4 build** = operator action + next-loop build, documented.
+
+**Continuation end. +10 commits (223983f → see git log). The deployed-script drift + the
+plugin-not-enabled findings are the two things that make "enable everything" an operator
+sequence, not an agent flag-flip — both now fully documented with exact commands.**
