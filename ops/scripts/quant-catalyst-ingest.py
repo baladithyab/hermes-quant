@@ -26,7 +26,7 @@ if _VENV.exists() and sys.executable != str(_VENV):
     os.execv(str(_VENV), [str(_VENV), __file__, *sys.argv[1:]])
 
 from hermes_quant.catalyst.ingest import ingest_queries
-from hermes_quant.catalyst.propagation import load_graph
+from hermes_quant.catalyst.propagation import load_graph, log_propagations
 from hermes_quant.catalyst.synthesize import synthesize_packets, write_packets
 
 # Query set: per-sector sweeps covering the graph's known entities. Extend as the
@@ -37,6 +37,17 @@ QUERIES = {
     "aero": '(Boeing OR "737" OR "aircraft grounding" OR "FAA") when:1d',
     "ev": '(Tesla OR "EV recall" OR "electric vehicle" OR Rivian OR Lucid) when:1d',
     "banks": '("bank failure" OR "bank collapse" OR "banking crisis" OR contagion) when:1d',
+    # --- consumer-trend / social-arbitrage sweeps (ADR-0074 Phase-1) ---
+    # Surface viral-demand / sell-out / craze stories on the curated brands. These
+    # feed the consumer-trend graph edges (CELH/CROX/TPR/NWL/DIIBF). News GN-RSS
+    # surfaces the social-arb story once it's reported; a dedicated Reddit/Trends
+    # producer (hermes_quant.catalyst.social) is wired separately (HERMES_QUANT_SOCIAL_INGEST).
+    # Consumer-trend packets are confidence-haircut at synth time, so they enter BMA
+    # as a deliberately weak peer view.
+    "consumer_celsius": '(Celsius energy drink OR CELH) (viral OR craze OR "sells out" OR surge OR soar) when:1d',
+    "consumer_crocs": '(Crocs OR CROX) (viral OR craze OR trend OR surge OR soar) when:1d',
+    "consumer_coach": '(Coach handbag OR Tapestry OR TPR) (viral OR trend OR surge OR popularity) when:1d',
+    "consumer_brands": '("goes viral" OR "sells out" OR "consumer craze") (brand OR product OR retail) when:1d',
     # NOTE: the "energy" query was dropped 2026-05-29 — the OPEC/commodity edge was
     # removed (severity classifier can't extract supply direction, so it mis-signed
     # oil producers). Re-add the query when the energy edge returns with a
@@ -51,7 +62,7 @@ QUERIES = {
 # the precondition the perception-layer cross-SOURCE validator (PDR-3,
 # HERMES_QUANT_CONVERGENCE) needs before it can be flipped without silencing a
 # single-source feed (see docs/operations/2026-05-31-selfevolve-flag-flip-decision.md).
-# All public, unauthenticated endpoints (reddit.com .json, Google Trends daily);
+# All public, no-auth endpoints (reddit.com Atom .rss, Google trending/rss);
 # ingest_social NEVER raises (a dead producer contributes zero items). The social
 # CatalystItems carry "reddit/..." and "google_trends/..." source tags that the
 # PDR-3 family taxonomy keys on; they flow through the SAME classify->propagate->
@@ -84,7 +95,7 @@ def main() -> int:
     if _social_on():
         # Multi-source feed (B08). Silence-by-default: ingest_social never raises;
         # a dead/blocked producer contributes zero items, so the news path is
-        # unaffected. These items go through the identical synthesize pipeline.
+        # unaffected. These items go through the identical per-item synth loop below.
         from hermes_quant.catalyst.social import ingest_social
 
         social_items = ingest_social(
@@ -94,11 +105,21 @@ def main() -> int:
         )
         n_social = len(social_items)
         items = items + social_items
-    prop_log: list[dict] = []
-    packets = synthesize_packets(
-        items, graph=graph, aliases=aliases, propagation_log=prop_log
-    )
+
+    # Synthesize per-item so each propagation-log batch carries the item's pub time
+    # (asof) — the profitability loop needs asof to fetch the realized forward return.
+    packets = []
+    n_logged = 0
+    for it in items:
+        item_log: list[dict] = []
+        item_packets = synthesize_packets(
+            [it], graph=graph, aliases=aliases, propagation_log=item_log
+        )
+        packets.extend(item_packets)
+        if item_log:
+            n_logged += log_propagations(item_log, asof=it.published_at.isoformat())
     n_written = write_packets(packets)
+    prop_log = [None] * n_logged  # for the summary count only
 
     if json_mode:
         import json
