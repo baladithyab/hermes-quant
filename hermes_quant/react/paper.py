@@ -24,6 +24,7 @@ from typing import Any
 
 from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, append_locked
 
+from .admissibility_precondition import admissibility_reject_equity
 from .base import ExecutionRecord
 
 logger = logging.getLogger(__name__)
@@ -52,20 +53,6 @@ def _account_nav_usd() -> float | None:
         return float(boot) if boot > 0 else None
     except Exception as exc:  # noqa: BLE001 — fail-closed: unknown NAV => None.
         logger.warning("paper-react: NAV lookup failed (admissibility fail-closed): %s", exc)
-        return None
-
-
-def _parse_utc(value: str | None) -> datetime | None:
-    """Parse an ISO-8601 UTC string to an aware datetime, or None (fail-closed)."""
-    if not value:
-        return None
-    try:
-        s = str(value).strip().replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
-        return dt
-    except (ValueError, TypeError):
         return None
 
 
@@ -268,81 +255,33 @@ class PaperReactor:
     ) -> ExecutionRecord | None:
         """Pre-trade admissibility precondition for SHORT equity paper fills (ADR-0077/0079).
 
-        Returns:
+        Delegates to the shared ``admissibility_reject_equity`` seam so the
+        multi-leg reactor's equity-leg precondition is BIT-IDENTICAL to this one
+        (plan §2.6). Behavior is unchanged from the inline version:
+
             None  => proceed with the fill (flag OFF, long order, non-equity, or ADMITTED).
                      With HERMES_QUANT_ADMISSIBILITY unset this ALWAYS returns None and never
                      touches the oracle / NAV lookup — bit-for-bit the pre-ADR-0077 behavior.
             ExecutionRecord (fill_size_pct=0.0, NOT written to the bus) => the short was found
-                     inadmissible; the reactor records the rejection in the audit trail (log +
-                     a no-fill record whose reactor_metadata carries the verdict reason) and the
-                     caller's fill is skipped.
+                     inadmissible; the reactor records the rejection in the audit trail.
         """
-        if os.environ.get("HERMES_QUANT_ADMISSIBILITY", "0") != "1":
-            return None
-        # Admissibility constrains opening SHORT EQUITY only. Longs, flats, and non-equity
-        # (options/crypto) are out of scope here — the oracle would ACCEPT them anyway, but we
-        # skip the lookup entirely to keep the seam cheap and the flag-ON long path a no-op too.
-        if fill_size_pct >= 0 or proposal.asset_class != "equity":
-            return None
-
-        from hermes_quant.admissibility import admit_or_reject
-
-        decision_price = self._extract_decision_price(proposal)
-        nav = _account_nav_usd()
-        # asof: prefer the advisor's wall-clock decision time, else the bar boundary, else now —
-        # parsed to an aware UTC datetime for the oracle (snapshot honesty). Fail-closed parse.
+        # asof: prefer the advisor's wall-clock decision time, else the bar boundary, else now.
         adv = proposal.advisor_result or {}
         asof_str = adv.get("decision_wall_clock") or adv.get("as_of") or now
-        asof_dt = _parse_utc(asof_str) or datetime.now(tz=UTC)
-        price = decision_price if decision_price > 0 else None
-
-        verdict = admit_or_reject(
-            proposal.symbol,
-            "short",
-            fill_size_pct,
-            nav,
-            price,
-            asof_dt,
-        )
-        if verdict.admitted:
-            return None
-
-        logger.warning(
-            "paper-react: ADMISSIBILITY REJECT %s asset=%s target=%+.4f state=%s reason=%s "
-            "qty_shares=%d — NO FILL written",
-            proposal.proposal_id,
-            proposal.symbol,
-            fill_size_pct,
-            verdict.state.value,
-            verdict.reason,
-            verdict.qty_shares,
-        )
-        # No-fill audit record: fill_size_pct=0.0, fill_price=0.0, NOT appended to the bus.
-        # reactor_metadata carries the verdict so the rejection is reconstructable from the
-        # returned record (the caller persists it as the proposal's execution audit trail).
-        return ExecutionRecord(
-            proposal_id=proposal.proposal_id,
-            signal_id=self._extract_signal_id(proposal),
-            asset=proposal.symbol,
+        bar_ts = adv.get("bar_ts") or adv.get("as_of")
+        return admissibility_reject_equity(
+            symbol=proposal.symbol,
             asset_class=proposal.asset_class,
-            timeframe=proposal.timeframe,
+            fill_size_pct=fill_size_pct,
+            decision_price=self._extract_decision_price(proposal),
+            nav_provider=_account_nav_usd,
             asof_decision=asof_str,
             asof_execution=now,
-            target_position_pct=fill_size_pct,
-            decision_price=decision_price,
-            fill_price=0.0,
-            fill_size_pct=0.0,
             reactor_name=self.name,
-            human_in_the_loop=True,
-            reactor_metadata={
-                "paper": True,
-                "admissibility_rejected": True,
-                "admissibility_state": verdict.state.value,
-                "admissibility_reason": verdict.reason,
-                "admissibility_qty_shares": verdict.qty_shares,
-                "requested_target_pct": fill_size_pct,
-            },
-            bar_ts=adv.get("bar_ts") or adv.get("as_of"),
+            proposal_id=proposal.proposal_id,
+            signal_id=self._extract_signal_id(proposal),
+            timeframe=proposal.timeframe,
+            bar_ts=bar_ts,
         )
 
     @staticmethod

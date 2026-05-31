@@ -431,7 +431,7 @@ def quant_approve(args: dict, **_kwargs) -> str:
             ProposalStateError,
             get_default_store,
         )
-        from hermes_quant.react import PaperReactor
+        from hermes_quant.react.dispatch import select_reactor
     except Exception as exc:  # noqa: BLE001
         return json.dumps(
             {
@@ -485,9 +485,12 @@ def quant_approve(args: dict, **_kwargs) -> str:
             }
         )
 
-    # Fire the paper reactor BEFORE state advance — if React fails, the
-    # proposal stays pending and the operator can retry.
-    reactor = PaperReactor()
+    # Fire the reactor BEFORE state advance — if React fails, the proposal stays
+    # pending and the operator can retry. select_reactor() dispatches on proposal
+    # kind: equity -> PaperReactor, multi-leg -> MultiLegPaperReactor (default-OFF;
+    # a MultiLegReactorDisabled raise leaves the proposal pending and surfaces the
+    # error — never a silent equity fill). HITL/CLI-only money seam.
+    reactor = select_reactor(proposal)
     try:
         execution = reactor.execute(
             proposal,

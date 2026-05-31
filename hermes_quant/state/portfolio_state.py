@@ -121,11 +121,22 @@ CREATE TABLE IF NOT EXISTS executions_replayed (
 -- of every fill that has been applied. Prevents double-apply if PaperReactor
 -- crashes between executions.jsonl append and apply_execution, or if a
 -- reconstruct_from runs after partial incremental applies.
+--
+-- ADR-0029 multi-leg extension: a multi-leg FAMILY shares (proposal_id,
+-- asof_execution) across ALL its child legs, so the single-instrument key would
+-- swallow leg 2 as a duplicate of leg 1. The key is extended with asset +
+-- asset_class. Legacy single-instrument equity rows use the sentinel "" for both
+-- so the equity reconciliation path keys EXACTLY as before (one fill per
+-- (proposal_id, asof_execution, "", "")) — bit-identical. Each multi-leg child
+-- claims its OWN (proposal_id, asof_execution, asset, asset_class); re-applying the
+-- same child is still a no-op (idempotency held per leg).
 CREATE TABLE IF NOT EXISTS processed_fills (
     proposal_id    TEXT NOT NULL,
     asof_execution TEXT NOT NULL,
+    asset          TEXT NOT NULL DEFAULT '',
+    asset_class    TEXT NOT NULL DEFAULT '',
     applied_at     TEXT NOT NULL,
-    PRIMARY KEY (proposal_id, asof_execution)
+    PRIMARY KEY (proposal_id, asof_execution, asset, asset_class)
 );
 """
 
@@ -222,6 +233,58 @@ class PortfolioState:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate_processed_fills(conn)
+
+    @staticmethod
+    def _migrate_processed_fills(conn: sqlite3.Connection) -> None:
+        """Idempotent migration: bring a pre-existing processed_fills table up to the
+        4-column PRIMARY KEY (proposal_id, asof_execution, asset, asset_class) that the
+        ADR-0029 multi-leg per-leg idempotency key requires.
+
+        A DB created before this wave has the old 2-column PK (proposal_id,
+        asof_execution). A bare ``ALTER TABLE ADD COLUMN`` adds the columns but
+        CANNOT change the PRIMARY KEY in SQLite — so the dedup key stays 2-column and
+        a multi-leg family (which shares proposal_id + asof_execution across its legs)
+        collides: the 2nd leg's ``INSERT OR IGNORE`` is treated as a duplicate and the
+        leg is SILENTLY DROPPED from state.db while still landing on executions.jsonl
+        — a bus/state divergence on the money path. So a full PK REBUILD is REQUIRED
+        (caught by the Wave-D adversarial review; the fresh-DB tests never hit the
+        legacy path). We rebuild only when the PK is not already the 4-column form, so
+        this stays idempotent and a no-op on fresh / already-migrated DBs.
+        """
+        # PK column names, in order, from PRAGMA (pk>0 marks key membership).
+        info = list(conn.execute("PRAGMA table_info(processed_fills)"))
+        if not info:
+            return  # table not created yet (executescript creates it first; defensive)
+        pk_cols = [row[1] for row in sorted((r for r in info if r[5]), key=lambda r: r[5])]
+        if pk_cols == ["proposal_id", "asof_execution", "asset", "asset_class"]:
+            return  # already on the 4-column PK — nothing to do
+        # Legacy table: rebuild with the 4-column PK, preserving every existing row
+        # (legacy rows get '' sentinels for the new key columns — the equity dedup key
+        # is unchanged for those, so historical idempotency is preserved exactly).
+        conn.execute(
+            """
+            CREATE TABLE processed_fills_new (
+                proposal_id    TEXT NOT NULL,
+                asof_execution TEXT NOT NULL,
+                asset          TEXT NOT NULL DEFAULT '',
+                asset_class    TEXT NOT NULL DEFAULT '',
+                applied_at     TEXT NOT NULL,
+                PRIMARY KEY (proposal_id, asof_execution, asset, asset_class)
+            )
+            """
+        )
+        existing = {row[1] for row in info}
+        asset_expr = "asset" if "asset" in existing else "''"
+        class_expr = "asset_class" if "asset_class" in existing else "''"
+        conn.execute(
+            f"INSERT OR IGNORE INTO processed_fills_new "
+            f"(proposal_id, asof_execution, asset, asset_class, applied_at) "
+            f"SELECT proposal_id, asof_execution, {asset_expr}, {class_expr}, applied_at "
+            f"FROM processed_fills"
+        )
+        conn.execute("DROP TABLE processed_fills")
+        conn.execute("ALTER TABLE processed_fills_new RENAME TO processed_fills")
 
     # ------------------------------------------------------------------
     # Full rebuild (idempotent)
@@ -397,6 +460,23 @@ class PortfolioState:
         fill_size_pct = float(record.get("fill_size_pct", 0.0))
         fill_price = float(record.get("fill_price", 0.0))
         asof = record.get("asof_execution") or _utc_now_iso()
+
+        # ADR-0029 multi-leg: a child leg carries an explicit SIGNED contract/share
+        # count in reactor_metadata.quantity. When present, the position quantity is
+        # tracked in CONTRACTS/SHARES (the true unit), not the NAV-fraction proxy. The
+        # idempotency key is then keyed per-leg (asset/asset_class) so two legs of one
+        # family don't collide. WITHOUT a quantity (the existing equity path), the
+        # behavior is bit-identical: NAV-fraction quantity + the legacy "" key sentinel.
+        rmeta = record.get("reactor_metadata") or {}
+        leg_quantity = rmeta.get("quantity") if isinstance(rmeta, dict) else None
+        if leg_quantity is not None:
+            pos_delta = float(leg_quantity)  # signed contracts/shares
+            dedup_asset = symbol
+            dedup_asset_class = asset_class
+        else:
+            pos_delta = fill_size_pct  # NAV-fraction proxy (legacy path)
+            dedup_asset = ""
+            dedup_asset_class = ""
         # Cross-model review C2 (Claude Opus): future-bound asof. A crafted
         # asof of "9999-12-31..." would wedge the watermark and silently
         # cause future delta-replays to skip every legitimate record.
@@ -432,8 +512,9 @@ class PortfolioState:
                 if proposal_id:
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO processed_fills "
-                        "(proposal_id, asof_execution, applied_at) VALUES (?, ?, ?)",
-                        (proposal_id, asof, _utc_now_iso()),
+                        "(proposal_id, asof_execution, asset, asset_class, applied_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (proposal_id, asof, dedup_asset, dedup_asset_class, _utc_now_iso()),
                     )
                     if cur.rowcount == 0:
                         # Already applied — this is the duplicate-apply
@@ -441,9 +522,11 @@ class PortfolioState:
                         # return cleanly.
                         conn.execute("ROLLBACK")
                         logger.info(
-                            "apply_execution: idempotency hit on (%s, %s); skipping",
+                            "apply_execution: idempotency hit on (%s, %s, %s, %s); skipping",
                             proposal_id,
                             asof,
+                            dedup_asset,
+                            dedup_asset_class,
                         )
                         return
 
@@ -461,7 +544,7 @@ class PortfolioState:
                     old_qty = 0.0
                     old_avg = 0.0
 
-                new_qty, new_avg = _update_position(old_qty, old_avg, fill_size_pct, fill_price)
+                new_qty, new_avg = _update_position(old_qty, old_avg, pos_delta, fill_price)
 
                 # ── upsert position ──────────────────────────────────────
                 if abs(new_qty) < 1e-12:
@@ -731,6 +814,13 @@ def _replay_record(
     fill_price = float(rec.get("fill_price", 0.0))
     asof = rec.get("asof_execution") or _utc_now_iso()
 
+    # ADR-0029 multi-leg: a child leg with an explicit signed contract/share count
+    # tracks position quantity in that true unit (parity with apply_execution).
+    # Without it, the legacy NAV-fraction proxy is used (equity path bit-identical).
+    rmeta = rec.get("reactor_metadata") or {}
+    leg_quantity = rmeta.get("quantity") if isinstance(rmeta, dict) else None
+    pos_delta = float(leg_quantity) if leg_quantity is not None else fill_size_pct
+
     # Bootstrap cash for new accounts
     if acct not in cash_map:
         cash_map[acct] = initial_cash
@@ -743,7 +833,7 @@ def _replay_record(
     else:
         old_qty, old_avg = pos["quantity"], pos["avg_entry_price"]
 
-    new_qty, new_avg = _update_position(old_qty, old_avg, fill_size_pct, fill_price)
+    new_qty, new_avg = _update_position(old_qty, old_avg, pos_delta, fill_price)
     positions[key] = {
         "quantity": new_qty,
         "avg_entry_price": new_avg,

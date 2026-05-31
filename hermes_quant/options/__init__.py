@@ -22,6 +22,7 @@ from .greeks import (
     european_greeks,
     implied_vol,
 )
+from .multileg import MultiLegProposal
 from .occ import (
     OccComponents,
     OccParseError,
@@ -50,4 +51,6 @@ __all__ = [
     "OptionChain",
     "ChainSnapshotReader",
     "aggregate_net_greeks",
+    # multi-leg proposal carrier (ADR-0029 D5)
+    "MultiLegProposal",
 ]
