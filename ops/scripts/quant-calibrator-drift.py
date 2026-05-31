@@ -63,10 +63,18 @@ def _load_baseline() -> dict:
 
 
 def _save_baseline(state: dict) -> None:
-    """Persist the watchdog baseline. Best-effort (never raises)."""
+    """Persist the watchdog baseline. Best-effort (never raises).
+
+    Atomic write (AGENTS.md N-rule for no_agent watchdog baselines): serialize
+    to a ``.tmp`` sibling then ``os.replace`` so a crash mid-write can never
+    leave a truncated JSON that the next run's _load_baseline reads as corrupt.
+    os.replace is atomic on the same filesystem.
+    """
     try:
         _BASELINE.parent.mkdir(parents=True, exist_ok=True)
-        _BASELINE.write_text(json.dumps(state, sort_keys=True))
+        tmp = _BASELINE.with_suffix(_BASELINE.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, sort_keys=True))
+        os.replace(tmp, _BASELINE)
     except OSError:
         pass
 
