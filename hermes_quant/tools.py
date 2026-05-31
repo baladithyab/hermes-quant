@@ -504,6 +504,32 @@ def quant_approve(args: dict, **_kwargs) -> str:
             }
         )
 
+    # ADR-0077/0079 admissibility: if the reactor refused the short pre-trade
+    # (a 0-fill no-bus record flagged in reactor_metadata), do NOT advance the
+    # proposal to `approved` and do NOT report success — that would mark a
+    # broker-refused order as a successful approval (operator-facing dishonesty,
+    # found in the Wave-S review). Keep the proposal PENDING and surface the
+    # rejection at the top level so the audit trail is truthful. No capital moved.
+    _rmeta = getattr(execution, "reactor_metadata", None) or {}
+    if _rmeta.get("admissibility_rejected"):
+        return json.dumps(
+            {
+                "success": False,
+                "error": "admissibility_rejected",
+                "proposal_id": proposal_id,
+                "state": "pending",  # NOT advanced — operator may revise or reject
+                "admissibility_state": _rmeta.get("admissibility_state"),
+                "admissibility_reason": _rmeta.get("admissibility_reason"),
+                "requested_fill_size_pct": fill_size_pct,
+                "message": (
+                    "Pre-trade admissibility REJECTED this short (e.g. not "
+                    "easy-to-borrow / missing account context); no paper fill was "
+                    "placed and the proposal remains pending."
+                ),
+            },
+            default=str,
+        )
+
     # Now advance state machine. If this fails, we have a paper exec on the
     # bus without a corresponding approved proposal — we surface a warning
     # and keep going. The settlement loop reconciles via signal_id.

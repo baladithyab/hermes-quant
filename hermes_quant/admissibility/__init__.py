@@ -20,6 +20,10 @@ from .borrow_pnl import (
     daily_borrow_fee,
     payment_in_lieu,
 )
+from .gate_order import (
+    AdmissibilityVerdict,
+    admit_or_reject,
+)
 from .oracle import (
     ALPACA_SHORT_ASK_MULT,
     ETB_DEFAULT_ANNUAL_CBR,
@@ -91,6 +95,9 @@ __all__ = [
     "apply_verdict_to_target",
     "side_of",
     "target_pct_to_shares",
+    # gate_order — the single reusable pre-trade gate seam
+    "AdmissibilityVerdict",
+    "admit_or_reject",
     # borrow_pnl
     "BorrowAccrual",
     "DAY_COUNT_BASIS",

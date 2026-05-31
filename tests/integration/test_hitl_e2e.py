@@ -271,6 +271,44 @@ def test_approve_nonexistent_returns_not_found(isolated_store, monkeypatch, tmp_
     assert parsed["error"] == "not_found"
 
 
+def test_approve_admissibility_rejected_short_stays_pending_and_honest(
+    isolated_store, monkeypatch, tmp_path
+):
+    """Wave-S review fix: when HERMES_QUANT_ADMISSIBILITY=1 and PaperReactor refuses
+    an inadmissible short (0-fill, no bus write), quant_approve must NOT report
+    success / advance the proposal to 'approved' — it must surface
+    admissibility_rejected and keep the proposal PENDING (operator-facing honesty).
+    The live oracle here fail-closes on missing account context, which is exactly
+    the reject path that would otherwise be silently rubber-stamped as approved."""
+    _patch_default_store(monkeypatch, isolated_store)
+    exec_path = tmp_path / "executions.jsonl"
+    _patch_executions_path(monkeypatch, exec_path)
+    monkeypatch.setenv("HERMES_QUANT_ADMISSIBILITY", "1")
+
+    from hermes_quant.tools import quant_approve
+
+    # A SHORT proposal (negative kelly) — admissibility only constrains shorts.
+    proposal = isolated_store.propose(
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
+        advisor_result=_sample_advisor_result(kelly=-0.05),
+    )
+
+    out = quant_approve({"proposal_id": proposal.proposal_id, "size_override_pct": -0.05})
+    parsed = json.loads(out)
+
+    # Honest response: NOT a success, names the admissibility rejection.
+    assert parsed["success"] is False
+    assert parsed["error"] == "admissibility_rejected"
+    assert parsed["state"] == "pending"
+    # The proposal was NOT advanced to approved; the operator can revise/reject.
+    final = isolated_store.get(proposal.proposal_id)
+    assert final.state == "pending"
+    # No paper fill was written to the bus.
+    assert not exec_path.exists() or exec_path.read_text().strip() == ""
+
+
 # ---------------------------------------------------------------------------
 # 6: Approve already-approved -> state_mismatch
 # ---------------------------------------------------------------------------

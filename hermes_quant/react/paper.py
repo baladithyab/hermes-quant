@@ -18,15 +18,55 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, append_locked
 
-from .base import ExecutionRecord, Reactor
+from .base import ExecutionRecord
 
 logger = logging.getLogger(__name__)
+
+
+def _account_nav_usd() -> float | None:
+    """Best-available paper-account NAV (USD), or None on any failure (fail-closed).
+
+    Mirrors `hermes_quant.autonomous._account_nav_usd` so the reactor's admissibility
+    share-conversion uses the SAME NAV source as the autonomous-tick seam, without
+    importing from autonomous.py (kept decoupled). Source priority:
+      1. state.db cash.equity_total (materialized NAV after fills) — the truth.
+      2. paper bootstrap initial cash (no fills yet).
+    Returns None on any failure so the caller fails-closed (no fabricated NAV).
+    """
+    try:
+        from hermes_quant.state.portfolio_state import (
+            _default_initial_cash,
+            get_portfolio_state,
+        )
+
+        cash = get_portfolio_state().get_cash("paper-default")
+        if cash is not None and cash.equity_total > 0:
+            return float(cash.equity_total)
+        boot = _default_initial_cash()
+        return float(boot) if boot > 0 else None
+    except Exception as exc:  # noqa: BLE001 — fail-closed: unknown NAV => None.
+        logger.warning("paper-react: NAV lookup failed (admissibility fail-closed): %s", exc)
+        return None
+
+
+def _parse_utc(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 UTC string to an aware datetime, or None (fail-closed)."""
+    if not value:
+        return None
+    try:
+        s = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    except (ValueError, TypeError):
+        return None
 
 
 class PaperReactor:
@@ -77,7 +117,17 @@ class PaperReactor:
         """
         decision_price = self._extract_decision_price(proposal)
         signal_id = self._extract_signal_id(proposal)
-        now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # ADR-0077 / ADR-0079: pre-trade admissibility as a REACTION-layer PRECONDITION.
+        # DEFAULT-OFF behind HERMES_QUANT_ADMISSIBILITY; with the flag absent this block is a
+        # bit-for-bit no-op (the gate is never consulted and the fill proceeds exactly as today).
+        # When ON, an inadmissible SHORT equity order is REJECTED here — the reactor (the actual
+        # Reaction layer) is now admissibility-aware, not just the autonomous-tick decision seam.
+        # REJECT-only / fail-closed: it can only refuse to fill, never widen, force, or flip a side.
+        admissibility_reject = self._admissibility_reject(proposal, fill_size_pct, now)
+        if admissibility_reject is not None:
+            return admissibility_reject
         # ADR-0068: prefer the wall-clock decision time emitted by the advisor.
         # Fall back to `as_of` (= bar boundary) for advisor_result dicts produced
         # before the ADR-0068 split, then to `now` if neither is available.
@@ -212,6 +262,88 @@ class PaperReactor:
                 logger.warning("Wave4 reflection hook failed (non-blocking): %s", _re)
 
         return record
+
+    def _admissibility_reject(
+        self, proposal: Any, fill_size_pct: float, now: str
+    ) -> ExecutionRecord | None:
+        """Pre-trade admissibility precondition for SHORT equity paper fills (ADR-0077/0079).
+
+        Returns:
+            None  => proceed with the fill (flag OFF, long order, non-equity, or ADMITTED).
+                     With HERMES_QUANT_ADMISSIBILITY unset this ALWAYS returns None and never
+                     touches the oracle / NAV lookup — bit-for-bit the pre-ADR-0077 behavior.
+            ExecutionRecord (fill_size_pct=0.0, NOT written to the bus) => the short was found
+                     inadmissible; the reactor records the rejection in the audit trail (log +
+                     a no-fill record whose reactor_metadata carries the verdict reason) and the
+                     caller's fill is skipped.
+        """
+        if os.environ.get("HERMES_QUANT_ADMISSIBILITY", "0") != "1":
+            return None
+        # Admissibility constrains opening SHORT EQUITY only. Longs, flats, and non-equity
+        # (options/crypto) are out of scope here — the oracle would ACCEPT them anyway, but we
+        # skip the lookup entirely to keep the seam cheap and the flag-ON long path a no-op too.
+        if fill_size_pct >= 0 or proposal.asset_class != "equity":
+            return None
+
+        from hermes_quant.admissibility import admit_or_reject
+
+        decision_price = self._extract_decision_price(proposal)
+        nav = _account_nav_usd()
+        # asof: prefer the advisor's wall-clock decision time, else the bar boundary, else now —
+        # parsed to an aware UTC datetime for the oracle (snapshot honesty). Fail-closed parse.
+        adv = proposal.advisor_result or {}
+        asof_str = adv.get("decision_wall_clock") or adv.get("as_of") or now
+        asof_dt = _parse_utc(asof_str) or datetime.now(tz=UTC)
+        price = decision_price if decision_price > 0 else None
+
+        verdict = admit_or_reject(
+            proposal.symbol,
+            "short",
+            fill_size_pct,
+            nav,
+            price,
+            asof_dt,
+        )
+        if verdict.admitted:
+            return None
+
+        logger.warning(
+            "paper-react: ADMISSIBILITY REJECT %s asset=%s target=%+.4f state=%s reason=%s "
+            "qty_shares=%d — NO FILL written",
+            proposal.proposal_id,
+            proposal.symbol,
+            fill_size_pct,
+            verdict.state.value,
+            verdict.reason,
+            verdict.qty_shares,
+        )
+        # No-fill audit record: fill_size_pct=0.0, fill_price=0.0, NOT appended to the bus.
+        # reactor_metadata carries the verdict so the rejection is reconstructable from the
+        # returned record (the caller persists it as the proposal's execution audit trail).
+        return ExecutionRecord(
+            proposal_id=proposal.proposal_id,
+            signal_id=self._extract_signal_id(proposal),
+            asset=proposal.symbol,
+            asset_class=proposal.asset_class,
+            timeframe=proposal.timeframe,
+            asof_decision=asof_str,
+            asof_execution=now,
+            target_position_pct=fill_size_pct,
+            decision_price=decision_price,
+            fill_price=0.0,
+            fill_size_pct=0.0,
+            reactor_name=self.name,
+            human_in_the_loop=True,
+            reactor_metadata={
+                "paper": True,
+                "admissibility_rejected": True,
+                "admissibility_state": verdict.state.value,
+                "admissibility_reason": verdict.reason,
+                "admissibility_qty_shares": verdict.qty_shares,
+                "requested_target_pct": fill_size_pct,
+            },
+            bar_ts=adv.get("bar_ts") or adv.get("as_of"),
+        )
 
     @staticmethod
     def _extract_decision_price(proposal: Any) -> float:
