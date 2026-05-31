@@ -7,10 +7,16 @@ synthesize) consumes social signal identically to news signal.
 
 Two free producers:
 
-  * Reddit — public ``.json`` endpoints (``/r/<sub>/new.json``,
-    ``/r/<sub>/search.json``). No OAuth needed for read-only public listings; a
-    descriptive User-Agent is required by Reddit's API rules. Each post becomes a
-    CatalystItem with published_at = post ``created_utc`` (the fidelity anchor).
+  * Reddit — public Atom RSS feeds (``/r/<sub>/new.rss``,
+    ``/r/<sub>/search.rss``). The unauthenticated ``.json`` endpoints now return
+    HTTP 403 (Reddit closed anonymous JSON access), but the public Atom feeds still
+    serve WITHOUT OAuth. A descriptive User-Agent is still sent (Reddit throttles
+    bare UAs). We parse the Atom ``<entry>`` elements with ``xml.etree`` (same
+    approach as the GN-RSS ingester): each post becomes a CatalystItem with
+    published_at = the entry ``<published>`` time (fallback ``<updated>``), an
+    ISO-8601 timestamp parsed to tz-aware UTC — the fidelity anchor. NOTE: the
+    public RSS feed does NOT expose the post score/comment count the old JSON did,
+    so we do not fabricate one; the source tag is just ``reddit/r/<sub> (rss)``.
 
   * Google Trends — the public ``trending/rss`` feed returns RSS 2.0 (the old
     ``trends/api/dailytrends`` JSON endpoint was removed and now 404s). We parse it
@@ -26,7 +32,6 @@ This is what keeps any social-driven backtest lookahead-honest (ADR-0074 D74.4).
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
 import urllib.parse
@@ -56,42 +61,73 @@ def _fetch_raw(url: str, timeout: float) -> bytes:
 # --------------------------------------------------------------------------- #
 # Reddit producer
 # --------------------------------------------------------------------------- #
-_REDDIT_NEW = "https://www.reddit.com/r/{sub}/new.json?limit={limit}"
+# Public Atom RSS feeds — serve WITHOUT OAuth (the unauthenticated ``.json``
+# endpoints now 403). Same query semantics as the old JSON URLs.
+_REDDIT_NEW = "https://www.reddit.com/r/{sub}/new.rss?limit={limit}"
 _REDDIT_SEARCH = (
-    "https://www.reddit.com/r/{sub}/search.json"
+    "https://www.reddit.com/r/{sub}/search.rss"
     "?q={q}&restrict_sr=1&sort=new&limit={limit}"
 )
 
+# Atom namespace — every element (<entry>, <title>, <published>, <link>...) lives in
+# this namespace, so we address them with Clark-notation "{ns}tag" names (the form
+# ElementTree expands a default xmlns into). This is the public Atom namespace URI
+# and is stable across Reddit's new/search feeds.
+_ATOM_NS = "http://www.w3.org/2005/Atom"
 
-def _reddit_posts_to_items(raw: bytes, *, query: str) -> list[CatalystItem]:
-    """Parse a Reddit listing JSON payload into CatalystItems."""
+
+def _parse_atom_dt(s: str) -> datetime | None:
+    """Parse an Atom ISO-8601 timestamp to tz-aware UTC. Returns None on failure.
+
+    Atom ``<published>``/``<updated>`` are ISO-8601 (e.g. "2026-05-31T20:24:50+00:00"
+    or a "...Z" form), NOT RFC-822 — so we use ``datetime.fromisoformat`` rather than
+    ``ingest._parse_pubdate`` (which is the RFC-2822 ``parsedate_to_datetime`` path).
+    A naive value (no offset) is treated as UTC; anything unparseable returns None so
+    the caller SKIPS the entry rather than fabricating a now() asof.
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _reddit_posts_to_items(raw: bytes, *, sub: str, query: str) -> list[CatalystItem]:
+    """Parse a Reddit Atom RSS feed into CatalystItems.
+
+    For each ``<entry>``: title = ``<title>``; published_at = ``<published>``
+    (fallback ``<updated>``) parsed to tz-aware UTC — NEVER wall-clock now. An entry
+    with a missing/unparseable timestamp is SKIPPED (defaulting to now would fabricate
+    freshness and corrupt packet.asof). link = the ``<link href=...>`` attribute. The
+    public RSS feed carries no post score, so the source tag is just
+    ``reddit/r/<sub> (rss)`` (no fabricated score) — it still starts with "reddit/"
+    so PDR-3's ``source_family`` maps it to the reddit family.
+    """
     items: list[CatalystItem] = []
     try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError) as e:
-        logger.warning("catalyst.social: reddit JSON parse error: %s", e)
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        logger.warning("catalyst.social: reddit RSS parse error: %s", e)
         return items
-    children = (data.get("data") or {}).get("children") or []
-    for ch in children:
-        d = ch.get("data") or {}
-        title = (d.get("title") or "").strip()
-        created = d.get("created_utc")
-        if not title or created is None:
-            continue
-        try:
-            pub = datetime.fromtimestamp(float(created), tz=UTC)
-        except (TypeError, ValueError, OSError):
-            continue
-        # fold engagement into the title so the classifier sees "viral" velocity;
-        # the raw score/comments are kept implicitly via the headline framing.
-        score = d.get("score") or 0
-        ncomments = d.get("num_comments") or 0
-        sub = d.get("subreddit") or ""
-        link = "https://www.reddit.com" + (d.get("permalink") or "")
+    src = f"reddit/r/{sub} (rss)"
+    for entry in root.iter(f"{{{_ATOM_NS}}}entry"):
+        title = (entry.findtext(f"{{{_ATOM_NS}}}title") or "").strip()
+        pub = _parse_atom_dt(entry.findtext(f"{{{_ATOM_NS}}}published") or "")
+        if pub is None:  # fall back to <updated> before giving up
+            pub = _parse_atom_dt(entry.findtext(f"{{{_ATOM_NS}}}updated") or "")
+        if not title or pub is None:
+            continue  # no title, or no parseable timestamp to anchor packet.asof
+        link_el = entry.find(f"{{{_ATOM_NS}}}link")
+        link = link_el.get("href", "") if link_el is not None else ""
         items.append(CatalystItem(
             title=title,
             published_at=pub,
-            source=f"reddit/r/{sub} (score={score} c={ncomments})",
+            source=src,
             link=link,
             query=query,
         ))
@@ -125,7 +161,7 @@ def ingest_reddit(
         logger.warning("catalyst.social: reddit fetch failed for r/%s: %s", sub, e)
         return [], time.monotonic() - t0
     latency = time.monotonic() - t0
-    items = _reddit_posts_to_items(raw, query=query or f"r/{sub}")
+    items = _reddit_posts_to_items(raw, sub=sub, query=query or f"r/{sub}")
     if dedupe:
         items = dedupe_items(items)
     return items, latency
