@@ -260,3 +260,46 @@ the discipline that made eval-gate-green trustworthy.
 Remaining (next loops, none blocking): PDR-2/3/4 perception primitives (#18); cosmetic nits (#31);
 full-suite env test-pollution (torch/ccxt/sklearn, #12); operator enablement (flip flags per the
 runbooks after each eval gate).
+
+### PDR-2/3/4 PERCEPTION LAYER — COMPLETE (2026-05-31)
+
+The last named self-evolution waves: the three perception primitives that turn social-arbitrage
+from "linked to a ticker" into the actual Camillo edge (DETECT → VALIDATE → EXIT). All built
+default-OFF, eval-gated, perception-layer evidence-only, each adversarially reviewed CONFIRMED with
+the rails re-verified on-machine before commit.
+
+- **Plans (f22007a)** — seam recon + 3 impl-ready plans, every file:line seam verified against HEAD.
+  The audit caught a silent-no-op bug in the PDR-4 plan pre-build: frame.semantic_packets holds
+  DICTS, so the planned getattr() produce-code would have made saturation dead even flag-ON; fixed
+  to .get() + a CRITICAL DATA-SHAPE callout so the build inherited the right seam.
+- **PDR-2 TrendVelocity (28a0a3e)** — GAP-A/DETECT. Week-over-week acceleration (the SLOPE, not
+  keyword severity) re-sources packet magnitude under HERMES_QUANT_TREND_VELOCITY. Band-bounded to
+  the severity scale [0,0.06] so a flag flip can't widen the ladder. D74.7 ≥0.6 gate on the labeled
+  Camillo corpus, now PROMOTED off /tmp to versioned tests/fixtures/socialarb/ (N13). 14 files.
+- **PDR-3 ConvergenceValidator (633b0ee)** — GAP-B/VALIDATE. Cross-SOURCE require_ensemble at the
+  perception layer (≥2 independent source families, policed taxonomy counting distinct ORIGINS),
+  gating packet EMISSION under HERMES_QUANT_CONVERGENCE via a subtract-only haircut. Two-pass
+  synthesize refactor preserves PDR-2 verbatim AND propagation_log byte-identity (propagate() called
+  exactly once per item, instrumented). Complementary to BMA's cross-ANALYST guard — a lone view
+  clearing PDR-3 is still silenced by BMA. ≥0.65 higher-bar eval. The build caught a real bug in the
+  plan's own pseudocode (entity leak via a 3-tuple) and fixed it to a 4-tuple. 12 files.
+- **PDR-4 SaturationScore (106c4ce)** — GAP-C/EXIT. Silence-only confidence decay (m∈(0,1]) on the
+  semantic analyst's OWN view BEFORE BMA under HERMES_QUANT_SATURATION. Two property tests are the
+  hard gate: (A) post-saturation ≤ pre for every adversarial input; (B) VIEW-LOCAL — every
+  non-semantic view bit-identical sat-on-vs-off (the D79.4 no-cross-view-veto rail that distinguishes
+  it from the rejected aggregate placement). Backtest flips social-arb-slice Sharpe -0.52 → +0.42 on
+  the versioned exit set. 6 files.
+
+**Verification:** 201 perception+catalyst+no-lookahead tests green together with all three flags OFF;
+grep-verified no flag hard-enabled in source (the only os.environ["HERMES_QUANT_CONVERGENCE"]="1" is
+the scoped eval helper that restores in a finally). Live default path byte-identical — all three land
+inert until the operator flips each flag after its eval gate (PDR-2/3 additionally need B08 real
+Reddit/Trends producers + B09 larger labeled set; PDR-4 needs the larger B09 exit set + side-by-side
+audit). The mechanism + unit gates build NOW; live-influence waits on data volume.
+
+**Net:** with PDR-1 (PerceptionFrame) shipped earlier, the PDR-1..4 perception layer is fully
+realized in code. Combined with W1-W7, the self-evolution architecture from the capability map is
+complete: perception (velocity/convergence/saturation) → decision (BMA + deterministic gate, the
+final authority) → reaction (admissibility + paper), with the advisory plane evolving and the
+gate/ladder/kill-switch immutable by it. The Camillo social-arb edge is now LATENT-but-built:
+every mechanism exists behind a flag; only the operator's eval-gated flips arm it.
