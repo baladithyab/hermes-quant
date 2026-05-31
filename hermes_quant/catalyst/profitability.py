@@ -106,6 +106,8 @@ def measure_profitability(
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(row, dict):
+                continue  # valid JSON but not an object (corrupt/partial append) — skip
             rows_seen += 1
             sym = row.get("symbol")
             relation = row.get("relation", "unknown")

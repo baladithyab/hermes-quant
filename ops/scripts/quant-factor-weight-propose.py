@@ -1,14 +1,17 @@
 """quant-factor-weight-propose.py — W4 weekly factor-weight proposer cron (DEFAULT-OFF).
 
 Flag-gated by HERMES_QUANT_FACTOR_WEIGHT_PROPOSER=1 (default-OFF: byte-identical no-op when unset).
-Runs FactorOracle.evaluate_all on real OHLCV bars, maps verdicts → a CANDIDATE weight diff
-(silence-only, capped), scores the proposed set on a held-out OOS DSR / walk-forward window the
-proposer never saw, and writes an ADVISORY-PLANE candidate JSON for OPERATOR review. Promotes
-NOTHING. Mirrors the catalyst-profitability watchdog: silent unless a factor crosses a tier
-boundary or the eval verdict flips.
+Splits real OHLCV bars TIME-ORDERED into TRAIN/HOLDOUT, runs FactorOracle.evaluate_all → a
+CANDIDATE weight diff (silence-only, capped) on the TRAIN bars ONLY, then scores that PROPOSED set
+on the strictly-later HOLDOUT window the proposer never saw (genuine OOS DSR + cross-fold Sharpe
+jitter → plateau_stable), and writes an ADVISORY-PLANE candidate JSON for OPERATOR review only when
+the set STRICTLY beats prior-best AND is plateau-stable. Promotes NOTHING. Mirrors the
+catalyst-profitability watchdog: silent unless a factor crosses a tier boundary or the eval flips.
 
-External-truth: forward returns / OOS DSR come from market bars; the proposer never sees them at
-propose time. Honesty rails = graph_mining.py. Promotion path = operator + ADR-0052 only.
+No lookahead: the TRAIN/HOLDOUT split is positional on chronologically-ordered bars, so every
+HOLDOUT timestamp strictly post-dates TRAIN, and the proposer is handed TRAIN only. External-truth:
+forward returns / OOS DSR come from market bars — never the proposer's own verdict re-ingested as
+truth (ADR-0080 §D80.3). Honesty rails = graph_mining.py. Promotion path = operator + ADR-0052 only.
 
 Cron registration (operator-applied): job ``quant-factor-weight-propose-weekly``, ``0 7 * * 6``
 (Sat 07:00 PT — AFTER the catalyst-graph-mine slot at 06:00 so the two weekly miners don't
@@ -115,7 +118,12 @@ def _yf_bars(symbol: str, *, period: str = "5y", interval: str = "1d"):
 
 
 def _build_proposal_set(bars):
-    """evaluate_all → propose_weights. Pure given bars; current weights default to zero."""
+    """evaluate_all → propose_weights on the TRAIN bars ONLY. Pure given bars.
+
+    Returns ``(proposal_set, zoo)``: the zoo is handed back so the held-out scorer can recompute
+    the SAME factor series on the HOLDOUT tail (the proposer itself never sees the holdout — the
+    split happens in main() before this is called). Current weights default to zero.
+    """
     from hermes_quant.factors.alpha_zoo import AlphaZoo
     from hermes_quant.factors.factor_oracle import FactorOracle
     from hermes_quant.factors.starter_set import register_starter_set
@@ -123,17 +131,21 @@ def _build_proposal_set(bars):
 
     zoo = AlphaZoo()
     register_starter_set(zoo)
-    verdicts = zoo and FactorOracle(zoo).evaluate_all(bars)
-    return propose_weights(verdicts, current_weights=None)
+    verdicts = FactorOracle(zoo).evaluate_all(bars)
+    return propose_weights(verdicts, current_weights=None), zoo
 
 
-def run_once(*, bars, holdout_dsr, holdout_sharpe_delta, plateau_stable, verbose=False) -> int:
+def run_once(
+    *, bars, holdout_dsr, holdout_sharpe_delta, plateau_stable, proposal_set=None, verbose=False
+) -> int:
     """Core watchdog logic, decoupled from network so it is unit-testable.
 
-    1. propose from verdicts; 2. score against held-out (caller supplies the OOS numbers the
-    proposer never saw); 3. if eval_passed → write candidates + update checkpoint, else →
-    append to the rejected buffer (checkpoint-fallback: do NOT write candidates); 4. emit ONLY
-    on a tier transition or eval-verdict flip (no_agent watchdog).
+    1. propose from TRAIN verdicts (``proposal_set`` is built on TRAIN bars by the caller — main()
+       supplies it after the time-ordered split so the proposer never sees the holdout; when None
+       it is built from ``bars`` for unit tests); 2. score against held-out (caller supplies the
+       OOS numbers the proposer never saw); 3. if eval_passed → write candidates + update
+       checkpoint, else → append to the rejected buffer (checkpoint-fallback: do NOT write
+       candidates); 4. emit ONLY on a tier transition or eval-verdict flip (no_agent watchdog).
     """
     from hermes_quant.factors.weight_proposer import (
         append_rejected,
@@ -143,7 +155,8 @@ def run_once(*, bars, holdout_dsr, holdout_sharpe_delta, plateau_stable, verbose
         write_candidates,
     )
 
-    proposal_set = _build_proposal_set(bars)
+    if proposal_set is None:
+        proposal_set = _build_proposal_set(bars)
     if not proposal_set.proposals:
         return 0  # silence-by-default: no factors evaluated
 
@@ -185,6 +198,21 @@ def run_once(*, bars, holdout_dsr, holdout_sharpe_delta, plateau_stable, verbose
     return 0
 
 
+TRAIN_FRAC: float = 0.7  # the first 70% of bars (time-ordered) is TRAIN; the later 30% is HOLDOUT.
+
+
+def _split_train_holdout(bars):
+    """Time-ordered TRAIN/HOLDOUT split. The HOLDOUT is a STRICTLY-LATER window; the proposer
+    only ever sees TRAIN. No lookahead: rows are in chronological order on entry (yfinance
+    returns ascending dates), and the cut is positional so HOLDOUT timestamps all post-date TRAIN.
+    """
+    n = len(bars)
+    cut = int(n * TRAIN_FRAC)
+    train = bars.iloc[:cut]
+    holdout = bars.iloc[cut:]
+    return train, holdout
+
+
 def main() -> int:
     # DEFAULT-OFF flag gate (read at call time). Off-state = byte-identical no-op.
     if not _flag_on():
@@ -195,43 +223,42 @@ def main() -> int:
     if bars is None or len(bars) < 80:
         return 0  # silence-by-default: insufficient bars to evaluate
 
-    # HELD-OUT: split off an OOS tail the proposer never saw, run the OOS DSR / walk-forward on
-    # the PROPOSED set, and compute plateau_stable from cross-fold jitter (NOT the IS peak).
-    holdout_dsr, holdout_sharpe_delta, plateau_stable = _compute_holdout(bars)
+    # NO-LOOKAHEAD: split TIME-ORDERED into TRAIN/HOLDOUT *before* the proposer runs. The proposer
+    # (evaluate_all → propose_weights) sees TRAIN bars ONLY; the HOLDOUT is a strictly-later window.
+    train, holdout = _split_train_holdout(bars)
+    if len(train) < 60 or len(holdout) < 30:
+        return 0  # silence-by-default: not enough bars for an honest train/holdout split
+
+    proposal_set, zoo = _build_proposal_set(train)
+    if not proposal_set.proposals:
+        return 0  # silence-by-default: no factors evaluated
+
+    # HELD-OUT: run a genuine walk-forward on the PROPOSED set over the holdout the proposer never
+    # saw, and compute plateau_stable from cross-fold Sharpe jitter (robustness, NOT the IS peak).
+    holdout_dsr, holdout_sharpe_delta, plateau_stable = _compute_holdout(
+        proposal_set, holdout, zoo
+    )
     return run_once(
-        bars=bars,
+        bars=train,
         holdout_dsr=holdout_dsr,
         holdout_sharpe_delta=holdout_sharpe_delta,
         plateau_stable=plateau_stable,
+        proposal_set=proposal_set,
         verbose=verbose,
     )
 
 
-def _compute_holdout(bars):
-    """Compute the held-out OOS DSR / Sharpe-delta / plateau-stability on a tail window the
-    proposer never saw. Conservative default: a non-passing (no-evidence) tuple, so the cron
-    appends to the rejected buffer rather than writing candidates until a real walk-forward is
-    wired. (The OOS computation is the operator's to extend with a full WalkForward run.)
+def _compute_holdout(proposal_set, holdout_bars, zoo):
+    """Genuine held-out OOS score of the PROPOSED weight set on a strictly-later window the
+    proposer never saw. Builds the proposed-weight factor composite as a long/short position,
+    realizes it against NEXT-bar returns (no lookahead), scores OOS DSR, and derives
+    plateau_stable from cross-fold Sharpe jitter (robustness, NOT the in-sample peak — the
+    AMZN-weight lesson). Returns ``(holdout_dsr, holdout_sharpe, plateau_stable)``; conservative
+    (-inf, 0.0, False) on insufficient/degenerate data so the cron buffers rather than promotes.
     """
-    from hermes_quant.evaluation.dsr import deflated_sharpe
+    from hermes_quant.factors.weight_proposer import score_holdout
 
-    closes = bars["close"].dropna()
-    n = len(closes)
-    holdout = closes.iloc[n // 2:]
-    rets = holdout.pct_change().dropna()
-    n_obs = len(rets)
-    if n_obs < 30:
-        return float("-inf"), 0.0, False
-    mean = float(rets.mean())
-    std = float(rets.std(ddof=1)) or 1e-9
-    sharpe = mean / std * (252 ** 0.5)
-    try:
-        dsr = deflated_sharpe(sharpe, n_trials=1, n_observations=n_obs)
-    except ValueError:
-        return float("-inf"), 0.0, False
-    # plateau_stability is intentionally conservative-by-default here; a real cross-fold
-    # jitter check is the operator-supplied WalkForward extension (NOT the in-sample peak).
-    return dsr, sharpe, False
+    return score_holdout(proposal_set, holdout_bars, zoo.compute)
 
 
 if __name__ == "__main__":

@@ -184,6 +184,33 @@ def test_asof_is_lookahead_honest(tmp_path):  # 5
     assert seen == [datetime.fromisoformat("2024-03-15T09:30:00+00:00").date()]
 
 
+def test_non_dict_log_line_is_skipped_silently(tmp_path):  # H-W5 silence-by-default
+    """A valid-JSON-but-non-dict line (bare string/number/list/null) from a corrupt or
+    partial append to the append-only log must be SKIPPED, never crash. Before the fix
+    ``row.get(...)`` raised AttributeError that escaped the json.JSONDecodeError/OSError
+    handlers -> the no_agent cron crashed instead of staying silent. Both mine_graph and
+    measure_profitability must skip the non-dicts, process the dict, and never raise."""
+    # interleave valid JSON non-dicts (string, number, list, null) with one real dict row
+    dict_row = _row("AAA", "src_a", "sector_member", -1, _ASOF)
+    p = tmp_path / "propagation-log.jsonl"
+    lines = [
+        '"a bare json string"',  # str
+        "12345",  # int
+        "[1, 2, 3]",  # list
+        "null",  # None
+        json.dumps(dict_row),  # the one good dict
+    ]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # mine_graph: skips the four non-dicts, scores the single dict row, never raises.
+    ev = mine_graph(lambda s, d: -5.0, path=p, graph=_GRAPH)
+    assert ev[("src_a", "AAA", "sector_member")].n_scored == 1
+
+    # measure_profitability: same log, same guarantee — skips non-dicts, scores the dict.
+    stats = measure_profitability(lambda s, d: -5.0, path=p)
+    assert stats["sector_member"].n_scored == 1
+
+
 # ===========================================================================
 # 6-10. Eval-gate thresholds (MIN_SAMPLE / MIN_HIT_RATE — the held-out bar)
 # ===========================================================================

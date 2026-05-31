@@ -190,6 +190,154 @@ def propose_weights(
     )
 
 
+# --- Held-out OOS scoring (external-truth: realized forward returns from market bars) --------
+# The cron passes the OOS *tail* the proposer never saw, plus a `compute_factor` callable
+# (AlphaZoo.compute). We build the PROPOSED-weight factor composite as a long/short position
+# series, realize it against next-bar returns (signal at t → return t→t+1, no lookahead), score
+# the OOS Sharpe → DSR, and read robustness from cross-fold Sharpe jitter (NOT the in-sample
+# peak — the AMZN-weight lesson). This module performs NO network I/O; bars are supplied.
+HOLDOUT_FOLDS: int = 4               # contiguous OOS sub-windows for the cross-fold jitter check.
+# plateau_stable iff the RELATIVE cross-fold Sharpe dispersion (coefficient of variation =
+# stdev/|mean|) is bounded AND a majority of folds keep the OOS sign. A relative cap (not an
+# absolute one) is what robustness means here: a consistently-strong edge has large per-fold
+# Sharpes but LOW relative dispersion, whereas a single-window spike has high dispersion — the
+# AMZN-weight lesson (select on a stable plateau, never the in-sample peak).
+PLATEAU_CV_MAX: float = 1.5
+_ANNUALIZATION: float = 252.0 ** 0.5
+
+
+def _composite_position(
+    proposal_set: FactorWeightProposalSet,
+    holdout_bars,
+    compute_factor,
+):
+    """Build the PROPOSED-weight factor composite as a per-bar long/short position in [-1, 1].
+
+    For each factor with a non-zero proposed weight: z-score its values over the holdout (so
+    factors are comparable), weight by `proposed_weight`, and sum. The composite's sign is the
+    position direction (positive factor predicts positive forward return — the IC convention in
+    ic_panel.py). Returns a pd.Series aligned to holdout_bars, or None if nothing weighted.
+    """
+    import numpy as np
+    import pandas as pd
+
+    combined: pd.Series | None = None
+    total_w = 0.0
+    for p in proposal_set.proposals:
+        w = float(p.proposed_weight)
+        if w <= 0.0:
+            continue  # silence-toward-0 factors contribute nothing
+        try:
+            series = compute_factor(p.factor_id, holdout_bars)
+        except Exception:  # noqa: BLE001 — a single bad factor must not crash the OOS score
+            continue
+        series = pd.Series(series).astype(float)
+        std = series.std(ddof=0)
+        if not np.isfinite(std) or std == 0.0:
+            continue  # degenerate / constant factor contributes no signal
+        z = (series - series.mean()) / std
+        contribution = z.fillna(0.0) * w
+        combined = contribution if combined is None else combined.add(contribution, fill_value=0.0)
+        total_w += w
+
+    if combined is None or total_w == 0.0:
+        return None
+    # Bounded position in [-1, 1]: sign of the weighted composite (discrete-direction, not size —
+    # the sizing ladder is OUTSIDE this loop and untouched here).
+    return np.sign(combined).clip(-1.0, 1.0)
+
+
+def _strategy_returns(position, holdout_bars):
+    """Realize the position against NEXT-bar returns (no lookahead: signal at t, return t→t+1)."""
+    import pandas as pd
+
+    closes = pd.Series(holdout_bars["close"]).astype(float)
+    next_ret = closes.pct_change().shift(-1)  # return earned over t→t+1, attributed to bar t
+    aligned = pd.concat([position.rename("pos"), next_ret.rename("ret")], axis=1).dropna()
+    return (aligned["pos"] * aligned["ret"]).dropna()
+
+
+def _sharpe(returns) -> float:
+    """Annualized Sharpe of a per-bar return series (0 if degenerate)."""
+    import numpy as np
+
+    if len(returns) < 2:
+        return 0.0
+    std = float(returns.std(ddof=1))
+    if not np.isfinite(std) or std == 0.0:
+        return 0.0
+    return float(returns.mean()) / std * _ANNUALIZATION
+
+
+def score_holdout(
+    proposal_set: FactorWeightProposalSet,
+    holdout_bars,
+    compute_factor,
+    *,
+    n_folds: int = HOLDOUT_FOLDS,
+    plateau_cv_max: float = PLATEAU_CV_MAX,
+) -> tuple[float, float, bool]:
+    """Genuine walk-forward score of the PROPOSED weight set on a held-out OOS tail.
+
+    Returns ``(holdout_dsr, holdout_sharpe, plateau_stable)``:
+      - ``holdout_dsr``   : DeFlated Sharpe (P[not-false-discovery]) of the OOS strategy return.
+      - ``holdout_sharpe``: annualized OOS Sharpe of the proposed composite.
+      - ``plateau_stable``: True iff the per-fold Sharpe jitter (stdev across contiguous OOS
+        folds) is small — robustness, NOT the in-sample peak. A sharp single-window spike that
+        does not repeat across folds is jitter-unstable → False (the AMZN-weight lesson).
+
+    Conservative-fail (-inf, 0.0, False) on insufficient/degenerate data so the cron buffers
+    rather than promotes. Pure: no network, no env; `compute_factor` is injected by the caller.
+    """
+    from hermes_quant.evaluation.dsr import deflated_sharpe
+
+    position = _composite_position(proposal_set, holdout_bars, compute_factor)
+    if position is None:
+        return float("-inf"), 0.0, False
+
+    rets = _strategy_returns(position, holdout_bars)
+    n_obs = len(rets)
+    if n_obs < MIN_OBSERVATIONS:
+        return float("-inf"), 0.0, False
+
+    sharpe = _sharpe(rets)
+    try:
+        dsr = deflated_sharpe(sharpe, n_trials=1, n_observations=n_obs)
+    except ValueError:
+        return float("-inf"), 0.0, False
+
+    # --- Robustness-not-peak: cross-fold Sharpe jitter over contiguous OOS sub-windows. ---
+    fold_sharpes: list[float] = []
+    folds = max(2, int(n_folds))
+    if n_obs >= folds * MIN_OBSERVATIONS // 2 and folds >= 2:
+        size = n_obs // folds
+        if size >= 2:
+            for k in range(folds):
+                lo = k * size
+                hi = n_obs if k == folds - 1 else (k + 1) * size
+                fold_sharpes.append(_sharpe(rets.iloc[lo:hi]))
+    if len(fold_sharpes) < 2:
+        plateau_stable = False  # cannot establish robustness on < 2 folds → conservative
+    else:
+        import numpy as np
+
+        mean_fold = float(np.mean(fold_sharpes))
+        std_fold = float(np.std(fold_sharpes, ddof=1))
+        # Relative dispersion (coefficient of variation). A consistently-strong edge has high
+        # per-fold Sharpes but LOW CV; a one-window spike has high CV. Robustness, NOT the peak.
+        cv = std_fold / abs(mean_fold) if mean_fold != 0.0 else float("inf")
+        # Majority of folds must keep the OOS sign (an edge that only appears in one window is not
+        # a plateau). Both conditions are robustness checks, never the in-sample peak.
+        same_sign = sum(1 for s in fold_sharpes if (s > 0) == (sharpe > 0))
+        plateau_stable = bool(
+            np.isfinite(cv)
+            and cv <= plateau_cv_max
+            and same_sign > len(fold_sharpes) / 2
+        )
+
+    return dsr, sharpe, plateau_stable
+
+
 def evaluate_against_holdout(
     proposal_set: FactorWeightProposalSet,
     *,
@@ -214,11 +362,14 @@ def evaluate_against_holdout(
     the proposer cannot author the signal that grades it (D80.3 #1).
     """
     # (4) bounded — a violation is a hard error (the silence-only clamp must hold by construction).
+    # Explicit raise (NOT a bare assert) so the bounds check survives `python -O` (asserts are
+    # stripped under -O; this invariant guards money-software and must never be optimized away).
     for p in proposal_set.proposals:
-        assert WEIGHT_FLOOR <= p.proposed_weight <= WEIGHT_CAP, (
-            f"proposed_weight {p.proposed_weight} for {p.factor_id!r} outside "
-            f"[{WEIGHT_FLOOR}, {WEIGHT_CAP}] — silence-only invariant violated"
-        )
+        if not (WEIGHT_FLOOR <= p.proposed_weight <= WEIGHT_CAP):
+            raise ValueError(
+                f"proposed_weight {p.proposed_weight} for {p.factor_id!r} outside "
+                f"[{WEIGHT_FLOOR}, {WEIGHT_CAP}] — silence-only invariant violated"
+            )
 
     beats_prior_best = holdout_dsr > prior_best_dsr   # (2) STRICT — a tie reverts.
     eval_passed = bool(beats_prior_best and plateau_stable)   # (3) robustness-not-peak ANDed in.
