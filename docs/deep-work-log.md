@@ -303,3 +303,41 @@ complete: perception (velocity/convergence/saturation) → decision (BMA + deter
 final authority) → reaction (admissibility + paper), with the advisory plane evolving and the
 gate/ladder/kill-switch immutable by it. The Camillo social-arb edge is now LATENT-but-built:
 every mechanism exists behind a flag; only the operator's eval-gated flips arm it.
+
+### ACTIVATION — flag-flip discipline + B08 social producers unblocked (2026-05-31)
+
+Operator authorized the agent to flip `.env` flags directly ("flip the env flags yourself").
+The disciplined outcome was NOT to append 9 lines but to find why each flag was/wasn't safe,
+fix the real blocker, and flip the one that genuinely advances the goal. Full analysis:
+`docs/operations/2026-05-31-selfevolve-flag-flip-decision.md`.
+
+- **Per-flag analysis vs LIVE state (not just unit gates):** of 9 self-evolution/PDR flags, W1 is
+  already live and the other 8 were each blocked by an unmet precondition — flipping blindly would
+  be inert (undeployed crons / RESEARCH_DEBATE off / no beliefs corpus) or HARMFUL (CONVERGENCE on a
+  100%-news_rss feed would drop every packet; SATURATION would decay live confidence with no B09
+  audit). Backed up `.env` → `~/.hermes/.env.pre-selfevolve-enable`; flipped nothing blindly.
+- **Traced the PDR-3 blocker to B08:** `catalyst/social.py` (Reddit+Trends producers) was built but
+  (a) unwired into the ingest cron and (b) its live endpoints were dead. Fixed BOTH, no operator
+  OAuth needed: Trends `dailytrends`(404)→`trending/rss` RSS-2.0 (cac3af0); Reddit `.json`(403)→
+  public Atom `.rss` (42f6cb4). Each via build→adversarial-review→self-verify, LIVE-tested (not just
+  mocked) — asof from <pubDate>/<published> never now(), never-raises, source tags preserved.
+- **Deploy-drift reconciled (the "look at the target before overwriting" rule):** the deployed
+  `~/.hermes/scripts/quant-catalyst-ingest.py` had uncommitted FEATURES the repo lacked (consumer-
+  trend sweeps + per-item `log_propagations`). A naive `cp` of the repo version would have regressed
+  live behavior. Reconciled repo = deployed-base + B08 social wiring (1933064/4a29cc3), committed,
+  THEN deployed (DEPLOYED == REPO). Widened the Reddit query set for CELH/CROX/TPR coverage (6edd268).
+- **FLIPPED `HERMES_QUANT_SOCIAL_INGEST=1`** (.env:440): live cron now produces a genuinely
+  multi-source feed (148 reddit + 360 news → 309 packets); TSLA/RIVN/LCID multi-family in the store;
+  a live recommend runs clean (gate + haircut + require_ensemble still govern). Pure upside —
+  adds evidence, drops nothing.
+- **HELD `HERMES_QUANT_CONVERGENCE` (PDR-3) OFF — measured reason:** with SEMANTIC_ENABLED=1 the
+  ingest-time drop is consequential; a kept-vs-dropped check showed flipping now would KEEP only
+  TSLA/RIVN/LCID and DROP 16 single-source symbols INCLUDING CELH/CROX (the thesis's own names —
+  they lack ACCUMULATED cross-source overlap in a single pull; convergence is temporal over PDR-3's
+  freshness window). Gate for the flip: let the deployed cron accumulate cross-source overlap across
+  its cadence, re-measure, then flip. Forcing it now would silence the social-arb edge it validates.
+
+**Lesson reinforced:** a flag's safety is a property of the RUNNING system (live data + deploy
+state), not the code. The honest path to "flip the flag" ran through building the producers +
+reconciling the deploy, not editing `.env`. Memories corrected: `.env` is operator-authorizable;
+deploying a cron SCRIPT is agent-doable but ALWAYS diff the target for diverged features first.
