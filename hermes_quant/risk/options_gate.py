@@ -25,11 +25,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from hermes_quant.options.data import (
+    GreekComputationError,
     NetGreeks,
     OptionLeg,
     StockLeg,
     aggregate_net_greeks,
 )
+from hermes_quant.options.occ import OccParseError
 
 
 class OptionsGateDisabled(RuntimeError):  # noqa: N818 — plan/ADR-0027-mandated name
@@ -151,10 +153,14 @@ def _classify_structure(
     if not shorts:
         return StructureBucket.DEFINED_RISK
 
-    # A short option with a covering wider long leg (vertical / condor / fly) is
-    # defined-risk. We treat "any long option leg present alongside the short(s)"
-    # as the spread case (the max-loss caller validates the width/credit math).
-    if longs:
+    # A short option is DEFINED_RISK only if a long leg actually COVERS it:
+    # same underlying, same (covering) right, and expiry >= the short's expiry.
+    # A same-right long with expiry no earlier than the short caps the otherwise
+    # unbounded tail (the long offsets 1:1 past both strikes); the caller's
+    # width/credit math validates the max-loss MAGNITUDE within the envelope.
+    # Anything that does not cover EVERY short (e.g. a naked short call paired
+    # with an unrelated long put) is NAKED — never silently DEFINED_RISK.
+    if longs and all(_is_covered_short(short, longs) for short in shorts):
         return StructureBucket.DEFINED_RISK
 
     # Lone short leg(s). Distinguish covered call vs cash-secured put vs naked.
@@ -168,13 +174,48 @@ def _classify_structure(
         return StructureBucket.NAKED
 
     if all_puts:
-        required = strike * 100 * contracts - premium_received
+        # ADR-0027 D4: cash-secured requires the FULL assignment cash reserved
+        # (strike*100*contracts). The premium received does NOT reduce the
+        # collateral requirement — on assignment the operator must buy the
+        # shares outright at the strike. Netting the premium would admit an
+        # under-collateralized (effectively naked) short put.
+        required = strike * 100 * contracts
         if options_buying_power >= required:
             return StructureBucket.CASH_SECURED_PUT
         return StructureBucket.NAKED
 
     # Mixed lone shorts (e.g. short call + short put, no cover) => naked strangle.
     return StructureBucket.NAKED
+
+
+def _is_covered_short(short: OptionLeg, longs: Sequence[OptionLeg]) -> bool:
+    """True iff some long leg actually covers `short` (caps its unbounded tail).
+
+    Covering requires: same underlying, same right (a long call caps a short
+    call's upside; a long put caps a short put's downside), and the long's
+    expiry >= the short's expiry (an earlier-expiring long leaves the short
+    naked after the long expires). The loss-MAGNITUDE (strike width / credit) is
+    validated separately by the max-loss caller; here we only decide naked vs
+    defined-risk, so a same-right same-underlying long-dated long is sufficient
+    to cap the tail. Fail-closed: any unparseable OCC field => not covered.
+    """
+    try:
+        s_under = short.underlying
+        s_right = short.right
+        s_expiry = short.expiry
+    except OccParseError:
+        return False
+    for lng in longs:
+        try:
+            if (
+                lng.underlying == s_under
+                and lng.right == s_right
+                and lng.expiry >= s_expiry
+            ):
+                return True
+        except OccParseError:
+            continue
+    return False
 
 
 def _shares_needed(contracts: int) -> int:
@@ -255,9 +296,20 @@ def _size_contracts(
 
     if bucket == StructureBucket.COVERED_CALL:
         if composite_intent == "wheel":
-            # Overlay on already-held shares: no new capital deployed; only the
-            # truly-covered constraint binds.
-            return held_shares // 100
+            # Overlay on already-held shares. The held-shares lot count is one
+            # binding constraint, but it can NEVER be the only one: the gate
+            # never sizes up, so the NAV sizing target (target_nav over the
+            # per-contract collateral basis = basis_per_share*100) is an
+            # additional ceiling. We take the MIN of the two so the wheel can
+            # only subtract relative to the NAV target, never widen exposure
+            # beyond max_position_pct / action_step (ADR-0027 D3).
+            by_shares = held_shares // 100
+            if not collateral_per_contract or collateral_per_contract <= 0:
+                # No collateral basis to bound the NAV target -> fail-closed to
+                # the share cap alone would WIDEN; size 0 instead (silence).
+                return 0
+            by_nav = math.floor(target / collateral_per_contract)
+            return min(by_shares, by_nav)
         # Initiation: collateral_per_contract = basis_per_share * 100.
         if not collateral_per_contract or collateral_per_contract <= 0:
             return 0
@@ -325,16 +377,27 @@ def options_gate(
             "enable (this wave never sets it live)"
         )
 
-    # Aggregate candidate net greeks first (fail-closed on missing greeks).
-    # This MUST come before any per-position check (ADR-0027 D6).
-    candidate_net = aggregate_net_greeks(legs)
-    portfolio_after = portfolio_net_greeks + candidate_net
-
     # ---- O-classify (D7 composite-intent feeds the classifier sizing). ----
     # Provisional contract count for the share-coverage classification: use the
     # short-call ratio_qty sum as the structural contract count, before sizing.
     shorts = _short_option_legs(legs)
     structural_contracts = sum(leg.ratio_qty for leg in shorts) or 1
+
+    # Aggregate candidate net greeks first (fail-closed on missing greeks).
+    # This MUST come before any per-position check (ADR-0027 D6). Scale by the
+    # proposed order quantity (structural_contracts) so a multi-contract order is
+    # checked against its REAL greek footprint, not a single-lot footprint — a
+    # per-lot aggregate would let a multi-lot order slip past O3/O5/net-delta.
+    # A leg missing greeks raises GreekComputationError; we convert that to a
+    # deterministic silence (reject) rather than aborting the tick (ADR-0027 D6).
+    try:
+        candidate_net = aggregate_net_greeks(legs, order_qty=structural_contracts)
+    except (GreekComputationError, TypeError) as exc:
+        return OptionsGateResult.silence(
+            StructureBucket.NAKED,
+            f"greeks_unavailable: {exc}",
+        )
+    portfolio_after = portfolio_net_greeks + candidate_net
 
     # D7 wheel: refuse a third leg (CC + CSP already open -> any new leg).
     if composite_intent == "wheel" and open_strategies_on_underlying >= 2:
@@ -453,8 +516,19 @@ def options_gate(
             bpr_estimate=bpr, max_loss=max_loss,
         )
 
-    # ---- O7: pin-risk filter (min DTE <= threshold AND |moneyness| <= thr). ----
-    if min_dte is not None and strike > 0 and spot > 0:
+    # ---- O7: pin-risk filter + min-DTE hard envelope. ----
+    # FAIL-CLOSED: an unknown DTE on a new entry is a trade-affecting input we
+    # cannot verify; we MUST reject rather than skip both checks (the old
+    # `if min_dte is not None` nesting silently bypassed pin-risk AND the
+    # min_dte_for_new_entry envelope when DTE was unknown — fail-OPEN).
+    if min_dte is None:
+        return OptionsGateResult.silence(
+            bucket, "dte_unknown_for_new_entry", net_greeks=candidate_net,
+            bpr_estimate=bpr, max_loss=max_loss,
+        )
+    # Pin-risk filter (min DTE <= threshold AND |moneyness| <= thr). Checked
+    # before the min-DTE envelope to preserve the more-specific pin-risk reason.
+    if strike > 0 and spot > 0:
         moneyness = abs(spot - strike) / spot
         if (
             min_dte <= cfg.pin_risk_dte_threshold
@@ -464,12 +538,12 @@ def options_gate(
                 bucket, "pin_risk", net_greeks=candidate_net,
                 bpr_estimate=bpr, max_loss=max_loss,
             )
-        # min_dte_for_new_entry envelope (never open new <7 DTE).
-        if min_dte < cfg.min_dte_for_new_entry:
-            return OptionsGateResult.silence(
-                bucket, "below_min_dte_for_new_entry", net_greeks=candidate_net,
-                bpr_estimate=bpr, max_loss=max_loss,
-            )
+    # min_dte_for_new_entry envelope (never open new <7 DTE).
+    if min_dte < cfg.min_dte_for_new_entry:
+        return OptionsGateResult.silence(
+            bucket, "below_min_dte_for_new_entry", net_greeks=candidate_net,
+            bpr_estimate=bpr, max_loss=max_loss,
+        )
 
     # ---- Sizing (D3 + amendment). Contract count is floor() of a discrete-step ---
     # NAV target. Per ADR-0027 D3 amendment, the income/collateral sizing target

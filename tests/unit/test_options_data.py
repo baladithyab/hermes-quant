@@ -125,6 +125,33 @@ def test_aggregate_ratio_qty_scales() -> None:
     assert aggregate_net_greeks(legs).delta == pytest.approx(100.0)
 
 
+def test_aggregate_order_qty_default_is_one_lot() -> None:
+    """Default order_qty=1 keeps the single-lot footprint (bit-for-bit prior)."""
+    legs = [_opt("NVDA260612C00150000", "buy", delta=0.50)]
+    assert aggregate_net_greeks(legs).delta == pytest.approx(50.0)
+    assert aggregate_net_greeks(legs, order_qty=1).delta == pytest.approx(50.0)
+
+
+def test_aggregate_order_qty_scales_multi_contract() -> None:
+    """Bug 6: a multi-contract order's greeks scale by ratio_qty*order_qty*100,
+    NOT a single lot. A 10-contract 0.50Δ call is 500 delta, not 50 — scaling by
+    one lot would let a 10-lot order slip past per-lot greek caps."""
+    legs = [_opt("NVDA260612C00150000", "buy", delta=0.50)]
+    assert aggregate_net_greeks(legs, order_qty=10).delta == pytest.approx(500.0)
+
+
+def test_aggregate_order_qty_compounds_with_ratio_qty() -> None:
+    """units = ratio_qty * order_qty * 100: ratio_qty=2, order_qty=3 -> 600Δ."""
+    legs = [_opt("NVDA260612C00150000", "buy", delta=0.50, ratio_qty=2)]
+    assert aggregate_net_greeks(legs, order_qty=3).delta == pytest.approx(300.0)
+
+
+def test_aggregate_order_qty_does_not_scale_stock_qty() -> None:
+    """Stock qty is an absolute share count -> NOT multiplied by order_qty."""
+    legs = [StockLeg(underlying="NVDA", qty=100)]
+    assert aggregate_net_greeks(legs, order_qty=5).delta == pytest.approx(100.0)
+
+
 def test_aggregate_full_greek_vector() -> None:
     legs = [
         _opt(

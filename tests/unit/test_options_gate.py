@@ -367,7 +367,11 @@ def test_cc_initiation_sizing_correct_when_capital_allows() -> None:
 
 
 def test_cc_overlay_sizes_against_held_shares() -> None:
-    """composite_intent='wheel', held_shares=300 -> max_contracts_by_held_shares=3."""
+    """composite_intent='wheel': held_shares=300 (3 lots) but the NAV target is
+    the binding ceiling. nav 1M, basis 100 -> collateral 10_000, target
+    1M*0.25*0.10 = 25_000 -> floor(25000/10000) = 2. The wheel CAP takes
+    min(by_shares=3, by_nav=2) = 2: the held-shares count can only SUBTRACT
+    against the NAV target, never widen it (the pre-fix bug returned 3)."""
     res = options_gate(
         [
             StockLeg(underlying="NVDA", qty=300, basis_per_share=100.0),
@@ -379,7 +383,7 @@ def test_cc_overlay_sizes_against_held_shares() -> None:
         ),
     )
     assert res.admitted is True
-    assert res.contracts == 3
+    assert res.contracts == 2  # min(by_shares=3, by_nav=2); never the buggy 3
 
 
 # ---------------------------------------------------------------------------
@@ -485,3 +489,128 @@ def test_max_strategies_per_underlying_silenced() -> None:
     )
     assert res.admitted is False
     assert res.reason == "max_strategies_per_underlying"
+
+
+# ---------------------------------------------------------------------------
+# Pre-go-live hardening (Codex Facets 1+2+4 convergent correctness bugs)
+# ---------------------------------------------------------------------------
+
+
+def _long_put(strike_sym: str, *, delta: float, theta: float = -0.05) -> OptionLeg:
+    return OptionLeg(
+        symbol=strike_sym,
+        side="buy",
+        position_intent="buy_to_open",
+        greeks_at_decision=OptionGreeksSnapshot(
+            delta=delta, gamma=0.01, theta=theta, vega=0.05, rho=-0.01
+        ),
+    )
+
+
+def test_naked_short_call_with_unrelated_long_put_is_naked() -> None:
+    """Bug 1: a short call paired with an UNRELATED long put (wrong right) must
+    NOT be classified DEFINED_RISK. The long put does not cap the short call's
+    unbounded upside tail -> the short is naked -> reject. (Pre-fix: any long
+    leg present made the structure DEFINED_RISK, bypassing the no-naked check.)"""
+    res = options_gate(
+        [
+            _short_call("NVDA260612C00160000", delta=0.25),
+            _long_put("NVDA260612P00120000", delta=-0.20),
+        ],
+        **_base_kwargs(held_shares=0, strike=160.0, min_dte=30),
+    )
+    assert res.admitted is False
+    assert res.bucket == StructureBucket.NAKED
+
+
+def test_short_call_with_earlier_expiry_long_call_is_naked() -> None:
+    """Bug 1 (expiry guard): a long call that expires BEFORE the short leaves the
+    short naked after the long expires -> not covering -> reject."""
+    res = options_gate(
+        [
+            _short_call("NVDA260612C00160000", delta=0.25),  # expires 2026-06-12
+            _long_call("NVDA260605C00170000", delta=0.20),  # expires 2026-06-05 (earlier)
+        ],
+        **_base_kwargs(held_shares=0, strike=160.0, min_dte=30),
+    )
+    assert res.admitted is False
+    assert res.bucket == StructureBucket.NAKED
+
+
+def test_min_dte_none_rejects_fail_closed() -> None:
+    """Bug 2: an unknown DTE (min_dte=None) on a new entry MUST reject, not skip
+    the pin-risk + min-DTE envelope (pre-fix the whole block was nested under
+    `if min_dte is not None` -> fail-OPEN). This proves fail-closed silence."""
+    res = options_gate(
+        [
+            StockLeg(underlying="NVDA", qty=1000, basis_per_share=100.0),
+            _short_call("NVDA260612C00160000", delta=0.25),
+        ],
+        **_base_kwargs(
+            nav=1_000_000.0, held_shares=1000, strike=160.0, basis_per_share=100.0,
+            min_dte=None,
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "dte_unknown_for_new_entry"
+    assert res.contracts == 0
+
+
+def test_csp_under_collateralized_rejected_full_assignment_cash() -> None:
+    """Bug 3: cash-secured put requires the FULL assignment cash
+    (strike*100*contracts) reserved; the premium does NOT reduce it. BP that
+    covers strike*100 - premium but NOT strike*100 must be rejected as naked."""
+    # strike 140 -> full required = 14_000; premium-netted (buggy) = 13_750.
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=13_800.0,  # >= 13_750 (buggy) but < 14_000 (full)
+            premium_received=250.0,
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False
+    assert res.bucket == StructureBucket.NAKED
+
+
+def test_wheel_capped_by_nav_target_not_held_shares() -> None:
+    """Bug 4: wheel CC overlay is capped by the NAV sizing target, never just
+    held_shares//100. held_shares=1000 (10 lots) but NAV target only allows 2."""
+    res = options_gate(
+        [
+            StockLeg(underlying="NVDA", qty=1000, basis_per_share=100.0),
+            _short_call("NVDA260612C00160000", delta=0.25),
+        ],
+        **_base_kwargs(
+            nav=1_000_000.0, held_shares=1000, strike=160.0, basis_per_share=100.0,
+            min_dte=30, composite_intent="wheel", open_strategies_on_underlying=1,
+        ),
+    )
+    # by_shares = 10; by_nav = floor(1M*0.25*0.10 / 10_000) = 2 -> min = 2.
+    assert res.admitted is True
+    assert res.contracts == 2
+    assert res.contracts < 1000 // 100  # the NAV cap strictly subtracted
+
+
+def test_missing_greeks_returns_silence_not_raise() -> None:
+    """Bug 5: a leg missing greeks must yield a deterministic silence (reject),
+    never abort the tick by raising out of options_gate()."""
+    leg_no_greeks = OptionLeg(
+        symbol="NVDA260612C00160000",
+        side="sell",
+        position_intent="sell_to_open",
+        greeks_at_decision=None,
+    )
+    res = options_gate(
+        [
+            StockLeg(underlying="NVDA", qty=100, basis_per_share=100.0),
+            leg_no_greeks,
+        ],
+        **_base_kwargs(held_shares=100, strike=160.0, basis_per_share=100.0, min_dte=30),
+    )
+    assert isinstance(res, OptionsGateResult)
+    assert res.admitted is False
+    assert res.contracts == 0
+    assert (res.reason or "").startswith("greeks_unavailable")

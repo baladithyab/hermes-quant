@@ -246,17 +246,25 @@ class OptionChain:
 # ---------------------------------------------------------------------------
 
 
-def aggregate_net_greeks(legs: Sequence[OptionLeg | StockLeg]) -> NetGreeks:
+def aggregate_net_greeks(
+    legs: Sequence[OptionLeg | StockLeg], *, order_qty: int = 1
+) -> NetGreeks:
     """Aggregate per-leg greeks into NetGreeks (ADR-0027 D6 + both amendments).
 
-      - OptionLeg: sign(side) * per-contract-greek * (ratio_qty * 100).
-        sign = +1 buy / -1 sell. greeks_at_decision MUST be non-None for every
+      - OptionLeg: sign(side) * per-contract-greek * (ratio_qty * order_qty * 100).
+        sign = +1 buy / -1 sell. ``order_qty`` is the number of times the whole
+        structure (the ratio set) is ordered; the real position greeks are
+        per-lot greeks * order_qty (ADR-0027 D6 amendment). Scaling by 1 lot
+        would let a multi-contract order slip past per-lot caps while the real
+        order breaches them. greeks_at_decision MUST be non-None for every
         option leg; raise GreekComputationError if any is None (fail-closed —
         the gate refuses to evaluate missing greeks, ADR-0027 D6).
       - StockLeg: delta += 1.0 * qty (signed); gamma/theta/vega/rho contribute 0.
+        Stock qty is an absolute share count, NOT scaled by order_qty.
       - Unknown leg type: TypeError.
     """
     net = NetGreeks.zero()
+    qty = max(int(order_qty), 1)
     for leg in legs:
         if isinstance(leg, OptionLeg):
             g = leg.greeks_at_decision
@@ -270,7 +278,7 @@ def aggregate_net_greeks(legs: Sequence[OptionLeg | StockLeg]) -> NetGreeks:
                     f"option leg {leg.symbol} has incomplete greeks; fail-closed"
                 )
             sgn = 1 if leg.side == "buy" else -1
-            units = sgn * leg.ratio_qty * _CONTRACT_MULTIPLIER
+            units = sgn * leg.ratio_qty * qty * _CONTRACT_MULTIPLIER
             net = net + NetGreeks(
                 delta=g.delta * units,
                 gamma=g.gamma * units,
