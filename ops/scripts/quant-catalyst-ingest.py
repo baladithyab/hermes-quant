@@ -69,9 +69,15 @@ QUERIES = {
 # synthesize pipeline as news, so a brand only emits a packet if it is already a
 # graph entity (no new authority, evidence-only).
 SOCIAL_REDDIT_QUERIES = {
-    "stocks:Crocs OR Tesla OR Celsius OR Coach OR Tapestry": "social/reddit-r-stocks",
-    "wallstreetbets:Crocs OR Tesla OR Celsius OR Boeing": "social/reddit-r-wsb",
-    "investing:TSMC OR Boeing OR Tesla OR bank failure": "social/reddit-r-investing",
+    # Brand + TICKER search across the subs that actually carry consumer-trend chatter
+    # (verified live: wsb/stocks surface CELH/CROX/TPR by ticker, r/SecurityAnalysis carries
+    # long/short theses). Searching by ticker AND brand name is what surfaces the social-arb
+    # consumer names — the precondition for PDR-3 cross-source convergence on CELH/CROX/TPR.
+    "stocks:CELH OR CROX OR TPR OR Crocs OR Celsius OR Tapestry": "social/reddit-r-stocks",
+    "wallstreetbets:CELH OR CROX OR Crocs OR Celsius OR Tesla": "social/reddit-r-wsb",
+    "StockMarket:Crocs OR Celsius OR Coach OR Tesla OR Boeing": "social/reddit-r-stockmarket",
+    "investing:TSMC OR Boeing OR Tesla OR Tapestry OR bank failure": "social/reddit-r-investing",
+    "SecurityAnalysis:Celsius OR Crocs OR Tapestry OR Coach": "social/reddit-r-securityanalysis",
 }
 # Trends is filtered to the graph's consumer-brand terms so it stays targeted
 # (not a firehose of every trending search). Mirrors the alias brand set.
