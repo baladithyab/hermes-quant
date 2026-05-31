@@ -249,6 +249,34 @@ def build_perception_frame(
                 "build_perception_frame(%s): convergence stamp failed: %s", symbol, exc
             )
 
+    # ---- Step 6b: PDR-4 SaturationScore (ADR-0079 GAP-C) -- default-OFF ----
+    # Flag read at CALL time (mirrors wiring.py:40). OFF -> saturation stays None
+    # -> adapter writes NOTHING -> semantic view byte-identical (flag-OFF safety).
+    frame_saturation: Mapping[str, Any] | None = None
+    if os.environ.get("HERMES_QUANT_SATURATION", "0") == "1" and semantic_packets:
+        try:
+            from hermes_quant.perception.saturation import compute_saturation
+
+            # Score the freshest packet (the one the analyst selects: semantic.py:194).
+            # CRITICAL: frame.semantic_packets holds packet DICTS, not objects --
+            # load_packets_for returns list[dict] (synthesize.py:166,198) and the
+            # builder does `tuple(packets)` (builder.py:182). Use dict .get(), NOT
+            # getattr(): getattr on a dict returns the default every time, which would
+            # make saturation a SILENT no-op even with the flag ON (the basis would
+            # always be "no_basis"). Verified against HEAD 2026-05-31.
+            _pkt = max(semantic_packets, key=lambda p: p.get("asof", ""))
+            _md = _pkt.get("metadata") or {}
+            _cd = _md.get("confirm_date") if isinstance(_md, Mapping) else None
+            frame_saturation = compute_saturation(
+                packet_asof=_pkt.get("asof"),
+                asof=last_bar_ts_utc,            # the bar-asof replay anchor (== frame.asof)
+                trend_velocity=None,             # PDR-2 fills frame.trend_velocity; None today
+                confirm_date=_cd,
+            )
+        except Exception as exc:  # noqa: BLE001 -- never block frame build on saturation
+            logger.debug("build_perception_frame(%s): saturation failed: %s", symbol, exc)
+            frame_saturation = None
+
     # ---- Step 6: last_close (advisor.py:877) ----
     last_close = float(bars["close"].iloc[-1])
 
@@ -262,7 +290,7 @@ def build_perception_frame(
         semantic_packets=semantic_packets,
         trend_velocity=frame_trend_velocity,
         convergence=frame_convergence,
-        saturation=None,
+        saturation=frame_saturation,
         provenance=(),
         extras=frame_extras,
     )

@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "description": "Labeled social-arb EXIT cases: trends past their velocity peak / confirm date, with the REALIZED forward return AFTER the saturation point. Edge is time-decaying information asymmetry (Camillo EXIT-on-parity); once Wall Street caught up (earnings/credit-card confirm passed, social velocity rolled over) the residual move is adverse to the stale stance. The PDR-4 decay shrinks the saturated semantic view so the silenced position AVOIDS the post-parity drawdown. External-truth labels (realized forward returns), never self-graded.",
+  "half_life_days": 14.0,
+  "cases": [
+    {
+      "symbol": "CROX",
+      "packet_asof": "2024-02-01T13:30:00Z",
+      "decision_asof": "2024-03-15T13:30:00Z",
+      "peak_asof": "2024-02-05T13:30:00Z",
+      "confirm_date": "2024-02-20T21:00:00Z",
+      "stance": "bullish",
+      "pre_sat_confidence": 0.62,
+      "realized_forward_return_pct": -3.1,
+      "note": "Earnings (confirm_date) passed; Wall Street caught up; edge gone -> the silenced view AVOIDS the post-parity drawdown."
+    },
+    {
+      "symbol": "CELH",
+      "packet_asof": "2024-04-10T13:30:00Z",
+      "decision_asof": "2024-06-01T13:30:00Z",
+      "peak_asof": "2024-04-15T13:30:00Z",
+      "confirm_date": "2024-05-07T21:00:00Z",
+      "stance": "bullish",
+      "pre_sat_confidence": 0.58,
+      "realized_forward_return_pct": -6.4,
+      "note": "Energy-drink craze fully priced post-earnings; momentum reversed; stale bull stance bleeds."
+    },
+    {
+      "symbol": "TPR",
+      "packet_asof": "2023-11-01T13:30:00Z",
+      "decision_asof": "2023-12-20T13:30:00Z",
+      "peak_asof": "2023-11-06T13:30:00Z",
+      "confirm_date": "2023-11-09T21:00:00Z",
+      "stance": "bullish",
+      "pre_sat_confidence": 0.51,
+      "realized_forward_return_pct": -2.2,
+      "note": "Coach handbag trend confirmed by quarterly; info parity reached; modest adverse drift."
+    },
+    {
+      "symbol": "NWL",
+      "packet_asof": "2024-01-08T13:30:00Z",
+      "decision_asof": "2024-02-28T13:30:00Z",
+      "peak_asof": "2024-01-12T13:30:00Z",
+      "confirm_date": "2024-02-09T21:00:00Z",
+      "stance": "bullish",
+      "pre_sat_confidence": 0.47,
+      "realized_forward_return_pct": -4.0,
+      "note": "Elmer-glue slime fad past peak; consumer-staples mean-reversion; stale view drawdown."
+    },
+    {
+      "symbol": "CROX",
+      "packet_asof": "2024-07-01T13:30:00Z",
+      "decision_asof": "2024-07-12T13:30:00Z",
+      "peak_asof": "2024-07-03T13:30:00Z",
+      "confirm_date": null,
+      "stance": "bullish",
+      "pre_sat_confidence": 0.55,
+      "realized_forward_return_pct": 1.8,
+      "note": "FRESH case (decision only ~9 days after packet, no confirm): edge still live, decay near 1.0, return positive -> sat must NOT meaningfully shrink a still-fresh winner."
+    },
+    {
+      "symbol": "CELH",
+      "packet_asof": "2024-09-02T13:30:00Z",
+      "decision_asof": "2024-09-09T13:30:00Z",
+      "peak_asof": "2024-09-04T13:30:00Z",
+      "confirm_date": null,
+      "stance": "bullish",
+      "pre_sat_confidence": 0.6,
+      "realized_forward_return_pct": 2.5,
+      "note": "FRESH winner: decision 7 days after packet, edge intact; decay ~ near 1.0 keeps most of the position."
+    }
+  ]
+}

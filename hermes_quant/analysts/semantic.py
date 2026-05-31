@@ -26,8 +26,8 @@ For any analyst that fetches news/social data:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any
 
 from hermes_quant.protocol import AnalystView, MarketContext
 from hermes_quant.semantic import (
@@ -128,6 +128,21 @@ class HermesSemanticAnalyst:
             confidence = apply_regime_multiplier(float(confidence), _regime, "semantic")
         except Exception:  # noqa: BLE001
             pass
+
+        # ADR-0079 PDR-4 [SATURATE]: silence-only edge-decay multiplier on THIS
+        # view's confidence, BEFORE BMA (D79.4: view-local, never the aggregate).
+        # Flag read at call time; OFF or no saturation extra -> m=1.0 (no-op,
+        # byte-identical). post <= pre is guaranteed by apply_saturation's clamp.
+        import os
+        if os.environ.get("HERMES_QUANT_SATURATION", "0") == "1" and ctx.extras:
+            try:
+                from hermes_quant.perception.saturation import apply_saturation
+                _sat = ctx.extras.get("saturation")
+                confidence = apply_saturation(float(confidence), _sat)
+                if _sat is not None:
+                    metadata["saturation"] = dict(_sat)   # provenance into the view metadata
+            except Exception:  # noqa: BLE001 -- saturation must not break the view
+                pass
 
         view = AnalystView(
             analyst=self.name,
