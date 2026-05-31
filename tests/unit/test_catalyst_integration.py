@@ -135,3 +135,96 @@ def test_format_report_recommends_action(tmp_path):
     stats = {"brand_self": RelationStats("brand_self", n_scored=MIN_SAMPLE, hits=int(MIN_SAMPLE*0.7), sum_signed_return=50.0)}
     rep = format_report(stats)
     assert "RAISING" in rep  # profitable -> suggest raising the haircut
+
+
+# ---------------------------------------------------------------------------
+# PDR-2 TrendVelocity — flag-OFF byte-identical (T2) + flag-ON magnitude-only (T3)
+# ---------------------------------------------------------------------------
+def _camillo_item():
+    return CatalystItem(
+        title="Celsius energy drink goes viral on TikTok as sales surge among Gen Z",
+        published_at=datetime(2021, 3, 1, tzinfo=UTC),
+        source="phase0-label",
+        link="n/a",
+    )
+
+
+def test_velocity_flag_off_is_byte_identical(monkeypatch):
+    """HERMES_QUANT_TREND_VELOCITY unset/0 -> magnitude stays severity-based and the
+    synthesized packets are BYTE-IDENTICAL to the no-velocity baseline. The single most
+    important rail (#1): the default path is bit-for-bit today's, even when a velocity
+    map is PASSED. Asserted on the full dict INCLUDING the packet hash."""
+    monkeypatch.delenv("HERMES_QUANT_TREND_VELOCITY", raising=False)
+    g, a = load_graph()
+    items = [_camillo_item()]
+    base = synthesize_packets(items, graph=g, aliases=a)
+    # passing a (loud) velocity map but with the flag OFF must change NOTHING:
+    withv = synthesize_packets(
+        items, graph=g, aliases=a, velocity_by_symbol={"CELH": {"baseline_z": 9.0}}
+    )
+    assert [p.to_dict(include_hash=True) for p in base] == [
+        p.to_dict(include_hash=True) for p in withv
+    ]
+    # and no provenance keys leaked into metadata when the flag is OFF:
+    for p in withv:
+        assert "magnitude_source" not in p.metadata
+        assert "velocity_score" not in p.metadata
+
+
+def test_velocity_flag_off_explicit_zero_is_byte_identical(monkeypatch):
+    """Same as above but with the flag EXPLICITLY set to '0' (not just unset)."""
+    monkeypatch.setenv("HERMES_QUANT_TREND_VELOCITY", "0")
+    g, a = load_graph()
+    items = [_camillo_item()]
+    base = synthesize_packets(items, graph=g, aliases=a)
+    withv = synthesize_packets(
+        items, graph=g, aliases=a, velocity_by_symbol={"CELH": {"baseline_z": 9.0}}
+    )
+    assert [p.to_dict(include_hash=True) for p in base] == [
+        p.to_dict(include_hash=True) for p in withv
+    ]
+
+
+def test_velocity_flag_on_changes_only_magnitude(monkeypatch):
+    """Flag ON: magnitude moves to velocity-sourced; stance + confidence UNCHANGED
+    (D74.3 magnitude/confidence never conflated)."""
+    monkeypatch.setenv("HERMES_QUANT_TREND_VELOCITY", "1")
+    g, a = load_graph()
+    base = synthesize_packets([_camillo_item()], graph=g, aliases=a)
+    on = synthesize_packets(
+        [_camillo_item()], graph=g, aliases=a, velocity_by_symbol={"CELH": {"baseline_z": 9.0}}
+    )
+    assert base and on
+    assert base[0].stance == on[0].stance
+    assert base[0].confidence == on[0].confidence  # confidence is NOT re-sourced (D74.3)
+    assert on[0].magnitude != base[0].magnitude  # magnitude (and ONLY magnitude) moved
+    assert on[0].metadata["magnitude_source"] == "velocity"
+    assert on[0].metadata["velocity_score"] == {"baseline_z": 9.0}
+    # metadata otherwise identical (only the two provenance keys added):
+    extra = set(on[0].metadata) - set(base[0].metadata)
+    assert extra == {"magnitude_source", "velocity_score"}
+
+
+def test_velocity_flag_on_no_score_for_symbol_falls_back_to_severity(monkeypatch):
+    """Flag ON but the velocity map has no entry for the touched symbol -> magnitude
+    falls back to severity and NO provenance is stamped (silence-by-default abstain)."""
+    monkeypatch.setenv("HERMES_QUANT_TREND_VELOCITY", "1")
+    g, a = load_graph()
+    base = synthesize_packets([_camillo_item()], graph=g, aliases=a)
+    on = synthesize_packets(
+        [_camillo_item()], graph=g, aliases=a, velocity_by_symbol={"NVDA": {"baseline_z": 9.0}}
+    )
+    assert on[0].magnitude == base[0].magnitude
+    assert "magnitude_source" not in on[0].metadata
+
+
+def test_velocity_flag_on_decelerating_z_floors_magnitude(monkeypatch):
+    """A decelerating (z<=0) score floors magnitude to 0.0 — a flag flip on a fading
+    trend does not inflate the packet (rail #2)."""
+    monkeypatch.setenv("HERMES_QUANT_TREND_VELOCITY", "1")
+    g, a = load_graph()
+    on = synthesize_packets(
+        [_camillo_item()], graph=g, aliases=a, velocity_by_symbol={"CELH": {"baseline_z": -3.0}}
+    )
+    assert on[0].magnitude == 0.0
+    assert on[0].metadata["magnitude_source"] == "velocity"

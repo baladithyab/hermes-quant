@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -74,6 +75,7 @@ def synthesize_packets(
     aliases: dict[str, str] | None = None,
     propagation_log: list[dict] | None = None,
     model: str = "catalyst-sense:v1",
+    velocity_by_symbol: dict[str, dict] | None = None,  # PDR-2: frame.trend_velocity, keyed by symbol
 ) -> list[SemanticPacket]:
     """Turn catalyst items into SemanticPackets via classify + propagate.
 
@@ -106,6 +108,36 @@ def synthesize_packets(
             sized_confidence = round(min(1.0, res.confidence * haircut), 4)
             if sized_confidence <= 0.0:
                 continue
+            # PDR-2 (GAP-A): source magnitude from trend VELOCITY when the flag is
+            # ON and a score exists for this symbol; else keep the severity default
+            # (byte-identical when flag OFF). Magnitude vs confidence never conflated
+            # (D74.3): only magnitude is re-sourced; confidence stays linkage × haircut.
+            magnitude = round(float(cls.severity), 4)  # headline severity (default)
+            vmag = None
+            if (
+                velocity_by_symbol is not None
+                and os.environ.get("HERMES_QUANT_TREND_VELOCITY", "0") == "1"
+            ):
+                from hermes_quant.perception.velocity import velocity_magnitude
+
+                vmag = velocity_magnitude(velocity_by_symbol.get(sym))
+                if vmag is not None:
+                    magnitude = vmag
+            metadata = {
+                "catalyst_polarity": cls.polarity,
+                "matched_terms": list(cls.matched_terms),
+                "source_entities": sorted(ents),
+                "n_contributions": len(res.contributions),
+                "feed_source": item.source,
+                "relations": sorted(str(c["relation"]) for c in res.contributions if c.get("relation")),
+                "confidence_haircut": haircut,
+                "confidence_pre_haircut": round(res.confidence, 4),
+            }
+            # Provenance ONLY when velocity actually sourced the magnitude — keeps the
+            # flag-OFF metadata (and packet hash) byte-identical to today (rail #1).
+            if vmag is not None:
+                metadata["magnitude_source"] = "velocity"
+                metadata["velocity_score"] = velocity_by_symbol.get(sym)
             packet = semantic_packet_from_dict({
                 "schema_version": 1,
                 "asset": sym,
@@ -113,7 +145,7 @@ def synthesize_packets(
                 "horizon": horizon,
                 "stance": res.stance,
                 "confidence": sized_confidence,                     # linkage score × size haircut
-                "magnitude": round(float(cls.severity), 4),         # headline severity
+                "magnitude": magnitude,                             # severity (default) | velocity (flag ON)
                 "summary": (
                     f"{item.title[:180]} — propagated {res.stance} to {sym} "
                     f"via {', '.join(c['relation'] for c in res.contributions[:3])}."
@@ -124,16 +156,7 @@ def synthesize_packets(
                     "title": item.title[:200],
                 }],
                 "model": model,
-                "metadata": {
-                    "catalyst_polarity": cls.polarity,
-                    "matched_terms": list(cls.matched_terms),
-                    "source_entities": sorted(ents),
-                    "n_contributions": len(res.contributions),
-                    "feed_source": item.source,
-                    "relations": sorted(str(c["relation"]) for c in res.contributions if c.get("relation")),
-                    "confidence_haircut": haircut,
-                    "confidence_pre_haircut": round(res.confidence, 4),
-                },
+                "metadata": metadata,
             })
             packets.append(packet)
     return packets

@@ -18,6 +18,14 @@ from hermes_quant.catalyst.eval import EvalCase, SignCase, eval_gate
 from hermes_quant.catalyst.ingest import CatalystItem
 from hermes_quant.catalyst.propagation import PropagationEdge
 
+# N13: read the VERSIONED fixture (committed, offline-deterministic), NEVER /tmp.
+# Resolved repo-relative from this script (ops/scripts/ -> repo root -> tests/fixtures).
+import pathlib as _pathlib
+LABELS_PATH = (
+    _pathlib.Path(__file__).resolve().parents[2]
+    / "tests" / "fixtures" / "socialarb" / "camillo_labels.json"
+)
+
 # ---------------------------------------------------------------------------
 # 1. Consumer-trend LEXICON patch — the social-arb catalyst vocabulary that the
 #    base lexicon lacks. Without these, a "goes viral / sells out / craze" headline
@@ -77,7 +85,7 @@ def _item(headline: str, date: str) -> CatalystItem:
 
 def main():
     _patch_lexicon()
-    labels = json.load(open("/tmp/phase0_labels.json"))
+    labels = json.load(open(LABELS_PATH))
     cases, scored_syms = [], []
     for c in labels:
         if c["fwd_return_pct"] is None:

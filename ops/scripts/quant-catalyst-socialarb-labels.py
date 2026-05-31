@@ -6,7 +6,15 @@ import io
 import contextlib
 import datetime as dt
 import json
+import pathlib
 import warnings; warnings.filterwarnings('ignore')
+
+# N13: write the VERSIONED fixture (committed, offline-deterministic), NEVER /tmp.
+# Resolved repo-relative from this script (ops/scripts/ -> repo root -> tests/fixtures).
+LABELS_PATH = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "tests" / "fixtures" / "socialarb" / "camillo_labels.json"
+)
 err=io.StringIO()
 with contextlib.redirect_stderr(err):
     import yfinance as yf
@@ -64,5 +72,6 @@ for label,tk,d,headline,win in cases:
         print(f"{tk:7s} {d}  +{win}d  ret={ret:+7.1f}%  entry/exit={px[0]:.2f}->{px[1]:.2f} @ {px[2]}")
     else:
         print(f"{tk:7s} {d}  FAILED: {errmsg}")
-json.dump(out, open('/tmp/phase0_labels.json','w'), indent=2)
-print("\nsaved /tmp/phase0_labels.json")
+LABELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+json.dump(out, open(LABELS_PATH, 'w'), indent=2)
+print(f"\nsaved {LABELS_PATH}")

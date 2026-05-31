@@ -857,6 +857,78 @@ def test_build_perception_frame_only_future_packet_absorbs_nothing(monkeypatch, 
     assert "decision_asof" not in frame.extras
 
 
+# ---------------------------------------------------------------------------
+# Invariant 7c — PDR-2 TrendVelocity PRODUCING path is lookahead-honest (rail #3,
+# Wave S5/M21; ADR-0079 D-4). The velocity score at asof=T must come from ONLY
+# observations <= T — a future interest spike must NOT inflate the slope.
+# ---------------------------------------------------------------------------
+def test_velocity_score_excludes_future_observations():
+    """A velocity series at asof=T must score from ONLY observations <= T. A future
+    observation must NOT inflate the slope (producing-path lookahead leak class, M21)."""
+    from hermes_quant.perception.velocity import compute_trend_velocity, counts_per_period
+
+    asof = pd.Timestamp("2026-01-15T00:00:00Z")
+    past = [pd.Timestamp(f"2026-01-{d:02d}T00:00:00Z") for d in (1, 2, 8, 9, 14)]
+    future = [pd.Timestamp("2026-01-25T00:00:00Z")] * 50  # LOUD future spike
+    counts = counts_per_period(past + future, asof=asof, freq="W")
+    sc = compute_trend_velocity(counts, asof=asof)
+    # the future spike's bucket must be absent (no period starts after asof):
+    assert all(pd.Timestamp(period.start_time, tz="UTC") <= asof for period in counts.index), (
+        "a future interest bucket leaked into the velocity counts (M21 producing-path leak)"
+    )
+    assert int(counts.sum()) == len(past), "future observations inflated the count series"
+    # and if a score was produced, it stamps the asof anchor (never a future one):
+    assert sc is None or sc.asof == asof
+
+
+def test_build_perception_frame_velocity_honors_decision_asof(monkeypatch):
+    """build_perception_frame(..., decision_asof=T) with HERMES_QUANT_TREND_VELOCITY=1
+    must feed the velocity producer ONLY observations <= T, so frame.trend_velocity
+    stamps asof <= T. A LOUD post-T interest burst must not change the score's anchor
+    (frame PRODUCING-path no-lookahead, rail #3)."""
+    from hermes_quant.perception import velocity_source
+    from hermes_quant.perception.builder import build_perception_frame
+
+    monkeypatch.setenv("HERMES_QUANT_TREND_VELOCITY", "1")
+    decision = datetime(2026, 2, 15, 12, 0, 0, tzinfo=UTC)
+
+    # The seam returns a past series (4 weekly buckets <= T) PLUS a loud future burst.
+    # An honest producer feeds counts_per_period the raw timestamps and the <= asof cut
+    # happens inside it — so we hand the seam BOTH and require the future to be ignored.
+    def _fake_ts_by_symbol(symbol, asof, *, horizon=None):
+        base = pd.Timestamp("2026-01-19T00:00:00Z")  # a Monday, 4 weeks before T
+        past = []
+        for wk, n in enumerate([1, 1, 1, 6]):
+            for i in range(n):
+                past.append(base + pd.Timedelta(weeks=wk) + pd.Timedelta(hours=i))
+        future = [pd.Timestamp("2026-03-10T00:00:00Z")] * 99  # LOUD post-T burst
+        return {"AAPL": [t.to_pydatetime() for t in (past + future)]}
+
+    monkeypatch.setattr(
+        velocity_source, "interest_timestamps_by_symbol", _fake_ts_by_symbol
+    )
+
+    bars = _make_bars(120, trend=0.5, seed=42)
+    frame = build_perception_frame(
+        "AAPL",
+        timeframe="1d",
+        asset_class="equity",
+        provider=_InertProvider(bars),
+        asof_ts=pd.Timestamp(bars["timestamp"].iloc[-1]),
+        lookback_bars=200,
+        decision_asof=decision,
+    )
+    assert frame is not None
+    assert frame.trend_velocity, "flag ON + past series should attach a velocity score"
+    score = frame.trend_velocity["AAPL"]
+    score_asof = pd.Timestamp(score["asof"])
+    score_asof = score_asof.tz_localize("UTC") if score_asof.tzinfo is None else score_asof.tz_convert("UTC")
+    assert score_asof <= pd.Timestamp(decision), (
+        f"velocity score stamped asof={score_asof} > decision={decision} — FRAME "
+        f"PRODUCING-path velocity lookahead leak (M21)"
+    )
+
+
 def test_frame_to_context_preserves_decision_asof_cutoff():
     """The frame carries decision_asof in extras verbatim; after projection the
     SemanticAnalyst's `<=` cutoff (semantic.py:161-172) is unchanged — a packet

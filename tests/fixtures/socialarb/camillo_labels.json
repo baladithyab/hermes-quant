@@ -1,0 +1,72 @@
+[
+  {
+    "label": "Celsius TikTok energy-drink craze",
+    "ticker": "CELH",
+    "date": "2021-03-01",
+    "headline": "Celsius energy drink goes viral on TikTok as sales surge among Gen Z",
+    "window": 120,
+    "fwd_return_pct": 13.953842861579213,
+    "detail": [
+      21.809999465942383,
+      24.85333251953125,
+      "2021-03-01"
+    ],
+    "err": null
+  },
+  {
+    "label": "Crocs pandemic resurgence",
+    "ticker": "CROX",
+    "date": "2020-06-01",
+    "headline": "Crocs sales soar as healthcare workers and celebrity collabs drive viral demand",
+    "window": 150,
+    "fwd_return_pct": 82.83102073506876,
+    "detail": [
+      29.530000686645508,
+      53.9900016784668,
+      "2020-06-01"
+    ],
+    "err": null
+  },
+  {
+    "label": "Dorel bike shortage (pandemic)",
+    "ticker": "DIIBF",
+    "date": "2020-04-15",
+    "headline": "Pandemic bike shortage sends demand soaring for bicycle maker Dorel",
+    "window": 180,
+    "fwd_return_pct": 469.76745394920226,
+    "detail": [
+      0.7338557243347168,
+      4.181271076202393,
+      "2020-04-15"
+    ],
+    "err": null
+  },
+  {
+    "label": "Tapestry / Coach bag demand",
+    "ticker": "TPR",
+    "date": "2023-08-01",
+    "headline": "Coach handbags surge in popularity on social media driving Tapestry sales",
+    "window": 120,
+    "fwd_return_pct": -25.288889067094665,
+    "detail": [
+      39.95812225341797,
+      29.85315704345703,
+      "2023-08-01"
+    ],
+    "err": null
+  },
+  {
+    "label": "Newell / Elmer's slime craze",
+    "ticker": "NWL",
+    "date": "2017-09-01",
+    "headline": "Elmer's glue sales jump as DIY slime craze goes viral with kids",
+    "window": 120,
+    "fwd_return_pct": -34.82272013906139,
+    "detail": [
+      32.41774368286133,
+      21.129003524780273,
+      "2017-09-01"
+    ],
+    "err": null
+  }
+]

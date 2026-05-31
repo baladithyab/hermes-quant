@@ -79,6 +79,7 @@ def run_precision(
     min_hit_rate: float = 0.6,
     graph: dict[str, list[PropagationEdge]] | None = None,
     aliases: dict[str, str] | None = None,
+    velocity_by_symbol: dict[str, dict] | None = None,  # PDR-2: pass-through to synthesize_packets
 ) -> PrecisionResult:
     """Directional precision: synthesized stance must match realized direction.
 
@@ -90,7 +91,10 @@ def run_precision(
     scored = 0
     misses: list[str] = []
     for case in cases:
-        packets = synthesize_packets([case.item], graph=graph, aliases=aliases)
+        packets = synthesize_packets(
+            [case.item], graph=graph, aliases=aliases,
+            velocity_by_symbol=velocity_by_symbol,
+        )
         sym_packets = [p for p in packets if p.asset == case.symbol]
         if not sym_packets:
             continue

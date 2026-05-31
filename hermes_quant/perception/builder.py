@@ -184,6 +184,39 @@ def build_perception_frame(
         except Exception as exc:  # noqa: BLE001 — never block on packet loading
             logger.debug("build_perception_frame(%s): semantic load failed: %s", symbol, exc)
 
+    # ---- Step 5b: PDR-2 TrendVelocity (GAP-A) — flag-gated, default-OFF ----
+    # Mirrors the Step-5 flag idiom (builder.py:175). OFF -> stays None -> adapter
+    # writes nothing (adapter.py:51) -> synthesize keeps severity -> byte-identical.
+    # `os` is bound function-locally in Step 5 (builder.py:173, unconditionally
+    # before this block); `datetime`/`UTC` are imported at module head.
+    frame_trend_velocity: Mapping[str, Any] | None = None
+    if os.environ.get("HERMES_QUANT_TREND_VELOCITY", "0") == "1":
+        try:
+            from hermes_quant.perception.velocity import (
+                compute_trend_velocity,
+                counts_per_period,
+            )
+            from hermes_quant.perception.velocity_source import (
+                interest_timestamps_by_symbol,
+            )
+
+            vel_asof = decision_asof or datetime.now(UTC)
+            ts_by_symbol = interest_timestamps_by_symbol(
+                symbol, vel_asof, horizon=timeframe
+            )
+            scores: dict[str, Any] = {}
+            for sym, tss in ts_by_symbol.items():
+                counts = counts_per_period(tss, asof=vel_asof, freq="W")
+                sc = compute_trend_velocity(counts, asof=vel_asof)
+                if sc is not None:
+                    scores[sym] = sc.to_mapping()
+            if scores:
+                frame_trend_velocity = scores
+        except Exception as exc:  # noqa: BLE001 — never block frame build on velocity
+            logger.debug(
+                "build_perception_frame(%s): velocity build failed: %s", symbol, exc
+            )
+
     # ---- Step 6: last_close (advisor.py:877) ----
     last_close = float(bars["close"].iloc[-1])
 
@@ -195,7 +228,7 @@ def build_perception_frame(
         last_close=last_close,
         regime=frame_regime,
         semantic_packets=semantic_packets,
-        trend_velocity=None,
+        trend_velocity=frame_trend_velocity,
         convergence=None,
         saturation=None,
         provenance=(),
