@@ -54,6 +54,11 @@ def frame_to_context(
         extras["convergence"] = frame.convergence
     if frame.saturation is not None:
         extras["saturation"] = frame.saturation
+    # ADR-0084: outcome-free, asof-honest scheduled-event risk. None when OFF, so
+    # the default extras key-set is preserved (byte-identical flag-OFF). Analysts
+    # ignore unknown keys (protocol.py:16); this is the bull/bear/judge READ surface.
+    if frame.event_risk is not None:
+        extras["event_risk"] = frame.event_risk
     return MarketContext(
         asset=frame.symbol,
         timeframe=timeframe,

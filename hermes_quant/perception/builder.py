@@ -309,6 +309,30 @@ def build_perception_frame(
             )
             frame_saturation = None
 
+    # ---- Step 5d: ADR-0084 event_risk (HERMES_QUANT_CALENDAR_ENABLED) — default-OFF ----
+    # Flag read at CALL time (mirrors Step 5/5b/5c/6b). OFF -> event_risk stays None
+    # -> adapter writes NOTHING (adapter.py) -> default extras key-set preserved ->
+    # byte-identical. The seam is asof-honest (a future-announced event is excluded)
+    # and outcome-free (only scheduled_for/kind/impact ride). decision_asof defaults
+    # to wall-clock now (live); explicit for backtests (ADR-0068/0074).
+    frame_event_risk: Mapping[str, Any] | None = None
+    if os.environ.get("HERMES_QUANT_CALENDAR_ENABLED", "0") == "1":
+        try:
+            from hermes_quant.catalyst.wiring import calendar_market_extras
+
+            cal_asof = decision_asof or datetime.now(UTC)
+            cal_extras = calendar_market_extras(symbol, decision_asof=cal_asof)
+            if cal_extras is not None and cal_extras.get("event_risk") is not None:
+                frame_event_risk = cal_extras["event_risk"]
+        except Exception as exc:  # noqa: BLE001 — never block frame build on calendar
+            # RR13: only reached with HERMES_QUANT_CALENDAR_ENABLED=1 (feature ENABLED)
+            # -> warn so an always-failing enabled feature is visible in ops logs.
+            logger.warning(
+                "build_perception_frame(%s): event_risk build failed (feature ENABLED): %s",
+                symbol,
+                exc,
+            )
+
     # ---- Step 6: last_close (advisor.py:877) ----
     last_close = float(bars["close"].iloc[-1])
 
@@ -323,6 +347,7 @@ def build_perception_frame(
         trend_velocity=frame_trend_velocity,
         convergence=frame_convergence,
         saturation=frame_saturation,
+        event_risk=frame_event_risk,
         provenance=(),
         extras=frame_extras,
     )

@@ -1,7 +1,9 @@
 """T1 — PerceptionFrame is frozen / add-only / defaults-safe (ADR-0079 PDR-1).
 
-Pins the carrier's shape: the 11 fields of ADR-0079 §D79.2 in order, frozen,
-with all future-score fields defaulting to None/empty so the adapter omits them.
+Pins the carrier's shape: the ADR-0079 §D79.2 fields in order, frozen, with all
+future-score fields defaulting to None/empty so the adapter omits them. The
+``event_risk`` slot (ADR-0084) is an add-only extension sitting with the other
+optional future-score fields, before ``provenance``/``extras``.
 """
 
 from __future__ import annotations
@@ -40,7 +42,9 @@ def test_frame_is_frozen():
 
 
 def test_frame_field_order_matches_adr_0079():
-    """The 11 fields in ADR-0079 §D79.2 order."""
+    """The ADR-0079 §D79.2 fields in order, plus the add-only ``event_risk`` slot
+    (ADR-0084) which sits with the other optional future-score fields, before
+    ``provenance``/``extras`` (add-only versioning; consumers ignore unknown fields)."""
     names = [fld.name for fld in dataclasses.fields(PerceptionFrame)]
     assert names == [
         "symbol",
@@ -52,6 +56,7 @@ def test_frame_field_order_matches_adr_0079():
         "trend_velocity",
         "convergence",
         "saturation",
+        "event_risk",
         "provenance",
         "extras",
     ]
@@ -70,6 +75,7 @@ def test_future_score_fields_default_safe():
     assert f.trend_velocity is None
     assert f.convergence is None
     assert f.saturation is None
+    assert f.event_risk is None  # ADR-0084 add-only field defaults None (OFF)
     assert f.provenance == ()
     assert dict(f.extras) == {}
 

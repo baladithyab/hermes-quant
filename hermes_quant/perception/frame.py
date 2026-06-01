@@ -38,6 +38,7 @@ class PerceptionFrame:
     trend_velocity: Mapping[str, Any] | None = None  # GAP-A (HERMES_QUANT_TREND_VELOCITY) — empty until PDR-2
     convergence: Mapping[str, Any] | None = None  # GAP-B (HERMES_QUANT_CONVERGENCE) — empty until PDR-3
     saturation: Mapping[str, Any] | None = None  # GAP-C (HERMES_QUANT_SATURATION) — empty until PDR-4
+    event_risk: Mapping[str, Any] | None = None  # ADR-0084 (HERMES_QUANT_CALENDAR_ENABLED) — None until ON; outcome-free, asof-honest
     provenance: tuple[str, ...] = ()  # evidence_ids / source URLs / fetch run-ids (ADR-0033/0041)
     extras: Mapping[str, Any] = field(default_factory=dict)
     """Forward-compat escape hatch. Carries EXACTLY the non-regime/non-semantic
