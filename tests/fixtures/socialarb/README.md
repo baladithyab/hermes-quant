@@ -8,26 +8,52 @@ live here and are committed so the unit tests run with no network and no live yf
 ## Files
 
 ### `camillo_labels.json`
-The 5 documented Camillo consumer-trend social-arb cases (CELH / CROX / DIIBF / TPR / NWL)
-with **REAL yfinance forward returns**, captured once by
-`ops/scripts/quant-catalyst-socialarb-labels.py` and committed. Each entry:
-`{label, ticker, date, headline, window, fwd_return_pct, detail:[entry_px, exit_px, entry_date], err}`.
+The documented consumer-trend social-arb cases with **REAL yfinance forward returns**,
+captured once by `ops/scripts/quant-catalyst-socialarb-labels.py` and committed. Each entry:
+`{label, ticker, date, headline, window, fwd_return_pct, detail:[entry_px, exit_px, entry_date], err, provenance}`.
 
-Realized forward returns (the external truth the D74.7 directional-precision gate scores against):
+**B09 (Wave-4) expansion.** The Phase-0 set was **5** cases (CELH/CROX/DIIBF/TPR/NWL) that
+cleared the D74.7 `>=0.60` directional bar at a **knife-edge 3/5=0.60** (TPR/NWL the
+documented false positives). B09 grows the set to **12** by adding 7 documented
+consumer-trend social-arb episodes, so the precision **measurement** is higher-confidence,
+and runs `run_precision` over it at a **STATED HIGHER `min_hit_rate` = 0.70** (see
+`ops/scripts/quant-catalyst-socialarb-eval.py::MIN_HIT_RATE` and
+`tests/unit/test_catalyst_socialarb_eval_b09.py`). B09 does **NOT** change the
+`synthesize.py` consumer-trend haircut — that is B07, data-gated; B09 only raises the
+eval bar so B07 acts on a stronger number.
 
-| ticker | surfaced   | fwd window | fwd_return_pct | direction |
-|--------|------------|-----------:|---------------:|-----------|
-| CELH   | 2021-03-01 |      120 d  |       +13.95 % | hit       |
-| CROX   | 2020-06-01 |      150 d  |       +82.83 % | hit       |
-| DIIBF  | 2020-04-15 |      180 d  |      +469.77 % | hit       |
-| TPR    | 2023-08-01 |      120 d  |       -25.29 % | miss      |
-| NWL    | 2017-09-01 |      120 d  |       -34.82 % | miss      |
+Realized forward returns (the external truth the directional-precision gate scores against).
+All cases propagate a **bullish** stance (a positive consumer-trend); the surfaced date is
+chosen by the **documented** surfacing of the trend, NOT by hindsight of the return (the
+anti-cherry-pick discipline — the misses are KEPT). Each row's `provenance` field records why
+the case is defensible.
 
-All 5 cases propagate a **bullish** stance (positive consumer-trend). 3/5 realized positive
-=> directional precision = 0.60 hit-rate, clearing the D74.7 `>= 0.6` bar **exactly** on n=5
-(TPR/NWL are the documented false positives — see `synthesize.py` haircut comment). The
-N13 note in the labels script: regenerate by running the labels script, then **commit the
-output here — never re-introduce the `/tmp` coupling.**
+| ticker | set     | surfaced   | fwd window | fwd_return_pct | direction | provenance (short)                                   |
+|--------|---------|------------|-----------:|---------------:|-----------|------------------------------------------------------|
+| CELH   | Phase-0 | 2021-03-01 |      120 d  |       +13.95 % | hit       | TikTok energy-drink Gen-Z virality                   |
+| CROX   | Phase-0 | 2020-06-01 |      150 d  |       +82.83 % | hit       | healthcare-worker + celebrity-collab resurgence      |
+| DIIBF  | Phase-0 | 2020-04-15 |      180 d  |      +469.77 % | hit       | pandemic bicycle shortage (demand>supply)            |
+| TPR    | Phase-0 | 2023-08-01 |      120 d  |       -25.29 % | **miss**  | Coach social popularity, but Capri-deal selloff      |
+| NWL    | Phase-0 | 2017-09-01 |      120 d  |       -34.82 % | **miss**  | Elmer's slime craze, but conglomerate weakness       |
+| ELF    | B09     | 2023-01-15 |      150 d  |       +94.11 % | hit       | #beautytok Gen-Z demand, sustained sales growth      |
+| DECK   | B09     | 2022-10-01 |      150 d  |       +30.30 % | hit       | UGG Tasman/Minis TikTok autumn-2022 resurgence       |
+| YETI   | B09     | 2021-01-15 |      150 d  |       +27.63 % | hit       | viral premium-drinkware (Rambler) craze              |
+| MNST   | B09     | 2020-04-01 |      150 d  |       +57.93 % | hit       | energy-drink category strength (CELH sector-peer)    |
+| CMG    | B09     | 2022-01-15 |      150 d  |       -15.71 % | **miss**  | TikTok menu-hack virality, but 2022 market drawdown  |
+| PTON   | B09     | 2020-03-15 |      150 d  |      +195.33 % | hit       | early-pandemic at-home-fitness viral demand          |
+| WING   | B09     | 2023-02-15 |      150 d  |       +11.21 % | hit       | social-driven QSR digital-order momentum             |
+
+**Result: 9/12 directionally positive => directional precision = 0.75 hit-rate**, clearing
+the stated higher `>=0.70` bar (vs the Phase-0 knife-edge 0.60 on n=5). The 3 misses
+(TPR/NWL/CMG) are the documented false positives — kept, not cherry-picked away.
+
+**Edge promotion status.** The Phase-0 five are already promoted to the live seed YAML +
+`propagation.py` (the n=5 eval cleared 0.60). The 7 B09 brands (ELF/DECK/YETI/MNST/CMG/
+PTON/WING) live ONLY as **EVAL-only in-memory edges** in the eval script and the B09 test —
+they are eval INPUTS, not promoted edges, until a future wave decides to wire them live.
+
+N13 note: regenerate by running the labels script, then **commit the output here — never
+re-introduce the `/tmp` coupling.**
 
 ### `interest_series.json`
 Per-symbol **weekly interest counts** — the input to
@@ -38,6 +64,10 @@ Per-symbol **weekly interest counts** — the input to
 period index via `pd.Timestamp(week_start).to_period("W")` without pandas' brittle
 `YYYY-Wnn` string parsing). `asof` equals the matching case's surfaced `date` so the
 velocity score's lookahead anchor == the eval case's publication date (no future bucket).
+
+This series covers the **Phase-0 five only** (it is the PDR-2 velocity input, not the B09
+precision input); the 7 B09 brands have committed returns but no interest series — the B09
+eval scores DIRECTION via the severity-sourced magnitude path, which needs no velocity score.
 
 **Provenance / how the series were derived:** these are documented-narrative-derived
 synthetic GN-RSS/social interest volumes (NOT live Reddit/Trends — that is the B08 data
@@ -54,7 +84,7 @@ search volumes; the eval scores DIRECTION (stance) against the real returns abov
 ~/.hermes/hermes-agent/venv/bin/python3 ops/scripts/quant-catalyst-socialarb-labels.py
 # -> writes tests/fixtures/socialarb/camillo_labels.json (commit the result)
 
-# Re-run the social-arb edge eval against the committed fixture:
+# Re-run the social-arb edge eval against the committed fixture (B09: 12 cases, min 0.70):
 ~/.hermes/hermes-agent/venv/bin/python3 ops/scripts/quant-catalyst-socialarb-eval.py
 ```
 
