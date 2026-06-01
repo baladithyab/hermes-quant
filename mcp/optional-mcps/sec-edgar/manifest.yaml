@@ -10,14 +10,14 @@ description: >-
   complements the catalyst classifier (8-K = catalyst) + insider-Form-4 signal.
 source: https://github.com/stefanoamorelli/sec-edgar-mcp
 
-enabled: false
+enabled: true   # enabled 2026-05-31 (keyless read-only, operator opt-in; live in config.yaml mcp_servers)
 
 transport:
   type: stdio
   command: uvx
   args:
     - "--from"
-    - "sec-edgar-mcp==1.0.0"   # PIN before enabling; AGPL-3.0, built on edgartools
+    - "sec-edgar-mcp"   # latest (==1.0.0 did NOT exist on PyPI; verified resolve 2026-05-31)   # PIN before enabling; AGPL-3.0, built on edgartools
     - "sec-edgar-mcp"
 
 install:

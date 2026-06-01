@@ -301,3 +301,27 @@ in the research synthesis that seeded this doc. Brokerage servers
 (alpaca/longbridge/robinhood) and every excluded order-placement server were
 cross-checked against the official org repo / PyPI / npm registry before
 classification.
+
+---
+
+## Live state (2026-05-31) — keyless read-only servers ENABLED
+
+Operator opted in to enable all KEYLESS read-only servers. The following 4 are now LIVE in
+`~/.hermes/config.yaml` `mcp_servers:` (backup at `~/.hermes/config.yaml.pre-keyless-mcp`):
+
+| Server | Transport | Pin | Verified |
+|---|---|---|---|
+| **tradingview** | stdio `bunx -y tradingview-mcp-server@0.6.1` | 0.6.1 | npm resolve ✓ |
+| **coingecko** | http `https://mcp.api.coingecko.com/mcp` | server v5.1.1 | MCP initialize handshake ✓ |
+| **yahoo-finance** | stdio `uvx mcp-yahoo-finance` | latest | uvx resolved 51 pkgs ✓ |
+| **sec-edgar** | stdio `uvx --from sec-edgar-mcp sec-edgar-mcp` (UA env set) | latest (the `==1.0.0` pin was wrong — that version does NOT exist on PyPI; corrected to latest) | uvx resolve ✓ (edgartools) |
+
+All 4 are **read-only data** (`money_write: false`, `underlying_can_write: false`) — no order surface,
+so safe to enable without the gate/HITL concerns that apply to alpaca/robinhood/longbridge. A gateway
+reload is needed for an already-running gateway to pick them up (`mcp_reload_confirm: true`).
+
+**Still DISABLED (cred-gated, until the operator loads creds):** alpaca (creds on disk; pinned
+read-only via ALPACA_TOOLSETS when enabled), robinhood, longbridge (all 3 have an underlying
+order/money surface — never auto-enabled), polygon, fred (read-only data, need an API key).
+
+Rollback any: remove its block from `~/.hermes/config.yaml` `mcp_servers:` (or `cp` the backup) + reload.

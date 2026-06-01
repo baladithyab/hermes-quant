@@ -75,7 +75,7 @@ optional_env:
 #   mcp/optional-mcps/README.md          (registry design)
 optional_mcps:
   registry: mcp/optional-mcps
-  default_enabled: false   # registry-wide: nothing ships enabled
+  default_enabled: false   # registry-wide default; the 4 KEYLESS read-only servers (tradingview/coingecko/yahoo-finance/sec-edgar) are enabled in config.yaml (operator opt-in 2026-05-31). Cred-gated servers stay OFF until creds loaded.
   servers:
     - name: alpaca
       manifest: mcp/optional-mcps/alpaca/manifest.yaml
@@ -85,6 +85,7 @@ optional_mcps:
       requires_creds: true
     - name: tradingview
       manifest: mcp/optional-mcps/tradingview/manifest.yaml
+      enabled: true   # keyless read-only — LIVE in config.yaml mcp_servers (2026-05-31, operator opt-in)
       read_only: true
       money_write: false
       underlying_can_write: false
@@ -103,6 +104,7 @@ optional_mcps:
       requires_creds: true
     - name: sec-edgar
       manifest: mcp/optional-mcps/sec-edgar/manifest.yaml
+      enabled: true   # keyless read-only — LIVE in config.yaml mcp_servers (2026-05-31, operator opt-in)
       read_only: true
       money_write: false
       underlying_can_write: false
@@ -121,12 +123,14 @@ optional_mcps:
       requires_creds: true
     - name: coingecko
       manifest: mcp/optional-mcps/coingecko/manifest.yaml
+      enabled: true   # keyless read-only — LIVE in config.yaml mcp_servers (2026-05-31, operator opt-in)
       read_only: true
       money_write: false
       underlying_can_write: false
       requires_creds: false
     - name: yahoo-finance
       manifest: mcp/optional-mcps/yahoo-finance/manifest.yaml
+      enabled: true   # keyless read-only — LIVE in config.yaml mcp_servers (2026-05-31, operator opt-in)
       read_only: true
       money_write: false
       underlying_can_write: false

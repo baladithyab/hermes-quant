@@ -8,7 +8,7 @@ description: >-
   volume, OHLCV, trending, NFT/DeFi, 1M+ assets. url-style (like tavily/exa).
 source: https://docs.coingecko.com/docs/ai-agent-hub/mcp-server
 
-enabled: false
+enabled: true   # enabled 2026-05-31 (keyless read-only, operator opt-in; live in config.yaml mcp_servers)
 
 # url-style transport (matches the host tavily/exa/deepwiki/aws block).
 transport:

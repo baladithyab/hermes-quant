@@ -10,7 +10,7 @@ description: >-
   lookup/search symbols, list_fields, get_ta_summary, rank_by_ta, presets.
 source: https://github.com/fiale-plus/tradingview-mcp-server
 
-enabled: false
+enabled: true   # enabled 2026-05-31 (keyless read-only, operator opt-in; live in config.yaml mcp_servers)
 
 transport:
   type: stdio
