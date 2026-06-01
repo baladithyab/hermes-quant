@@ -790,3 +790,81 @@ def test_format_telegram_handles_empty_report() -> None:
     assert "Hermes" in tg
     assert "2026\\-05\\-27" in tg  # date is escaped
     assert len(tg) <= 4096
+
+
+# ---------------------------------------------------------------------------
+# B18 / ADR-0010 §8 — optional Committee Stage Outputs section wires the
+# canonical schema_render helpers into the daily brief surface. Default-OFF.
+# ---------------------------------------------------------------------------
+
+
+def test_format_markdown_no_stage_outputs_is_byte_identical_default() -> None:
+    """Default (no stage_outputs) is byte-identical to passing None/[].
+
+    Behavior-preserving guarantee for every existing caller: omitting the
+    new kwarg must not add a Committee Stage Outputs section.
+    """
+    r = DailyReport(date=date(2026, 5, 27))
+    default_md = format_markdown(r)
+    assert format_markdown(r, stage_outputs=None) == default_md
+    assert format_markdown(r, stage_outputs=[]) == default_md
+    assert "## Committee Stage Outputs" not in default_md
+
+
+def test_format_markdown_stage_outputs_renders_non_empty_section() -> None:
+    """A passed TraderProposal is rendered into a non-empty markdown section
+    via the canonical schema_render dispatcher (B18 wiring)."""
+    from hermes_quant.agents.trader import TraderAction, TraderProposal
+
+    proposal = TraderProposal(
+        action=TraderAction.BUY,
+        size_fraction=0.10,
+        confidence=0.70,
+        rationale="momentum confirmed by multiple analysts",
+    )
+    r = DailyReport(date=date(2026, 5, 27))
+    md = format_markdown(r, stage_outputs=[proposal])
+    assert "## Committee Stage Outputs" in md
+    # The canonical render_trader_proposal heading + load-bearing fields appear.
+    assert "### TraderProposal — BUY" in md
+    assert "size_fraction" in md
+    # Section is genuinely non-empty markdown (not just a bare header).
+    section = md.split("## Committee Stage Outputs", 1)[1]
+    assert section.strip()
+
+
+def test_format_markdown_stage_outputs_mixed_schema_types() -> None:
+    """Multiple distinct schema objects each dispatch to their renderer."""
+    from hermes_quant.agents.research_debate.schemas import (
+        PortfolioRating,
+        ResearchPlan,
+    )
+    from hermes_quant.agents.trader import TraderAction, TraderProposal
+    from hermes_quant.aggregators.llm_committee import PortfolioDecision
+
+    objs = [
+        TraderProposal(
+            action=TraderAction.SELL,
+            size_fraction=0.05,
+            confidence=0.6,
+            rationale="weakening trend",
+        ),
+        ResearchPlan(
+            recommendation=PortfolioRating.SELL,
+            confidence=0.65,
+            rationale="deteriorating fundamentals",
+            strategic_actions="reduce exposure",
+        ),
+        PortfolioDecision(
+            action="Hold",
+            size_multiplier=1.0,
+            confidence=0.5,
+            rationale="balanced",
+            vetoed=False,
+        ),
+    ]
+    r = DailyReport(date=date(2026, 5, 27))
+    md = format_markdown(r, stage_outputs=objs)
+    assert "### TraderProposal — SELL" in md
+    assert "### ResearchPlan" in md
+    assert "### PortfolioDecision — Hold" in md

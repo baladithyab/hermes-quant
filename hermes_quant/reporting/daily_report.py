@@ -565,11 +565,24 @@ def _md_escape_pipe(s: str) -> str:
     return s.replace("|", "\\|").replace("\n", " ")
 
 
-def format_markdown(report: DailyReport) -> str:
+def format_markdown(
+    report: DailyReport,
+    *,
+    stage_outputs: list[Any] | None = None,
+) -> str:
     """Render a :class:`DailyReport` as plain-Markdown (GitHub-flavored).
 
     The output is sectioned, table-formatted, and safe to paste into
     Discord, GitHub issues, or persist to disk.
+
+    ``stage_outputs`` (B18 / ADR-0010 §8 wiring) is an OPTIONAL list of
+    LLM-stage Pydantic schema objects — ``TraderProposal``, ``ResearchPlan``,
+    ``RiskDebateSummary``, ``PortfolioDecision``. When supplied, each is
+    rendered via the canonical, pure ``schema_render.render_schema`` dispatcher
+    (the single place those renderers live) and appended as a
+    "Committee Stage Outputs" section. Default ``None`` ⇒ no section is
+    emitted and the rendered report is byte-identical to the pre-B18 output,
+    so every existing caller's behavior is preserved.
     """
     out: list[str] = []
     out.append(f"# Hermes-Quant Daily Report — {report.date.isoformat()}")
@@ -697,6 +710,19 @@ def format_markdown(report: DailyReport) -> str:
     else:
         out.append("_No proposals awaiting approval._")
     out.append("")
+
+    # Committee Stage Outputs (B18 / ADR-0010 §8) — OPTIONAL, default-OFF.
+    # When the caller passes through the day's LLM-stage schema objects we
+    # surface them via the canonical per-schema renderers instead of
+    # re-authoring the markdown here. Absent / empty ⇒ no section, so the
+    # default report stays byte-identical.
+    if stage_outputs:
+        from hermes_quant.agents.schema_render import render_schema
+
+        out.append("## Committee Stage Outputs")
+        for obj in stage_outputs:
+            out.append(render_schema(obj))
+            out.append("")
 
     return "\n".join(out)
 
