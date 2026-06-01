@@ -1,56 +1,90 @@
-# ADR index
+# Architecture Decision Records
 
-- [ADR-0001-sidecar-architecture.md](ADR-0001-sidecar-architecture.md) — ADR-0001: Sidecar architecture — daemon decoupled from gateway
-- [ADR-0002-analyst-protocol.md](ADR-0002-analyst-protocol.md) — ADR-0002: Analyst protocol contract
-- [ADR-0003-aggregator.md](ADR-0003-aggregator.md) — ADR-0003: Aggregator design — Bayesian baseline + logistic stacking, RL deferred
-- [ADR-0004-risk-gate.md](ADR-0004-risk-gate.md) — ADR-0004: Risk gate — deterministic rules, silence-by-default
-- [ADR-0005-data-layer.md](ADR-0005-data-layer.md) — ADR-0005: Data layer — yfinance bootstrap, ccxt for crypto, alpaca-py for equities
-- [ADR-0006-rl-aggregator-deferred.md](ADR-0006-rl-aggregator-deferred.md) — ADR-0006: RL aggregator deferred to v0.2 with concrete success criterion
-- [ADR-0007-plugin-shape.md](ADR-0007-plugin-shape.md) — ADR-0007: Plugin shape — Hermes plugin tools = read-only views; daemon owns the loop
-- [ADR-0008-freqtrade-integration.md](ADR-0008-freqtrade-integration.md) — ADR-0008: Freqtrade integration via signal bus (sidecar consumer)
-- [ADR-0009-amendments-from-phase4-review.md](ADR-0009-amendments-from-phase4-review.md) — ADR-0009: Phase-4 cross-family review amendments to ADR-0001..0008
-- [ADR-0010-settlement-journal.md](ADR-0010-settlement-journal.md) — ADR-0010: Settlement journal (markdown sidecar)
-- [ADR-0011-portfolio-reconstruction-sign-convention.md](ADR-0011-portfolio-reconstruction-sign-convention.md) — ADR-0011: Portfolio reconstruction sign convention
-- [ADR-0012-llmanalyst-protocol-deferred.md](ADR-0012-llmanalyst-protocol-deferred.md) — ADR-0012: LLMAnalyst protocol (deferred to v0.3.0)
-- [ADR-0013-hermes-core-integration-stance.md](ADR-0013-hermes-core-integration-stance.md) — ADR-0013: Hermes-core integration stance + dual-surface architecture
-- [ADR-0014-chat-mode-advisor-surface.md](ADR-0014-chat-mode-advisor-surface.md) — ADR-0014: Chat-mode advisor surface
-- [ADR-0015-hitl-propose-decide-react.md](ADR-0015-hitl-propose-decide-react.md) — ADR-0015: HITL propose-decide-react surface
-- [ADR-0016-autonomous-mode.md](ADR-0016-autonomous-mode.md) — ADR-0016: Autonomous mode (silence-bias gated paper-trading)
-- [ADR-0017-ccxt-provider.md](ADR-0017-ccxt-provider.md) — ADR-0017: CcxtProvider for crypto OHLCV bars
-- [ADR-0018-kronos-analyst.md](ADR-0018-kronos-analyst.md) — ADR-0018: KronosAnalyst — third voice, not the oracle
-- [ADR-0019-evaluation-module.md](ADR-0019-evaluation-module.md) — ADR-0019: `evaluation/` module promotion (CV + lookahead + DSR)
-- [ADR-0020-backtest-harness.md](ADR-0020-backtest-harness.md) — ADR-0020: Backtest harness — `hermes_quant.backtest`
-- [ADR-0021-pdr-recipe-runtime.md](ADR-0021-pdr-recipe-runtime.md) — ---
-- [ADR-0022-hermes-semantic-perception.md](ADR-0022-hermes-semantic-perception.md) — ADR-0022: Hermes semantic perception layer
-- [ADR-0023-deliberative-committee-decision-layer.md](ADR-0023-deliberative-committee-decision-layer.md) — ADR-0023: Deliberative committee decision layer
-- [ADR-0024-autonomous-semantic-perception.md](ADR-0024-autonomous-semantic-perception.md) — ADR-0024: Autonomous semantic perception artifacts
-- [ADR-0025-user-editable-recipes-and-perception-status.md](ADR-0025-user-editable-recipes-and-perception-status.md) — ADR-0025: User-editable recipes and perception status
-- [ADR-0039-robinhood-mcp-reactor.md](ADR-0039-robinhood-mcp-reactor.md) — ADR-0039: Robinhood Agentic Trading MCP Reactor — additive equity execution rail
-- [ADR-0041-signal-provenance-audit-trail.md](ADR-0041-signal-provenance-audit-trail.md) — ADR-0041: Signal provenance & audit-trail observability (renumbered from 0039 due to upstream conflict)
-- [ADR-0042-persistent-memory-reflection.md](ADR-0042-persistent-memory-reflection.md) — ADR-0042: Persistent memory & deferred reflection layer (renumbered from 0040)
-- [ADR-0059-unified-status-cli.md](ADR-0059-unified-status-cli.md) — ADR-0059: Unified `quant status` CLI for single-pane observability across event stores
-- [ADR-0060-fallback-probe.md](ADR-0060-fallback-probe.md) — ADR-0060: Fallback Probe — verifies silence-by-default holds for all v0.2 LLM-wired surfaces under synthetic failure injection
-- [ADR-0061-daily-report.md](ADR-0061-daily-report.md) — ADR-0061: Daily Markdown Report — single-file synthesis of audit log + decisions + reflections + factor verdicts, publishable to Telegram or archived to disk
-- [ADR-0062-rollout-playbook.md](ADR-0062-rollout-playbook.md) — ADR-0062: Production rollout playbook for v0.2 LLM surfaces (canonical `docs/operations/ROLLOUT.md` + lightweight consistency tests)
-- [ADR-0063-regime-in-marketcontext-extras.md](ADR-0063-regime-in-marketcontext-extras.md) — ADR-0063: Regime in MarketContext.extras (v0.6.0) — analysts read regime info via stable `volatility_tier` to avoid HMM label-mapping fragility
-- [ADR-0064-fundamentals-analyst.md](ADR-0064-fundamentals-analyst.md) — ADR-0064: FundamentalsAnalyst integration (v0.6.1) — closes equities balance-sheet/earnings/cashflow blind spot via yfinance with parquet snapshot cache
-- [ADR-0065-bull-bear-adversarial-debate.md](ADR-0065-bull-bear-adversarial-debate.md) — ADR-0065: Bull/Bear adversarial debate stage (v0.6.1) — true alternating debate with `current_response` feedback loop, ResearchPlan Pydantic schema, 5-tier PortfolioRating enum
-- [ADR-0067-robinhood-mcp-usage-research-amendment.md](ADR-0067-robinhood-mcp-usage-research-amendment.md) — ADR-0067: Robinhood MCP usage-research amendment to ADR-0039 — adds D7.8–D7.13 (mode flag, default-ro until 2026-06-26, live-confirm token, secondary-account guidance, deposit-gate hardening) based on 24-hour-post-launch research
-- [ADR-0066-research-debate-production-wiring.md](ADR-0066-research-debate-production-wiring.md) — ADR-0066: Production Wiring for ResearchDebateStage (v0.6.2)
-- [ADR-0068-decision-time-vs-bar-time-honesty.md](ADR-0068-decision-time-vs-bar-time-honesty.md) — ADR-0068: Decision-time vs bar-time honesty — `asof_decision` semantics
-- [ADR-0069-still-forming-bar-discipline.md](ADR-0069-still-forming-bar-discipline.md) — ADR-0069: Still-forming-bar discipline for daily timeframe mid-session
-- [ADR-0070-paper-execution-fidelity.md](ADR-0070-paper-execution-fidelity.md) — ADR-0070: Paper-execution fidelity — slippage, queue delay, and fill realism
-- [ADR-0071-portfolio-aware-dynamic-kelly.md](ADR-0071-portfolio-aware-dynamic-kelly.md) — ADR-0071: Portfolio-aware dynamic Kelly sizing and exposure caps
-- [ADR-0072-advisor-intraday-open-guard.md](ADR-0072-advisor-intraday-open-guard.md) — ADR-0072: Advisor-layer intraday open-guard (cross-run per-symbol-per-day dedup)
-- [ADR-0073-event-catalyst-awareness.md](ADR-0073-event-catalyst-awareness.md) — ADR-0073: Event/catalyst awareness — universe onboarding, semantic analyst activation, intraday cadence
-- [ADR-0074-catalyst-sense-semantic-fusion.md](ADR-0074-catalyst-sense-semantic-fusion.md) — ADR-0074: Catalyst Sense — semantic-numerical fusion via parallel catalyst detection
-- [ADR-0075-catalyst-driven-universe-onboarding.md](ADR-0075-catalyst-driven-universe-onboarding.md) — ADR-0075: Catalyst-driven universe onboarding
-- [ADR-0076-social-arbitrage-integration.md](ADR-0076-social-arbitrage-integration.md) — ADR-0076: Social-arbitrage integration — consumer-trend entity class, sized fusion, profitability-verification loop
-- [ADR-0077-pretrade-admissibility-shortability.md](ADR-0077-pretrade-admissibility-shortability.md) — ADR-0077: Pre-trade admissibility engine + ShortabilityOracle (paper→live fidelity foundation)
-- [ADR-0078-order-lifecycle-fills-idempotency.md](ADR-0078-order-lifecycle-fills-idempotency.md) — ADR-0078: Order-lifecycle state machine + fill realism + exactly-once idempotency
-- [ADR-0079-perception-decision-reaction-architecture.md](ADR-0079-perception-decision-reaction-architecture.md) — ADR-0079: Unified Perception→Decision→Reaction architecture + signal-source unification (capstone; ratifies PDR, social-arb as a perception-layer method, four default-OFF future waves)
-- [ADR-0080-self-evolution-framework.md](ADR-0080-self-evolution-framework.md) — ADR-0080: Self-evolution framework — the advisory plane, multi-rate retro tiers (T0/T1/T2/T3), and the held-out eval-gate contract (capstone; sibling to ADR-0079; advisory plane vs immutable outer standard-of-truth; W1 shipped, W2–W7 default-OFF future waves)
-- [ADR-0081-belief-store-and-distillation-tiers.md](ADR-0081-belief-store-and-distillation-tiers.md) — ADR-0081: Bounded decaying belief store with weekly/monthly distillation tiers (CVRF + FINMEM) — proposed; closes O2 (distillation) + O3 (writes weekly_retro_promotion_readiness)
-- [ADR-0082-deterministic-structure-selection-layer.md](ADR-0082-deterministic-structure-selection-layer.md) — ADR-0082: Deterministic structure-selection layer + registry-open plays — proposed; registry-open plays (Part A, mechanical) + a deterministic stance×IV-regime structure-selection table fed by a coarse `structure_intent` (Part B); deliberation proposes intent, the table+gate decide; no LLM picks legs
-- [ADR-0083-defer-intraday-build-horizon-neutral-foundations.md](ADR-0083-defer-intraday-build-horizon-neutral-foundations.md) — ADR-0083: Defer long-horizon intraday; build the horizon-neutral foundations first — proposed; DEFER intraday (unmeasurable until settlement v0.1.2, economically unmotivated), Phase 0 = still-forming-bar fix + settlement exit-fill join, Phase 1 gated on a measurable edge
-- [ADR-0084-scheduled-event-calendar-and-pre-event-guard.md](ADR-0084-scheduled-event-calendar-and-pre-event-guard.md) — ADR-0084: Scheduled-event calendar (FOMC/CPI/NFP/earnings) as asof-honest perception + a default-OFF pre-event REJECT/abstain guard — proposed; two-timestamp (announced_at/scheduled_for) events via check_view_lookahead, event_risk extras the agents read, deterministic backstop
+82 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
+
+Status vocabulary: proposed | accepted | rejected | deprecated | superseded by ADR-NNNN. A compound status (e.g. "Part A accepted; Part B proposed") is the ADR's own — see the file.
+
+| # | Title | Status | Date |
+|---|---|---|---|
+| [ADR-0001](ADR-0001-sidecar-architecture.md) | Sidecar architecture — daemon decoupled from gateway | proposed | 2026-05-12 |
+| [ADR-0002](ADR-0002-analyst-protocol.md) | Analyst protocol contract | proposed | 2026-05-12 |
+| [ADR-0003](ADR-0003-aggregator.md) | Aggregator design — Bayesian baseline + logistic stacking, RL deferred | proposed | 2026-05-12 |
+| [ADR-0004](ADR-0004-risk-gate.md) | Risk gate — deterministic rules, silence-by-default | proposed | 2026-05-12 |
+| [ADR-0005](ADR-0005-data-layer.md) | Data layer — yfinance bootstrap, ccxt for crypto, alpaca-py for equities | proposed | 2026-05-12 |
+| [ADR-0006](ADR-0006-rl-aggregator-deferred.md) | RL aggregator deferred to v0.2 with concrete success criterion | proposed | 2026-05-12 |
+| [ADR-0007](ADR-0007-plugin-shape.md) | Plugin shape — Hermes plugin tools = read-only views; daemon owns the loop | proposed | 2026-05-12 |
+| [ADR-0008](ADR-0008-freqtrade-integration.md) | Freqtrade integration via signal bus (sidecar consumer) | proposed | 2026-05-12 |
+| [ADR-0009](ADR-0009-amendments-from-phase4-review.md) | Phase-4 cross-family review amendments to ADR-0001..0008 | proposed | 2026-05-12 |
+| [ADR-0010](ADR-0010-settlement-journal.md) | Settlement journal (markdown sidecar) | Accepted | 2026-05-13 |
+| [ADR-0011](ADR-0011-portfolio-reconstruction-sign-convention.md) | Portfolio reconstruction sign convention | Accepted (2026-05-13), target v0.1.2 implementation | ? |
+| [ADR-0012](ADR-0012-llmanalyst-protocol-deferred.md) | LLMAnalyst protocol (deferred to v0.3.0) | Proposed (2026-05-13), deferred to v0.3.0 implementation | ? |
+| [ADR-0013](ADR-0013-hermes-core-integration-stance.md) | Hermes-core integration stance + dual-surface architecture | Proposed (2026-05-13), target v0.1.2 | ? |
+| [ADR-0014](ADR-0014-chat-mode-advisor-surface.md) | Chat-mode advisor surface | Proposed (target: v0.1.2) | ? |
+| [ADR-0015](ADR-0015-hitl-propose-decide-react.md) | HITL propose-decide-react surface | Proposed (target: v0.1.2) | ? |
+| [ADR-0016](ADR-0016-autonomous-mode.md) | Autonomous mode (silence-bias gated paper-trading) | Proposed | 2026-05-13 |
+| [ADR-0017](ADR-0017-ccxt-provider.md) | CcxtProvider for crypto OHLCV bars | Proposed | 2026-05-13 |
+| [ADR-0018](ADR-0018-kronos-analyst.md) | KronosAnalyst — third voice, not the oracle | Proposed | 2026-05-13 |
+| [ADR-0019](ADR-0019-evaluation-module.md) | `evaluation/` module promotion (CV + lookahead + DSR) | Proposed | 2026-05-13 |
+| [ADR-0020](ADR-0020-backtest-harness.md) | Backtest harness — `hermes_quant.backtest` | Proposed | 2026-05-13 (post v0.3.1) |
+| [ADR-0021](ADR-0021-pdr-recipe-runtime.md) | Adopt PDR recipes as the Hermes-native runtime contract | accepted | 2026-05-14 |
+| [ADR-0022](ADR-0022-hermes-semantic-perception.md) | Hermes semantic perception layer | Accepted | 2026-05-13 |
+| [ADR-0023](ADR-0023-deliberative-committee-decision-layer.md) | Deliberative committee decision layer | Accepted | 2026-05-13 |
+| [ADR-0024](ADR-0024-autonomous-semantic-perception.md) | Autonomous semantic perception artifacts | Accepted | 2026-05-14 |
+| [ADR-0025](ADR-0025-user-editable-recipes-and-perception-status.md) | User-editable recipes and perception status | Accepted | 2026-05-14 |
+| [ADR-0026](ADR-0026-retrospective-amendment-loop.md) | Retrospective amendment loop — deterministic postmortems + LLM weekly/monthly retro, proposal-only | Proposed | 2026-05-24 |
+| [ADR-0027](ADR-0027-options-aware-risk-gate.md) | Options-aware risk gate — extends ADR-0004 with Greek limits, BPR, and assignment risk | Proposed | 2026-05-24 |
+| [ADR-0028](ADR-0028-options-data-layer.md) | Options data layer — `OptionContract`, `OptionChain`, provider abstraction, greek completion | Proposed | 2026-05-24 |
+| [ADR-0029](ADR-0029-multi-leg-paper-reactor.md) | Multi-Leg Paper Reactor | Proposed | 2026-05-24 |
+| [ADR-0030](ADR-0030-daily-picker-recipe-and-from-reel-pipeline.md) | Daily Picker Recipe + From-Reel Methodology Pipeline | Proposed | 2026-05-24 |
+| [ADR-0031](ADR-0031-governance-plane-consolidation.md) | Governance Plane Consolidation | Proposed | 2026-05-24 |
+| [ADR-0032](ADR-0032-trading-flow-contract.md) | Trading Flow Contract | Proposed | 2026-05-24 |
+| [ADR-0033](ADR-0033-evidence-store.md) | Evidence Store + Three-Timestamp Invariant | Proposed | 2026-05-24 |
+| [ADR-0034](ADR-0034-run-cards.md) | Run Cards | Proposed | 2026-05-24 |
+| [ADR-0035](ADR-0035-playbook-cadence-daily-weekly-quarterly.md) | Playbook Cadence — Daily / Weekly / Quarterly (NOT Intraday) | Proposed | 2026-05-26 |
+| [ADR-0036](ADR-0036-multi-timeframe-analyst-fan-out.md) | Multi-Timeframe Analyst Fan-Out | Proposed | 2026-05-26 |
+| [ADR-0037](ADR-0037-llm-backed-committee-turns.md) | LLM-Backed Committee Turns (Bull/Bear/Risk-Mgmt Debate) | Proposed | 2026-05-26 |
+| [ADR-0038](ADR-0038-tradingagents-pattern-backfill.md) | TradingAgents Pattern Backfill (P3 / P5 / P6 / P8 / P11 / P12) | proposed | 2026-05-26 |
+| [ADR-0039](ADR-0039-robinhood-mcp-reactor.md) | Robinhood Agentic Trading MCP Reactor — additive equity execution rail | Proposed | 2026-05-27 |
+| [ADR-0041](ADR-0041-signal-provenance-audit-trail.md) | Signal Provenance & Audit-Trail Observability | Proposed | 2026-05-27 |
+| [ADR-0042](ADR-0042-persistent-memory-reflection.md) | Persistent Memory & Deferred Reflection Layer | Proposed | 2026-05-27 |
+| [ADR-0043](ADR-0043-three-way-risk-committee.md) | Three-Way Risk Committee (Aggressive / Conservative / Neutral) | Accepted | 2026-05-27 |
+| [ADR-0044](ADR-0044-trader-stage-and-structured-output.md) | Trader Stage & Structured Output (Wave 2) | Accepted | 2026-05-27 |
+| [ADR-0045](ADR-0045-backtester-walk-forward-cost-model.md) | Walk-Forward Backtester with Explicit Cost Model | Accepted | 2026-05-27 |
+| [ADR-0047](ADR-0047-regime-aware-bma-weights.md) | Regime-Aware BMA Weights (Wave 7) | Accepted | 2026-05-27 |
+| [ADR-0048](ADR-0048-hypothesis-registry-and-run-cards.md) | Hypothesis Registry + Run Card Artifacts (Research Autopilot) | Accepted | 2026-05-27 |
+| [ADR-0049](ADR-0049-shadow-account-counterfactual.md) | Shadow Account Counterfactual Backtest | Accepted | 2026-05-27 |
+| [ADR-0050](ADR-0050-alpha-zoo-with-ast-purity-and-lookahead-gate.md) | Alpha Zoo with AST Purity Gate and Lookahead Sentinel | Accepted | 2026-05-27 |
+| [ADR-0051](ADR-0051-lookahead-sentinel-v0.2.md) | Lookahead Sentinel v0.2: Closing MoA Review False-Negatives | Accepted | 2026-05-27 |
+| [ADR-0052](ADR-0052-promotion-orchestrator-and-cron.md) | Promotion Orchestrator and Cron | Accepted | 2025-05-27 |
+| [ADR-0053](ADR-0053-daily-brief-regime-and-research-surfacing.md) | Daily Brief: Regime + Research + Shadow Surfacing | Accepted | 2026-05-27 |
+| [ADR-0054](ADR-0054-llm-caller-foundation-and-trader-v02.md) | LLM-Caller Foundation & TraderNode v0.2 | Accepted | 2026-05-27 |
+| [ADR-0055](ADR-0055-factor-oracle-and-production-readiness-tiers.md) | FactorOracle and Production-Readiness Tiers | Accepted | 2026-05-27 |
+| [ADR-0056](ADR-0056-risk-committee-v02-llm-wiring.md) | RiskCommittee v0.2 — LLM Wiring | Accepted | 2026-05-27 |
+| [ADR-0057](ADR-0057-reflector-v02-llm-wiring.md) | Reflector v0.2 — LLM-Wired Structured Reflection | Accepted | 2026-05-27 |
+| [ADR-0058](ADR-0058-hmm-regime-classifier-v0.2.md) | HMM Regime Classifier v0.2 | Accepted | 2026-05-27 |
+| [ADR-0059](ADR-0059-unified-status-cli.md) | Unified `quant status` CLI for single-pane observability across event stores | Accepted | 2026-05-27 |
+| [ADR-0060](ADR-0060-fallback-probe.md) | Fallback Probe for Silence-by-Default Verification | Accepted | 2026-05-27 |
+| [ADR-0061](ADR-0061-daily-report.md) | Daily Markdown Report | Accepted | 2026-05-27 |
+| [ADR-0062](ADR-0062-rollout-playbook.md) | Production Rollout Playbook for v0.2 LLM Surfaces | Accepted | 2026-05-27 |
+| [ADR-0063](ADR-0063-regime-in-marketcontext-extras.md) | Regime in MarketContext.extras | Accepted (2026-05-27) | ? |
+| [ADR-0064](ADR-0064-fundamentals-analyst.md) | FundamentalsAnalyst Integration | Accepted (2026-05-27) | ? |
+| [ADR-0065](ADR-0065-bull-bear-adversarial-debate.md) | Bull/Bear Adversarial Debate Stage (with ResearchPlan + 5-tier PortfolioRating) | Accepted (2026-05-27) | ? |
+| [ADR-0066](ADR-0066-research-debate-production-wiring.md) | Production Wiring for ResearchDebateStage (v0.6.2) | Proposed | 2026-05-28 |
+| [ADR-0067](ADR-0067-robinhood-mcp-usage-research-amendment.md) | Robinhood Agentic Trading MCP — usage-research amendment to ADR-0039 | Proposed | 2026-05-28 |
+| [ADR-0068](ADR-0068-decision-time-vs-bar-time-honesty.md) | Decision-time vs bar-time honesty — `asof_decision` semantics | Proposed | 2026-05-28 |
+| [ADR-0069](ADR-0069-still-forming-bar-discipline.md) | Still-forming-bar discipline for daily timeframe mid-session | Proposed | 2026-05-28 |
+| [ADR-0070](ADR-0070-paper-execution-fidelity.md) | Paper-execution fidelity — slippage, queue delay, and fill realism | Proposed | 2026-05-28 |
+| [ADR-0071](ADR-0071-portfolio-aware-dynamic-kelly.md) | Portfolio-aware dynamic Kelly sizing and exposure caps | Proposed | 2026-05-28 |
+| [ADR-0072](ADR-0072-advisor-intraday-open-guard.md) | Advisor-layer intraday open-guard (cross-run per-symbol-per-day dedup) | Accepted | 2026-05-29 |
+| [ADR-0073](ADR-0073-event-catalyst-awareness.md) | Event/catalyst awareness — universe onboarding, semantic analyst activation, intraday cadence | Proposed | 2026-05-29 |
+| [ADR-0074](ADR-0074-catalyst-sense-semantic-fusion.md) | Catalyst Sense — semantic-numerical fusion via parallel catalyst detection | Proposed | 2026-05-29 |
+| [ADR-0075](ADR-0075-catalyst-driven-universe-onboarding.md) | Catalyst-driven universe onboarding | Proposed | 2026-05-29 |
+| [ADR-0076](ADR-0076-social-arbitrage-integration.md) | Social-arbitrage integration — consumer-trend entity class, sized fusion, and a profitability-verification loop | Accepted | 2026-05-30 |
+| [ADR-0077](ADR-0077-pretrade-admissibility-shortability.md) | Pre-trade admissibility engine + ShortabilityOracle (paper→live fidelity foundation) | Proposed | 2026-05-30 |
+| [ADR-0078](ADR-0078-order-lifecycle-fills-idempotency.md) | Order-lifecycle state machine + fill realism + exactly-once idempotency | Proposed | 2026-05-30 |
+| [ADR-0079](ADR-0079-perception-decision-reaction-architecture.md) | Unified Perception → Decision → Reaction architecture + signal-source unification | Proposed | 2026-05-30 |
+| [ADR-0080](ADR-0080-self-evolution-framework.md) | Self-evolution framework — the advisory plane, multi-rate retro tiers, and the held-out eval-gate contract | Proposed | 2026-05-30 |
+| [ADR-0081](ADR-0081-belief-store-and-distillation-tiers.md) | Bounded decaying belief store with weekly/monthly distillation tiers (CVRF + FINMEM) | proposed | 2026-05-30 |
+| [ADR-0082](ADR-0082-deterministic-structure-selection-layer.md) | Deterministic structure-selection layer + registry-open plays | proposed | 2026-05-31 |
+| [ADR-0083](ADR-0083-defer-intraday-build-horizon-neutral-foundations.md) | Defer long-horizon intraday; build the horizon-neutral foundations first | proposed | 2026-05-31 |
+| [ADR-0084](ADR-0084-scheduled-event-calendar-and-pre-event-guard.md) | Scheduled-event calendar as asof-honest perception + a default-OFF pre-event REJECT/abstain guard | Proposed | 2026-05-31 |
