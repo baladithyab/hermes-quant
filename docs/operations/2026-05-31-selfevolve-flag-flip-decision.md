@@ -134,3 +134,36 @@ subs, r/StockMarket, r/options) and let the store accumulate, then re-measure.
 - **ON:** REFLECTION, MEMORY_INJECT (W1, pre-existing), SEMANTIC_ENABLED (pre-existing), **SOCIAL_INGEST (NEW)**.
 - **OFF (correctly, precondition-gated):** CONVERGENCE (needs broader Reddit coverage), SATURATION
   (needs B09 audit), TREND_VELOCITY (decision-inert + costly), W2-W7 crons (undeployed/RESEARCH_DEBATE off).
+
+---
+
+## Addendum 3 — CONVERGENCE flip blocked by a MEASURED freshness-window mismatch (2026-05-31)
+
+Pushed to actually flip CONVERGENCE. Accumulated the live multi-source store (SOCIAL_INGEST=1,
+multiple cron runs → 117 reddit packets present) and MEASURED the kept-vs-dropped set within PDR-3's
+24h freshness window. Result: ZERO multi-source symbols — every symbol reads news_rss-only in-window.
+
+Root cause (data, not assumption): packet AGE distribution by family in the live store —
+- **news_rss:** n=4238, median age 47h, 1583 within 24h (intraday `when:1d` queries).
+- **reddit:** n=117, **median age 1494h (62 days), min 939h (39 days), 0 within 24h.**
+
+The Reddit public `new.rss` feed for these brand/ticker queries returns mostly weeks-to-months-old
+posts (low-volume subs + stale search results), so a reddit packet's `published_at` (the honest
+fidelity anchor) is always far outside the 24h window the news packets live in. A genuinely
+convergent trend (CROX discussed on Reddit + a CROX news story) never has BOTH packets
+SIMULTANEOUSLY fresh — so PDR-3, which validates convergence over `load_packets_for`'s uniform 24h
+`max_age_minutes`, can't see the overlap. Flipping CONVERGENCE now would drop ~everything.
+
+**This is NOT "needs more accumulation" — it is two real, code-level design gaps:**
+1. **Stale Reddit feed:** `new.rss` surfaces old content; needs a recency filter (drop entries older
+   than N days at ingest) or a higher-volume/real-time social source so reddit produces RECENT signal.
+2. **Uniform convergence window:** PDR-3 validates within a single 24h window, but source families
+   have wildly different freshness distributions. Convergence-over-a-rolling-window needs a
+   FAMILY-AWARE lookback (a longer window for slow social families than for intraday news), or a
+   convergence notion that doesn't require simultaneous freshness (e.g. "both families touched the
+   symbol within the trend's lifetime", not "both fresh in the same 24h").
+
+Both are reviewed-wave work (a PDR-3 windowing change is a money-path validation-semantics change),
+NOT a flag flip. Tracked in #35. CONVERGENCE stays OFF until one of them lands and the kept-vs-dropped
+re-measure shows CELH/CROX/TPR in the KEPT set. This is the precise, measured blocker — found by
+digging to the data, not by assuming.
