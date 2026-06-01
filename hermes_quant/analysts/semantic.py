@@ -26,6 +26,7 @@ For any analyst that fetches news/social data:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +36,8 @@ from hermes_quant.semantic import (
     parse_semantic_packet,
     validate_semantic_packet,
 )
+
+logger = logging.getLogger(__name__)
 
 _STANCE_TO_DIRECTION = {"bullish": 1, "bearish": -1, "neutral": 0}
 
@@ -141,8 +144,18 @@ class HermesSemanticAnalyst:
                 confidence = apply_saturation(float(confidence), _sat)
                 if _sat is not None:
                     metadata["saturation"] = dict(_sat)   # provenance into the view metadata
-            except Exception:  # noqa: BLE001 -- saturation must not break the view
-                pass
+            except Exception as exc:  # noqa: BLE001 -- saturation must not break the view
+                # RR14: this block ONLY runs with HERMES_QUANT_SATURATION=1 (feature
+                # ENABLED). Still swallow (the rail: saturation must never break the
+                # view) but LOG so an always-failing enabled multiplier is visible
+                # instead of silently no-op'ing the confidence decay. The happy path
+                # emits nothing, so flag-OFF / no-error stays byte-identical.
+                logger.warning(
+                    "%s: saturation multiplier failed (feature ENABLED), "
+                    "confidence left undecayed: %s",
+                    self.name,
+                    exc,
+                )
 
         view = AnalystView(
             analyst=self.name,

@@ -52,3 +52,41 @@ fixture (no discriminating power); RR19 recency naive-timestamp branch untested.
 RR1/RR2/RR3/RR6/RR7/RR9 are agent-doable + high-value (test coverage of money-path locks + the real
 convergence wiring fix) → next execution wave. RR4/RR10 fold into the PDR wiring fix. RR5 + LOWs batch.
 None touch the gate/ladder/kill-switch. RR2 is the headline: the real reason convergence can't fire.
+
+## LOW review-nits batch — disposition (2026-05-31, seed hermes-quant-1ef6 review-nits)
+Behavior-preserving polish only; no rail changes; happy path byte-identical when each feature is OFF.
+
+- **RR11 — DONE.** Added a no-lookahead RELEASE-BLOCKER fence for the saturation PRODUCER in
+  `tests/test_no_lookahead.py` (Invariant 7d): a pure-producer fence (`compute_saturation` ignores a
+  future velocity peak / confirm_date / packet asof → m=1.0, basis `no_basis`, asof stamped == decision)
+  AND a frame-builder Step-6b fence (a FUTURE confirm_date on packet metadata must NOT drive the
+  multiplier to the floor; the score stamps the bar asof <= decision). Discriminating (a past anchor
+  decays). Complements the existing unit-level `test_pdr4_saturation.py::test_saturation_is_lookahead_honest`.
+- **RR12 — DONE.** `catalyst/social.py:_filter_by_recency` now takes an injectable `now: datetime | None`
+  (default `None` => `datetime.now(UTC)`, byte-identical to the wall-clock path; a naive injected `now`
+  is localized to UTC). `ingest_social(..., now=...)` threads it through. Tests in
+  `test_catalyst_social.py` pin a FIXED `now` for deterministic recency cuts (no wall-clock dependency),
+  the default==wall-clock equivalence, and the naive-now branch.
+- **RR13 — DONE.** The four flag-gated enrichment except handlers in `perception/builder.py` (Step 5
+  semantic, 5b velocity, 5c convergence, 6b saturation) now log at `warning` (was `debug`): each block is
+  reached ONLY when its flag is ON (feature ENABLED), so an always-failing enabled feature is now visible.
+  Failure is still swallowed (silence-by-default rail). Happy path emits nothing → byte-identical.
+  Tests: `tests/perception/test_builder_enrichment_logging.py`.
+- **RR14 — DONE.** Two parts. (a) `analysts/semantic.py` SATURATE multiplier `except` now LOGS a
+  `warning` (feature ENABLED) instead of a silent `pass`; still swallows (saturation must never break the
+  view). (b) `perception/saturation.py:apply_saturation` narrowed its bare `except Exception` to
+  `except (TypeError, ValueError)` — the only exceptions `float()` raises on a missing/non-numeric
+  `decay_multiplier`; NaN/inf still pass float() and are rejected by the existing `(0,1]` guard, so the
+  malformed-input matrix is byte-identical. An UNEXPECTED error class now propagates (no longer masked).
+  Tests added to `test_pdr4_saturation.py` (narrowed-except matrix, propagation, failure-logs-and-view-
+  survives, happy-path-logs-nothing).
+- **RR15 — NOT cleanly fixable (documented, no code-behavior change).** A genuinely zero/negative-BP
+  account collapses to the SAME `None` as an unknown/failed fetch in `oracle.live_buying_power()`
+  (`bp if bp > 0 else None`), so the oracle labels it `MISSING_ACCOUNT_CONTEXT` instead of the more
+  precise `INSUFFICIENT_BPR`. Both REJECT — the fail-closed DIRECTION is identical (a zero-BP short never
+  admits), so it is purely a reason-code label nuance. A real fix would (a) change the observable
+  `verdict.reason` on the live zero-BP path (NOT byte-identical), (b) change `live_buying_power`'s
+  contract (pinned by `tests/unit/test_admissibility_bp.py::test_live_bp_zero_returns_none`), and (c)
+  touch the admissibility seam — all outside a behavior-preserving review-nit. Added a clarifying RR15
+  note to the `live_buying_power` docstring (comment-only, runtime byte-identical). Revisit only behind an
+  explicit reason-code refinement task. (RR16–RR19 out of scope for this batch.)

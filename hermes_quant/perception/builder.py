@@ -182,7 +182,15 @@ def build_perception_frame(
                 semantic_packets = tuple(packets)
                 frame_extras["decision_asof"] = sem_asof.isoformat()
         except Exception as exc:  # noqa: BLE001 — never block on packet loading
-            logger.debug("build_perception_frame(%s): semantic load failed: %s", symbol, exc)
+            # RR13: this branch is only reached when HERMES_QUANT_SEMANTIC_ENABLED=1,
+            # i.e. the feature is ENABLED. A silent debug log would hide an
+            # always-failing enabled feature; warn so it is visible in ops logs.
+            # (The happy path emits nothing, so flag-OFF / no-error stays byte-identical.)
+            logger.warning(
+                "build_perception_frame(%s): semantic load failed (feature ENABLED): %s",
+                symbol,
+                exc,
+            )
 
     # ---- Step 5b: PDR-2 TrendVelocity (GAP-A) — flag-gated, default-OFF ----
     # Mirrors the Step-5 flag idiom (builder.py:175). OFF -> stays None -> adapter
@@ -213,8 +221,12 @@ def build_perception_frame(
             if scores:
                 frame_trend_velocity = scores
         except Exception as exc:  # noqa: BLE001 — never block frame build on velocity
-            logger.debug(
-                "build_perception_frame(%s): velocity build failed: %s", symbol, exc
+            # RR13: only reached with HERMES_QUANT_TREND_VELOCITY=1 (feature ENABLED)
+            # -> warn (not debug) so an always-failing enabled feature is visible.
+            logger.warning(
+                "build_perception_frame(%s): velocity build failed (feature ENABLED): %s",
+                symbol,
+                exc,
             )
 
     # ---- Step 5c: PDR-3 convergence evidence (HERMES_QUANT_CONVERGENCE) ----
@@ -245,8 +257,12 @@ def build_perception_frame(
                 "validated": len(fams) >= CONVERGENCE_MIN_FAMILIES,
             }
         except Exception as exc:  # noqa: BLE001 — never block frame build
-            logger.debug(
-                "build_perception_frame(%s): convergence stamp failed: %s", symbol, exc
+            # RR13: only reached with HERMES_QUANT_CONVERGENCE=1 + packets present
+            # (feature ENABLED) -> warn so an always-failing enabled feature is visible.
+            logger.warning(
+                "build_perception_frame(%s): convergence stamp failed (feature ENABLED): %s",
+                symbol,
+                exc,
             )
 
     # ---- Step 6b: PDR-4 SaturationScore (ADR-0079 GAP-C) -- default-OFF ----
@@ -284,7 +300,13 @@ def build_perception_frame(
                 confirm_date=_cd,
             )
         except Exception as exc:  # noqa: BLE001 -- never block frame build on saturation
-            logger.debug("build_perception_frame(%s): saturation failed: %s", symbol, exc)
+            # RR13: only reached with HERMES_QUANT_SATURATION=1 + packets present
+            # (feature ENABLED) -> warn so an always-failing enabled feature is visible.
+            logger.warning(
+                "build_perception_frame(%s): saturation failed (feature ENABLED): %s",
+                symbol,
+                exc,
+            )
             frame_saturation = None
 
     # ---- Step 6: last_close (advisor.py:877) ----

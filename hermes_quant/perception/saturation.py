@@ -88,7 +88,14 @@ def apply_saturation(confidence: float, saturation: Mapping[str, Any] | None) ->
         return confidence
     try:
         m = float(saturation.get("decay_multiplier", 1.0))
-    except Exception:  # noqa: BLE001
+    except (TypeError, ValueError):
+        # RR14: narrowed from a bare `except Exception`. float() on a missing /
+        # non-numeric decay_multiplier raises exactly TypeError (e.g. None) or
+        # ValueError (e.g. "garbage"); narrowing keeps the silence-only no-op for
+        # malformed input while no longer masking an unexpected programming error.
+        # NaN/inf do NOT raise here -- they pass float() and are rejected by the
+        # (0,1] contract guard below, so behavior is byte-identical for every
+        # input the test matrix exercises.
         return confidence
     if not (0.0 < m <= 1.0):   # defensive: any out-of-contract m is treated as a no-op
         return confidence

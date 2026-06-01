@@ -426,6 +426,19 @@ def live_buying_power() -> float | None:
     admissibility BP check fails-closed (MISSING_ACCOUNT_CONTEXT) rather than
     admitting a short on a fabricated sufficiency (ADR-0077 D77, the documented
     H-adm #1 gap this closes). Never raises.
+
+    RR15 (reason-code conflation, KNOWN + intentional): a GENUINELY zero / negative
+    BP account collapses to the SAME ``None`` as an unknown/failed fetch, so the
+    oracle labels it ``MISSING_ACCOUNT_CONTEXT`` rather than the more precise
+    ``INSUFFICIENT_BPR``. Both REJECT (the fail-closed DIRECTION is identical — a
+    zero-BP short never admits either way), so this is purely a reason-code label
+    nuance, not a sizing/gate change. It is NOT "fixed" here because distinguishing
+    zero from unknown would (a) change the observable ``verdict.reason`` on the live
+    zero-BP path (not byte-identical), (b) change this function's pinned contract
+    (`bp if bp > 0 else None`, asserted by test_admissibility_bp.py), and (c) touch
+    the admissibility seam — all outside a behavior-preserving review-nit. Tracked
+    as a documented design choice; revisit only behind an explicit reason-code
+    refinement task.
     """
     try:
         oracle = AlpacaShortabilityOracle()

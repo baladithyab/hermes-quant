@@ -409,3 +409,95 @@ def test_peak_asof_wins_when_both_keys_present():
     )
     assert out["basis"] == "velocity_peak"
     assert 0.0 < out["decay_multiplier"] < 1.0
+
+
+# ===========================================================================
+# RR14 — apply_saturation narrowed except (TypeError/ValueError) is behavior-
+# preserving over the malformed-input matrix; the SATURATE multiplier failure in
+# the analyst LOGS (feature ENABLED) instead of silently no-op'ing.
+# ===========================================================================
+def test_apply_saturation_narrowed_except_still_noops_on_malformed():
+    """The narrowed (TypeError/ValueError) except still treats every malformed
+    decay_multiplier (None, non-numeric string, missing key) as a silence-only
+    no-op (== pre), and NaN/inf are rejected by the (0,1] contract guard."""
+    assert apply_saturation(0.5, {"decay_multiplier": None}) == 0.5      # TypeError on float()
+    assert apply_saturation(0.5, {"decay_multiplier": "garbage"}) == 0.5  # ValueError on float()
+    assert apply_saturation(0.5, {"other_key": 7}) == 0.5                 # default 1.0 -> no-op
+    assert apply_saturation(0.5, {"decay_multiplier": float("nan")}) == 0.5  # guard rejects
+    assert apply_saturation(0.5, {"decay_multiplier": float("inf")}) == 0.5  # guard rejects
+
+
+def test_apply_saturation_unexpected_error_no_longer_masked():
+    """RR14: the narrowed except no longer masks an UNEXPECTED error class. A
+    saturation mapping whose .get raises something other than TypeError/ValueError
+    now PROPAGATES (it is a programming bug, not malformed-but-tolerated input).
+    apply_saturation's own contract (`Mapping | None`) still holds for all real
+    callers; the analyst wraps the call so a propagated error cannot break a view."""
+    class _Exploding(dict):
+        def get(self, *a, **k):
+            raise KeyError("unexpected non-float/value error")
+
+    with pytest.raises(KeyError):
+        apply_saturation(0.5, _Exploding())
+
+
+def test_saturate_multiplier_failure_logs_and_view_survives(monkeypatch, caplog):
+    """RR14: when the SATURATE multiplier raises with the feature ENABLED, the
+    analyst LOGS a warning (no longer a silent pass) AND still emits the view with
+    UNDECAYED confidence (the rail: saturation must never break the view)."""
+    import logging
+
+    import hermes_quant.analysts.semantic as sem_mod
+
+    monkeypatch.setenv("HERMES_QUANT_SATURATION", "1")
+
+    # Force apply_saturation (imported inside analyze()) to raise.
+    def _boom(*_a, **_k):
+        raise RuntimeError("forced saturation failure")
+
+    monkeypatch.setattr(
+        "hermes_quant.perception.saturation.apply_saturation", _boom
+    )
+
+    # A frame carrying a saturation slot so the adapter projects ctx.extras['saturation'].
+    sat = {"decay_multiplier": 0.3, "basis": "confirm_date_passed",
+           "asof": "2024-01-03T11:00:00Z"}
+    frame = _frame_with_packet(sat_dict=sat)
+    ctx = frame_to_context(frame, timeframe="1h", asset_class="equity")
+
+    with caplog.at_level(logging.WARNING, logger=sem_mod.__name__):
+        view = HermesSemanticAnalyst().analyze(ctx)
+
+    assert view is not None, "saturation failure must not break the view (rail)"
+    assert view.analyst == "hermes_semantic"
+    # confidence is left UNDECAYED (the multiplier never applied) — silence-only safety.
+    # The shrink (0.20) still applied: 0.75 - 0.20 = 0.55, NOT * 0.3.
+    assert view.confidence == pytest.approx(0.55)
+    # and the failure is VISIBLE (RR14): a warning was logged, not silently swallowed.
+    assert any(
+        "saturation multiplier failed" in r.message and r.levelno == logging.WARNING
+        for r in caplog.records
+    ), f"expected a saturation-failure WARNING, got: {[r.message for r in caplog.records]}"
+
+
+def test_saturate_multiplier_happy_path_logs_nothing(monkeypatch, caplog):
+    """RR14 byte-identity guard: on the happy path (no error) the analyst emits NO
+    warning — the added log is failure-only, so flag-ON success is unchanged."""
+    import logging
+
+    import hermes_quant.analysts.semantic as sem_mod
+
+    monkeypatch.setenv("HERMES_QUANT_SATURATION", "1")
+    sat = {"decay_multiplier": 0.3, "basis": "confirm_date_passed",
+           "asof": "2024-01-03T11:00:00Z"}
+    frame = _frame_with_packet(sat_dict=sat)
+    ctx = frame_to_context(frame, timeframe="1h", asset_class="equity")
+
+    with caplog.at_level(logging.WARNING, logger=sem_mod.__name__):
+        view = HermesSemanticAnalyst().analyze(ctx)
+
+    assert view is not None
+    assert view.confidence == pytest.approx(0.55 * 0.3)  # decay DID apply (happy path)
+    assert not any(
+        "saturation multiplier failed" in r.message for r in caplog.records
+    ), "happy path must emit no saturation-failure warning"

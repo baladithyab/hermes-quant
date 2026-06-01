@@ -260,11 +260,18 @@ def ingest_social(
     timeout: float = 15.0,
     fetcher=None,
     max_age_days: float | None = None,
+    now: datetime | None = None,
 ) -> list[CatalystItem]:
     """Pull configured Reddit subs + Google Trends, concat, cross-query dedupe.
 
     ``reddit_queries`` maps ``"sub"`` or ``"sub:search terms"`` -> a provenance
     label. Never raises; producers that fail contribute zero items.
+
+    ``now`` — INJECTABLE clock for the ``max_age_days`` recency gate (default
+    ``None`` => wall-clock ``datetime.now(UTC)``, byte-identical to the live path).
+    Pass a fixed tz-aware UTC ``now`` to make the recency cut deterministic in
+    tests/backtests (it only affects which items survive the cutoff; it never
+    shifts an item's real ``published_at``).
 
     ``max_age_days`` — RECENCY GATE (ADR-0074, PDR-3 enabler). If given, DROP any
     item whose ``published_at`` is older than ``now_utc - max_age_days``. This is
@@ -293,12 +300,15 @@ def ingest_social(
                                           timeout=timeout, fetcher=fetcher, dedupe=True)
         logger.info("catalyst.social: google-trends %s -> %d items in %.2fs", trends_geo, len(items), lat)
         all_items.extend(items)
-    all_items = _filter_by_recency(all_items, max_age_days=max_age_days)
+    all_items = _filter_by_recency(all_items, max_age_days=max_age_days, now=now)
     return dedupe_items(all_items)
 
 
 def _filter_by_recency(
-    items: list[CatalystItem], *, max_age_days: float | None
+    items: list[CatalystItem],
+    *,
+    max_age_days: float | None,
+    now: datetime | None = None,
 ) -> list[CatalystItem]:
     """Drop items older than ``now_utc - max_age_days`` by their real published_at.
 
@@ -308,10 +318,18 @@ def _filter_by_recency(
     suspenders: an item whose ``published_at`` is somehow naive is kept (it would
     raise on a naive-vs-aware compare; producers already exclude such items, but we
     refuse to let one bad item drop the batch — silence-by-default).
+
+    ``now`` is an INJECTABLE clock (default ``None`` => ``datetime.now(UTC)`` read
+    at call time, byte-identical to the wall-clock path). Tests pass a fixed
+    tz-aware UTC ``now`` for determinism (no dependency on real wall-clock); a
+    naive ``now`` is localized to UTC so the cutoff comparison stays well-defined.
     """
     if max_age_days is None:
         return items
-    cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+    base_now = now if now is not None else datetime.now(UTC)
+    if base_now.tzinfo is None:  # accept a naive injected clock -> treat as UTC
+        base_now = base_now.replace(tzinfo=UTC)
+    cutoff = base_now - timedelta(days=max_age_days)
     kept: list[CatalystItem] = []
     for it in items:
         pub = it.published_at

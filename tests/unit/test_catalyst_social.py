@@ -368,3 +368,84 @@ def test_recency_filter_applies_to_trends_too():
         max_age_days=7,
     )
     assert items == []  # every trend pubDate is 2021 -> all dropped by a 7-day gate
+
+
+# --- RR12: injectable clock makes the recency cut DETERMINISTIC ---------------
+# _filter_by_recency previously anchored on datetime.now(UTC) directly, so a test
+# had to compute its "fresh" date relative to real wall-clock. ingest_social(...,
+# now=<fixed tz-aware UTC>) pins the cutoff so the same feed yields the SAME
+# survivors on every run, independent of when the test executes. The injected
+# clock NEVER shifts an item's published_at — it only moves the inclusion cutoff.
+
+
+def test_recency_filter_uses_injected_now_deterministically():
+    """With a FIXED ``now``, the recency cut is reproducible against fixed-date
+    feed items — no dependency on real wall-clock. The 2021 fixtures (Reddit
+    2021-03-01/02, Trends 2021-03-01) are 'fresh' relative to a now of
+    2021-03-05, and 'stale' relative to a now of 2021-06-01, deterministically."""
+    fixed_now = datetime(2021, 3, 5, tzinfo=UTC)
+
+    def fetch(url, timeout):
+        return _TRENDS_PAYLOAD if "trends.google" in url else _REDDIT_PAYLOAD
+
+    # now=2021-03-05, 7-day window -> 2021-03-01/02 items are INSIDE the window.
+    kept = ingest_social(
+        reddit_queries={"stocks": "social/reddit-r-stocks"},
+        trends_geo="US",
+        trends_watch_terms={"celsius", "crocs"},
+        fetcher=fetch,
+        max_age_days=7,
+        now=fixed_now,
+    )
+    titles = " ".join(it.title for it in kept)
+    assert "Celsius" in titles  # reddit 2021-03-01 within 7d of 2021-03-05
+    # published_at is UNCHANGED by the injected clock (real post/trend time).
+    assert all(it.published_at < fixed_now for it in kept)
+    assert all(it.published_at.year == 2021 for it in kept)
+
+    # The SAME feed + a later fixed now (2021-06-01) -> all 2021-03 items are stale.
+    later_now = datetime(2021, 6, 1, tzinfo=UTC)
+    dropped = ingest_social(
+        reddit_queries={"stocks": "social/reddit-r-stocks"},
+        trends_geo="US",
+        trends_watch_terms={"celsius", "crocs"},
+        fetcher=fetch,
+        max_age_days=7,
+        now=later_now,
+    )
+    assert dropped == [], "every 2021-03 item is >7d before 2021-06-01 -> dropped"
+
+
+def test_recency_filter_injected_now_default_matches_wallclock():
+    """Omitting ``now`` (default) is byte-identical to passing the wall-clock now:
+    the param defaults to datetime.now(UTC), so the live path is unchanged."""
+    from hermes_quant.catalyst.ingest import CatalystItem
+    from hermes_quant.catalyst.social import _filter_by_recency
+
+    fresh = CatalystItem(
+        title="fresh", published_at=datetime.now(UTC) - timedelta(days=1),
+        source="reddit/r/x (rss)", link="", query="x",
+    )
+    stale = CatalystItem(
+        title="stale", published_at=datetime.now(UTC) - timedelta(days=62),
+        source="reddit/r/x (rss)", link="", query="x",
+    )
+    # default now (None -> wall-clock) and an explicit wall-clock now agree.
+    default_kept = _filter_by_recency([fresh, stale], max_age_days=7)
+    explicit_kept = _filter_by_recency([fresh, stale], max_age_days=7, now=datetime.now(UTC))
+    assert [i.title for i in default_kept] == [i.title for i in explicit_kept] == ["fresh"]
+
+
+def test_recency_filter_accepts_naive_injected_now():
+    """A naive (tz-less) injected ``now`` is treated as UTC so the cutoff compare
+    against tz-aware published_at stays well-defined (never raises)."""
+    from hermes_quant.catalyst.ingest import CatalystItem
+    from hermes_quant.catalyst.social import _filter_by_recency
+
+    item = CatalystItem(
+        title="t", published_at=datetime(2021, 3, 1, tzinfo=UTC),
+        source="reddit/r/x (rss)", link="", query="x",
+    )
+    naive_now = datetime(2021, 3, 3)  # tz-less
+    kept = _filter_by_recency([item], max_age_days=7, now=naive_now)
+    assert [i.title for i in kept] == ["t"]  # 2021-03-01 within 7d of 2021-03-03
