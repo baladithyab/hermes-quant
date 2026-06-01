@@ -13,8 +13,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from hermes_quant.data.fundamentals_provider import FundamentalsProvider
-
+from hermes_quant.data.fundamentals_provider import (
+    DEFAULT_REPORTING_LAG_DAYS,
+    REPORTING_LAG_ENV_FLAG,
+    FundamentalsProvider,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -35,6 +38,8 @@ def _row(
     *,
     fetched_at: pd.Timestamp,
     as_of_date: pd.Timestamp | None = None,
+    report_date: pd.Timestamp | None = None,
+    period_end: pd.Timestamp | None = None,
     pe_trailing: float = 18.0,
     pe_forward: float = 17.0,
     debt_to_equity: float = 1.5,
@@ -53,6 +58,8 @@ def _row(
     return {
         "as_of_date": (as_of_date or fetched_at).normalize(),
         "fetched_at": fetched_at,
+        "report_date": report_date if report_date is not None else pd.NaT,
+        "period_end": period_end if period_end is not None else pd.NaT,
         "source": "yfinance",
         "pe_trailing": pe_trailing,
         "pe_forward": pe_forward,
@@ -238,3 +245,198 @@ def test_write_atomic_rename_no_partial_files(
         p for p in provider.yfinance_dir.iterdir() if p.name.endswith(".tmp")
     ]
     assert leftovers == []
+
+
+# ---------------------------------------------------------------------------
+# B34: reporting-lag-adjusted as_of (no-lookahead). Default-OFF behind
+# HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG; ON only ever TIGHTENS visibility.
+# ---------------------------------------------------------------------------
+
+
+def _write_reportlag_row(
+    p: FundamentalsProvider,
+    *,
+    ticker: str = "AAPL",
+    as_of_date: pd.Timestamp,
+    period_end: pd.Timestamp | None = None,
+    report_date: pd.Timestamp | None = None,
+) -> None:
+    """Write one snapshot whose datum became knowable at report_date/period_end."""
+    p.write_snapshot(
+        ticker,
+        _row(
+            fetched_at=as_of_date + pd.Timedelta(hours=12),
+            as_of_date=as_of_date,
+            period_end=period_end,
+            report_date=report_date,
+            pe_trailing=18.0,
+        ),
+    )
+
+
+def test_reporting_lag_default_constant_is_conservative() -> None:
+    assert DEFAULT_REPORTING_LAG_DAYS == 45
+
+
+def test_reporting_lag_columns_roundtrip(provider: FundamentalsProvider) -> None:
+    """report_date / period_end are persisted and read back tz-aware."""
+    pe = pd.Timestamp("2026-03-31", tz="UTC")
+    rd = pd.Timestamp("2026-04-20", tz="UTC")
+    _write_reportlag_row(
+        provider,
+        as_of_date=pd.Timestamp("2026-04-25", tz="UTC"),
+        period_end=pe,
+        report_date=rd,
+    )
+    df = pd.read_parquet(provider.ticker_path("AAPL"))
+    assert "report_date" in df.columns
+    assert "period_end" in df.columns
+    assert pd.Timestamp(df.iloc[0]["period_end"]) == pe
+    assert pd.Timestamp(df.iloc[0]["report_date"]) == rd
+
+
+def test_reporting_lag_flag_off_is_byte_identical(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Flag OFF: a row knowable only LATER is still visible (pre-B34 behavior).
+
+    period_end 2026-03-31 + 45d lag = 2026-05-15 is AFTER as_of 2026-04-10, but
+    with the flag OFF only the legacy ``as_of_date <= as_of`` predicate applies.
+    """
+    monkeypatch.delenv(REPORTING_LAG_ENV_FLAG, raising=False)
+    _write_reportlag_row(
+        provider,
+        as_of_date=pd.Timestamp("2026-04-01", tz="UTC"),
+        period_end=pd.Timestamp("2026-03-31", tz="UTC"),
+    )
+    snap = provider.read_latest("AAPL", as_of=pd.Timestamp("2026-04-10", tz="UTC"))
+    assert snap is not None
+    assert snap["pe_trailing"] == pytest.approx(18.0)
+
+
+def test_reporting_lag_excludes_not_yet_reported_by_period_end(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE core B34 assertion (period_end fallback path).
+
+    A fundamental whose period_end (2026-03-31) is BEFORE as_of (2026-04-10) but
+    whose period_end + reporting_lag (45d -> 2026-05-15) is AFTER as_of is
+    EXCLUDED — it was not yet reported as of 2026-04-10.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "1")
+    _write_reportlag_row(
+        provider,
+        as_of_date=pd.Timestamp("2026-04-01", tz="UTC"),
+        period_end=pd.Timestamp("2026-03-31", tz="UTC"),
+    )
+    assert provider.read_latest("AAPL", as_of=pd.Timestamp("2026-04-10", tz="UTC")) is None
+
+
+def test_reporting_lag_excludes_not_yet_reported_by_report_date(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """report_date is preferred over period_end when both present.
+
+    report_date 2026-04-20 + 45d = 2026-06-04 > as_of 2026-05-01 -> EXCLUDED.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "1")
+    _write_reportlag_row(
+        provider,
+        as_of_date=pd.Timestamp("2026-04-25", tz="UTC"),
+        period_end=pd.Timestamp("2026-03-31", tz="UTC"),
+        report_date=pd.Timestamp("2026-04-20", tz="UTC"),
+    )
+    assert provider.read_latest("AAPL", as_of=pd.Timestamp("2026-05-01", tz="UTC")) is None
+
+
+def test_reporting_lag_admits_once_lag_horizon_passed(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once as_of is past report_date + lag, the row becomes visible again."""
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "1")
+    _write_reportlag_row(
+        provider,
+        as_of_date=pd.Timestamp("2026-04-01", tz="UTC"),
+        period_end=pd.Timestamp("2026-03-31", tz="UTC"),
+    )
+    # period_end 2026-03-31 + 45d = 2026-05-15; read at 2026-06-01 -> visible.
+    snap = provider.read_latest("AAPL", as_of=pd.Timestamp("2026-06-01", tz="UTC"))
+    assert snap is not None
+    assert snap["pe_trailing"] == pytest.approx(18.0)
+
+
+def test_reporting_lag_missing_pit_columns_falls_back_to_as_of_date(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No report_date AND no period_end -> fall back to as_of_date + lag.
+
+    This only ever TIGHTENS: as_of_date 2026-04-01 + 45d = 2026-05-16 > as_of
+    2026-04-10 -> EXCLUDED. A missing backfill never loosens visibility.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "1")
+    _write_reportlag_row(
+        provider,
+        as_of_date=pd.Timestamp("2026-04-01", tz="UTC"),
+        period_end=None,
+        report_date=None,
+    )
+    assert provider.read_latest("AAPL", as_of=pd.Timestamp("2026-04-10", tz="UTC")) is None
+    assert (
+        provider.read_latest("AAPL", as_of=pd.Timestamp("2026-06-01", tz="UTC"))
+        is not None
+    )
+
+
+def test_reporting_lag_never_admits_beyond_off_path(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ON is a strict subset of OFF: a row OFF excludes is never admitted ON.
+
+    as_of_date (2026-05-01) is AFTER as_of (2026-04-10), so OFF already drops it
+    on the legacy predicate; ON must also drop it.
+    """
+    _write_reportlag_row(
+        provider,
+        as_of_date=pd.Timestamp("2026-05-01", tz="UTC"),
+        period_end=pd.Timestamp("2026-03-31", tz="UTC"),
+        report_date=pd.Timestamp("2026-04-01", tz="UTC"),
+    )
+    as_of = pd.Timestamp("2026-04-10", tz="UTC")
+    monkeypatch.delenv(REPORTING_LAG_ENV_FLAG, raising=False)
+    assert provider.read_latest("AAPL", as_of=as_of) is None  # OFF
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "1")
+    assert provider.read_latest("AAPL", as_of=as_of) is None  # ON
+
+
+def test_reporting_lag_custom_lag_days(
+    cache_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A larger configured reporting_lag_days tightens further."""
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "1")
+    p = FundamentalsProvider(cache_root=cache_root, reporting_lag_days=90)
+    _write_reportlag_row(
+        p,
+        as_of_date=pd.Timestamp("2026-04-01", tz="UTC"),
+        period_end=pd.Timestamp("2026-03-31", tz="UTC"),
+    )
+    # period_end + 90d = 2026-06-29. Default 45d would admit at 2026-06-01; with
+    # 90d it stays EXCLUDED there but is admitted once past 2026-06-29.
+    assert p.read_latest("AAPL", as_of=pd.Timestamp("2026-06-01", tz="UTC")) is None
+    assert (
+        p.read_latest("AAPL", as_of=pd.Timestamp("2026-07-01", tz="UTC")) is not None
+    )
+
+
+def test_reporting_lag_no_op_without_as_of(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """as_of=None is a live 'most recent' read — the lag filter does not apply."""
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "1")
+    _write_reportlag_row(
+        provider,
+        as_of_date=pd.Timestamp("2026-04-01", tz="UTC"),
+        period_end=pd.Timestamp("2026-03-31", tz="UTC"),
+    )
+    snap = provider.read_latest("AAPL")  # no as_of -> latest row regardless of lag
+    assert snap is not None
+    assert snap["pe_trailing"] == pytest.approx(18.0)

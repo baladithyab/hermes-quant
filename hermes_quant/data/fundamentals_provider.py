@@ -23,6 +23,11 @@ Per-ticker schema (one parquet file per ticker, append-only)::
 
     as_of_date           date          snapshot key (UTC, day-truncated)
     fetched_at           datetime[UTC] wall-clock fetch time
+    report_date          datetime[UTC] filing/report date the datum was first
+                                       publicly knowable (NULLable; backfilled
+                                       additively — older snapshots leave NaT)
+    period_end           datetime[UTC] fiscal period end the datum describes
+                                       (NULLable; coarse report_date fallback)
     source               str           "yfinance" / "yfinance_balance_sheet"
     pe_trailing          float64       info["trailingPE"]
     pe_forward           float64       info["forwardPE"]
@@ -45,6 +50,34 @@ rename.
 
 Sector-median sibling cache holds rolling sector P/E benchmarks refreshed
 weekly via `refresh_sector_medians`.
+
+Reporting-lag-adjusted as_of (B34, no-lookahead)
+------------------------------------------------
+A fundamental datum is NOT knowable as of its period end — it is only
+knowable after its filing/report date PLUS the typical reporting lag (e.g.
+a Q4 closing 31-Dec is filed ~mid-Feb). Filtering a backtest read on the
+period end (or even on the cache snapshot date) can therefore leak a
+fundamental into the past before it was actually reported.
+
+When ``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG`` is truthy (default OFF), the
+hot-path reads (`read_latest`, `read_sector_median_pe`) require, in addition
+to the existing ``as_of_date <= as_of`` snapshot filter, that the row's
+effective-knowable date satisfies::
+
+    effective_knowable = (report_date or period_end) + reporting_lag_days
+    keep row iff effective_knowable <= as_of
+
+The lag (``reporting_lag_days``, default 45d — a safe ~quarterly filing
+window) only ever TIGHTENS what is visible: a row that passes the snapshot
+filter may still be dropped because its report_date+lag is after as_of, but
+no row that the OFF path would have excluded is ever admitted (the original
+``as_of_date <= as_of`` predicate is still ANDed in). Rows with neither
+report_date nor period_end fall back to the snapshot ``as_of_date`` (already
+a knowable date — it is when the datum entered the cache), so missing
+backfill never loosens visibility.
+
+The flag is read at call time; with it OFF the read path is byte-identical
+to the pre-B34 behavior.
 """
 
 from __future__ import annotations
@@ -65,10 +98,40 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache" / "fundamentals"
 
+# B34 reporting-lag-adjusted as_of. Default-OFF; read at call time so the
+# off-state read path is byte-identical to pre-B34 behavior.
+REPORTING_LAG_ENV_FLAG = "HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG"
+# Conservative default for quarterly fundamentals: a 10-K/10-Q can land ~40d
+# (large accelerated filer) to ~75d after period end. 45d is a safe, jitter-
+# stable middle of the quarterly filing window — it never loosens visibility.
+DEFAULT_REPORTING_LAG_DAYS: int = 45
+
+
+def _reporting_lag_flag_on() -> bool:
+    """True iff the reporting-lag-adjusted as_of filter is enabled.
+
+    Canonical multi-value idiom (mirrors memory/meta_retro.py:_flag_on). Read
+    at call time so flipping the env var takes effect without re-import and the
+    OFF path stays byte-identical.
+    """
+    return os.environ.get(REPORTING_LAG_ENV_FLAG, "0") in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "on",
+    )
+
 # Per-ticker snapshot schema (column -> dtype)
 _SNAPSHOT_COLUMNS: dict[str, str] = {
     "as_of_date": "datetime64[ns, UTC]",
     "fetched_at": "datetime64[ns, UTC]",
+    # B34 reporting-lag-adjusted as_of: NULLable point-in-time columns. Older
+    # parquets predate them and are backfilled with NaT by the normalizer; the
+    # reporting-lag read filter is no-op while these are NaT unless the flag is
+    # ON and a period_end exists.
+    "report_date": "datetime64[ns, UTC]",
+    "period_end": "datetime64[ns, UTC]",
     "source": "string",
     "pe_trailing": "float64",
     "pe_forward": "float64",
@@ -155,6 +218,21 @@ def _normalize_dte(raw: Any) -> float:
     return f
 
 
+def _coerce_epoch_to_ts(value: Any) -> pd.Timestamp:
+    """Coerce a yfinance unix-epoch seconds value to a tz-aware UTC Timestamp.
+
+    Returns ``pd.NaT`` for missing / non-positive / unparseable input. Used for
+    B34 period-end stamping (info["mostRecentQuarter"] is unix seconds).
+    """
+    f = _coerce_float(value)
+    if np.isnan(f) or f <= 0:
+        return pd.NaT
+    try:
+        return pd.Timestamp(int(f), unit="s", tz="UTC")
+    except (ValueError, OverflowError, OSError):
+        return pd.NaT
+
+
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
@@ -187,6 +265,11 @@ class FundamentalsProvider:
     ttl_hours: int = 24
     name: str = "yfinance_fundamentals"
 
+    # B34: conservative reporting lag (days) added to report_date / period_end
+    # when the reporting-lag-adjusted as_of filter is ON. Only TIGHTENS
+    # visibility (no-lookahead). Has no effect while the flag is OFF.
+    reporting_lag_days: int = DEFAULT_REPORTING_LAG_DAYS
+
     # Sector-median hard staleness in days (per ADR-0064 §1.2 D5)
     SECTOR_MEDIAN_STALE_HARD_DAYS: int = 30
 
@@ -212,6 +295,52 @@ class FundamentalsProvider:
 
     def sector_median_path(self, sector: str) -> Path:
         return self.sector_medians_dir / f"{_safe_component(sector)}.parquet"
+
+    # ------------------------------------------------------------------
+    # B34: reporting-lag-adjusted as_of filter (default-OFF, no-lookahead)
+    # ------------------------------------------------------------------
+
+    def _apply_reporting_lag_filter(
+        self, df: pd.DataFrame, asof_ts: pd.Timestamp
+    ) -> pd.DataFrame:
+        """Drop rows not yet knowable as of ``asof_ts`` under the reporting lag.
+
+        No-op (returns ``df`` unchanged) when the reporting-lag flag is OFF, so
+        the read path is byte-identical to pre-B34 behavior. When ON, a row is
+        kept only if its effective-knowable date satisfies::
+
+            effective_knowable = (report_date or period_end) + lag <= asof_ts
+
+        Rows with neither ``report_date`` nor ``period_end`` fall back to the
+        snapshot ``as_of_date`` (already a knowable date), so a missing backfill
+        never loosens visibility. This predicate is ANDed with the caller's
+        existing ``as_of_date <= as_of`` filter — it only ever TIGHTENS.
+        """
+        if not _reporting_lag_flag_on():
+            return df
+        lag = pd.Timedelta(days=int(self.reporting_lag_days))
+
+        # Normalize the candidate point-in-time columns to tz-aware UTC. Both
+        # are NULLable; missing/absent columns fall back to as_of_date.
+        def _as_utc(col: str) -> pd.Series:
+            if col not in df.columns:
+                return pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
+            ser = df[col]
+            if not pd.api.types.is_datetime64_any_dtype(ser):
+                ser = pd.to_datetime(ser, utc=True, errors="coerce")
+            elif getattr(ser.dt, "tz", None) is None:
+                ser = ser.dt.tz_localize("UTC")
+            return ser
+
+        report = _as_utc("report_date")
+        period = _as_utc("period_end")
+        as_of_date = _as_utc("as_of_date")
+
+        # report_date preferred; fall back to period_end; finally as_of_date.
+        basis = report.fillna(period).fillna(as_of_date)
+        effective_knowable = basis + lag
+        keep = effective_knowable <= asof_ts
+        return df[keep]
 
     # ------------------------------------------------------------------
     # Hot path: reads
@@ -252,6 +381,10 @@ class FundamentalsProvider:
             if asof_ts.tzinfo is None:
                 asof_ts = asof_ts.tz_localize("UTC")
             df = df[df["as_of_date"] <= asof_ts]
+            if df.empty:
+                return None
+            # B34: ANDed reporting-lag-adjusted as_of (no-op when flag OFF).
+            df = self._apply_reporting_lag_filter(df, asof_ts)
             if df.empty:
                 return None
 
@@ -521,9 +654,17 @@ class FundamentalsProvider:
         except Exception as exc:  # noqa: BLE001
             logger.debug("fundamentals: derived cashflow failed %s: %s", ticker, exc)
 
+        # B34: best-effort point-in-time stamps. yfinance does not expose a true
+        # SEC filing date, so report_date stays NaT here (the read filter then
+        # uses period_end + lag, which is conservative). period_end is the most
+        # recent reported quarter end (info["mostRecentQuarter"], unix-epoch).
+        period_end = _coerce_epoch_to_ts(info.get("mostRecentQuarter"))
+
         snapshot = {
             "as_of_date": asof.normalize(),
             "fetched_at": asof,
+            "report_date": pd.NaT,
+            "period_end": period_end,
             "source": "yfinance",
             "pe_trailing": _coerce_float(info.get("trailingPE")),
             "pe_forward": _coerce_float(info.get("forwardPE")),
@@ -559,9 +700,11 @@ class FundamentalsProvider:
             if col not in df.columns:
                 df[col] = pd.NA
         df = df[list(_SNAPSHOT_COLUMNS.keys())]
-        # Ensure timestamps are tz-aware UTC
-        for col in ("as_of_date", "fetched_at"):
-            df[col] = pd.to_datetime(df[col], utc=True)
+        # Ensure timestamps are tz-aware UTC (schema-driven so B34's NULLable
+        # report_date / period_end are coerced to NaT-friendly datetime too).
+        for col, dtype in _SNAPSHOT_COLUMNS.items():
+            if dtype.startswith("datetime64"):
+                df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
         # Coerce floats
         for col, dtype in _SNAPSHOT_COLUMNS.items():
             if dtype == "float64":
@@ -595,4 +738,9 @@ class FundamentalsProvider:
         return df
 
 
-__all__ = ["FundamentalsProvider", "DEFAULT_CACHE_ROOT"]
+__all__ = [
+    "FundamentalsProvider",
+    "DEFAULT_CACHE_ROOT",
+    "DEFAULT_REPORTING_LAG_DAYS",
+    "REPORTING_LAG_ENV_FLAG",
+]
