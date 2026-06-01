@@ -35,6 +35,7 @@ dependencies = [
     "httpx>=0.25",
     "click>=8.1",
     "rich>=13.0",
+    "pydantic>=2",   # imported module-level in 18 agents/* files (schemas, LLM caller, committees); was only present transitively
 ]
 
 [project.optional-dependencies]
@@ -138,24 +139,16 @@ hermes-quant-daemon = "hermes_quant.daemon.main:main"
 hermes-quant-trainer = "hermes_quant.training.main:main"
 
 [tool.setuptools]
-packages = [
-    "hermes_quant",
-    "hermes_quant.analysts",
-    "hermes_quant.aggregators",
-    "hermes_quant.cli",
-    "hermes_quant.config",
-    "hermes_quant.consumers",
-    "hermes_quant.consumers.freqtrade",
-    "hermes_quant.daemon",
-    "hermes_quant.data",
-    "hermes_quant.evaluation",
-    "hermes_quant.options",
-    "hermes_quant.options.pricing",
-    "hermes_quant.risk",
-    "hermes_quant.schemas",
-    "hermes_quant.skills",
-    "hermes_quant.training",
-]
+# Auto-discover every hermes_quant.* package. The previous hand-maintained list
+# pinned only 16 of 45 real packages — a NON-editable wheel/sdist would silently
+# omit catalyst/governance/evidence/react/perception/factors/playbook/… and
+# import-crash (the editable .pth install masks this because it loads live source).
+# `find` keeps the package set in sync with the tree automatically. ("skills" is a
+# data dir, not a package — it has no __init__ and ships via package-data below.)
+
+[tool.setuptools.packages.find]
+include = ["hermes_quant*"]
+exclude = ["tests*", "ops*", "docs*"]
 
 [tool.setuptools.package-data]
 hermes_quant = [
