@@ -71,10 +71,17 @@ hermes plugins install baladithyab/hermes-quant
 # 2. Install Python deps INTO THE HERMES VENV (NOT your shell pip)
 ~/.hermes/hermes-agent/venv/bin/python3 -m pip install -e ~/.hermes/plugins/hermes-quant'[all]'
 
-# 3. Enable
-hermes plugins enable hermes-quant
+# 3. Enable — add the plugin to the config.yaml allow-list (NOT `hermes plugins enable`)
+#    hermes-quant is an entry-point ("standalone") plugin: it loads only if its name
+#    is in ~/.hermes/config.yaml under `plugins.enabled`. `hermes plugins enable` manages
+#    only bundled/git-installed plugins and will print "not installed or bundled" here.
+#    Add it to the list:
+#        plugins:
+#          enabled:
+#            - hermes-quant
+#    (edit ~/.hermes/config.yaml by hand, or however you manage that file).
 
-# 4. (Optional) Restart gateway if it's running
+# 4. Restart gateway so it picks up the newly-enabled plugin
 hermes gateway restart
 
 # 5. Setup
@@ -82,6 +89,8 @@ hermes quant setup
 ```
 
 > ⚠️  Use the explicit hermes venv pip path above. A bare `pip install -e .` will install into your conda/system Python where Hermes can't see it. See [Hermes plugin authoring gotchas](https://hermes-agent.nousresearch.com/) for context.
+> ⚠️  Step 3 is the `config.yaml plugins.enabled` allow-list, **not** `hermes plugins enable`
+> (which only handles bundled/git plugins). See `docs/operations/HERMES-INTEGRATION.md` §1.3.
 
 ### CUDA torch (optional)
 

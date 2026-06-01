@@ -29,19 +29,26 @@ Three discipline principles, in priority order:
 
 ## Architecture map
 
-8 ADRs in [docs/adr/](docs/adr/). Read them before touching code:
+**82 ADRs** in [docs/adr/](docs/adr/) — the full index is [docs/adr/README.md](docs/adr/README.md).
+Read the index before touching code; it is the authoritative decision record and has grown
+far beyond the foundational eight. The load-bearing foundations to start with:
 
 - ADR-0001: sidecar architecture (daemon ↔ Hermes plugin)
 - ADR-0002: analyst protocol (`MarketContext`, `AnalystView`, `Analyst` Protocol)
 - ADR-0003: aggregators (BMA + stacking; RL slot for v0.2)
-- ADR-0004: risk gate (deterministic, silence-by-default, ¼-Kelly)
+- ADR-0004: risk gate (deterministic, silence-by-default, ¼-Kelly) — **immutable, final authority**
 - ADR-0005: data layer (yfinance / ccxt / alpaca with provider chains)
-- ADR-0006: RL deferred to v0.2 with concrete graduation criteria
 - ADR-0007: plugin shape (tools = read-only views, CLI = control)
 - ADR-0008: freqtrade integration via signal bus (JSONL contract)
+- ADR-0015: HITL (propose → human-approve → gate → react)
+- ADR-0079: PDR unified architecture (Perception → Decision → Reaction)
+- ADR-0080: self-evolution framework (advisory-plane; W-flags; human ships every change)
+- ADR-0082/0083/0084: strategy-openness, horizon-neutral foundations, scheduled-event calendar
 
-3 research notes in [docs/research/](docs/research/). The decisions in the
-ADRs are grounded in these.
+For the rest (governance plane 0031, options 0027/0028/0029, admissibility 0077, etc.) consult
+the index — do NOT assume the eight foundations are the whole picture.
+
+**49 research notes** in [docs/research/](docs/research/) ground the ADR decisions.
 
 ## Repo layout
 
@@ -54,8 +61,8 @@ hermes-quant/
 ├── AGENTS.md                     # this file
 ├── CHANGELOG.md
 ├── docs/
-│   ├── adr/                      # 8 ADRs
-│   └── research/                 # 3 research lenses
+│   ├── adr/                      # 82 ADRs (see adr/README.md index)
+│   └── research/                 # 49 research lenses
 ├── hermes_quant/
 │   ├── __init__.py               # register(ctx) — Hermes plugin entry point
 │   ├── protocol.py               # MarketContext, AnalystView, Analyst Protocol
