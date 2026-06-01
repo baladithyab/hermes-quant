@@ -114,6 +114,13 @@ bma = "hermes_quant.aggregators.bma:BMAAggregator"
 # and scipy are already used (calibrators.py, factors/, options/pricing/gbs.py).
 deliberative_committee = "hermes_quant.aggregators.deliberative:DeliberativeCommitteeAggregator"
 
+# Registry-open plays (ADR-0082 Part A continuation). A third-party play can be
+# declared here as `my_play = "my_pkg.module:my_play_profile"` (a PlayProfile, a
+# zero-arg factory returning one, or a mapping). hermes_quant.playbook.play_loader
+# discovers this group — but ONLY when HERMES_QUANT_PLAYS_OPEN=1 (default-OFF). No
+# built-in members: the off-state registry is byte-identical to the built-in 5.
+[project.entry-points."hermes_quant.plays"]
+
 [project.entry-points."hermes_quant.data_providers"]
 yfinance = "hermes_quant.data.yfinance_provider:YFinanceProvider"
 ccxt = "hermes_quant.data.ccxt_provider:CcxtProvider"

@@ -1,0 +1,72 @@
+# FOMC scheduled-event calendar — vendored no-key PRIMARY seed (ADR-0084, D-1 of Option D).
+#
+# The no-key, government-primary source of FORWARD FOMC events. Mirrors the
+# posture of catalyst/propagation_graph.seed.yaml: a vendored, operator-editable
+# YAML that ships WITH the code (loaded relative to this package, not from
+# ~/.hermes), parsed by a stdlib loader, with silence-by-default fallback.
+#
+# Two timestamps per row (ADR-0084 D-2 — asof-honesty is enforced at construction):
+#   * scheduled_for — when the event HAPPENS (the forward-looking payload that
+#       the pre-event guard gates on). FOMC decisions are released at 2:00 PM ET
+#       on the SECOND day of the two-day meeting; the UTC instant accounts for
+#       US Eastern DST (2pm EST = 19:00 UTC, 2pm EDT = 18:00 UTC).
+#   * announced_at — when the schedule became PUBLIC (the asof anchor). The Fed
+#       publishes its FOMC meeting schedule ~1+ year ahead, so for 2026 dates
+#       announced_at is a HARD PAST FACT (it is impossible to look ahead through
+#       a date that was already public). announced_at <= scheduled_for ALWAYS.
+#
+# Every row carries BOTH timestamps from this file — ZERO network at load time.
+# outcome is intentionally absent: the calendar carries the EXISTENCE of a
+# forward event, NEVER its result (CalendarEvent.outcome is always None).
+#
+# SOURCES (verified, public):
+#   * Meeting dates: federalreserve.gov/monetarypolicy/fomccalendars.htm
+#       (2026 schedule: 8 two-day meetings; decision at 2:00 PM ET on day 2).
+#   * Blackout windows: the FOMC Communications policy / Chicago Fed rule — the
+#       external-communications blackout begins the SECOND Saturday preceding a
+#       meeting and ends the THURSDAY following it. Windows below are bounded at
+#       00:00 ET (start) and 23:59:59 ET (end), expressed in UTC.
+#   * announced_at anchor: the Fed's public release of the 2026 FOMC schedule
+#       (issued ~18 months ahead). A single conservative publication anchor is
+#       used for all 2026 rows; it is comfortably in the past (as of build) and
+#       earlier than every 2026 scheduled_for, satisfying announced_at <= scheduled_for.
+#
+# REFRESH: ops/scripts/quant-fomc-calendar-refresh.py prints the next year's
+# windows for operator review (the Fed publishes ~1yr ahead). A freshness
+# assertion test WARNS when this seed no longer covers the current + next quarter.
+
+year: 2026
+# Conservative single publication anchor for all 2026 rows. The Fed released the
+# 2026 FOMC meeting schedule well over a year before the first 2026 meeting; this
+# instant (2:00 PM ET on a documented 2024 FOMC-statement day) is a hard past
+# fact and is earlier than every scheduled_for below.
+announced_at: "2024-06-12T18:00:00Z"
+market: US
+impact: high
+source: federalreserve.gov/fomccalendars
+
+# 8 FOMC MEETING windows (scheduled_for = 2:00 PM ET decision release, day 2 of
+# the two-day meeting). meeting_dates is the human-readable two-day span.
+meetings:
+  - {meeting_dates: "2026-01-27/2026-01-28", scheduled_for: "2026-01-28T19:00:00Z", title: "FOMC meeting (Jan 27-28) — rate decision 2:00pm ET"}
+  - {meeting_dates: "2026-03-17/2026-03-18", scheduled_for: "2026-03-18T18:00:00Z", title: "FOMC meeting (Mar 17-18, SEP) — rate decision 2:00pm ET"}
+  - {meeting_dates: "2026-04-28/2026-04-29", scheduled_for: "2026-04-29T18:00:00Z", title: "FOMC meeting (Apr 28-29) — rate decision 2:00pm ET"}
+  - {meeting_dates: "2026-06-16/2026-06-17", scheduled_for: "2026-06-17T18:00:00Z", title: "FOMC meeting (Jun 16-17, SEP) — rate decision 2:00pm ET"}
+  - {meeting_dates: "2026-07-28/2026-07-29", scheduled_for: "2026-07-29T18:00:00Z", title: "FOMC meeting (Jul 28-29) — rate decision 2:00pm ET"}
+  - {meeting_dates: "2026-09-15/2026-09-16", scheduled_for: "2026-09-16T18:00:00Z", title: "FOMC meeting (Sep 15-16, SEP) — rate decision 2:00pm ET"}
+  - {meeting_dates: "2026-10-27/2026-10-28", scheduled_for: "2026-10-28T18:00:00Z", title: "FOMC meeting (Oct 27-28) — rate decision 2:00pm ET"}
+  - {meeting_dates: "2026-12-08/2026-12-09", scheduled_for: "2026-12-09T19:00:00Z", title: "FOMC meeting (Dec 8-9, SEP) — rate decision 2:00pm ET"}
+
+# 8 BLACKOUT windows (second Saturday preceding -> Thursday following each
+# meeting). blackout_start/blackout_end bound the window in UTC; scheduled_for is
+# the window's risk-CLEARS instant (== blackout_end), so the freshness check and
+# the asof gate treat each blackout as a forward event that resolves at its end.
+blackouts:
+  - {blackout_start: "2026-01-17T05:00:00Z", blackout_end: "2026-01-30T04:59:59Z", scheduled_for: "2026-01-30T04:59:59Z", title: "FOMC blackout (Jan 17 -> Jan 29 ET) — Jan 27-28 meeting"}
+  - {blackout_start: "2026-03-07T05:00:00Z", blackout_end: "2026-03-20T03:59:59Z", scheduled_for: "2026-03-20T03:59:59Z", title: "FOMC blackout (Mar 7 -> Mar 19 ET) — Mar 17-18 meeting"}
+  - {blackout_start: "2026-04-18T04:00:00Z", blackout_end: "2026-05-01T03:59:59Z", scheduled_for: "2026-05-01T03:59:59Z", title: "FOMC blackout (Apr 18 -> Apr 30 ET) — Apr 28-29 meeting"}
+  - {blackout_start: "2026-06-06T04:00:00Z", blackout_end: "2026-06-19T03:59:59Z", scheduled_for: "2026-06-19T03:59:59Z", title: "FOMC blackout (Jun 6 -> Jun 18 ET) — Jun 16-17 meeting"}
+  - {blackout_start: "2026-07-18T04:00:00Z", blackout_end: "2026-07-31T03:59:59Z", scheduled_for: "2026-07-31T03:59:59Z", title: "FOMC blackout (Jul 18 -> Jul 30 ET) — Jul 28-29 meeting"}
+  - {blackout_start: "2026-09-05T04:00:00Z", blackout_end: "2026-09-18T03:59:59Z", scheduled_for: "2026-09-18T03:59:59Z", title: "FOMC blackout (Sep 5 -> Sep 17 ET) — Sep 15-16 meeting"}
+  - {blackout_start: "2026-10-17T04:00:00Z", blackout_end: "2026-10-30T03:59:59Z", scheduled_for: "2026-10-30T03:59:59Z", title: "FOMC blackout (Oct 17 -> Oct 29 ET) — Oct 27-28 meeting"}
+  - {blackout_start: "2026-11-28T05:00:00Z", blackout_end: "2026-12-11T04:59:59Z", scheduled_for: "2026-12-11T04:59:59Z", title: "FOMC blackout (Nov 28 -> Dec 10 ET) — Dec 8-9 meeting"}
