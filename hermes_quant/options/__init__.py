@@ -29,6 +29,15 @@ from .occ import (
     format_occ,
     parse_occ,
 )
+from .structure_select import (
+    Direction,
+    IVRegime,
+    classify_iv_regime,
+    direction_from_rating,
+    select_structure,
+    select_structure_for_plan,
+    structure_select_enabled,
+)
 
 __all__ = [
     # pricing / greeks (optlib facade)
@@ -53,4 +62,12 @@ __all__ = [
     "aggregate_net_greeks",
     # multi-leg proposal carrier (ADR-0029 D5)
     "MultiLegProposal",
+    # deterministic structure-selection table (ADR-0082 Part B)
+    "Direction",
+    "IVRegime",
+    "classify_iv_regime",
+    "direction_from_rating",
+    "select_structure",
+    "select_structure_for_plan",
+    "structure_select_enabled",
 ]
