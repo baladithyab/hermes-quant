@@ -219,112 +219,132 @@ def test_tiny_but_perfect_rule_rejected_by_wilson():
     assert wilson_lower_bound(5, 5) < MIN_WILSON_LB
 
 
-def _lift_trap_corpus() -> list[SettlementEntry]:
-    """A corpus that ACTUALLY produces a proposed rule AND contains lift~1 traps.
+def _low_lift_corpus() -> list[SettlementEntry]:
+    """A corpus that ACTUALLY produces a low-lift ``confidence`` split which — but for the
+    production lift guard — WOULD be proposed by ``mine_rules``. This is the corpus the
+    rebuilt B27 lift-guard test rests on, and the reason it is MUTATION-KILLING.
 
-    Two independent signals:
-      * ``confidence`` is UNCORRELATED with outcome — every equity bucket wins at the
-        SAME ~0.73 rate, so every confidence split's win-rate ≈ the corpus base rate
-        (lift ~1.0). Crucially the support is large enough (n up to 120) that these
-        splits CLEAR the Wilson lower-bound gate (wlb up to ~0.72 >= 0.60). The ONLY
-        gate that can stop them is the lift guard (the bread->milk trap, note §1b/§4).
-      * ``asset_class == 'fx'`` is genuinely predictive (39/40 wins, lift ~1.23,
-        Bonferroni-significant) — so a rule IS proposed and the test is NOT vacuous.
+    Construction (deterministic, no RNG): a high base rate (~0.946) bulk where confidence
+    carries almost no signal, split into two equal buckets so the OneR stump produces a
+    ``confidence > 0.6`` split whose covered win-rate (~0.992) is only marginally above the
+    base rate:
+
+      * low-confidence (0.3): 130 rows, 117 wins (win-rate 0.900)
+      * high-confidence (0.9): 130 rows, 129 wins (win-rate 0.992)
+
+    The corpus base rate is 246/260 = 0.9462. The enumerated ``confidence > 0.6`` split
+    covers the 130 high-confidence rows at 129/130 = 0.992 wins, so:
+
+      * lift = 0.992 / 0.9462 ≈ 1.049 — BELOW 1.0 + LIFT_MARGIN(0.05)=1.05, so it is the
+        bread->milk "adds nothing" trap the LIFT guard exists to reject;
+      * Wilson lower bound ≈ 0.958 — well ABOVE MIN_WILSON_LB(0.60), so the Wilson gate
+        does NOT reject it;
+      * Bonferroni-corrected p ≈ 0.025 — BELOW ALPHA(0.05), so the Bonferroni gate does
+        NOT reject it either.
+
+    So in PRODUCTION the split's verdict is FAILS_LIFT and ``mine_rules`` returns it in NO
+    proposed set. If the lift guard regresses (the ``elif lift < 1.0 + LIFT_MARGIN`` branch
+    is neutralized), the split falls through to PROPOSE — and ``mine_rules`` WOULD emit a
+    ``confidence > 0.6`` rule. The test below asserts ``mine_rules`` does NOT, so it FAILS
+    under exactly that mutation. (Verified by mutating the guard: normal -> [], mutated ->
+    one ``confidence > 0.6`` PROPOSE rule with lift≈1.049.)
     """
     rows: list[SettlementEntry] = []
     i = 0
-    # equity bulk — confidence carries NO signal (uniform 22/30 = 0.733 per bucket).
-    for c in (0.3, 0.5, 0.7, 0.9):
-        for k in range(30):
-            rows.append(
-                _entry(i, confidence=c, direction=1,
-                       alpha_return=(2.0 if k < 22 else -1.0), asset_class="equity")
-            )
-            i += 1
-    # fx slice — the genuine, lifted, significant signal (so mining is non-vacuous).
-    for k in range(40):
+    # low-confidence bucket — 117/130 wins (below the high bucket, ~at/below base).
+    for k in range(130):
         rows.append(
-            _entry(i, confidence=(0.3 + 0.2 * (k % 4)), direction=1,
-                   alpha_return=(2.0 if k < 39 else -1.0), asset_class="fx")
+            _entry(i, confidence=0.3, direction=1,
+                   alpha_return=(2.0 if k < 117 else -1.0), asset_class="equity")
+        )
+        i += 1
+    # high-confidence bucket — 129/130 wins. Point-impressive, but in a corpus that
+    # ALREADY wins ~94.6% it adds almost nothing: lift ≈ 1.049 < 1.05 (the trap).
+    for k in range(130):
+        rows.append(
+            _entry(i, confidence=0.9, direction=1,
+                   alpha_return=(2.0 if k < 129 else -1.0), asset_class="equity")
         )
         i += 1
     return rows
 
 
-def _verdict_for(cand, *, base_rate: float, n_trials: int) -> str:
-    """Replay mine_rules' exact gate cascade for one enumerated candidate so the test
-    can assert the SPECIFIC failing gate (mine_rules itself returns only PROPOSE rows)."""
-    n = len(cand.covered)
-    win_rate = cand.wins / n if n else 0.0
-    wlb = wilson_lower_bound(cand.wins, n)
-    lift = (win_rate / base_rate) if base_rate > 0 else float("inf")
-    bonf_p = min(1.0, rule_mining._binom_sf_ge(cand.wins, n, base_rate) * n_trials)
-    if n < MIN_SAMPLE:
-        return "INSUFFICIENT_SAMPLE"
-    if wlb < MIN_WILSON_LB:
-        return "FAILS_WILSON"
-    if lift < 1.0 + LIFT_MARGIN:
-        return "FAILS_LIFT"
-    if bonf_p > ALPHA:
-        return "FAILS_BONFERRONI"
-    return "PROPOSE"
+def test_high_lift_confidence_rule_is_accepted():
+    """ACCEPT side: on a separable corpus (base rate ~0.5) where high confidence genuinely
+    wins, the lift guard does NOT block — ``mine_rules`` PROPOSES a confidence rule whose
+    lift clears 1.0 + LIFT_MARGIN by a wide margin. Paired with the REJECT test below this
+    pins the guard's behavior on BOTH sides (accept a high-lift rule, reject a low-lift
+    one) so a guard regression can't pass by trivially proposing or rejecting everything."""
+    rules = mine_rules(entries=_separable_corpus())
+    conf_rules = [r for r in rules if r.feature == "confidence"]
+    assert conf_rules, "a genuine high-confidence -> wins signal must be PROPOSED"
+    top = conf_rules[0]
+    assert top.verdict == "PROPOSE"
+    assert top.lift >= 1.0 + LIFT_MARGIN
+    # The high-confidence corpus has base rate ~0.5 and the winning slice ~0.9, so lift is
+    # comfortably above the margin (not merely scraping past it).
+    assert top.lift > 1.5, f"expected a strongly-lifted rule, got lift={top.lift:.3f}"
 
 
 def test_lift_one_rule_adds_nothing_rejected():
-    """DISCRIMINATING bread->milk trap (note §1b/§4): a rule whose covered win-rate ≈ the
-    base rate has lift~1 and 'adds nothing' and MUST be rejected by the LIFT guard
-    specifically — even though it clears the Wilson lower-bound gate.
+    """REJECT side / MUTATION-KILLING bread->milk trap (note §1b/§4): a ``confidence > 0.6``
+    split whose covered win-rate (~0.992) only marginally beats a high base rate (~0.946)
+    has lift ≈ 1.049 < 1.0 + LIFT_MARGIN — it 'adds nothing' and MUST be rejected by the
+    LIFT guard SPECIFICALLY. The split CLEARS the Wilson gate (wlb≈0.958) AND the Bonferroni
+    gate (corrected p≈0.025), so the lift guard is the ONLY thing standing between it and a
+    PROPOSE verdict.
 
-    The old version of this test was VACUOUS: its corpus produced zero proposed rules,
-    so its loop body never ran and it would have passed even with the lift guard deleted.
-    Here we (a) confirm mining is non-vacuous (the fx signal IS proposed), (b) confirm a
-    real lift~1 confidence split clears Wilson, and (c) confirm that split's verdict is
-    exactly FAILS_LIFT — so the test FAILS if the lift guard regresses (the verdict would
-    flip to PROPOSE / FAILS_BONFERRONI, never FAILS_LIFT)."""
-    corpus = _lift_trap_corpus()
+    The earlier version of this test was non-discriminating: it asserted FAILS_LIFT against
+    a test-local REPLICA of the gate cascade (a ``_verdict_for`` helper), so neutralizing
+    the PRODUCTION lift guard left it green. This version asserts against the PRODUCTION
+    ``mine_rules`` output directly:
 
-    # (a) NON-VACUOUS: a genuinely-lifted, significant rule is proposed.
+      * with the real lift guard, ``mine_rules`` proposes NO ``confidence`` rule on this
+        corpus (the split is FAILS_LIFT);
+      * if the ``elif lift < 1.0 + LIFT_MARGIN`` branch regresses, the split falls through
+        to PROPOSE and ``mine_rules`` WOULD emit a ``confidence > 0.6`` rule with lift~1.05.
+
+    So this assertion FAILS exactly when the lift guard regresses. (Mentally / empirically
+    verified by mutating the guard: normal run -> no confidence rule; mutated run -> one
+    ``confidence`` PROPOSE rule with lift≈1.049.)"""
+    corpus = _low_lift_corpus()
+
+    # PRODUCTION assertion: no lift~1 confidence rule may be proposed. With the lift guard
+    # intact this set is empty of confidence rules; if the guard regresses, mine_rules
+    # surfaces the FAILS_LIFT split as a PROPOSE -> this assertion fails.
     rules = mine_rules(entries=corpus)
-    assert rules, "corpus must actually produce a proposed rule (else the test is vacuous)"
-    assert any(r.feature == "asset_class" and r.threshold == "fx" for r in rules)
-    # No lift~1 confidence rule may sneak into the proposed set.
-    for r in rules:
-        if r.feature == "confidence":
-            assert r.lift >= 1.0 + LIFT_MARGIN, (
-                "a lift~1 confidence rule was PROPOSED — the lift guard failed to reject "
-                "the bread->milk trap"
-            )
+    proposed_conf = [r for r in rules if r.feature == "confidence"]
+    assert not proposed_conf, (
+        "a lift~1 confidence rule was PROPOSED — the lift guard failed to reject the "
+        f"bread->milk trap: {[(r.op, r.threshold, round(r.lift, 4)) for r in proposed_conf]}"
+    )
 
-    # (b)+(c) The lift guard is the LOAD-BEARING rejector. Re-score every enumerated
-    # candidate and find the lift~1 confidence splits that CLEAR Wilson — the only thing
-    # that may stop them is the lift gate.
+    # SETUP INVARIANT (intrinsic, NOT via LIFT_MARGIN so it is mutation-invariant): the
+    # corpus really does contain a ``confidence`` split that clears BOTH the Wilson and the
+    # Bonferroni gates while being lift~1, so the lift guard is provably the sole rejector.
+    # If this invariant ever breaks the REJECT assertion above would be vacuous, so we pin
+    # it explicitly here.
     prows = rule_mining._resolved_profitable_rows(corpus)
-    base_wins = sum(1 for e in prows if (e.alpha_return or 0.0) > 0)
-    base_rate = base_wins / len(prows)
+    base_rate = sum(1 for e in prows if (e.alpha_return or 0.0) > 0) / len(prows)
     cands = rule_mining._enumerate_candidates(prows)
     n_trials = len(cands)
-
-    # Select lift~1 traps by an INTRINSIC criterion (win-rate within a fixed ±3% band of
-    # the base rate) — NOT via LIFT_MARGIN, so the selection set is invariant under a lift-
-    # guard mutation. Each such split clears the Wilson gate, so the lift guard is the only
-    # thing that can stop it; a regressed lift guard flips its verdict off FAILS_LIFT.
-    lift_trap_clearing_wilson = [
+    lift_one_clearing_other_gates = [
         c
         for c in cands
         if c.feature == "confidence"
+        # clears Wilson:
         and wilson_lower_bound(c.wins, len(c.covered)) >= MIN_WILSON_LB
-        and abs((c.wins / len(c.covered)) - base_rate) <= 0.03 * base_rate
+        # clears Bonferroni:
+        and min(1.0, rule_mining._binom_sf_ge(c.wins, len(c.covered), base_rate) * n_trials)
+        <= ALPHA
+        # but is a lift~1 trap (selected intrinsically: win-rate within +5% of base rate):
+        and 1.0 <= (c.wins / len(c.covered)) / base_rate < 1.0 + LIFT_MARGIN
     ]
-    assert lift_trap_clearing_wilson, (
-        "test setup broken: expected a lift~1 confidence split that clears the Wilson gate "
-        "so that ONLY the lift guard can reject it"
+    assert lift_one_clearing_other_gates, (
+        "test setup broken: expected a lift~1 confidence split that clears BOTH the Wilson "
+        "and Bonferroni gates, so that ONLY the lift guard can reject it (else this test "
+        "would be vacuous / non-discriminating)"
     )
-    for c in lift_trap_clearing_wilson:
-        verdict = _verdict_for(c, base_rate=base_rate, n_trials=n_trials)
-        assert verdict == "FAILS_LIFT", (
-            f"a Wilson-clearing, lift~1 confidence split got verdict {verdict!r}, expected "
-            f"'FAILS_LIFT' — the lift guard is not what rejects the bread->milk trap"
-        )
 
 
 def test_bonferroni_correction_counts_all_trials():

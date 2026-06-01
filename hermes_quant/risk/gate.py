@@ -24,8 +24,10 @@ Per ADR-0004 §Configuration profiles: ships three named profiles
 from __future__ import annotations
 
 import logging
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -182,6 +184,98 @@ def _ts_to_datetime(ts: pd.Timestamp | datetime) -> datetime:
 
 
 # ---------------------------------------------------------------------------
+# ADR-0084: pre-event REJECT/abstain guard (default-OFF, additive)
+# ---------------------------------------------------------------------------
+
+# Flag name (mirrors the catalyst calendar feature flag). The guard is a no-op
+# unless this env var is exactly "1"; absent/"0" => byte-identical to today.
+EVENT_RISK_FLAG = "HERMES_QUANT_EVENT_RISK"
+
+
+def _event_risk_enabled() -> bool:
+    """True iff HERMES_QUANT_EVENT_RISK=1. Read at gate() time (mirrors the
+    catalyst flag-reading posture: os.environ.get, never cached at import)."""
+    return os.environ.get(EVENT_RISK_FLAG, "0") == "1"
+
+
+def _parse_event_ts(s: Any) -> datetime | None:
+    """Coerce an event timestamp (ISO string or datetime) to tz-aware UTC.
+
+    Returns None on any failure — a malformed/missing scheduled_for can NEVER
+    fabricate a blackout (ADR-0084 Negative-risk note: missing data => NO
+    blackout, never invent one). Pure; never raises.
+    """
+    try:
+        if isinstance(s, datetime):
+            dt = s
+        elif isinstance(s, str):
+            v = s.strip()
+            if not v:
+                return None
+            dt = datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith("Z") else v)
+        else:
+            return None
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def in_event_blackout(
+    event_risk: Mapping[str, Any] | None,
+    *,
+    asof: datetime,
+    window_days: float,
+    high_impact_only: bool = True,
+) -> tuple[bool, str | None]:
+    """Pure predicate: is `asof` inside the pre-event blackout window?
+
+    Reads the asof-honest, outcome-free ``event_risk`` payload produced by the
+    catalyst calendar wiring (ctx.extras['event_risk'] — already filtered to
+    ``announced_at <= decision_asof`` upstream, so EXISTENCE was knowable at
+    signal.asof; this predicate only inspects the FORWARD ``scheduled_for``).
+
+    A blackout fires iff some event satisfies ALL of:
+      * impact == "high" (when ``high_impact_only``; macro Tier-1 / earnings),
+      * ``scheduled_for`` is FORWARD of (or equal to) ``asof`` (a past event is
+        not a pre-event risk; the position already lived through it), and
+      * ``scheduled_for - asof <= window_days`` (imminent).
+
+    Returns ``(True, reason)`` on the FIRST qualifying event (deterministic:
+    callers feed a list already sorted by (scheduled_for, kind)), else
+    ``(False, None)``. A None/empty/malformed payload => ``(False, None)`` — the
+    guard NEVER fabricates a blackout from missing data (ADR-0084 Negative).
+    Pure; never raises; reads no env and no clock.
+    """
+    if not event_risk:
+        return False, None
+    events = event_risk.get("events") if isinstance(event_risk, Mapping) else None
+    if not events:
+        return False, None
+    if asof.tzinfo is None:
+        asof = asof.replace(tzinfo=UTC)
+    horizon = asof + timedelta(days=window_days)
+    for ev in events:
+        if not isinstance(ev, Mapping):
+            continue
+        impact = str(ev.get("impact") or "").strip().lower()
+        if high_impact_only and impact != "high":
+            continue
+        scheduled = _parse_event_ts(ev.get("scheduled_for"))
+        if scheduled is None:
+            continue  # missing/malformed schedule => never a blackout
+        # Forward-window test: the event is still ahead (or exactly at asof) AND
+        # within window_days. A schedule strictly in the past is not pre-event.
+        if scheduled < asof:
+            continue
+        if scheduled <= horizon:
+            kind = str(ev.get("kind") or "event").strip().lower() or "event"
+            return True, f"event_blackout_{kind}_high_impact"
+    return False, None
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -215,6 +309,16 @@ class RiskConfig:
     cooldown_after_loss_minutes: int = 60
     """Cooldown window after a realized loss (heuristic; v0.2 may
     config-default-off)."""
+
+    event_risk_window_days: float = 1.0
+    """ADR-0084 pre-event guard: how many days FORWARD of signal.asof a
+    HIGH-impact scheduled event (from ctx.extras['event_risk']) silences a
+    fresh opening/increasing position. Default 1.0 = the macro window
+    (FOMC/CPI/NFP print day). Config-only knob; the guard is ADDITIVE and
+    ENTIRELY GATED on HERMES_QUANT_EVENT_RISK=1 — when the flag is absent the
+    window value is never read and behavior is byte-identical (ADR-0084 D-3).
+    The guard can ONLY reject/abstain; it never touches the ladder, never
+    sizes up, never blocks de-risking (ADR-0084 D-1)."""
 
     paper_zero_costs: bool = False
     """PAPER-MODE-ONLY override: when True, the cost-gate threshold is
@@ -325,6 +429,7 @@ class DefaultRiskGate:
         self._n_silenced_cost_gate = 0
         self._n_silenced_min_trade = 0
         self._n_silenced_lookahead = 0
+        self._n_silenced_event_risk = 0
 
     def _audit_rejection(self, signal: AggregatedSignal, reason: str) -> None:
         """Emit a 'gate_rejection' audit event. Failures are swallowed."""
@@ -428,6 +533,39 @@ class DefaultRiskGate:
         if signal.direction == 0 or signal.confidence < 1e-6:
             self._n_silenced_flat += 1
             return self._silence(signal, reason="flat_or_zero_confidence")
+
+        # Rule 3.5: ADR-0084 pre-event blackout guard (DEFAULT-OFF, ADDITIVE).
+        # A HIGH-impact scheduled event (FOMC/CPI/NFP/earnings) within
+        # config.event_risk_window_days FORWARD of signal.asof silences a fresh
+        # OPENING/INCREASING position. asof-honest: the event_risk payload was
+        # already filtered upstream to announced_at<=decision_asof (the event's
+        # EXISTENCE was knowable at signal.asof); this rule only tests the
+        # forward scheduled_for window — a forward date that was knowable at
+        # signal.asof, mirroring the halt/cooldown/drawdown SILENCE rules.
+        #
+        # RAILS (ADR-0084 D-1): this rule can ONLY reject/abstain. It NEVER
+        # touches the ladder, never sizes, never blocks DE-RISKING. It is fully
+        # gated on HERMES_QUANT_EVENT_RISK=1 — flag absent => this whole block is
+        # skipped => byte-identical to today. The deterministic gate stays the
+        # FINAL, IMMUTABLE authority; this is an ADDED reject condition only,
+        # never a weakened one.
+        if _event_risk_enabled():
+            # Opening/increasing only: a signal that pushes exposure further from
+            # flat in its own direction is opening/increasing; a signal opposite
+            # the current position is de-risking and is NEVER blocked. Flat
+            # (current==0) is treated as opening.
+            current = portfolio.current_position_pct(signal.asset)
+            is_opening_or_increasing = signal.direction * current >= 0
+            if is_opening_or_increasing:
+                event_risk = (signal.metadata or {}).get("event_risk")
+                blackout, reason = in_event_blackout(
+                    event_risk,
+                    asof=_ts_to_datetime(signal.asof),
+                    window_days=self.config.event_risk_window_days,
+                )
+                if blackout:
+                    self._n_silenced_event_risk += 1
+                    return self._silence(signal, reason=reason or "event_blackout")
 
         # Rule 4: Post-loss cooldown
         cooldown_key = (portfolio.account_id, portfolio.asset_class, signal.asset)
@@ -542,6 +680,7 @@ class DefaultRiskGate:
             "n_silenced_cost_gate": self._n_silenced_cost_gate,
             "n_silenced_min_trade": self._n_silenced_min_trade,
             "n_silenced_lookahead": self._n_silenced_lookahead,
+            "n_silenced_event_risk": self._n_silenced_event_risk,
         }
 
 

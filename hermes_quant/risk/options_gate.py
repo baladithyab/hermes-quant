@@ -21,8 +21,9 @@ from __future__ import annotations
 import logging
 import math
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from hermes_quant.options.data import (
@@ -80,6 +81,14 @@ class OptionsRiskConfig:
     pin_risk_moneyness_threshold: float = 0.02
     max_strategies_per_underlying: int = 1
     max_concurrent_open_positions: int = 8
+    # ADR-0084 O8 (earnings-proximity / IV-crush guard). ADDITIVE, default-OFF
+    # at the call seam (event_risk=None => no check). Only the net-theta-paying /
+    # net-vega-long side (long premium) is ever flagged; premium sellers HARVEST
+    # the crush and are exempt.
+    earnings_proximity_dte: int = 5
+    """Days BEFORE a scheduled earnings date within which opening a long-premium
+    structure is rejected (IV-crush risk). Default 5 matches the existing
+    covered_call days_since_earnings>=5 convention (ADR-0084 §Consequences)."""
 
 
 @dataclass(frozen=True)
@@ -337,6 +346,95 @@ def _round_to_step(value: float, step: float) -> float:
     return math.floor(value / step) * step
 
 
+def _event_risk_enabled() -> bool:
+    """True iff HERMES_QUANT_EVENT_RISK=1 (ADR-0084 O8 master flag). Read at
+    call time (os.environ.get; never cached at import)."""
+    return os.environ.get("HERMES_QUANT_EVENT_RISK", "0") == "1"
+
+
+def _parse_event_ts(s) -> datetime | None:
+    """Coerce an event timestamp (ISO string or datetime) to tz-aware UTC, or
+    None on any failure. Missing/malformed => None => NO blackout (ADR-0084
+    Negative: never fabricate an earnings date). Pure; never raises."""
+    try:
+        if isinstance(s, datetime):
+            dt = s
+        elif isinstance(s, str):
+            v = s.strip()
+            if not v:
+                return None
+            dt = datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith("Z") else v)
+        else:
+            return None
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _earnings_proximity_violation(
+    event_risk: Mapping | None,
+    candidate_net: NetGreeks,
+    *,
+    underlying: str,
+    asof: datetime | None,
+    dte_window: int,
+) -> str | None:
+    """O8: flag a LONG-PREMIUM structure opening into an imminent earnings date.
+
+    The IV-crush trap (research §earnings-IV-crush literature, ADR-0084) is on
+    the NET-THETA-PAYING / NET-VEGA-LONG side: a long-premium structure spanning
+    earnings pays decay and is long vega, so the post-print IV collapse erodes
+    its value. Premium SELLERS (net theta >= 0, collecting decay) HARVEST the
+    crush and MUST NOT be blocked — so this predicate is a no-op for them.
+
+    Returns a reject reason string iff ALL hold:
+      * the structure is long-premium (net theta < 0 AND net vega > 0), and
+      * ``event_risk`` carries a HIGH-impact ``earnings`` event for ``underlying``
+        whose ``scheduled_for`` is FORWARD of ``asof`` and within ``dte_window``
+        days (imminent print).
+
+    asof-honest: ``event_risk`` was filtered upstream to
+    ``announced_at <= decision_asof`` (the earnings date's EXISTENCE was knowable
+    at decision time); this only tests the forward ``scheduled_for``. Missing
+    data => None => NO reject (never fabricate a blackout). Pure; never raises.
+    """
+    if event_risk is None or not isinstance(event_risk, Mapping):
+        return None
+    # Only long-premium (net theta-paying AND net vega-long) is at IV-crush risk.
+    # A theta-collecting OR vega-short structure (CC/CSP/credit spread) is exempt.
+    if not (candidate_net.theta < 0 and candidate_net.vega > 0):
+        return None
+    events = event_risk.get("events")
+    if not events:
+        return None
+    when = asof or datetime.now(UTC)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    horizon = when + timedelta(days=dte_window)
+    sym_u = (underlying or "").strip().upper()
+    for ev in events:
+        if not isinstance(ev, Mapping):
+            continue
+        if str(ev.get("kind") or "").strip().lower() != "earnings":
+            continue
+        if str(ev.get("impact") or "").strip().lower() != "high":
+            continue
+        # Single-name scope: an earnings event applies only to its own symbol.
+        # If the payload carries a symbol, it must match the structure's
+        # underlying; a symbol-less earnings row is conservatively in-scope.
+        ev_sym = ev.get("symbol")
+        if ev_sym is not None and str(ev_sym).strip().upper() != sym_u:
+            continue
+        scheduled = _parse_event_ts(ev.get("scheduled_for"))
+        if scheduled is None or scheduled < when:
+            continue  # missing/past => not a forward IV-crush risk
+        if scheduled <= horizon:
+            return "earnings_proximity_iv_crush"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
@@ -366,11 +464,18 @@ def options_gate(
     min_dte: int | None = None,
     open_strategies_on_underlying: int = 0,
     edge: float = 0.0,
+    # ADR-0084 O8 (earnings-proximity / IV-crush). ADDITIVE + DEFAULT-OFF at the
+    # seam: event_risk=None => O8 never runs => byte-identical to today. The
+    # check ALSO requires HERMES_QUANT_EVENT_RISK=1 (master flag), so even a
+    # caller that passes a payload is a no-op when the feature is OFF.
+    event_risk: Mapping | None = None,
+    decision_asof: datetime | None = None,
 ) -> OptionsGateResult:
-    """Run the O1-O7 sequence. Returns silence (admitted=False) on any
+    """Run the O1-O8 sequence. Returns silence (admitted=False) on any
     violation. Rules in order: O-classify -> O1 max-loss/margin -> O2 no-naked
     -> O3 gamma -> O4 theta -> O5 vega -> O6 BPR buffer -> O7 pin-risk ->
-    sizing -> min-contract guard.
+    O8 earnings-proximity (long-premium IV-crush) -> sizing -> min-contract
+    guard.
 
     Raises OptionsGateDisabled unless HERMES_QUANT_OPTIONS_GATE=1.
     """
@@ -565,6 +670,30 @@ def options_gate(
             bucket, "below_min_dte_for_new_entry", net_greeks=candidate_net,
             bpr_estimate=bpr, max_loss=max_loss,
         )
+
+    # ---- O8: earnings-proximity / IV-crush guard (ADR-0084, DEFAULT-OFF). ----
+    # A LONG-PREMIUM structure (net theta-paying AND net vega-long) opening into
+    # an imminent HIGH-impact earnings date for this underlying is rejected — the
+    # post-print IV collapse erodes long premium. Premium sellers (theta-
+    # collecting / vega-short) HARVEST the crush and are EXEMPT (the predicate is
+    # a no-op for them). asof-honest: event_risk was filtered upstream to
+    # announced_at<=decision_asof; this only tests the forward scheduled_for.
+    # RAILS: this can ONLY reject — it never sizes, never amplifies. Fully gated
+    # on HERMES_QUANT_EVENT_RISK=1 AND a non-None event_risk payload; otherwise a
+    # no-op (byte-identical).
+    if event_risk is not None and _event_risk_enabled():
+        o8_reason = _earnings_proximity_violation(
+            event_risk,
+            candidate_net,
+            underlying=underlying,
+            asof=decision_asof,
+            dte_window=cfg.earnings_proximity_dte,
+        )
+        if o8_reason is not None:
+            return OptionsGateResult.silence(
+                bucket, o8_reason, net_greeks=candidate_net,
+                bpr_estimate=bpr, max_loss=max_loss,
+            )
 
     # ---- Sizing (D3 + amendment). Contract count is floor() of a discrete-step ---
     # NAV target. Per ADR-0027 D3 amendment, the income/collateral sizing target
