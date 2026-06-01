@@ -88,6 +88,7 @@ def synthesize_packets(
     graph: dict[str, list[PropagationEdge]] | None = None,
     aliases: dict[str, str] | None = None,
     propagation_log: list[dict] | None = None,
+    stamp_log_asof: bool = False,  # see RR2 note below; default-OFF => byte-identical
     model: str = "catalyst-sense:v1",
     velocity_by_symbol: dict[str, dict] | None = None,  # PDR-2: frame.trend_velocity, keyed by symbol
 ) -> list[SemanticPacket]:
@@ -96,6 +97,18 @@ def synthesize_packets(
     For each item: classify polarity+severity, extract entities, propagate to
     symbols, emit one packet per touched symbol with asof = item.published_at.
     Neutral / non-catalyst items and neutral propagations produce no packet.
+
+    RR2 (PDR-3 batch fix): convergence is scored over the FULL item set per symbol
+    (Pass 1.5), so the cron MUST call this ONCE over all items (not per-item) or
+    convergence always sees n=1 and drops every packet. To keep the per-propagation
+    asof the profitability/graph-mining loop needs (each row stamped with its
+    SOURCE item's publication time), the cron sets ``stamp_log_asof=True``: each
+    propagation-log entry this item appends is stamped with ``item.published_at``
+    so the caller can ``log_propagations(log)`` ONCE with the per-row asof intact.
+    DEFAULT-OFF (``stamp_log_asof=False``) => no "asof" key is added here, so every
+    existing caller (eval.py, the per-item path) stays byte-identical. The stamped
+    value is ``item.published_at.isoformat()`` — the exact string the per-item cron
+    passed to ``log_propagations(asof=...)`` — so the log is byte-identical too.
     """
     if graph is None or aliases is None:
         g, a = load_graph()
@@ -124,7 +137,17 @@ def synthesize_packets(
         ents = extract_entities(item.title, aliases)
         if not ents:
             continue
+        _log_before = len(propagation_log) if propagation_log is not None else 0
         results = propagate(ents, sign, graph, log=propagation_log)
+        # RR2: stamp THIS item's pub time onto the rows it just appended, so a
+        # single batch call preserves the per-propagation asof the per-item cron
+        # used to set via log_propagations(asof=...). Default-OFF => no key added
+        # => byte-identical for every other caller. The key is appended LAST,
+        # matching log_propagations' row = dict(e); row["asof"] = ... ordering.
+        if stamp_log_asof and propagation_log is not None:
+            _asof = item.published_at.isoformat()
+            for _row in propagation_log[_log_before:]:
+                _row["asof"] = _asof
         prepared.append((item, cls, ents, results))
         for sym, res in results.items():
             if res.stance == "neutral" or res.confidence <= 0.0:

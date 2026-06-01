@@ -124,18 +124,25 @@ def main() -> int:
         n_social = len(social_items)
         items = items + social_items
 
-    # Synthesize per-item so each propagation-log batch carries the item's pub time
-    # (asof) — the profitability loop needs asof to fetch the realized forward return.
-    packets = []
-    n_logged = 0
-    for it in items:
-        item_log: list[dict] = []
-        item_packets = synthesize_packets(
-            [it], graph=graph, aliases=aliases, propagation_log=item_log
-        )
-        packets.extend(item_packets)
-        if item_log:
-            n_logged += log_propagations(item_log, asof=it.published_at.isoformat())
+    # RR2 (PDR-3 fix): synthesize the WHOLE item set in ONE call. The per-item loop
+    # this replaced fed synthesize_packets([it]) one item at a time, so the
+    # PDR-3 convergence pass (validate_convergence) ALWAYS saw a 1-item set per
+    # symbol => n_independent==1 => validated=False => with HERMES_QUANT_CONVERGENCE=1
+    # EVERY packet was dropped (the eval batched the full set and passed, but
+    # production was blind). A single batch call lets convergence observe each
+    # symbol's full MULTI-SOURCE item set, so it can actually fire on a multi-source
+    # feed. stamp_log_asof=True preserves the per-propagation asof the profitability/
+    # graph-mining loop needs (each log row carries its SOURCE item's publication
+    # time, exactly as the per-item log_propagations(asof=...) call did) — so we now
+    # log ONCE over the full batch with the per-row asof already in place. With the
+    # CONVERGENCE flag OFF this is byte-identical to the old per-item path (packets
+    # AND propagation-log rows; golden-verified).
+    propagation_log: list[dict] = []
+    packets = synthesize_packets(
+        items, graph=graph, aliases=aliases,
+        propagation_log=propagation_log, stamp_log_asof=True,
+    )
+    n_logged = log_propagations(propagation_log) if propagation_log else 0
     n_written = write_packets(packets)
     prop_log = [None] * n_logged  # for the summary count only
 
