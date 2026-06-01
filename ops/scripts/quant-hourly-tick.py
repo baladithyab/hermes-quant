@@ -500,29 +500,51 @@ def maybe_run_autonomous_phase() -> str:
     skipped = summary.get("idempotent_skipped", 0)
     errors = summary.get("errors", 0)
     scanned = summary.get("scanned", 0)
+    tick_id = summary.get("tick_id", "")
+    asof = tick_id[:16].replace("T", " ") + " UTC" if tick_id else ""
 
-    # Emit ONLY when something actionable happened. Silence-by-default.
-    notable = (
-        fired > 0
-        or errors > 0
-        or halt
-        or (armed and silenced > 0)  # silences-while-armed are worth knowing
-    )
-    if not notable:
-        return ""
+    # Emit ONLY when something genuinely actionable happened. Tiered: hard-fail
+    # (halt/error) > fire > silence-while-armed. The silence-while-armed tier
+    # used to spam Discord when 3 names hit gate-rejection; we now collapse it
+    # to a single emoji line that's easy to skim past.
+    has_fire = fired > 0
+    has_hard_fail = bool(halt) or errors > 0
+    has_silence_signal = armed and silenced > 0
 
-    suffix = "" if armed else " (dry-run)"
+    if not (has_fire or has_hard_fail or has_silence_signal):
+        return ""  # truly silent heartbeat
+
+    mode_tag = "📦 paper" if armed else "🧪 dry-run"
+    asof_tag = f", {asof}" if asof else ""
+
+    # Hard-fail headlines — loud and explicit
     if halt:
-        return f"🚨 autonomous phase{suffix}: HALT ABORT (active halts present)"
-    parts = [f"⚙️ autonomous phase{suffix}",
-             f"scanned={scanned}",
-             f"fired={fired}",
-             f"silenced={silenced}",
-             f"gate_rejected={gate_rejected}",
-             f"idempotent_skipped={skipped}"]
+        return f"🚨 **hourly autonomous phase HALT-ABORTED** ({mode_tag}{asof_tag})\n> Active halts present in halt_state.json — fail-closed."
     if errors > 0:
-        parts.append(f"errors={errors}")
-    return " ".join(parts)
+        return (
+            f"⚠️ **hourly autonomous phase: {errors} error(s)** ({mode_tag}{asof_tag})\n"
+            f"```\nscanned={scanned} fired={fired} silenced={silenced} gate_rejected={gate_rejected} errors={errors}\n```"
+        )
+
+    # Fire headlines — call out what fired (placebo if multi-fire detail
+    # isn't available; the tick journal carries the per-symbol detail and
+    # the operator can look there).
+    if has_fire:
+        head = (
+            f"📈 **hourly autonomous phase: {fired} fire(s)** "
+            f"({mode_tag}{asof_tag})"
+        )
+        return (
+            f"{head}\n```\n"
+            f"scanned={scanned} fired={fired} silenced={silenced} "
+            f"gate_rejected={gate_rejected} idempotent_skipped={skipped}\n```"
+        )
+
+    # Silence-while-armed — terse single-line, no stat block
+    return (
+        f"🔕 hourly autonomous phase: {silenced} signal(s) silenced "
+        f"(no fire) — {mode_tag}{asof_tag}"
+    )
 
 
 # ---------- main ----------

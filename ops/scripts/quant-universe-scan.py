@@ -67,7 +67,27 @@ from hermes_quant.universe import scan_universe  # noqa: E402
 
 def main() -> int:
     payload = scan_universe()
-    print(payload["count"])
+    count = payload.get("count", 0)
+    asof = payload.get("asof", "?")
+    filters = payload.get("filters", {}) or {}
+    output_path = filters.get("output_path", "?")
+    min_price = filters.get("min_price")
+    max_price = filters.get("max_price")
+    min_adv = filters.get("min_avg_dollar_volume_30d")
+    max_symbols = filters.get("max_symbols")
+
+    # Headline: count + key filter knobs in 1 line
+    print(f"🌐 **universe scan** — {count} symbols passed filters (asof={asof[:19] if asof else '?'})")
+    print("```")
+    print(f"  count           = {count}")
+    if min_price is not None or max_price is not None:
+        print(f"  price range     = ${min_price or 0:.2f} – ${max_price or 0:.2f}")
+    if min_adv is not None:
+        print(f"  min ADV (30d)   = ${min_adv:,.0f}")
+    if max_symbols is not None:
+        print(f"  max_symbols cap = {max_symbols}")
+    print(f"  output          = {output_path}")
+    print("```")
     return 0
 
 

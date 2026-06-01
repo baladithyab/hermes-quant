@@ -119,14 +119,28 @@ def append_rebalance_log(record: dict[str, Any]) -> None:
 
 # ---------- halt-state fail-closed gate ----------
 def read_active_halts() -> list[dict]:
-    """Read ~/.hermes/quant/halt_state.json. Returns active halts (empty = OK)."""
+    """Read ~/.hermes/quant/halt_state.json. Returns active halts (empty = OK).
+
+    Wave 1d fix (2026-05-27): filter to equity-relevant halts only.
+    Crypto-only halts (asset_class='crypto') do not affect the quarterly
+    equity portfolio review. Only account-wide ('*', None) or 'equity'
+    class halts abort the quarterly review.
+    """
     if not HALT_MIRROR_PATH.exists():
         return []
     try:
         data = json.loads(HALT_MIRROR_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
         return [{"reason": f"halt_state.json corrupt: {e}", "scope": "fail-closed"}]
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        return []
+    equity_halts = []
+    for h in data:
+        ac = h.get("asset_class")
+        # Only halt equity quarterly review for account-wide or equity halts.
+        if ac in (None, "*", "equity"):
+            equity_halts.append(h)
+    return equity_halts
 
 
 def is_first_monday_of_quarter(now: datetime | None = None) -> bool:

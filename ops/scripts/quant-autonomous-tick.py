@@ -465,6 +465,128 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
     return summary
 
 
+def _format_human_summary(summary: dict, *, armed: bool) -> str:
+    """Format a tick_summary dict as Discord-friendly markdown.
+
+    Returns "" (empty) when the run was both unremarkable AND uneventful —
+    the wrapper's no_agent=True semantics treat empty stdout as silent, so
+    routine "scanned 119, fired 0, all silenced" ticks don't spam Discord.
+
+    Returns a non-empty multi-line string when anything notable happened:
+      - placed > 0 (a paper trade fired) → 📈 lead with symbol(s)
+      - halt_aborted → 🚨 lead with halt warning
+      - errors > 0 → ⚠️ lead with error count
+      - skipped_idempotent > 0 OR per-tick-cap-hit → context line so the
+        operator knows the system saw signals it didn't fire on
+    Otherwise the heartbeat is silent.
+    """
+    scanned = summary.get("scanned", 0)
+    decided = summary.get("decided", 0)
+    placed = summary.get("placed", 0)
+    abstained = summary.get("abstained", 0)
+    errors = summary.get("errors", 0)
+    skipped = summary.get("skipped_idempotent", 0)
+    halt_aborted = summary.get("halt_aborted", False)
+    watchlist_size = summary.get("watchlist_size", scanned)
+    tick_id = summary.get("tick_id", "")
+    asof = tick_id[:16].replace("T", " ") + " UTC" if tick_id else ""
+    mode = "📦 paper" if armed else "🧪 dry-run"
+
+    # Decide whether to speak at all.
+    notable = bool(placed or halt_aborted or errors)
+    has_capped_signals = False
+    capped_symbols: list[tuple[str, str]] = []  # (symbol, play) of would-have-fired-but-capped
+    placed_symbols: list[tuple[str, str, float]] = []  # (symbol, play, target_pct)
+
+    # Enrich with recent decision rows from autonomous-tick.jsonl for this tick_id.
+    if tick_id:
+        try:
+            for line in AUDIT_LOG_PATH.read_text().splitlines()[-300:]:
+                if not line.strip() or tick_id not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("event") != "decision":
+                    continue
+                if rec.get("tick_id") != tick_id:
+                    continue
+                gate = rec.get("gate")
+                sym = rec.get("symbol", "?")
+                plays = rec.get("plays", []) or []
+                play = plays[0] if plays else "?"
+                if gate in ("FIRE", "DRY_RUN_FIRE"):
+                    action = rec.get("action") or {}
+                    placed_symbols.append((sym, play, float(action.get("target_position_pct", 0.0))))
+                elif gate and "PER_TICK_CAP" in gate:
+                    has_capped_signals = True
+                    capped_symbols.append((sym, play))
+        except Exception:
+            pass  # Enrichment is best-effort; never block summary delivery on parse failures.
+
+    if has_capped_signals:
+        notable = True
+
+    if not notable:
+        return ""  # silence-by-default heartbeat
+
+    lines: list[str] = []
+
+    # Headline
+    if halt_aborted:
+        lines.append(f"🚨 **autonomous-tick HALT-ABORTED** ({mode}, {asof})")
+        lines.append("> Active halts present in halt_state.json — fail-closed. No fires this tick.")
+    elif placed > 0:
+        if len(placed_symbols) == 1:
+            sym, play, pct = placed_symbols[0]
+            side = "SHORT" if pct < 0 else "LONG"
+            verb = "would have fired" if not armed else "fired"
+            lines.append(
+                f"📈 **autonomous-tick: 1 paper trade {verb}** "
+                f"({sym} {side} {abs(pct):.0%} via `{play}`, {mode}, {asof})"
+            )
+        else:
+            verb = "would have fired" if not armed else "fired"
+            lines.append(
+                f"📈 **autonomous-tick: {placed} paper trades {verb}** "
+                f"({mode}, {asof})"
+            )
+            for sym, play, pct in placed_symbols[:5]:
+                side = "SHORT" if pct < 0 else "LONG"
+                lines.append(f"  • {sym} {side} {abs(pct):.0%} via `{play}`")
+    elif errors > 0:
+        lines.append(f"⚠️ **autonomous-tick: {errors} error(s)** ({mode}, {asof})")
+    elif has_capped_signals:
+        # Notable but no fire happened: operator should know we saw real signals.
+        n = len(capped_symbols)
+        sym_list = ", ".join(f"{s}/{p}" for s, p in capped_symbols[:5])
+        lines.append(
+            f"🔕 **autonomous-tick: {n} signal(s) capped** ({mode}, {asof})"
+        )
+        lines.append(
+            f"> Per-tick open cap reached after the first fire. Held back: {sym_list}"
+            + (f" (+{n - 5} more)" if n > 5 else "")
+        )
+
+    # Body — tight stat line
+    body_parts: list[str] = []
+    body_parts.append(f"watchlist={watchlist_size}")
+    body_parts.append(f"scanned={scanned}")
+    body_parts.append(f"decided={decided}")
+    body_parts.append(f"placed={placed}")
+    body_parts.append(f"abstained={abstained}")
+    if skipped:
+        body_parts.append(f"idempotent_skipped={skipped}")
+    if errors:
+        body_parts.append(f"errors={errors}")
+    lines.append("```")
+    lines.append(" ".join(body_parts))
+    lines.append("```")
+
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="hermes-quant per-tick autonomous paper-trading orchestrator"
@@ -475,7 +597,7 @@ def main() -> int:
     g.add_argument("--armed", dest="armed", action="store_true",
                    help="Real paper-mode firing. Required for the cron.")
     parser.add_argument("--json", action="store_true",
-                        help="Emit single-line JSON summary on stdout.")
+                        help="Emit single-line JSON summary on stdout (debug).")
     args = parser.parse_args()
     armed = bool(args.armed) and not bool(args.dry_run)
 
@@ -492,31 +614,22 @@ def main() -> int:
             "armed": armed,
         })
         sys.stderr.write(f"quant-autonomous-tick: uncaught: {exc}\n")
+        # Still emit a loud Discord-side alert.
+        print(
+            f"⚠️ **autonomous-tick crashed**: `{type(exc).__name__}: {exc}` "
+            f"(see ~/.hermes/quant/autonomous-tick.jsonl for trace)",
+            flush=True,
+        )
         return 1
 
     if args.json:
+        # Debug path — preserve raw shape for investigation.
         print(json.dumps(summary, default=str), flush=True)
     else:
-        scanned = summary["scanned"]
-        decided = summary["decided"]
-        placed = summary["placed"]
-        abstained = summary["abstained"]
-        suffix = ""
-        if summary["halt_aborted"]:
-            suffix = " HALT-ABORTED"
-        elif not armed:
-            suffix = " (dry-run)"
-        skipped = summary.get("skipped_idempotent", 0)
-        skip_str = f" skipped_idempotent={skipped}" if skipped else ""
-        dbm = summary.get("direction_bias_mismatch", 0)
-        dbm_str = f" direction_bias_mismatch={dbm}" if dbm else ""
-        err = summary.get("errors", 0)
-        err_str = f" errors={err}" if err else ""
-        print(
-            f"tick: scanned={scanned} decided={decided} placed={placed} "
-            f"abstained={abstained}{skip_str}{dbm_str}{err_str}{suffix}",
-            flush=True,
-        )
+        msg = _format_human_summary(summary, armed=armed)
+        if msg:
+            print(msg, flush=True)
+        # Empty stdout when uneventful → no_agent silent semantics.
     return 0
 
 

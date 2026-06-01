@@ -111,13 +111,30 @@ def append_journal(record: dict[str, Any]) -> None:
 
 # ---------- halt-state fail-closed gate ----------
 def read_active_halts() -> list[dict]:
+    """Return halts that are relevant to EQUITY operations.
+
+    Wave 1d fix (2026-05-27): the original version returned ALL halts,
+    including crypto-only halts (e.g. BTC/USDT daily_loss_breaker). A
+    crypto halt should not abort the equity weekly rebalance. We now
+    filter to halts whose asset_class is '*', 'equity', or None (account-
+    wide / unspecified). Crypto-only halts are ignored here.
+    """
     if not HALT_MIRROR_PATH.exists():
         return []
     try:
         data = json.loads(HALT_MIRROR_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
         return [{"reason": f"halt_state.json corrupt: {e}", "scope": "fail-closed"}]
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        return []
+    equity_halts = []
+    for h in data:
+        ac = h.get("asset_class")
+        # Only halt equity playbook for account-wide ('*', None, or 'equity') halts.
+        # Crypto-only halts (asset_class='crypto') do not affect equity operations.
+        if ac in (None, "*", "equity"):
+            equity_halts.append(h)
+    return equity_halts
 
 
 # ---------- exit-rule logic (pure, unit-tested) ----------

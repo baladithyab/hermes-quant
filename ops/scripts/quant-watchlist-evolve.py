@@ -305,7 +305,24 @@ def main() -> int:
     ):
         return 0
 
-    print(f"as_of={summary['as_of']} events={summary['events_written']}")
+    # Aggregate counters for the headline so the operator can scan in 1s.
+    total_active = sum(v["n_active"] for v in summary["per_play"].values())
+    total_onboarded = sum(v["n_onboarded_today"] for v in summary["per_play"].values())
+    total_evicted = sum(v["n_evicted_today"] for v in summary["per_play"].values())
+
+    # Headline tells the story: "watchlist evolve: N active, +X onboarded, -Y evicted"
+    headline_emoji = "📋"
+    if total_evicted > total_onboarded * 2 and total_evicted > 5:
+        # Heavy eviction signals regime/quality shift — flag it.
+        headline_emoji = "📉"
+    elif total_onboarded > total_evicted * 2 and total_onboarded > 5:
+        headline_emoji = "📈"
+    print(
+        f"{headline_emoji} **watchlist evolve** — {total_active} active "
+        f"(+{total_onboarded} onboarded, -{total_evicted} evicted) — "
+        f"as_of={summary['as_of']}"
+    )
+    print("```")
     for play, stats in summary["per_play"].items():
         if stats["n_active"] or stats["n_onboarded_today"] or stats["n_evicted_today"]:
             top = ", ".join(f"{s}:{sc:.2f}" for s, sc in stats["top5"])
@@ -314,6 +331,11 @@ def main() -> int:
                 f"+{stats['n_onboarded_today']:2d} -{stats['n_evicted_today']:2d}  "
                 f"top5: {top}"
             )
+    print("```")
+    print(
+        f"_events_written={summary['events_written']} → "
+        f"~/.hermes/quant/watchlist/journal.jsonl_"
+    )
     return 0
 
 

@@ -991,16 +991,58 @@ def run_tick(*, dry_run: bool) -> dict[str, Any]:
 
 # ---------- summary rendering ----------
 def render_summary(s: dict[str, Any]) -> str:
+    """Render the daily playbook tick summary as Discord-friendly markdown.
+
+    Tiered emit (matches autonomous-tick + hourly-tick):
+      - halt_aborted → 🚨 loud halt notice
+      - errors > 0   → ⚠️ loud error notice
+      - fired > 0    → 📈 lead with fire count + per-(symbol, play) detail
+      - silenced > 0 OR gate_rejected > 0 (real signals) → 🔕 single-line summary
+      - all-clear and nothing-tried → "" (silent heartbeat)
+
+    --always-print bypasses the silent path for debug.
+    """
     et_now = datetime.now(UTC).astimezone(ET).strftime("%a %b %-d, %-I:%M %p ET")
-    suffix = ""
-    if s["halt_aborted"]:
-        suffix = " HALT-ABORTED"
-    elif s["dry_run"]:
-        suffix = " (dry-run)"
-    return (f"📋 hermes-quant playbook tick {et_now}{suffix} "
-            f"scanned={s['scanned']} fired={s['fired']} "
-            f"silenced={s['silenced']} gate_rejected={s['gate_rejected']} "
-            f"idempotent_skipped={s['idempotent_skipped']} errors={s['errors']}")
+    halt_aborted = s.get("halt_aborted", False)
+    fired = s.get("fired", 0)
+    silenced = s.get("silenced", 0)
+    gate_rejected = s.get("gate_rejected", 0)
+    skipped = s.get("idempotent_skipped", 0)
+    errors = s.get("errors", 0)
+    scanned = s.get("scanned", 0)
+    dry_run = s.get("dry_run", False)
+    mode_tag = "🧪 dry-run" if dry_run else "📦 paper"
+
+    # Hard-fail headlines — loud and explicit
+    if halt_aborted:
+        return f"🚨 **playbook tick HALT-ABORTED** ({mode_tag}, {et_now})\n> Active halts present in halt_state.json — fail-closed."
+    if errors > 0:
+        return (
+            f"⚠️ **playbook tick: {errors} error(s)** ({mode_tag}, {et_now})\n"
+            f"```\nscanned={scanned} fired={fired} silenced={silenced} "
+            f"gate_rejected={gate_rejected} errors={errors}\n```"
+        )
+
+    # Fires — call out the count + stats. Per-(symbol, play) detail lives
+    # in tick-journal.jsonl; the brief surfaces just the rollup.
+    if fired > 0:
+        return (
+            f"📈 **playbook tick: {fired} fire(s)** ({mode_tag}, {et_now})\n"
+            f"```\n"
+            f"scanned={scanned} fired={fired} silenced={silenced} "
+            f"gate_rejected={gate_rejected} idempotent_skipped={skipped}\n```"
+        )
+
+    # No fire but real signals processed — terse single-line summary
+    if silenced > 0 or gate_rejected > 0:
+        return (
+            f"🔕 playbook tick: scanned={scanned}, "
+            f"silenced={silenced}, gate_rejected={gate_rejected} "
+            f"(no fire) — {mode_tag}, {et_now}"
+        )
+
+    # Truly nothing happened (empty universe, no signals at all) — silent
+    return ""
 
 
 # ---------- entrypoint ----------
@@ -1058,7 +1100,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(summary, default=str), flush=True)
     else:
-        print(render_summary(summary), flush=True)
+        rendered = render_summary(summary)
+        if rendered:  # render_summary may return "" for fully-silent cases
+            print(rendered, flush=True)
     return 0
 
 
