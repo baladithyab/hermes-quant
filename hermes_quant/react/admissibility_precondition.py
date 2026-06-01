@@ -59,6 +59,7 @@ def admissibility_reject_equity(
     bar_ts: str | None,
     approver_user_id: str | None = None,
     extra_metadata: dict[str, Any] | None = None,
+    play_tag: str = "advisor",
 ) -> ExecutionRecord | None:
     """Pre-trade admissibility precondition for a SHORT equity leg (ADR-0077/0079).
 
@@ -134,4 +135,5 @@ def admissibility_reject_equity(
         approver_user_id=approver_user_id,
         reactor_metadata=metadata,
         bar_ts=bar_ts,
+        play_tag=play_tag,  # B13: source of the fire propagated onto the reject record
     )

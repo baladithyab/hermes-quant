@@ -84,6 +84,7 @@ class PaperReactor:
         *,
         fill_size_pct: float,
         approver_user_id: str | None = None,
+        play_tag: str = "advisor",
     ) -> ExecutionRecord:
         """Append an execution record to the bus and return it.
 
@@ -95,6 +96,11 @@ class PaperReactor:
                 what should land here; otherwise the advisor's
                 kelly_fraction.
             approver_user_id: Hermes user id of approver, if available.
+            play_tag: B13 source/play_tag of the fire — "advisor" (HITL
+                approve, the default), "playbook", or "autonomous". Carried
+                onto the ExecutionRecord so the retro/settlement loop can
+                attribute fills by source. Default "advisor" keeps existing
+                callers bit-for-bit (every fill read as advisor before B13).
 
         Wave 4 (ADR-0042) reflection hook:
             When env var HERMES_QUANT_REFLECTION=1 is set AND the fill
@@ -112,7 +118,9 @@ class PaperReactor:
         # When ON, an inadmissible SHORT equity order is REJECTED here — the reactor (the actual
         # Reaction layer) is now admissibility-aware, not just the autonomous-tick decision seam.
         # REJECT-only / fail-closed: it can only refuse to fill, never widen, force, or flip a side.
-        admissibility_reject = self._admissibility_reject(proposal, fill_size_pct, now)
+        admissibility_reject = self._admissibility_reject(
+            proposal, fill_size_pct, now, play_tag=play_tag
+        )
         if admissibility_reject is not None:
             return admissibility_reject
         # ADR-0068: prefer the wall-clock decision time emitted by the advisor.
@@ -191,6 +199,7 @@ class PaperReactor:
                 "slippage_breakdown": slippage_breakdown,
             },
             bar_ts=bar_ts,
+            play_tag=play_tag,  # B13: source of the fire (advisor/playbook/autonomous)
         )
 
         # Append to the executions bus. Same flock pattern signal_bus uses.
@@ -259,7 +268,7 @@ class PaperReactor:
         return record
 
     def _admissibility_reject(
-        self, proposal: Any, fill_size_pct: float, now: str
+        self, proposal: Any, fill_size_pct: float, now: str, *, play_tag: str = "advisor"
     ) -> ExecutionRecord | None:
         """Pre-trade admissibility precondition for SHORT equity paper fills (ADR-0077/0079).
 
@@ -290,6 +299,7 @@ class PaperReactor:
             signal_id=self._extract_signal_id(proposal),
             timeframe=proposal.timeframe,
             bar_ts=bar_ts,
+            play_tag=play_tag,
         )
 
     @staticmethod
@@ -357,4 +367,5 @@ def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
         "approver_user_id": record.approver_user_id,
         "reactor_metadata": record.reactor_metadata or {},
         "bar_ts": record.bar_ts,  # ADR-0068: explicit bar-boundary anchor
+        "play_tag": record.play_tag,  # B13: source of the fire
     }

@@ -688,6 +688,7 @@ def _react(
         proposal,
         fill_size_pct=fill_size_pct,
         approver_user_id="autonomous",
+        play_tag="autonomous",  # B13: stamp the autonomous-tick source on the fill
     )
 
     # Append a journal entry tagged with hitl_kind=approve (autonomous

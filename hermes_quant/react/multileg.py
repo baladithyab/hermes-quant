@@ -107,12 +107,17 @@ class MultiLegPaperReactor:
         *,
         fill_size_pct: float,
         approver_user_id: str | None = None,
+        play_tag: str = "advisor",
     ) -> ExecutionRecord:
         """Fill an already-gated + already-HITL-approved MultiLegProposal on paper.
 
         Returns the PARENT ExecutionRecord; child (per-leg) records are written to the
         bus as side-effects. Default-OFF: raises MultiLegReactorDisabled (first check)
         and writes nothing unless HERMES_QUANT_MULTILEG_REACTOR=1.
+
+        B13: ``play_tag`` (advisor/playbook/autonomous) is stamped onto the parent and
+        every child record so the retro/settlement loop can attribute the family by
+        source. Default "advisor" keeps existing callers bit-for-bit.
         """
         if not self._enabled():
             raise MultiLegReactorDisabled(
@@ -120,7 +125,10 @@ class MultiLegPaperReactor:
                 "HERMES_QUANT_MULTILEG_REACTOR=1 to enable (gated by ADR-0029 D7)"
             )
         return self._execute_enabled(
-            proposal, fill_size_pct=fill_size_pct, approver_user_id=approver_user_id
+            proposal,
+            fill_size_pct=fill_size_pct,
+            approver_user_id=approver_user_id,
+            play_tag=play_tag,
         )
 
     # ------------------------------------------------------------------
@@ -132,6 +140,7 @@ class MultiLegPaperReactor:
         *,
         fill_size_pct: float,
         approver_user_id: str | None,
+        play_tag: str = "advisor",
     ) -> ExecutionRecord:
         # ── Step 1: precondition re-assert (gate is FINAL authority). ───────────
         # The reactor NEVER re-runs options_gate — it TRUSTS the proposal's copied
@@ -189,6 +198,7 @@ class MultiLegPaperReactor:
                 timeframe="",
                 bar_ts=None,
                 approver_user_id=approver_user_id,
+                play_tag=play_tag,
                 extra_metadata={
                     "multi_leg_id": multi_leg_id,
                     "strategy_kind": proposal.strategy_kind,
@@ -217,6 +227,7 @@ class MultiLegPaperReactor:
                 fill_size_pct=fill_size_pct,
                 approver_user_id=approver_user_id,
                 status=str(exc),
+                play_tag=play_tag,
             )
 
         # ── Step 6: slippage (ADR-0070), asymmetric (research §2.2 / §3.6). ─────
@@ -240,6 +251,7 @@ class MultiLegPaperReactor:
             asof_execution=now,
             fill_size_pct=fill_size_pct,
             approver_user_id=approver_user_id,
+            play_tag=play_tag,
         )
 
         # ── Step 8: write atomically — parent first, then children, ONE lock. ───
@@ -439,6 +451,7 @@ class MultiLegPaperReactor:
         asof_execution: str,
         fill_size_pct: float,
         approver_user_id: str | None,
+        play_tag: str = "advisor",
     ) -> tuple[ExecutionRecord, list[ExecutionRecord]]:
         ng = proposal.net_greeks
         net_greeks_dict = {
@@ -478,6 +491,7 @@ class MultiLegPaperReactor:
                 "role": "parent",
             },
             bar_ts=None,
+            play_tag=play_tag,
         )
 
         children: list[ExecutionRecord] = []
@@ -513,6 +527,7 @@ class MultiLegPaperReactor:
                             "option_pricing": "iex_possibly_delayed",
                         },
                         bar_ts=None,
+                        play_tag=play_tag,
                     )
                 )
                 leg_index += 1
@@ -541,6 +556,7 @@ class MultiLegPaperReactor:
                             "paper": True,
                         },
                         bar_ts=None,
+                        play_tag=play_tag,
                     )
                 )
         return parent, children
@@ -577,6 +593,7 @@ class MultiLegPaperReactor:
         fill_size_pct: float,
         approver_user_id: str | None,
         status: str,
+        play_tag: str = "advisor",
     ) -> ExecutionRecord:
         """No-fill parent audit record on a broker reject/expire. NOT appended to the
         bus (mirror PaperReactor._admissibility_reject) — never fabricate a fill, and
@@ -606,6 +623,7 @@ class MultiLegPaperReactor:
                 "role": "parent",
             },
             bar_ts=None,
+            play_tag=play_tag,
         )
 
     # ------------------------------------------------------------------
@@ -756,6 +774,7 @@ def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
         "approver_user_id": record.approver_user_id,
         "reactor_metadata": record.reactor_metadata or {},
         "bar_ts": record.bar_ts,
+        "play_tag": record.play_tag,  # B13: source of the fire
     }
 
 
@@ -778,4 +797,5 @@ def _dict_to_record(rec: dict[str, Any]) -> ExecutionRecord:
         approver_user_id=rec.get("approver_user_id"),
         reactor_metadata=rec.get("reactor_metadata") or {},
         bar_ts=rec.get("bar_ts"),
+        play_tag=rec.get("play_tag", "advisor"),  # B13: default "advisor" for pre-B13 records
     )

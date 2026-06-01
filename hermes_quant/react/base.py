@@ -39,6 +39,13 @@ class ExecutionRecord:
     # distinguish "when did the model run" (asof_decision) from "what bar did
     # the model see" (bar_ts).
     bar_ts: str | None = None
+    # B13: source/play_tag of the fire so the retro/settlement loop can tell
+    # advisor (HITL approve) vs playbook vs autonomous-tick fills apart. Before
+    # this field every fill read as "advisor" by default; the three writers now
+    # stamp their own source. Backward-compatible: records persisted before B13
+    # lack the key and read back as the safe default "advisor", so existing
+    # readers that ignore it are bit-for-bit unaffected.
+    play_tag: str = "advisor"
 
 
 @runtime_checkable
@@ -65,4 +72,5 @@ class Reactor(Protocol):
         *,
         fill_size_pct: float,
         approver_user_id: str | None = None,
+        play_tag: str = "advisor",  # B13: source of the fire (advisor/playbook/autonomous)
     ) -> ExecutionRecord: ...

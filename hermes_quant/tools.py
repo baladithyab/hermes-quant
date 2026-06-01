@@ -428,6 +428,15 @@ def quant_approve(args: dict, **_kwargs) -> str:
                 }
             )
 
+    # B13: source/play_tag of this fire so the retro/settlement loop can tell
+    # advisor (the default HITL approve) from a playbook-driven approve apart.
+    # Additive + default-OFF: omitted => "advisor" (bit-for-bit prior behavior);
+    # an unrecognized tag falls back to "advisor" so a bad caller can't poison
+    # the audit field. Allowed: advisor | playbook | autonomous.
+    play_tag = str(args.get("play_tag") or "advisor")
+    if play_tag not in ("advisor", "playbook", "autonomous"):
+        play_tag = "advisor"
+
     try:
         from hermes_quant.proposals import (
             ProposalExpiredError,
@@ -499,6 +508,7 @@ def quant_approve(args: dict, **_kwargs) -> str:
             proposal,
             fill_size_pct=fill_size_pct,
             approver_user_id=_kwargs.get("user_id"),
+            play_tag=play_tag,  # B13: advisor (default) | playbook
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("quant_approve: PaperReactor failed: %s", exc, exc_info=True)
