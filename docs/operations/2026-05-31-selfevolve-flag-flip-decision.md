@@ -167,3 +167,34 @@ Both are reviewed-wave work (a PDR-3 windowing change is a money-path validation
 NOT a flag flip. Tracked in #35. CONVERGENCE stays OFF until one of them lands and the kept-vs-dropped
 re-measure shows CELH/CROX/TPR in the KEPT set. This is the precise, measured blocker — found by
 digging to the data, not by assuming.
+
+---
+
+## Addendum 4 — freshness FIXED; CONVERGENCE now coverage-bound, not freshness-bound (2026-05-31)
+
+Shipped the recency fix (13ca85a): cron now pulls new.rss (live: 244 social items, all ≤7d,
+vs the old search.rss median 62d) + a max_age_days=7 backstop. Re-measured CONVERGENCE
+flippability on the fresh store. Still zero in-window multi-source overlap — but the binding
+constraint has MOVED, and measuring showed exactly where:
+
+Of 244 FRESH social items: 26 classify as a catalyst, 20 hit a graph entity, but only **2 do
+BOTH** → 8 reddit packets synthesized (all space names RKLB/ASTS/LUNR/RDW). The convergence
+funnel is three sequential filters, each multiplying down:
+  1. endpoint freshness — FIXED (new.rss + 7d gate).
+  2. catalyst-classify + graph-entity — THE NEW BOTTLENECK: the catalyst lexicon is tuned for
+     NEWS headlines ("beats earnings", "recall", "bankruptcy"), not retail-chat phrasing
+     ("YOLO", "to the moon", "$CROX upside", "bag holder"), so fresh on-topic Reddit chatter
+     mostly produces no packet (2/244 yield).
+  3. same-symbol news∩reddit overlap in-window — needs (2) to yield enough reddit packets that
+     some land on a symbol news also covers.
+
+So CONVERGENCE is now FRESHNESS-unblocked but COVERAGE-bound. Flipping it today would still
+over-drop (news-heavy symbols have no same-symbol reddit packet). The next real lever is lifting
+the social→packet yield — a catalyst lexicon (classify.py) tuned for social phrasing + possibly a
+social-specific entity/cashtag extractor ($TICKER). That is a substantive classifier wave (its own
+eval: does social-tuned classification keep precision while lifting recall?), NOT a flag flip.
+
+Tracked in #35. Every freshness/plumbing layer toward CONVERGENCE is now done and committed
+(producers live, fresh, source-tagged, recency-gated); the remaining work is classifier coverage,
+which is honestly its own reviewed wave. CONVERGENCE stays OFF until social→packet yield is high
+enough that the kept-vs-dropped re-measure shows real same-symbol cross-source overlap.
