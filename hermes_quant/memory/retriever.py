@@ -229,6 +229,8 @@ def _load_decisions(decisions_path: Path) -> dict[str, dict[str, Any]]:
                 row = json.loads(raw)
             except Exception:
                 continue
+            if not isinstance(row, dict):
+                continue
             if row.get("kind") == "decision":
                 pending[row["decision_id"]] = row
             elif row.get("kind") == "resolution":

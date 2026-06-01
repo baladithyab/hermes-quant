@@ -245,6 +245,8 @@ def load_weekly_beliefs(asof: datetime, *, window_days: int, path: Path | None =
             except json.JSONDecodeError:
                 logger.warning("beliefs.jsonl: skipping malformed row")
                 continue
+            if not isinstance(row, dict):
+                continue
             bid = row.get("belief_id")
             if not bid:
                 continue
@@ -288,6 +290,8 @@ def _default_realized_alpha_lookup() -> Callable[[str], float | None]:
                 try:
                     row = json.loads(raw)
                 except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
                     continue
                 did = str(row.get("decision_id", ""))
                 if not did:

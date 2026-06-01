@@ -181,7 +181,13 @@ class DecisionLog:
                 raw = raw.strip()
                 if not raw:
                     continue
-                yield json.loads(raw)
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                yield obj
 
     def read_pending(self) -> Iterator[dict[str, Any]]:
         """Yield decision rows whose decision_id has no matching resolution."""

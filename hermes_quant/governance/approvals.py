@@ -101,7 +101,13 @@ def _iter_rows() -> Iterator[dict[str, Any]]:
             raw = raw.strip()
             if not raw:
                 continue
-            yield json.loads(raw)
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            yield obj
 
 
 def _consumed_ids() -> set[str]:

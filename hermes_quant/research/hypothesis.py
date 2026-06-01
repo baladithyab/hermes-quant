@@ -434,9 +434,13 @@ class HypothesisRegistry:
                 if not raw:
                     continue
                 try:
-                    yield json.loads(raw)
+                    obj = json.loads(raw)
                 except json.JSONDecodeError:
                     logger.warning("hypothesis-registry: skipping malformed row")
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                yield obj
 
     def _read_by_status(self, status: str) -> Iterator[Hypothesis]:
         seen_ids: set[str] = set()

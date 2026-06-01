@@ -297,6 +297,8 @@ class FactorOracle:
                     continue
                 try:
                     data = json.loads(line)
+                    if not isinstance(data, dict):
+                        continue
                     if data.get("factor_id") == factor_id:
                         latest = FactorVerdict.model_validate(data)
                 except Exception as exc:  # noqa: BLE001

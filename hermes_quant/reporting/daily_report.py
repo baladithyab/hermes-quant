@@ -133,10 +133,13 @@ def _read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
                 if not raw:
                     continue
                 try:
-                    yield json.loads(raw)
+                    obj = json.loads(raw)
                 except json.JSONDecodeError:
                     logger.warning("daily_report: skipping malformed line in %s", path)
                     continue
+                if not isinstance(obj, dict):
+                    continue
+                yield obj
     except OSError as exc:
         logger.warning("daily_report: could not read %s: %s", path, exc)
 

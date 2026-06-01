@@ -170,7 +170,12 @@ def read(
             raw = raw.strip()
             if not raw:
                 continue
-            row = json.loads(raw)
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
             row_version = row.get("schema_version")
             if row_version != CURRENT_SCHEMA_VERSION:
                 raise AuditLogSchemaMismatch(

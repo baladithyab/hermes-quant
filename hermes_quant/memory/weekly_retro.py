@@ -187,6 +187,8 @@ def load_reflections(asof: datetime, *, path: Path | None = None,
             except json.JSONDecodeError:
                 logger.warning("reflections.jsonl: skipping malformed row")
                 continue
+            if not isinstance(row, dict):
+                continue
             tau = _parse_dt(row.get("tau_observable"))
             if tau is None or tau >= asof:
                 # not yet knowable at the distillation tick — EXCLUDE (Oracle guard)
@@ -210,9 +212,12 @@ def load_belief_rows(*, path: Path | None = None) -> list[dict]:
             if not raw:
                 continue
             try:
-                rows.append(json.loads(raw))
+                obj = json.loads(raw)
             except json.JSONDecodeError:
                 logger.warning("beliefs.jsonl: skipping malformed row")
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
     return rows
 
 

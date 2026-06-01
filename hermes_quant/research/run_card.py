@@ -254,9 +254,13 @@ class RunCardLog:
                 if not raw:
                     continue
                 try:
-                    yield json.loads(raw)
+                    obj = json.loads(raw)
                 except json.JSONDecodeError:
                     logger.warning("run-card-log: skipping malformed row")
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                yield obj
 
 
 # ---------------------------------------------------------------------------

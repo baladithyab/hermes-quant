@@ -235,6 +235,8 @@ class AlphaZoo:
                     continue
                 try:
                     record = json.loads(line)
+                    if not isinstance(record, dict):
+                        continue
                     # Strip schema_version envelope if present
                     if "schema_version" in record and "factor" in record:
                         record = record["factor"]
