@@ -664,17 +664,33 @@ def evolve_watchlist(
             "top5": top5,
         }
 
-    # Persist new state + journal. Journal first so a crash between the
-    # two leaves an audit trail without a stale state file (worst case:
-    # journal entries that don't match an updated state, which we'd
-    # detect on next run anyway because state is recomputed every tick).
-    _append_journal(journal_path, all_events)
-
+    # Persist new state + journal. B14(a): STATE FIRST, journal second.
+    #
+    # The original ordering wrote the journal first "so a crash leaves an
+    # audit trail". But state is the operational source of truth and the
+    # journal is its append-only audit derivative (per the module contract +
+    # ADR-0010 "markdown is a render derivative"). With journal-first, a crash
+    # between the two writes leaves journal events for transitions that never
+    # landed in play-fit.json; the *next* run then reads the stale pre-crash
+    # state, recomputes the SAME onboard/evict transitions, and re-appends them
+    # -- producing DUPLICATE journal entries (fresh event_id each) for one
+    # logical transition, corrupting the audit trail and any event-counting
+    # consumer.
+    #
+    # State-first closes that window: _atomic_write_json is crash-safe
+    # (tempfile + fsync + os.replace), so after it returns the new state is
+    # durable. If we then crash before appending the journal, the next run
+    # reads the NOW-CURRENT state, sees the transition already happened, and
+    # does NOT re-emit the event. Worst case is a single lost audit line on a
+    # crash in the narrow gap -- strictly safer than a duplicate, because the
+    # operational state stays consistent and self-correcting.
     payload = {
         "as_of": asof.isoformat(),
         "plays": {p: [r.to_dict() for r in rows] for p, rows in new_state.items()},
     }
     _atomic_write_json(watchlist_path, payload)
+
+    _append_journal(journal_path, all_events)
 
     return {
         "as_of": asof.isoformat(),

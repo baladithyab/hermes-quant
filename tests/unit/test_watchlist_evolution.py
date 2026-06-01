@@ -385,6 +385,95 @@ def test_atomic_write_no_partial_state_on_crash(tmp_path: Path):
     assert leftovers == []
 
 
+def test_state_written_before_journal_no_duplicate_events_on_crash(universe_file, state_paths):
+    """B14(a): crash between state-write and journal-append must NOT cause a
+    duplicate journal event on the next run.
+
+    Ordering is now STATE FIRST, journal second. We simulate a crash *after*
+    the atomic state write but *before* the journal append by making
+    ``_append_journal`` raise on the run that onboards. Because state is the
+    operational source of truth and was persisted, the next run reads the
+    advanced state, does not re-fire the onboard transition, and therefore
+    does not re-journal it. The audit trail loses at most the one line that
+    was in flight when the crash happened — never gains a duplicate.
+    """
+    watchlist_path, journal_path = state_paths
+
+    # Runs 1-2: build the sticky streak (no onboard yet at sticky=3).
+    _run(universe_file, state_paths, score=0.7, asof=pd.Timestamp("2026-01-01", tz="UTC"))
+    _run(universe_file, state_paths, score=0.7, asof=pd.Timestamp("2026-01-02", tz="UTC"))
+
+    journal_before_crash = _read_journal(journal_path)
+
+    # Run 3: this is the onboard run. State write succeeds, journal append
+    # crashes — exactly the gap the fix protects.
+    with mock.patch(
+        "hermes_quant.playbook.watchlist_evolution._append_journal",
+        side_effect=OSError("simulated crash after state write"),
+    ):
+        with pytest.raises(OSError, match="simulated crash"):
+            _run(
+                universe_file,
+                state_paths,
+                score=0.7,
+                asof=pd.Timestamp("2026-01-03", tz="UTC"),
+            )
+
+    # State write happened BEFORE the journal crash → symbols are now active.
+    state = _read_state(watchlist_path)
+    active = [r for r in state["plays"]["covered_call"] if r["state"] == STATE_ACTIVE]
+    assert len(active) == 3, "state must be persisted before the journal append"
+
+    # The journal got no new onboard lines from the crashed run.
+    journal_after_crash = _read_journal(journal_path)
+    assert journal_after_crash == journal_before_crash
+
+    # Run 4: a normal run after recovery. The state already shows the symbols
+    # active, so the onboard transition does NOT re-fire → NO duplicate
+    # onboard events are appended.
+    _run(universe_file, state_paths, score=0.7, asof=pd.Timestamp("2026-01-04", tz="UTC"))
+
+    journal_final = _read_journal(journal_path)
+    onboard_events = [e for e in journal_final if e["action"] == "onboard"]
+    # Zero onboard events total: the only run that would have emitted them
+    # crashed before journalling, and the recovery run sees state already
+    # advanced so it never re-emits. The key invariant: NOT more than 3.
+    assert len(onboard_events) <= 3, (
+        "state-first ordering must not produce duplicate onboard events "
+        f"across the crash boundary; got {len(onboard_events)}"
+    )
+    # And the active symbols never duplicated either (each appears once).
+    symbols = [r["symbol"] for r in state["plays"]["covered_call"]]
+    assert len(symbols) == len(set(symbols))
+
+
+def test_journal_append_happens_after_state_write_on_happy_path(universe_file, state_paths):
+    """B14(a): on the non-crash path, verify the call order is state then
+    journal (regression-pins the ordering so a future refactor can't silently
+    revert to journal-first)."""
+    import hermes_quant.playbook.watchlist_evolution as we
+
+    call_order: list[str] = []
+    real_write = we._atomic_write_json
+    real_journal = we._append_journal
+
+    def _tracked_write(path, payload):
+        call_order.append("state")
+        return real_write(path, payload)
+
+    def _tracked_journal(path, events):
+        call_order.append("journal")
+        return real_journal(path, events)
+
+    with mock.patch.object(we, "_atomic_write_json", side_effect=_tracked_write), \
+         mock.patch.object(we, "_append_journal", side_effect=_tracked_journal):
+        _run(universe_file, state_paths, score=0.7, asof=pd.Timestamp("2026-01-01", tz="UTC"))
+
+    assert call_order == ["state", "journal"], (
+        f"state must be written before the journal; got order {call_order}"
+    )
+
+
 def test_evolve_watchlist_silent_when_universe_missing(tmp_path: Path):
     """Missing universe → empty summary, no crash, no state written."""
     summary = evolve_watchlist(

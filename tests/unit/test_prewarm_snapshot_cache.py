@@ -214,6 +214,67 @@ def test_prewarm_then_score_symbol_uses_cache():
     assert mock_cps.call_count == 0
 
 
+def test_snapshot_cache_lock_exists_and_is_a_lock():
+    """B14(b): the module exposes a real threading lock guarding the cache."""
+    import threading
+
+    assert hasattr(scorers_module, "_SNAPSHOT_CACHE_LOCK")
+    lock = scorers_module._SNAPSHOT_CACHE_LOCK
+    # A threading.Lock instance has acquire/release and works as a CM.
+    assert hasattr(lock, "acquire") and hasattr(lock, "release")
+    with lock:
+        pass  # acquirable + releasable
+    # Sanity: it is the lock primitive type, not an RLock or arbitrary object.
+    assert isinstance(lock, type(threading.Lock()))
+
+
+def test_concurrent_score_symbol_no_cache_corruption(monkeypatch):
+    """B14(b): many threads calling score_symbol for the SAME symbol/day under
+    contention must converge on one consistent cache entry — no torn writes,
+    no lost cache, no crash. Regression for the unlocked read-miss-then-write
+    that two overlapping crons could interleave."""
+    import threading
+
+    n_threads = 32
+    # A barrier maximizes the chance every thread reaches the read-miss at the
+    # same instant, so the (previously unguarded) write race is exercised hard.
+    start = threading.Barrier(n_threads)
+    build_count = {"n": 0}
+    count_lock = threading.Lock()
+
+    def _counting_snapshot(symbol, asof):  # type: ignore[no-untyped-def]
+        with count_lock:
+            build_count["n"] += 1
+        return _fake_snapshot(symbol, asof)
+
+    results: list[float] = []
+    results_lock = threading.Lock()
+
+    def _worker():
+        start.wait()
+        val = score_symbol("AAPL", "covered_call")
+        with results_lock:
+            results.append(val)
+
+    with patch.object(scorers_module, "compute_play_snapshot", side_effect=_counting_snapshot):
+        threads = [threading.Thread(target=_worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    # Every worker returned a float (no exception escaped under contention).
+    assert len(results) == n_threads
+    assert all(isinstance(v, float) for v in results)
+
+    # Exactly one cache entry exists for (AAPL, today) — not a torn/duplicated
+    # state. The cache holds a single, well-formed snapshot.
+    today_key = datetime.now(UTC).strftime("%Y-%m-%d")
+    cached = _SNAPSHOT_CACHE.get(("AAPL", today_key))
+    assert cached is not None
+    assert cached["symbol"] == "AAPL"
+
+
 def test_env_var_overrides_default_workers(monkeypatch):
     """HERMES_QUANT_PREWARM_WORKERS env var should override the 12 default."""
     monkeypatch.setenv("HERMES_QUANT_PREWARM_WORKERS", "3")

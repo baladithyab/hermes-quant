@@ -258,6 +258,80 @@ def test_swing_eviction_fires_on_runaway_vol() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# B14(c): wheel composite eviction divergence
+# --------------------------------------------------------------------------- #
+#
+# The wheel profile's eviction_rules are the UNION of covered_call's and csp's
+# eviction rules, prefixed cc_/csp_ (see profiles.py). The SAME logical key
+# (e.g. market_cap_too_small) exists in BOTH legs with DIFFERENT thresholds:
+#   * cc_market_cap_too_small  : market_cap_usd < 1.5e9   (stricter)
+#   * csp_market_cap_too_small : market_cap_usd < 5e8     (looser)
+# Because eviction fires if ANY rule is True, the wheel must evict at the
+# STRICTER (CC) threshold — there is a band [5e8, 1.5e9) where CC would evict
+# but CSP would not, and the wheel must still evict there. These tests pin that
+# "more-restrictive-leg-wins" behavior so a future refactor (e.g. collapsing
+# the cc_/csp_ prefixes into one key and silently dropping the stricter
+# threshold) cannot relax the wheel's eviction floor unnoticed.
+
+
+def test_wheel_eviction_uses_stricter_cc_market_cap_threshold() -> None:
+    """A market cap in [5e8, 1.5e9): CSP's own eviction does NOT fire, but
+    CC's does — the wheel must still be evicted (stricter leg wins)."""
+    s = _good_covered_call_snapshot()
+    s["market_cap_usd"] = 1e9  # below cc 1.5e9, above csp 5e8
+
+    fit_cc = score_covered_call(s)
+    fit_csp = score_csp(s)
+    fit_wheel = score_wheel(s)
+
+    # CC's eviction fires at 1e9 < 1.5e9.
+    assert any(r == "evict:market_cap_too_small" for r in fit_cc.failed_rules)
+    # CSP's *eviction* does NOT fire at 1e9 (its floor is 5e8) — confirm the
+    # divergence band actually exists for this snapshot.
+    assert not any(r == "evict:market_cap_too_small" for r in fit_csp.failed_rules)
+
+    # The wheel's merged eviction carries the prefixed cc_ rule, so it fires;
+    # and because CC is ineligible the AND-of-legs also forces wheel ineligible.
+    assert fit_wheel.eligible is False
+    assert any("evict:cc_market_cap_too_small" == r for r in fit_wheel.failed_rules)
+
+
+def test_wheel_eviction_fires_when_only_csp_leg_evicts() -> None:
+    """Symmetric case: a field that only CSP's eviction catches must still
+    evict the wheel via the csp_-prefixed merged rule."""
+    s = _good_covered_call_snapshot()
+    # adv between csp/cc evict floors is identical (both 2e6); instead use a
+    # market cap that trips CSP eviction (<5e8) — which also trips CC's, so to
+    # isolate the csp_ rule we assert the csp_-prefixed name is present.
+    s["market_cap_usd"] = 4e8  # below BOTH evict floors
+
+    fit_wheel = score_wheel(s)
+    assert fit_wheel.eligible is False
+    # Both prefixed rules should be recorded (union semantics), proving the
+    # merged profile retained BOTH legs' eviction rules rather than collapsing.
+    assert any(r == "evict:cc_market_cap_too_small" for r in fit_wheel.failed_rules)
+    assert any(r == "evict:csp_market_cap_too_small" for r in fit_wheel.failed_rules)
+
+
+def test_wheel_merged_eviction_rule_keys_are_union_of_both_legs() -> None:
+    """Pin the prefixed-union composition: every CC eviction key appears as
+    cc_<key> and every CSP eviction key as csp_<key> in the wheel profile.
+    A naive dict.update() that dropped the prefix would collapse same-named
+    keys and silently lose the stricter threshold."""
+    cc_rules = PROFILES["covered_call"].eviction_rules
+    csp_rules = PROFILES["csp"].eviction_rules
+    wheel_rules = PROFILES["wheel"].eviction_rules
+
+    for key, rule in cc_rules.items():
+        assert wheel_rules.get(f"cc_{key}") == rule, f"missing/changed cc_{key}"
+    for key, rule in csp_rules.items():
+        assert wheel_rules.get(f"csp_{key}") == rule, f"missing/changed csp_{key}"
+
+    # No collapse: the count is exactly the sum of both legs' rule counts.
+    assert len(wheel_rules) == len(cc_rules) + len(csp_rules)
+
+
+# --------------------------------------------------------------------------- #
 # None-handling: silence-by-default
 # --------------------------------------------------------------------------- #
 

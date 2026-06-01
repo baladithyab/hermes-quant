@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -629,6 +630,20 @@ def compute_play_snapshot(symbol: str, asof: date | datetime | None = None) -> d
 # across all 5 plays in one evolution tick. Keyed by (symbol, asof_date_str).
 _SNAPSHOT_CACHE: dict[tuple[str, str], dict] = {}
 
+# B14(b): guard _SNAPSHOT_CACHE against concurrent-cron corruption. The cache
+# is a process-global dict shared by every caller in the process. When two
+# crons (e.g. the prewarm cron and the watchlist-evolution cron, or two
+# overlapping evolution ticks) run in the same interpreter they mutate this
+# dict from different threads. CPython makes a single dict get/set atomic, but
+# score_symbol's read-miss-then-write and prewarm's membership-check-then-write
+# are NOT atomic as a unit — interleaving them can double-fetch or, worse,
+# expose a half-built snapshot built off a stale asof. The lock makes each
+# get-or-build and each membership-check-or-write a single critical section.
+# It is a plain in-process Lock (not an RLock) because no path re-enters while
+# holding it, and the compute happens OUTSIDE the lock so we never serialize
+# the slow yfinance fetch — only the dict touches.
+_SNAPSHOT_CACHE_LOCK = threading.Lock()
+
 
 # Default worker count for the parallel prewarm. yfinance is HTTP-bound (the
 # GIL releases on socket I/O), so threads scale well, but we keep this modest
@@ -699,6 +714,9 @@ def prewarm_snapshot_cache(
             max_workers = _DEFAULT_PREWARM_WORKERS
 
     # Dedupe + drop already-cached symbols so prewarm is idempotent.
+    # B14(b): the membership check reads the shared cache, so take the lock
+    # for the read snapshot. We hold it only for the dict gets (fast), not the
+    # surrounding loop bookkeeping.
     todo: list[str] = []
     seen: set[str] = set()
     skipped = 0
@@ -709,7 +727,9 @@ def prewarm_snapshot_cache(
         if upper in seen:
             continue
         seen.add(upper)
-        if (upper, asof_key) in _SNAPSHOT_CACHE:
+        with _SNAPSHOT_CACHE_LOCK:
+            already_cached = (upper, asof_key) in _SNAPSHOT_CACHE
+        if already_cached:
             skipped += 1
             continue
         todo.append(upper)
@@ -746,7 +766,9 @@ def prewarm_snapshot_cache(
                 errors += 1
                 logger.debug("prewarm: %s failed inside worker: %s", sym, exc)
                 continue
-            _SNAPSHOT_CACHE[(sym, asof_key)] = snap
+            # B14(b): single atomic write under the shared-cache lock.
+            with _SNAPSHOT_CACHE_LOCK:
+                _SNAPSHOT_CACHE[(sym, asof_key)] = snap
             prewarmed += 1
 
     elapsed = time.perf_counter() - t0
@@ -787,13 +809,18 @@ def score_symbol(symbol: str, play: str) -> float:
     """
     asof_dt = datetime.now(UTC)
     cache_key = (symbol.upper(), asof_dt.strftime("%Y-%m-%d"))
-    snap = _SNAPSHOT_CACHE.get(cache_key)
+    # B14(b): read the shared cache under the lock. The slow compute happens
+    # OUTSIDE the lock so concurrent crons never serialize on yfinance; only
+    # the dict get/set are inside the critical section.
+    with _SNAPSHOT_CACHE_LOCK:
+        snap = _SNAPSHOT_CACHE.get(cache_key)
     if snap is None:
         try:
             snap = compute_play_snapshot(symbol, asof_dt)
         except Exception:
             return 0.0
-        _SNAPSHOT_CACHE[cache_key] = snap
+        with _SNAPSHOT_CACHE_LOCK:
+            _SNAPSHOT_CACHE[cache_key] = snap
 
     try:
         all_fits = score_all(snap)
