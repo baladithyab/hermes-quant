@@ -30,9 +30,15 @@ flag added to `~/.hermes/.env` takes effect on the **next cron invocation** — 
 long-running daemon is needed, because the trading crons are short-lived `no_agent` scripts
 re-launched per schedule by the DB scheduler.
 
-Currently SET in deployed `~/.hermes/.env`: **only `HERMES_QUANT_SEMANTIC_ENABLED=1`.** Every
-flag below is default-OFF in code (grep-verified, synthesis §"Verification evidence"). Landing
-the 2026-05-30 wave altered **zero** live behavior.
+**Live-flag state is NOT hard-listed here** (it drifts). The authoritative source-of-truth for
+every flag's CODE default is the generated [`FLAG-INVENTORY.md`](FLAG-INVENTORY.md)
+(`python ops/scripts/quant-flag-inventory.py --write`); the currently-FLIPPED set in deployed
+`~/.hermes/.env` is recorded in [`2026-05-31-selfevolve-flag-flip-decision.md`](2026-05-31-selfevolve-flag-flip-decision.md).
+As of 2026-06-01 the deployed `.env` has `SEMANTIC_ENABLED`, `REFLECTION`, `MEMORY_INJECT`,
+`SOCIAL_INGEST` on (W1 keystone live) plus ARIA's 2026-06-01 self-evolution flips
+(`WEEKLY_RETRO`/`FACTOR_WEIGHT_PROPOSER`/`GRAPH_MINING` enabled; `MONTHLY_META_RETRO`/
+`RESEARCH_LOOP` armed). Every flag is default-OFF in code (grep-verified; see FLAG-INVENTORY.md) —
+landing a wave alters **zero** live behavior until a flag is explicitly flipped per its eval gate.
 
 ### The universal probe — dry tick + audit-log diff
 
