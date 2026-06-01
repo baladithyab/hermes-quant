@@ -1035,3 +1035,208 @@ def test_kronos_view_at_t_independent_of_future_bars():
     assert v1.direction == v2.direction
     assert v1.confidence_raw == pytest.approx(v2.confidence_raw, rel=1e-9)
     assert v1.magnitude == pytest.approx(v2.magnitude, rel=1e-9)
+
+
+
+# ---------------------------------------------------------------------------
+# Invariant 7 — still-forming-bar discipline is TIMEFRAME-AWARE (ADR-0083
+# Phase 0a). The "still-forming" boundary is the bar's OWN period, not
+# unconditionally the day. An intraday read at decision-time T must not see a
+# partial current period -- that is a no-lookahead honesty hole if the cutoff
+# assumes a daily bar for a 1h/15m read.
+# ---------------------------------------------------------------------------
+
+
+def test_still_forming_drop_is_timeframe_aware_intraday():
+    """A 1h read mid-hour drops the current incomplete hour but keeps closed
+    hours. Drives the real `drop_still_forming_bar` (the same helper the
+    advisor + builder call)."""
+    from hermes_quant.data.bar_alignment import drop_still_forming_bar
+
+    # 14:00/15:00 are closed hours; 16:00 is the current still-forming hour.
+    bars = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2026-05-28 14:00", "2026-05-28 15:00", "2026-05-28 16:00"]
+            ).tz_localize("UTC"),
+            "open": [100.0, 101.0, 102.0],
+            "high": [101.5, 102.5, 103.0],
+            "low": [99.5, 100.5, 101.0],
+            "close": [101.0, 102.0, 102.5],
+            "volume": [1e6, 9e5, 5e5],
+        }
+    )
+
+    # Decision time T = 16:30 UTC: the 16:00 hour has NOT closed (closes 17:00).
+    decision_t = datetime(2026, 5, 28, 16, 30, tzinfo=UTC)
+    trimmed, info = drop_still_forming_bar(bars, "1h", "equity", now=decision_t)
+
+    # The partial current hour is invisible; only the two closed hours remain.
+    assert info["still_forming_dropped"] is True
+    assert list(trimmed["timestamp"].dt.hour) == [14, 15]
+    assert float(trimmed["close"].iloc[-1]) == 102.0  # last CLOSED hour
+    assert info["still_forming_close"] == 102.5  # surfaced for opt-in analysts
+
+    # No-lookahead fence: the kept set at T must equal "all bars whose period
+    # closed by T" (timestamp + 1h <= T) -- it cannot depend on the partial.
+    closed_by_t = bars[bars["timestamp"] + pd.Timedelta(hours=1) <= pd.Timestamp(decision_t)]
+    assert list(trimmed["timestamp"]) == list(closed_by_t["timestamp"])
+
+
+def test_still_forming_daily_path_byte_identical_under_change():
+    """The DAILY path (the common case) is byte-identical after the
+    timeframe-aware change: equity 1d mid-session still drops today's
+    still-forming bar; after the ET close it keeps it."""
+    from hermes_quant.data.bar_alignment import drop_still_forming_bar
+
+    bars = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-05-27", "2026-05-28"]).tz_localize("UTC"),
+            "open": [100.0, 102.0],
+            "high": [101.5, 103.0],
+            "low": [99.5, 101.0],
+            "close": [101.0, 102.5],
+            "volume": [1e6, 5e5],
+        }
+    )
+
+    # 14:00 ET (18:00 UTC, EDT): mid-session -> drop today's still-forming bar.
+    mid = datetime(2026, 5, 28, 18, 0, tzinfo=UTC)
+    trimmed_mid, info_mid = drop_still_forming_bar(bars, "1d", "equity", now=mid)
+    assert len(trimmed_mid) == 1
+    assert info_mid["still_forming_dropped"] is True
+    assert float(trimmed_mid["close"].iloc[-1]) == 101.0
+
+    # 17:00 ET (21:00 UTC, EDT): post-close -> keep the settled bar.
+    post = datetime(2026, 5, 28, 21, 0, tzinfo=UTC)
+    trimmed_post, info_post = drop_still_forming_bar(bars, "1d", "equity", now=post)
+    assert len(trimmed_post) == 2
+    assert info_post["still_forming_dropped"] is False
+    assert "bar_settled" in info_post["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Invariant 7d — PDR-4 SaturationScore PRODUCING path is lookahead-honest (RR11,
+# Wave S5/M21; ADR-0079 D-4). The saturation decay multiplier at asof=T must be
+# derived from ONLY anchors <= T: a future velocity peak, a future confirm_date,
+# and a future packet asof must ALL be ignored (no decay manufactured from the
+# future), and the producer must stamp the DECISION asof, never a future anchor.
+# This is the saturation analogue of the velocity fence (Invariant 7c): RR11's
+# test_pdr4_saturation.py covers the unit producer, this pins it as a RELEASE-
+# BLOCKER fence (the canonical no-lookahead gate) on BOTH the pure producer and
+# the frame-builder Step-6b seam.
+# ---------------------------------------------------------------------------
+
+
+def test_saturation_producer_ignores_future_anchors():
+    """compute_saturation(asof=T) must IGNORE every anchor in the future of T —
+    a future velocity peak, future confirm_date, and future packet asof all yield
+    NO decay (m == 1.0, basis 'no_basis'), and the stamped asof is exactly T (the
+    decision anchor), never a future anchor. A past anchor decays as expected, so
+    this is a discriminating fence (not vacuously green)."""
+    from hermes_quant.perception.saturation import compute_saturation
+
+    asof = pd.Timestamp("2026-03-01T00:00:00Z")
+    future = compute_saturation(
+        packet_asof="2026-04-01T00:00:00Z",
+        asof=asof,
+        trend_velocity={"peak_period": "2026-04-15T00:00:00Z"},  # the REAL producer key
+        confirm_date="2026-04-10T00:00:00Z",
+    )
+    assert future["decay_multiplier"] == 1.0, (
+        "a future anchor manufactured saturation decay — PDR-4 producer lookahead leak"
+    )
+    assert future["basis"] == "no_basis"
+    assert pd.Timestamp(future["asof"]) == asof, "stamped a future asof, not the decision asof"
+
+    # And concretely: the SAME packet/peak in the PAST does decay (discriminating).
+    past = compute_saturation(
+        packet_asof="2026-01-01T00:00:00Z",
+        asof=asof,
+        trend_velocity={"peak_period": "2026-02-01T00:00:00Z"},
+    )
+    assert 0.0 < past["decay_multiplier"] < 1.0
+    assert past["basis"] == "velocity_peak"
+
+
+def test_build_perception_frame_saturation_ignores_future_anchors(monkeypatch, tmp_path):
+    """build_perception_frame(..., decision_asof=T) with HERMES_QUANT_SATURATION=1
+    must score saturation from ONLY anchors <= the frame asof (== last closed bar,
+    which is <= T). A LOUD future confirm_date on the packet metadata must NOT drive
+    the multiplier to the floor — the frame-builder Step-6b producer is lookahead-
+    honest, not just the pure unit (RR11 frame-path release-blocker fence)."""
+    from hermes_quant.catalyst import synthesize
+    from hermes_quant.perception.builder import build_perception_frame
+
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "1")
+    monkeypatch.setenv("HERMES_QUANT_SATURATION", "1")
+    store = tmp_path / "packets.jsonl"
+    monkeypatch.setattr(synthesize, "_DEFAULT_STORE", store)
+
+    # Bars end at a fixed close; the frame asof is the last closed daily bar.
+    bars = _make_bars(120, trend=0.5, seed=42)
+    bar_last = pd.Timestamp(bars["timestamp"].iloc[-1])
+    decision = (bar_last + pd.Timedelta(hours=1)).to_pydatetime()  # live decision after the close
+
+    # A FRESH packet (published right at the last bar, so it is admitted) whose
+    # metadata carries a FUTURE confirm_date — the loudest possible saturation
+    # anchor. An honest producer must ignore it (confirm_date > asof) and fall
+    # back to packet_age, which at age ~0 gives ~no decay.
+    fresh_asof = bar_last.isoformat()
+    future_confirm = (bar_last + pd.Timedelta(days=400)).isoformat()
+    pkt = semantic_packet_from_dict_for_store(
+        asset="AAPL", asof=fresh_asof, confirm_date=future_confirm
+    )
+    store.parent.mkdir(parents=True, exist_ok=True)
+    with store.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(pkt, default=str) + "\n")
+
+    frame = build_perception_frame(
+        "AAPL",
+        timeframe="1d",
+        asset_class="equity",
+        provider=_InertProvider(bars),
+        asof_ts=bar_last,
+        lookback_bars=200,
+        decision_asof=decision,
+    )
+    assert frame is not None
+    assert frame.semantic_packets, "expected the fresh packet to be absorbed"
+    sat = frame.saturation
+    assert sat is not None, "flag ON + packets present should attach a saturation score"
+    # The future confirm_date must NOT have engaged -> not the hard-floor confirm basis.
+    assert sat["basis"] != "confirm_date_passed", (
+        "a FUTURE confirm_date drove saturation to the floor — PDR-4 FRAME producer "
+        "lookahead leak (Step 6b)"
+    )
+    # asof-honesty: the score is stamped at the bar asof (<= decision), never the future.
+    sat_asof = pd.Timestamp(sat["asof"])
+    sat_asof = sat_asof.tz_localize("UTC") if sat_asof.tzinfo is None else sat_asof.tz_convert("UTC")
+    assert sat_asof <= pd.Timestamp(decision), (
+        f"saturation stamped asof={sat_asof} > decision={decision} — FRAME producer "
+        f"lookahead leak"
+    )
+    # A fresh packet at age ~0 with no past anchor must not be silenced (m ~ 1.0).
+    assert sat["decay_multiplier"] == pytest.approx(1.0, abs=1e-3)
+
+
+def semantic_packet_from_dict_for_store(*, asset: str, asof: str, confirm_date: str) -> dict:
+    """Build a hash-attached SemanticPacket dict carrying a confirm_date in metadata
+    (the synthesize.py shape the saturation producer reads at builder.py Step 6b)."""
+    from hermes_quant.semantic import semantic_packet_from_dict
+
+    return semantic_packet_from_dict(
+        {
+            "schema_version": 1,
+            "asset": asset,
+            "asof": asof,
+            "horizon": "1d",
+            "stance": "bullish",
+            "confidence": 0.70,
+            "magnitude": 0.05,
+            "summary": f"saturation no-lookahead fence packet {asset} {asof}",
+            "sources": [{"type": "note", "ref": "saturation-lookahead-fence"}],
+            "model": "hermes:saturation-lookahead-test",
+            "metadata": {"confirm_date": confirm_date},
+        }
+    ).to_dict(include_hash=True)
