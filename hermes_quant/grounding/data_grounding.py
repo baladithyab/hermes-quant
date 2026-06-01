@@ -9,21 +9,46 @@ F3 (SOTA LLM-trading research): LLM-fabricated price levels and phantom chart
 patterns. Analysts must cite a Ground Truth ID for every numerical claim or the
 ClaimVerifier rejects the view.
 
-Context compression policy (v0.1)
-----------------------------------
-If the rendered block exceeds 4 KB, automatically trim to the highest-information
-rows:
-  - Latest 5 trading days (maximum recency signal)
-  - Monthly closes for the 8 prior calendar weeks (≈ 8 representative rows)
+Context compression policy (v0.2 — deterministic, NO LLM)
+---------------------------------------------------------
+This block is rendered into an analyst prompt and is bounded to ``_MAX_RENDER_BYTES``
+(4 KB). When the rendered block would exceed that ceiling it is compacted by two
+deterministic, no-LLM, no-lookahead layers (see B46 research note
+``docs/research/2026-05-31-r-B46.md``):
 
-TODO (v0.2 — HKUDS full 5-layer compression):
-  Layer 0 — microcompact row encoding (6-char float repr)
-  Layer 1 — per-window LLM summary (1-sentence per week)
-  Layer 2 — iterative context update (rolling summary + new bars delta)
-  Layer 3 — semantic deduplication (drop rows whose info < 5% marginal)
-  Layer 4 — adaptive truncation with information-theoretic score
-The v0.1 trim policy implemented here is the structural skeleton; production
-upgrade requires only replacing _trim_to_high_info_rows().
+  - Layer A — microcompact row encoding. A narrower OHLCV line (no 80-char ruler,
+    tighter column widths, ``k``/``M`` volume shorthand). Close prices keep their
+    exact ``:.4f`` token so the ClaimVerifier (``verifier.py``) can still substring-
+    trace every analyst claim — compaction NEVER changes a citeable number.
+
+  - Layer B — deterministic saliency keep (``_saliency_keep``). Non-recent bars are
+    ranked by a fixed-weight saliency proxy (|return| + intraday range + volume-z)
+    using ONLY in-window bars at or before each bar's own date (no-lookahead). The
+    latest 5 bars (recency invariant) and the window min-close / max-close bars
+    (so ``window_low``/``window_high`` range claims stay traceable) are force-kept.
+    Rows are packed greedily until the next row would breach the byte cap.
+
+Honesty note (load-bearing — do not "upgrade" to an LLM pipeline)
+-----------------------------------------------------------------
+An earlier TODO here listed a "HKUDS full 5-layer compression pipeline" (per-window
+LLM summary, iterative LLM context update, semantic dedup, info-theoretic
+truncation). That was a **misattribution**: those are Vibe-Trading's *conversation
+agent-loop* context layers (``agent/src/agent/loop.py``), three of which require an
+LLM call. Vibe-Trading's actual *Data Grounding Block*
+(``agent/src/swarm/grounding.py``) is fully deterministic and simpler than this
+module. There is no richer upstream OHLCV-compression pipeline to port, and porting
+the LLM layers would break B46's no-LLM / determinism / silence contract. The
+"information-theoretic truncation" here is therefore a deterministic *saliency
+proxy*, not Shannon self-information (which would need a model). Keep it that way.
+
+Fail-closed silence contract
+----------------------------
+  - Empty bars in → empty bars out (never fabricate placeholder rows).
+  - ``HARD_RULE_PREAMBLE`` is appended last, verbatim, ALWAYS — even under maximal
+    trimming. If compact + saliency-keep still cannot fit preamble + the latest 5
+    bars within the cap, fall back to latest-5-only + preamble; data rows are
+    dropped before the preamble is ever dropped or paraphrased.
+  - No LLM call exists in any path. The default and only path is deterministic.
 """
 
 from __future__ import annotations
@@ -50,6 +75,22 @@ HARD_RULE_PREAMBLE: str = (
 )
 
 _MAX_RENDER_BYTES = 4096  # 4 KB context-compression threshold
+
+# Trim policy selector (deterministic; default-OFF guard for the behavioral change).
+# "saliency" (default, v0.2)  — deterministic saliency-keep + forced recency/min/max.
+# "weekly"   (legacy, v0.1)   — last-5 + one bar per ISO week for the prior 8 weeks.
+# Kept reachable for one release so a downstream-analyst regression is attributable
+# to the row-keep change; remove "weekly" once v0.2 has soaked. No .env flag needed:
+# this is an internal renderer, not a strategy — it ships behind the green-tests gate.
+_TRIM_POLICY: str = "saliency"
+
+# Deterministic saliency weights (fixed; NO RNG, NO wall-clock, NO lookahead).
+# saliency(bar) = _W_RETURN*|ret| + _W_RANGE*(intraday range / close) + _W_VOLZ*volume_z
+_W_RETURN = 1.0
+_W_RANGE = 1.0
+_W_VOLZ = 0.5
+
+_RECENCY_KEEP = 5  # latest N bars always survive (recency invariant; tested)
 
 
 # ---------------------------------------------------------------------------
@@ -227,28 +268,98 @@ def render_for_prompt(block: GroundTruthBlock) -> str:
 
     Always includes the HARD_RULE_PREAMBLE verbatim at the end.
 
-    If the rendered size exceeds 4 KB, automatically trims to
-    highest-information rows before appending the preamble.
+    Deterministic, no-LLM, no-lookahead. If the rendered block would exceed
+    ``_MAX_RENDER_BYTES`` (4 KB) the bars are compacted in stages, fail-closed,
+    so the preamble is NEVER dropped (see module docstring):
+
+      1. Full render. If it fits, return it (default/unchanged path for the
+         common <4 KB case — byte-identical to v0.1 in non-compact mode).
+      2. Compact render (Layer A microcompact). If it fits, return it.
+      3. Compact render over saliency-kept bars (Layer B), packed greedily to
+         the byte cap with forced recency + min/max-close rows.
+      4. Fail-closed: compact render over the latest ``_RECENCY_KEEP`` bars only.
+         The preamble is always present.
     """
-    # Build full render first; trim if needed
+    if not block.ohlcv_60d:
+        # Silence contract: nothing to compact; full render (with preamble) only.
+        return _render_full(block)
+
+    # Stage 1 — full render (unchanged v0.1 layout); the common path.
     rendered = _render_full(block)
-    if len(rendered.encode("utf-8")) > _MAX_RENDER_BYTES:
-        trimmed_bars, trimmed_ids = _trim_to_high_info_rows(block.ohlcv_60d, block.citation_ids)
-        trimmed_block = GroundTruthBlock(
-            symbol=block.symbol,
-            asof=block.asof,
-            ohlcv_60d=trimmed_bars,
-            current_quote=block.current_quote,
-            citation_ids=trimmed_ids,
-            context_summary=block.context_summary,
+    if len(rendered.encode("utf-8")) <= _MAX_RENDER_BYTES:
+        return rendered
+
+    # Legacy v0.1 reproduction: under _TRIM_POLICY == "weekly", trim to the weekly
+    # row set and render NON-compact (byte-identical to v0.1's overflow path).
+    if _TRIM_POLICY == "weekly":
+        weekly_bars, weekly_ids = _trim_to_high_info_rows(
+            block.ohlcv_60d, block.citation_ids
         )
-        rendered = _render_full(trimmed_block)
+        rendered = _render_full(_with_bars(block, weekly_bars, weekly_ids))
+        if len(rendered.encode("utf-8")) <= _MAX_RENDER_BYTES:
+            return rendered
+        # If even the weekly set overflows, fall through to compact fail-closed.
 
-    return rendered
+    # Stage 2 — Layer A: microcompact the whole window.
+    rendered = _render_full(block, compact=True)
+    if len(rendered.encode("utf-8")) <= _MAX_RENDER_BYTES:
+        return rendered
+
+    # Stage 3 — Layer B: deterministic saliency keep, packed greedily under the cap.
+    kept_bars, kept_ids = _saliency_keep(
+        block.ohlcv_60d, block.citation_ids, max_bytes=_MAX_RENDER_BYTES, block=block
+    )
+    rendered = _render_full(_with_bars(block, kept_bars, kept_ids), compact=True)
+    if len(rendered.encode("utf-8")) <= _MAX_RENDER_BYTES:
+        return rendered
+
+    # Stage 4 — fail-closed: latest-N bars only. Preamble is sacred; drop data, not it.
+    tail_n = min(_RECENCY_KEEP, len(block.ohlcv_60d))
+    tail_bars = block.ohlcv_60d[-tail_n:]
+    tail_ids = block.citation_ids[-tail_n:]
+    return _render_full(_with_bars(block, tail_bars, tail_ids), compact=True)
 
 
-def _render_full(block: GroundTruthBlock) -> str:
-    """Produce the complete prompt section for a block (no trimming)."""
+def _with_bars(
+    block: GroundTruthBlock, bars: list[Bar], ids: list[str]
+) -> GroundTruthBlock:
+    """Return a copy of *block* with replaced bars/ids (other fields preserved)."""
+    return GroundTruthBlock(
+        symbol=block.symbol,
+        asof=block.asof,
+        ohlcv_60d=bars,
+        current_quote=block.current_quote,
+        citation_ids=ids,
+        context_summary=block.context_summary,
+    )
+
+
+def _fmt_volume_compact(volume: float) -> str:
+    """Compact, deterministic volume shorthand: 1_000_000 -> '1.00M', 12_345 -> '12.35k'.
+
+    Layout-only: volume is not a citeable close-price token, so abbreviating it does
+    not affect ClaimVerifier substring tracing of price/return/ratio claims.
+    """
+    av = abs(volume)
+    if av >= 1_000_000_000:
+        return f"{volume / 1_000_000_000:.2f}B"
+    if av >= 1_000_000:
+        return f"{volume / 1_000_000:.2f}M"
+    if av >= 1_000:
+        return f"{volume / 1_000:.2f}k"
+    return f"{volume:.0f}"
+
+
+def _render_full(block: GroundTruthBlock, *, compact: bool = False) -> str:
+    """Produce the complete prompt section for a block (no trimming).
+
+    Parameters
+    ----------
+    compact : if True, emit Layer-A microcompact OHLCV rows — no 80-char ruler,
+              tighter column widths, ``k``/``M``/``B`` volume shorthand. Close
+              prices KEEP their exact ``:.4f`` token (verifier-coupled) so every
+              cited number remains substring-traceable. Layout-only change.
+    """
     lines: list[str] = []
     lines.append(f"=== GROUND TRUTH: {block.symbol} as of {block.asof} ===")
     lines.append("")
@@ -274,19 +385,29 @@ def _render_full(block: GroundTruthBlock) -> str:
     lines.append(f"  Citation ID: gt_{block.symbol}_{block.asof.replace('-', '')}_quote")
     lines.append("")
 
-    # OHLCV table header
+    # OHLCV table
     if block.ohlcv_60d:
-        lines.append(f"{'Date':<12} {'Open':>8} {'High':>8} {'Low':>8} {'Close':>8} {'Volume':>12}  Citation ID")
-        lines.append("-" * 80)
-        for bar, cid in zip(block.ohlcv_60d, block.citation_ids):
+        if compact:
+            # Layer-A microcompact: tighter layout, no ruler, volume shorthand.
+            # Close keeps :.4f (verifier-coupled). Other OHLC kept at :.4f too so
+            # high/low range claims remain traceable; only whitespace/ruler shrink.
+            lines.append("Date        O/H/L/C  Vol  Citation ID")
+            for bar, cid in zip(block.ohlcv_60d, block.citation_ids, strict=True):
+                lines.append(_compact_row(bar, cid))
+        else:
             lines.append(
-                f"{bar.date_str:<12} "
-                f"{bar.open:>8.4f} "
-                f"{bar.high:>8.4f} "
-                f"{bar.low:>8.4f} "
-                f"{bar.close:>8.4f} "
-                f"{bar.volume:>12.0f}  [{cid}]"
+                f"{'Date':<12} {'Open':>8} {'High':>8} {'Low':>8} {'Close':>8} {'Volume':>12}  Citation ID"
             )
+            lines.append("-" * 80)
+            for bar, cid in zip(block.ohlcv_60d, block.citation_ids):
+                lines.append(
+                    f"{bar.date_str:<12} "
+                    f"{bar.open:>8.4f} "
+                    f"{bar.high:>8.4f} "
+                    f"{bar.low:>8.4f} "
+                    f"{bar.close:>8.4f} "
+                    f"{bar.volume:>12.0f}  [{cid}]"
+                )
         lines.append("")
 
     # HARD RULE preamble (regression-critical — must appear verbatim)
@@ -296,26 +417,147 @@ def _render_full(block: GroundTruthBlock) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 5-layer context compression — v0.1 trim policy
+# Deterministic context compaction (v0.2) — NO LLM, NO lookahead
+# ---------------------------------------------------------------------------
+
+
+def _saliency_keep(
+    bars: list[Bar],
+    citation_ids: list[str],
+    *,
+    max_bytes: int = _MAX_RENDER_BYTES,
+    block: GroundTruthBlock | None = None,
+) -> tuple[list[Bar], list[str]]:
+    """Keep the highest-saliency rows that fit under *max_bytes*, deterministically.
+
+    Layer B of the v0.2 compaction (honest replacement for the misattributed
+    "semantic dedup + information-theoretic truncation" LLM layers — there is no
+    model-free information-theoretic compression, so this is a deterministic
+    saliency *proxy*, NOT Shannon self-information).
+
+    Saliency (fixed weights, no RNG, no wall-clock)::
+
+        saliency(bar_i) = _W_RETURN * |close_i - close_{i-1}| / close_{i-1}
+                        + _W_RANGE  * (high_i - low_i) / close_i
+                        + _W_VOLZ   * z(volume_i)   over the window mean/std
+
+    No-lookahead: the return term uses ``close_{i-1}`` (a strictly-earlier bar
+    already inside the as-of window); the volume-z uses the full passed window's
+    mean/std — and that window has already been sliced to ``<= asof`` by the
+    builder, so no future bar is ever referenced.
+
+    Force-kept rows (always survive, regardless of saliency):
+      - the latest ``_RECENCY_KEEP`` bars (recency invariant; a test invariant), and
+      - the window min-close and max-close bars, so ``window_low``/``window_high``
+        range claims stay substring-traceable by the ClaimVerifier.
+
+    Packing is greedy by descending saliency; ties break by date descending. Rows
+    are added until the *next* candidate would push the compact render past
+    *max_bytes*. Output is returned in ascending date order.
+    """
+    if not bars:
+        return bars, citation_ids
+
+    n = len(bars)
+    indices = list(range(n))
+
+    # --- forced-keep set (recency + min/max-close) -------------------------
+    forced: set[int] = set(range(max(0, n - _RECENCY_KEEP), n))
+    closes = [b.close for b in bars]
+    forced.add(min(indices, key=lambda i: (closes[i], i)))   # min-close (stable)
+    forced.add(max(indices, key=lambda i: (closes[i], -i)))  # max-close (stable)
+
+    # --- saliency scores (no-lookahead) ------------------------------------
+    vols = [b.volume for b in bars]
+    vol_mean = statistics.mean(vols) if vols else 0.0
+    vol_std = statistics.pstdev(vols) if len(vols) > 1 else 0.0
+
+    def _saliency(i: int) -> float:
+        bar = bars[i]
+        ret = 0.0
+        if i > 0 and closes[i - 1]:  # close_{i-1}: strictly earlier, in-window
+            ret = abs(closes[i] - closes[i - 1]) / abs(closes[i - 1])
+        rng = ((bar.high - bar.low) / bar.close) if bar.close else 0.0
+        volz = ((vols[i] - vol_mean) / vol_std) if vol_std else 0.0
+        return _W_RETURN * ret + _W_RANGE * rng + _W_VOLZ * abs(volz)
+
+    # Candidate (non-forced) rows ranked by saliency desc, then date desc (stable).
+    candidates = sorted(
+        (i for i in indices if i not in forced),
+        key=lambda i: (-_saliency(i), -i),
+    )
+
+    # --- greedy pack under byte cap ----------------------------------------
+    # Exact incremental byte accounting: _render_full joins lines with "\n", so a
+    # render with row-index set S costs `_bytes_for(forced) + sum over the extra
+    # rows of (1 + len(row_line))`. We measure the forced-only render once, then
+    # each additional data row adds exactly `1 + len(compact_row.encode())` bytes.
+    # Deterministic and O(n log n) — no per-trial re-render.
+    ref = block if block is not None else _MINIMAL_REF
+    row_cost = [1 + len(_compact_row(bars[i], citation_ids[i]).encode("utf-8")) for i in indices]
+
+    kept: set[int] = set(forced)
+    used = _bytes_for(ref, sorted(kept), bars, citation_ids)
+
+    for i in candidates:
+        if used + row_cost[i] <= max_bytes:
+            kept.add(i)
+            used += row_cost[i]
+        # else: skip this row but keep trying smaller-saliency rows that may fit.
+
+    sel = sorted(kept)
+    return [bars[i] for i in sel], [citation_ids[i] for i in sel]
+
+
+def _compact_row(bar: Bar, cid: str) -> str:
+    """The single compact OHLCV row line (must match _render_full compact mode)."""
+    return (
+        f"{bar.date_str} "
+        f"{bar.open:.4f}/{bar.high:.4f}/{bar.low:.4f}/{bar.close:.4f} "
+        f"{_fmt_volume_compact(bar.volume)} [{cid}]"
+    )
+
+
+def _bytes_for(
+    ref: GroundTruthBlock, sel: list[int], bars: list[Bar], citation_ids: list[str]
+) -> int:
+    """Exact UTF-8 byte length of the compact render of *ref* over row indices *sel*."""
+    sub_bars = [bars[i] for i in sel]
+    sub_ids = [citation_ids[i] for i in sel]
+    rendered = _render_full(_with_bars(ref, sub_bars, sub_ids), compact=True)
+    return len(rendered.encode("utf-8"))
+
+
+# Minimal reference block for byte-accounting when no full block is supplied.
+_MINIMAL_REF = GroundTruthBlock(
+    symbol="REF",
+    asof="2026-01-01",
+    ohlcv_60d=[],
+    current_quote={},
+    citation_ids=[],
+    context_summary={},
+)
+
+
+# ---------------------------------------------------------------------------
+# Legacy weekly trim — v0.1 policy (reachable via _TRIM_POLICY == "weekly")
 # ---------------------------------------------------------------------------
 
 
 def _trim_to_high_info_rows(
     bars: list[Bar], citation_ids: list[str]
 ) -> tuple[list[Bar], list[str]]:
-    """Trim OHLCV to highest-information rows when the block exceeds 4 KB.
+    """Trim OHLCV to highest-information rows (legacy v0.1 weekly policy).
 
-    v0.1 policy:
+    Kept reachable via ``_TRIM_POLICY == "weekly"`` for one release so a downstream
+    analyst regression caused by the v0.2 saliency-keep is attributable; remove once
+    v0.2 has soaked. The v0.2 default path (``render_for_prompt``) uses
+    ``_saliency_keep`` instead — this function is no longer on the default path.
+
+    Policy:
       - Keep the latest 5 trading days (maximum recency signal).
       - Keep one bar per calendar week for the prior 8 weeks
         (the last bar of each ISO week = Friday close or last available).
-
-    TODO (v0.2): replace with HKUDS full 5-layer compression pipeline:
-      Layer 0 — microcompact 6-char float repr
-      Layer 1 — per-window LLM summary
-      Layer 2 — iterative context update
-      Layer 3 — semantic deduplication
-      Layer 4 — adaptive information-theoretic truncation
     """
     if not bars:
         return bars, citation_ids
