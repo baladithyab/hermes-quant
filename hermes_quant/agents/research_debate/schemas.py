@@ -39,6 +39,7 @@ __all__ = [
     "InvestDebateState",
     "PortfolioRating",
     "ResearchPlan",
+    "StructureIntent",
 ]
 
 
@@ -78,6 +79,42 @@ class PortfolioRating(StrEnum):
         }[self.value]
 
 
+class StructureIntent(StrEnum):
+    """Coarse, advisory multi-leg STRUCTURE intent the debate may PROPOSE (ADR-0082 Part B).
+
+    This is the contract field only — *intent* granularity, NOT legs/Greeks/
+    strikes. The bull/bear/judge can argue a qualitative structural stance
+    (e.g. "thesis is range-bound → prefer premium capture"); the deterministic
+    structure-selection table (``options/structure_select.py``, a SEPARATE
+    seed) + the ``options_gate`` decide the actual ``StrategyKind`` and legs.
+    The LLM NEVER picks legs and ``structure_intent`` is NEVER a money-path
+    lever: it is advisory input to a downstream deterministic selector.
+
+    ``StrEnum`` (not plain ``Enum``) for the same reason as ``PortfolioRating``:
+    free, label-stable JSON serialisation across restarts (ADR-0058).
+
+    Members mirror ADR-0082 §"Part B" exactly:
+        * ``NONE``                → no structure preference → today's equity path.
+          The silence-by-default member; absent/ambiguous deliberation defaults
+          here so no option structure is ever implied by omission.
+        * ``DEFINED_RISK_CREDIT`` → defined-risk credit stance (e.g. credit spread).
+        * ``DEFINED_RISK_DEBIT``  → defined-risk debit stance (e.g. debit spread).
+        * ``PREMIUM_CAPTURE``     → income/premium-selling stance (e.g. CC / CSP).
+        * ``LONG_PREMIUM``        → long-volatility / long-premium stance.
+
+    NOTHING in this seed consumes these members; they exist so the debate
+    schema can CARRY the intent. Wiring to the selector/gate is Part B + a
+    later seed. Out-of-table / non-defined-risk intents resolve to silence in
+    that downstream layer, never here.
+    """
+
+    NONE = "none"
+    DEFINED_RISK_CREDIT = "defined_risk_credit"
+    DEFINED_RISK_DEBIT = "defined_risk_debit"
+    PREMIUM_CAPTURE = "premium_capture"
+    LONG_PREMIUM = "long_premium"
+
+
 class ResearchPlan(BaseModel):
     """Output contract of the ResearchDebateStage (ADR-0065).
 
@@ -115,6 +152,17 @@ class ResearchPlan(BaseModel):
     # magnitude, confidence, the gate, or any limit). Defaults to None so the
     # off-state is byte-identical (extra='forbid' requires it be declared).
     counterarguments: str | None = Field(default=None, max_length=4000)
+
+    # ADR-0082 Part B (additive, advisory): the COARSE multi-leg structure intent
+    # the deliberation may PROPOSE. Optional with default None so existing plans
+    # parse and round-trip byte-identically (absence ≡ ``StructureIntent.NONE`` ≡
+    # today's equity path; silence-by-default). ``extra='forbid'`` requires it be
+    # declared. This seed adds ONLY the contract field: NOTHING consumes it yet.
+    # The deterministic structure-selection table (separate seed) + the
+    # options_gate decide the actual StrategyKind/legs — the LLM NEVER picks legs
+    # and this is NEVER a money-path lever (it is advisory input to a downstream
+    # deterministic selector, ADR-0082 D-1).
+    structure_intent: StructureIntent | None = None
 
 
 class InvestDebateState(BaseModel):
