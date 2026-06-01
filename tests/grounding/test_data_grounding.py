@@ -244,9 +244,26 @@ def _make_overflow_bars(n: int = 600) -> list[Bar]:
     return _make_bars(n)
 
 
-def _make_spiky_bars(n: int = 600, spike_at: int = 200) -> list[Bar]:
-    """Nearly-flat series with one genuinely-salient bar (big return + range +
-    volume surprise) placed at a NON-recent index, on otherwise flat volume.
+def _make_salient_vs_magnitude_bars(
+    n: int = 600, salient_at: int = 20
+) -> list[Bar]:
+    """A monotonically-rising series (so close == magnitude grows with index) with
+    ONE genuinely-salient bar at a LOW index — i.e. a SMALL close.
+
+    The salient bar's CLOSE stays on-trend (it is NOT the window max-close, and at a
+    low index it is near the BOTTOM of the close range), but it carries a huge
+    intraday range and a 50x volume surprise. So:
+
+      * a TRUE saliency proxy (|return| + range + volume-z) ranks this bar far above
+        the flat bars and keeps it; while
+      * a degenerate "rank by close magnitude" proxy would rank this low-close bar
+        near LAST and instead keep the highest-close (recent) bars.
+
+    This breaks the old _make_spiky_bars confound, where the spike bar was ALSO the
+    window max-close and thus force-kept by the min/max-close invariant regardless of
+    whether saliency worked at all (the test could not tell saliency from magnitude).
+    Here the salient bar is neither the min- nor max-close, so its survival is
+    attributable ONLY to the saliency score.
     """
     from datetime import date, timedelta
 
@@ -256,11 +273,12 @@ def _make_spiky_bars(n: int = 600, spike_at: int = 200) -> list[Bar]:
     for i in range(n):
         while d.weekday() >= 5:
             d += timedelta(days=1)
-        close = base + 0.01 * i  # nearly flat drift
+        close = base + 0.1 * i  # steady rise: close strictly grows with index
         hi, lo, vol = close + 0.1, close - 0.1, 1_000_000.0
-        if i == spike_at:
-            close = base * 1.15  # +15% jump vs the flat neighbour
-            hi, lo, vol = close + 5.0, close - 5.0, 10_000_000.0  # 10x volume
+        if i == salient_at:
+            # On-trend close (NOT extreme), but a 25-wide intraday range and 50x
+            # volume — pure saliency, zero close-magnitude advantage.
+            hi, lo, vol = close + 25.0, close - 25.0, 50_000_000.0
         bars.append(Bar(d.isoformat(), close - 0.05, hi, lo, close, vol))
         d += timedelta(days=1)
     return bars
@@ -383,17 +401,60 @@ def test_min_and_max_close_bars_survive_trim():
     assert max_date in rendered, "max-close bar dropped — range claim untraceable"
 
 
-def test_saliency_keeps_genuinely_salient_bar():
-    """A non-recent bar with a large return + intraday range + volume surprise
-    must be kept over its flat neighbours.
+def test_saliency_keeps_genuinely_salient_bar_not_magnitude():
+    """DISCRIMINATING: saliency, not close-magnitude, must drive the keep.
+
+    Setup: a monotonically-rising series (close grows with index) with ONE salient
+    bar at a LOW index — small close, but huge intraday range + 50x volume. We pin
+    the byte cap so there is exactly ONE non-forced candidate slot. Under a TRUE
+    saliency proxy that slot goes to the salient (low-close) bar; under a degenerate
+    "rank by close magnitude" proxy it would go to the highest-close recent bar.
+
+    Asserts:
+      * the salient low-close bar IS kept (it wins the single competitive slot);
+      * the highest-close non-forced bar — which a magnitude-ranker would keep
+        instead — is DROPPED;
+      * the salient bar is neither the window min- nor max-close (so its survival is
+        not an artifact of the min/max-close force-keep invariant).
+
+    This FAILS if saliency degrades to pure magnitude: the low-close salient bar
+    would lose the slot to a high-close flat bar.
     """
-    bars = _make_spiky_bars(600, spike_at=200)
+    salient_at = 20
+    bars = _make_salient_vs_magnitude_bars(600, salient_at=salient_at)
     block = build_ground_truth_block(
         "AAPL", "2026-05-27", lookback_days=600, ohlcv_bars=bars
     )
-    kept, _ = _saliency_keep(bars, block.citation_ids, block=block)
-    kept_dates = {b.date_str for b in kept}
-    assert bars[200].date_str in kept_dates
+
+    closes = [b.close for b in bars]
+    # The salient bar is on-trend: strictly between the min- and max-close bars,
+    # so the min/max force-keep invariant cannot explain its survival.
+    assert bars[salient_at].close != min(closes)
+    assert bars[salient_at].close != max(closes)
+
+    # Pin a tight cap that leaves exactly one competitive (non-forced) candidate slot.
+    kept, _ = _saliency_keep(bars, block.citation_ids, max_bytes=1100, block=block)
+    kept_idx = {bars.index(b) for b in kept}
+
+    forced = set(range(600 - _RECENCY_KEEP, 600)) | {
+        closes.index(min(closes)),
+        closes.index(max(closes)),
+    }
+    extra = sorted(kept_idx - forced)
+    assert extra == [salient_at], (
+        f"saliency-keep gave the single competitive slot to {extra}, not the "
+        f"genuinely-salient bar {salient_at} — saliency may have degraded to magnitude"
+    )
+
+    # The bar a close-magnitude ranker would have kept (highest-close non-forced bar)
+    # must be DROPPED — directly distinguishing saliency from magnitude.
+    highest_close_candidate = max(
+        (i for i in range(600) if i not in forced), key=lambda i: closes[i]
+    )
+    assert highest_close_candidate not in kept_idx, (
+        "the highest-close non-forced bar was kept — that is a magnitude artifact, "
+        "not saliency"
+    )
 
 
 # --- no-lookahead ----------------------------------------------------------

@@ -119,6 +119,43 @@ def _train_correctness(
         )
 
 
+def _train_partial(
+    agg: BMAAggregator,
+    name_a: str,
+    name_b: str,
+    p_copy: float,
+    n: int = 200,
+    seed: int = 0,
+) -> None:
+    """Train two analysts to a TUNABLE correctness correlation.
+
+    ``name_b`` copies ``name_a``'s per-episode correctness with probability
+    ``p_copy``, else draws an independent Bernoulli(0.6). This makes the
+    realized Pearson correlation ≈ ``p_copy`` (0 → independent, 1 → perfect),
+    so a graded set of correlations can be fed without changing the marginal
+    correctness rate (~0.6) of either analyst. Used to assert the redundancy
+    discount tracks the MAGNITUDE of ρ, not merely its sign / co-training."""
+    rng = random.Random(seed)
+    a_seq = [rng.random() < 0.6 for _ in range(n)]
+    b_seq = [
+        a_seq[i] if rng.random() < p_copy else (rng.random() < 0.6) for i in range(n)
+    ]
+    seqs = {name_a: a_seq, name_b: b_seq}
+    for episode in range(n):
+        dc = {nm: seqs[nm][episode] for nm in (name_a, name_b)}
+        sig = agg.aggregate([_view(name_a, 1), _view(name_b, 1)], _ctx())
+        agg.update(
+            EpisodeOutcome(
+                asset="BTC/USDT",
+                timeframe="1h",
+                asof=pd.Timestamp("2026-05-13"),
+                aggregated_signal=sig,
+                realized_returns={"1h": 0.01},
+                direction_correct=dc,
+            )
+        )
+
+
 # ---------------------------------------------------------------------------
 # Flag plumbing
 # ---------------------------------------------------------------------------
@@ -344,6 +381,46 @@ class TestRedundancyFactors:
         indep_combined = sum(indep._redundancy_factors(["c", "d"]).values())
         assert corr_combined < indep_combined
         assert corr_combined == pytest.approx(1.0)  # exactly one independent unit
+
+    def test_combined_weight_is_monotone_in_correlation_magnitude(self):
+        """DISCRIMINATING tightening of the confound the verifier flagged: the
+        combined effective weight must track the MAGNITUDE of the correctness
+        correlation, not merely its sign / the fact that two analysts were
+        co-trained.
+
+        We feed three pairs with graded correlation (ρ ≈ 0.0, 0.5, 1.0) at a
+        FIXED marginal correctness (~0.6) and assert a STRICT three-way ordering:
+
+            sum(f | ρ≈1)  <  sum(f | ρ≈0.5)  <  sum(f | ρ≈0)
+
+        A degenerate discount that (a) treats any positive co-movement as full
+        redundancy (binary), (b) ignores ρ and applies a constant discount, or
+        (c) keys on an agreement-rate magnitude rather than the de-meaned Pearson
+        correlation would collapse the middle point onto one of the extremes and
+        break the strict ordering. So this FAILS if the discount stops being a
+        monotone function of ρ."""
+        sums: dict[float, float] = {}
+        for p_copy in (0.0, 0.5, 1.0):
+            agg = _fresh_aggregator()
+            _train_partial(agg, "a", "b", p_copy=p_copy, n=200, seed=3)
+            sums[p_copy] = sum(agg._redundancy_factors(["a", "b"]).values())
+
+        # Sanity: the realized correlations are actually graded as intended.
+        rho_mid = _fresh_aggregator()
+        _train_partial(rho_mid, "a", "b", p_copy=0.5, n=200, seed=3)
+        rho = rho_mid._pairwise_correctness_corr(
+            list(rho_mid._stats["a"].history), list(rho_mid._stats["b"].history)
+        )
+        assert 0.3 < rho < 0.8, f"middle pair ρ={rho} not in the partial band"
+
+        # Strict monotone in correlation magnitude — the load-bearing assertion.
+        assert sums[1.0] < sums[0.5] < sums[0.0], (
+            f"combined weight not strictly monotone in ρ: {sums} — the redundancy "
+            f"discount degraded to a sign/binary/constant artifact"
+        )
+        # Endpoints pinned to their information-theoretic anchors.
+        assert sums[1.0] == pytest.approx(1.0)  # ρ=1 → one independent unit
+        assert sums[0.0] > 1.9  # ρ≈0 → ~two independent units
 
     def test_single_analyst_no_discount(self):
         a = _fresh_aggregator()
