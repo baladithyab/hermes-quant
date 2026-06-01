@@ -5,5 +5,15 @@ liquidity- and price-filtered scan against the Alpaca paper API.
 """
 
 from hermes_quant.universe.alpaca_scanner import scan_universe
+from hermes_quant.universe.point_in_time import (
+    ListingRecord,
+    filter_listed_at_asof,
+    is_point_in_time_active,
+)
 
-__all__ = ["scan_universe"]
+__all__ = [
+    "ListingRecord",
+    "filter_listed_at_asof",
+    "is_point_in_time_active",
+    "scan_universe",
+]
