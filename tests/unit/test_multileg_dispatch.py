@@ -12,11 +12,17 @@ from decimal import Decimal
 
 import pytest
 
-from hermes_quant.options.data import NetGreeks, OptionGreeksSnapshot, OptionLeg, StockLeg
+from hermes_quant.options.data import (
+    NetGreeks,
+    OptionGreeksSnapshot,
+    OptionLeg,
+    StockLeg,
+)
 from hermes_quant.options.multileg import MultiLegProposal
 from hermes_quant.react.dispatch import is_multi_leg_proposal, select_reactor
 from hermes_quant.react.multileg import MultiLegPaperReactor, MultiLegReactorDisabled
 from hermes_quant.react.paper import PaperReactor
+from hermes_quant.risk.options_gate import OptionsGateResult, StructureBucket
 
 
 class _EquityProposal:
@@ -40,7 +46,19 @@ def _ml() -> MultiLegProposal:
         ),
         fill_price=4.5,
     )
-    return MultiLegProposal(
+    # risk_gate_pass=True is unrepresentable by direct construction (ADR-0029/#38);
+    # mint through the blessed seam with a minimal admitted gate result.
+    return MultiLegProposal.from_gate_result(
+        gate_result=OptionsGateResult(
+            admitted=True,
+            bucket=StructureBucket.COVERED_CALL,
+            reason=None,
+            net_greeks=NetGreeks(),
+            bpr_estimate=0.0,
+            max_loss=None,
+            contracts=1,
+            warnings=(),
+        ),
         proposal_id="prop_ml",
         asof=datetime(2026, 5, 30, 18, 0, 0, tzinfo=UTC),
         strategy_kind="covered_call",
@@ -49,16 +67,10 @@ def _ml() -> MultiLegProposal:
         stock_leg=StockLeg(underlying="NVDA", qty=100, basis_per_share=160.0),
         outer_qty=1,
         net_debit_credit=Decimal("-4.5"),
-        net_greeks=NetGreeks(),
-        bpr_estimate=Decimal("0"),
-        max_loss=None,
         max_gain=Decimal("450"),
         breakeven_underlying=(Decimal("155.5"),),
         rationale="cc",
         source_recipe_id="r",
-        risk_gate_pass=True,
-        risk_gate_bucket="covered_call",
-        risk_gate_reason=None,
     )
 
 

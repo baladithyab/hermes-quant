@@ -16,7 +16,12 @@ from decimal import Decimal
 
 import pytest
 
-from hermes_quant.options.data import NetGreeks, OptionGreeksSnapshot, OptionLeg, StockLeg
+from hermes_quant.options.data import (
+    NetGreeks,
+    OptionGreeksSnapshot,
+    OptionLeg,
+    StockLeg,
+)
 from hermes_quant.options.multileg import MultiLegProposal
 from hermes_quant.react import __all__ as react_all
 from hermes_quant.react.base import Reactor
@@ -25,6 +30,7 @@ from hermes_quant.react.multileg import (
     MultiLegPaperReactor,
     MultiLegReactorDisabled,
 )
+from hermes_quant.risk.options_gate import OptionsGateResult, StructureBucket
 
 
 def _cc_proposal(*, risk_gate_pass: bool = True) -> MultiLegProposal:
@@ -39,7 +45,7 @@ def _cc_proposal(*, risk_gate_pass: bool = True) -> MultiLegProposal:
         ),
         fill_price=4.50,
     )
-    return MultiLegProposal(
+    common = dict(
         proposal_id="prop_20260530T180000_NVDA_abc123",
         asof=datetime(2026, 5, 30, 18, 0, 0, tzinfo=UTC),
         strategy_kind="covered_call",
@@ -48,17 +54,25 @@ def _cc_proposal(*, risk_gate_pass: bool = True) -> MultiLegProposal:
         stock_leg=StockLeg(underlying="NVDA", qty=100, basis_per_share=160.0),
         outer_qty=1,
         net_debit_credit=Decimal("-4.50"),
-        net_greeks=NetGreeks(delta=75.0, gamma=-1.0, theta=3.0, vega=-10.0),
-        bpr_estimate=Decimal("0"),
-        max_loss=None,
         max_gain=Decimal("450"),
         breakeven_underlying=(Decimal("155.50"),),
         rationale="test cc",
         source_recipe_id="recipe_cc",
-        risk_gate_pass=risk_gate_pass,
-        risk_gate_bucket="covered_call",
-        risk_gate_reason=None if risk_gate_pass else "naked_short_call",
     )
+    # A passing verdict is unrepresentable by direct construction (ADR-0029/#38),
+    # so mint it through the blessed seam; a rejected (False) proposal builds
+    # freely and is the explicit non-admitted shape.
+    gate = OptionsGateResult(
+        admitted=risk_gate_pass,
+        bucket=StructureBucket.COVERED_CALL if risk_gate_pass else StructureBucket.NAKED,
+        reason=None if risk_gate_pass else "naked_short_call",
+        net_greeks=NetGreeks(delta=75.0, gamma=-1.0, theta=3.0, vega=-10.0),
+        bpr_estimate=0.0,
+        max_loss=None,
+        contracts=1 if risk_gate_pass else 0,
+        warnings=(),
+    )
+    return MultiLegProposal.from_gate_result(gate_result=gate, **common)
 
 
 # --------------------------------------------------------------------------- #

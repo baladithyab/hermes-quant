@@ -24,7 +24,32 @@ from hermes_quant.react.multileg import (
     GateRejectedProposal,
     MultiLegPaperReactor,
 )
+from hermes_quant.risk.options_gate import OptionsGateResult, StructureBucket
 from hermes_quant.state.portfolio_state import PortfolioState
+
+
+def _admitted_gate(
+    *,
+    bucket: StructureBucket,
+    net_greeks: NetGreeks,
+    bpr_estimate: float = 0.0,
+    max_loss: float | None = None,
+) -> OptionsGateResult:
+    """A minimal admitted gate result so builders mint a passing proposal via the
+    blessed ``MultiLegProposal.from_gate_result`` seam (risk_gate_pass=True is
+    unrepresentable by direct construction — ADR-0029/#38). The gate copies
+    bucket/net_greeks/bpr/max_loss verbatim onto the proposal, so these values
+    reproduce the previously hand-built field values exactly."""
+    return OptionsGateResult(
+        admitted=True,
+        bucket=bucket,
+        reason=None,
+        net_greeks=net_greeks,
+        bpr_estimate=bpr_estimate,
+        max_loss=max_loss,
+        contracts=1,
+        warnings=(),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -64,7 +89,13 @@ def _cc(*, pid="prop_20260530T180000_NVDA_cc0001") -> MultiLegProposal:
         greeks_at_decision=_snap(),
         fill_price=4.50,
     )
-    return MultiLegProposal(
+    return MultiLegProposal.from_gate_result(
+        gate_result=_admitted_gate(
+            bucket=StructureBucket.COVERED_CALL,
+            net_greeks=NetGreeks(delta=75.0, gamma=-1.0, theta=3.0, vega=-10.0),
+            bpr_estimate=0.0,
+            max_loss=None,
+        ),
         proposal_id=pid,
         asof=datetime(2026, 5, 30, 18, 0, 0, tzinfo=UTC),
         strategy_kind="covered_call",
@@ -73,16 +104,10 @@ def _cc(*, pid="prop_20260530T180000_NVDA_cc0001") -> MultiLegProposal:
         stock_leg=StockLeg(underlying="NVDA", qty=100, basis_per_share=160.0),
         outer_qty=1,
         net_debit_credit=Decimal("-4.50"),
-        net_greeks=NetGreeks(delta=75.0, gamma=-1.0, theta=3.0, vega=-10.0),
-        bpr_estimate=Decimal("0"),
-        max_loss=None,
         max_gain=Decimal("450"),
         breakeven_underlying=(Decimal("155.50"),),
         rationale="cc",
         source_recipe_id="r_cc",
-        risk_gate_pass=True,
-        risk_gate_bucket="covered_call",
-        risk_gate_reason=None,
     )
 
 
@@ -95,7 +120,13 @@ def _csp(*, pid="prop_20260530T180000_NVDA_csp001") -> MultiLegProposal:
         greeks_at_decision=_snap(delta=-0.25),
         fill_price=3.10,
     )
-    return MultiLegProposal(
+    return MultiLegProposal.from_gate_result(
+        gate_result=_admitted_gate(
+            bucket=StructureBucket.CASH_SECURED_PUT,
+            net_greeks=NetGreeks(delta=25.0),
+            bpr_estimate=13000.0,
+            max_loss=None,
+        ),
         proposal_id=pid,
         asof=datetime(2026, 5, 30, 18, 0, 0, tzinfo=UTC),
         strategy_kind="cash_secured_put",
@@ -104,16 +135,10 @@ def _csp(*, pid="prop_20260530T180000_NVDA_csp001") -> MultiLegProposal:
         stock_leg=None,
         outer_qty=1,
         net_debit_credit=Decimal("-3.10"),
-        net_greeks=NetGreeks(delta=25.0),
-        bpr_estimate=Decimal("13000"),
-        max_loss=None,
         max_gain=Decimal("310"),
         breakeven_underlying=(Decimal("126.90"),),
         rationale="csp",
         source_recipe_id="r_csp",
-        risk_gate_pass=True,
-        risk_gate_bucket="cash_secured_put",
-        risk_gate_reason=None,
     )
 
 
@@ -134,7 +159,13 @@ def _pmcc(*, pid="prop_20260530T180000_NVDA_pmcc01") -> MultiLegProposal:
         greeks_at_decision=_snap(delta=0.30, theta=-0.05, iv=0.40),
         fill_price=3.5,
     )
-    return MultiLegProposal(
+    return MultiLegProposal.from_gate_result(
+        gate_result=_admitted_gate(
+            bucket=StructureBucket.DEFINED_RISK,
+            net_greeks=NetGreeks(delta=52.0, theta=4.0),
+            bpr_estimate=4450.0,
+            max_loss=4450.0,
+        ),
         proposal_id=pid,
         asof=datetime(2026, 5, 30, 18, 0, 0, tzinfo=UTC),
         strategy_kind="pmcc",
@@ -143,16 +174,10 @@ def _pmcc(*, pid="prop_20260530T180000_NVDA_pmcc01") -> MultiLegProposal:
         stock_leg=None,
         outer_qty=1,
         net_debit_credit=Decimal("44.50"),  # net DEBIT (positive)
-        net_greeks=NetGreeks(delta=52.0, theta=4.0),
-        bpr_estimate=Decimal("4450"),
-        max_loss=Decimal("4450"),
         max_gain=None,
         breakeven_underlying=(Decimal("164.50"),),
         rationale="pmcc",
         source_recipe_id="r_pmcc",
-        risk_gate_pass=True,
-        risk_gate_bucket="defined_risk",
-        risk_gate_reason=None,
     )
 
 
@@ -319,11 +344,28 @@ def test_admissibility_short_stock_leg_flag_on(enabled, state_db, tmp_path, monk
     reactor = MultiLegPaperReactor(executions_path=bus)
 
     p = _cc()
-    collar = MultiLegProposal(
-        **{
-            **{k: getattr(p, k) for k in p.__dataclass_fields__},
-            "stock_leg": StockLeg(underlying="NVDA", qty=-100, basis_per_share=160.0),
-        }
+    # Re-mint a passing proposal that differs only in the (short) stock leg.
+    # risk_gate_pass=True is unrepresentable by a direct re-spread (ADR-0029/#38),
+    # so route through the same blessed seam the builder uses.
+    collar = MultiLegProposal.from_gate_result(
+        gate_result=_admitted_gate(
+            bucket=StructureBucket.COVERED_CALL,
+            net_greeks=p.net_greeks,
+            bpr_estimate=float(p.bpr_estimate),
+            max_loss=None if p.max_loss is None else float(p.max_loss),
+        ),
+        proposal_id=p.proposal_id,
+        asof=p.asof,
+        strategy_kind=p.strategy_kind,
+        underlying=p.underlying,
+        option_legs=p.option_legs,
+        stock_leg=StockLeg(underlying="NVDA", qty=-100, basis_per_share=160.0),
+        outer_qty=p.outer_qty,
+        net_debit_credit=p.net_debit_credit,
+        max_gain=p.max_gain,
+        breakeven_underlying=p.breakeven_underlying,
+        rationale=p.rationale,
+        source_recipe_id=p.source_recipe_id,
     )
     # The live oracle fails-closed (MISSING_ACCOUNT_CONTEXT) for a short -> REJECT.
     parent = reactor.execute(collar, fill_size_pct=0.05)
