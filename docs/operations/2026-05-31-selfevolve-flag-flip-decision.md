@@ -198,3 +198,32 @@ Tracked in #35. Every freshness/plumbing layer toward CONVERGENCE is now done an
 (producers live, fresh, source-tagged, recency-gated); the remaining work is classifier coverage,
 which is honestly its own reviewed wave. CONVERGENCE stays OFF until social→packet yield is high
 enough that the kept-vs-dropped re-measure shows real same-symbol cross-source overlap.
+
+---
+
+## Addendum 5 — CONVERGENCE: the honest terminal call (do NOT force the flip) (2026-05-31)
+
+Inspected WHY only 2/244 fresh social items become packets. The answer kills the "loosen the
+lexicon" reflex: most non-classifications are CORRECT. The live fresh Reddit chatter is dominated
+by "SpaceX IPO" / "SpaceX share unlock" / "merger chatter" / "bag holder" / "$SPCE pump" — and
+SpaceX is PRIVATE (not a tradeable ticker; the graph maps it to suppliers like RKLB, for which an
+IPO rumor is NOT a clean directional catalyst). The classifier returning is_catalyst=False on these
+is right, not a miss. Loosening the lexicon to fire on "IPO"/"pump"/"merger" would MANUFACTURE
+false-positive packets — the exact cry-wolf failure the catalyst eval's negative-control guards
+against — degrading precision to chase a convergence count.
+
+**Terminal determination:** CONVERGENCE stays OFF, and that is the CORRECT state right now — not a
+dodged code gap. Every plumbing layer is done and committed: producers live (Reddit Atom + Trends
+RSS, no OAuth), fresh (new.rss, ≤7d recency-gated), correctly source-tagged (PDR-3 taxonomy intact),
+flowing through the same classify→propagate→synthesize pipeline. The remaining gap is not code —
+it is that the social-arb edge requires an ORGANIC same-symbol social+news convergence on a
+tradeable name, which the current watchlist (space/EV/semis — institutional, not retail-meme names)
++ this week's flow simply isn't producing. The Camillo edge is in CONSUMER names (CELH/CROX) during
+ACTUAL viral moments; you cannot fabricate a trend that isn't there.
+
+The flip is therefore correctly DATA-gated (on a real convergent event occurring), not engineering-
+gated. When a genuine consumer-trend moment hits (CELH/CROX trending on Reddit AND in the news on the
+same day), the kept-vs-dropped re-measure will show it, and CONVERGENCE becomes a safe, value-adding
+flip. Until then, flipping it would silence real single-source news signal to chase a convergence the
+market isn't offering. Forcing it would be the un-rigorous move. #35 mechanism = DONE; #35 live-flip
+= correctly awaiting an organic convergent event (operator/market-gated, not agent-doable by fiat).
