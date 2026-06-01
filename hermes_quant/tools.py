@@ -1466,6 +1466,115 @@ def _compute_drift_surface(
     }
 
 
+def quant_insider(args: dict, **_kwargs) -> str:
+    """Read-only SEC EDGAR Form-4 insider-transactions surface (B20). Read-only.
+
+    DEFAULT-OFF: gated behind ``HERMES_QUANT_INSIDER_ENABLED`` read at call time.
+    When the flag is OFF (the default) this returns
+    ``{"success": True, "enabled": False, "filings": []}`` and touches NO network
+    (silence-by-default; ADR-0007 read-only tool surface). When ON it fetches the
+    issuer's recent Form-4 filings from data.sec.gov and surfaces them with their
+    asof-honest ``filed_at`` anchor (the EDGAR acceptance/filing moment — NEVER
+    the transaction date). The documented SEC 403 from cloud egress degrades to an
+    empty filing list, never an exception.
+
+    This tool only READS/surfaces filings and (optionally) writes append-only
+    EvidenceRecords; it never trades or mutates daemon state (ADR-0007).
+
+    Args:
+        cik: 10-digit (or shorter, zero-padded internally) SEC CIK of the issuer.
+        since: optional ISO timestamp; keep only filings with filed_at >= since.
+        limit: max filings to return (most recent kept; default 20).
+        store: when True, append each filing as a FilingEvidence to the evidence
+            store (idempotent). Default False (pure read).
+    """
+    # Lazy import — the adapter pulls urllib/network; keep register() fast.
+    from hermes_quant.evidence.adapters import form4 as _form4
+
+    if not _form4.insider_enabled():
+        # Flag OFF -> silence. No network, no error: this is the safe default.
+        return json.dumps(
+            {
+                "success": True,
+                "enabled": False,
+                "filings": [],
+                "note": (
+                    "insider adapter is default-OFF; set HERMES_QUANT_INSIDER_ENABLED=1 "
+                    "(after a connectivity smoke check) to enable."
+                ),
+            }
+        )
+
+    cik = args.get("cik")
+    if cik is None or str(cik).strip() == "":
+        return json.dumps({"success": False, "error": "cik is required"})
+    limit = int(args.get("limit", 20))
+    since = None
+    since_raw = args.get("since")
+    if since_raw:
+        try:
+            from datetime import datetime as _dt
+
+            since = _dt.fromisoformat(str(since_raw))
+        except ValueError:
+            return json.dumps(
+                {"success": False, "error": f"unparseable since timestamp: {since_raw!r}"}
+            )
+    do_store = bool(args.get("store", False))
+
+    try:
+        filings, latency = _form4.fetch_form4_filings(str(cik), since=since)
+    except Exception as e:  # noqa: BLE001 - defensive: adapter is fail-closed, but never crash the tool
+        logger.warning("quant_insider: fetch error for CIK %s: %s", cik, e)
+        return json.dumps({"success": False, "error": str(e)})
+
+    # Most-recent-first, capped.
+    filings = sorted(filings, key=lambda f: f.filed_at, reverse=True)[:limit]
+
+    n_stored = 0
+    store_error = None
+    if do_store and filings:
+        try:
+            from hermes_quant.evidence.store import EvidenceStore
+
+            est = EvidenceStore()
+            for f in filings:
+                est.append(_form4.to_filing_evidence(f))
+                n_stored += 1
+        except Exception as e:  # noqa: BLE001 - storing must not break the read surface
+            store_error = str(e)
+            logger.warning("quant_insider: store error: %s", e)
+
+    out_filings = [
+        {
+            "accession_number": f.accession_number,
+            "form_type": f.form_type,
+            "issuer_symbol": f.issuer_symbol,
+            "issuer_cik": f.issuer_cik,
+            # filed_at is the asof anchor (acceptance/filing moment), NOT the trade date.
+            "filed_at": f.filed_at.isoformat(),
+            "period_of_report": f.period_of_report.isoformat()
+            if f.period_of_report is not None
+            else None,
+            "url": f.archive_url(),
+        }
+        for f in filings
+    ]
+    return json.dumps(
+        {
+            "success": True,
+            "enabled": True,
+            "cik": str(cik),
+            "count": len(out_filings),
+            "latency_seconds": round(latency, 4),
+            "stored": n_stored,
+            "store_error": store_error,
+            "filings": out_filings,
+        },
+        default=str,
+    )
+
+
 def handle_quant_slash(args: list, **kwargs) -> str:
     """Slash-command multiplexer for /quant <subcommand>.
 

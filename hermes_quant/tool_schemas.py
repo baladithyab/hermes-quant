@@ -391,3 +391,50 @@ QUANT_DOCTOR = {
         "required": [],
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Insider-transactions surface (B20) — SEC EDGAR Form-4 EvidenceRecord adapter
+# ---------------------------------------------------------------------------
+
+QUANT_INSIDER = {
+    "name": "quant_insider",
+    "description": "Surface recent SEC EDGAR Form-4 insider transactions for an "
+    "issuer CIK as asof-honest filing evidence. Read-only; does "
+    "NOT trade. DEFAULT-OFF: returns an empty list (enabled=False) "
+    "unless HERMES_QUANT_INSIDER_ENABLED=1. The asof anchor is the "
+    "EDGAR acceptance/filing datetime (when the Form 4 became "
+    "public), NEVER the transaction date — using the trade date "
+    "would corrupt backtests. SEC may block cloud egress (403); the "
+    "tool degrades silently to an empty list, never errors on that.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "cik": {
+                "type": "string",
+                "description": "Issuer SEC CIK (zero-padded internally to 10 digits). "
+                "Required when the adapter is enabled.",
+            },
+            "since": {
+                "type": "string",
+                "description": "Optional ISO timestamp; keep only filings whose "
+                "filed_at (acceptance/filing time) is >= this.",
+            },
+            "limit": {
+                "type": "integer",
+                "default": 20,
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Max filings to return (most recent first).",
+            },
+            "store": {
+                "type": "boolean",
+                "default": False,
+                "description": "If true, append each filing as a FilingEvidence to "
+                "the append-only evidence store (idempotent). Default "
+                "false (pure read).",
+            },
+        },
+        "required": [],
+    },
+}
