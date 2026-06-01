@@ -75,6 +75,131 @@ _RULE_FIELDS: tuple[str, ...] = (
     "regime_gates",
 )
 
+# Rule-op grammar, mirrored from ``scorers._eval_rule`` / ``scorers._eval_eviction``
+# so an externally-declared play can never carry an op the scorers don't know.
+# This is the *load-time* fail-closed counterpart to the bias check: without it a
+# play with ``hard_rules:{rsi_14:[bogusop,5]}`` LOADS, then ``score_all`` (which
+# iterates EVERY play) raises ``unknown rule op`` for the whole batch, and
+# ``score_symbol``'s blanket ``except -> 0.0`` silently zeroes the built-in 5,
+# mass-evicting the watchlist. We refuse such a play at LOAD instead.
+#
+# Each entry maps op -> (min_args, max_args) where ``args`` is the count of
+# tuple elements AFTER the op token (``rule[1:]``); ``None`` for max_args means
+# unbounded. Arities are read directly off the scorers' unpacking:
+#   between/nonzero_window  use rule[1],rule[2]            -> exactly 2
+#   ge/gt/le/lt/eq          use rule[1]                    -> exactly 1
+#   in                      uses rule[1] (a container)     -> exactly 1
+#   or                      uses rule[1],rule[2] (subrules)-> exactly 2 (recursed)
+#   any_of                  uses rule[1:] (subrules)       -> >= 1   (recursed)
+#   *_field (eviction)      unpack ``_, field, arg = rule``-> exactly 2
+_VALUE_RULE_ARITY: dict[str, tuple[int, int | None]] = {
+    "between": (2, 2),
+    "nonzero_window": (2, 2),
+    "ge": (1, 1),
+    "gt": (1, 1),
+    "le": (1, 1),
+    "lt": (1, 1),
+    "eq": (1, 1),
+    "in": (1, 1),
+}
+# Composite ops whose args are themselves rules (validated recursively).
+_OR_ARITY: tuple[int, int | None] = (2, 2)
+_ANY_OF_ARITY: tuple[int, int | None] = (1, None)
+# Eviction ops: ``(op, field_name, arg)`` — exactly 2 args after the op.
+_EVICTION_RULE_ARITY: dict[str, tuple[int, int | None]] = {
+    "lt_field": (2, 2),
+    "gt_field": (2, 2),
+    "ne_field": (2, 2),
+    "not_in_field": (2, 2),
+}
+# regime_gates action vocabulary, mirrored from ``scorers._eval_regime_gate``
+# (which treats an unknown action as ``allow`` — fails OPEN). We refuse an
+# unknown action at LOAD so a ``{bull: nuke}`` gate can never silently allow.
+_VALID_REGIME_ACTIONS: frozenset[str] = frozenset({"allow", "warn", "deny"})
+
+
+def _validate_value_rule(rule: Any, *, field_name: str, play_name: str, depth: int = 0) -> None:
+    """Fail-closed validation of one hard/soft rule tuple against the
+    ``scorers._eval_rule`` op grammar (op known + correct arity).
+
+    ``or`` / ``any_of`` are composite ops whose arguments are themselves rules,
+    so we recurse into them. ``depth`` guards against a pathologically nested
+    (or self-referential) YAML structure. Raises ``ValueError`` on any
+    violation; the caller turns the raise into a skip+log.
+    """
+    if depth > 16:
+        raise ValueError(
+            f"play {play_name!r}: {field_name} rule nested too deeply (>16); refusing"
+        )
+    if not isinstance(rule, tuple) or not rule:
+        raise ValueError(
+            f"play {play_name!r}: {field_name} rule must be a non-empty tuple, got {rule!r}"
+        )
+    op = rule[0]
+    if not isinstance(op, str):
+        raise ValueError(
+            f"play {play_name!r}: {field_name} rule op must be a string, got {op!r}"
+        )
+    n_args = len(rule) - 1
+    if op == "or":
+        lo, hi = _OR_ARITY
+        if n_args != lo:
+            raise ValueError(
+                f"play {play_name!r}: {field_name} op 'or' takes exactly {lo} sub-rules, got {n_args}"
+            )
+        for sub in rule[1:]:
+            _validate_value_rule(sub, field_name=field_name, play_name=play_name, depth=depth + 1)
+        return
+    if op == "any_of":
+        lo, _hi = _ANY_OF_ARITY
+        if n_args < lo:
+            raise ValueError(
+                f"play {play_name!r}: {field_name} op 'any_of' needs >= {lo} sub-rule, got {n_args}"
+            )
+        for sub in rule[1:]:
+            _validate_value_rule(sub, field_name=field_name, play_name=play_name, depth=depth + 1)
+        return
+    arity = _VALUE_RULE_ARITY.get(op)
+    if arity is None:
+        raise ValueError(
+            f"play {play_name!r}: {field_name} has unknown rule op {op!r}; "
+            f"valid ops are {sorted([*_VALUE_RULE_ARITY, 'or', 'any_of'])} (fail-closed)"
+        )
+    lo, hi = arity
+    if n_args < lo or (hi is not None and n_args > hi):
+        want = f"{lo}" if lo == hi else f"{lo}..{hi}"
+        raise ValueError(
+            f"play {play_name!r}: {field_name} op {op!r} takes {want} arg(s), got {n_args}"
+        )
+
+
+def _validate_eviction_rule(rule: Any, *, play_name: str) -> None:
+    """Fail-closed validation of one eviction rule tuple against the
+    ``scorers._eval_eviction`` op grammar (op known + correct arity).
+    """
+    if not isinstance(rule, tuple) or not rule:
+        raise ValueError(
+            f"play {play_name!r}: eviction_rules rule must be a non-empty tuple, got {rule!r}"
+        )
+    op = rule[0]
+    if not isinstance(op, str):
+        raise ValueError(
+            f"play {play_name!r}: eviction_rules rule op must be a string, got {op!r}"
+        )
+    arity = _EVICTION_RULE_ARITY.get(op)
+    if arity is None:
+        raise ValueError(
+            f"play {play_name!r}: eviction_rules has unknown op {op!r}; "
+            f"valid ops are {sorted(_EVICTION_RULE_ARITY)} (fail-closed)"
+        )
+    n_args = len(rule) - 1
+    lo, hi = arity
+    if n_args < lo or (hi is not None and n_args > hi):
+        want = f"{lo}" if lo == hi else f"{lo}..{hi}"
+        raise ValueError(
+            f"play {play_name!r}: eviction_rules op {op!r} takes {want} arg(s), got {n_args}"
+        )
+
 
 def plays_open_enabled() -> bool:
     """True iff external play discovery is enabled (default-OFF, fail-closed)."""
@@ -114,8 +239,19 @@ def _normalize_rule_map(raw: Any, *, field_name: str, play_name: str) -> dict:
             f"play {play_name!r}: {field_name} must be a mapping, got {type(raw).__name__}"
         )
     if field_name == "regime_gates":
-        # label -> action string; leave as-is (validated cheaply below).
-        return dict(raw)
+        # label -> action string. Fail-closed on the action vocabulary:
+        # ``scorers._eval_regime_gate`` treats an unknown action as ``allow``
+        # (fails OPEN), so a ``{bull: nuke}`` gate would silently allow. Refuse
+        # any action outside {allow, warn, deny} at LOAD, mirroring the bias check.
+        gates: dict = {}
+        for k, v in raw.items():
+            if not isinstance(v, str) or v not in _VALID_REGIME_ACTIONS:
+                raise ValueError(
+                    f"play {play_name!r}: regime_gates[{k!r}] action must be one of "
+                    f"{sorted(_VALID_REGIME_ACTIONS)}; got {v!r} (fail-closed)"
+                )
+            gates[str(k)] = v
+        return gates
     return {str(k): _tuplize_rule(v) for k, v in raw.items()}
 
 
@@ -132,6 +268,13 @@ def play_profile_from_mapping(data: Mapping[str, Any]) -> PlayProfile:
       incompatible and refused (the dataclass default is only for in-code use).
     * Unknown top-level keys are rejected (typos fail early).
     * Rule maps are normalized (lists -> tuples) for hash/grammar parity.
+    * Every hard/soft rule's op + arity is validated against
+      ``scorers._eval_rule``, every eviction rule's against
+      ``scorers._eval_eviction``, and every ``regime_gates`` action against
+      {allow,warn,deny}. An unknown op / wrong arity / unknown action is refused
+      at LOAD (fail-closed), so a malformed play can never reach a scorer and
+      make ``score_all`` raise (which ``score_symbol`` would silently zero,
+      mass-evicting the built-in plays).
     """
     if not isinstance(data, Mapping):
         raise ValueError(f"play definition must be a mapping, got {type(data).__name__}")
@@ -159,6 +302,18 @@ def play_profile_from_mapping(data: Mapping[str, Any]) -> PlayProfile:
         kwargs[field_name] = _normalize_rule_map(
             data.get(field_name), field_name=field_name, play_name=name
         )
+
+    # Fail-closed rule-op/arity validation (the load-time counterpart to the bias
+    # check). hard/soft rules go through ``scorers._eval_rule``; eviction rules go
+    # through ``scorers._eval_eviction``. A play carrying an op those scorers
+    # don't know (or the wrong arity) would LOAD here but then make ``score_all``
+    # raise for EVERY play, which ``score_symbol``'s blanket except silently turns
+    # into 0.0 and mass-evicts the built-in 5. We refuse such a play at LOAD.
+    for field_name in ("hard_rules", "soft_rules"):
+        for _fname, rule in kwargs[field_name].items():
+            _validate_value_rule(rule, field_name=field_name, play_name=name)
+    for _fname, rule in kwargs["eviction_rules"].items():
+        _validate_eviction_rule(rule, play_name=name)
 
     profile = PlayProfile(**kwargs)  # type: ignore[arg-type]
     return profile

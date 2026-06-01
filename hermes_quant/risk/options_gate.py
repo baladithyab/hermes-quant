@@ -398,10 +398,21 @@ def _earnings_proximity_violation(
     asof-honest: ``event_risk`` was filtered upstream to
     ``announced_at <= decision_asof`` (the earnings date's EXISTENCE was knowable
     at decision time); this only tests the forward ``scheduled_for``. Missing
-    data => None => NO reject (never fabricate a blackout). Pure; never raises.
+    data => None => NO reject (never fabricate a blackout).
+
+    CLOCK-FREE (mirrors ``risk.gate.in_event_blackout``): this predicate reads NO
+    wall clock. A ``None`` ``asof`` cannot anchor the forward window, so it
+    returns None (never fabricate a blackout, never silently substitute
+    ``now()`` — a now() fallback in a past-dated replay would measure the forward
+    earnings window against the future, systematically MISSING imminent-earnings
+    rejects). The gate seam is responsible for FAIL-CLOSED rejecting a supplied
+    ``event_risk`` payload that arrives without a ``decision_asof``. Pure; never
+    raises.
     """
     if event_risk is None or not isinstance(event_risk, Mapping):
         return None
+    if asof is None:
+        return None  # no anchor => no forward window; never clock, never fabricate
     # Only long-premium (net theta-paying AND net vega-long) is at IV-crush risk.
     # A theta-collecting OR vega-short structure (CC/CSP/credit spread) is exempt.
     if not (candidate_net.theta < 0 and candidate_net.vega > 0):
@@ -409,7 +420,7 @@ def _earnings_proximity_violation(
     events = event_risk.get("events")
     if not events:
         return None
-    when = asof or datetime.now(UTC)
+    when = asof
     if when.tzinfo is None:
         when = when.replace(tzinfo=UTC)
     horizon = when + timedelta(days=dte_window)
@@ -682,6 +693,18 @@ def options_gate(
     # on HERMES_QUANT_EVENT_RISK=1 AND a non-None event_risk payload; otherwise a
     # no-op (byte-identical).
     if event_risk is not None and _event_risk_enabled():
+        # FAIL-CLOSED asof guard: a caller that supplies event_risk MUST also
+        # supply decision_asof. Without it the forward earnings window has no
+        # anchor; silently defaulting to wall-clock now() (the pre-fix behavior)
+        # would, in a past-dated replay/backtest, measure the forward window
+        # against the future and systematically MISS imminent-earnings rejects
+        # (under-block). The equity path (gate.in_event_blackout) already REQUIRES
+        # asof; mirror that here. Reject (silence) rather than measure-against-now.
+        if decision_asof is None:
+            return OptionsGateResult.silence(
+                bucket, "event_risk_requires_decision_asof", net_greeks=candidate_net,
+                bpr_estimate=bpr, max_loss=max_loss,
+            )
         o8_reason = _earnings_proximity_violation(
             event_risk,
             candidate_net,

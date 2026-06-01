@@ -351,10 +351,25 @@ def dispatch_settlement(
 #
 # Everything below is PURELY ADDITIVE measurement infrastructure. It does NOT
 # touch the deterministic risk gate, the sizing ladder, the kill-switch, or
-# the slippage_only calibration gate above. It reads the SAME executions.jsonl
-# records the rest of the loop reads and joins an EXIT fill to its ENTRY fill
-# so a realized holding-period return can be computed and written to a
-# settlement record. The reflector + calibrator may then read realized alpha.
+# the slippage_only calibration gate above. It consumes the SAME executions.jsonl
+# bus the rest of the loop reads — i.e. the ExecutionRecord schema serialized by
+# hermes_quant.react.paper._record_to_dict (fields: asset, asset_class,
+# asof_execution, target_position_pct, fill_price, fill_size_pct, signal_id,
+# proposal_id, …). It does NOT add new bus columns: a bus->lot adapter
+# (_normalize_exec_record) derives the lot side from the sign of the signed
+# fill_size_pct, the lot qty from its magnitude (NAV-fraction units, matching
+# portfolio_state's pos_delta convention), and the lot asof from asof_execution
+# (the fill time). It then joins an EXIT fill to its ENTRY fill so a realized
+# holding-period return can be computed and written to a settlement record. The
+# reflector + calibrator may then read realized alpha.
+#
+# NOTE on history: an earlier draft of this block claimed it "reads the SAME
+# records the rest of the loop reads" and then keyed off rec['side'] / ['qty'] /
+# ['asof'] / ['exec_id'] / ['fees'] — keys that DO NOT EXIST on the real bus
+# (review-team-3 defect 1). It does now, via the adapter above. There is NO
+# production caller yet (daemon/main.py wires construct_realized_outcomes +
+# dispatch_settlement, not join_exit_fills), so this stays additive; the
+# adapter makes the instrument correct before a future seed wires it.
 #
 # Why this is the keystone (ADR-0083): settlement v0.1.1 computes per-fill
 # SLIPPAGE only — it never joins an exit to its entry, so a multi-period hold
@@ -417,7 +432,16 @@ class SettledRoundTrip:
 
 
 def _coerce_asof(value) -> pd.Timestamp | None:
-    """Parse an asof value to a tz-naive-comparable Timestamp, or None."""
+    """Parse an asof value to a UTC tz-aware Timestamp, or None.
+
+    Review-team-3 defect (4): the bus mixes tz-aware ISO strings (the real
+    PaperReactor stamps ``"...Z"`` / offset suffixes) with the occasional
+    naive value carried in from older records or carry-in lot state. Comparing
+    a tz-aware Timestamp against a naive one raises ``TypeError`` at the
+    asof-honesty check. We therefore normalize EVERY asof to UTC tz-aware:
+    naive inputs are localized to UTC; offset/Z inputs are converted to UTC.
+    Comparisons across carry-in calls are then always well-formed.
+    """
     if value is None:
         return None
     try:
@@ -426,20 +450,150 @@ def _coerce_asof(value) -> pd.Timestamp | None:
         return None
     if ts is pd.NaT:
         return None
+    # Normalize to UTC tz-aware so naive/aware never mix at the comparison.
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
     return ts
 
 
+def _normalize_exec_record(rec: dict) -> dict | None:
+    """Adapt a real executions.jsonl record to the canonical lot shape.
+
+    Review-team-3 defect (1): the rest of the daemon (and the real
+    PaperReactor / live reactors) write the ExecutionRecord schema serialized
+    by ``hermes_quant.react.paper._record_to_dict`` — fields are ``asset``,
+    ``asset_class``, ``asof_execution`` (ISO, the FILL time), ``fill_price``,
+    ``fill_size_pct`` (SIGNED actual fill as a NAV fraction), ``signal_id``,
+    ``proposal_id``, ``target_position_pct`` … There is NO ``side``, ``qty``,
+    ``exec_id``, ``fees``, ``asof``, or ``account_id`` key on a real record.
+    The original join_exit_fills read those non-existent keys and silently
+    dropped every real fill.
+
+    This adapter derives the lot fields from the real schema, while staying
+    backward-compatible with records that already carry explicit
+    ``side``/``qty``/``asof``/``exec_id``/``fees`` (older synthetic / future
+    broker shapes): an explicit field always wins, the real-bus field is the
+    fallback. Derivation from the real schema:
+
+      - side: sign of the signed fill (``fill_size_pct``, else
+        ``target_position_pct``). delta > 0 -> "buy" (long), < 0 -> "sell".
+        This matches the position-quantity convention in
+        ``portfolio_state._apply_execution_unsafe`` (``pos_delta =
+        fill_size_pct``; ``new_qty = old_qty + fill_size_pct``), so a lot's
+        direction is exactly the sign of the fraction it added.
+      - qty: the MAGNITUDE of that signed fill (``abs(fill_size_pct)``), i.e.
+        the NAV-fraction the fill moved the position by. The existing lot math
+        treats notional as ``price * qty``, so qty in NAV-fraction units keeps
+        the realized-return formula scale-free (gross is price-ratio based;
+        fee drag is ``fees / (price * qty)``).
+      - asof: ``asof_execution`` (the actual fill time) — the asof-honest
+        ordering anchor. NOT ``asof_decision`` (advisor time).
+      - asset: ``asset`` (the real field; there is no ``symbol`` key).
+      - account_id: explicit ``account_id`` else ``reactor_metadata.account_id``
+        else the bus default ``"paper-default"`` (mirrors PaperReactor's
+        PortfolioState injection).
+      - exec_id: explicit ``exec_id`` else ``proposal_id`` (the stable
+        per-fill audit id on the real schema).
+      - fees: explicit ``fees`` else ``reactor_metadata.fees`` else 0.0.
+
+    Returns a dict with canonical keys (side, qty, fill_price, asof, asset,
+    asset_class, account_id, exec_id, signal_id, fees) or None if the record
+    is not a well-formed fill (no signed size, non-positive price, …). None
+    records are skipped by the caller — never fabricated.
+    """
+    rmeta = rec.get("reactor_metadata")
+    if not isinstance(rmeta, dict):
+        rmeta = {}
+
+    # ── side + qty ────────────────────────────────────────────────────────
+    side = rec.get("side")
+    qty = rec.get("qty")
+    if side not in ("buy", "sell") or qty is None:
+        # Derive from the signed NAV-fraction fill (real-bus path).
+        signed = rec.get("fill_size_pct")
+        if signed is None:
+            signed = rec.get("target_position_pct")
+        try:
+            signed_f = float(signed)
+        except (TypeError, ValueError):
+            return None
+        if signed_f == 0.0:
+            # A zero-size fill (e.g. an admissibility REJECT record stamped
+            # fill_size_pct=0.0) is not a position-moving lot. Skip it.
+            return None
+        derived_side = "buy" if signed_f > 0 else "sell"
+        derived_qty = abs(signed_f)
+        if side not in ("buy", "sell"):
+            side = derived_side
+        if qty is None:
+            qty = derived_qty
+
+    try:
+        qty_f = float(qty)
+        fill_price = float(rec["fill_price"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if qty_f <= 0 or fill_price <= 0:
+        return None
+
+    # ── asof: explicit `asof` else the real `asof_execution` fill time ─────
+    asof = _coerce_asof(rec.get("asof") if rec.get("asof") is not None
+                        else rec.get("asof_execution"))
+    if asof is None:
+        return None
+
+    # ── fees: explicit else reactor_metadata.fees else 0.0 ─────────────────
+    fees_raw = rec.get("fees")
+    if fees_raw is None:
+        fees_raw = rmeta.get("fees")
+    try:
+        fees = float(fees_raw) if fees_raw is not None else 0.0
+    except (TypeError, ValueError):
+        fees = 0.0
+
+    account_id = (
+        rec.get("account_id")
+        or rmeta.get("account_id")
+        or "paper-default"
+    )
+    exec_id = rec.get("exec_id") or rec.get("proposal_id")
+
+    return {
+        "side": side,
+        "qty": qty_f,
+        "fill_price": fill_price,
+        "asof": asof,
+        "asset": rec.get("asset"),
+        "asset_class": rec.get("asset_class"),
+        "account_id": account_id,
+        "exec_id": exec_id,
+        "signal_id": rec.get("signal_id"),
+        "fees": fees,
+        "_idx": rec.get("_idx", 0),
+    }
+
+
 def _exec_sort_key(rec: dict) -> tuple:
-    """Stable, asof-honest ordering key for execution records.
+    """Stable, asof-honest ordering key for canonical lot records.
 
     Orders by asof ascending so FIFO entries open before exits close them.
-    Ties broken by exec_id then the record's positional index (added by the
-    caller) so ordering is fully deterministic even for same-asof fills.
+
+    Review-team-3 defect (2): ties (same-asof fills) MUST break by the
+    record's positional BUS INDEX (``_idx``) BEFORE any id. The bus order is
+    the authoritative open-before-close lineage — an opening fill is appended
+    before the closing fill that settles it. The original key tie-broke by
+    ``exec_id`` lexically first, so a same-asof exit whose id sorts before its
+    entry's id was processed first and treated as the OPENING lot, inverting
+    both side and magnitude (a long opened +10% would record as short +9.09%).
+    Never tie-break by lexical id before positional order. ``exec_id`` is kept
+    only as a final, fully-deterministic last resort after ``_idx``.
     """
     asof = _coerce_asof(rec.get("asof"))
-    # NaT-asof records sort last but stay deterministic via exec_id/index.
+    # NaT-asof records sort last but stay deterministic via index/exec_id.
     asof_key = asof.value if asof is not None else 1 << 62
-    return (asof_key, str(rec.get("exec_id") or ""), rec.get("_idx", 0))
+    return (asof_key, rec.get("_idx", 0), str(rec.get("exec_id") or ""))
 
 
 def join_exit_fills(
@@ -480,29 +634,50 @@ def join_exit_fills(
     lots: dict[tuple, list[dict]] = {}
     if open_lots:
         # Deep-ish copy so we never mutate the caller's carry-in structure.
+        # Review-team-3 defect (4): re-coerce each carried-in lot's asof to UTC
+        # tz-aware so a naive carry-in value (from an older record) never mixes
+        # with this call's tz-aware exit asof at the asof-honesty comparison.
+        # Namespaced ("_deferred", ...) keys carry still-pending deferred exits
+        # forward verbatim — they are not position lots and are not re-matched.
         for k, v in open_lots.items():
-            lots[k] = [dict(lot) for lot in v]
+            copied = []
+            for lot in v:
+                lot_copy = dict(lot)
+                if "asof" in lot_copy:
+                    coerced = _coerce_asof(lot_copy["asof"])
+                    if coerced is not None:
+                        lot_copy["asof"] = coerced
+                copied.append(lot_copy)
+            lots[k] = copied
 
-    indexed = [{**rec, "_idx": i} for i, rec in enumerate(execution_records)]
+    # Review-team-3 defect (1): normalize every record from the REAL bus
+    # schema (ExecutionRecord / _record_to_dict) — there is no side/qty/asof
+    # key on a real fill. The adapter derives them; non-fills return None and
+    # are dropped (never fabricated). It also stamps the positional bus index
+    # so defect (2)'s deterministic, open-before-close tie-break holds.
+    indexed = []
+    for i, rec in enumerate(execution_records):
+        norm = _normalize_exec_record({**rec, "_idx": i})
+        if norm is not None:
+            indexed.append(norm)
     ordered = sorted(indexed, key=_exec_sort_key)
 
     round_trips: list[SettledRoundTrip] = []
+    # Review-team-3 defect (3): deferred exits — fills whose closing quantity
+    # could not honestly match the open queue because the only opposing lots
+    # opened LATER (carry-in lookahead). Held here, keyed by bucket, so they
+    # are returned still-pending instead of fabricating an opposing residual
+    # lot in a bucket that already holds the other direction. Stored under a
+    # distinct namespaced key in the returned open_lots so the one-direction
+    # invariant per real bucket is never violated.
+    deferred: dict[tuple, list[dict]] = {}
 
     for rec in ordered:
-        side = rec.get("side")
-        if side not in ("buy", "sell"):
-            continue
-        try:
-            qty = float(rec["qty"])
-            fill_price = float(rec["fill_price"])
-        except (KeyError, ValueError, TypeError):
-            continue
-        if qty <= 0 or fill_price <= 0:
-            continue
-        asof = _coerce_asof(rec.get("asof"))
-        if asof is None:
-            continue
-        fees = float(rec.get("fees", 0.0) or 0.0)
+        side = rec["side"]
+        qty = rec["qty"]
+        fill_price = rec["fill_price"]
+        asof = rec["asof"]
+        fees = rec["fees"]
 
         bucket = (
             rec.get("account_id"),
@@ -540,13 +715,17 @@ def join_exit_fills(
         # Opposing fill — close FIFO against the open queue.
         remaining = qty
         exit_fee_per_unit = fee_per_unit
+        asof_honest_break = False  # True if we stopped on a lookahead lot
         while remaining > 1e-12 and queue:
             lot = queue[0]
             # asof-honest: an entry must not be later than the exit closing it.
             if lot["asof"] > asof:
                 # Out-of-order record (lot opened "after" this exit). Skip the
                 # match rather than fabricate a lookahead pairing; leave the
-                # lot open. Deterministic + fail-closed.
+                # lot open. Deterministic + fail-closed. Defect (3): mark so we
+                # DEFER the unmatched exit instead of opening an opposing
+                # residual lot in this (now-mixed-direction) bucket.
+                asof_honest_break = True
                 break
             matched = min(lot["qty"], remaining)
             entry_price = lot["price"]
@@ -587,28 +766,59 @@ def join_exit_fills(
             if lot["qty"] <= 1e-12:
                 queue.pop(0)
 
-        # Residual opposing quantity beyond the open queue = a direction flip.
-        # Open a fresh lot in the new direction with the leftover (its fee
-        # share is the un-consumed remainder of this fill's fees).
+        # Residual quantity beyond what the open queue could honestly settle.
         if remaining > 1e-12:
-            queue.append(
-                {
-                    "asset": rec.get("asset"),
-                    "account_id": rec.get("account_id"),
-                    "asset_class": rec.get("asset_class"),
-                    "side": side,
-                    "qty": remaining,
-                    "price": fill_price,
-                    "asof": asof,
-                    "exec_id": rec.get("exec_id"),
-                    "signal_id": rec.get("signal_id"),
-                    "fee_per_unit": exit_fee_per_unit,
-                }
-            )
+            residual_lot = {
+                "asset": rec.get("asset"),
+                "account_id": rec.get("account_id"),
+                "asset_class": rec.get("asset_class"),
+                "side": side,
+                "qty": remaining,
+                "price": fill_price,
+                "asof": asof,
+                "exec_id": rec.get("exec_id"),
+                "signal_id": rec.get("signal_id"),
+                "fee_per_unit": exit_fee_per_unit,
+            }
+            if asof_honest_break:
+                # Defect (3): the queue still holds opposing lots that opened
+                # AFTER this exit (carry-in lookahead). We must NOT enqueue an
+                # opposing residual into that bucket — that would leave the
+                # bucket holding BOTH directions, violating the one-direction
+                # queue invariant. DEFER the exit: hold it still-pending in a
+                # namespaced bucket so it is returned to the caller (honestly
+                # unsettled) rather than fabricating a phantom opposing lot.
+                deferred.setdefault(bucket, []).append(residual_lot)
+            else:
+                # Genuine direction flip: the queue fully drained (every
+                # opposing lot was older and is now closed), so the leftover
+                # opens a fresh lot in the new direction. Single-direction
+                # invariant holds because `queue` is empty here.
+                queue.append(residual_lot)
 
         # Drop emptied buckets so open_lots only carries truly-open quantity.
         if not queue:
             lots.pop(bucket, None)
+
+    # ── invariant assertion: each real bucket holds exactly one direction ──
+    # Review-team-3 defect (3): a real position queue must never mix buy +
+    # sell lots. Namespaced ("_deferred", ...) keys are NOT position queues —
+    # they hold still-pending exits (possibly of differing sides across defer
+    # events), so they are exempt from the one-direction invariant.
+    for bkt, q in lots.items():
+        if bkt and bkt[0] == "_deferred":
+            continue
+        sides = {lot["side"] for lot in q}
+        assert len(sides) <= 1, (
+            f"one-direction-per-queue invariant violated in bucket {bkt}: {sides}"
+        )
+
+    # Merge deferred (still-pending, honestly-unsettled) exits into the
+    # returned open_lots under a namespaced key so they survive to the next
+    # incremental call without colliding with the real position bucket. Append
+    # (not overwrite) so deferred exits carried in from a prior call are kept.
+    for bkt, dlots in deferred.items():
+        lots.setdefault(("_deferred", *bkt), []).extend(dlots)
 
     return round_trips, lots
 
@@ -619,6 +829,7 @@ def compute_horizon_return(
     side: str,
     *,
     fees: float = 0.0,
+    qty: float = 1.0,
 ) -> float | None:
     """Realized holding-period return for one entry->exit pair, net of fees.
 
@@ -629,6 +840,14 @@ def compute_horizon_return(
         exit_price: lot exit fill price (> 0).
         side: ENTRY side — "buy" (long) or "sell" (short).
         fees: total fees on the round trip, in quote currency, to net out.
+        qty: lot quantity the ``fees`` were charged on (default 1.0).
+            Review-team-3 defect (5): fee drag is the fee burden divided by the
+            ENTRY NOTIONAL, which is ``entry_price * qty`` — exactly the
+            convention ``join_exit_fills`` uses (``prorated_fees /
+            (entry_price * matched)``). The original helper divided by
+            ``entry_price`` alone (an implicit qty=1), so the two disagreed
+            whenever qty != 1. With the explicit qty param they now agree, and
+            the default 1.0 keeps existing single-unit callers/tests identical.
 
     Returns:
         Net holding-period return (positive == the lot made money), or None if
@@ -641,19 +860,21 @@ def compute_horizon_return(
     try:
         ep = float(entry_price)
         xp = float(exit_price)
+        q = float(qty)
     except (ValueError, TypeError):
         return None
     if ep <= 0 or xp <= 0:
+        return None
+    if q <= 0:
         return None
     if side == "buy":
         gross = (xp - ep) / ep
     else:
         gross = (ep - xp) / ep
-    # Net of fees: prorate against entry notional (qty cancels, so pass total
-    # fees / (entry_price) per unit — caller supplies total fees and we treat
-    # one notional unit). For a per-unit-agnostic helper we express fee drag
-    # relative to entry price; callers with qty should use join_exit_fills.
-    fee_drag = (fees / ep) if (fees and ep > 0) else 0.0
+    # Net of fees: divide the total fee burden by the entry NOTIONAL
+    # (entry_price * qty), agreeing with join_exit_fills' prorated fee drag.
+    entry_notional = ep * q
+    fee_drag = (fees / entry_notional) if (fees and entry_notional > 0) else 0.0
     return gross - fee_drag
 
 

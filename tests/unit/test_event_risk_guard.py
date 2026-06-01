@@ -514,3 +514,105 @@ class TestO8GateIntegration:
             ),
         )
         assert res.admitted is True
+
+
+class TestO8AsofHonesty:
+    """seed f5ad: when event_risk IS supplied, decision_asof is REQUIRED.
+
+    The pre-fix O8 fell back to ``datetime.now(UTC)`` when decision_asof was
+    None. A past-dated replay/backtest caller that supplied event_risk but
+    forgot decision_asof would have measured the FORWARD earnings window against
+    wall-clock now() — systematically MISSING imminent-earnings rejects
+    (under-block). Fix: fail-closed (reject/silence) at the gate seam when
+    event_risk is supplied without decision_asof; the pure predicate is clock-
+    free. When event_risk is NOT supplied, the path stays byte-identical.
+    """
+
+    LONG_PREM = NetGreeks(delta=0.1, gamma=0.01, theta=-5.0, vega=12.0)
+
+    def test_event_risk_without_decision_asof_fails_closed(self, monkeypatch) -> None:
+        # event_risk supplied + master flag ON + decision_asof OMITTED => the
+        # gate REJECTS (silence) rather than silently measuring against now().
+        monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+        monkeypatch.setenv("HERMES_QUANT_EVENT_RISK", "1")
+        res = options_gate(
+            _long_premium_debit_vertical(),
+            **_long_premium_kwargs(
+                event_risk=_earnings_payload(offset=timedelta(days=2)),
+                # decision_asof intentionally omitted (defaults None).
+            ),
+        )
+        assert res.admitted is False
+        assert res.reason == "event_risk_requires_decision_asof"
+
+    def test_event_risk_without_asof_does_not_silently_now(self, monkeypatch) -> None:
+        # Hard proof the fail-closed reason is NOT a now()-measured outcome:
+        # an earnings date that is in the PAST relative to ASOF_DT but FORWARD of
+        # wall-clock now() would, under the old now() fallback, either be
+        # admitted (past-relative-to-now miss) or flagged as iv_crush. With the
+        # fix, the missing decision_asof short-circuits to the asof-guard reason
+        # BEFORE any window measurement runs.
+        monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+        monkeypatch.setenv("HERMES_QUANT_EVENT_RISK", "1")
+        far_future_print = {
+            "events": [
+                {
+                    "kind": "earnings",
+                    "impact": "high",
+                    "symbol": "NVDA",
+                    "scheduled_for": (
+                        datetime.now(UTC) + timedelta(days=3)
+                    ).isoformat(),
+                }
+            ]
+        }
+        res = options_gate(
+            _long_premium_debit_vertical(),
+            **_long_premium_kwargs(event_risk=far_future_print),
+        )
+        assert res.admitted is False
+        assert res.reason == "event_risk_requires_decision_asof"
+        assert res.reason != "earnings_proximity_iv_crush"
+
+    def test_with_both_window_measured_against_decision_asof(self, monkeypatch) -> None:
+        # With BOTH event_risk and decision_asof, the forward window is anchored
+        # on decision_asof (past-dated replay), NOT on wall-clock now(). The
+        # earnings print is 2 days FORWARD of ASOF_DT (a past date) and well in
+        # the PAST relative to now() — so a now()-anchored check would MISS it,
+        # but the decision_asof-anchored check correctly flags the IV-crush.
+        monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+        monkeypatch.setenv("HERMES_QUANT_EVENT_RISK", "1")
+        res = options_gate(
+            _long_premium_debit_vertical(),
+            **_long_premium_kwargs(
+                event_risk=_earnings_payload(offset=timedelta(days=2)),
+                decision_asof=ASOF_DT,
+            ),
+        )
+        assert res.admitted is False
+        assert res.reason == "earnings_proximity_iv_crush"
+
+    def test_no_event_risk_admits_regardless_of_asof(self, monkeypatch) -> None:
+        # event_risk NOT supplied => O8 never runs => the missing-asof guard never
+        # fires => byte-identical admit (decision_asof omitted is fine here).
+        monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+        monkeypatch.setenv("HERMES_QUANT_EVENT_RISK", "1")
+        res = options_gate(
+            _long_premium_debit_vertical(),
+            **_long_premium_kwargs(event_risk=None),
+        )
+        assert res.admitted is True
+        assert res.bucket == StructureBucket.DEFINED_RISK
+
+    def test_predicate_is_clock_free_none_asof_returns_none(self) -> None:
+        # The pure predicate reads NO clock: a None asof yields None (no
+        # fabricated blackout, no now() substitution). The fail-closed REJECT is
+        # the gate seam's responsibility, not the predicate's.
+        reason = _earnings_proximity_violation(
+            _earnings_payload(offset=timedelta(days=2)),
+            self.LONG_PREM,
+            underlying="NVDA",
+            asof=None,
+            dte_window=5,
+        )
+        assert reason is None
