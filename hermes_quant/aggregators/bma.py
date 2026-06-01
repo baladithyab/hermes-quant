@@ -26,14 +26,34 @@ Post-aggregation calibration:
 Per ADR-0009 §P1-10:
 - update() takes EpisodeOutcome (cross-sectional snapshot of all analysts at
   a single timestamp) — required for stacking/RL learning correlations.
-- v0.1.1 BMA only updates per-analyst Beta posteriors; correlations are
-  not yet exploited (deferred to StackingAggregator in v0.1.3).
+- v0.1.1 BMA only updates per-analyst Beta posteriors.
+
+Cross-correlation stacking (B50, flag-gated, DEFAULT-OFF):
+- The Beta-binomial posterior treats every analyst as an INDEPENDENT source of
+  evidence. When two analysts are perfectly correlated (they're right and wrong
+  on the same episodes — e.g. two TA analysts reading the same momentum signal),
+  the vote share double-counts them as if they were two independent confirmations.
+  This inflates the aggregate confidence relative to the true information content.
+- When the flag HERMES_QUANT_STACKING=1 is set (read at call time), the
+  aggregator down-weights correlated analysts by an effective-sample-size
+  redundancy factor derived from their pairwise correctness-correlation history
+  (accumulated in update()). Two perfectly-correlated analysts then contribute
+  strictly LESS than two independent ones.
+- This is purely a FUSION change upstream of the deterministic risk gate and the
+  sizing ladder: it only reshapes how peer views combine into the aggregate
+  confidence. It never touches the gate, the sizing ladder, or require_ensemble.
+- DEFAULT-OFF: when the flag is unset/!="1", the path is byte-identical to the
+  pre-B50 BMA. The correctness history is still accumulated (purely additive,
+  cheap) so toggling the flag on does not require a warm-up replay, but it is
+  NEVER read while the flag is off.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import pickle
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -127,15 +147,52 @@ logger = logging.getLogger(__name__)
 # floating-point noise from calibrators.
 ABSTAIN_THRESHOLD = 0.10
 
+# ---------------------------------------------------------------------------
+# Cross-correlation stacking (B50) — flag-gated, DEFAULT-OFF
+# ---------------------------------------------------------------------------
+
+# Rolling window (number of co-observed episodes) over which pairwise
+# correctness-correlation is measured. Bounded so the discount tracks the
+# CURRENT correlation structure rather than ancient history, and so memory is
+# O(n_analysts × window) regardless of runtime.
+STACKING_CORR_WINDOW = 200
+
+# Minimum number of CO-OBSERVED episodes (both analysts settled in the same
+# episode) required before a pairwise correlation is trusted. Below this the
+# pair is treated as independent (discount factor 1.0) — fail-open to the
+# conservative no-discount default rather than down-weighting on a noisy
+# 2-sample correlation.
+STACKING_CORR_MIN_PAIRS = 10
+
+
+def _stacking_enabled() -> bool:
+    """True iff HERMES_QUANT_STACKING=1 (read at CALL TIME, not import time).
+
+    DEFAULT-OFF: any value other than the exact string "1" leaves the
+    aggregator byte-identical to the pre-B50 BMA path.
+    """
+    return os.environ.get("HERMES_QUANT_STACKING", "0") == "1"
+
 
 @dataclass
 class _AnalystStats:
-    """Per-analyst Beta-binomial posterior."""
+    """Per-analyst Beta-binomial posterior.
+
+    ``history`` is a bounded ring of recent ``(episode_idx, correct)`` tuples
+    (B50). The episode index lets the correlation-discount path align two
+    analysts on CO-OBSERVED episodes only (analysts that settled at the same
+    timestamp), so a pair seen on disjoint episodes is never spuriously
+    correlated. It is ALWAYS accumulated (cheap, additive) but is ONLY consulted
+    when HERMES_QUANT_STACKING=1, so the OFF path is unaffected by its presence.
+    """
 
     name: str
     alpha: float
     beta: float
     n_observations: int = 0
+    history: deque[tuple[int, bool]] = field(
+        default_factory=lambda: deque(maxlen=STACKING_CORR_WINDOW)
+    )
 
     @property
     def posterior_accuracy(self) -> float:
@@ -209,6 +266,11 @@ class BMAAggregator:
 
         self._n_aggregated = 0
         self._last_aggregated_at: pd.Timestamp | None = None
+
+        # B50 cross-correlation stacking: monotone episode counter used to
+        # align per-analyst correctness histories on co-observed episodes.
+        # Incremented once per update() call (one EpisodeOutcome == one episode).
+        self._episode_idx = 0
 
         # IC dedup gate (Wave 6b).  When None (default), behavior is
         # bit-identical to pre-Wave-6 BMA.  When provided, analyst views whose
@@ -301,6 +363,74 @@ class BMAAggregator:
         horizon to AnalystView.horizon doesn't silently downweight views.
         """
         return float(self.horizon_weights.get(horizon, 1.0))
+
+    @staticmethod
+    def _pairwise_correctness_corr(
+        hist_a: list[tuple[int, bool]],
+        hist_b: list[tuple[int, bool]],
+    ) -> float | None:
+        """Pearson correlation of two analysts' CO-OBSERVED correctness series.
+
+        Aligns on shared episode indices only. Returns None when there are
+        fewer than ``STACKING_CORR_MIN_PAIRS`` co-observations, or when either
+        analyst's correctness is constant over the shared window (zero
+        variance → correlation undefined; treat as "no evidence of
+        redundancy"). The returned value is clamped to [-1, 1] for numerical
+        safety.
+        """
+        map_a = dict(hist_a)
+        map_b = dict(hist_b)
+        shared = map_a.keys() & map_b.keys()
+        if len(shared) < STACKING_CORR_MIN_PAIRS:
+            return None
+        xs = np.fromiter((1.0 if map_a[i] else 0.0 for i in shared), dtype=float)
+        ys = np.fromiter((1.0 if map_b[i] else 0.0 for i in shared), dtype=float)
+        # Constant series → undefined correlation → no redundancy evidence.
+        if xs.std() < 1e-12 or ys.std() < 1e-12:
+            return None
+        rho = float(np.corrcoef(xs, ys)[0, 1])
+        if not np.isfinite(rho):
+            return None
+        return float(np.clip(rho, -1.0, 1.0))
+
+    def _redundancy_factors(self, analyst_names: list[str]) -> dict[str, float]:
+        """Per-analyst redundancy discount in (0, 1] from correctness-correlation.
+
+        B50 cross-correlation stacking. Correlated analysts are not independent
+        evidence: if analyst i is right/wrong on the SAME episodes as its peers,
+        it adds little information beyond them. We discount each analyst by
+
+            f_i = 1 / (1 + Σ_{j != i} max(0, ρ_ij))
+
+        where ρ_ij is the pairwise correctness correlation (None / negative
+        treated as 0 — anti-correlated or independent analysts are genuinely
+        additional evidence and are NOT discounted). Properties:
+
+          * Two PERFECTLY-correlated analysts (ρ=1): each f = 1/2, so their
+            COMBINED contribution is 1.0 — exactly one independent analyst.
+          * Two INDEPENDENT analysts (ρ=0 or insufficient data): each f = 1,
+            combined contribution 2.0 — strictly MORE than the correlated pair.
+
+        This is the effective-sample-size correction that prevents redundant
+        peers from double-counting in the fused confidence. Caller multiplies
+        these factors into per-analyst weights upstream of the gate.
+        """
+        factors: dict[str, float] = {name: 1.0 for name in analyst_names}
+        if len(analyst_names) < 2:
+            return factors
+        hists = {
+            name: list(self._get_or_create_stats(name).history) for name in analyst_names
+        }
+        for name in analyst_names:
+            redundancy = 0.0
+            for other in analyst_names:
+                if other == name:
+                    continue
+                rho = self._pairwise_correctness_corr(hists[name], hists[other])
+                if rho is not None and rho > 0.0:
+                    redundancy += rho
+            factors[name] = 1.0 / (1.0 + redundancy)
+        return factors
 
     def aggregate(
         self,
@@ -426,6 +556,23 @@ class BMAAggregator:
         else:
             _regime_adjusted = {}
 
+        # B50 cross-correlation stacking (DEFAULT-OFF, flag read at CALL TIME).
+        # When the flag is unset this stays None and the weights loop below is
+        # byte-identical to the pre-B50 BMA. When set, correlated analysts are
+        # discounted by an effective-sample-size redundancy factor so two
+        # perfectly-correlated peers contribute strictly less than two
+        # independent ones. This reshapes ONLY the fused confidence upstream of
+        # the deterministic gate — it never touches the gate or sizing ladder.
+        redundancy_factors: dict[str, float] | None = None
+        stacking_used = False
+        if _stacking_enabled():
+            redundancy_factors = self._redundancy_factors(
+                [v.analyst for v in views]
+            )
+            # Record whether the discount actually bit (any factor < 1) so the
+            # OFF/uninformative case is auditable as a no-op in metadata.
+            stacking_used = any(f < 1.0 - 1e-12 for f in redundancy_factors.values())
+
         weights = []
         signed_terms = []  # direction × magnitude × weight × confidence
         signed_dir_terms = []  # direction × weight × confidence (for direction)
@@ -441,6 +588,9 @@ class BMAAggregator:
             #   below (so the full ADR formula is base × horizon × confidence).
             h_w = self._horizon_weight(v.horizon)
             w = base_w * h_w
+            # B50: apply the correlation redundancy discount when stacking is on.
+            if redundancy_factors is not None:
+                w *= redundancy_factors.get(v.analyst, 1.0)
             weights.append(w)
             signed_dir_terms.append(v.direction * w * v.confidence)
 
@@ -575,6 +725,27 @@ class BMAAggregator:
                     np.clip(confidence * self.config.horizon_disagreement_penalty, 0.0, 1.0)
                 )
 
+        metadata = {
+            "weights": {v.analyst: w for v, w in zip(views, weights, strict=False)},
+            "vote_share": float(vote_share),
+            "n_contributing": len(contributing),
+            "n_views": len(views),
+            # ADR-0036 audit fields
+            "horizons_present": horizons_present,
+            "horizon_agreement": horizon_agreement,
+            # Wave 6b: IC dedup audit
+            "ic_dedup_excluded_analysts": ic_dedup_excluded,
+            # Wave 7: regime audit (None when regime_detector is not set)
+            "regime_state": regime_state_value,
+            "regime_weight_multipliers": regime_weight_multipliers,
+        }
+        # B50 stacking audit fields — injected ONLY when the flag is on, so the
+        # OFF-path metadata dict is byte-identical to the pre-B50 BMA. The
+        # discounted weights are already reflected in metadata["weights"].
+        if redundancy_factors is not None:
+            metadata["stacking_redundancy_factors"] = redundancy_factors
+            metadata["stacking_used"] = stacking_used
+
         signal = AggregatedSignal(
             asset=context.asset,
             timeframe=context.timeframe,
@@ -587,20 +758,7 @@ class BMAAggregator:
             horizon=horizon,
             components=tuple(views),
             aggregator=self.name,
-            metadata={
-                "weights": {v.analyst: w for v, w in zip(views, weights, strict=False)},
-                "vote_share": float(vote_share),
-                "n_contributing": len(contributing),
-                "n_views": len(views),
-                # ADR-0036 audit fields
-                "horizons_present": horizons_present,
-                "horizon_agreement": horizon_agreement,
-                # Wave 6b: IC dedup audit
-                "ic_dedup_excluded_analysts": ic_dedup_excluded,
-                # Wave 7: regime audit (None when regime_detector is not set)
-                "regime_state": regime_state_value,
-                "regime_weight_multipliers": regime_weight_multipliers,
-            },
+            metadata=metadata,
         )
         self._n_aggregated += 1
         self._last_aggregated_at = context.asof
@@ -641,9 +799,19 @@ class BMAAggregator:
         Per ADR-0009 §P1-10: EpisodeOutcome contains AggregatedSignal +
         per-horizon realized returns + per-analyst direction_correct map.
 
-        v0.1.1: per-analyst Beta update only. Cross-correlation not yet
-        exploited (StackingAggregator in v0.1.3).
+        Beta update: per-analyst directional accuracy (unchanged).
+
+        B50 cross-correlation stacking: in ADDITION to the Beta update, each
+        analyst's per-episode correctness is appended to a bounded ring keyed
+        by a shared episode index. This history feeds the correlation-discount
+        path in aggregate() when HERMES_QUANT_STACKING=1. The accumulation is
+        purely additive — it mutates no Beta posterior and changes no return
+        value, so update() is byte-identical to pre-B50 with the flag off. We
+        accumulate UNCONDITIONALLY (not flag-gated) so flipping the flag on does
+        not require a settlement replay to warm up the correlation window.
         """
+        episode_idx = self._episode_idx
+        self._episode_idx += 1
         for view in outcome.aggregated_signal.components:
             stats = self._get_or_create_stats(view.analyst)
             correct = outcome.direction_correct.get(view.analyst)
@@ -654,6 +822,8 @@ class BMAAggregator:
                 stats.alpha += 1.0
             else:
                 stats.beta += 1.0
+            # B50: append (episode_idx, correct) for co-observation alignment.
+            stats.history.append((episode_idx, bool(correct)))
 
     def status(self) -> dict:
         return {
