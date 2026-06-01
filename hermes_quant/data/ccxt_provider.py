@@ -104,10 +104,70 @@ class CcxtProvider:
                 self._ex.set_sandbox_mode(True)
 
     # ------------------------------------------------------------------
-    # Public API — DataProvider Protocol
+    # Public API — DataProvider Protocol (canonical signature)
     # ------------------------------------------------------------------
 
     def fetch_bars(
+        self,
+        asset: str,
+        timeframe: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        *,
+        use_cache: bool = True,
+        as_of: pd.Timestamp | None = None,
+    ) -> pd.DataFrame:
+        """Fetch OHLCV bars on the CANONICAL DataProvider Protocol signature.
+
+        B22 (R-B22, 2026-05-31): unified ``fetch_bars(asset, timeframe, start,
+        end, *, use_cache, as_of)`` so ``CcxtProvider`` conforms to its own
+        Protocol and can sit in ``fetch_with_chain`` next to yfinance/AV.
+        ``lookback_bars`` is DERIVED from ``[start, end]`` (same math as the
+        CLI at cli/__init__.py) and the call delegates to the crypto-specific
+        :meth:`_fetch_crypto_bars`, which retains the original behavior.
+
+        Args:
+            asset: unified crypto symbol WITH slash, e.g. 'BTC/USDT'.
+            timeframe: one of _VALID_TIMEFRAMES.
+            start, end: UTC range. Used to derive ``lookback_bars`` and (when
+                ``as_of`` is None) the as_of cutoff (``end``), so the legacy
+                lookahead-safe close-time filter is preserved.
+            use_cache: accepted for interface symmetry (forwarded by the
+                chain); ccxt does its own pagination, no provider-level cache.
+            as_of: lookahead cutoff; if None, derived from ``end`` (then from
+                wall-clock now if ``end`` is also None) so the filter never
+                admits future bars.
+
+        Returns:
+            DataFrame ['timestamp', 'open', 'high', 'low', 'close', 'volume'],
+            tz-aware UTC bar OPEN times, ascending.
+
+        Raises:
+            DataProviderError: invalid symbol/timeframe
+            RateLimitError: ccxt RateLimitExceeded after retries
+            DataQualityError: validate_bars rejected the result
+        """
+        # Derive the lookahead cutoff: explicit as_of wins; else end; else now.
+        effective_as_of = as_of if as_of is not None else end
+
+        # Derive lookback_bars from [start, end] (same math as the CLI).
+        lookback_bars = 200
+        if start is not None and end is not None and timeframe in _TF_SECONDS:
+            s = pd.Timestamp(start)
+            e = pd.Timestamp(end)
+            delta_seconds = (e - s).total_seconds()
+            if delta_seconds > 0:
+                lookback_bars = max(int(delta_seconds / _TF_SECONDS[timeframe]) + 5, 2)
+
+        return self._fetch_crypto_bars(
+            asset,
+            "crypto",
+            timeframe,
+            lookback_bars=lookback_bars,
+            as_of=effective_as_of,
+        )
+
+    def _fetch_crypto_bars(
         self,
         symbol: str,
         asset_class: str,
@@ -116,7 +176,13 @@ class CcxtProvider:
         lookback_bars: int = 200,
         as_of: pd.Timestamp | None = None,
     ) -> pd.DataFrame:
-        """Fetch OHLCV bars; lookahead-safe per ADR-0017 §D3.
+        """Crypto-specific OHLCV fetch; lookahead-safe per ADR-0017 §D3.
+
+        B22: this is the ORIGINAL ``fetch_bars`` body, renamed so the public
+        ``fetch_bars`` can expose the canonical Protocol signature without
+        breaking the lookback/as_of semantics. Callers needing the legacy
+        crypto-shaped call (``symbol, asset_class, timeframe, lookback_bars``)
+        can use this directly.
 
         Returns DataFrame indexed 0..N-1 with columns
         ['timestamp', 'open', 'high', 'low', 'close', 'volume'].

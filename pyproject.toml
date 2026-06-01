@@ -43,6 +43,10 @@ yfinance = ["yfinance>=0.2.40", "pyyaml>=6.0"]
 ccxt = ["ccxt>=4.2"]
 # US equities data + execution
 alpaca = ["alpaca-py>=0.30"]
+# Alpha Vantage equity OHLCV fallback tier (B22). `requests` is already a
+# transitive base dep; this extra is symbolic (mirrors the empty `options`
+# extra) so consumers can opt-in explicitly.
+alphavantage = ["requests>=2.31"]
 # Kronos foundation-model analyst (heavy: torch + HF)
 kronos = [
     "torch>=2.0",
@@ -63,7 +67,7 @@ mlflow = ["mlflow>=2.10"]
 options = []
 # Convenience: full feature set excluding GPU-only torch builds
 all = [
-    "hermes-quant[yfinance,ccxt,alpaca,kronos,stacking,backtest,mlflow,options]",
+    "hermes-quant[yfinance,ccxt,alpaca,alphavantage,kronos,stacking,backtest,mlflow,options]",
 ]
 # Dev / testing
 dev = [
@@ -83,6 +87,7 @@ test = [
     "hermes-quant[stacking]",
     "hermes-quant[ccxt]",
     "hermes-quant[alpaca]",
+    "hermes-quant[alphavantage]",
     "hermes-quant[yfinance]",
     "hermes-quant[backtest]",
     "pyarrow>=15.0",
@@ -112,7 +117,14 @@ deliberative_committee = "hermes_quant.aggregators.deliberative:DeliberativeComm
 [project.entry-points."hermes_quant.data_providers"]
 yfinance = "hermes_quant.data.yfinance_provider:YFinanceProvider"
 ccxt = "hermes_quant.data.ccxt_provider:CcxtProvider"
-alpaca = "hermes_quant.data.alpaca_provider:AlpacaProvider"
+alphavantage = "hermes_quant.data.alphavantage_provider:AlphaVantageProvider"
+# NOTE (B22, R-B22): the `alpaca` data-provider entry point was removed —
+# `hermes_quant/data/alpaca_provider.py` does not exist, so the dangling line
+# made `discover_data_providers()` log a "failed to load entry point" warning
+# on every daemon boot (same anti-pattern as the `stacking` aggregator note
+# above). Re-add `alpaca = "...alpaca_provider:AlpacaProvider"` in the same
+# commit that lands the module. The `[alpaca]` dependency extra stays (the
+# alpaca-py SDK is used by the execution side).
 
 [project.scripts]
 hermes-quant-daemon = "hermes_quant.daemon.main:main"

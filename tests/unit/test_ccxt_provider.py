@@ -10,6 +10,13 @@ Covers:
   - lazy import: module loads without ccxt installed (fake_factory path)
   - Empty result -> DataQualityError
   - <2 bars after as_of filter -> DataQualityError
+
+B22 (R-B22, 2026-05-31): the public ``fetch_bars`` now exposes the CANONICAL
+DataProvider Protocol signature ``(asset, timeframe, start, end, *, use_cache,
+as_of)`` and delegates to the renamed crypto-specific ``_fetch_crypto_bars``.
+The legacy-shaped tests below exercise ``_fetch_crypto_bars`` directly; a
+dedicated test verifies the canonical wrapper derives lookback/as_of and
+delegates so ccxt can sit in ``fetch_with_chain``.
 """
 
 from __future__ import annotations
@@ -110,17 +117,17 @@ def provider_with_bars(hourly_bars):
 
 def test_rejects_unknown_asset_class(provider_with_bars):
     with pytest.raises(DataProviderError, match="asset_class"):
-        provider_with_bars.fetch_bars("BTC/USDT", "equity", "1h")
+        provider_with_bars._fetch_crypto_bars("BTC/USDT", "equity", "1h")
 
 
 def test_rejects_invalid_timeframe(provider_with_bars):
     with pytest.raises(DataProviderError, match="timeframe"):
-        provider_with_bars.fetch_bars("BTC/USDT", "crypto", "999h")
+        provider_with_bars._fetch_crypto_bars("BTC/USDT", "crypto", "999h")
 
 
 def test_rejects_no_slash_symbol(provider_with_bars):
     with pytest.raises(DataProviderError, match="unified format"):
-        provider_with_bars.fetch_bars("BTCUSDT", "crypto", "1h")
+        provider_with_bars._fetch_crypto_bars("BTCUSDT", "crypto", "1h")
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +143,7 @@ def test_as_of_drops_in_flight_bar(provider_with_bars, hourly_bars):
     # The bar opening at 13:00 closes at 14:00 ≤ 14:30 → ADMITTED.
     # Result: 14 bars (open_times 0..13).
     as_of = pd.Timestamp("2026-05-13T14:30:00Z")
-    result = provider_with_bars.fetch_bars(
+    result = provider_with_bars._fetch_crypto_bars(
         "BTC/USDT",
         "crypto",
         "1h",
@@ -152,7 +159,7 @@ def test_as_of_exactly_on_close_admits_bar(provider_with_bars):
     """as_of == bar close_time must ADMIT that bar (≤, not <)."""
     # Bar opening 13:00 closes at 14:00. as_of=14:00 -> bar admitted.
     as_of = pd.Timestamp("2026-05-13T14:00:00Z")
-    result = provider_with_bars.fetch_bars(
+    result = provider_with_bars._fetch_crypto_bars(
         "BTC/USDT",
         "crypto",
         "1h",
@@ -166,7 +173,7 @@ def test_as_of_exactly_on_close_admits_bar(provider_with_bars):
 def test_as_of_one_second_before_close_drops_bar(provider_with_bars):
     """as_of one second BEFORE close_time must DROP that bar."""
     as_of = pd.Timestamp("2026-05-13T13:59:59Z")
-    result = provider_with_bars.fetch_bars(
+    result = provider_with_bars._fetch_crypto_bars(
         "BTC/USDT",
         "crypto",
         "1h",
@@ -188,7 +195,7 @@ def test_default_as_of_is_now(hourly_bars):
         timeframe_seconds=3600,
     )
     provider = CcxtProvider(_exchange_factory=lambda: FakeExchange(rows=rows))
-    result = provider.fetch_bars("BTC/USDT", "crypto", "1h")
+    result = provider._fetch_crypto_bars("BTC/USDT", "crypto", "1h")
     # All 10 bars close in the past -> all admitted
     assert len(result) == 10
 
@@ -200,7 +207,7 @@ def test_default_as_of_is_now(hourly_bars):
 
 def test_returns_at_most_lookback_bars(provider_with_bars):
     as_of = pd.Timestamp("2026-05-13T23:00:00Z")
-    result = provider_with_bars.fetch_bars(
+    result = provider_with_bars._fetch_crypto_bars(
         "BTC/USDT",
         "crypto",
         "1h",
@@ -213,7 +220,7 @@ def test_returns_at_most_lookback_bars(provider_with_bars):
 def test_returns_tail_not_head(provider_with_bars):
     """When more bars exist than lookback, return the LATEST ones."""
     as_of = pd.Timestamp("2026-05-13T23:00:00Z")
-    result = provider_with_bars.fetch_bars(
+    result = provider_with_bars._fetch_crypto_bars(
         "BTC/USDT",
         "crypto",
         "1h",
@@ -233,7 +240,7 @@ def test_returns_tail_not_head(provider_with_bars):
 def test_empty_result_raises_data_quality_error():
     provider = CcxtProvider(_exchange_factory=lambda: FakeExchange(rows=[]))
     with pytest.raises(DataQualityError, match="no bars"):
-        provider.fetch_bars("BTC/USDT", "crypto", "1h")
+        provider._fetch_crypto_bars("BTC/USDT", "crypto", "1h")
 
 
 def test_insufficient_bars_after_as_of_filter_raises(hourly_bars):
@@ -242,7 +249,7 @@ def test_insufficient_bars_after_as_of_filter_raises(hourly_bars):
     # as_of before any bars exist -> filter drops everything
     as_of = pd.Timestamp("2025-01-01T00:00:00Z")
     with pytest.raises(DataQualityError, match="bars remain"):
-        provider.fetch_bars("BTC/USDT", "crypto", "1h", as_of=as_of)
+        provider._fetch_crypto_bars("BTC/USDT", "crypto", "1h", as_of=as_of)
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +349,7 @@ def test_pagination_terminates_on_empty_chunk():
     fake = FakeExchange(rows=[])
     provider = CcxtProvider(_exchange_factory=lambda: fake)
     with pytest.raises(DataQualityError):
-        provider.fetch_bars("BTC/USDT", "crypto", "1h")
+        provider._fetch_crypto_bars("BTC/USDT", "crypto", "1h")
     assert len(fake.calls) == 1
 
 
@@ -355,7 +362,7 @@ def test_pagination_terminates_on_partial_page():
     )
     fake = FakeExchange(rows=rows)
     provider = CcxtProvider(_exchange_factory=lambda: fake)
-    result = provider.fetch_bars(
+    result = provider._fetch_crypto_bars(
         "BTC/USDT",
         "crypto",
         "1h",
@@ -376,7 +383,47 @@ def test_pagination_terminates_on_partial_page():
 def test_provider_does_not_silently_normalize_symbols(provider_with_bars):
     """Per ADR-0017 §D2, no-slash symbols raise immediately, not silently retry."""
     with pytest.raises(DataProviderError, match="ccxt rejects"):
-        provider_with_bars.fetch_bars("ETHUSDT", "crypto", "1h")
+        provider_with_bars._fetch_crypto_bars("ETHUSDT", "crypto", "1h")
+
+
+# ---------------------------------------------------------------------------
+# B22: canonical Protocol signature (fetch_bars delegates to _fetch_crypto_bars)
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_fetch_bars_signature_delegates(hourly_bars):
+    """fetch_bars(asset, timeframe, start, end, *, use_cache, as_of) works.
+
+    The canonical wrapper must derive lookback from [start, end], pass as_of
+    (defaulting to end when None), and return the same bars _fetch_crypto_bars
+    would for the equivalent window — so ccxt can sit in fetch_with_chain.
+    """
+    provider = CcxtProvider(_exchange_factory=lambda: FakeExchange(rows=hourly_bars))
+    start = pd.Timestamp("2026-05-13T00:00:00Z")
+    end = pd.Timestamp("2026-05-13T14:00:00Z")
+    result = provider.fetch_bars("BTC/USDT", "1h", start, end, use_cache=True)
+    # Bars opening 0..13 close at 1..14; as_of defaults to end=14:00 -> 14 bars.
+    assert len(result) == 14
+    assert result["timestamp"].iloc[-1] == pd.Timestamp("2026-05-13T13:00:00Z")
+
+
+def test_canonical_fetch_bars_explicit_as_of_overrides_end(hourly_bars):
+    """An explicit as_of wins over end in the canonical signature."""
+    provider = CcxtProvider(_exchange_factory=lambda: FakeExchange(rows=hourly_bars))
+    start = pd.Timestamp("2026-05-13T00:00:00Z")
+    end = pd.Timestamp("2026-05-13T23:00:00Z")
+    result = provider.fetch_bars(
+        "BTC/USDT", "1h", start, end, as_of=pd.Timestamp("2026-05-13T14:00:00Z")
+    )
+    assert result["timestamp"].iloc[-1] == pd.Timestamp("2026-05-13T13:00:00Z")
+
+
+def test_canonical_fetch_bars_rejects_no_slash(provider_with_bars):
+    """Canonical path still rejects no-slash symbols via _fetch_crypto_bars."""
+    start = pd.Timestamp("2026-05-13T00:00:00Z")
+    end = pd.Timestamp("2026-05-13T14:00:00Z")
+    with pytest.raises(DataProviderError, match="unified format"):
+        provider_with_bars.fetch_bars("BTCUSDT", "1h", start, end)
 
 
 # ---------------------------------------------------------------------------

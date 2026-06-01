@@ -45,8 +45,10 @@ from hermes_quant.data.yfinance_provider import YFinanceProvider
 # counters across the dispatch table.
 # ---------------------------------------------------------------------------
 _YFINANCE: YFinanceProvider | None = None
-# NOTE: _CCXT singleton + _get_ccxt() helper removed in commit 95173a6
-# follow-up — see signature-compatibility note in VENDOR_METHODS below.
+# B22 (R-B22, 2026-05-31): _CCXT singleton restored. CcxtProvider.fetch_bars
+# now exposes the canonical Protocol signature, so ccxt can re-join the
+# dispatch table (closes the signature-split TODO below).
+_CCXT: Any = None
 
 
 def _get_yfinance() -> YFinanceProvider:
@@ -61,6 +63,21 @@ def _get_yfinance() -> YFinanceProvider:
     if _YFINANCE is None:
         _YFINANCE = YFinanceProvider()
     return _YFINANCE
+
+
+def _get_ccxt() -> Any:
+    """Lazily instantiate the CcxtProvider singleton (default exchange).
+
+    Lazy construction is REQUIRED here: CcxtProvider.__init__ imports ccxt
+    and constructs an exchange client, which must not happen at module import
+    (would break test collection on machines without ccxt configured).
+    """
+    global _CCXT
+    if _CCXT is None:
+        from hermes_quant.data.ccxt_provider import CcxtProvider
+
+        _CCXT = CcxtProvider()
+    return _CCXT
 
 
 # ---------------------------------------------------------------------------
@@ -81,26 +98,24 @@ def _yfinance_fetch_bars(*args: Any, **kwargs: Any) -> Any:
     return _get_yfinance().fetch_bars(*args, **kwargs)
 
 
-# NOTE: _ccxt_fetch_bars closure removed in commit 95173a6 follow-up —
-# CcxtProvider.fetch_bars signature differs from YFinanceProvider's, so it
-# cannot sit in the same dispatch entry. Reintroduce when DataProvider
-# Protocol unifies the signature (future ADR).
+def _ccxt_fetch_bars(*args: Any, **kwargs: Any) -> Any:
+    # B22: CcxtProvider.fetch_bars now conforms to the canonical Protocol
+    # signature (asset, timeframe, start, end, *, use_cache, as_of), so it can
+    # sit in the same dispatch entry as yfinance.
+    return _get_ccxt().fetch_bars(*args, **kwargs)
 
 
 VENDOR_METHODS: dict[str, dict[str, Callable[..., Any]]] = {
     "fetch_bars": {
         "yfinance": _yfinance_fetch_bars,
-        # NOTE: CcxtProvider.fetch_bars signature is currently
-        # `(symbol, asset_class, timeframe, *, lookback_bars, as_of)` —
-        # NOT compatible with YFinanceProvider.fetch_bars
-        # `(asset, timeframe, start, end, ...)`. Calling
-        # ``route_to_vendor("fetch_bars", "ccxt")`` and passing
-        # yfinance-style args would raise TypeError. Until the
-        # DataProvider Protocol unifies these signatures (planned for a
-        # future ADR), ccxt is intentionally absent from the dispatch
-        # table; callers that need ccxt klines should construct a
-        # CcxtProvider directly. Caught by Codex review of commit
-        # 95173a6 (Wave D, P11/P12).
+        # B22 (R-B22, 2026-05-31): ccxt re-added. CcxtProvider.fetch_bars now
+        # exposes the canonical signature
+        # `(asset, timeframe, start, end, *, use_cache, as_of)` — identical to
+        # YFinanceProvider — so ``route_to_vendor("fetch_bars", "ccxt")`` works
+        # with the same call shape. The legacy crypto-specific path moved to
+        # CcxtProvider._fetch_crypto_bars. Closes the signature-split TODO from
+        # commit 95173a6 (Wave D, P11/P12).
+        "ccxt": _ccxt_fetch_bars,
     },
 }
 
@@ -117,10 +132,9 @@ TOOLS_CATEGORIES: dict[str, list[str]] = {
 }
 
 
-VENDOR_LIST: list[str] = ["yfinance"]
-# NOTE: "ccxt" is intentionally NOT in VENDOR_LIST as of commit 95173a6
-# follow-up — see signature-compatibility note above. Add when the
-# DataProvider Protocol unifies fetch_bars across vendors.
+VENDOR_LIST: list[str] = ["yfinance", "ccxt"]
+# B22 (R-B22, 2026-05-31): "ccxt" re-added now that CcxtProvider.fetch_bars
+# conforms to the canonical DataProvider Protocol signature (see note above).
 
 
 def route_to_vendor(method: str, vendor: str) -> Callable[..., Any]:

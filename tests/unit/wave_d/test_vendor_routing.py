@@ -84,16 +84,18 @@ def test_route_to_vendor_yfinance_dispatches_to_yfinance_provider() -> None:
     # that here to keep the test offline-safe.
 
 
-def test_route_to_vendor_unknown_ccxt_raises() -> None:
-    """ccxt was removed from VENDOR_METHODS due to fetch_bars signature
-    incompatibility (see commit 95173a6 follow-up). Until the
-    DataProvider Protocol unifies the signature, ccxt is not in the
-    dispatch table; calling route_to_vendor("fetch_bars", "ccxt") must
-    raise KeyError so callers get a clear failure rather than a
-    surprise TypeError on first call.
+def test_route_to_vendor_ccxt_resolves() -> None:
+    """B22 (R-B22, 2026-05-31): ccxt re-added to the dispatch table.
+
+    CcxtProvider.fetch_bars now conforms to the canonical Protocol signature
+    `(asset, timeframe, start, end, *, use_cache, as_of)`, so
+    route_to_vendor("fetch_bars", "ccxt") resolves to the _ccxt_fetch_bars
+    closure (no longer a KeyError). The closure does not construct a provider
+    until called, so this stays side-effect-free.
     """
-    with pytest.raises(KeyError, match="does not implement"):
-        vr.route_to_vendor("fetch_bars", "ccxt")
+    fn = vr.route_to_vendor("fetch_bars", "ccxt")
+    assert fn is vr._ccxt_fetch_bars
+    assert callable(fn)
 
 
 def test_category_for_method_happy_path() -> None:
@@ -142,8 +144,13 @@ def test_dispatch_closures_are_callable_without_provider_instantiation() -> None
     """
     # The closure objects themselves are real callables
     assert callable(vr._yfinance_fetch_bars)
+    assert callable(vr._ccxt_fetch_bars)
     # And they appear in the dispatch table
     assert vr.VENDOR_METHODS["fetch_bars"]["yfinance"] is vr._yfinance_fetch_bars
-    # ccxt is intentionally absent (signature mismatch — see commit 95173a6)
-    assert "ccxt" not in vr.VENDOR_METHODS["fetch_bars"]
-    assert "ccxt" not in vr.VENDOR_LIST
+    # B22: ccxt re-added now that fetch_bars conforms to the canonical
+    # Protocol signature. The closure still does NOT construct a provider at
+    # import — _get_ccxt() lazy-imports ccxt only on first call.
+    assert vr.VENDOR_METHODS["fetch_bars"]["ccxt"] is vr._ccxt_fetch_bars
+    assert "ccxt" in vr.VENDOR_LIST
+    # Importing vendor_routing must not have built the ccxt singleton yet.
+    assert vr._CCXT is None
