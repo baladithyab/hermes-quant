@@ -41,7 +41,7 @@ import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -162,7 +162,7 @@ def _parse_ts(s: str | datetime | None) -> datetime | None:
                 try:
                     dt = datetime.strptime(s, fmt)
                     if fmt.endswith("Z"):
-                        dt = dt.replace(tzinfo=timezone.utc)
+                        dt = dt.replace(tzinfo=UTC)
                     break
                 except ValueError:
                     continue
@@ -175,8 +175,8 @@ def _parse_ts(s: str | datetime | None) -> datetime | None:
     if dt is None:
         return None
     if dt.tzinfo is None:  # naive -> assume UTC (last resort, made explicit)
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _norm_kind(s: str | None) -> str:
@@ -666,9 +666,9 @@ def ingest_yfinance_earnings(
     ``.calendar`` is the yfinance dict) for offline tests. A missing/empty/failed
     lookup for a symbol yields NO event (never fabricate a blackout). Never raises.
     """
-    observed = asof or datetime.now(timezone.utc)
+    observed = asof or datetime.now(UTC)
     if observed.tzinfo is None:
-        observed = observed.replace(tzinfo=timezone.utc)
+        observed = observed.replace(tzinfo=UTC)
     factory = ticker_factory or _default_ticker_factory
     t0 = time.monotonic()
     rows: list[dict] = []
@@ -783,5 +783,5 @@ def visible_at(events: Iterable[CalendarEvent], decision_asof: datetime) -> list
     one whose ``scheduled_for`` is still in the future.) Pure; never raises.
     """
     if decision_asof.tzinfo is None:
-        decision_asof = decision_asof.replace(tzinfo=timezone.utc)
+        decision_asof = decision_asof.replace(tzinfo=UTC)
     return [e for e in events if e.announced_at <= decision_asof]
