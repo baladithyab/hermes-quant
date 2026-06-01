@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -342,3 +343,345 @@ def dispatch_settlement(
             logger.warning("aggregator update failed for %s: %s", sig_id, e)
 
     return stats
+
+
+# ===========================================================================
+# Settlement v0.1.2 — exit-fill joining + horizon-return math (ADR-0083 Phase 0b)
+# ===========================================================================
+#
+# Everything below is PURELY ADDITIVE measurement infrastructure. It does NOT
+# touch the deterministic risk gate, the sizing ladder, the kill-switch, or
+# the slippage_only calibration gate above. It reads the SAME executions.jsonl
+# records the rest of the loop reads and joins an EXIT fill to its ENTRY fill
+# so a realized holding-period return can be computed and written to a
+# settlement record. The reflector + calibrator may then read realized alpha.
+#
+# Why this is the keystone (ADR-0083): settlement v0.1.1 computes per-fill
+# SLIPPAGE only — it never joins an exit to its entry, so a multi-period hold
+# cannot be scored, which blocks BMA Beta auto-learning (O6) and any
+# horizon-mode measurement. Joining the pair and computing entry->exit return
+# net of cost is the measurement instrument every eval depends on.
+#
+# Honesty rails:
+#   - asof-honest: an exit fill is only matched against entries whose asof is
+#     <= the exit's asof (no lookahead — you cannot close a lot before you
+#     opened it).
+#   - no fabrication: an unpaired / still-open lot yields realized_return=None,
+#     NOT 0.0. A fabricated 0 would silently feed the calibrator a "flat"
+#     outcome that never happened.
+#   - net of the existing cost model: the realized return is computed on the
+#     actual fill prices (which already embed the slippage envelope applied at
+#     fill time, ADR-0070) and is further netted of the explicit `fees`
+#     recorded on both legs. No new cost assumption is introduced.
+#   - deterministic: FIFO lot matching over records in bus order; no RNG, no
+#     clock reads.
+
+
+@dataclass(frozen=True)
+class SettledRoundTrip:
+    """A joined entry+exit (or partial-exit) lot with its realized return.
+
+    A single exit fill may settle quantity drawn from multiple FIFO entry
+    lots; each (entry_lot, exit_fill) pairing of matched quantity produces one
+    SettledRoundTrip. Realized return is the holding-period return on the
+    matched quantity, entry_price -> exit_price, net of the prorated fees on
+    both legs.
+
+    asof_entry <= asof_exit is guaranteed by the matcher (asof-honest).
+    """
+
+    asset: str
+    account_id: str
+    asset_class: str
+    side: str  # the ENTRY side: "buy" (long lot) or "sell" (short lot)
+    qty: float  # matched quantity settled by this pairing (always > 0)
+    entry_price: float
+    exit_price: float
+    asof_entry: pd.Timestamp
+    asof_exit: pd.Timestamp
+    entry_exec_id: str | None
+    exit_exec_id: str | None
+    entry_signal_id: str | None
+    exit_signal_id: str | None
+    fees: float  # prorated entry + exit fees attributed to the matched qty
+    realized_return: float
+    """Holding-period return on the matched qty, net of prorated fees.
+
+    For a long lot (entry side == "buy"):
+        gross = (exit_price - entry_price) / entry_price
+    For a short lot (entry side == "sell"):
+        gross = (entry_price - exit_price) / entry_price
+    The fee drag (prorated fees / entry notional) is subtracted from gross so
+    the sign convention is "positive return == the lot made money".
+    """
+
+
+def _coerce_asof(value) -> pd.Timestamp | None:
+    """Parse an asof value to a tz-naive-comparable Timestamp, or None."""
+    if value is None:
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except (ValueError, TypeError):
+        return None
+    if ts is pd.NaT:
+        return None
+    return ts
+
+
+def _exec_sort_key(rec: dict) -> tuple:
+    """Stable, asof-honest ordering key for execution records.
+
+    Orders by asof ascending so FIFO entries open before exits close them.
+    Ties broken by exec_id then the record's positional index (added by the
+    caller) so ordering is fully deterministic even for same-asof fills.
+    """
+    asof = _coerce_asof(rec.get("asof"))
+    # NaT-asof records sort last but stay deterministic via exec_id/index.
+    asof_key = asof.value if asof is not None else 1 << 62
+    return (asof_key, str(rec.get("exec_id") or ""), rec.get("_idx", 0))
+
+
+def join_exit_fills(
+    execution_records: Iterable[dict],
+    *,
+    open_lots: dict | None = None,
+) -> tuple[list[SettledRoundTrip], dict]:
+    """Join exit fills to their entry fills via FIFO lot matching.
+
+    Walks executions in asof-honest (asof-ascending, then exec_id, then bus
+    order) sequence. Each fill either OPENS/ADDS to the open-lot queue for its
+    (account, asset_class, asset) bucket (when it is the same direction as the
+    current net position) or CLOSES against the oldest opposing lots first
+    (FIFO). Each matched (entry_lot, exit_fill) pairing emits one
+    SettledRoundTrip carrying the realized holding-period return on the matched
+    quantity, net of prorated fees on both legs.
+
+    A direction flip (e.g. selling more than the open long) closes the entire
+    opposing queue and opens a fresh lot with the residual quantity, so the
+    join never fabricates a phantom return for the residual.
+
+    Args:
+        execution_records: executions to settle. Read-only; not mutated.
+        open_lots: optional carry-in lot state from a prior call (the returned
+            `open_lots` of an earlier invocation). Lets the daemon settle
+            incrementally without re-reading the whole bus. Defaults to empty.
+
+    Returns:
+        (round_trips, open_lots):
+          - round_trips: SettledRoundTrip per matched entry/exit pairing,
+            in the order exits were processed (deterministic).
+          - open_lots: residual open-lot state ({bucket_key: [lot, ...]}) for
+            unmatched (still-open) quantity. Carry this into the next call.
+            Quantity still in open_lots has realized_return = None semantics
+            (it is simply absent from round_trips — never a fabricated 0).
+    """
+    # bucket_key -> list of open lots (FIFO; each lot is a mutable dict).
+    lots: dict[tuple, list[dict]] = {}
+    if open_lots:
+        # Deep-ish copy so we never mutate the caller's carry-in structure.
+        for k, v in open_lots.items():
+            lots[k] = [dict(lot) for lot in v]
+
+    indexed = [{**rec, "_idx": i} for i, rec in enumerate(execution_records)]
+    ordered = sorted(indexed, key=_exec_sort_key)
+
+    round_trips: list[SettledRoundTrip] = []
+
+    for rec in ordered:
+        side = rec.get("side")
+        if side not in ("buy", "sell"):
+            continue
+        try:
+            qty = float(rec["qty"])
+            fill_price = float(rec["fill_price"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if qty <= 0 or fill_price <= 0:
+            continue
+        asof = _coerce_asof(rec.get("asof"))
+        if asof is None:
+            continue
+        fees = float(rec.get("fees", 0.0) or 0.0)
+
+        bucket = (
+            rec.get("account_id"),
+            rec.get("asset_class"),
+            rec.get("asset"),
+        )
+        queue = lots.setdefault(bucket, [])
+
+        # Current net direction of the open queue: "buy" lots are long, "sell"
+        # lots are short. A queue holds only one direction at a time (a flip
+        # fully closes the queue before opening the residual).
+        queue_side = queue[0]["side"] if queue else None
+
+        # fee-per-unit on this fill, used to prorate the matched-qty fee share.
+        fee_per_unit = (fees / qty) if qty > 0 else 0.0
+
+        if queue_side is None or queue_side == side:
+            # Opening or adding to a same-direction lot — just enqueue.
+            queue.append(
+                {
+                    "asset": rec.get("asset"),
+                    "account_id": rec.get("account_id"),
+                    "asset_class": rec.get("asset_class"),
+                    "side": side,
+                    "qty": qty,
+                    "price": fill_price,
+                    "asof": asof,
+                    "exec_id": rec.get("exec_id"),
+                    "signal_id": rec.get("signal_id"),
+                    "fee_per_unit": fee_per_unit,
+                }
+            )
+            continue
+
+        # Opposing fill — close FIFO against the open queue.
+        remaining = qty
+        exit_fee_per_unit = fee_per_unit
+        while remaining > 1e-12 and queue:
+            lot = queue[0]
+            # asof-honest: an entry must not be later than the exit closing it.
+            if lot["asof"] > asof:
+                # Out-of-order record (lot opened "after" this exit). Skip the
+                # match rather than fabricate a lookahead pairing; leave the
+                # lot open. Deterministic + fail-closed.
+                break
+            matched = min(lot["qty"], remaining)
+            entry_price = lot["price"]
+            exit_price = fill_price
+
+            if lot["side"] == "buy":
+                gross = (exit_price - entry_price) / entry_price
+            else:  # short lot
+                gross = (entry_price - exit_price) / entry_price
+
+            entry_notional = entry_price * matched
+            prorated_fees = lot["fee_per_unit"] * matched + exit_fee_per_unit * matched
+            fee_drag = (prorated_fees / entry_notional) if entry_notional > 0 else 0.0
+            realized_return = gross - fee_drag
+
+            round_trips.append(
+                SettledRoundTrip(
+                    asset=lot["asset"],
+                    account_id=lot["account_id"],
+                    asset_class=lot["asset_class"],
+                    side=lot["side"],
+                    qty=matched,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    asof_entry=lot["asof"],
+                    asof_exit=asof,
+                    entry_exec_id=lot["exec_id"],
+                    exit_exec_id=rec.get("exec_id"),
+                    entry_signal_id=lot["signal_id"],
+                    exit_signal_id=rec.get("signal_id"),
+                    fees=prorated_fees,
+                    realized_return=realized_return,
+                )
+            )
+
+            lot["qty"] -= matched
+            remaining -= matched
+            if lot["qty"] <= 1e-12:
+                queue.pop(0)
+
+        # Residual opposing quantity beyond the open queue = a direction flip.
+        # Open a fresh lot in the new direction with the leftover (its fee
+        # share is the un-consumed remainder of this fill's fees).
+        if remaining > 1e-12:
+            queue.append(
+                {
+                    "asset": rec.get("asset"),
+                    "account_id": rec.get("account_id"),
+                    "asset_class": rec.get("asset_class"),
+                    "side": side,
+                    "qty": remaining,
+                    "price": fill_price,
+                    "asof": asof,
+                    "exec_id": rec.get("exec_id"),
+                    "signal_id": rec.get("signal_id"),
+                    "fee_per_unit": exit_fee_per_unit,
+                }
+            )
+
+        # Drop emptied buckets so open_lots only carries truly-open quantity.
+        if not queue:
+            lots.pop(bucket, None)
+
+    return round_trips, lots
+
+
+def compute_horizon_return(
+    entry_price: float,
+    exit_price: float,
+    side: str,
+    *,
+    fees: float = 0.0,
+) -> float | None:
+    """Realized holding-period return for one entry->exit pair, net of fees.
+
+    Pure helper exposed for the calibrator/reflector and for direct testing.
+
+    Args:
+        entry_price: lot entry fill price (> 0).
+        exit_price: lot exit fill price (> 0).
+        side: ENTRY side — "buy" (long) or "sell" (short).
+        fees: total fees on the round trip, in quote currency, to net out.
+
+    Returns:
+        Net holding-period return (positive == the lot made money), or None if
+        the inputs are not a well-formed pair (e.g. missing/non-positive
+        price). None is the honest "cannot measure" value — never a
+        fabricated 0.0.
+    """
+    if side not in ("buy", "sell"):
+        return None
+    try:
+        ep = float(entry_price)
+        xp = float(exit_price)
+    except (ValueError, TypeError):
+        return None
+    if ep <= 0 or xp <= 0:
+        return None
+    if side == "buy":
+        gross = (xp - ep) / ep
+    else:
+        gross = (ep - xp) / ep
+    # Net of fees: prorate against entry notional (qty cancels, so pass total
+    # fees / (entry_price) per unit — caller supplies total fees and we treat
+    # one notional unit). For a per-unit-agnostic helper we express fee drag
+    # relative to entry price; callers with qty should use join_exit_fills.
+    fee_drag = (fees / ep) if (fees and ep > 0) else 0.0
+    return gross - fee_drag
+
+
+def realized_returns_by_signal(
+    round_trips: Iterable[SettledRoundTrip],
+) -> dict[str, float]:
+    """Aggregate settled round trips into a {entry_signal_id: realized_return}.
+
+    For signals settled by multiple exits (partial closes), the per-lot
+    returns are combined as a notional-weighted average over the matched
+    quantity so the result is the realized return of the whole entry signal.
+
+    Returns only signals that have at least one settled (closed) lot; an
+    entry signal whose position is still fully open does NOT appear (its
+    realized return is None — absence, never a fabricated 0).
+    """
+    weighted_sum: dict[str, float] = defaultdict(float)
+    weight: dict[str, float] = defaultdict(float)
+    for rt in round_trips:
+        if not rt.entry_signal_id:
+            continue
+        w = rt.entry_price * rt.qty  # entry notional
+        if w <= 0:
+            continue
+        weighted_sum[rt.entry_signal_id] += rt.realized_return * w
+        weight[rt.entry_signal_id] += w
+    return {
+        sig_id: weighted_sum[sig_id] / weight[sig_id]
+        for sig_id in weighted_sum
+        if weight[sig_id] > 0
+    }
