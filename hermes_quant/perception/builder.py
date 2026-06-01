@@ -267,10 +267,20 @@ def build_perception_frame(
             _pkt = max(semantic_packets, key=lambda p: p.get("asof", ""))
             _md = _pkt.get("metadata") or {}
             _cd = _md.get("confirm_date") if isinstance(_md, Mapping) else None
+            # RR10: wire THIS symbol's velocity score (PDR-2) through when present, so
+            # the asof-honest "velocity_peak" basis can engage. frame_trend_velocity is
+            # keyed by symbol (scores[sym] = sc.to_mapping(), Step 5b); .get(symbol)
+            # yields None when velocity is OFF / absent -> compute_saturation falls back
+            # to packet_age, exactly as before. Still flag-gated + default-OFF.
+            _tv = (
+                frame_trend_velocity.get(symbol)
+                if frame_trend_velocity is not None
+                else None
+            )
             frame_saturation = compute_saturation(
                 packet_asof=_pkt.get("asof"),
                 asof=last_bar_ts_utc,            # the bar-asof replay anchor (== frame.asof)
-                trend_velocity=None,             # PDR-2 fills frame.trend_velocity; None today
+                trend_velocity=_tv,              # PDR-2 velocity score for `symbol`, or None
                 confirm_date=_cd,
             )
         except Exception as exc:  # noqa: BLE001 -- never block frame build on saturation

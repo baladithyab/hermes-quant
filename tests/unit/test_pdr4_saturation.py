@@ -29,6 +29,10 @@ from hermes_quant.perception.saturation import (
     apply_saturation,
     compute_saturation,
 )
+from hermes_quant.perception.velocity import (
+    compute_trend_velocity,
+    counts_per_period,
+)
 from hermes_quant.semantic import semantic_packet_from_dict
 
 # ---------------------------------------------------------------------------
@@ -336,3 +340,72 @@ def test_half_life_halves_at_one_half_life():
     )
     expected = _FLOOR + (1.0 - _FLOOR) * 0.5
     assert out["decay_multiplier"] == pytest.approx(round(expected, 6))
+
+
+# ===========================================================================
+# §6.6b RR6 regression — a REAL VelocityScore.to_mapping() engages velocity_peak
+# ===========================================================================
+def test_real_velocity_mapping_engages_velocity_peak_basis():
+    """RR6: feeding the ONLY real producer's output (VelocityScore.to_mapping(), which
+    emits "peak_period", NOT "peak_asof") to compute_saturation MUST hit the
+    "velocity_peak" basis. Previously the key mismatch made this DEAD (silently fell
+    through to packet_age). Builds a real series whose interest peaks well before asof,
+    so the peak anchor is asof-honest (peak <= asof) and dominates packet age."""
+    asof = pd.Timestamp("2024-03-01T00:00:00Z")
+    # Weekly interest observations: a clear early peak (mid-Jan), then it cools off.
+    # All timestamps <= asof, so counts_per_period keeps every bucket.
+    weeks = [
+        ("2024-01-01", 2), ("2024-01-08", 5), ("2024-01-15", 9),  # <- peak week
+        ("2024-01-22", 4), ("2024-01-29", 3), ("2024-02-05", 2),
+    ]
+    timestamps: list[pd.Timestamp] = []
+    for day, n in weeks:
+        timestamps.extend([pd.Timestamp(day + "T12:00:00Z")] * n)
+
+    counts = counts_per_period(timestamps, asof=asof, freq="W")
+    score = compute_trend_velocity(counts, asof=asof)
+    assert score is not None, "expected a real VelocityScore from a multi-week series"
+    assert score.peak_period is not None
+
+    mapping = score.to_mapping()
+    # Guard the contract this test exists to protect: the real producer emits peak_period,
+    # and compute_saturation must read it (it does NOT emit peak_asof).
+    assert "peak_period" in mapping and mapping["peak_period"] is not None
+    assert "peak_asof" not in mapping
+    # asof honesty: the peak the producer found is in the past relative to the decision asof.
+    assert pd.Timestamp(mapping["peak_period"]) <= asof
+
+    out = compute_saturation(
+        packet_asof="2024-02-25T00:00:00Z",  # packet age would ALSO be a valid (weaker) basis
+        asof=asof,
+        trend_velocity=mapping,
+    )
+    assert out["basis"] == "velocity_peak", (
+        f"real VelocityScore mapping did not engage velocity_peak: {out}"
+    )
+    assert 0.0 < out["decay_multiplier"] < 1.0  # a passed peak decays, but not to floor
+    assert pd.Timestamp(out["asof"]) == asof    # stamps the decision asof, not wall-clock
+
+
+def test_back_compat_peak_asof_still_engages_velocity_peak():
+    """Older synthetic mappings using the legacy "peak_asof" key still engage the
+    velocity_peak basis (back-compat preserved by the dual-key read)."""
+    asof = pd.Timestamp("2024-03-01T00:00:00Z")
+    out = compute_saturation(
+        packet_asof="2024-01-01T00:00:00Z", asof=asof,
+        trend_velocity={"peak_asof": "2024-02-20T00:00:00Z"},
+    )
+    assert out["basis"] == "velocity_peak"
+
+
+def test_peak_asof_wins_when_both_keys_present():
+    """When both keys are supplied, peak_asof takes precedence (documented contract)."""
+    asof = pd.Timestamp("2024-03-01T00:00:00Z")
+    # peak_asof is in the past (engages); peak_period is in the FUTURE (would NOT engage).
+    out = compute_saturation(
+        packet_asof="2024-01-01T00:00:00Z", asof=asof,
+        trend_velocity={"peak_asof": "2024-02-20T00:00:00Z",
+                        "peak_period": "2024-04-01T00:00:00Z"},
+    )
+    assert out["basis"] == "velocity_peak"
+    assert 0.0 < out["decay_multiplier"] < 1.0

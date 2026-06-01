@@ -52,9 +52,15 @@ def compute_saturation(
                 "asof": out_asof, "basis": "confirm_date_passed"}
 
     # ---- basis 2: velocity peak (PDR-2) ----
+    # The ONLY producer is VelocityScore.to_mapping() (velocity.py), which emits the
+    # series-peak under the key "peak_period". Accept "peak_asof" too for back-compat
+    # with older synthetic fixtures / mappings. Prefer whichever is present (they are
+    # the same anchor); "peak_asof" wins only when both are supplied.
     peak = None
     if trend_velocity is not None:
-        peak = _as_utc_or_none(trend_velocity.get("peak_asof"))
+        peak = _as_utc_or_none(
+            trend_velocity.get("peak_asof", trend_velocity.get("peak_period"))
+        )
     anchor, basis = (peak, "velocity_peak") if (peak is not None and peak <= asof_ts) else (None, None)
 
     # ---- basis 3: packet-age fallback ----
