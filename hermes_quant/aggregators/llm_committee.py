@@ -263,6 +263,16 @@ def _render_prompt(
     bit-identical to pre-Wave-4 when the env var is absent.  Bull, bear, and
     risk debaters do NOT see the lessons block (ADR-0042 anti-pattern list).
 
+    G15 (ADR-0042): a SECOND, sub-gated flag HERMES_QUANT_MEMORY_SPLIT=1 (read
+    at call time, default OFF) swaps the lessons renderer to
+    format_context_block_split() — same-ticker history stays RICH (full lesson)
+    while cross-ticker / cross-sector analogs are rendered LEAN (one line each)
+    within the same 2048-char budget. The split is purely a render asymmetry
+    over the already-Oracle-guarded buckets from get_past_context(); the
+    no-lookahead guard is upstream and untouched. With MEMORY_SPLIT unset/0 the
+    original combined renderer is used → byte-identical to pre-G15. The flag is
+    a no-op unless MEMORY_INJECT is also ON.
+
     ADR-0065 (v0.6.1): when called from ``run_research_debate`` (the
     Bull/Bear adversarial stage), four extra placeholders may be supplied:
     ``current_response`` (opponent's last argument verbatim),
@@ -301,6 +311,7 @@ def _render_prompt(
             try:
                 from hermes_quant.memory.retriever import (
                     format_context_block,
+                    format_context_block_split,
                     get_past_context,
                 )
                 asof_dt = market_context.asof if isinstance(market_context.asof, __import__("datetime").datetime) else None  # type: ignore[attr-defined]
@@ -311,7 +322,16 @@ def _render_prompt(
                     ticker=market_context.asset,
                     asof=asof_dt,
                 )
-                lessons_block = format_context_block(ctx, max_chars=2048)
+                # G15 (ADR-0042): same-ticker-rich vs cross-ticker-lean render,
+                # gated by HERMES_QUANT_MEMORY_SPLIT=1 (read at call time, default
+                # OFF). When OFF the original combined-verbosity renderer is used
+                # → byte-identical to pre-G15. The output SHAPE (lessons_block str
+                # clipped to the same 2048-char budget) is unchanged either way,
+                # so the prompt template and downstream hashing are agnostic.
+                if os.environ.get("HERMES_QUANT_MEMORY_SPLIT", "0") == "1":
+                    lessons_block = format_context_block_split(ctx, max_chars=2048)
+                else:
+                    lessons_block = format_context_block(ctx, max_chars=2048)
             except Exception:
                 logger.warning(
                     "Memory injection failed for role=%r (non-blocking); "
