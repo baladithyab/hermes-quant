@@ -1,0 +1,46 @@
+# hermes-quant optional-MCP candidate — DISABLED-BY-DEFAULT.
+# Presence here is a vetted recipe, NOT activation. See ../README.md.
+manifest_version: 1
+
+name: fred
+description: >-
+  Read-only FRED (Federal Reserve Economic Data) MCP. ~800k macro/econ
+  time-series (CPI, rates, unemployment). 8 tools. Complements the
+  financial-calendar / macro / regime layer.
+source: https://github.com/cyanheads/federal-reserve-mcp-server
+
+enabled: false
+
+transport:
+  type: stdio
+  command: bunx
+  args:
+    - "@cyanheads/federal-reserve-mcp-server@latest"  # pin a version before enabling
+
+install:
+  type: npm
+  package: "@cyanheads/federal-reserve-mcp-server"
+  ref: latest   # operator: pin to a concrete version before enabling
+
+auth:
+  type: api_key
+  env:
+    - name: FRED_API_KEY
+      prompt: "FRED API key (free from fredaccount.stlouisfed.org)"
+      value: "${FRED_API_KEY}"   # PLACEHOLDER
+      required: true
+      secret: true
+
+x_hermes_quant:
+  classification:
+    read_only: true
+    money_write: false
+    underlying_can_write: false
+    safe_boundary: "macro time-series retrieval only; no order/write tools"
+  provenance: community
+  alt_read_only:
+    command: uvx
+    args: ["fred-mcp-server"]   # PyPI floriancaro/fred-mcp-server, same FRED_API_KEY
+
+post_install: |
+  Free key. Load FRED_API_KEY, copy this block into config.yaml mcp_servers, reload.

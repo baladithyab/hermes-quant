@@ -1,0 +1,48 @@
+# hermes-quant optional-MCP candidate — DISABLED-BY-DEFAULT.
+# Presence here is a vetted recipe, NOT activation. See ../README.md.
+manifest_version: 1
+
+name: polygon
+description: >-
+  Read-only Polygon.io market-data MCP. 30+ tools: aggregates/bars, trades,
+  quotes, snapshots, ticker details, stock financials. No order/write surface.
+source: https://github.com/polygon-io/mcp_polygon
+
+enabled: false
+
+transport:
+  type: stdio
+  command: uvx
+  args:
+    # Pin the PRE-REBRAND Polygon tag — the repo rebranded to massive-com/mcp_massive
+    # and POLYGON_API_KEY became a deprecated alias of MASSIVE_API_KEY. Pin to
+    # avoid that drift.
+    - "--from"
+    - "git+https://github.com/polygon-io/mcp_polygon@v0.1.0"
+    - "mcp_polygon"
+
+install:
+  type: uvx
+  url: https://github.com/polygon-io/mcp_polygon
+  ref: "v0.1.0"
+
+auth:
+  type: api_key
+  env:
+    - name: POLYGON_API_KEY
+      prompt: "Polygon.io API key (paid tier for full coverage)"
+      value: "${POLYGON_API_KEY}"   # PLACEHOLDER
+      required: true
+      secret: true
+
+x_hermes_quant:
+  classification:
+    read_only: true
+    money_write: false
+    underlying_can_write: false
+    safe_boundary: "market-data retrieval only; no order/write tools"
+  provenance: official  # polygon-io org (pin pre-rebrand)
+
+post_install: |
+  Highest-value market-data server. Load POLYGON_API_KEY, copy this block into
+  config.yaml mcp_servers, reload.

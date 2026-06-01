@@ -1,0 +1,54 @@
+# hermes-quant optional-MCP candidate — DISABLED-BY-DEFAULT.
+# Presence here is a vetted recipe, NOT activation. See ../README.md.
+manifest_version: 1
+
+name: tradingview
+description: >-
+  Read-only TradingView screener + technical-analysis MCP (fiale-plus). Anonymous
+  access to TradingView's public scanner/TA endpoints. NO order surface, NO
+  alerts-write, NO account access. 12 tools: screen_stocks/forex/crypto/etf,
+  lookup/search symbols, list_fields, get_ta_summary, rank_by_ta, presets.
+source: https://github.com/fiale-plus/tradingview-mcp-server
+
+enabled: false
+
+transport:
+  type: stdio
+  command: bunx          # npx also works; bunx is on PATH per Hermes rails
+  args:
+    - "-y"
+    - "tradingview-mcp-server@0.6.1"   # PINNED — npm latest 0.6.1, MIT
+  env: {}
+
+install:
+  type: npm
+  package: tradingview-mcp-server
+  ref: "0.6.1"
+
+auth:
+  type: none
+  # README verbatim: "No authentication is required; access level is the same as
+  # the TradingView website without login." Still disabled-by-default per the
+  # money-software OFF posture (unofficial API can break without notice).
+
+x_hermes_quant:
+  classification:
+    read_only: true
+    money_write: false
+    underlying_can_write: false
+    safe_boundary: "no write/order/account API exists in this server"
+  rails:
+    - "DO NOT substitute the bare PyPI `tradingview-mcp` (v0.9.1, DEBARPAN2000) —
+       it exposes execute_order (paper today, live = future)."
+    - "DO NOT substitute the CDP-bridge variants (tradesdontlie/ulianbass) — they
+       write to your real TradingView account (alerts/watchlist/Pine)."
+  provenance: unofficial  # community, MIT, no official TradingView MCP exists
+  alt_read_only:
+    # Python alternative (screener + backtest + Reddit sentiment), also keyless:
+    command: uvx
+    args: ["--from", "tradingview-mcp-server", "tradingview-mcp"]  # atilaahmettaner project (name collides w/ npm)
+
+post_install: |
+  No creds. Copy this block into config.yaml mcp_servers and reload. Outputs are
+  informational/educational only — they are evidence into the perception layer,
+  never an order authority. The deterministic gate (ADR-0004) is final.

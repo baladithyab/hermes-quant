@@ -1,0 +1,47 @@
+# hermes-quant optional-MCP candidate — DISABLED-BY-DEFAULT.
+# Presence here is a vetted recipe, NOT activation. See ../README.md.
+manifest_version: 1
+
+name: sec-edgar
+description: >-
+  Read-only SEC EDGAR filings/financials MCP. CIK lookup, company facts,
+  10-K/10-Q/8-K retrieval + section extraction, XBRL statements, Form 3/4/5
+  insider transactions; every response carries source filing URLs. Directly
+  complements the catalyst classifier (8-K = catalyst) + insider-Form-4 signal.
+source: https://github.com/stefanoamorelli/sec-edgar-mcp
+
+enabled: false
+
+transport:
+  type: stdio
+  command: uvx
+  args:
+    - "--from"
+    - "sec-edgar-mcp==1.0.0"   # PIN before enabling; AGPL-3.0, built on edgartools
+    - "sec-edgar-mcp"
+
+install:
+  type: uvx
+  package: sec-edgar-mcp
+  ref: "1.0.0"   # operator: confirm/adjust pin against live PyPI before enabling
+
+auth:
+  type: api_key   # not a real secret — a polite UA header required by SEC fair-access
+  env:
+    - name: SEC_EDGAR_USER_AGENT
+      prompt: "SEC fair-access User-Agent string, e.g. 'Your Name (you@example.com)'"
+      value: "${SEC_EDGAR_USER_AGENT}"   # PLACEHOLDER — non-secret
+      required: true
+      secret: false
+
+x_hermes_quant:
+  classification:
+    read_only: true
+    money_write: false
+    underlying_can_write: false
+    safe_boundary: "data-retrieval only; zero order/transaction surface"
+  provenance: community  # not affiliated with the SEC
+
+post_install: |
+  Lowest-friction data server (free, non-secret UA). Set SEC_EDGAR_USER_AGENT,
+  copy this block into config.yaml mcp_servers, reload.

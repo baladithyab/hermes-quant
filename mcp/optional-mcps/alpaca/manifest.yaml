@@ -1,0 +1,81 @@
+# hermes-quant optional-MCP candidate — DISABLED-BY-DEFAULT.
+# Presence here is a vetted recipe, NOT activation. See ../README.md and
+# ../../../docs/operations/MCP-INTEGRATION.md for the enable runbook + policy.
+manifest_version: 1
+
+name: alpaca
+description: >-
+  Official Alpaca brokerage MCP. SHIPPED READ-ONLY: market data (stocks/crypto/
+  options), account/portfolio reads, corporate actions, news. The order-placement
+  `trading` and `watchlists` toolsets are stripped at launch via ALPACA_TOOLSETS.
+source: https://github.com/alpacahq/alpaca-mcp-server
+
+# ---- DISABLED. Operator must copy this into ~/.hermes/config.yaml mcp_servers ----
+enabled: false
+
+transport:
+  type: stdio
+  command: uvx
+  args:
+    - alpaca-mcp-server
+  # NOTE: a bare `uvx alpaca-mcp-server` (no ALPACA_TOOLSETS) loads ALL toolsets
+  # INCLUDING `trading` — that is money-write and is FORBIDDEN by hermes-quant
+  # rails. The env below pins the read-only allowlist; do not remove it.
+
+# Pin the package version — manifests do not float HEAD.
+install:
+  type: uvx
+  package: alpaca-mcp-server
+  ref: "2.0.2"  # PyPI v2.0.2, released 2026-05-20, author Alpaca <info@alpaca.markets>
+
+auth:
+  type: api_key
+  env:
+    - name: ALPACA_API_KEY
+      prompt: "Alpaca API key (paper account)"
+      value: "${ALPACA_API_KEY}"          # PLACEHOLDER — never a real key
+      required: true
+      secret: true
+      # Hermes already holds these at ~/.hermes/secrets/alpaca.env for the
+      # read-only shortability oracle + buying-power. Enabling this MCP grants
+      # an AI assistant order authority over the SAME account — a strictly
+      # larger blast radius. Do not conflate "we already use Alpaca" with this.
+    - name: ALPACA_SECRET_KEY
+      prompt: "Alpaca API secret (paper account)"
+      value: "${ALPACA_SECRET_KEY}"       # PLACEHOLDER — never a real secret
+      required: true
+      secret: true
+    - name: ALPACA_PAPER_TRADE
+      prompt: "Paper trading toggle — MUST be true for hermes-quant paper posture"
+      value: "true"                       # "false" = LIVE real money. PINNED true.
+      required: true
+      secret: false
+    - name: ALPACA_TOOLSETS
+      prompt: "Read-only toolset allowlist (excludes `trading` + `watchlists`)"
+      # This comma-separated allowlist is the ONLY safe boundary — the MCP has no
+      # internal HITL hook. Excluding `trading` de-registers place_stock_order /
+      # place_option_order / close_all_positions / cancel_all_orders / etc.
+      value: "account,stock-data,crypto-data,options-data,assets,corporate-actions,news"
+      required: true
+      secret: false
+
+x_hermes_quant:
+  classification:
+    read_only: true       # AS SHIPPED, via the ALPACA_TOOLSETS allowlist above.
+    money_write: false    # ...but the underlying server CAN write — see warning.
+    underlying_can_write: true
+    safe_boundary: "ALPACA_TOOLSETS excludes `trading`,`watchlists`; ALPACA_PAPER_TRADE=true"
+  rails:
+    - "If ALPACA_TOOLSETS is removed/relaxed to include `trading`, this becomes
+       money-write and MUST NOT be enabled — the deterministic risk gate
+       (ADR-0004) + HITL (ADR-0015) remain the sole order authority."
+    - "Never set ALPACA_PAPER_TRADE=false. paper/live is solely this var (not a
+       base-URL var) in v2.x."
+  provenance: official  # alpacahq org repo + PyPI author Alpaca
+
+post_install: |
+  READ-ONLY recipe. After loading creds into ~/.hermes/.env (or
+  ~/.hermes/secrets/alpaca.env) and copying this block into config.yaml
+  mcp_servers, reload (mcp_reload_confirm: true will prompt). Verify the tool
+  list contains NO place_*_order / close_*_position / cancel_* / update_account_config
+  tools. If any appear, ALPACA_TOOLSETS was not applied — STOP and do not use.

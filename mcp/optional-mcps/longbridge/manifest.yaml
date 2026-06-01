@@ -1,0 +1,69 @@
+# hermes-quant optional-MCP candidate — DISABLED-BY-DEFAULT.
+# Presence here is a vetted recipe, NOT activation. See ../README.md.
+manifest_version: 1
+
+name: longbridge
+description: >-
+  Official Longbridge OpenAPI brokerage MCP (legacy stdio binary). US + HK
+  markets. SHIPPED READ-ONLY via the hard `--readonly` switch, which
+  de-registers the 3 write tools (trade-submit/cancel/replace-order) entirely.
+  ~107 read tools: quotes, depth, candlesticks, option chains, fundamentals,
+  analyst ratings, calendar, account/position/order reads.
+source: https://github.com/longbridge/openapi/blob/main/mcp/README.md
+
+enabled: false
+
+transport:
+  type: stdio
+  command: longbridge-mcp     # built from longbridge/openapi `mcp/` (official)
+  args:
+    - "--readonly"            # LOAD-BEARING: "will prevent the server from
+                              # submitting orders to the exchange" (repo README).
+                              # Removing this re-registers money-write tools.
+  # ALTERNATIVE (third-party, easiest via uvx; maintainer zanderzhng/stonk-org,
+  # NOT Longbridge-official): command=uvx args=[longbridge-mcp] with
+  # env LONGBRIDGE_MCP_READ_ONLY=true (default). Prefer the official binary.
+
+install:
+  type: source
+  url: https://github.com/longbridge/openapi
+  ref: "main"   # pin to a release tag/commit before enabling; build `longbridge-mcp`
+  note: "Official legacy stdio/SSE binary in the mcp/ subdir. Has the hard --readonly switch."
+
+auth:
+  type: api_key
+  env:
+    - name: LONGBRIDGE_APP_KEY
+      prompt: "Longbridge OpenAPI app key"
+      value: "${LONGBRIDGE_APP_KEY}"       # PLACEHOLDER
+      required: true
+      secret: true
+    - name: LONGBRIDGE_APP_SECRET
+      prompt: "Longbridge OpenAPI app secret"
+      value: "${LONGBRIDGE_APP_SECRET}"    # PLACEHOLDER
+      required: true
+      secret: true
+    - name: LONGBRIDGE_ACCESS_TOKEN
+      prompt: "Longbridge OpenAPI access token"
+      value: "${LONGBRIDGE_ACCESS_TOKEN}"  # PLACEHOLDER
+      required: true
+      secret: true
+
+x_hermes_quant:
+  classification:
+    read_only: true       # AS SHIPPED, via --readonly.
+    money_write: false
+    underlying_can_write: true   # trade-submit/cancel/replace-order exist w/o --readonly
+    safe_boundary: "official --readonly de-registers the 3 write tools entirely"
+  rails:
+    - "If --readonly is removed (or the hosted HTTP / Rust self-host variants are
+       used — neither has a read-only flag), this becomes money-write and MUST
+       NOT be enabled. The deterministic risk gate + HITL remain final authority."
+    - "Use a Longbridge PAPER account for the access token (paper is supported)."
+  provenance: official  # longbridge/openapi legacy stdio binary
+
+post_install: |
+  READ-ONLY recipe. Build the longbridge-mcp binary from the pinned ref, load
+  creds into ~/.hermes/.env, copy this block into config.yaml mcp_servers,
+  reload. Verify NO trade-submit-order / trade-cancel-order / trade-replace-order
+  tools appear. If they do, --readonly was not applied — STOP.

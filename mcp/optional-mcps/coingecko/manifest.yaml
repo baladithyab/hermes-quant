@@ -1,0 +1,36 @@
+# hermes-quant optional-MCP candidate — DISABLED-BY-DEFAULT.
+# Presence here is a vetted recipe, NOT activation. See ../README.md.
+manifest_version: 1
+
+name: coingecko
+description: >-
+  Official CoinGecko hosted remote MCP. 76+ read-only tools: prices, market cap,
+  volume, OHLCV, trending, NFT/DeFi, 1M+ assets. url-style (like tavily/exa).
+source: https://docs.coingecko.com/docs/ai-agent-hub/mcp-server
+
+enabled: false
+
+# url-style transport (matches the host tavily/exa/deepwiki/aws block).
+transport:
+  type: http
+  url: https://mcp.api.coingecko.com/mcp   # KEYLESS public endpoint (shared rate limit)
+  timeout: 120
+  # Pro/BYOK alternative: url https://mcp.pro-api.coingecko.com/mcp with
+  # env COINGECKO_PRO_API_KEY. Local alternative: npx -y @coingecko/coingecko-mcp.
+
+auth:
+  type: none
+  # Keyless public endpoint — lowest opt-in friction. Still disabled-by-default
+  # per the money-software OFF posture.
+
+x_hermes_quant:
+  classification:
+    read_only: true
+    money_write: false
+    underlying_can_write: false
+    safe_boundary: "crypto market-data retrieval only; no order/write tools"
+  provenance: official  # CoinGecko hosted MCP
+
+post_install: |
+  No creds for the public endpoint. Copy this url-style block into config.yaml
+  mcp_servers (alongside tavily/exa) and reload.

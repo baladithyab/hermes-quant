@@ -62,3 +62,72 @@ optional_env:
   - name: MLFLOW_TRACKING_URI
     description: Optional — point the daemon at an MLflow tracking server; defaults to file backend at ~/.hermes/quant/mlruns
     secret: false
+
+# Optional MCP servers the plugin ships as DISABLED-BY-DEFAULT, vetted candidates.
+# These are NOT activated by register(ctx) (there is no register_mcp path) — each
+# entry points at a manifest under mcp/optional-mcps/<name>/manifest.yaml mirroring
+# the host ~/.hermes/hermes-agent/optional-mcps/<name>/manifest.yaml schema. An
+# operator activates one by copying its block into ~/.hermes/config.yaml
+# mcp_servers: (creds via the tool-guarded ~/.hermes/.env) and confirming reload.
+# Money-write tools are NEVER auto-enabled; the deterministic risk gate (ADR-0004)
+# + HITL (ADR-0015) remain the sole order authority. See:
+#   docs/operations/MCP-INTEGRATION.md  (authoritative policy + enable runbook)
+#   mcp/optional-mcps/README.md          (registry design)
+optional_mcps:
+  registry: mcp/optional-mcps
+  default_enabled: false   # registry-wide: nothing ships enabled
+  servers:
+    - name: alpaca
+      manifest: mcp/optional-mcps/alpaca/manifest.yaml
+      read_only: true        # as shipped (ALPACA_TOOLSETS excludes `trading`)
+      money_write: false
+      underlying_can_write: true
+      requires_creds: true
+    - name: tradingview
+      manifest: mcp/optional-mcps/tradingview/manifest.yaml
+      read_only: true
+      money_write: false
+      underlying_can_write: false
+      requires_creds: false
+    - name: robinhood
+      manifest: mcp/optional-mcps/robinhood/manifest.yaml
+      read_only: true
+      money_write: false
+      underlying_can_write: false
+      requires_creds: true
+    - name: longbridge
+      manifest: mcp/optional-mcps/longbridge/manifest.yaml
+      read_only: true        # as shipped (--readonly)
+      money_write: false
+      underlying_can_write: true
+      requires_creds: true
+    - name: sec-edgar
+      manifest: mcp/optional-mcps/sec-edgar/manifest.yaml
+      read_only: true
+      money_write: false
+      underlying_can_write: false
+      requires_creds: true   # non-secret UA string
+    - name: polygon
+      manifest: mcp/optional-mcps/polygon/manifest.yaml
+      read_only: true
+      money_write: false
+      underlying_can_write: false
+      requires_creds: true
+    - name: fred
+      manifest: mcp/optional-mcps/fred/manifest.yaml
+      read_only: true
+      money_write: false
+      underlying_can_write: false
+      requires_creds: true
+    - name: coingecko
+      manifest: mcp/optional-mcps/coingecko/manifest.yaml
+      read_only: true
+      money_write: false
+      underlying_can_write: false
+      requires_creds: false
+    - name: yahoo-finance
+      manifest: mcp/optional-mcps/yahoo-finance/manifest.yaml
+      read_only: true
+      money_write: false
+      underlying_can_write: false
+      requires_creds: false

@@ -1,0 +1,67 @@
+# hermes-quant optional-MCP candidate — DISABLED-BY-DEFAULT.
+# Presence here is a vetted recipe, NOT activation. See ../README.md.
+manifest_version: 1
+
+name: robinhood
+description: >-
+  Read-only Robinhood MCP (verygoodplugins/robinhood-mcp). 15 get_*/search tools:
+  accounts, portfolio, positions, quotes, fundamentals, historicals, news,
+  earnings, ratings, dividends, options positions, order-history. Architecturally
+  incapable of placing orders — "read-only by design, cannot execute trades."
+source: https://github.com/verygoodplugins/robinhood-mcp
+
+enabled: false
+
+transport:
+  type: stdio
+  command: uvx
+  args:
+    - robinhood-mcp
+  # NOTE: This is the ONLY read-only Robinhood MCP. Every OTHER community
+  # Robinhood MCP found is money-write (order placement) and is EXCLUDED.
+
+install:
+  type: uvx
+  package: robinhood-mcp
+  ref: "0.1.2"   # PyPI v0.1.2, MIT; FastMCP + robin_stocks + pyotp
+
+auth:
+  type: api_key   # full account login, not a scoped key — high blast radius
+  env:
+    - name: ROBINHOOD_USERNAME
+      prompt: "Robinhood username (full login — unofficial robin_stocks API)"
+      value: "${ROBINHOOD_USERNAME}"      # PLACEHOLDER
+      required: true
+      secret: true
+    - name: ROBINHOOD_PASSWORD
+      prompt: "Robinhood password"
+      value: "${ROBINHOOD_PASSWORD}"      # PLACEHOLDER
+      required: true
+      secret: true
+    - name: ROBINHOOD_TOTP_SECRET
+      prompt: "Robinhood TOTP 2FA secret (optional)"
+      value: "${ROBINHOOD_TOTP_SECRET}"   # PLACEHOLDER
+      required: false
+      secret: true
+
+x_hermes_quant:
+  classification:
+    read_only: true
+    money_write: false
+    underlying_can_write: false
+    safe_boundary: "server exposes zero buy/sell/cancel tools (verified PyPI + server.json)"
+  rails:
+    - "SECURITY: this hands a FULL Robinhood login (user/pass/2FA) to an
+       UNOFFICIAL third-party (robin_stocks). Session cached at
+       ~/.tokens/robinhood.pickle. High friction + high blast radius if leaked.
+       Operator decision only — disabled until creds + explicit opt-in."
+    - "DO NOT substitute any other Robinhood MCP — all others place orders."
+    - "Distinct from the Robinhood Agentic Trading reactor rail
+       (ADR-0039/ADR-0067), which is a money-write reactor behind ADR-0011's seam
+       + ≥4-week shadow burn-in, NOT an auto-exposed agent tool."
+  provenance: community  # no official Robinhood MCP exists
+
+post_install: |
+  READ-ONLY. After loading creds into ~/.hermes/.env and copying this block into
+  config.yaml mcp_servers, reload. Verify the tool list is all get_*/search — no
+  buy/sell/cancel. Treat the cached session token as a secret.

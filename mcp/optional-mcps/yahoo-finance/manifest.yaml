@@ -1,0 +1,42 @@
+# hermes-quant optional-MCP candidate — DISABLED-BY-DEFAULT.
+# Presence here is a vetted recipe, NOT activation. See ../README.md.
+manifest_version: 1
+
+name: yahoo-finance
+description: >-
+  Read-only Yahoo Finance MCP (mcp-yahoo-finance). Price history, options chains,
+  financials, analyst estimates, holders, screeners. NO creds. LOWEST provenance
+  — wraps the unofficial yfinance scraper (ToS-grey, breakage-prone). Convenience
+  / fallback only.
+source: https://pypi.org/project/mcp-yahoo-finance/
+
+enabled: false
+
+transport:
+  type: stdio
+  command: uvx
+  args:
+    - mcp-yahoo-finance   # maxscheijen; alt: uvx yfinance-market-mcp (hachecito, 30 tools)
+  env: {}
+
+install:
+  type: uvx
+  package: mcp-yahoo-finance
+  ref: latest   # operator: pin a version before enabling
+
+auth:
+  type: none
+
+x_hermes_quant:
+  classification:
+    read_only: true
+    money_write: false
+    underlying_can_write: false
+    safe_boundary: "data retrieval only; no order/write tools"
+  rails:
+    - "Lowest reliability of the data set — unofficial yfinance scraper. Treat
+       as convenience/fallback; do not make a load-bearing dependency."
+  provenance: community
+
+post_install: |
+  No creds. Copy this block into config.yaml mcp_servers and reload.
