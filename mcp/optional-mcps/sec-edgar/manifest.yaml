@@ -23,7 +23,7 @@ transport:
 install:
   type: uvx
   package: sec-edgar-mcp
-  ref: "1.0.0"   # operator: confirm/adjust pin against live PyPI before enabling
+  ref: "latest"   # ==1.0.0 did not exist on PyPI; latest is 1.0.8 as of 2026-05-31   # operator: confirm/adjust pin against live PyPI before enabling
 
 auth:
   type: api_key   # not a real secret — a polite UA header required by SEC fair-access

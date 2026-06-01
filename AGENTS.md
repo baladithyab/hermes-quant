@@ -380,8 +380,7 @@ pending, in-progress, blocked, and done — including externally-gated items (ne
   (`docs/research/2026-05-31-review-team-findings.md`), and the flag-flip/enablement runbooks are the
   *prose* record; **seeds are the live tracker** — mirror them in.
 - **Externally-gated items** (operator cron-registration, data-volume accumulation, market events,
-  governance) are seeds with a `blocked` status + a label (`gated:operator` / `gated:data` /
-  `gated:market`) and the precise unblock condition in the description. They are NOT closed until the
+  governance) are seeds with a `blocked` status + a label (`gated:operator` / `gated:data` / `gated:market` / `gated:deferred` / `gated:maintenance`) and the precise unblock condition in the description. They are NOT closed until the
   gate clears — surfacing the blocker IS the deliverable.
 - **Rails are non-negotiable and override any seed:** a seed may PROPOSE work, but the deterministic risk
   gate (ADR-0004), the discrete sizing ladder {0, ±0.05, ±0.10, ±0.15, ±0.20}, and the kill-switch are

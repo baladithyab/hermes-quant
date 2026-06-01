@@ -2,7 +2,7 @@
 
 - Date: 2026-05-31
 - Type: research → architecture study (decisive)
-- Status: recommendations + dependency-ordered seed specs; one ADR proposed (ADR-0082)
+- Status: recommendations + dependency-ordered seed specs; one ADR proposed (ADR-0084)
 - Operator question: *Should hermes-quant add a financial/economic calendar (FOMC / ADP / CPI / NFP + earnings) as a risk + perception data point, and can the pipeline's agents deliberate on it?*
 
 ## Verdict (one line)
@@ -124,7 +124,7 @@ It is filtered to `announced_at <= decision_asof` BEFORE it ever reaches the fra
 
 ## 5. ADR
 
-A durable architectural decision is warranted (a new forward-event data type + a new gate reject condition + a new perception field). **ADR-0082 (proposed)** is drafted alongside this study: *"Scheduled-event calendar as asof-honest perception + a default-OFF pre-event REJECT/abstain guard."* MADR, status proposed, ≥2 options, negative consequences enumerated. See `docs/adr/ADR-0082-scheduled-event-calendar-and-pre-event-guard.md`.
+A durable architectural decision is warranted (a new forward-event data type + a new gate reject condition + a new perception field). **ADR-0084 (proposed)** is drafted alongside this study: *"Scheduled-event calendar as asof-honest perception + a default-OFF pre-event REJECT/abstain guard."* MADR, status proposed, ≥2 options, negative consequences enumerated. See `docs/adr/ADR-0084-scheduled-event-calendar-and-pre-event-guard.md`.
 
 ---
 

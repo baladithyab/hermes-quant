@@ -177,7 +177,7 @@ mcp_servers:
 
   sec-edgar:
     command: uvx
-    args: ["--from", "sec-edgar-mcp==1.0.0", "sec-edgar-mcp"]
+    args: ["--from", "sec-edgar-mcp", "sec-edgar-mcp"]
     env:
       SEC_EDGAR_USER_AGENT: "Your Name (you@example.com)"   # PLACEHOLDER (non-secret)
 
@@ -292,8 +292,6 @@ default-off feature flag and a mandatory ≥4-week shadow burn-in, gated by the
 deterministic risk gate + HITL. That is **not** an auto-exposed agent MCP tool
 and is **not** part of this read-only registry.
 
----
-
 ## 7. Provenance
 
 Verified server provenance and write-surface flags are recorded per-manifest and
@@ -325,3 +323,163 @@ read-only via ALPACA_TOOLSETS when enabled), robinhood, longbridge (all 3 have a
 order/money surface — never auto-enabled), polygon, fred (read-only data, need an API key).
 
 Rollback any: remove its block from `~/.hermes/config.yaml` `mcp_servers:` (or `cp` the backup) + reload.
+
+---
+
+## 8. CONSUMPTION — how an analyst / the deliberation actually CALLS an enabled read-only MCP tool
+
+§1–§7 cover the *enable/disable policy* and the operator runbook. This section
+answers the PHASE-5 question: once a read-only server is LIVE in `config.yaml`
+(the 4 keyless ones are, as of 2026-05-31), **how does an analyst, a recipe, or
+the deliberation consume its data?** All claims below are verified by a live
+probe on this host (`~/.hermes/hermes-agent/venv/bin/python3`).
+
+### 8.1 The host AUTO-EXPOSES MCP tools to the agent — no plugin wiring needed
+
+This is the headline fact, and it means the bulk of this is **doc-only**:
+
+The host's `tools/mcp_tool.py::discover_mcp_tools()` connects to every
+`config.yaml mcp_servers:` entry, calls `list_tools()`, and **registers each one
+into the same global `tools.registry` that the plugin's 16 `quant_*` tools live
+in** (`_register_server_tools` → `registry.register(...)`). The naming is
+deterministic:
+
+```
+mcp_<sanitized-server>_<sanitized-tool>     # toolset:  mcp-<server>
+# hyphens → underscores; so sec-edgar → mcp_sec_edgar_*, yahoo-finance → mcp_yahoo_finance_*
+```
+
+`register(ctx)` plays **no role** here — there is no `register_mcp` path in the
+PluginContext (HERMES-INTEGRATION.md §2), and there does not need to be. The
+host owns MCP discovery; the plugin just *sees the tools appear* in the registry
+exactly like its own.
+
+**Live probe (2026-05-31) — the 4 keyless servers register 47 quant-relevant tools:**
+```
+$ ~/.hermes/hermes-agent/venv/bin/python3 -c "
+from tools.mcp_tool import discover_mcp_tools
+names = discover_mcp_tools()
+print(len([n for n in names if any(s in n for s in
+      ('coingecko','tradingview','yahoo','sec_edgar'))]), 'quant-relevant of', len(names))"
+47 quant-relevant of 133
+```
+Examples that landed: `mcp_sec_edgar_analyze_8k`, `mcp_sec_edgar_get_recent_filings`,
+`mcp_sec_edgar_get_form4_details`, `mcp_tradingview_screen_stocks`,
+`mcp_tradingview_get_ta_summary`/`rank_by_ta` (via presets), `mcp_coingecko_execute`,
+`mcp_yahoo_finance_get_current_stock_price`.
+
+### 8.2 Path A — the chat LLM / advisor briefs see them FOR FREE
+
+Globally-enabled MCP servers are **available on all platforms by default**
+(`hermes_cli/tools_config.py`: the server name is treated as a toolset that is
+included unless a platform sets an explicit MCP allowlist or the `no_mcp`
+sentinel). So:
+
+- In **chat / Discord**, the LLM can already call `mcp_sec_edgar_get_recent_filings`,
+  `mcp_tradingview_screen_stocks`, etc. — type a question, the model picks the tool.
+- In the **`no_agent=False` advisor-brief crons** (`quant-daily-*-interim`,
+  HERMES-INTEGRATION.md §4.1), the prompt runs with `enabled_toolsets`; because
+  the default toolset set already includes globally-enabled MCP servers, the
+  brief LLM can reach SEC-EDGAR filings as evidence or a TradingView screen
+  *without any change to the cron record* — unless a cron pins an explicit
+  toolset list that omits them (then add the server name to that list).
+
+**Rail:** an LLM calling a read-only MCP tool produces *evidence only*. It can
+silence (veto), never authorize. The deterministic gate (ADR-0004) + HITL
+(ADR-0015) remain the sole order authority (§3, HERMES-INTEGRATION.md §3 pt 4).
+None of these 47 tools can place an order — they are all data reads.
+
+### 8.3 Path B — programmatic consumption from deterministic package code
+
+For an **analyst**, a **recipe builder**, or a **`no_agent=True` cron script**
+(pure Python, no LLM) that wants to fold an MCP read into a computation, the
+underlying host seam is:
+
+```python
+from tools.mcp_tool import discover_mcp_tools   # host module; only inside the gateway process
+from tools.registry import registry
+discover_mcp_tools()                              # idempotent; ensures the server is connected
+raw = registry.dispatch("mcp_sec_edgar_get_recent_filings", {"ticker": "AAPL"})
+# raw is a JSON string (Hermes tool convention): {"result": ...} or {"error": ...}
+```
+
+**Live probe — end-to-end dispatch returns real data:**
+```
+$ ~/.hermes/hermes-agent/venv/bin/python3 -c "
+from tools.mcp_tool import discover_mcp_tools; from tools.registry import registry
+discover_mcp_tools()
+print(registry.dispatch('mcp_tradingview_list_presets', {})[:80])"
+{"result": "[\n  {\n    \"key\": \"quality_stocks\", ...
+```
+
+Rather than hand-roll those `registry.dispatch` calls (and re-implement the
+rails at each call site), the plugin ships **one thin, tested seam**:
+
+#### `hermes_quant/data/mcp_bridge.py` — default-OFF, read-only, fail-closed (PHASE 5, additive)
+
+```python
+from hermes_quant.data import mcp_bridge
+
+# Safe wrapper: returns None on ANY failure (flag off / denied / unavailable),
+# so an MCP read is OPTIONAL ENRICHMENT that degrades silently to the existing
+# behavior. This is the form decision code should use.
+filings = mcp_bridge.try_read_tool("mcp_sec_edgar_get_recent_filings", {"ticker": "AAPL"})
+if filings is not None:
+    ...  # fold into evidence, stamped with the wall-clock fetch time (no back-dating)
+
+# Strict wrapper: raises a typed error (McpReadsDisabledError / McpReadDeniedError /
+# McpReadUnavailableError) when you want to handle the specific failure mode.
+preset = mcp_bridge.call_read_tool("mcp_tradingview_list_presets")
+```
+
+The bridge enforces every money-software rail **in-module**, so it is safe to
+call from anywhere:
+
+- **Default OFF.** Both wrappers no-op unless the operator sets
+  `HERMES_QUANT_MCP_READS_ENABLED=1` in the tool-guarded `~/.hermes/.env`
+  (FEATURE-ENABLEMENT.md §0). With the flag unset, the dispatch backend is
+  **never even touched** — the existing path is byte-identical. (Verified by
+  `test_strict_raises_when_disabled` / `test_safe_returns_none_when_disabled`:
+  `discover_calls == 0` and `dispatch_calls == []` when OFF.)
+- **Read-only server allowlist.** Only `{coingecko, tradingview, yahoo_finance,
+  sec_edgar}` are reachable. Brokerage / underlying-can-write servers (alpaca,
+  robinhood, longbridge) and even read-only-but-cred-gated polygon are
+  **absent** and cannot be added without a code change + review.
+- **Money-write denylist (defense-in-depth).** Even on an allowlisted server, a
+  tool whose name contains a write verb (`place_order`, `execute_order`,
+  `cancel_order`, `close_position`, `trade`, `buy`, `sell`, `withdraw`, …) is
+  refused *before* dispatch. The 4 shipped servers have no such tools; this
+  guards against a future server version silently adding a write surface.
+- **Fail-closed + asof-honest.** Any error returns `None` (safe) / raises
+  (strict); an `{"error": ...}` envelope is treated as a failure. The module
+  does not touch time — callers MUST stamp an MCP read with the wall-clock
+  fetch time and honor `evidence/lookahead_gate.py`; never back-date it.
+
+The bridge is **purely additive and imports cleanly even outside the host**
+(the `tools.registry` import is deferred to call time), so the plugin's offline
+test runner exercises it against an injected fake backend
+(`tests/unit/test_data_mcp_bridge.py`, 31 tests, no live network). It is wired
+into **no** existing path — an analyst/recipe opts in by importing it, and only
+when the operator has flipped the flag.
+
+### 8.4 Worked examples (the brief's two scenarios)
+
+- **CoinGecko crypto data into a crypto recipe.** The coingecko MCP exposes a
+  generic `mcp_coingecko_execute` (+ `search_docs`) gateway to the CoinGecko
+  API. A crypto recipe's perception step can call
+  `mcp_bridge.try_read_tool("mcp_coingecko_execute", {...})` for a spot price /
+  market snapshot as an *additional evidence input* alongside the existing
+  `CcxtProvider` OHLCV chain — it does not replace the deterministic
+  bars-based features, it enriches them, and silently degrades to None if the
+  flag is off or the server is down.
+- **SEC-EDGAR filings as evidence.** `mcp_sec_edgar_get_recent_filings` /
+  `analyze_8k` / `get_form4_details` complement the catalyst classifier (8-K)
+  and the insider signal. A `no_agent` catalyst/coverage cron, or the catalyst
+  ingest step, can pull a filing as a typed evidence packet (stamped at fetch
+  time, run through `evidence/lookahead_gate.py`) that feeds the semantic /
+  catalyst path — again as *evidence that can only silence, never authorize*.
+
+In both cases the read is OPTIONAL and OFF by default; nothing about the
+deterministic gate / sizing ladder / kill-switch is touched.
+
+---

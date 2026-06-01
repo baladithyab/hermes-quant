@@ -1,5 +1,7 @@
 # hermes-quant optional-MCP registry (DISABLED-BY-DEFAULT)
 
+> **Update 2026-05-31:** the 4 KEYLESS read-only servers (tradingview, coingecko, yahoo-finance, sec-edgar) are now `enabled: true` (operator opt-in, live in `~/.hermes/config.yaml`). The cred-gated + order-capable servers (alpaca/robinhood/longbridge/polygon/fred) remain `enabled: false`. See docs/operations/MCP-INTEGRATION.md 'Live state'.
+
 This directory is the plugin-shipped **declared-but-disabled** MCP catalog. It
 mirrors the Hermes host pattern at
 `~/.hermes/hermes-agent/optional-mcps/<name>/manifest.yaml` (see the host's
