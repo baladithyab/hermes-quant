@@ -306,6 +306,167 @@ def _read_learn_from_rejections() -> bool:
 # ---------------------------------------------------------------------------
 
 
+_MULTI_LEG_STRATEGIES = {"covered_call", "cash_secured_put", "wheel"}
+
+
+def _maybe_propose_multi_leg(symbol: str, args: dict) -> str | None:
+    """B01 multi-leg producer branch for ``quant_propose``.
+
+    Returns a JSON result string when ``args['strategy_kind']`` is a multi-leg
+    strategy (covered_call / cash_secured_put / wheel); returns ``None`` otherwise so
+    the equity path runs unchanged (byte-identical). The whole path is inert unless
+    HERMES_QUANT_OPTIONS_GATE=1 — the builder runs the deterministic options_gate,
+    which raises ``OptionsGateDisabled`` without the flag; we surface that as a clear
+    ``options_gate_disabled`` error rather than building anything.
+
+    Inputs (paper / offline / deterministic): ``asof`` (ISO; required for the replay
+    chain), ``nav`` and ``options_buying_power`` (account context), optional
+    ``held_shares`` (CC cover), ``chains_dir`` (test/replay override). The chain is
+    read via ``ChainSnapshotReader.replay_chain`` — NEVER live.
+    """
+    strategy_kind = args.get("strategy_kind")
+    if strategy_kind not in _MULTI_LEG_STRATEGIES:
+        return None  # equity path; caller continues byte-identically.
+
+    # Fail-closed flag check (mirror the builder/gate rail; clearer operator error).
+    if os.environ.get("HERMES_QUANT_OPTIONS_GATE", "0") != "1":
+        return json.dumps(
+            {
+                "success": False,
+                "error": "options_gate_disabled",
+                "message": "multi-leg proposals require HERMES_QUANT_OPTIONS_GATE=1 "
+                "(the options gate is default-OFF). No proposal registered.",
+                "strategy_kind": strategy_kind,
+            }
+        )
+
+    try:
+        from hermes_quant.options.data import ChainSnapshotReader
+        from hermes_quant.options.recipes import (
+            RecipeBuildError,
+            build_and_persist_multi_leg,
+        )
+        from hermes_quant.proposals import get_default_store
+        from hermes_quant.risk.options_gate import OptionsGateDisabled
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("quant_propose[mleg]: import failed: %s", exc, exc_info=True)
+        return json.dumps(
+            {"success": False, "error": f"hermes-quant import failed: {exc}"}
+        )
+
+    asof_raw = args.get("asof")
+    if not asof_raw:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "asof_required",
+                "message": "multi-leg proposals require an `asof` (ISO UTC) for the "
+                "deterministic replay chain.",
+            }
+        )
+    try:
+        from datetime import UTC, datetime
+
+        asof = datetime.fromisoformat(str(asof_raw).replace("Z", "+00:00"))
+        if asof.tzinfo is None:
+            asof = asof.replace(tzinfo=UTC)
+    except ValueError:
+        return json.dumps(
+            {"success": False, "error": "bad_asof", "message": f"invalid asof: {asof_raw!r}"}
+        )
+
+    try:
+        nav = float(args.get("nav", 0.0))
+        options_buying_power = float(args.get("options_buying_power", 0.0))
+        held_shares = int(args.get("held_shares", 0))
+    except (TypeError, ValueError):
+        return json.dumps(
+            {"success": False, "error": "bad_account_context",
+             "message": "nav / options_buying_power / held_shares must be numeric."}
+        )
+    if nav <= 0 or options_buying_power <= 0:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "account_context_required",
+                "message": "multi-leg proposals require positive nav and "
+                "options_buying_power (paper account context).",
+            }
+        )
+
+    chains_dir = args.get("chains_dir")
+    reader = (
+        ChainSnapshotReader(chains_dir=Path(chains_dir)) if chains_dir else None
+    )
+
+    store = get_default_store()
+    try:
+        result, record = build_and_persist_multi_leg(
+            store=store,
+            symbol=symbol,
+            asof=asof,
+            strategy_kind=strategy_kind,  # type: ignore[arg-type]
+            nav=nav,
+            options_buying_power=options_buying_power,
+            held_shares=held_shares,
+            reader=reader,
+            ttl_minutes=int(args.get("ttl_minutes", 15)),
+        )
+    except OptionsGateDisabled:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "options_gate_disabled",
+                "message": "the options gate is default-OFF; set "
+                "HERMES_QUANT_OPTIONS_GATE=1 to enable.",
+            }
+        )
+    except RecipeBuildError as exc:
+        return json.dumps(
+            {"success": False, "error": "recipe_build_failed", "message": str(exc)}
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("quant_propose[mleg]: build/persist failed: %s", exc, exc_info=True)
+        return json.dumps(
+            {"success": False, "error": f"multi-leg proposal failed: {exc}"}
+        )
+
+    if not result.admitted or record is None:
+        # Gate REJECT: no passing proposal persisted (rail). Surface the verdict.
+        return json.dumps(
+            {
+                "success": False,
+                "error": "gate_rejected",
+                "message": f"options gate rejected this {strategy_kind}: "
+                f"{result.reason}. No proposal registered.",
+                "bucket": result.bucket.value,
+                "reason": result.reason,
+            }
+        )
+
+    return json.dumps(
+        {
+            "success": True,
+            "proposal_id": record.proposal_id,
+            "proposal_kind": "multi_leg",
+            "state": record.state,
+            "strategy_kind": strategy_kind,
+            "bucket": result.bucket.value,
+            "contracts": result.contracts,
+            "expires_at": record.expires_at,
+            "next_steps": (
+                f"Multi-leg {strategy_kind} gated + registered. Approve with "
+                f"quant_approve(proposal_id='{record.proposal_id}') (fires the "
+                f"MultiLegPaperReactor — default-OFF behind "
+                f"HERMES_QUANT_MULTILEG_REACTOR=1) or reject with "
+                f"quant_reject(proposal_id='{record.proposal_id}', reason='...'). "
+                f"Expires at {record.expires_at}."
+            ),
+        },
+        default=str,
+    )
+
+
 def quant_propose(args: dict, **_kwargs) -> str:
     """Propose a trade for human approval (ADR-0015 §D4).
 
@@ -328,6 +489,16 @@ def quant_propose(args: dict, **_kwargs) -> str:
                 "current_mode": mode,
             }
         )
+
+    # ── B01 multi-leg producer branch (ADR-0029). ───────────────────────────────
+    # When the caller passes a multi-leg strategy_kind, route to the multi-leg
+    # builder/persist seam instead of the equity advisor path. The branch is INERT
+    # unless HERMES_QUANT_OPTIONS_GATE=1 (the builder runs options_gate, which raises
+    # OptionsGateDisabled without the flag). When no strategy_kind (or an equity one)
+    # is passed, this returns None and the equity path below runs byte-identically.
+    _ml = _maybe_propose_multi_leg(symbol, args)
+    if _ml is not None:
+        return _ml
 
     try:
         from hermes_quant.advisor import recommend

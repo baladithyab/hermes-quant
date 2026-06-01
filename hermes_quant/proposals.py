@@ -28,9 +28,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from hermes_quant.daemon.signal_bus import append_locked
+
+if TYPE_CHECKING:  # pragma: no cover - typing only (avoid import cost/cycles)
+    from hermes_quant.options.multileg import MultiLegProposal
+    from hermes_quant.risk.options_gate import OptionsGateResult
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +81,20 @@ class Proposal:
 
     # Set when React fires (state=approved AND execution succeeded)
     execution: dict[str, Any] | None = None
+
+    # ── B01 multi-leg producer seam (ADR-0029) ──────────────────────────────
+    # proposal_kind discriminates the React routing (react/dispatch.select_reactor):
+    #   'equity'    (default) -> PaperReactor; the existing equity path, UNCHANGED.
+    #   'multi_leg'           -> MultiLegPaperReactor (default-OFF behind the flag).
+    # When proposal_kind == 'multi_leg', ``multi_leg`` carries the serialized
+    # MultiLegProposal payload (OCC option legs + stock leg + the OptionsGateResult
+    # FIELDS) so store.get() can RE-MINT a MultiLegProposal via from_gate_result
+    # (the #38 constructor-lock: risk_gate_pass=True is NEVER hand-set — it is
+    # rebuilt by re-running from_gate_result over the persisted gate result). The
+    # field is None for every equity proposal, so equity rows reconstruct unchanged
+    # and serialize byte-identically (default omitted by the JSON encoder path).
+    proposal_kind: str = "equity"
+    multi_leg: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +169,32 @@ class ProposalStore:
                 CREATE INDEX IF NOT EXISTS idx_proposals_symbol
                   ON proposals(symbol, created_at);
             """)
+            self._migrate_add_proposal_kind(conn)
+
+    @staticmethod
+    def _migrate_add_proposal_kind(conn: sqlite3.Connection) -> None:
+        """B01 additive migration: add the nullable, DEFAULT-'equity' ``proposal_kind``
+        column to a pre-B01 ``proposals`` table.
+
+        Backward-compatible by construction: a pre-B01 DB has no ``proposal_kind``
+        column; ``ALTER TABLE ADD COLUMN ... DEFAULT 'equity'`` backfills every
+        existing equity row with 'equity' and adds nothing to the record bytes (the
+        authoritative shape stays in ``record_json``; this column is only a fast
+        discriminator/index). The full record (incl. the multi-leg payload) always
+        lives in ``record_json``, so even a DB that never ran this migration
+        reconstructs correctly — the column is a convenience index, not the source
+        of truth. Idempotent: skipped when the column already exists.
+        """
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(proposals)")}
+        if "proposal_kind" not in cols:
+            conn.execute(
+                "ALTER TABLE proposals ADD COLUMN proposal_kind TEXT "
+                "NOT NULL DEFAULT 'equity'"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proposals_kind "
+            "ON proposals(proposal_kind, state)"
+        )
 
     # -----------------------------------------------------------------
     # Lifecycle: create
@@ -188,6 +232,55 @@ class ProposalStore:
         )
         self._persist(proposal, event="create")
         return proposal
+
+    def propose_multi_leg(
+        self,
+        *,
+        proposal: MultiLegProposal,
+        gate_result: OptionsGateResult,
+        advisor_result: dict[str, Any] | None = None,
+        ttl_minutes: int = DEFAULT_TTL_MINUTES,
+    ) -> Proposal:
+        """Persist an ALREADY-GATED, ALREADY-MINTED ``MultiLegProposal`` (B01).
+
+        The producer builds + mints the ``MultiLegProposal`` via
+        ``MultiLegProposal.from_gate_result`` (the #38 constructor-lock — the ONLY
+        way ``risk_gate_pass=True`` can exist) and hands it here together with the
+        ``OptionsGateResult`` it came from. We serialize BOTH (legs via OCC + the
+        gate RESULT fields) into the ``multi_leg`` payload so ``get()`` can RE-MINT
+        the proposal on reconstruct by replaying ``from_gate_result`` over the
+        rebuilt ``OptionsGateResult`` — ``risk_gate_pass`` is therefore NEVER
+        hand-set on the read path either; it is always the gate's verdict copied by
+        the blessed seam.
+
+        ``proposal.proposal_id`` (already in the prop_<ISO>_<u>_<rand6> shape, minted
+        by the producer) is reused as the store key so the multi_leg_id the reactor
+        dedups on matches the proposal id end-to-end.
+
+        Money-software rail: a ``risk_gate_pass != True`` (gate-rejected) proposal is
+        still PERSISTED for replay/audit — but it carries the rejected verdict, and
+        the reactor refuses to fill it (gate-is-final-authority). The producer
+        decides whether to even call this on a reject (B01's producer does NOT, so an
+        ungated/rejected structure never lands a *passing* proposal — see
+        options/recipes.py).
+        """
+        now = _utc_now()
+        expires = now + timedelta(minutes=ttl_minutes)
+
+        record = Proposal(
+            proposal_id=proposal.proposal_id,
+            state="pending",
+            symbol=proposal.underlying,
+            asset_class="multi_leg",
+            timeframe=proposal.timeframe if hasattr(proposal, "timeframe") else "",
+            created_at=_iso(now),
+            expires_at=_iso(expires),
+            advisor_result=advisor_result or {},
+            proposal_kind="multi_leg",
+            multi_leg=_multi_leg_to_dict(proposal, gate_result),
+        )
+        self._persist(record, event="create")
+        return record
 
     # -----------------------------------------------------------------
     # Lifecycle: approve / reject / expire
@@ -287,11 +380,21 @@ class ProposalStore:
     # Lookup
     # -----------------------------------------------------------------
 
-    def get(self, proposal_id: str) -> Proposal | None:
+    def get(self, proposal_id: str) -> Proposal | StoredMultiLegProposal | None:
         """Look up a proposal by id. None if not found.
 
         Lazy expiration: if the proposal is pending but past its TTL,
         the call advances it to expired before returning.
+
+        B01 multi-leg routing: a ``proposal_kind == 'multi_leg'`` row is returned as
+        a :class:`StoredMultiLegProposal` wrapper that (a) carries the lifecycle
+        fields ``quant_approve`` reads (``state``/``expires_at``/``advisor_result``/
+        ``proposal_kind``) and (b) RE-MINTS the inner ``MultiLegProposal`` via
+        ``from_gate_result`` (so ``risk_gate_pass`` is the gate's verdict, never
+        hand-set) and delegates every structural attribute the reactor reads to it.
+        ``react.dispatch.select_reactor`` routes it to ``MultiLegPaperReactor`` (it
+        carries ``proposal_kind == 'multi_leg'`` AND ``option_legs``/``strategy_kind``).
+        The equity path is unchanged — an equity row returns the plain ``Proposal``.
         """
         with self._lock:
             try:
@@ -300,7 +403,14 @@ class ProposalStore:
                 return None
             if current.state == "pending":
                 if _iso_in_past(current.expires_at):
-                    return self.expire_one(proposal_id)
+                    current = self.expire_one(proposal_id) or current
+            if current.proposal_kind == "multi_leg" and current.multi_leg is not None:
+                # Re-mint + wrap so the reactor sees a real MultiLegProposal and
+                # quant_approve sees the lifecycle fields. A malformed payload is
+                # fail-closed: a wrapper that the reactor will refuse (risk_gate_pass
+                # is rebuilt from the gate verdict — a rejected/garbled payload never
+                # mints a passing proposal).
+                return StoredMultiLegProposal.from_record(current)
             return current
 
     def list_pending(
@@ -420,8 +530,8 @@ class ProposalStore:
                             INSERT INTO proposals
                               (proposal_id, state, symbol, asset_class, timeframe,
                                created_at, expires_at, approved_at, rejected_at,
-                               expired_at, record_json)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                               expired_at, record_json, proposal_kind)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                             """,
                             (
                                 proposal.proposal_id,
@@ -437,6 +547,7 @@ class ProposalStore:
                                 json.dumps(
                                     record, separators=(",", ":"), sort_keys=True
                                 ),
+                                proposal.proposal_kind,
                             ),
                         )
                     conn.execute("COMMIT")
@@ -550,15 +661,16 @@ class ProposalStore:
                     INSERT INTO proposals
                       (proposal_id, state, symbol, asset_class, timeframe,
                        created_at, expires_at, approved_at, rejected_at,
-                       expired_at, record_json)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                       expired_at, record_json, proposal_kind)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(proposal_id) DO UPDATE SET
                       state = excluded.state,
                       expires_at = excluded.expires_at,
                       approved_at = excluded.approved_at,
                       rejected_at = excluded.rejected_at,
                       expired_at = excluded.expired_at,
-                      record_json = excluded.record_json
+                      record_json = excluded.record_json,
+                      proposal_kind = excluded.proposal_kind
                     """,
                     (
                         proposal.proposal_id,
@@ -572,6 +684,7 @@ class ProposalStore:
                         proposal.rejected_at,
                         proposal.expired_at,
                         json.dumps(record, separators=(",", ":"), sort_keys=True),
+                        proposal.proposal_kind,
                     ),
                 )
                 conn.execute("COMMIT")
@@ -648,8 +761,15 @@ def _make_proposal_id(symbol: str, now: datetime) -> str:
 
 
 def _proposal_to_dict(p: Proposal) -> dict[str, Any]:
-    """Convert Proposal dataclass to plain dict for serialization."""
-    return {
+    """Convert Proposal dataclass to plain dict for serialization.
+
+    B01 byte-identity rail: ``proposal_kind`` / ``multi_leg`` are emitted ONLY for
+    a multi-leg proposal. An equity proposal (the default ``proposal_kind=='equity'``
+    with ``multi_leg is None``) produces the EXACT pre-B01 dict — no new keys — so
+    its JSONL/SQLite ``record_json`` bytes are unchanged (the equity path stays
+    byte-identical, per the wave rail).
+    """
+    d = {
         "proposal_id": p.proposal_id,
         "state": p.state,
         "symbol": p.symbol,
@@ -666,6 +786,13 @@ def _proposal_to_dict(p: Proposal) -> dict[str, Any]:
         "advisor_result": p.advisor_result,
         "execution": p.execution,
     }
+    # Additive-only: include the multi-leg discriminator + payload ONLY when this is
+    # actually a multi-leg proposal. Omitting them on the equity path keeps the
+    # serialized record byte-identical to the pre-B01 shape.
+    if p.proposal_kind != "equity" or p.multi_leg is not None:
+        d["proposal_kind"] = p.proposal_kind
+        d["multi_leg"] = p.multi_leg
+    return d
 
 
 def _proposal_from_json(json_str: str) -> Proposal:
@@ -688,7 +815,257 @@ def _proposal_from_json(json_str: str) -> Proposal:
         expired_at=d.get("expired_at"),
         advisor_result=d.get("advisor_result", {}),
         execution=d.get("execution"),
+        # B01: default to the equity discriminator for any pre-B01 record (no
+        # `proposal_kind` key) so old equity rows reconstruct unchanged.
+        proposal_kind=d.get("proposal_kind", "equity"),
+        multi_leg=d.get("multi_leg"),
     )
+
+
+# ---------------------------------------------------------------------------
+# B01 multi-leg payload (de)serialization + re-mint
+# ---------------------------------------------------------------------------
+#
+# DESIGN (the #38 constructor-lock at the persistence boundary):
+#   We persist the OptionsGateResult FIELDS (not a flag) plus the leg/structure
+#   shape, and on read we REBUILD the OptionsGateResult and re-run
+#   MultiLegProposal.from_gate_result. So ``risk_gate_pass`` is NEVER serialized as
+#   an authoritative truth value we trust on read — it is ALWAYS recomputed as
+#   ``gate_result.admitted`` copied by the blessed mint seam. A tampered/garbled
+#   payload cannot resurrect a passing verdict: the worst case is a malformed
+#   OptionsGateResult that mints a *rejected* (or unparseable -> raises) proposal,
+#   which the reactor refuses. Fail-closed, by construction.
+
+
+def _greeks_to_dict(g: Any) -> dict[str, Any] | None:
+    if g is None:
+        return None
+    return {
+        "delta": g.delta,
+        "gamma": g.gamma,
+        "theta": g.theta,
+        "vega": g.vega,
+        "rho": g.rho,
+        "iv": g.iv,
+        "iv_source": g.iv_source,
+    }
+
+
+def _multi_leg_to_dict(
+    proposal: MultiLegProposal, gate_result: OptionsGateResult
+) -> dict[str, Any]:
+    """Serialize a minted MultiLegProposal + its OptionsGateResult to a JSON-safe
+    payload. Money is stored as ``str`` (Decimal round-trips exactly via str)."""
+    ng = gate_result.net_greeks
+    return {
+        "schema_version": 1,
+        "strategy_kind": proposal.strategy_kind,
+        "underlying": proposal.underlying,
+        "asof": _iso(proposal.asof),
+        "outer_qty": int(proposal.outer_qty),
+        "net_debit_credit": str(proposal.net_debit_credit),
+        "max_gain": (None if proposal.max_gain is None else str(proposal.max_gain)),
+        "breakeven_underlying": [str(b) for b in proposal.breakeven_underlying],
+        "rationale": proposal.rationale,
+        "source_recipe_id": proposal.source_recipe_id,
+        "option_legs": [
+            {
+                "symbol": leg.symbol,
+                "side": leg.side,
+                "position_intent": leg.position_intent,
+                "ratio_qty": int(leg.ratio_qty),
+                "greeks_at_decision": _greeks_to_dict(leg.greeks_at_decision),
+                "fill_price": leg.fill_price,
+            }
+            for leg in proposal.option_legs
+        ],
+        "stock_leg": (
+            None
+            if proposal.stock_leg is None
+            else {
+                "underlying": proposal.stock_leg.underlying,
+                "qty": int(proposal.stock_leg.qty),
+                "basis_per_share": proposal.stock_leg.basis_per_share,
+            }
+        ),
+        # The gate RESULT fields — the source of truth for the re-mint.
+        "gate_result": {
+            "admitted": bool(gate_result.admitted),
+            "bucket": gate_result.bucket.value,
+            "reason": gate_result.reason,
+            "net_greeks": {
+                "delta": ng.delta,
+                "gamma": ng.gamma,
+                "theta": ng.theta,
+                "vega": ng.vega,
+                "rho": ng.rho,
+            },
+            "bpr_estimate": float(gate_result.bpr_estimate),
+            "max_loss": (
+                None if gate_result.max_loss is None else float(gate_result.max_loss)
+            ),
+            "contracts": int(gate_result.contracts),
+            "warnings": list(gate_result.warnings),
+        },
+    }
+
+
+def _rebuild_gate_result(d: dict[str, Any]) -> OptionsGateResult:
+    """Rebuild an OptionsGateResult from the persisted gate-result fields."""
+    from hermes_quant.options.data import NetGreeks
+    from hermes_quant.risk.options_gate import OptionsGateResult, StructureBucket
+
+    ng = d["net_greeks"]
+    return OptionsGateResult(
+        admitted=bool(d["admitted"]),
+        bucket=StructureBucket(d["bucket"]),
+        reason=d.get("reason"),
+        net_greeks=NetGreeks(
+            delta=ng.get("delta", 0.0),
+            gamma=ng.get("gamma", 0.0),
+            theta=ng.get("theta", 0.0),
+            vega=ng.get("vega", 0.0),
+            rho=ng.get("rho", 0.0),
+        ),
+        bpr_estimate=float(d["bpr_estimate"]),
+        max_loss=(None if d.get("max_loss") is None else float(d["max_loss"])),
+        contracts=int(d.get("contracts", 0)),
+        warnings=tuple(d.get("warnings", ())),
+    )
+
+
+def _multi_leg_from_dict(d: dict[str, Any]) -> MultiLegProposal:
+    """Re-mint a MultiLegProposal from a persisted payload via from_gate_result.
+
+    This is the ONLY read-path that produces a MultiLegProposal, and it ALWAYS goes
+    through the blessed mint seam — so ``risk_gate_pass`` is the gate's verdict, never
+    a value we trust off disk. ``proposal_id`` is supplied by the caller (the store
+    key), keeping it authoritative even if the payload were tampered.
+    """
+    from decimal import Decimal
+
+    from hermes_quant.options.data import OptionGreeksSnapshot, OptionLeg, StockLeg
+    from hermes_quant.options.multileg import MultiLegProposal
+
+    def _snap(g: dict[str, Any] | None) -> OptionGreeksSnapshot | None:
+        if g is None:
+            return None
+        return OptionGreeksSnapshot(
+            delta=g.get("delta"),
+            gamma=g.get("gamma"),
+            theta=g.get("theta"),
+            vega=g.get("vega"),
+            rho=g.get("rho"),
+            iv=g.get("iv"),
+            iv_source=g.get("iv_source"),
+        )
+
+    option_legs = tuple(
+        OptionLeg(
+            symbol=leg["symbol"],
+            side=leg["side"],
+            position_intent=leg["position_intent"],
+            ratio_qty=int(leg.get("ratio_qty", 1)),
+            greeks_at_decision=_snap(leg.get("greeks_at_decision")),
+            fill_price=leg.get("fill_price"),
+        )
+        for leg in d["option_legs"]
+    )
+    sl = d.get("stock_leg")
+    stock_leg = (
+        None
+        if sl is None
+        else StockLeg(
+            underlying=sl["underlying"],
+            qty=int(sl["qty"]),
+            basis_per_share=sl.get("basis_per_share"),
+        )
+    )
+    gate_result = _rebuild_gate_result(d["gate_result"])
+    return MultiLegProposal.from_gate_result(
+        gate_result=gate_result,
+        proposal_id=d["proposal_id"],
+        asof=datetime.strptime(d["asof"].replace("Z", ""), "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=UTC
+        ),
+        strategy_kind=d["strategy_kind"],
+        underlying=d["underlying"],
+        option_legs=option_legs,
+        stock_leg=stock_leg,
+        outer_qty=int(d["outer_qty"]),
+        net_debit_credit=Decimal(str(d["net_debit_credit"])),
+        max_gain=(None if d.get("max_gain") is None else Decimal(str(d["max_gain"]))),
+        breakeven_underlying=tuple(
+            Decimal(str(b)) for b in d.get("breakeven_underlying", ())
+        ),
+        rationale=d.get("rationale", ""),
+        source_recipe_id=d.get("source_recipe_id", ""),
+    )
+
+
+class StoredMultiLegProposal:
+    """Read-path wrapper for a persisted multi-leg proposal (B01).
+
+    Carries BOTH faces a multi-leg proposal needs after ``store.get()``:
+
+      * the HITL lifecycle fields ``quant_approve`` reads — ``state``,
+        ``expires_at``, ``created_at``, ``advisor_result``, ``proposal_kind`` (='multi_leg'),
+        ``symbol``/``asset_class``/``timeframe`` — taken from the persisted ``Proposal`` row;
+      * the structural ``MultiLegProposal`` the reactor consumes — re-minted via
+        ``from_gate_result`` and exposed by delegating every other attribute to it
+        (``risk_gate_pass``, ``option_legs``, ``strategy_kind``, ``net_debit_credit``,
+        ``net_greeks``, ``underlying``, ``outer_qty``, ``asof``, etc.).
+
+    ``react.dispatch.select_reactor`` routes it to ``MultiLegPaperReactor`` because it
+    exposes ``proposal_kind == 'multi_leg'`` AND ``option_legs``/``strategy_kind``. The
+    lifecycle attributes are set explicitly on the instance, so ``__getattr__`` (which
+    only fires for *missing* attributes) cleanly delegates the rest to the inner
+    proposal without shadowing the lifecycle fields. No reactor change is needed.
+    """
+
+    proposal_kind = "multi_leg"
+
+    def __init__(self, record: Proposal, inner: MultiLegProposal) -> None:
+        self.proposal_id = record.proposal_id
+        self.state = record.state
+        self.symbol = record.symbol
+        self.asset_class = record.asset_class
+        self.timeframe = record.timeframe
+        self.created_at = record.created_at
+        self.expires_at = record.expires_at
+        self.advisor_result = record.advisor_result
+        self.approved_at = record.approved_at
+        self.approver_user_id = record.approver_user_id
+        self.size_override_pct = record.size_override_pct
+        self.rejected_at = record.rejected_at
+        self.rejection_reason = record.rejection_reason
+        self.expired_at = record.expired_at
+        self.execution = record.execution
+        self.multi_leg = record.multi_leg
+        # The re-minted structural proposal the reactor consumes.
+        self.proposal = inner
+
+    @classmethod
+    def from_record(cls, record: Proposal) -> StoredMultiLegProposal:
+        if record.multi_leg is None:
+            raise ValueError(
+                f"proposal {record.proposal_id} is multi_leg but has no payload"
+            )
+        # proposal_id authoritative from the row (not the payload).
+        payload = dict(record.multi_leg)
+        payload["proposal_id"] = record.proposal_id
+        inner = _multi_leg_from_dict(payload)
+        return cls(record, inner)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached for attributes NOT set on the instance (the lifecycle fields
+        # above) and NOT on the class — i.e. the structural MultiLegProposal surface
+        # the reactor reads. Delegate to the inner proposal.
+        try:
+            inner = object.__getattribute__(self, "proposal")
+        except AttributeError as exc:  # pragma: no cover - during __init__ only
+            raise AttributeError(name) from exc
+        return getattr(inner, name)
 
 
 # ---------------------------------------------------------------------------
