@@ -71,15 +71,32 @@ class InvalidStatusTransition(ValueError):
     """Raised when a requested status transition is not allowed."""
 
 
+class ResearchAuthorityViolation(ValueError):  # noqa: N818 — matches sibling *Violation exceptions above
+    """Raised at register() when a hypothesis' text implies live-execution
+    authority AND the opt-in hard-block flag (HERMES_QUANT_RESEARCH_RISK_TIER_BLOCK=1)
+    is set (B30). By default (flag unset) such a hypothesis is downgraded to
+    research_only and annotated, never blocked — see
+    :func:`hermes_quant.research.risk_tier.classify_risk_tier`."""
+
+
 # ---------------------------------------------------------------------------
 # Status transition graph
 # ---------------------------------------------------------------------------
 
-# open → running → {validated | falsified | abandoned}
+# open → running → {monitoring | validated | falsified | abandoned}
+# monitoring → {validated | falsified | abandoned}
 # abandoned is reachable from any non-terminal state.
+#
+# B25 (ADR-0048): `monitoring` is a non-terminal observation state inserted
+# between `running` and the terminal verdicts. A hypothesis whose run-cards
+# have been produced but whose verdict is being watched (e.g. paper-trading a
+# candidate before promotion) sits in `monitoring`. The transition is purely
+# additive: the legacy `running → {validated | falsified}` edges are preserved,
+# so existing callers (orchestrator, promotion_orchestrator) are unaffected.
 _VALID_TRANSITIONS: dict[str, set[str]] = {
     "open": {"running", "abandoned"},
-    "running": {"validated", "falsified", "abandoned"},
+    "running": {"monitoring", "validated", "falsified", "abandoned"},
+    "monitoring": {"validated", "falsified", "abandoned"},
     "validated": set(),  # terminal
     "falsified": set(),  # terminal
     "abandoned": set(),  # terminal
@@ -127,9 +144,15 @@ class Hypothesis(BaseModel):
         env_vars, etc.  Max 10 keys.
     related_adrs:
         List of related ADR identifiers, e.g. ["ADR-0044", "ADR-0046"].
+    run_card_ids:
+        Run-card linkage (B25). The list of ``run_id`` values produced for
+        this hypothesis, recorded via ``HypothesisRegistry.link_run_card``.
+        Append-only and order-preserving; defaults to ``[]`` so legacy rows
+        registered before B25 (which have no such field) parse unchanged.
     status:
         Current lifecycle status. Valid transitions:
-        open → running → {validated | falsified | abandoned}.
+        open → running → {monitoring | validated | falsified | abandoned};
+        monitoring → {validated | falsified | abandoned}.
         Status transitions are append-only new rows — NEVER mutations.
     """
 
@@ -144,7 +167,10 @@ class Hypothesis(BaseModel):
     duration_target_days: int = Field(ge=1, le=730)
     scope: dict[str, Any] = Field(default_factory=dict)
     related_adrs: list[str] = Field(default_factory=list)
-    status: Literal["open", "running", "validated", "falsified", "abandoned"] = "open"
+    run_card_ids: list[str] = Field(default_factory=list)
+    status: Literal[
+        "open", "running", "monitoring", "validated", "falsified", "abandoned"
+    ] = "open"
 
     model_config = {"extra": "forbid"}
 
@@ -275,10 +301,25 @@ class HypothesisRegistry:
         If ``hypothesis.hypothesis_id`` is empty, a unique ID is generated
         from the first ticker in ``hypothesis.scope`` (or "UNKNOWN").
 
+        Defensive RiskTier guard (B30)
+        ------------------------------
+        Before the row is written, the hypothesis' free-text (claim,
+        null_hypothesis, experiment_design) is classified by
+        ``risk_tier.classify_risk_tier``. The research plane must NEVER claim
+        live-execution authority, so the persisted row is annotated with a
+        ``risk_tier`` field (additive; defaults to ``research_only``). A
+        hypothesis whose text implies live-trading authority is FLAGGED and the
+        annotation records the matched phrases — but it is still recorded as
+        ``research_only`` (downgraded, fail-closed). When the opt-in flag
+        ``HERMES_QUANT_RESEARCH_RISK_TIER_BLOCK=1`` is set, a flagged hypothesis
+        is refused with :class:`ResearchAuthorityViolation` instead.
+
         Raises
         ------
         HypothesisIDCollision:
             If a hypothesis with the same ID already exists in the registry.
+        ResearchAuthorityViolation:
+            Only when the opt-in hard-block flag is set AND the text is flagged.
         """
         ticker = _extract_ticker(hypothesis)
         hyp_id = hypothesis.hypothesis_id or _make_hypothesis_id(ticker)
@@ -291,6 +332,33 @@ class HypothesisRegistry:
                 f"hypothesis_id {hyp_id!r} already exists in the registry"
             )
 
+        # ---- B30: defensive research-only RiskTier keyword guard ----------
+        # Imported lazily so the registry has no import-time dependency on the
+        # guard module (mirrors the lazy ast_purity / audit_log imports above).
+        from hermes_quant.research.risk_tier import (
+            RiskTier,
+            block_on_flag_enabled,
+            classify_risk_tier,
+        )
+
+        tier_result = classify_risk_tier(
+            hypothesis.claim,
+            hypothesis.null_hypothesis,
+            hypothesis.experiment_design,
+        )
+        if tier_result.is_flagged:
+            if block_on_flag_enabled():
+                raise ResearchAuthorityViolation(
+                    f"hypothesis {hyp_id!r} {tier_result.reason}; "
+                    "refused (HERMES_QUANT_RESEARCH_RISK_TIER_BLOCK=1)"
+                )
+            logger.warning(
+                "hypothesis-registry: %s %s", hyp_id, tier_result.reason
+            )
+        # Fail-closed: the research plane only ever lands at research_only. The
+        # FLAGGED tier is downgraded; the matched phrases survive for audit.
+        persisted_tier = RiskTier.RESEARCH_ONLY.value
+
         # Build a canonical copy with filled-in defaults
         hyp_dict = hypothesis.model_dump()
         hyp_dict["hypothesis_id"] = hyp_id
@@ -299,6 +367,8 @@ class HypothesisRegistry:
         row: dict[str, Any] = {
             "schema_version": CURRENT_SCHEMA_VERSION,
             "kind": "hypothesis",
+            "risk_tier": persisted_tier,
+            "risk_tier_flagged": list(tier_result.matched),
             **hyp_dict,
         }
         _append_row(self._path, row)
@@ -314,7 +384,8 @@ class HypothesisRegistry:
         """Append a status_change row; never mutates the original registration.
 
         Valid transitions:
-          open → running → {validated | falsified | abandoned}
+          open → running → {monitoring | validated | falsified | abandoned}
+          monitoring → {validated | falsified | abandoned}
           open → abandoned
           running → abandoned
 
@@ -351,6 +422,38 @@ class HypothesisRegistry:
             "hypothesis-registry: %s %s → %s", hypothesis_id, current, new_status
         )
 
+    def link_run_card(self, hypothesis_id: str, run_id: str) -> None:
+        """Append a run-card linkage row (B25); never mutates the registration.
+
+        Records that the run-card ``run_id`` (produced by RunCardLog) belongs
+        to ``hypothesis_id``. The linkage is materialised into
+        ``Hypothesis.run_card_ids`` by ``read`` replaying these rows in order.
+        Re-linking an already-linked ``run_id`` is a no-op (deduplicated).
+
+        Raises
+        ------
+        HypothesisNotFound:
+            If hypothesis_id does not exist.
+        """
+        hyp = self.read(hypothesis_id)
+        if hyp is None:
+            raise HypothesisNotFound(hypothesis_id)
+        if run_id in hyp.run_card_ids:
+            # Idempotent: already linked; do not append a duplicate row.
+            return
+
+        row: dict[str, Any] = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "kind": "run_card_link",
+            "hypothesis_id": hypothesis_id,
+            "run_id": run_id,
+            "asof": _now_iso(),
+        }
+        _append_row(self._path, row)
+        logger.info(
+            "hypothesis-registry: %s linked run_card %s", hypothesis_id, run_id
+        )
+
     # ------------------------------------------------------------------
     # Read side
     # ------------------------------------------------------------------
@@ -361,26 +464,45 @@ class HypothesisRegistry:
         The state is materialized by replaying the event log:
           1. Find the registration row.
           2. Apply all status_change rows in order.
+          3. Accumulate run_card_link rows into run_card_ids (B25).
         """
         registration: dict[str, Any] | None = None
         latest_status: str | None = None
+        linked_run_cards: list[str] = []
 
         for row in self._iter_rows():
             if row.get("kind") == "hypothesis" and row.get("hypothesis_id") == hypothesis_id:
                 registration = row
                 latest_status = row.get("status", "open")
+                # Seed from any run_card_ids already present on the
+                # registration row (e.g. pre-linked at register time).
+                seed = row.get("run_card_ids", [])
+                if isinstance(seed, list):
+                    linked_run_cards = [str(rid) for rid in seed]
             elif (
                 row.get("kind") == "status_change"
                 and row.get("hypothesis_id") == hypothesis_id
             ):
                 latest_status = row.get("new_status", latest_status)
+            elif (
+                row.get("kind") == "run_card_link"
+                and row.get("hypothesis_id") == hypothesis_id
+            ):
+                run_id = row.get("run_id")
+                if run_id is not None and run_id not in linked_run_cards:
+                    linked_run_cards.append(str(run_id))
 
         if registration is None:
             return None
 
-        # Reconstruct with applied status
-        data = {k: v for k, v in registration.items() if k not in ("schema_version", "kind")}
+        # Reconstruct with applied status + materialised run-card linkage.
+        # Strip registry-level annotations (schema_version, kind) and the B30
+        # RiskTier guard fields, none of which are Hypothesis model fields
+        # (the model is extra="forbid").
+        non_model_keys = ("schema_version", "kind", "risk_tier", "risk_tier_flagged")
+        data = {k: v for k, v in registration.items() if k not in non_model_keys}
         data["status"] = latest_status or data.get("status", "open")
+        data["run_card_ids"] = linked_run_cards
         return Hypothesis(**data)
 
     def read_all_open(self) -> Iterator[Hypothesis]:
@@ -390,6 +512,10 @@ class HypothesisRegistry:
     def read_all_running(self) -> Iterator[Hypothesis]:
         """Yield all hypotheses with status='running'."""
         yield from self._read_by_status("running")
+
+    def read_all_monitoring(self) -> Iterator[Hypothesis]:
+        """Yield all hypotheses with status='monitoring' (B25)."""
+        yield from self._read_by_status("monitoring")
 
     def read_all_resolved(self) -> Iterator[Hypothesis]:
         """Yield all hypotheses with terminal status (validated|falsified|abandoned)."""
