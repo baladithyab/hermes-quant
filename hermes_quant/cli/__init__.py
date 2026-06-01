@@ -494,6 +494,33 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Directory to write report.md + result.json (default: ~/.hermes/quant/backtests/<run-id>/)",
     )
+    p_bt.add_argument(
+        "--validate",
+        action="store_true",
+        help=(
+            "Emit validation.json (B32): Monte-Carlo permutation test + stationary "
+            "block bootstrap CI + deflated Sharpe over the realized return series. "
+            "Default OFF; evidence only, never a trade or promotion decision."
+        ),
+    )
+    p_bt.add_argument(
+        "--validate-permutations",
+        type=int,
+        default=1000,
+        help="Monte-Carlo permutation count for --validate (default 1000)",
+    )
+    p_bt.add_argument(
+        "--validate-resamples",
+        type=int,
+        default=9999,
+        help="Bootstrap resample count for --validate (default 9999)",
+    )
+    p_bt.add_argument(
+        "--validate-seed",
+        type=int,
+        default=42,
+        help="Deterministic seed for --validate (default 42)",
+    )
     p_bt.add_argument("--json", action="store_true", help="Print JSON to stdout instead of report")
 
     p_btr = sub.add_parser(
@@ -1323,6 +1350,12 @@ def _dispatch_backtest(args) -> int:
             for d in result.decisions_summary:
                 f.write(_json.dumps(d, default=str) + "\n")
 
+    # B32 validation suite (default-OFF, additive). Evidence only — never a
+    # trade or promotion decision; the deterministic gate stays authoritative.
+    validation_written = False
+    if getattr(args, "validate", False):
+        validation_written = _emit_validation_json(args, result, out_dir)
+
     # Output
     if args.json:
         print(_json.dumps(result.to_dict(), indent=2, default=str))
@@ -1338,8 +1371,99 @@ def _dispatch_backtest(args) -> int:
         else:
             print("  equity_curve.csv — per-bar equity / buy-hold / position")
             print("  decisions.jsonl  — per-bar advisor result snapshots")
+        if validation_written:
+            print("  validation.json  — MC permutation + bootstrap CI + DSR (B32, evidence-only)")
 
     return 0
+
+
+def _emit_validation_json(args, result, out_dir) -> bool:
+    """Build + write out_dir/validation.json (B32). Returns True on success.
+
+    Operates only on the already-realized return vector(s). For walk-forward
+    it concatenates the per-fold OOS strategy returns chronologically (folds
+    are non-overlapping test slices -> no leakage; preserve fold order). The
+    deterministic config_hash is reused; generated_at stays OUT of any hash.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    import pandas as _pd
+
+    from hermes_quant.backtest.replay import _bars_per_year
+    from hermes_quant.evaluation import validate_returns
+
+    out_dir = _Path(out_dir)
+    bars_per_year = _bars_per_year(args.timeframe)
+
+    if args.walk_forward:
+        # Chronological concatenation of non-overlapping OOS test folds.
+        strat_parts = []
+        bh_parts = []
+        for fold in result.folds:
+            strat_parts.append(fold.result.equity_curve.pct_change().dropna())
+            bh_parts.append(fold.result.bh_equity_curve.pct_change().dropna())
+        strat_returns = (
+            _pd.concat(strat_parts) if strat_parts else _pd.Series(dtype=float)
+        )
+        bh_returns = _pd.concat(bh_parts) if bh_parts else _pd.Series(dtype=float)
+        wf_summary = {
+            "n_splits": result.n_splits,
+            "positive_excess_fold_rate": result.positive_excess_fold_rate,
+            "mean_sharpe_delta": result.mean_sharpe_delta,
+        }
+        metrics = {
+            "sharpe": result.mean_sharpe_delta,
+            "n_observations": int(len(strat_returns)),
+        }
+        config_hash = result.folds[0].result.config_hash if result.folds else ""
+        run_at = result.folds[0].result.run_at if result.folds else ""
+    else:
+        strat_returns = result.equity_curve.pct_change().dropna()
+        bh_returns = result.bh_equity_curve.pct_change().dropna()
+        wf_summary = None
+        metrics = {
+            "sharpe": result.sharpe,
+            "excess_return_vs_buy_hold_pct": result.excess_return_vs_buy_hold_pct,
+            "n_observations": int(len(strat_returns)),
+        }
+        config_hash = result.config_hash
+        run_at = result.run_at
+
+    report = validate_returns(
+        strat_returns,
+        bars_per_year=bars_per_year,
+        bh_returns=bh_returns,
+        n_permutations=args.validate_permutations,
+        n_resamples=args.validate_resamples,
+        seed=args.validate_seed,
+        walk_forward_summary=wf_summary,
+    )
+    rdict = report.to_dict()
+
+    # Vibe-Trading run_card envelope (extended). generated_at is the only
+    # non-deterministic field and is deliberately kept out of config_hash.
+    monte_carlo = {p["statistic"]: p for p in rdict["permutation"]}
+    bootstrap = {c["statistic"]: c for c in rdict["bootstrap"]}
+    envelope = {
+        "schema_version": "1",
+        "generated_at": run_at or _pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reproducibility": {"config_hash": config_hash, "seed": report.seed},
+        "metrics": metrics,
+        "validation": {
+            "deflated_sharpe": rdict["deflated_sharpe"],
+            "monte_carlo": monte_carlo,
+            "bootstrap": bootstrap,
+            "walk_forward": rdict["walk_forward"],
+        },
+        "warnings": rdict["warnings"],
+        "artifacts": [],
+    }
+    (out_dir / "validation.json").write_text(
+        _json.dumps(envelope, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    return True
 
 
 def _load_bars_file(path: str):
@@ -1430,10 +1554,14 @@ def _fetch_bars_via_provider(
         provider_name = f"ccxt:{exchange_id}"
 
         def fetch():
-            return provider.fetch_bars(
-                symbol=symbol,
-                asset_class=asset_class,
-                timeframe=timeframe,
+            # B22: CcxtProvider.fetch_bars now exposes the canonical Protocol
+            # signature; the crypto-specific lookback/as_of path lives in
+            # _fetch_crypto_bars. Call it directly to preserve the CLI's own
+            # lookback_bars computation (and thus the cache key) byte-for-byte.
+            return provider._fetch_crypto_bars(
+                symbol,
+                asset_class,
+                timeframe,
                 lookback_bars=lookback,
                 as_of=as_of,
             )
@@ -1448,11 +1576,34 @@ def _fetch_bars_via_provider(
         provider_name = "yfinance"
 
         def fetch():
+            # B22: fixed latent bug — YFinanceProvider.fetch_bars has NEVER
+            # accepted (symbol=, asset_class=, lookback_bars=); those
+            # ccxt-shaped kwargs were copy-pasted and would TypeError if this
+            # branch ran. Call the canonical signature
+            # (asset, timeframe, start, end, *, use_cache, as_of). Derive the
+            # [start, end] window from the same lookback the cache key uses so
+            # behavior stays consistent with the ccxt branch.
+            _end = as_of if as_of is not None else _pd.Timestamp.utcnow()
+            _tf_seconds = {
+                "1m": 60,
+                "5m": 300,
+                "15m": 900,
+                "30m": 1800,
+                "1h": 3600,
+                "4h": 14400,
+                "1d": 86400,
+            }.get(timeframe, 3600)
+            _start = (
+                _pd.Timestamp(start)
+                if start
+                else _end - _pd.Timedelta(seconds=_tf_seconds * lookback * 2)
+            )
             return provider.fetch_bars(
-                symbol=symbol,
-                asset_class=asset_class,
-                timeframe=timeframe,
-                lookback_bars=lookback,
+                symbol,
+                timeframe,
+                _start,
+                _end,
+                use_cache=use_cache,
                 as_of=as_of,
             )
     else:

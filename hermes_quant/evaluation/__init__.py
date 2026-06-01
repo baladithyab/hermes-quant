@@ -15,6 +15,12 @@ imports `shuffle_timestamps_test` from here.
 from .cv import PurgedWalkForward, WalkForwardSplit
 from .dsr import deflated_sharpe
 from .lookahead import LookaheadTestResult, shuffle_timestamps_test
+from .validation import (
+    BootstrapCI,
+    PermutationResult,
+    ValidationReport,
+    validate_returns,
+)
 
 __all__ = [
     "PurgedWalkForward",
@@ -22,4 +28,8 @@ __all__ = [
     "LookaheadTestResult",
     "shuffle_timestamps_test",
     "deflated_sharpe",
+    "validate_returns",
+    "ValidationReport",
+    "BootstrapCI",
+    "PermutationResult",
 ]
