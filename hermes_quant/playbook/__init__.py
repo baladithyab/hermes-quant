@@ -31,6 +31,14 @@ from hermes_quant.playbook.direction_bias import (
     direction_play_compatible,
     play_bias,
 )
+from hermes_quant.playbook.play_loader import (
+    build_play_registry,
+    discover_external_plays,
+    install_external_plays,
+    load_user_plays,
+    play_profile_from_mapping,
+    plays_open_enabled,
+)
 from hermes_quant.playbook.profiles import (
     PROFILES,
     PlayProfile,
@@ -71,6 +79,13 @@ __all__ = [
     "compatible_plays",
     "direction_play_compatible",
     "play_bias",
+    # registry-open play loader (ADR-0082 Part A continuation)
+    "build_play_registry",
+    "discover_external_plays",
+    "install_external_plays",
+    "load_user_plays",
+    "play_profile_from_mapping",
+    "plays_open_enabled",
     # fitness scoring
     "PROFILES",
     "PlayFitness",
