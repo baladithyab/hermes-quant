@@ -273,6 +273,16 @@ class HermesQuantConsumer(IStrategy):
         for orphan fills, which is correct (we have no decision context).
         """
         try:
+            # order_filled delivers fill data on the `order` object (freqtrade Order:
+            # safe_price = fill price, safe_filled = filled qty). NOT via `rate`/`amount`
+            # — those are confirm_trade_entry params and were undefined here (latent
+            # NameError on the first real fill). getattr-guarded for defensiveness.
+            _fill_price = getattr(order, "safe_price", None)
+            if _fill_price is None:
+                _fill_price = getattr(order, "average", None) or getattr(order, "price", 0.0)
+            _fill_amount = getattr(order, "safe_filled", None)
+            if _fill_amount is None:
+                _fill_amount = getattr(order, "filled", None) or getattr(order, "amount", 0.0)
             signal = self._latest_signal_for(pair, current_time)
             signal_id = signal.get("id") if signal else None
             if signal is not None and "decision_price" in signal:
@@ -282,7 +292,7 @@ class HermesQuantConsumer(IStrategy):
                 # Orphan fill or pre-fix bus record. Fall back to fill price
                 # so realized_return = 0 (settlement loop will skip this for
                 # calibrator updates per P0-A.3).
-                decision_price = float(rate)
+                decision_price = float(_fill_price)
 
             record = {
                 "schema_version": 1,
@@ -290,8 +300,8 @@ class HermesQuantConsumer(IStrategy):
                 "asof": (current_time or pd.Timestamp.utcnow()).isoformat(),
                 "asset": pair,
                 "side": "buy" if order.side == "buy" else "sell",
-                "qty": float(amount),
-                "fill_price": float(rate),
+                "qty": float(_fill_amount),
+                "fill_price": float(_fill_price),
                 "decision_price": decision_price,
                 "fees": float(getattr(order, "cost", 0.0)) * 0.001,  # estimate
                 "account_id": "freqtrade",
