@@ -2,7 +2,7 @@
 
 > ARIA-powered multi-analyst algorithmic trading framework.
 > Distributed as a [Hermes Agent](https://hermes-agent.nousresearch.com/) plugin.
-> **v0.4.4 — alpha. Paper/backtest/HITL scaffolding only. Do not run live with real money.**
+> **v0.6.4 — alpha. Paper/backtest/HITL scaffolding only. Do not run live with real money.**
 
 ```
                     ┌─────────────────────────┐

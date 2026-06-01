@@ -1225,7 +1225,7 @@ wheels = [
 
 [[package]]
 name = "hermes-quant"
-version = "0.4.4"
+version = "0.6.4"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -1246,6 +1246,7 @@ all = [
     { name = "matplotlib" },
     { name = "mlflow" },
     { name = "pyyaml" },
+    { name = "requests" },
     { name = "safetensors" },
     { name = "scikit-learn" },
     { name = "scipy" },
@@ -1256,6 +1257,9 @@ all = [
 ]
 alpaca = [
     { name = "alpaca-py" },
+]
+alphavantage = [
+    { name = "requests" },
 ]
 backtest = [
     { name = "matplotlib" },
@@ -1286,6 +1290,24 @@ stacking = [
     { name = "scikit-learn" },
     { name = "scipy" },
 ]
+test = [
+    { name = "alpaca-py" },
+    { name = "ccxt" },
+    { name = "matplotlib" },
+    { name = "mypy" },
+    { name = "pyarrow" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-mock" },
+    { name = "pytest-xdist" },
+    { name = "pyyaml" },
+    { name = "requests" },
+    { name = "ruff" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+    { name = "seaborn" },
+    { name = "yfinance" },
+]
 yfinance = [
     { name = "pyyaml" },
     { name = "yfinance" },
@@ -1297,7 +1319,14 @@ requires-dist = [
     { name = "ccxt", marker = "extra == 'ccxt'", specifier = ">=4.2" },
     { name = "click", specifier = ">=8.1" },
     { name = "einops", marker = "extra == 'kronos'", specifier = ">=0.7" },
-    { name = "hermes-quant", extras = ["yfinance", "ccxt", "alpaca", "kronos", "stacking", "backtest", "mlflow", "options"], marker = "extra == 'all'" },
+    { name = "hermes-quant", extras = ["alpaca"], marker = "extra == 'test'" },
+    { name = "hermes-quant", extras = ["alphavantage"], marker = "extra == 'test'" },
+    { name = "hermes-quant", extras = ["backtest"], marker = "extra == 'test'" },
+    { name = "hermes-quant", extras = ["ccxt"], marker = "extra == 'test'" },
+    { name = "hermes-quant", extras = ["dev"], marker = "extra == 'test'" },
+    { name = "hermes-quant", extras = ["stacking"], marker = "extra == 'test'" },
+    { name = "hermes-quant", extras = ["yfinance"], marker = "extra == 'test'" },
+    { name = "hermes-quant", extras = ["yfinance", "ccxt", "alpaca", "alphavantage", "kronos", "stacking", "backtest", "mlflow", "options"], marker = "extra == 'all'" },
     { name = "httpx", specifier = ">=0.25" },
     { name = "huggingface-hub", marker = "extra == 'kronos'", specifier = ">=0.20" },
     { name = "matplotlib", marker = "extra == 'backtest'", specifier = ">=3.7" },
@@ -1306,12 +1335,14 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
     { name = "pandas", specifier = ">=2.0" },
     { name = "pyarrow", specifier = ">=14.0" },
+    { name = "pyarrow", marker = "extra == 'test'", specifier = ">=15.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.4" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3.12" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.5" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "pyyaml", marker = "extra == 'yfinance'", specifier = ">=6.0" },
+    { name = "requests", marker = "extra == 'alphavantage'", specifier = ">=2.31" },
     { name = "rich", specifier = ">=13.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1" },
     { name = "safetensors", marker = "extra == 'kronos'", specifier = ">=0.4" },
@@ -1322,7 +1353,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'kronos'", specifier = ">=4.35" },
     { name = "yfinance", marker = "extra == 'yfinance'", specifier = ">=0.2.40" },
 ]
-provides-extras = ["yfinance", "ccxt", "alpaca", "kronos", "stacking", "backtest", "mlflow", "options", "all", "dev"]
+provides-extras = ["yfinance", "ccxt", "alpaca", "alphavantage", "kronos", "stacking", "backtest", "mlflow", "options", "all", "dev", "test"]
 
 [[package]]
 name = "hf-xet"

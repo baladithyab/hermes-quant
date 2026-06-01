@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-06-01
+
+This release consolidates the 0.5.x → 0.6.4 line. Headline since 0.4.4 (see
+`docs/adr/README.md` for the authoritative decision record):
+
+- **ADR-0077** admissibility/shortability oracle (Alpaca-backed, fail-closed, read-only).
+- **ADR-0079** PDR unified architecture (Perception → Decision → Reaction); the
+  deterministic risk gate remains the sole, immutable order authority.
+- **ADR-0082/0083/0084** strategy-openness (registry-open plays + deterministic
+  structure-selection table), horizon-neutral foundations (intraday deferred), and
+  the scheduled-event calendar + pre-event REJECT/abstain guard — all default-OFF,
+  eval-gated, byte-identical-when-off.
+- **MCP integration**: a disabled-by-default optional-MCP registry (9 vetted servers,
+  creds-gated, read-only-pinned); 4 keyless read-only data servers enabled
+  (tradingview/coingecko/yahoo-finance/sec-edgar). No MCP is ever an order authority.
+- **Catalyst / social-arb** (below), the admission-precision eval axis (ADR-0075),
+  IC-dedup-at-register, the settlement/horizon measurement instrument, and the
+  `quant_insider` SEC-EDGAR Form-4 surface (default-OFF, `HERMES_QUANT_INSIDER_ENABLED`).
+
 ### Added
 
 - **ADR-0076**: social-arbitrage integration — consumer-trend entity class, sized fusion, profitability-verification loop.

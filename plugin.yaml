@@ -25,6 +25,7 @@ provides_tools:
   - quant_watchlist_remove
   - quant_watchlist_list
   - quant_doctor
+  - quant_insider   # B20 SEC EDGAR Form-4 insider-transactions evidence (default-OFF behind HERMES_QUANT_INSIDER_ENABLED)
 
 provides_hooks:
   # pre_gateway_dispatch installs the Discord /quant slash command (register() wires
