@@ -328,3 +328,66 @@ We've studied TauricResearch/TradingAgents, HKUDS/AI-Trader, HKUDS/Vibe-Trading,
 
 **Convergent failure across all four reference projects:** every one of them lets the LLM be the final execution authority somewhere. TradingAgents at the trader role; AI-Trader at the copy-trading cascade; moon-dev at the override boundary. Vibe-Trading is the lone exception — it explicitly draws the boundary at "no live execution" via absence of broker SDKs in the tool registry. **Our deterministic-risk-gate + HITL pattern is the inverse of the reference-project failure mode.** Don't regress.
 
+
+<!-- seeds:start -->
+## Issue Tracking (Seeds)
+<!-- seeds-onboard:v0.4.5 -->
+<!-- seeds-onboard-schema:4 -->
+
+This project uses [Seeds](https://github.com/jayminwest/seeds) v0.4.5 for git-native issue tracking.
+
+**At the start of every session**, run:
+```
+sd prime
+```
+
+This injects session context: rules, command reference, and workflows. Pass `--format json|compact|markdown|plain|ids` on any command for agent-friendly output.
+
+**Quick reference:**
+- `sd ready` — Find unblocked work
+- `sd search <query>` — Full-text search across titles + descriptions
+- `sd create --title "..." --type task --priority 2` — Create issue
+- `sd update <id> --status in_progress` — Claim work
+- `sd close <id>` — Complete work
+- `sd dep add <id> <depends-on>` — Add dependency between issues
+- `sd sync` — Sync with git (run before pushing)
+
+### Planning
+Use `sd plan` when work is large or ambiguous enough that an LLM benefits from structured decomposition. Submit spawns one child seed per step; `step.blocks` uses forward semantics (step i with `blocks: [j]` means step i blocks step j, and step j gets step i's id in its `blockedBy`).
+
+- `sd plan templates` — List built-ins (`feature`, `bug`, `refactor`) plus custom templates
+- `sd plan prompt <seed-id>` — Emit a structured prompt the LLM fills in
+- `sd plan submit <seed-id> --plan <file>` — Validate + spawn child seeds
+- `sd plan show <pl-id>` — View sections, children, sub-plans
+- `sd plan outcome <pl-id> --result success|partial|failure` — Record outcome (storage-only)
+- `sd plan review <pl-id> --by <name>` — Record reviewer (informational)
+
+### Before You Finish
+1. Close completed issues: `sd close <id>`
+2. File issues for remaining work: `sd create --title "..."`
+3. Sync and push: `sd sync && git push`
+<!-- seeds:end -->
+
+<!-- hermes-quant-seeds-policy -->
+### Seeds policy for hermes-quant (project-specific)
+
+**Seeds is the single source of truth for what we need to do and have done.** Track ALL work here —
+pending, in-progress, blocked, and done — including externally-gated items (never silently drop them).
+
+- **On session start:** `sd prime` then `sd ready` (unblocked work) and `sd blocked` (what's waiting + why).
+- **Every backlog item, bug, capability gap, review finding, and operator-gated action gets a seed.** The
+  consolidated backlog (`docs/research/2026-05-30-backlog-consolidated.md`), the review-team findings
+  (`docs/research/2026-05-31-review-team-findings.md`), and the flag-flip/enablement runbooks are the
+  *prose* record; **seeds are the live tracker** — mirror them in.
+- **Externally-gated items** (operator cron-registration, data-volume accumulation, market events,
+  governance) are seeds with a `blocked` status + a label (`gated:operator` / `gated:data` /
+  `gated:market`) and the precise unblock condition in the description. They are NOT closed until the
+  gate clears — surfacing the blocker IS the deliverable.
+- **Rails are non-negotiable and override any seed:** a seed may PROPOSE work, but the deterministic risk
+  gate (ADR-0004), the discrete sizing ladder {0, ±0.05, ±0.10, ±0.15, ±0.20}, and the kill-switch are
+  immutable. Every new capability ships default-OFF, eval-gated, byte-identical when off. No seed
+  justifies a degrading flag flip or a fire on a non-event.
+- **Before finishing a wave:** `sd close` the done items, `sd create` for newly-discovered work
+  (review findings, follow-ups), then `sd sync`. The deep-work-loop (audit→research→architect→execute→
+  review→reconcile) reads from and writes back to seeds each iteration.
+<!-- /hermes-quant-seeds-policy -->
