@@ -23,6 +23,7 @@ v0.1.1's bottleneck is yfinance rate limiting, not loop concurrency.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -64,6 +65,32 @@ _WATERMARK_ENV = "HERMES_QUANT_WATERMARK_ENABLED"
 
 def _watermark_enabled() -> bool:
     return os.environ.get(_WATERMARK_ENV, "0").strip() == "1"
+
+
+# ADR-0084 event-risk master flag (mirrors risk/gate.py + advisor.py: read at
+# call time, never cached at import). Absent/"0" => no carry => byte-identical.
+_EVENT_RISK_FLAG = "HERMES_QUANT_EVENT_RISK"
+
+
+def _carry_event_risk(signal, ctx: MarketContext):  # noqa: ANN001, ANN201
+    """Copy ``ctx.extras['event_risk']`` onto ``signal.metadata['event_risk']``
+    (ADR-0084 carrier) so the 743b pre-event guard in risk/gate.py can read it.
+
+    DEFAULT-OFF + ADDITIVE: returns ``signal`` UNCHANGED unless
+    ``HERMES_QUANT_EVENT_RISK=1`` (read at call time) AND ``ctx.extras`` carries
+    a non-None ``event_risk``. When OFF (or the value is absent) NO metadata key
+    is added — byte-identical to today. The copy only ADDS a read-only advisory
+    key; it never touches the ladder, sizing, or the gate logic (ADR-0084
+    D-1/D-3). Pure; never raises.
+    """
+    if os.environ.get(_EVENT_RISK_FLAG, "0") != "1":
+        return signal
+    extras = getattr(ctx, "extras", None) or {}
+    event_risk = extras.get("event_risk")
+    if event_risk is None:
+        return signal
+    new_metadata = {**(signal.metadata or {}), "event_risk": event_risk}
+    return dataclasses.replace(signal, metadata=new_metadata)
 
 
 def _compute_indicator_snapshot_hash(ctx: MarketContext) -> str:
@@ -329,6 +356,15 @@ def run_one_tick(
 
             # Get portfolio
             portfolio = portfolio_for("default", task.asset_class)
+
+            # ADR-0084 event-risk carrier (DEFAULT-OFF, ADDITIVE). Bridge the
+            # same aggregator->gate seam as the advisor: copy the asof-honest,
+            # outcome-free `ctx.extras['event_risk']` payload onto
+            # `signal.metadata['event_risk']` so the 743b pre-event guard in
+            # risk/gate.py (which reads it from metadata) can fire. Fully gated
+            # on HERMES_QUANT_EVENT_RISK=1 (read at call time): flag absent =>
+            # no metadata key copied => the guard never fires => byte-identical.
+            signal = _carry_event_risk(signal, ctx)
 
             # Run risk gate
             action = risk_gate.gate(signal, market, portfolio, halt_state)

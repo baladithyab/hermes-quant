@@ -31,6 +31,8 @@ RAILS (the whole producer path is inert by default):
 from __future__ import annotations
 
 import logging
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -61,6 +63,11 @@ StrategyKind = Literal["covered_call", "cash_secured_put", "wheel"]
 _DEFAULT_TARGET_DELTA = 0.30  # |delta| target for the short leg (income workhorse)
 _DEFAULT_DTE_MIN = 25
 _DEFAULT_DTE_MAX = 45
+
+# ADR-0084 O8 master flag (mirrors risk/options_gate.py + risk/gate.py: read at
+# call time, never cached at import). Absent/"0" => event_risk is NOT forwarded
+# into options_gate => O8 never runs => byte-identical to today.
+_EVENT_RISK_FLAG = "HERMES_QUANT_EVENT_RISK"
 
 
 class RecipeBuildError(ValueError):
@@ -173,6 +180,12 @@ def build_multi_leg_proposal(
     dte_max: int = _DEFAULT_DTE_MAX,
     source_recipe_id: str = "options.recipes.build_multi_leg_proposal",
     proposal_id: str | None = None,
+    # ADR-0084 O8 (earnings-proximity / IV-crush). ADDITIVE + DEFAULT-OFF: the
+    # asof-honest, outcome-free event-risk payload (ctx.extras['event_risk']
+    # shape) for `symbol`. Forwarded into options_gate ONLY when
+    # HERMES_QUANT_EVENT_RISK=1 (read at call time); absent flag => not
+    # forwarded => O8 never runs => byte-identical. None => no check.
+    event_risk: Mapping | None = None,
 ) -> MultiLegBuildResult:
     """Build + gate (NOT persist) a CC/CSP/wheel from a DETERMINISTIC chain snapshot.
 
@@ -228,6 +241,19 @@ def build_multi_leg_proposal(
         stock_leg = None
         legs = [short_leg]
 
+    # ADR-0084 O8 carrier (DEFAULT-OFF, ADDITIVE): forward the asof-honest
+    # event-risk payload + the decision asof into options_gate ONLY when
+    # HERMES_QUANT_EVENT_RISK=1 (read at call time). Flag absent => both stay
+    # None => options_gate's O8 rule never runs => byte-identical to today. The
+    # gate's O8 ALSO re-checks the master flag, so a caller that passes a
+    # payload while the flag is OFF is still a no-op (defense in depth).
+    if os.environ.get(_EVENT_RISK_FLAG, "0") == "1":
+        gate_event_risk: Mapping | None = event_risk
+        gate_decision_asof: datetime | None = asof
+    else:
+        gate_event_risk = None
+        gate_decision_asof = None
+
     gate_result = options_gate(
         legs,
         strategy_kind="covered_call" if right == "C" else "cash_secured_put",
@@ -245,6 +271,8 @@ def build_multi_leg_proposal(
         basis_per_share=basis_per_share,
         min_dte=min_dte,
         open_strategies_on_underlying=open_strategies_on_underlying,
+        event_risk=gate_event_risk,
+        decision_asof=gate_decision_asof,
     )
 
     if not gate_result.admitted:

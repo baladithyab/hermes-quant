@@ -1013,6 +1013,21 @@ def recommend(
         logger.warning("advisor: aggregator raised: %s", exc, exc_info=True)
         return _gated_no_data(result, "aggregator_error")
 
+    # ---- Step 6.5: ADR-0084 event-risk carrier (DEFAULT-OFF, ADDITIVE) ----
+    # The 743b pre-event guard (risk/gate.py Rule 3.5) reads the asof-honest,
+    # outcome-free event-risk payload from `signal.metadata['event_risk']`, but
+    # the calendar wiring stamps it onto `ctx.extras['event_risk']`. Nothing
+    # copies it across the aggregator seam — so the guard never fired. This
+    # one-shot copy bridges that gap.
+    #
+    # RAILS (ADR-0084 D-1/D-3): fully gated on HERMES_QUANT_EVENT_RISK (read at
+    # call time). Flag absent => no metadata key is copied => the 743b guard
+    # never fires => behavior is byte-identical to today. The copy only ever
+    # ADDS the read-only advisory key; it never touches the ladder, sizing, or
+    # the gate logic itself. The payload was already filtered upstream to
+    # `announced_at <= decision_asof` (asof-honest by construction).
+    agg_signal = _carry_event_risk(agg_signal, ctx)
+
     result.aggregated_signal = _signal_to_dict(agg_signal)
 
     # ---- Step 7: risk gate ----
@@ -1067,6 +1082,37 @@ def recommend(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# ADR-0084 event-risk master flag (mirrors risk/gate.py + options_gate.py:
+# read at call time, never cached at import). Absent/"0" => no carry => the
+# pre-event guard never fires => byte-identical to today.
+_EVENT_RISK_FLAG = "HERMES_QUANT_EVENT_RISK"
+
+
+def _carry_event_risk(signal: AggregatedSignal, ctx: MarketContext) -> AggregatedSignal:
+    """One-shot copy of ``ctx.extras['event_risk']`` onto the aggregated
+    signal's ``metadata['event_risk']`` (ADR-0084 carrier).
+
+    The 743b pre-event guard (risk/gate.py) reads its asof-honest, outcome-free
+    event-risk payload from ``signal.metadata['event_risk']``, but the calendar
+    wiring stamps it onto ``ctx.extras['event_risk']``. This bridges that seam.
+
+    DEFAULT-OFF + ADDITIVE: returns ``signal`` UNCHANGED unless
+    ``HERMES_QUANT_EVENT_RISK=1`` (read at call time) AND ``ctx.extras`` carries
+    a non-None ``event_risk`` value. When OFF (or the carrier value is absent)
+    NO metadata key is added — the returned object is the same signal, so the
+    persisted dict and the gated signal are byte-identical to today. The copy
+    only ADDS the read-only advisory key; it never touches the ladder, sizing,
+    or the gate logic (ADR-0084 D-1/D-3). Pure; never raises.
+    """
+    if os.environ.get(_EVENT_RISK_FLAG, "0") != "1":
+        return signal
+    extras = getattr(ctx, "extras", None) or {}
+    event_risk = extras.get("event_risk")
+    if event_risk is None:
+        return signal
+    new_metadata = {**(signal.metadata or {}), "event_risk": event_risk}
+    return dataclasses.replace(signal, metadata=new_metadata)
 
 
 def _tf_minutes(timeframe: str) -> int:

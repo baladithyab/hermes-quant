@@ -19,9 +19,14 @@ References:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from hermes_quant.factors.alpha_zoo import AlphaFactor, AlphaZoo
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -204,24 +209,46 @@ _STARTER_FACTORS: list[dict] = [
 # ---------------------------------------------------------------------------
 
 
-def register_starter_set(zoo: AlphaZoo) -> list[str]:
+def register_starter_set(
+    zoo: AlphaZoo,
+    *,
+    factor_returns: Mapping[str, np.ndarray] | None = None,
+) -> list[str]:
     """Register the 15-factor starter set into *zoo*.
 
     All factors are validated through both the AST purity gate and the
     lookahead sentinel before being accepted.  Any unexpected rejection
     indicates a regression in the gate or a bug in the factor source.
 
+    IC-dedup gate (B38, DEFAULT-OFF):
+        When *factor_returns* is supplied AND the operator has set
+        ``HERMES_QUANT_IC_DEDUP_AT_INGEST=1``, each factor's per-factor return
+        series is forwarded to :meth:`AlphaZoo.register` so the IC-dedup gate
+        can reject near-duplicates (ICmax >= threshold) at ingest. The mapping
+        is keyed by factor *name* (``defn["name"]``); a factor with no entry in
+        the mapping is registered with ``factor_returns=None`` (the gate is a
+        no-op for that factor). When *factor_returns* is ``None`` (the default,
+        and what every current call-site passes), behavior is byte-identical to
+        the prior two-gate-only path -- the IC-dedup gate never runs.
+
     Args:
-        zoo: An :class:`AlphaZoo` instance to register factors into.
+        zoo:            An :class:`AlphaZoo` instance to register factors into.
+        factor_returns: Optional mapping ``{factor_name: return_series}`` used
+                        by the IC-dedup gate. Default ``None`` (gate off).
 
     Returns:
-        List of ``factor_id`` strings for all registered factors.
+        List of ``factor_id`` strings for all SUCCESSFULLY registered factors.
+        When the IC-dedup gate is active a near-duplicate factor is rejected
+        with :class:`~hermes_quant.factors.alpha_zoo.RedundantFactorError`,
+        which propagates to the caller.
 
     Raises:
         PurityViolation:   If any factor fails the AST purity gate
                            (should never happen for this starter set).
         LookaheadDetected: If any factor fails the lookahead sentinel
                            (should never happen for this starter set).
+        RedundantFactorError: If the IC-dedup gate (when active) rejects a
+                           factor as a near-duplicate of an earlier one.
     """
     registered: list[str] = []
     now = datetime.now(timezone.utc).isoformat()
@@ -237,7 +264,12 @@ def register_starter_set(zoo: AlphaZoo) -> list[str]:
             params={},
             version=1,
         )
-        fid = zoo.register(factor)
+        rets = (
+            factor_returns.get(defn["name"])
+            if factor_returns is not None
+            else None
+        )
+        fid = zoo.register(factor, factor_returns=rets)
         registered.append(fid)
         logger.debug("starter_set: registered %r as %s", factor.name, fid)
 

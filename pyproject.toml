@@ -182,4 +182,5 @@ filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
     "requires_network: tests that hit live network (skipped in CI; manually run before release)",
     "timeout(N): per-test timeout in seconds (pytest-timeout)",
+    "slow: long-running tests (e.g. full-universe load sweep); opt-in via env, not a CI gate",
 ]
