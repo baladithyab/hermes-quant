@@ -341,3 +341,33 @@ fix the real blocker, and flip the one that genuinely advances the goal. Full an
 state), not the code. The honest path to "flip the flag" ran through building the producers +
 reconciling the deploy, not editing `.env`. Memories corrected: `.env` is operator-authorizable;
 deploying a cron SCRIPT is agent-doable but ALWAYS diff the target for diverged features first.
+
+### Backlog drawdown — review-follow-up tasks closed (2026-05-31)
+
+Worked the 4 pending non-blocking review-follow-up tasks (#19/#22/#23/#31) to closure via a
+fix→adversarial-verify workflow + a completeness critic that re-checked every "already done"
+claim against ACTUAL HEAD code (not memory). Verification mattered: it confirmed #19/#22 were
+genuinely fixed in earlier commits AND caught that batch-1 of the JSONL sweep was INCOMPLETE.
+
+- **#19 CLOSED** — borrow_pnl PIL interval-predicate + datetime-normalization (already done),
+  greeks try/except split (already done), admit_or_reject shared seam (already done). Carved the
+  `available_bp` live-broker-fetch into **#36** (operator/runtime-gated, shorts fail-closed until).
+- **#22 CLOSED** — calibrator-drift baseline now atomic-write (tmp+os.replace, fb4ea68); options
+  at-admitted-size greeks+BPR re-check (already done); the autonomous single-seam (already done).
+- **#23 CLOSED** — frame_to_context extras key-set equality test exists; advisor I001 fixed; multileg
+  slippage determinism test added; PDR-2/3/4 built. Carved the PR-5 constructor-lock into **#38**.
+- **#31 CLOSED** — the headline: completed the silence-by-default JSONL `isinstance(row,dict)` guard
+  across the WHOLE library. Batch 1 (bf78093, 10 readers); Batch 2 (bcecff7, 11 readers — incl.
+  governance/audit_log, approvals, memory/decisions, retriever which had the TypeError UNCAUGHT, so
+  a single corrupt append-only line crashed a governance/reflection/audit read at runtime). Added a
+  narrow `except json.JSONDecodeError` to the 3 bare-loads readers + a pinning regression test
+  (test_jsonl_reader_nondict_guard.py) feeding int/str/list/corrupt lines through the previously-
+  uncaught readers. Plus meta_retro alpha-lookup sort-determinism + W3/W7/multileg determinism tests.
+
+Surfaced 2 PRE-EXISTING latent F821 undefined-name bugs (advisor.py:1060 'rate', freqtrade strategy
+'amount'/'rate') as **#37** — verified HEAD-vs-worktree that this session introduced ZERO new lint.
+
+715 tests green across the full session surface; every fix behavior-preserving (silence-guards /
+atomic-write / lint / determinism-tests) and adversarially reviewed CONFIRMED. Remaining open work
+is all genuinely deferred or operator/data-gated: #35 (convergence-flip accumulation), #36 (broker
+BP), #37 (latent F821 triage), #38 (PR-5 constructor lock).
