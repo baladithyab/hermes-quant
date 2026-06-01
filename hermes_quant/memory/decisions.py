@@ -184,8 +184,17 @@ class DecisionLog:
                 try:
                     obj = json.loads(raw)
                 except json.JSONDecodeError:
+                    logger.warning(
+                        "decision-log: skipping corrupt (non-JSON) line in %s",
+                        self._path,
+                    )
                     continue
                 if not isinstance(obj, dict):
+                    logger.warning(
+                        "decision-log: skipping non-dict line (type=%s) in %s",
+                        type(obj).__name__,
+                        self._path,
+                    )
                     continue
                 yield obj
 

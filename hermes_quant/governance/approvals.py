@@ -104,8 +104,17 @@ def _iter_rows() -> Iterator[dict[str, Any]]:
             try:
                 obj = json.loads(raw)
             except json.JSONDecodeError:
+                logger.warning(
+                    "approvals: skipping corrupt (non-JSON) line in token store %s",
+                    path,
+                )
                 continue
             if not isinstance(obj, dict):
+                logger.warning(
+                    "approvals: skipping non-dict line (type=%s) in token store %s",
+                    type(obj).__name__,
+                    path,
+                )
                 continue
             yield obj
 

@@ -290,11 +290,20 @@ class PromotionLog:
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    obj = json.loads(line)
                 except json.JSONDecodeError:
                     logger.warning(
                         "promotion-log: skipping malformed line in %s", self._path
                     )
+                    continue
+                if not isinstance(obj, dict):
+                    logger.warning(
+                        "promotion-log: skipping non-dict line (type=%s) in %s",
+                        type(obj).__name__,
+                        self._path,
+                    )
+                    continue
+                yield obj
 
 
 def _row_to_record(row: dict[str, Any]) -> PromotionRecord | None:

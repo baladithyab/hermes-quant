@@ -100,3 +100,91 @@ def test_decisions_all_bad_lines_yield_nothing_no_raise(tmp_path, only_bad):
     p.write_text("\n".join(body) + "\n", encoding="utf-8")
     rows = list(DecisionLog(path=p).read_all())
     assert len(rows) == (0 if only_bad else 1)
+
+
+def test_promotion_log_iter_rows_skips_non_dict(tmp_path):
+    """RR9: PromotionLog._iter_rows previously yielded json.loads(line) with NO
+    isinstance guard — a non-dict valid-JSON line (corrupt/partial append) leaked
+    through as a bare int/str/list and crashed the downstream `.get(...)` deref.
+    The guard must skip the bad lines and yield exactly the 2 dict rows."""
+    from hermes_quant.eval.promotion_orchestrator import PromotionLog
+
+    p = _write_store(
+        tmp_path,
+        "promotion_decisions.jsonl",
+        [{**_GOOD_A, "record_id": "P1"}, {**_GOOD_B, "record_id": "P2"}],
+    )
+    log = PromotionLog(path=p)
+    rows = list(log._iter_rows())  # must NOT raise on the non-dict/corrupt lines
+    assert all(isinstance(r, dict) for r in rows) and len(rows) == 2
+    assert {r["record_id"] for r in rows} == {"P1", "P2"}
+    # downstream readers that deref .get(...) must also run clean across bad lines
+    assert log.read("P1") is None  # P1 row isn't a valid PromotionRecord, just proves no raise
+
+
+# ---------------------------------------------------------------------------
+# RR5 / RR9: the SECURITY-SENSITIVE integrity readers must LOG (not silently
+# drop) a corrupt/non-dict line. A silently-skipped consumed-token line could
+# let a one-shot approval token become re-usable, so the skip must be LOUD.
+# ---------------------------------------------------------------------------
+
+
+def test_audit_log_warns_on_skipped_corrupt_line(tmp_path, monkeypatch, caplog):
+    from hermes_quant.governance import audit_log
+
+    p = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(audit_log, "AUDIT_LOG_PATH", p)
+    ev = audit_log.GovernanceEvent(
+        kind="gate_approval", asof=datetime(2026, 1, 1, tzinfo=UTC), source="test"
+    )
+    p.write_text("\n".join([ev.model_dump_json(), *_BAD_LINES]) + "\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="hermes_quant.governance.audit_log"):
+        events = list(audit_log.read())
+    assert len(events) == 1
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "audit-log must emit a WARNING when skipping a corrupt/non-dict line"
+    assert any("skipping" in r.getMessage() for r in warnings)
+
+
+def test_approvals_warns_on_skipped_corrupt_consumed_token_line(tmp_path, monkeypatch, caplog):
+    """A silently-dropped consumed-token line is a token-reuse hazard — assert LOUD."""
+    from hermes_quant.governance import approvals
+
+    good = {**_GOOD_A, "row_type": "consumed"}
+    p = tmp_path / "tokens.jsonl"
+    p.write_text("\n".join([json.dumps(good), *_BAD_LINES]) + "\n", encoding="utf-8")
+    monkeypatch.setattr(approvals, "TOKEN_STORE_PATH", p)
+    with caplog.at_level("WARNING", logger="hermes_quant.governance.approvals"):
+        consumed = approvals._consumed_ids()
+    assert consumed == {"T1"}
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "approvals must emit a WARNING when skipping a corrupt/non-dict token line"
+    assert any("skipping" in r.getMessage() for r in warnings)
+
+
+def test_decisions_warns_on_skipped_corrupt_line(tmp_path, caplog):
+    from hermes_quant.memory.decisions import DecisionLog
+
+    p = _write_store(tmp_path, "decisions.jsonl", [_GOOD_A, _GOOD_B])
+    with caplog.at_level("WARNING", logger="hermes_quant.memory.decisions"):
+        rows = list(DecisionLog(path=p).read_all())
+    assert [r["decision_id"] for r in rows] == ["D1", "D2"]
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "decision-log must emit a WARNING when skipping a corrupt/non-dict line"
+    assert any("skipping" in r.getMessage() for r in warnings)
+
+
+def test_promotion_log_warns_on_skipped_corrupt_line(tmp_path, caplog):
+    from hermes_quant.eval.promotion_orchestrator import PromotionLog
+
+    p = _write_store(
+        tmp_path,
+        "promotion_decisions.jsonl",
+        [{**_GOOD_A, "record_id": "P1"}, {**_GOOD_B, "record_id": "P2"}],
+    )
+    with caplog.at_level("WARNING", logger="hermes_quant.eval.promotion_orchestrator"):
+        rows = list(PromotionLog(path=p)._iter_rows())
+    assert len(rows) == 2
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "promotion-log must emit a WARNING when skipping a corrupt/non-dict line"
+    assert any("skipping" in r.getMessage() for r in warnings)

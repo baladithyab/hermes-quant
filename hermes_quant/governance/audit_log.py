@@ -173,8 +173,16 @@ def read(
             try:
                 row = json.loads(raw)
             except json.JSONDecodeError:
+                logger.warning(
+                    "audit-log: skipping corrupt (non-JSON) line in %s", path
+                )
                 continue
             if not isinstance(row, dict):
+                logger.warning(
+                    "audit-log: skipping non-dict line (type=%s) in %s",
+                    type(row).__name__,
+                    path,
+                )
                 continue
             row_version = row.get("schema_version")
             if row_version != CURRENT_SCHEMA_VERSION:
