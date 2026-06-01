@@ -185,6 +185,14 @@ def register(ctx: Any) -> None:
         schema=schemas.QUANT_DOCTOR,
         handler=quant_tools.quant_doctor,
     )
+    # Insider-transactions surface (B20) — SEC EDGAR Form-4 evidence; DEFAULT-OFF
+    # behind HERMES_QUANT_INSIDER_ENABLED (read at call time inside the handler).
+    ctx.register_tool(
+        name="quant_insider",
+        toolset="quant",
+        schema=schemas.QUANT_INSIDER,
+        handler=quant_tools.quant_insider,
+    )
 
     # Slash command (works in CLI + gateway-multiplexed)
     ctx.register_command(
