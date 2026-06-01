@@ -69,15 +69,22 @@ QUERIES = {
 # synthesize pipeline as news, so a brand only emits a packet if it is already a
 # graph entity (no new authority, evidence-only).
 SOCIAL_REDDIT_QUERIES = {
-    # Brand + TICKER search across the subs that actually carry consumer-trend chatter
-    # (verified live: wsb/stocks surface CELH/CROX/TPR by ticker, r/SecurityAnalysis carries
-    # long/short theses). Searching by ticker AND brand name is what surfaces the social-arb
-    # consumer names — the precondition for PDR-3 cross-source convergence on CELH/CROX/TPR.
-    "stocks:CELH OR CROX OR TPR OR Crocs OR Celsius OR Tapestry": "social/reddit-r-stocks",
-    "wallstreetbets:CELH OR CROX OR Crocs OR Celsius OR Tesla": "social/reddit-r-wsb",
-    "StockMarket:Crocs OR Celsius OR Coach OR Tesla OR Boeing": "social/reddit-r-stockmarket",
-    "investing:TSMC OR Boeing OR Tesla OR Tapestry OR bank failure": "social/reddit-r-investing",
-    "SecurityAnalysis:Celsius OR Crocs OR Tapestry OR Coach": "social/reddit-r-securityanalysis",
+    # NEW.RSS (no-query) pulls on the finance subs that carry FRESH, entity-bearing
+    # chatter. The old ticker/brand SEARCH queries used Reddit's search.rss, which is
+    # RELEVANCE-ranked and returned posts with a median age of ~62 days (verified live
+    # 2026-05-31) — so a reddit packet NEVER co-occurred with fresh news inside PDR-3's
+    # 24h cross-source convergence window. new.rss (NO query) returns RECENT posts
+    # (most <=72h) and still surfaces graph entities (SpaceX/Tesla/Blue Origin/New Glenn
+    # seen live in <=72h posts). A no-query entry is a bare "sub" (NO colon) ->
+    # ingest_reddit(sub, query=None) -> new.rss. The recency filter (max_age_days=7,
+    # below) trims the tail so every emitted packet is fresh enough to overlap PDR-3's
+    # window when the name is active. The provenance labels are cosmetic (PDR-3 keys on
+    # the source TAG built in social.py = "reddit/r/<sub> (rss)", not these values).
+    "stocks": "social/reddit-r-stocks",
+    "wallstreetbets": "social/reddit-r-wsb",
+    "StockMarket": "social/reddit-r-stockmarket",
+    "investing": "social/reddit-r-investing",
+    "options": "social/reddit-r-options",
 }
 # Trends is filtered to the graph's consumer-brand terms so it stays targeted
 # (not a firehose of every trending search). Mirrors the alias brand set.
@@ -108,6 +115,11 @@ def main() -> int:
             SOCIAL_REDDIT_QUERIES,
             trends_geo="US",
             trends_watch_terms=SOCIAL_TRENDS_WATCH,
+            # 7-day recency gate: DROP stale items by their real published_at so a
+            # reddit packet can co-occur with fresh news in PDR-3's convergence window
+            # (the measured blocker was median-62-day stale Reddit search posts). asof
+            # honesty: this only excludes by timestamp, never shifts one.
+            max_age_days=7,
         )
         n_social = len(social_items)
         items = items + social_items

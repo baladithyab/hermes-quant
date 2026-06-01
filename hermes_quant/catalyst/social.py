@@ -37,7 +37,7 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from hermes_quant.catalyst.ingest import CatalystItem, _parse_pubdate, dedupe_items
 
@@ -259,11 +259,27 @@ def ingest_social(
     trends_watch_terms: set[str] | None = None,
     timeout: float = 15.0,
     fetcher=None,
+    max_age_days: float | None = None,
 ) -> list[CatalystItem]:
     """Pull configured Reddit subs + Google Trends, concat, cross-query dedupe.
 
     ``reddit_queries`` maps ``"sub"`` or ``"sub:search terms"`` -> a provenance
     label. Never raises; producers that fail contribute zero items.
+
+    ``max_age_days`` — RECENCY GATE (ADR-0074, PDR-3 enabler). If given, DROP any
+    item whose ``published_at`` is older than ``now_utc - max_age_days``. This is
+    the durable fix for stale social packets: Reddit relevance-ranked search.rss
+    returns posts with a median age of ~62 days, so a "reddit packet" never
+    co-occurred with fresh news inside PDR-3's 24h cross-source convergence
+    window. A 7-day cutoff is fresh enough to overlap that window when a name is
+    active, lenient enough to catch a multi-day trend. asof HONESTY: this filter
+    ONLY excludes items by comparing each item's REAL ``published_at`` (already
+    parsed from ``<published>``/``<pubDate>`` — never wall-clock-now) against a
+    tz-aware UTC cutoff; it NEVER fabricates or shifts a timestamp. Items with a
+    naive/missing ``published_at`` are already dropped upstream by the producers
+    (``_parse_atom_dt``/``_parse_pubdate`` return None -> entry skipped), so every
+    surviving item here has a tz-aware UTC anchor safe to compare. ``None`` (the
+    default) => no filtering (backward compatible for library callers).
     """
     all_items: list[CatalystItem] = []
     for spec in (reddit_queries or {}):
@@ -277,4 +293,31 @@ def ingest_social(
                                           timeout=timeout, fetcher=fetcher, dedupe=True)
         logger.info("catalyst.social: google-trends %s -> %d items in %.2fs", trends_geo, len(items), lat)
         all_items.extend(items)
+    all_items = _filter_by_recency(all_items, max_age_days=max_age_days)
     return dedupe_items(all_items)
+
+
+def _filter_by_recency(
+    items: list[CatalystItem], *, max_age_days: float | None
+) -> list[CatalystItem]:
+    """Drop items older than ``now_utc - max_age_days`` by their real published_at.
+
+    ``None`` => no-op (returns items unchanged). The cutoff uses a tz-aware UTC
+    ``now`` so the comparison against each item's tz-aware UTC ``published_at`` is
+    well-defined. NEVER mutates a timestamp — it only includes/excludes. Belt-and-
+    suspenders: an item whose ``published_at`` is somehow naive is kept (it would
+    raise on a naive-vs-aware compare; producers already exclude such items, but we
+    refuse to let one bad item drop the batch — silence-by-default).
+    """
+    if max_age_days is None:
+        return items
+    cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+    kept: list[CatalystItem] = []
+    for it in items:
+        pub = it.published_at
+        if pub.tzinfo is None:  # defensive — should not happen (producers skip these)
+            kept.append(it)
+            continue
+        if pub >= cutoff:
+            kept.append(it)
+    return kept

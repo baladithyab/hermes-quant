@@ -7,7 +7,7 @@ CatalystItems flow through the existing classify->propagate path unchanged.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from hermes_quant.catalyst.social import (
     ingest_google_trends,
@@ -251,3 +251,120 @@ def test_social_items_flow_through_classify_unchanged():
     # the patch, "surging" base form should be a positive catalyst. At minimum the
     # item must be a valid CatalystItem the classifier accepts without error.
     assert cls is not None
+
+
+# --- recency filter (max_age_days) — the PDR-3 cross-source enabler ----------
+# The measured blocker: Reddit search.rss posts had median age ~62 days, so a
+# reddit packet never co-occurred with fresh news in PDR-3's 24h convergence
+# window. ingest_social(..., max_age_days=N) DROPS items older than now-N days by
+# their REAL published_at (never shifts a timestamp). These tests inject fetchers
+# whose feeds carry one FRESH entry (now - 1 day, computed at runtime so it is
+# always inside any sane window) and one STALE entry (a fixed far-past date), and
+# assert: stale dropped, fresh kept, and max_age_days=None keeps both.
+
+
+def _reddit_feed_with_dates(fresh_dt: datetime, stale_dt: datetime) -> bytes:
+    """Build a Reddit Atom feed with one FRESH and one STALE entry (distinct ids/titles
+    so dedupe keeps both). published_at is the <published> ISO-8601 time — the anchor
+    the recency filter compares; nothing is fabricated."""
+    fresh_iso = fresh_dt.astimezone(UTC).isoformat()
+    stale_iso = stale_dt.astimezone(UTC).isoformat()
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<feed xmlns="http://www.w3.org/2005/Atom">\n'
+        "  <title>newest submissions : stocks</title>\n"
+        "  <entry>\n"
+        "    <id>t3_fresh</id>\n"
+        '    <link href="https://www.reddit.com/r/stocks/comments/fresh/" />\n'
+        f"    <published>{fresh_iso}</published>\n"
+        f"    <updated>{fresh_iso}</updated>\n"
+        "    <title>FRESH Tesla post today</title>\n"
+        "  </entry>\n"
+        "  <entry>\n"
+        "    <id>t3_stale</id>\n"
+        '    <link href="https://www.reddit.com/r/stocks/comments/stale/" />\n'
+        f"    <published>{stale_iso}</published>\n"
+        f"    <updated>{stale_iso}</updated>\n"
+        "    <title>STALE Tesla post from long ago</title>\n"
+        "  </entry>\n"
+        "</feed>\n"
+    ).encode()
+
+
+def test_recency_filter_drops_stale_keeps_fresh():
+    fresh = datetime.now(UTC) - timedelta(days=1)   # well inside a 7-day window
+    stale = datetime.now(UTC) - timedelta(days=62)  # the measured median-age blocker
+    payload = _reddit_feed_with_dates(fresh, stale)
+
+    def fetch(url, timeout):
+        return payload
+
+    items = ingest_social(
+        reddit_queries={"stocks": "social/reddit-r-stocks"},
+        trends_geo=None,  # isolate the reddit path
+        fetcher=fetch,
+        max_age_days=7,
+    )
+    titles = [it.title for it in items]
+    assert any("FRESH" in t for t in titles), "fresh item must be kept"
+    assert not any("STALE" in t for t in titles), "stale item must be dropped"
+    assert len(items) == 1
+    # the surviving item's published_at is UNCHANGED (the real fresh post time)
+    assert items[0].published_at == fresh
+
+
+def test_recency_filter_none_keeps_all():
+    """max_age_days=None (the default) is a no-op — backward compatible."""
+    fresh = datetime.now(UTC) - timedelta(days=1)
+    stale = datetime.now(UTC) - timedelta(days=62)
+    payload = _reddit_feed_with_dates(fresh, stale)
+
+    def fetch(url, timeout):
+        return payload
+
+    items_none = ingest_social(
+        reddit_queries={"stocks": "social/reddit-r-stocks"},
+        trends_geo=None,
+        fetcher=fetch,
+        max_age_days=None,
+    )
+    assert len(items_none) == 2  # both kept when no cutoff
+    # and the implicit default (param omitted) behaves identically
+    items_default = ingest_social(
+        reddit_queries={"stocks": "social/reddit-r-stocks"},
+        trends_geo=None,
+        fetcher=fetch,
+    )
+    assert len(items_default) == 2
+
+
+def test_recency_filter_keeps_item_exactly_at_cutoff_edge():
+    """An item right at the cutoff (>= now-cutoff) is KEPT — boundary is inclusive."""
+    # published a hair under 7 days ago -> inside the window; a hair over -> dropped.
+    just_inside = datetime.now(UTC) - timedelta(days=7) + timedelta(hours=1)
+    just_outside = datetime.now(UTC) - timedelta(days=7) - timedelta(hours=1)
+    payload = _reddit_feed_with_dates(just_inside, just_outside)
+
+    def fetch(url, timeout):
+        return payload
+
+    items = ingest_social(
+        reddit_queries={"stocks": "social/reddit-r-stocks"},
+        trends_geo=None,
+        fetcher=fetch,
+        max_age_days=7,
+    )
+    assert len(items) == 1
+    assert "FRESH" in items[0].title  # just_inside maps to the FRESH-titled entry
+
+
+def test_recency_filter_applies_to_trends_too():
+    """The recency gate covers Google Trends items, not just Reddit."""
+    items = ingest_social(
+        reddit_queries=None,
+        trends_geo="US",
+        trends_watch_terms={"celsius", "crocs"},
+        fetcher=_trends_fetcher,  # fixed-2021 pubDate -> all stale
+        max_age_days=7,
+    )
+    assert items == []  # every trend pubDate is 2021 -> all dropped by a 7-day gate
