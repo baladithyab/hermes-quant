@@ -553,13 +553,17 @@ def tick(
                 # nav: the paper account NAV (`equity_total`), sourced the SAME way the
                 # reactor does. It is used BOTH for the NAV-fraction->whole-share UNIT
                 # BRIDGE and (as `account_equity`) for the live oracle's < $2,000 floor.
-                # `available_bp` is NOT cheaply available here (the materialized paper
-                # state tracks equity, not buying power -> needs a live broker fetch), so
-                # it stays None and the short fails-closed on the BP hard check:
-                # documented gap (H-adm #1), never a fabricated sufficiency.
+                # available_bp: a LIVE paper-account buying-power fetch (H-adm #1 closed)
+                # — reuses the oracle's paper TradingClient via live_buying_power().
+                # FAIL-CLOSED: any error / missing creds / non-positive => None, and the
+                # short then fails-closed on the BP hard check (never a fabricated
+                # sufficiency). Only fetched inside this admissibility-ON short branch.
                 # Fail-closed: missing/non-positive NAV or price -> 0 shares -> REJECT.
+                from hermes_quant.admissibility.oracle import live_buying_power
+
                 nav = _account_nav_usd()
                 price = _decision_price_from_advisor(advisor_result)
+                available_bp = live_buying_power()
                 verdict = admit_or_reject(
                     entry.symbol,
                     "short",
@@ -568,6 +572,7 @@ def tick(
                     price,
                     datetime.now(tz=UTC),
                     account_equity=nav,
+                    available_bp=available_bp,
                 )
                 if not verdict.admitted:
                     decision.gate = "SILENCE_ADMISSIBILITY"

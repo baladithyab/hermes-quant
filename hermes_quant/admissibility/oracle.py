@@ -264,10 +264,12 @@ class AlpacaShortabilityOracle:
     def __init__(self, get_asset=None, *, etb_cbr: float = ETB_DEFAULT_ANNUAL_CBR) -> None:
         self._get_asset = get_asset
         self._etb_cbr = etb_cbr
+        self._client = None  # cached TradingClient (account fetch reuses get_asset's client)
 
-    def _resolve_get_asset(self):
-        if self._get_asset is not None:
-            return self._get_asset
+    def _resolve_client(self):
+        """Lazily build + cache the paper TradingClient. Raises if creds absent."""
+        if self._client is not None:
+            return self._client
         # Lazy import so the package imports without alpaca-py installed.
         import os as _os
 
@@ -277,8 +279,14 @@ class AlpacaShortabilityOracle:
         secret = _os.environ.get("ALPACA_API_SECRET") or _os.environ.get("ALPACA_API_SECRET_KEY")
         if not key or not secret:
             raise RuntimeError("ALPACA_API_KEY and ALPACA_API_SECRET required")
-        client = TradingClient(api_key=key, secret_key=secret, paper=True)
-        self._get_asset = client.get_asset
+        self._client = TradingClient(api_key=key, secret_key=secret, paper=True)
+        return self._client
+
+    def _resolve_get_asset(self):
+        if self._get_asset is not None:
+            return self._get_asset
+        # Reuse the cached client so get_asset + get_account share one connection.
+        self._get_asset = self._resolve_client().get_asset
         return self._get_asset
 
     def is_tradeable_long(self, symbol: str) -> bool:
@@ -406,3 +414,25 @@ def select_oracle() -> ShortabilityOracle:
     if os.environ.get("HERMES_QUANT_ADMISSIBILITY", "0") == "1":
         return AlpacaShortabilityOracle()
     return NullShortabilityOracle()
+
+
+def live_buying_power() -> float | None:
+    """Live paper-account buying power (USD), or None on ANY failure.
+
+    Reuses the AlpacaShortabilityOracle's lazy paper TradingClient (same creds:
+    ALPACA_API_KEY[_ID] + ALPACA_API_SECRET[_KEY], paper=True). Fetches
+    get_account().buying_power. FAIL-CLOSED: missing alpaca-py, missing creds, a
+    network/API error, or a non-positive value all return None so the caller's
+    admissibility BP check fails-closed (MISSING_ACCOUNT_CONTEXT) rather than
+    admitting a short on a fabricated sufficiency (ADR-0077 D77, the documented
+    H-adm #1 gap this closes). Never raises.
+    """
+    try:
+        oracle = AlpacaShortabilityOracle()
+        client = oracle._resolve_client()
+        account = client.get_account()
+        bp = float(getattr(account, "buying_power", 0) or 0)
+        return bp if bp > 0 else None
+    except Exception as exc:  # noqa: BLE001 — fail-closed: unknown BP => None.
+        logger.warning("admissibility: live buying-power fetch failed (fail-closed): %s", exc)
+        return None
