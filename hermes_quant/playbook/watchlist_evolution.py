@@ -44,6 +44,11 @@ from typing import Any
 
 import pandas as pd
 
+# Re-export PLAY_NAMES from the scorers registry (PROFILES-derived single source
+# of truth, ADR-0082 Part A). Kept under its historical module-level name so all
+# existing callers (`from ...watchlist_evolution import PLAY_NAMES`) keep working.
+from .scorers import PLAY_NAMES
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,13 +57,11 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 
-PLAY_NAMES: tuple[str, ...] = (
-    "covered_call",
-    "csp",
-    "wheel",
-    "leaps",
-    "swing",
-)
+# Canonical play list — `PLAY_NAMES` is imported at module top from the scorers
+# registry, which derives it from PROFILES (single source of truth, ADR-0082
+# Part A). It keeps its historical name here for backward compatibility, but the
+# hand-maintained tuple that used to live at this spot is gone, so PLAY_NAMES can
+# no longer drift from PROFILES / score_all.
 
 DEFAULT_WATCHLIST_PATH = Path.home() / ".hermes" / "quant" / "watchlist" / "play-fit.json"
 DEFAULT_JOURNAL_PATH = Path.home() / ".hermes" / "quant" / "watchlist" / "journal.jsonl"

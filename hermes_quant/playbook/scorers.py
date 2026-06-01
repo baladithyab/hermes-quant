@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -293,26 +294,28 @@ def _score_against(profile: PlayProfile, snapshot: dict) -> PlayFitness:
 
 
 # --------------------------------------------------------------------------- #
-# Public per-play wrappers
+# Play registry — derived from PROFILES (single source of truth, ADR-0082 Pt A)
 # --------------------------------------------------------------------------- #
+#
+# Every play's eligibility/score is computed by the generic `_score_against`
+# scorer over its PlayProfile. ONE play (wheel) layers extra cross-play logic
+# on top of the generic result; that logic lives in `_score_wheel` and is wired
+# in via the `_SPECIAL_SCORERS` override map below. Everything else — the
+# `score_all` dict, the `PLAY_NAMES` tuple, and the per-play public wrappers —
+# is DERIVED from `PROFILES` so the hand-maintained parallel lists can no longer
+# drift (closing the >=4-file-edit-to-add-a-play footgun). Adding a profile to
+# `PROFILES` flows through `score_all`/`PLAY_NAMES`/`score_play` automatically;
+# only a play needing non-generic eligibility (like wheel) registers an override.
 
 
-def score_covered_call(snapshot: dict) -> PlayFitness:
-    return _score_against(PROFILES["covered_call"], snapshot)
-
-
-def score_csp(snapshot: dict) -> PlayFitness:
-    return _score_against(PROFILES["csp"], snapshot)
-
-
-def score_wheel(snapshot: dict) -> PlayFitness:
+def _score_wheel(snapshot: dict) -> PlayFitness:
     """Wheel eligibility = both covered_call AND csp eligible.
 
     We *also* run the merged wheel profile to produce a single score, but the
     eligible flag is the AND of the two underlying plays so it's airtight.
     """
-    cc = score_covered_call(snapshot)
-    csp = score_csp(snapshot)
+    cc = _score_against(PROFILES["covered_call"], snapshot)
+    csp = _score_against(PROFILES["csp"], snapshot)
     merged = _score_against(PROFILES["wheel"], snapshot)
     # Wheel eligibility = both legs eligible AND merged profile eligible.
     # The merged eligibility already enforces pass_hard AND score>=0.65 AND
@@ -326,23 +329,70 @@ def score_wheel(snapshot: dict) -> PlayFitness:
     return merged
 
 
-def score_leaps(snapshot: dict) -> PlayFitness:
-    return _score_against(PROFILES["leaps"], snapshot)
+# Override map: play name → custom scorer for plays whose eligibility is NOT a
+# plain `_score_against` over their own profile. Plays absent from this map use
+# the generic scorer. Keep this map as small as possible — it is the ONLY place
+# a play diverges from the registry-derived default.
+_SPECIAL_SCORERS: dict[str, Callable[[dict], PlayFitness]] = {
+    "wheel": _score_wheel,
+}
 
 
-def score_swing(snapshot: dict) -> PlayFitness:
-    return _score_against(PROFILES["swing"], snapshot)
+def score_play(play: str, snapshot: dict) -> PlayFitness:
+    """Score a snapshot against one play by name (registry-derived dispatch).
+
+    Looks the play up in PROFILES; applies the play's override scorer if it has
+    one (see `_SPECIAL_SCORERS`), else the generic `_score_against`. Raises
+    KeyError for an unknown play name — callers should pass a name from
+    `PLAY_NAMES` / `PROFILES`.
+    """
+    profile = PROFILES[play]  # KeyError on unknown play — fail loud, not silent
+    special = _SPECIAL_SCORERS.get(play)
+    if special is not None:
+        return special(snapshot)
+    return _score_against(profile, snapshot)
 
 
 def score_all(snapshot: dict) -> dict[str, PlayFitness]:
-    """Score a snapshot against every play. Returns dict keyed by play name."""
-    return {
-        "covered_call": score_covered_call(snapshot),
-        "csp": score_csp(snapshot),
-        "wheel": score_wheel(snapshot),
-        "leaps": score_leaps(snapshot),
-        "swing": score_swing(snapshot),
-    }
+    """Score a snapshot against every play. Returns dict keyed by play name.
+
+    Derived from PROFILES (insertion order preserved), so a new profile flows
+    through with no edit here — this is ADR-0082 Part A's anti-drift guarantee.
+    """
+    return {play: score_play(play, snapshot) for play in PROFILES}
+
+
+# Ordered tuple of every play name, derived from PROFILES insertion order. This
+# is the canonical source for `watchlist_evolution.PLAY_NAMES` (re-exported there
+# for backward compatibility) so the two can never disagree.
+PLAY_NAMES: tuple[str, ...] = tuple(PROFILES.keys())
+
+
+# --------------------------------------------------------------------------- #
+# Public per-play wrappers (backward-compat; thin shims over `score_play`)
+# --------------------------------------------------------------------------- #
+# These named entry points are preserved for existing callers/tests. Each just
+# dispatches through the registry, so they cannot drift from `score_all`.
+
+
+def score_covered_call(snapshot: dict) -> PlayFitness:
+    return score_play("covered_call", snapshot)
+
+
+def score_csp(snapshot: dict) -> PlayFitness:
+    return score_play("csp", snapshot)
+
+
+def score_wheel(snapshot: dict) -> PlayFitness:
+    return score_play("wheel", snapshot)
+
+
+def score_leaps(snapshot: dict) -> PlayFitness:
+    return score_play("leaps", snapshot)
+
+
+def score_swing(snapshot: dict) -> PlayFitness:
+    return score_play("swing", snapshot)
 
 
 # --------------------------------------------------------------------------- #
