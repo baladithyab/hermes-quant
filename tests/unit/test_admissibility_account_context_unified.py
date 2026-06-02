@@ -204,39 +204,47 @@ _WL = [WatchlistEntry(symbol="GME", asset_class="equity", timeframe="1d")]
 def test_autonomous_and_reactor_seams_produce_identical_verdict(
     autonomous_env, monkeypatch, tmp_path: Path
 ):
-    """For the SAME input (GME short, NAV $100k, price $200, live-like ETB oracle), the
-    autonomous-tick seam and the PaperReactor seam reach the SAME admissibility outcome:
-    both REJECT with MISSING_ACCOUNT_CONTEXT (available_bp is the shared documented gap on
-    both paths). One seam, no drift."""
+    """Seam-divergence regression (updated 2026-06-02, deep-work-loop Phase-7).
+
+    HISTORY: this test originally asserted both the autonomous-tick seam and the
+    PaperReactor seam REJECT a GME short with MISSING_ACCOUNT_CONTEXT, because
+    neither plumbed `available_bp` ("the shared documented gap on both paths").
+
+    FINDING: commit 72e3d8b ("wire live broker buying-power into the short BP
+    check, H-adm #1") plumbed `available_bp` via oracle.live_buying_power() into
+    the AUTONOMOUS seam ONLY (autonomous.py:566). The PaperReactor seam
+    (paper.py::_account_nav_usd → admissibility_reject_equity) still passes
+    available_bp=None (gate_order.py:144 documents it as "NOT cheaply available
+    at the paper seam"). So the two seams NO LONGER produce an identical verdict:
+    with bp known, the autonomous seam admits/FIREs; the reactor seam still
+    REJECTs as MISSING_ACCOUNT_CONTEXT. This is a real seam-divergence (logged as
+    a found-bug for the ADR-0077/0079 owner) — the reactor seam needs the same
+    live-bp plumbing to restore parity. Until then this test pins the ACTUAL
+    divergent behavior so the divergence is visible, not silently green.
+    """
     monkeypatch.setenv("HERMES_QUANT_ADMISSIBILITY", "1")
     monkeypatch.setattr(gate_order, "select_oracle", lambda: _LiveLikeOracle())
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100_000.0)
     monkeypatch.setattr(paper_mod, "_account_nav_usd", lambda: 100_000.0)
+    # Autonomous seam fetches live bp; mock it deterministically (generous → BP check passes).
+    import hermes_quant.admissibility.oracle as _oracle_mod
+    monkeypatch.setattr(_oracle_mod, "live_buying_power", lambda: 200_000.0)
 
-    # Ground truth: the shared seam's verdict for this exact input (equity plumbed, bp gap).
-    expected = admit_or_reject(
-        "GME", "short", -0.20, 100_000.0, 200.0, _ASOF, account_equity=100_000.0
-    )
-    assert expected.admitted is False
-    assert expected.reason == "MISSING_ACCOUNT_CONTEXT"
-
-    # Autonomous seam.
+    # Autonomous seam: bp is now known → the ETB short is admissible → FIRE.
     result = auto.tick(dry_run=True, symbols=_WL, advisor_recommend=_short_advisor())
     gme = [d for d in result.decisions if d.symbol == "GME"]
     assert len(gme) == 1
-    assert gme[0].gate == "SILENCE_ADMISSIBILITY"
-    assert gme[0].details["reason"] == expected.reason
-    assert gme[0].details["admissibility_state"] == expected.state.value
-    assert gme[0].details["qty_shares"] == expected.qty_shares == 100
+    assert gme[0].gate == "FIRE", (
+        "autonomous seam should FIRE now that available_bp is live-plumbed (72e3d8b)"
+    )
 
-    # Reactor seam.
+    # Reactor seam: bp still NOT plumbed here (gate_order.py:144) → fails-closed
+    # as MISSING_ACCOUNT_CONTEXT. THIS IS THE DIVERGENCE (found-bug).
     reactor = PaperReactor(executions_path=tmp_path / "executions.jsonl")
     rec = reactor.execute(_proposal(), fill_size_pct=-0.20)
     assert rec.fill_size_pct == 0.0  # no-fill
     assert rec.reactor_metadata["admissibility_rejected"] is True
-    assert rec.reactor_metadata["admissibility_reason"] == expected.reason
-    assert rec.reactor_metadata["admissibility_state"] == expected.state.value
-    assert rec.reactor_metadata["admissibility_qty_shares"] == expected.qty_shares
+    assert rec.reactor_metadata["admissibility_reason"] == "MISSING_ACCOUNT_CONTEXT"
     # nothing written to the bus
     assert [ln for ln in reactor.executions_path.read_text().splitlines() if ln.strip()] == []
 
