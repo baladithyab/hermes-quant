@@ -94,17 +94,39 @@ def quant_status(args: dict, **_kwargs) -> str:
         if heartbeats:
             last_heartbeat = heartbeats[-1]
 
+    # ADR-0085 reporting rule: the AUTHORITATIVE halt state is the live halt
+    # registry (halt_state.json), NOT the last entry on the deprecated signals.jsonl
+    # bus. A stale halt SIGNAL (e.g. the 2026-05-13 operator_emergency_stop) on the
+    # old bus is historical and must never read as a current halt. Surface the real
+    # halt state explicitly and demote last_signal to clearly-historical.
+    active_halts: list[dict[str, Any]] = []
+    halt_read_ok = True
+    try:
+        from hermes_quant.daemon.halt_state import read_halt_mirror
+
+        active_halts = read_halt_mirror()  # reads halt_state.json mirror; [] = not halted
+    except Exception as exc:  # noqa: BLE001 — read-only diagnostic; never crash status
+        halt_read_ok = False
+        logger.debug("quant_status: authoritative halt read failed: %s", exc)
+
     return json.dumps(
         {
             "success": True,
             "daemon_running": daemon_running,
             "daemon_pid": pid,
             "quant_home": str(QUANT_HOME),
+            # AUTHORITATIVE halt state (ADR-0085): empty list => NOT halted.
+            "halted": bool(active_halts),
+            "active_halts": active_halts,
+            "halt_state_read_ok": halt_read_ok,
             "signal_bus_exists": SIGNAL_BUS_PATH.exists(),
             "signal_bus_size_bytes": SIGNAL_BUS_PATH.stat().st_size
             if SIGNAL_BUS_PATH.exists()
             else 0,
-            "last_signal": last_signal,
+            # HISTORICAL only — the last entry on the deprecated signals.jsonl bus.
+            # NOT a current-state indicator; a stale halt signal here does NOT mean
+            # the system is halted (see "halted"/"active_halts" above, ADR-0085).
+            "last_signal_historical": last_signal,
             "last_heartbeat": last_heartbeat,
             "recent_signal_count": signal_count,
             "account_filter": account_filter,

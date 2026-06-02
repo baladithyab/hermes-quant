@@ -776,12 +776,20 @@ def _pretty_print_status(result: dict) -> None:
     if result.get("daemon_pid"):
         print(f"  PID: {result['daemon_pid']}")
     print(f"  Quant home: {result['quant_home']}")
+    # ADR-0085: authoritative halt state from the live registry, not a stale signal.
+    if result.get("halted"):
+        halts = result.get("active_halts") or []
+        print(f"  🛑 HALTED: {len(halts)} active halt(s) — {halts}")
+    else:
+        print("  Halt state: clear (no active halts)")
     print(f"  Signal bus: {'exists' if result['signal_bus_exists'] else 'NOT CREATED'}")
-    if result.get("last_signal"):
-        sig = result["last_signal"]
+    # last_signal_historical is HISTORICAL only (deprecated signals.jsonl); accept the
+    # legacy key too for forward/backward compatibility.
+    hist = result.get("last_signal_historical") or result.get("last_signal")
+    if hist:
         print(
-            f"  Last signal: {sig.get('asof', '?')} {sig.get('asset')} "
-            f"dir={sig.get('direction')} conf={sig.get('confidence')}"
+            f"  Last signal (historical): {hist.get('asof', '?')} {hist.get('asset')} "
+            f"dir={hist.get('direction')} conf={hist.get('confidence')}"
         )
     if result.get("last_heartbeat"):
         hb = result["last_heartbeat"]
