@@ -75,6 +75,39 @@ def _isolate_kill_switch_state_json(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 @pytest.fixture(autouse=True)
+def _isolate_portfolio_state_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the PortfolioState ledger (state.db) to a per-test tmp_path AND
+    reset the module-level singleton, so a test can NEVER write the user's real
+    ~/.hermes/quant/state.db.
+
+    ADR-0085 root cause (2026-06-01): the live paper ledger was polluted by test
+    fixtures (NVDA 2200@$150, GME@$200, prop_..._abc123) because PortfolioState()
+    defaults its db_path to DEFAULT_STATE_DB and nothing here isolated it — a test
+    that constructed PortfolioState() (directly or via get_portfolio_state())
+    applied fixture executions to the LIVE db, producing a fictional +$167K EOD
+    P&L. Two leak paths are closed here:
+      1. DEFAULT_STATE_DB -> tmp (covers `PortfolioState()` with no explicit path);
+      2. the `_singleton` is reset to None BEFORE and AFTER each test (covers
+         `get_portfolio_state()` caching a live-pointed instance across tests).
+    """
+    try:
+        from hermes_quant.state import portfolio_state as ps
+    except ImportError:
+        return tmp_path
+
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ps, "DEFAULT_STATE_DB", db_path, raising=True)
+    # Discard any singleton a prior test may have built against the live DB,
+    # and make get_portfolio_state() default to the tmp path for this test.
+    with ps._singleton_lock:
+        ps._singleton = None
+    yield db_path
+    # Don't leak this test's tmp-pointed singleton into the next test / teardown.
+    with ps._singleton_lock:
+        ps._singleton = None
+
+
+@pytest.fixture(autouse=True)
 def _autouse_dummy_third_party_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """Inject placeholder env vars for every third-party SDK so CI never
     blocks on missing creds. Real tests that need real creds opt out by
