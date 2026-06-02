@@ -738,6 +738,12 @@ class PortfolioState:
         cost_basis_equity = cash.equity_total if cash else _default_initial_cash()
         if nav_ref is None:
             nav_ref = cost_basis_equity
+        # Guard: a non-positive nav_ref would silently zero (or sign-invert) every
+        # unrealized contribution. Fall back to the bootstrap initial cash so the
+        # MTM estimate stays meaningful rather than collapsing to cost-basis
+        # (Phase-8 review finding 2026-06-02).
+        if nav_ref <= 0:
+            nav_ref = _default_initial_cash()
 
         positions = self.get_positions(account_id)
         total_unrealized = 0.0

@@ -369,7 +369,13 @@ class PaperReactor:
         )
 
         ps = get_portfolio_state()
-        positions = ps.get_positions("paper-default")
+        # Resolve the account the SAME way the bus-append path does (see execute():
+        # reactor_metadata.account_id override, else the "paper-default" sentinel).
+        # Hardcoding "paper-default" would read the wrong book for any non-default
+        # account (Phase-8 review finding 2026-06-02).
+        rmeta = getattr(proposal, "reactor_metadata", None) or {}
+        account_id = (rmeta.get("account_id") if isinstance(rmeta, dict) else None) or "paper-default"
+        positions = ps.get_positions(account_id)
         pos_map: dict[str, float] = {}
         for (asset_class, symbol), position in positions.items():
             # Positions are stored as NAV-fraction quantities in v0.1 (ADR-0041).
