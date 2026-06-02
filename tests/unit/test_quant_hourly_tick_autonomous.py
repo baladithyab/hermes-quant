@@ -87,7 +87,9 @@ def test_autonomous_phase_speaks_on_fire(monkeypatch):
     monkeypatch.setattr(m, "_import_playbook_tick", lambda: fake_module)
     out = m.maybe_run_autonomous_phase()
     assert "fired=2" in out
-    assert "(dry-run)" in out
+    # Dry-run (unarmed) surfaces the 🧪 dry-run mode tag (ARIA reconcile 078b9a1
+    # replaced the old " (dry-run)" suffix with a per-mode tag: 🧪 dry-run / 📦 paper).
+    assert "🧪 dry-run" in out
 
 
 def test_autonomous_phase_armed_loses_dry_run_suffix(monkeypatch):
@@ -110,7 +112,9 @@ def test_autonomous_phase_armed_loses_dry_run_suffix(monkeypatch):
     monkeypatch.setattr(m, "_import_playbook_tick", lambda: fake_module)
     out = m.maybe_run_autonomous_phase()
     assert captured["dry_run"] is False
-    assert "(dry-run)" not in out
+    # ARMED surfaces the 📦 paper mode tag, NOT the 🧪 dry-run tag (post-078b9a1).
+    assert "📦 paper" in out
+    assert "🧪 dry-run" not in out
     assert "fired=1" in out
 
 
@@ -130,7 +134,8 @@ def test_autonomous_phase_speaks_on_halt(monkeypatch):
     )
     monkeypatch.setattr(m, "_import_playbook_tick", lambda: fake_module)
     out = m.maybe_run_autonomous_phase()
-    assert "HALT ABORT" in out
+    # Halt headline is "HALT-ABORTED" (post-078b9a1 deployed formatter wording).
+    assert "HALT-ABORTED" in out
     assert "🚨" in out
 
 
