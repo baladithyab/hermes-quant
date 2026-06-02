@@ -589,11 +589,16 @@ def format_status_human(report: StatusReport) -> str:
             pos_body.append("")
         pos_body.append("  cash:")
         for c in report.cash:
+            # ADR-0086: `equity_total` in state.db is COST-BASIS (cash + Σ entry-notional),
+            # NOT mark-to-market. Label it honestly so a reader never mistakes it for live
+            # P&L — the offline status path has no marks. For true MTM use
+            # PortfolioState.get_marked_equity(account, mark_prices) from a marked report
+            # surface (e.g. quant-portfolio-daily, which fetches yfinance marks).
             pos_body.append(
                 f"    {c.account_id:20s}  bal={c.balance_usd:.2f}  "
-                f"equity={c.equity_total:.2f}"
+                f"equity(cost-basis)={c.equity_total:.2f}"
             )
-    lines.extend(_section("positions / cash (state.db)", pos_body))
+    lines.extend(_section("positions / cash (state.db — cost-basis, not MTM)", pos_body))
 
     # Warnings
     if report.warnings:
