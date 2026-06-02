@@ -398,6 +398,29 @@ into the seeds tracker (children/relatives of B41 = `hermes-quant-4665`):
 
 ---
 
+## 7b. Verification verdict (2026-06-02) — operator asked "research before flipping W7/RESEARCH_DEBATE"
+
+Re-verified the load-bearing claims against the live code before any flip. **Verdict: NO-GO for
+HERMES_QUANT_RESEARCH_DEBATE and HERMES_QUANT_REDTEAM_TURN.** Two of the five gates are
+structurally absent for the debate path:
+
+- **Gate 3 (OOS-beats-fallback) — ABSENT.** `tests/unit/test_redteam_eval_gate.py` exists but
+  proves only *dissent-surfaced ON ≠ OFF* and *false-flat-rate == 0* — a **no-harm / effect-real**
+  gate, NOT a "debate decisions beat the heuristic on realized returns OOS" gate. A grep for any
+  debate-vs-fallback realized-return eval finds none. The W7 eval that passes 21/21 is the
+  *no-harm* half; it does not establish the debate *improves* decisions.
+- **Gate 2 (cost ceiling) — ABSENT.** The only "budget" in `llm_committee.py` is a 2048-char
+  *prompt-render* limit, not a per-decision USD/token ceiling with a zero-call kill-switch.
+
+Gates 1 (default-OFF/byte-identical) and the silence-by-default half of 5 hold. So W7's green
+eval-gate is necessary-not-sufficient: **safe to run in shadow, not justified to make
+production-default.** The flip is correctly gated on B41-a (cost ceiling) + B41-e (dissent-quality
+OOS axis) landing green. Recommendation stands: keep both OFF; do the gating work (§7 seeds, now
+filed in the tracker) first. The 5 deterministic self-evolution W-flags already enabled are
+unaffected by this NO-GO.
+
+---
+
 ## 8. Appendix — sources
 
 - `AGENTS.md` §313–329 (reference-project anti-patterns + the convergent-failure synthesis),
