@@ -38,3 +38,20 @@ Contributing: the `quant_status` tool reported a phantom `operator_emergency_sto
 ## Lesson
 
 A risk control that only one of N firing layers respects is not a risk control. ADR-0071's caps were correct and tested — they were just never wired into the layer doing the most firing. When a safety gate ships behind an env flag, audit **every** call site that should honor it, not just the one in the PR.
+
+## Follow-up status (deep-work loop, 2026-06-02)
+
+A vision-driven deep-work loop ran the post-incident architecture pass. Outcomes:
+
+**Shipped this session (committed):**
+- **ADR-0086 Phase 1 — read-time mark-to-market.** `PortfolioState.get_marked_equity(account, mark_prices)` computes honest signed MTM equity on demand (the −$30k-reported-as-+$12k bug is now a regression-locked test). `cli/status.py` relabels `state.db.equity_total` as cost-basis (not MTM) so the status tool can never again present it as live P&L. No schema change, firing/cap path untouched.
+- **ADR-0087 — centralized portfolio cap at the `PaperReactor.execute()` seam**, default-OFF behind `HERMES_QUANT_PORTFOLIO_CAPS`, mirroring the admissibility-reject precedent. When armed, ALL four firing layers inherit the cap by construction — the structural fix for "a layer forgot the cap."
+- **Found-bug fixes:** two stale admissibility tests (root-caused to commit `72e3d8b` plumbing `available_bp` into the autonomous seam only) updated; Phase-8 review hardening (account-resolution in the cap seam instead of hardcoded `paper-default`; `nav_ref<=0` guard).
+
+**Found-bug logged, NOT fixed (out of MTM/cap scope — ADR-0077/0079 domain):**
+- **Seam divergence:** commit `72e3d8b` plumbed live buying-power (`available_bp`) into the AUTONOMOUS firing seam but NOT the PaperReactor seam (`gate_order.py:144` documents bp as "not cheaply available at the paper seam"). The two seams that are supposed to agree now diverge on a short's admissibility when bp is the deciding factor. Test `test_autonomous_and_reactor_seams_produce_identical_verdict` was rewritten to PIN the divergence (visible, not silently green) with a FINDING docstring. Restoring parity = plumb live bp into the reactor seam too.
+
+**Deferred (ADR-0086 Phase 2, gated by `docs/research/2026-06-02-premortem.md`):**
+- Full share-quantity + dollar-accounting migration (`executions.jsonl` gains signed `qty`; positions in shares; cash in real dollars; the cash-delta dimensional bug and `abs()`-short-sign bug fixed at the write path). Pre-mortem flagged 5 failure modes (NAV_at_fill bootstrapping circularity, share-migration blast radius across ≥4 consumers, reconcile divergence) that make it a 3-4 wave arc in its own session, not safe to half-ship during incident cleanup.
+- The `quant_status` stale-halt read was already fixed in the repo (ADR-0085 #49, commit `0cd16e7`) — the live tool was just running a stale venv; reinstalled via `uv pip install -e .` this session.
+- The per-layer cap clips (autonomous in-package, advisor in the deployed script) remain in place; they will be removed in favor of the reactor seam when `HERMES_QUANT_PORTFOLIO_CAPS` is flipped on for the seam — sequenced with the Phase-2 share migration because the cap reads weights and Phase 2 changes weight units.
