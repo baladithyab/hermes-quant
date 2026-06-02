@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-82 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
+83 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
 
 Status vocabulary: proposed | accepted | rejected | deprecated | superseded by ADR-NNNN. A compound status (e.g. "Part A accepted; Part B proposed") is the ADR's own — see the file.
 
@@ -88,3 +88,4 @@ Status vocabulary: proposed | accepted | rejected | deprecated | superseded by A
 | [ADR-0082](ADR-0082-deterministic-structure-selection-layer.md) | Deterministic structure-selection layer + registry-open plays | proposed | 2026-05-31 |
 | [ADR-0083](ADR-0083-defer-intraday-build-horizon-neutral-foundations.md) | Defer long-horizon intraday; build the horizon-neutral foundations first | proposed | 2026-05-31 |
 | [ADR-0084](ADR-0084-scheduled-event-calendar-and-pre-event-guard.md) | Scheduled-event calendar as asof-honest perception + a default-OFF pre-event REJECT/abstain guard | Proposed | 2026-05-31 |
+| [ADR-0085](ADR-0085-ledger-authority-and-state-derivation.md) | executions.jsonl is the authoritative event log; state.db is a derived projection | proposed | 2026-06-01 |
