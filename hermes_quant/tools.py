@@ -1026,10 +1026,34 @@ def quant_autonomous_status(args: dict, **_kwargs) -> str:
     rails = _read_safety_rails()
     ks = _read_kill_switch()
 
+    # ADR-0085 reporting rule: report the watchlist the ENGINE actually scans, not just
+    # the (often-empty) config.yaml operator watchlist. The deployed autonomous tick scans
+    # the evolving PDR play-fit watchlist (~/.hermes/quant/watchlist/play-fit.json); reporting
+    # only list_watchlist() showed size:0 while the tick scanned 117 — a confusing drift.
+    # Surface BOTH, clearly labeled, so neither is mistaken for the other.
+    engine_watchlist_size = 0
+    engine_watchlist_asof = None
+    try:
+        play_fit = QUANT_HOME / "watchlist" / "play-fit.json"
+        if play_fit.exists():
+            pf = json.loads(play_fit.read_text())
+            plays = pf.get("plays") if isinstance(pf, dict) else None
+            engine_watchlist_size = len(plays) if isinstance(plays, (list, dict)) else 0
+            engine_watchlist_asof = pf.get("as_of") if isinstance(pf, dict) else None
+    except Exception as exc:  # noqa: BLE001 — read-only diagnostic; never crash status
+        logger.debug("quant_autonomous_status: play-fit read failed: %s", exc)
+
     return json.dumps(
         {
             "success": True,
             "mode": mode,
+            # config.yaml operator watchlist (ADR-0016) — hand-curated, may be empty.
+            "operator_watchlist": [e.to_dict() for e in watchlist],
+            "operator_watchlist_size": len(watchlist),
+            # the watchlist the autonomous tick ACTUALLY scans (PDR play-fit, evolving).
+            "engine_watchlist_size": engine_watchlist_size,
+            "engine_watchlist_asof": engine_watchlist_asof,
+            # back-compat aliases (the legacy keys pointed at the operator watchlist).
             "watchlist": [e.to_dict() for e in watchlist],
             "watchlist_size": len(watchlist),
             "silence_bias_config": {
