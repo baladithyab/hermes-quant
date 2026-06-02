@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,30 +24,54 @@ logger = logging.getLogger(__name__)
 
 
 def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
-    """Map an ExecutionRecord dataclass to a JSON-serializable dict."""
-
-    out = asdict(record)
-    # ExecutionRecord is intentionally flat; reactor_metadata is a free-form
-    # dict already safe for JSON.  We keep this helper for symmetry with
-    # other reactors and to centralize any future shape tweaks.
-    return out
+    """Serialize an ExecutionRecord to a JSONL-safe dict."""
+    return {
+        "proposal_id": record.proposal_id,
+        "signal_id": record.signal_id,
+        "asset": record.asset,
+        "asset_class": record.asset_class,
+        "timeframe": record.timeframe,
+        "asof_decision": record.asof_decision,
+        "asof_execution": record.asof_execution,
+        "target_position_pct": record.target_position_pct,
+        "decision_price": record.decision_price,
+        "fill_price": record.fill_price,
+        "fill_size_pct": record.fill_size_pct,
+        "reactor_name": record.reactor_name,
+        "human_in_the_loop": record.human_in_the_loop,
+        "approver_user_id": record.approver_user_id,
+        "reactor_metadata": record.reactor_metadata or {},
+        "bar_ts": record.bar_ts,  # ADR-0068: explicit bar-boundary anchor
+        "play_tag": record.play_tag,  # B13: source of the fire
+    }
 
 
 def _account_nav_usd() -> float | None:
-    """Return the current paper account NAV (USD) or None on failure.
+    """Best-available paper-account NAV (USD), or None on any failure (fail-closed).
 
-    This is a thin wrapper over hermes_quant.state.portfolio_state so the
-    admissibility seam can remain decoupled from the PortfolioState
-    implementation details.  Failure must fail-closed: callers treat None
-    as "no NAV available" and REJECT rather than guess.
+    Mirrors `hermes_quant.autonomous._account_nav_usd` so the reactor's admissibility
+    share-conversion uses the SAME NAV source as the autonomous-tick seam, without
+    importing from autonomous.py (kept decoupled). Source priority:
+      1. state.db cash.equity_total (materialized NAV after fills) — the truth.
+      2. paper bootstrap initial cash (no fills yet).
+    Returns None on any failure so the caller fails-closed (no fabricated NAV).
+
+    NOTE (ADR-0086): this uses the cost-basis `equity_total` deliberately — the
+    admissibility share-conversion needs a NAV figure, and it must match the
+    autonomous seam's source for the two seams to agree. Read-time MTM
+    (get_marked_equity) is a SEPARATE reporting concern and must NOT be wired here.
     """
-
     try:
-        from hermes_quant.state.portfolio_state import get_portfolio_state
+        from hermes_quant.state.portfolio_state import (
+            _default_initial_cash,
+            get_portfolio_state,
+        )
 
-        ps = get_portfolio_state()
-        snap = ps.get_marked_equity("paper-default")
-        return snap.marked_equity
+        cash = get_portfolio_state().get_cash("paper-default")
+        if cash is not None and cash.equity_total > 0:
+            return float(cash.equity_total)
+        boot = _default_initial_cash()
+        return float(boot) if boot > 0 else None
     except Exception as exc:  # noqa: BLE001 — fail-closed: unknown NAV => None.
         logger.warning("paper-react: NAV lookup failed (admissibility fail-closed): %s", exc)
         return None
@@ -411,21 +434,22 @@ class PaperReactor:
         # Preferred: top-level decision_price (advisor Wave B.1+)
         top_dp = ar.get("decision_price")
         if top_dp is not None:
-            return float(top_dp)
-
-        # Fallback: analyst_views[0].metadata.last_close (pre-fix)
-        views = ar.get("analyst_views") or []
-        if views:
             try:
-                meta = views[0].get("metadata") or {}
-                lc = meta.get("last_close")
-                if lc is not None:
-                    return float(lc)
-            except Exception:  # noqa: BLE001 — defensive; fall through to 0.0
+                return float(top_dp)
+            except (TypeError, ValueError):
                 pass
-
-        # Last resort: 0.0 (caller should treat as invalid and fail-closed
-        # upstream; this path should be unreachable in well-formed proposals).
+        # Fallback for pre-Wave-B.1 advisor_results stored before the fix:
+        # ClassicalTA's metadata happens to carry last_close.
+        for view in ar.get("analyst_views") or []:
+            md = view.get("metadata") or {}
+            if "last_close" in md:
+                try:
+                    return float(md["last_close"])
+                except (TypeError, ValueError):
+                    pass
+        # Worst case: gated proposals approved-anyway (operator override)
+        # land here. 0.0 is the sentinel; the daemon's settlement loop
+        # gates on data_quality at calibration time.
         return 0.0
 
     @staticmethod
