@@ -122,3 +122,94 @@ class TestPaperReactorPortfolioCap:
         fresh_positions = fresh_ps.get_positions("paper-default")
         assert ("equity", "AAPL") in fresh_positions
         assert fresh_positions[("equity", "AAPL")].quantity == pytest.approx(0.05)
+
+    def test_cap_scales_partial_headroom(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADR-0087 acceptance gate: a fire that fits PARTIALLY is scaled to the
+        remaining headroom, a real fill lands at the clipped size, and
+        cap_scaled_from/to/factor are recorded in reactor_metadata.
+
+        Book setup: a single +0.75 long position. Under PortfolioCaps.standard()
+        (200% gross / 100% net / 20% cash), the binding cap is the cash sleeve:
+        cash_headroom = (1.0 - 0.20) - 0.75 = 0.05. A +0.20 fire therefore clips
+        to +0.05 (scale_factor = 0.25). Net cap is not binding
+        (prospective_net = 0.75 + 0.20 = 0.95 <= 1.0).
+        """
+
+        monkeypatch.setenv("HERMES_QUANT_PORTFOLIO_CAPS", "1")
+
+        executions_path = tmp_path / "executions.jsonl"
+        reactor = PaperReactor(executions_path=executions_path)
+        proposal = _make_proposal("NVDA")
+
+        import hermes_quant.state.portfolio_state as ps_mod
+        from hermes_quant.state.portfolio_state import PortfolioState as DBPortfolioState
+
+        ps_instance = DBPortfolioState(state_db_path=tmp_path / "state.db")
+
+        class DummyPos:
+            def __init__(self, quantity: float) -> None:
+                self.quantity = quantity
+
+        # Existing book: +0.75 long in AAPL -> gross=0.75, net=+0.75.
+        # cash_headroom = 0.8 - 0.75 = 0.05; gross_headroom = 2.0 - 0.75 = 1.25.
+        # The min (cash) binds at 0.05.
+        ps_instance.get_positions = MagicMock(
+            return_value={
+                ("equity", "AAPL"): DummyPos(0.75),
+            }
+        )
+
+        with patch.object(ps_mod, "_singleton", ps_instance):
+            record = reactor.execute(proposal, fill_size_pct=0.20)
+
+        # A REAL fill landed (not silenced) at the clipped, scaled-down size.
+        assert isinstance(record, ExecutionRecord)
+        assert record.asset == "NVDA"
+        rmeta = record.reactor_metadata or {}
+        assert not rmeta.get("silenced")
+        assert record.fill_size_pct == pytest.approx(0.05)
+        assert record.target_position_pct == pytest.approx(0.05)
+
+        # Cap audit trail surfaced in reactor_metadata.
+        assert rmeta.get("cap_scaled_from") == pytest.approx(0.20)
+        assert rmeta.get("cap_scaled_to") == pytest.approx(0.05)
+        assert rmeta.get("cap_scale_factor") == pytest.approx(0.25)
+
+        # The scaled fill is a position-moving fill: it was appended to the bus
+        # and applied to PortfolioState at the CLIPPED size, not the original.
+        fresh_ps = DBPortfolioState(state_db_path=ps_instance.db_path)
+        fresh_positions = fresh_ps.get_positions("paper-default")
+        assert ("equity", "NVDA") in fresh_positions
+        assert fresh_positions[("equity", "NVDA")].quantity == pytest.approx(0.05)
+
+    def test_cap_full_pass_records_no_scale_metadata(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard: a fire that fits ENTIRELY passes through unscaled and
+        records NO cap_scaled_* metadata (full-pass path unchanged)."""
+
+        monkeypatch.setenv("HERMES_QUANT_PORTFOLIO_CAPS", "1")
+
+        executions_path = tmp_path / "executions.jsonl"
+        reactor = PaperReactor(executions_path=executions_path)
+        proposal = _make_proposal("AAPL")
+
+        import hermes_quant.state.portfolio_state as ps_mod
+        from hermes_quant.state.portfolio_state import PortfolioState as DBPortfolioState
+
+        ps_instance = DBPortfolioState(state_db_path=tmp_path / "state.db")
+        # Empty book -> full headroom -> a 5% fire fits entirely (scale_factor=1.0).
+        ps_instance.get_positions = MagicMock(return_value={})
+
+        with patch.object(ps_mod, "_singleton", ps_instance):
+            record = reactor.execute(proposal, fill_size_pct=0.05)
+
+        rmeta = record.reactor_metadata or {}
+        assert record.fill_size_pct == pytest.approx(0.05)
+        assert not rmeta.get("silenced")
+        # Full pass: no scale audit keys present.
+        assert "cap_scaled_from" not in rmeta
+        assert "cap_scaled_to" not in rmeta
+        assert "cap_scale_factor" not in rmeta
