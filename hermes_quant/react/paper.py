@@ -145,17 +145,24 @@ class PaperReactor:
         if admissibility_reject is not None:
             return admissibility_reject
 
-        # ADR-0087 Wave 2: portfolio-cap seam at the REACTION layer (DEFAULT-OFF).
+        # ADR-0087: portfolio-cap seam at the REACTION layer (DEFAULT-OFF).
         # When HERMES_QUANT_PORTFOLIO_CAPS=1, this precondition reads current
-        # portfolio headroom and either SILENCES an over-cap fire or (future
-        # wave) scales it down. With the flag unset this helper is a
-        # bit-identical no-op: it returns None without touching state or the
-        # cap module.
-        cap_reject = self._portfolio_cap_reject(
+        # portfolio headroom and either SILENCES an over-cap fire (clipped to
+        # ~0) or SCALES it down to the remaining headroom. With the flag unset
+        # this helper is a bit-identical no-op: it returns (None, fill_size_pct,
+        # None) without touching state or the cap module.
+        #
+        # Three outcomes:
+        #   * full silence  -> returns a silenced ExecutionRecord (early return).
+        #   * partial scale -> rewrites fill_size_pct to the clipped value and
+        #                      returns cap_metadata (cap_scaled_from/to/factor)
+        #                      that is merged into the fired record below.
+        #   * full pass      -> fill_size_pct unchanged, cap_metadata is None.
+        cap_silence, fill_size_pct, cap_metadata = self._portfolio_cap_clip(
             proposal, fill_size_pct, now, play_tag=play_tag
         )
-        if cap_reject is not None:
-            return cap_reject
+        if cap_silence is not None:
+            return cap_silence
 
         # ADR-0068: prefer the wall-clock decision time emitted by the advisor.
         # Fall back to `as_of` (= bar boundary) for advisor_result dicts produced
@@ -231,6 +238,10 @@ class PaperReactor:
                 "advisor_caveats": (proposal.advisor_result or {}).get("caveats", []),
                 "slippage_model": slippage_mode,
                 "slippage_breakdown": slippage_breakdown,
+                # ADR-0087: when the portfolio-cap seam scaled this fire down to
+                # remaining headroom, surface the audit trail (cap_scaled_from/to/
+                # factor). None on the full-pass and flag-OFF paths.
+                **(cap_metadata or {}),
             },
             bar_ts=bar_ts,
             play_tag=play_tag,  # B13: source of the fire (advisor/playbook/autonomous)
@@ -336,28 +347,45 @@ class PaperReactor:
             play_tag=play_tag,
         )
 
-    def _portfolio_cap_reject(
+    def _portfolio_cap_clip(
         self,
         proposal: Any,
         fill_size_pct: float,
         now: str,
         *,
         play_tag: str = "advisor",
-    ) -> ExecutionRecord | None:
-        """Portfolio-cap precondition for paper fills (ADR-0087 Wave 2).
+    ) -> tuple[ExecutionRecord | None, float, dict[str, Any] | None]:
+        """Portfolio-cap precondition for paper fills (ADR-0087).
 
         DEFAULT-OFF behind HERMES_QUANT_PORTFOLIO_CAPS. With the flag unset
         this helper is a bit-identical no-op and does not import or touch
         portfolio-normalize or PortfolioState.
 
-        When enabled and the portfolio caps gate SILENCES this fire (no
-        remaining headroom), returns an ExecutionRecord marked as silenced
-        which is NOT appended to executions.jsonl. Scale-down behavior (pick
-        partially fits within headroom) is deferred to a later wave.
+        Returns a ``(silence_record, effective_fill_size_pct, cap_metadata)``
+        triad so the seam can express all three ADR-0087 outcomes:
+
+          * **Full silence** — the clip leaves no usable headroom (not fired,
+            or clipped to ~0). Returns ``(ExecutionRecord, 0.0, None)`` where
+            the record is an audit-only silenced record that is NOT appended to
+            executions.jsonl and does NOT update PortfolioState. The caller
+            early-returns it.
+          * **Partial scale** — the clip fits the fire only partially
+            (``fired=True`` with ``scale_factor < 1.0``). Returns
+            ``(None, clipped.portfolio_target_pct, cap_metadata)`` where
+            ``cap_metadata`` carries ``cap_scaled_from`` (original
+            fill_size_pct), ``cap_scaled_to`` (clipped value), and
+            ``cap_scale_factor``. The caller executes a real fill at the
+            CLIPPED size and merges ``cap_metadata`` into the record.
+          * **Full pass** — the fire fits entirely (``scale_factor == 1.0``).
+            Returns ``(None, fill_size_pct, None)``: the fill proceeds at the
+            original size, no cap metadata, behavior unchanged.
+
+        With HERMES_QUANT_PORTFOLIO_CAPS unset the return is always
+        ``(None, fill_size_pct, None)`` — bit-for-bit the pre-ADR behavior.
         """
 
         if os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") != "1":
-            return None
+            return None, fill_size_pct, None
 
         # Flag ON path only: import the cap machinery lazily so the OFF path
         # stays import- and IO-free.
@@ -391,16 +419,11 @@ class PaperReactor:
             caps=caps,
         )
 
-        # TODO (Wave 3): handle partial headroom by scaling fill_size_pct to
-        # clipped.portfolio_target_pct and surfacing cap_scaled_from/to in
-        # reactor_metadata. For Wave 2 we implement a pure SILENCE-or-pass
-        # semantics at the seam.
-
         if not clipped.fired or abs(clipped.portfolio_target_pct) < 1e-9:
-            # Silenced: record an audit-only ExecutionRecord that is NOT
+            # Full silence: record an audit-only ExecutionRecord that is NOT
             # appended to executions.jsonl and does NOT update PortfolioState.
             silence_reason = clipped.silence_reason or "no_headroom"
-            return ExecutionRecord(
+            silence_record = ExecutionRecord(
                 proposal_id=proposal.proposal_id,
                 signal_id=self._extract_signal_id(proposal),
                 asset=proposal.symbol,
@@ -423,8 +446,27 @@ class PaperReactor:
                 bar_ts=(proposal.advisor_result or {}).get("bar_ts"),
                 play_tag=play_tag,
             )
+            return silence_record, 0.0, None
 
-        return None
+        # The clip fired with usable headroom. Two sub-cases:
+        #   scale_factor ~= 1.0  -> full pass: nothing changes, no cap metadata.
+        #   scale_factor  < 1.0  -> partial scale: rewrite fill to the clipped
+        #                           NAV-fraction (already correctly signed by the
+        #                           clip) and surface the audit trail.
+        # clip_one_to_remaining_headroom() shrinks abs(target) to the remaining
+        # headroom and re-applies the original sign, so clipped.portfolio_target_pct
+        # is the new signed fill_size_pct directly — it composes linearly with the
+        # downstream slippage + record math (which only reads fill_size_pct).
+        if clipped.scale_factor >= 1.0 - 1e-9:
+            # Full pass — unchanged behavior.
+            return None, fill_size_pct, None
+
+        cap_metadata: dict[str, Any] = {
+            "cap_scaled_from": fill_size_pct,
+            "cap_scaled_to": clipped.portfolio_target_pct,
+            "cap_scale_factor": clipped.scale_factor,
+        }
+        return None, clipped.portfolio_target_pct, cap_metadata
 
     @staticmethod
     def _extract_decision_price(proposal: Any) -> float:
