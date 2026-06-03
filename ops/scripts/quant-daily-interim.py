@@ -274,6 +274,69 @@ def create_proposals_for_actionables(actionables: list[dict]) -> list[dict]:
     return actionables
 
 
+def _resolve_target_weight(v: dict) -> tuple[float, str | None]:
+    """Resolve the signed portfolio target weight for an actionable.
+
+    The cap gate (clip_one_to_remaining_headroom) needs a signed per-symbol
+    target weight as a fraction of NAV. The actionable-builder populates
+    `kelly_fraction` (signed, e.g. -0.20) and the trader/risk fields, but it
+    does NOT set a `target_position_pct` key. Reading that missing key as 0.0
+    made the cap silence EVERY pick as `zero_target` — a plumbing break that
+    masqueraded as "cap full" (see INCIDENT-2026-06-02 follow-up; bug found
+    2026-06-03).
+
+    Resolution order (first usable wins):
+      1. `target_position_pct` — explicit override if a caller set it.
+      2. signed `kelly_fraction` × risk_silence_multiplier — the canonical
+         path. kelly_fraction already carries direction and the quarter-Kelly
+         magnitude; the risk-debate committee multiplier (≤1.0) shrinks it.
+      3. sign(direction) × |trader_size_fraction| × risk mult — fallback when
+         kelly_fraction is absent but the trader proposed a size.
+
+    Returns (signed_weight, source_tag). source_tag is None when no size field
+    was resolvable — the caller MUST treat that as a loud error, NOT silence.
+    """
+    explicit = v.get("target_position_pct")
+    if explicit is not None:
+        try:
+            return float(explicit), "explicit"
+        except (TypeError, ValueError):
+            pass
+
+    mult = v.get("risk_silence_multiplier")
+    try:
+        mult = float(mult) if mult is not None else 1.0
+    except (TypeError, ValueError):
+        mult = 1.0
+    # Defensive clamp: committee can only silence (≤1.0), never amplify.
+    if mult < 0.0:
+        mult = 0.0
+    elif mult > 1.0:
+        mult = 1.0
+
+    kelly = v.get("kelly_fraction")
+    if kelly is not None:
+        try:
+            kf = float(kelly)
+            if kf != 0.0:
+                return kf * mult, "kelly_x_riskmult"
+        except (TypeError, ValueError):
+            pass
+
+    size = v.get("trader_size_fraction")
+    direction = v.get("direction")
+    if size is not None and direction is not None:
+        try:
+            mag = abs(float(size))
+            sign = 1.0 if float(direction) > 0 else -1.0
+            if mag != 0.0:
+                return sign * mag * mult, "tradersize_x_riskmult"
+        except (TypeError, ValueError):
+            pass
+
+    return 0.0, None
+
+
 def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
     """If HERMES_QUANT_AUTONOMY=paper is set, auto-fire approve on each actionable.
 
@@ -303,12 +366,89 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
             v["auto_approve_error"] = f"tools import failed: {type(exc).__name__}: {exc}"
         return actionables
 
+    # ADR-0071 portfolio-cap gate for the ADVISOR layer (added 2026-06-02 after
+    # the uncapped-advisor 41.6x-gross runaway incident — see
+    # docs/architecture/INCIDENT-2026-06-02-advisor-leverage-runaway.md).
+    # The autonomous-tick layer already clipped each fire against running
+    # headroom; the advisor auto-fire loop did NOT, so premarket/midday/EOD
+    # crons stacked the paper-default book to 4160% gross with zero portfolio
+    # awareness. Gate this layer the same way, behind the same env flag.
+    # Default-OFF preserves prior behavior; ops wrapper sets it to "1".
+    caps_enabled = os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") == "1"
+    _clip = None
+    _caps = None
+    _running = None  # dict[str, float] running signed target weights
+    if caps_enabled:
+        try:
+            from hermes_quant.risk.portfolio_normalize import (
+                clip_one_to_remaining_headroom,
+                PortfolioCaps,
+                PortfolioState,
+            )
+            _clip = clip_one_to_remaining_headroom
+            _caps = PortfolioCaps.standard()  # 200% gross / 100% net / 20% cash
+            _PState = PortfolioState
+            # Seed running state from the CURRENT live book so the cap is
+            # account-aware, not just per-run. state.db.positions.quantity is
+            # the net cumulative target weight per (asset_class, symbol).
+            import sqlite3 as _sq
+            import os as _os
+            _con = _sq.connect(_os.path.expanduser("~/.hermes/quant/state.db"), timeout=10)
+            live = {}
+            for _sym, _qty in _con.execute(
+                "SELECT symbol, quantity FROM positions WHERE account_id='paper-default'"
+            ).fetchall():
+                live[_sym] = float(_qty)
+            _con.close()
+            _running = dict(live)
+        except Exception as exc:  # fail-OPEN to prior behavior, but log loudly
+            _clip = None
+            for v in actionables:
+                v.setdefault("_cap_warn", f"cap gate init failed (firing uncapped): {type(exc).__name__}: {exc}")
+
     fired = 0
+    capped = 0
     for v in actionables:
         pid = v.get("proposal_id")
         if not pid:
             v["auto_approve_error"] = "no_proposal_id (proposal creation likely failed)"
             continue
+
+        # Portfolio-cap clip BEFORE firing.
+        if _clip is not None:
+            sym = v.get("symbol") or v.get("asset")
+            tgt, tgt_src = _resolve_target_weight(v)
+            v["_cap_target_weight"] = tgt
+            v["_cap_target_source"] = tgt_src
+            # GUARD: a None source means NO size field was resolvable. This is a
+            # plumbing break (the actionable reached the cap with no kelly /
+            # trader size / explicit target), NOT a benign "cap full". Fail it
+            # LOUDLY so it is distinguishable from a real headroom silence, and
+            # do not launder it into a zero_target silence (the 2026-06-03 bug).
+            if tgt_src is None:
+                v["auto_approve_error"] = (
+                    "size_field_missing (no kelly_fraction / trader_size_fraction / "
+                    "target_position_pct on actionable — cannot size; NOT a cap silence)"
+                )
+                continue
+            try:
+                state = _PState(positions=dict(_running))
+                clipped = _clip(sym, tgt, state, _caps)
+                # clipped is a NormalizedTarget; if not fired or scaled to ~0, skip
+                if not clipped.fired or abs(clipped.portfolio_target_pct) < 1e-6:
+                    v["auto_approve_error"] = (
+                        f"portfolio_cap_silenced ({clipped.silence_reason or 'no_headroom'})"
+                    )
+                    v["_cap_silenced"] = True
+                    capped += 1
+                    continue
+                # Accept the (possibly down-scaled) target into running state.
+                _running[sym] = _running.get(sym, 0.0) + clipped.portfolio_target_pct
+                if abs(clipped.scale_factor - 1.0) > 1e-6:
+                    v["_cap_scaled_to"] = clipped.portfolio_target_pct
+            except Exception as exc:
+                v.setdefault("_cap_warn", f"clip failed (firing uncapped): {type(exc).__name__}: {exc}")
+
         try:
             res = json.loads(_qa({
                 "proposal_id": pid,
@@ -328,6 +468,8 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
     if actionables:
         actionables[0].setdefault("_autonomy_summary", {})["fired"] = fired
         actionables[0]["_autonomy_summary"]["total"] = len(actionables)
+        actionables[0]["_autonomy_summary"]["cap_silenced"] = capped
+        actionables[0]["_autonomy_summary"]["caps_enabled"] = caps_enabled
     return actionables
 
 
