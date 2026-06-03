@@ -212,7 +212,11 @@ def test_format_human_has_all_sections(tmp_path: Path) -> None:
         "hypotheses (research)",
         "recent run cards (research)",
         "factor verdicts (factors)",
-        "positions / cash (state.db)",
+        # Prefix-match: the header carries a cost-basis/MTM suffix since
+        # ADR-0086 Phase 1 relabeled equity_total ("positions / cash
+        # (state.db — cost-basis, not MTM)"). Match the stable prefix so the
+        # test doesn't break on the (correct) relabel.
+        "positions / cash (state.db",
     ):
         assert section in text, f"missing section: {section}"
     # Empty stores show the placeholder.
