@@ -60,8 +60,25 @@ def admissibility_reject_equity(
     approver_user_id: str | None = None,
     extra_metadata: dict[str, Any] | None = None,
     play_tag: str = "advisor",
+    bp_provider: Callable[[], float | None] | None = None,
 ) -> ExecutionRecord | None:
     """Pre-trade admissibility precondition for a SHORT equity leg (ADR-0077/0079).
+
+    Args:
+        bp_provider: live buying-power source (USD) for the oracle's Reg-T / Alpaca
+            BP hard check (step 8b). When provided (the PaperReactor seam passes
+            ``admissibility.oracle.live_buying_power`` — the SAME source the
+            autonomous-tick seam uses, autonomous.py), the reactor seam and the
+            autonomous seam plumb ``available_bp`` from one identical, fail-closed
+            oracle helper and CANNOT diverge (Workstream C / ADR-0077-0079 seam
+            parity). When None (the default — kept for callers that have not yet
+            wired a BP source, e.g. the multi-leg collar leg), ``available_bp``
+            stays None and the short fails-closed on the BP hard check
+            (MISSING_ACCOUNT_CONTEXT) — never an assumed pass. FAIL-CLOSED in both
+            cases: a provider that returns None on any failure / missing creds /
+            non-positive BP still fails-closed. Resolved lazily, ONLY inside the
+            flag-ON short-equity branch, so the flag-OFF / long / non-equity paths
+            stay IO-free (bit-for-bit pre-ADR-0077).
 
     Returns:
         None  => proceed (flag OFF, long/flat order, non-equity, or ADMITTED).
@@ -87,12 +104,27 @@ def admissibility_reject_equity(
     price = decision_price if decision_price > 0 else None
 
     # For the paper account, equity == NAV (`equity_total`), so plumb it as
-    # `account_equity` to clear the live oracle's < $2,000 floor (step 5). `available_bp`
-    # is left None (not tracked in the materialized paper state — needs a live broker
-    # fetch), so a short still fails-closed on the BP hard check (step 8b): documented
-    # gap, never a fabricated pass. Bit-for-bit no-op when the flag is OFF (short-circuited above).
+    # `account_equity` to clear the live oracle's < $2,000 floor (step 5).
+    #
+    # Workstream C (seam parity): `available_bp` is plumbed from `bp_provider` when the
+    # caller supplies one. The PaperReactor seam passes the SAME `live_buying_power()`
+    # oracle helper the autonomous-tick seam uses (autonomous.py:566), resolved lazily
+    # here inside the flag-ON short branch, so identical inputs produce identical
+    # verdicts at both seams. Previously the reactor seam left it None (a documented
+    # gap) while the autonomous seam had live bp plumbed since 72e3d8b — a real seam
+    # divergence. FAIL-CLOSED either way: a None provider (or one that returns None on
+    # any failure / missing creds / non-positive BP) leaves available_bp=None and the
+    # short fails-closed on the BP hard check — never a fabricated pass.
+    available_bp = bp_provider() if bp_provider is not None else None
     verdict = admit_or_reject(
-        symbol, "short", fill_size_pct, nav, price, asof_dt, account_equity=nav
+        symbol,
+        "short",
+        fill_size_pct,
+        nav,
+        price,
+        asof_dt,
+        account_equity=nav,
+        available_bp=available_bp,
     )
     if verdict.admitted:
         return None

@@ -308,7 +308,10 @@ class PaperReactor:
 
         Delegates to the shared ``admissibility_reject_equity`` seam so the
         multi-leg reactor's equity-leg precondition is BIT-IDENTICAL to this one
-        (plan §2.6). Behavior is unchanged from the inline version:
+        (plan §2.6). Workstream C: that shared seam now plumbs ``available_bp``
+        via the SAME ``live_buying_power()`` oracle helper the autonomous-tick
+        seam uses, so the reactor seam and the autonomous seam can no longer
+        diverge on the BP hard check (step 8b) for the same input. Behavior:
 
             None  => proceed with the fill (flag OFF, long order, non-equity, or ADMITTED).
                      With HERMES_QUANT_ADMISSIBILITY unset this ALWAYS returns None and never
@@ -320,6 +323,15 @@ class PaperReactor:
         adv = proposal.advisor_result or {}
         asof_str = adv.get("decision_wall_clock") or adv.get("as_of") or now
         bar_ts = adv.get("bar_ts") or adv.get("as_of")
+        # Workstream C (seam parity): resolve `available_bp` from the SAME fail-closed
+        # `live_buying_power()` oracle helper the autonomous-tick seam uses
+        # (autonomous.py:566). Passing it as `bp_provider` makes the PaperReactor seam
+        # and the autonomous seam plumb identical BP context, so the BP hard check
+        # (step 8b) produces identical verdicts at both seams — closing the divergence
+        # where the reactor seam previously left available_bp=None and fail-closed while
+        # the autonomous seam admitted the same short. Fail-closed: live_buying_power()
+        # returns None on any failure / missing creds / non-positive BP.
+        from hermes_quant.admissibility.oracle import live_buying_power
         return admissibility_reject_equity(
             symbol=proposal.symbol,
             asset_class=proposal.asset_class,
@@ -334,6 +346,7 @@ class PaperReactor:
             timeframe=proposal.timeframe,
             bar_ts=bar_ts,
             play_tag=play_tag,
+            bp_provider=live_buying_power,
         )
 
     def _portfolio_cap_reject(

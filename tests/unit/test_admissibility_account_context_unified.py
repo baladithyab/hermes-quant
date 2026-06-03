@@ -3,11 +3,13 @@
 Two linked ADR-0077/0079 fixes this suite pins:
 
   (1) Account-context plumbing. The shared `admissibility.gate_order.admit_or_reject`
-      seam now plumbs `account_equity` (= the paper NAV) into AdmissibilityContext, so an
+      seam plumbs `account_equity` (= the paper NAV) into AdmissibilityContext, so an
       ETB whole-share short with account context ADMITS instead of fail-closing with
-      MISSING_ACCOUNT_CONTEXT on the equity floor. `available_bp` stays a documented gap
-      (not tracked in the materialized paper state) — a short with equity-but-no-BP still
-      fails-closed on the BP hard check, never an assumed pass.
+      MISSING_ACCOUNT_CONTEXT on the equity floor. `available_bp` (Workstream C) is now
+      resolved at BOTH the autonomous and the PaperReactor seams from the SAME
+      fail-closed `live_buying_power()` oracle helper — so a short with equity-and-bp
+      ADMITS, while one with equity-but-no-bp still fails-closed on the BP hard check at
+      BOTH seams identically (never an assumed pass).
 
   (2) Unification. The autonomous-tick seam was refactored to call the SAME
       `admit_or_reject` the PaperReactor + HITL paths use. This suite asserts the
@@ -204,47 +206,82 @@ _WL = [WatchlistEntry(symbol="GME", asset_class="equity", timeframe="1d")]
 def test_autonomous_and_reactor_seams_produce_identical_verdict(
     autonomous_env, monkeypatch, tmp_path: Path
 ):
-    """Seam-divergence regression (updated 2026-06-02, deep-work-loop Phase-7).
+    """Seam-PARITY regression (Workstream C, restored 2026-06-03).
 
     HISTORY: this test originally asserted both the autonomous-tick seam and the
-    PaperReactor seam REJECT a GME short with MISSING_ACCOUNT_CONTEXT, because
-    neither plumbed `available_bp` ("the shared documented gap on both paths").
+    PaperReactor seam REJECT a GME short with MISSING_ACCOUNT_CONTEXT (neither
+    plumbed `available_bp`). It was then rewritten to PIN a DIVERGENCE: commit
+    72e3d8b plumbed live `available_bp` via `live_buying_power()` into the
+    AUTONOMOUS seam ONLY (autonomous.py:566), so with bp known the autonomous seam
+    FIREd while the PaperReactor seam (paper.py → admissibility_reject_equity) still
+    passed available_bp=None and REJECTed — a real seam divergence.
 
-    FINDING: commit 72e3d8b ("wire live broker buying-power into the short BP
-    check, H-adm #1") plumbed `available_bp` via oracle.live_buying_power() into
-    the AUTONOMOUS seam ONLY (autonomous.py:566). The PaperReactor seam
-    (paper.py::_account_nav_usd → admissibility_reject_equity) still passes
-    available_bp=None (gate_order.py:144 documents it as "NOT cheaply available
-    at the paper seam"). So the two seams NO LONGER produce an identical verdict:
-    with bp known, the autonomous seam admits/FIREs; the reactor seam still
-    REJECTs as MISSING_ACCOUNT_CONTEXT. This is a real seam-divergence (logged as
-    a found-bug for the ADR-0077/0079 owner) — the reactor seam needs the same
-    live-bp plumbing to restore parity. Until then this test pins the ACTUAL
-    divergent behavior so the divergence is visible, not silently green.
+    FIX (Workstream C): the shared reactor precondition
+    (`admissibility_reject_equity`) now resolves `available_bp` from the SAME
+    fail-closed `live_buying_power()` oracle helper the autonomous seam uses, so
+    identical inputs produce IDENTICAL verdicts at both seams. This test now
+    asserts PARITY: with live bp generous, BOTH seams ADMIT (autonomous FIREs,
+    the reactor writes a real fill). The two seams can no longer diverge on the
+    BP hard check.
     """
     monkeypatch.setenv("HERMES_QUANT_ADMISSIBILITY", "1")
     monkeypatch.setattr(gate_order, "select_oracle", lambda: _LiveLikeOracle())
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100_000.0)
     monkeypatch.setattr(paper_mod, "_account_nav_usd", lambda: 100_000.0)
-    # Autonomous seam fetches live bp; mock it deterministically (generous → BP check passes).
+    # BOTH seams now source available_bp from oracle.live_buying_power(); mock it
+    # deterministically (generous → the BP hard check passes at both seams).
     import hermes_quant.admissibility.oracle as _oracle_mod
     monkeypatch.setattr(_oracle_mod, "live_buying_power", lambda: 200_000.0)
 
-    # Autonomous seam: bp is now known → the ETB short is admissible → FIRE.
+    # Autonomous seam: bp is live-plumbed → the ETB short is admissible → FIRE.
     result = auto.tick(dry_run=True, symbols=_WL, advisor_recommend=_short_advisor())
     gme = [d for d in result.decisions if d.symbol == "GME"]
     assert len(gme) == 1
     assert gme[0].gate == "FIRE", (
-        "autonomous seam should FIRE now that available_bp is live-plumbed (72e3d8b)"
+        "autonomous seam should FIRE with available_bp live-plumbed (72e3d8b)"
     )
 
-    # Reactor seam: bp still NOT plumbed here (gate_order.py:144) → fails-closed
-    # as MISSING_ACCOUNT_CONTEXT. THIS IS THE DIVERGENCE (found-bug).
+    # Reactor seam: bp is now plumbed here too (Workstream C) via the SAME
+    # live_buying_power() helper → the SAME ETB short ADMITS → a real fill is
+    # written. PARITY with the autonomous seam: identical input, identical verdict.
+    reactor = PaperReactor(executions_path=tmp_path / "executions.jsonl")
+    rec = reactor.execute(_proposal(), fill_size_pct=-0.20)
+    assert rec.fill_size_pct == -0.20  # real fill, full size — ADMITTED, no longer a no-fill
+    assert "admissibility_rejected" not in (rec.reactor_metadata or {})
+    # the admitted fill IS written to the bus
+    written = [ln for ln in reactor.executions_path.read_text().splitlines() if ln.strip()]
+    assert len(written) == 1
+
+
+def test_autonomous_and_reactor_seams_both_reject_when_bp_missing(
+    autonomous_env, monkeypatch, tmp_path: Path
+):
+    """Workstream C parity, fail-closed direction: when `live_buying_power()` is
+    UNAVAILABLE (returns None — missing creds / failed fetch / non-positive BP),
+    BOTH seams fail-closed on the BP hard check (step 8b) with the IDENTICAL
+    MISSING_ACCOUNT_CONTEXT reason. Proves the restored parity holds on the
+    reject path too — neither seam fabricates a BP sufficiency."""
+    monkeypatch.setenv("HERMES_QUANT_ADMISSIBILITY", "1")
+    monkeypatch.setattr(gate_order, "select_oracle", lambda: _LiveLikeOracle())
+    monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100_000.0)
+    monkeypatch.setattr(paper_mod, "_account_nav_usd", lambda: 100_000.0)
+    # Live bp UNAVAILABLE at both seams (the documented fail-closed source).
+    import hermes_quant.admissibility.oracle as _oracle_mod
+    monkeypatch.setattr(_oracle_mod, "live_buying_power", lambda: None)
+
+    # Autonomous seam: equity clears the floor, but bp is None → fail-closed on BP.
+    result = auto.tick(dry_run=True, symbols=_WL, advisor_recommend=_short_advisor())
+    gme = [d for d in result.decisions if d.symbol == "GME"][0]
+    assert gme.gate == "SILENCE_ADMISSIBILITY"
+    assert gme.details["reason"] == "MISSING_ACCOUNT_CONTEXT"
+
+    # Reactor seam: SAME None bp → SAME fail-closed verdict. Identical reason = parity.
     reactor = PaperReactor(executions_path=tmp_path / "executions.jsonl")
     rec = reactor.execute(_proposal(), fill_size_pct=-0.20)
     assert rec.fill_size_pct == 0.0  # no-fill
     assert rec.reactor_metadata["admissibility_rejected"] is True
     assert rec.reactor_metadata["admissibility_reason"] == "MISSING_ACCOUNT_CONTEXT"
+    assert gme.details["reason"] == rec.reactor_metadata["admissibility_reason"]
     # nothing written to the bus
     assert [ln for ln in reactor.executions_path.read_text().splitlines() if ln.strip()] == []
 

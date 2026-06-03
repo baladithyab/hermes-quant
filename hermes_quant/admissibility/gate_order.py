@@ -107,11 +107,13 @@ def admit_or_reject(
             paper account this IS the NAV (`equity_total`); pass `account_equity=nav`.
         available_bp: account buying power (USD) for the live oracle's Reg-T / Alpaca
             BP hard check (step 8b). None => the live oracle fails-closed
-            (MISSING_ACCOUNT_CONTEXT). This is NOT cheaply available at the paper
-            seam (the materialized paper state tracks equity_total, not buying power;
-            a true value needs a live broker account fetch), so the autonomous /
-            paper callers leave it None and the short fails-closed on it — a
-            documented gap, never a fabricated sufficiency.
+            (MISSING_ACCOUNT_CONTEXT). A true value needs a live broker account fetch
+            (the materialized paper state tracks equity_total, not buying power);
+            BOTH the autonomous seam and the PaperReactor seam now resolve it from the
+            SAME fail-closed ``live_buying_power()`` oracle helper (Workstream C seam
+            parity), so identical inputs produce identical verdicts at both seams. When
+            that fetch fails / creds are missing / BP is non-positive the helper returns
+            None and the short fails-closed — never a fabricated sufficiency.
 
     Returns:
         AdmissibilityVerdict. `admitted=True` with `adjusted_target_pct == target_pct`
@@ -139,11 +141,13 @@ def admit_or_reject(
     oracle = select_oracle()
     # ctx carries what IS available at this seam: the decision price as the quote, plus
     # whatever account context the caller could resolve. `account_equity` (= the paper
-    # NAV, `equity_total`) is now plumbed so an ETB whole-share short can clear the
+    # NAV, `equity_total`) is plumbed so an ETB whole-share short can clear the
     # equity floor (step 5) instead of fail-closing on MISSING_ACCOUNT_CONTEXT.
-    # `available_bp` is NOT cheaply available at the paper seam (the materialized state
-    # tracks equity, not buying power), so callers leave it None; the live oracle then
-    # fails-closed on the BP hard check (step 8b) — a documented gap, not assume-safe.
+    # `available_bp` (Workstream C) is now resolved by BOTH the autonomous and the
+    # PaperReactor callers from the SAME fail-closed `live_buying_power()` oracle helper
+    # and passed in here, so the BP hard check (step 8b) produces identical verdicts at
+    # both seams. When that fetch is unavailable the caller passes None and the live
+    # oracle fails-closed on BP — never an assume-safe pass.
     ctx = AdmissibilityContext(
         current_ask=price if (price is not None and price > 0) else None,
         account_equity=account_equity,
