@@ -1034,10 +1034,10 @@ def recommend(
     # ctx.extras['ground_truth_block']) whose numeric claims fail citation
     # verification is DROPPED from the vote — fail-CLOSED toward NOT trading on
     # ungrounded/hallucinated numerics. ADDITIVE: when no block is present (the
-    # default advisor path) or the kill-switch HERMES_QUANT_GROUNDING_ENFORCE=0,
-    # this is identity passthrough and byte-identical to today. The dropped views
-    # remain visible in result.analyst_views (marked grounding_dropped) so the
-    # audit trail still records WHY a view didn't reach the aggregator.
+    # default advisor path), or enforcement is unset/off, this is identity
+    # passthrough and byte-identical to today. The dropped views remain visible
+    # in result.analyst_views (marked grounding_dropped) so the audit trail still
+    # records WHY a view didn't reach the aggregator.
     from hermes_quant.grounding.enforcement import enforce_grounding
 
     _views_before = views

@@ -19,7 +19,8 @@ Invariants asserted here:
     if its rationale contains decimals (those are internal scores, not claims).
   - No GroundTruthBlock in ctx.extras → identity passthrough (today's default
     advisor path → byte-identical).
-  - Kill-switch HERMES_QUANT_GROUNDING_ENFORCE=0 → identity passthrough.
+  - Unset or HERMES_QUANT_GROUNDING_ENFORCE=0 → identity passthrough.
+  - HERMES_QUANT_GROUNDING_ENFORCE=1 → enforcement active.
   - A view whose grounding ERRORED (with_grounding=False marker) is still verified
     (fail-closed — it wanted grounding, so it does not get a free pass).
 """
@@ -124,12 +125,17 @@ def _plain_view(rationale: str, *, analyst: str = "classical_ta") -> AnalystView
     )
 
 
+@pytest.fixture
+def grounding_enforced(monkeypatch):
+    monkeypatch.setenv("HERMES_QUANT_GROUNDING_ENFORCE", "1")
+
+
 # ---------------------------------------------------------------------------
 # Drop / keep behavior
 # ---------------------------------------------------------------------------
 
 
-def test_drops_grounded_view_with_uncited_claim():
+def test_drops_grounded_view_with_uncited_claim(grounding_enforced):
     """A grounded view citing a fabricated price (999.99 ∉ block) is dropped."""
     block = _make_block("AAPL")
     view = _grounded_view("Target price is 999.99 with strong upside.")
@@ -139,7 +145,7 @@ def test_drops_grounded_view_with_uncited_claim():
     assert dropped[0]["analyst"] == "hermes_semantic"
 
 
-def test_keeps_grounded_view_with_all_cited_claims():
+def test_keeps_grounded_view_with_all_cited_claims(grounding_enforced):
     """A grounded view whose only number is a real GT close is kept, unchanged."""
     block = _make_block("AAPL")
     real_close = block.ohlcv_60d[-1].close  # 174.50
@@ -150,7 +156,7 @@ def test_keeps_grounded_view_with_all_cited_claims():
     assert kept[0] is view, "kept view must be the SAME object (no copy)"
 
 
-def test_keeps_grounded_view_with_no_numeric_claims():
+def test_keeps_grounded_view_with_no_numeric_claims(grounding_enforced):
     """A grounded view with zero numbers has nothing to verify → kept."""
     block = _make_block("AAPL")
     view = _grounded_view("The thesis is bullish on improving sentiment.")
@@ -159,7 +165,7 @@ def test_keeps_grounded_view_with_no_numeric_claims():
     assert dropped == []
 
 
-def test_keeps_non_grounded_view_even_with_decimals():
+def test_keeps_non_grounded_view_even_with_decimals(grounding_enforced):
     """A deterministic-analyst view (no grounding marker) is never verified.
 
     Its rationale decimals (e.g. rsi=0.75) are internal sub-scores, not sourced
@@ -191,9 +197,19 @@ def test_killswitch_off_is_passthrough(monkeypatch):
     assert dropped == []
 
 
-def test_default_is_enforce_on(monkeypatch):
-    """With the flag ABSENT, enforcement is ON by default (default-ON, fail-closed)."""
+def test_unset_env_is_passthrough(monkeypatch):
+    """With the flag absent, enforcement is OFF for byte-identical rollout."""
     monkeypatch.delenv("HERMES_QUANT_GROUNDING_ENFORCE", raising=False)
+    block = _make_block("AAPL")
+    view = _grounded_view("Target price is 999.99.")
+    kept, dropped = enforce_grounding([view], _ctx(block=block))
+    assert kept == [view]
+    assert dropped == []
+
+
+def test_env_one_enforces(monkeypatch):
+    """HERMES_QUANT_GROUNDING_ENFORCE=1 keeps the fail-closed behavior available."""
+    monkeypatch.setenv("HERMES_QUANT_GROUNDING_ENFORCE", "1")
     block = _make_block("AAPL")
     view = _grounded_view("Target price is 999.99.")
     kept, dropped = enforce_grounding([view], _ctx(block=block))
@@ -201,7 +217,7 @@ def test_default_is_enforce_on(monkeypatch):
     assert len(dropped) == 1
 
 
-def test_grounding_error_view_is_still_verified():
+def test_grounding_error_view_is_still_verified(grounding_enforced):
     """A view whose grounding ERRORED still declares participation → verified.
 
     Fail-closed: a semantic view that wanted grounding but hit an error must not
@@ -214,7 +230,7 @@ def test_grounding_error_view_is_still_verified():
     assert len(dropped) == 1
 
 
-def test_dropped_record_carries_audit_fields():
+def test_dropped_record_carries_audit_fields(grounding_enforced):
     """Dropped records preserve WHY (coverage + uncited claims) for the audit trail."""
     block = _make_block("AAPL")
     view = _grounded_view("Targets 999.99 and 1050.00, resistance 1100.00.")
@@ -227,7 +243,7 @@ def test_dropped_record_carries_audit_fields():
     assert rec["reason"]
 
 
-def test_mixed_batch_drops_only_failing_grounded_view():
+def test_mixed_batch_drops_only_failing_grounded_view(grounding_enforced):
     """A mixed batch keeps the good views and drops only the failing grounded one."""
     block = _make_block("AAPL")
     good_grounded = _grounded_view(
@@ -242,7 +258,7 @@ def test_mixed_batch_drops_only_failing_grounded_view():
     assert {r["analyst"] for r in dropped} == {"hermes_semantic_2"}
 
 
-def test_strict_threshold_drops_partial_citation():
+def test_strict_threshold_drops_partial_citation(grounding_enforced):
     """Strict (default 1.0): one real + one fabricated number → still dropped."""
     block = _make_block("AAPL")
     real = block.ohlcv_60d[-1].close

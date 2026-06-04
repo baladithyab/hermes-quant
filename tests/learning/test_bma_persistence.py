@@ -12,6 +12,8 @@ no save, no new file). Pure-Python, offline, deterministic.
 
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 
@@ -112,6 +114,36 @@ def test_flag_on_cold_start_when_no_file(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_QUANT_L2_POSTERIOR_PERSIST", "1")
     a = BMAAggregator(posterior_store_path=tmp_path / "absent.json")
     assert a._stats == {}
+
+
+def test_corrupt_persisted_row_cold_starts_analyst(tmp_path, monkeypatch):
+    """A corrupt persisted analyst row is skipped, then recreated from the prior."""
+    path = tmp_path / "p.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_kind": "l2_learning_posteriors",
+                "asof": "2026-06-01T00:00:00+00:00",
+                "posteriors": {
+                    "a": {
+                        "alpha": -1.0,
+                        "beta": 5.0,
+                        "n_observations": 10,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_QUANT_L2_POSTERIOR_PERSIST", "1")
+
+    a = BMAAggregator(posterior_store_path=path)
+    assert a._stats == {}
+    assert a._weight_for("a") == pytest.approx(0.5)
+    assert a._stats["a"].alpha == pytest.approx(a.prior_alpha)
+    assert a._stats["a"].beta == pytest.approx(a.prior_beta)
+    assert a._stats["a"].n_observations == 0
 
 
 def test_persisted_posterior_feeds_weight(tmp_path, monkeypatch):

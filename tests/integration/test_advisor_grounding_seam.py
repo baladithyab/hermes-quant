@@ -157,8 +157,9 @@ _ASOF = "2026-06-01"
 # --- Tests -------------------------------------------------------------------
 
 
-def test_ungrounded_grounded_view_dropped_from_vote():
+def test_ungrounded_grounded_view_dropped_from_vote(monkeypatch):
     """A grounded analyst with a fabricated number does not reach the aggregate."""
+    monkeypatch.setenv("HERMES_QUANT_GROUNDING_ENFORCE", "1")
     provider = _StubProvider(_daily_df())
     bad = _GroundedAnalyst("hermes_semantic", "Moonshot target 9999.00 imminent.", direction=1)
     plain = _PlainAnalyst("classical_ta", direction=-1)
@@ -177,7 +178,7 @@ def test_ungrounded_grounded_view_dropped_from_vote():
     assert any("grounding" in c.lower() for c in out["caveats"]), out["caveats"]
 
 
-def test_audit_annotation_matches_the_actually_dropped_view():
+def test_audit_annotation_matches_the_actually_dropped_view(monkeypatch):
     """Annotation must mark the DROPPED view, not a same-named kept view.
 
     Code review (Issue 1): when two views share an analyst name and only the
@@ -185,6 +186,7 @@ def test_audit_annotation_matches_the_actually_dropped_view():
     (kept) view as grounding_dropped and left the dropped one unannotated.
     Identity-based matching must annotate exactly the dropped entry.
     """
+    monkeypatch.setenv("HERMES_QUANT_GROUNDING_ENFORCE", "1")
     block = _block()
     real_close = block.ohlcv_60d[-1].close
     good = _GroundedAnalyst("hermes_semantic", f"Close confirmed at {real_close:.4f}.", direction=1)
@@ -278,13 +280,14 @@ def test_fully_grounded_view_byte_identical_to_no_verifier():
     assert on["aggregated_signal"]["n_components"] == 2
 
 
-def test_multi_horizon_drops_ungrounded_view():
+def test_multi_horizon_drops_ungrounded_view(monkeypatch):
     """recommend_multi_horizon must ALSO enforce grounding (second entry point).
 
     Adversarial review (A-sneak-ungrounded): recommend_multi_horizon returned
     views straight to the caller's aggregator without the Step-5.5 seam, so a
     grounded view with a fabricated number bypassed enforcement entirely.
     """
+    monkeypatch.setenv("HERMES_QUANT_GROUNDING_ENFORCE", "1")
     from hermes_quant.advisor import recommend_multi_horizon
 
     provider = _StubProvider(_daily_df())

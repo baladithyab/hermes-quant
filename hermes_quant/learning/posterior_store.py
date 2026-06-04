@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -41,6 +43,11 @@ logger = logging.getLogger(__name__)
 POSTERIOR_DIR = QUANT_HOME / "l2_learning_posteriors"
 
 SCHEMA_VERSION = 1
+
+# Corrupt state should cold-start, not dominate BMA weights. These bounds are
+# far above any realistic offline training horizon but reject poisoned artifacts.
+_MAX_BETA_PARAM = 10_000_000.0
+_MAX_N_OBSERVATIONS = 10_000_000
 
 
 @dataclass(frozen=True)
@@ -157,26 +164,91 @@ def load_posteriors(
     out: dict[str, PersistedPosterior] = {}
     for name, rec in raw.items():
         try:
-            last = rec.get("last_observable_asof")
-            samples_raw = rec.get("decay_samples") or []
-            decay_samples = tuple(
-                (pd.Timestamp(ts), bool(correct)) for ts, correct in samples_raw
-            )
-            out[name] = PersistedPosterior(
-                alpha=float(rec["alpha"]),
-                beta=float(rec["beta"]),
-                n_observations=int(rec.get("n_observations", 0)),
-                last_observable_asof=(pd.Timestamp(last) if last is not None else None),
-                decay_samples=decay_samples,
-            )
-        except (KeyError, ValueError, TypeError):
+            parsed = _parse_posterior_row(rec)
+        except (KeyError, ValueError, TypeError) as exc:
             logger.warning(
-                "posterior_store: skipping malformed posterior row for %r in %s",
+                "posterior_store: skipping corrupt posterior row for %r in %s (%s)",
                 name,
                 target,
+                exc,
             )
             continue
+        out[name] = parsed
     return out
+
+
+def _parse_posterior_row(rec: Any) -> PersistedPosterior:
+    if not isinstance(rec, dict):
+        raise TypeError("row is not an object")
+
+    alpha = _coerce_beta_param("alpha", rec["alpha"])
+    beta = _coerce_beta_param("beta", rec["beta"])
+    n_observations = _coerce_observation_count(rec.get("n_observations", 0))
+    last = _coerce_optional_timestamp("last_observable_asof", rec.get("last_observable_asof"))
+    decay_samples = _coerce_decay_samples(rec.get("decay_samples") or [])
+    return PersistedPosterior(
+        alpha=alpha,
+        beta=beta,
+        n_observations=n_observations,
+        last_observable_asof=last,
+        decay_samples=decay_samples,
+    )
+
+
+def _coerce_beta_param(field: str, raw: Any) -> float:
+    if isinstance(raw, bool):
+        raise ValueError(f"{field} must be numeric")
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0.0 or value > _MAX_BETA_PARAM:
+        raise ValueError(f"{field} out of bounds")
+    return value
+
+
+def _coerce_observation_count(raw: Any) -> int:
+    if isinstance(raw, bool):
+        raise ValueError("n_observations must be an integer")
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, float):
+        if not math.isfinite(raw) or not raw.is_integer():
+            raise ValueError("n_observations must be a finite integer")
+        value = int(raw)
+    elif isinstance(raw, str):
+        as_float = float(raw)
+        if not math.isfinite(as_float) or not as_float.is_integer():
+            raise ValueError("n_observations must be a finite integer")
+        value = int(as_float)
+    else:
+        raise ValueError("n_observations must be an integer")
+    if value < 0 or value > _MAX_N_OBSERVATIONS:
+        raise ValueError("n_observations out of bounds")
+    return value
+
+
+def _coerce_optional_timestamp(field: str, raw: Any) -> pd.Timestamp | None:
+    if raw is None:
+        return None
+    ts = pd.Timestamp(raw)
+    if pd.isna(ts):
+        raise ValueError(f"{field} is not finite")
+    return ts
+
+
+def _coerce_decay_samples(raw: Any) -> tuple[tuple[pd.Timestamp, bool], ...]:
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("decay_samples must be a list")
+    samples: list[tuple[pd.Timestamp, bool]] = []
+    for sample in raw:
+        if not isinstance(sample, (list, tuple)) or len(sample) != 2:
+            raise ValueError("decay sample must be [timestamp, correct]")
+        ts_raw, correct = sample
+        if not isinstance(correct, bool):
+            raise ValueError("decay sample correctness must be boolean")
+        ts = _coerce_optional_timestamp("decay sample timestamp", ts_raw)
+        if ts is None:
+            raise ValueError("decay sample timestamp is missing")
+        samples.append((ts, correct))
+    return tuple(samples)
 
 
 def _as_utc(ts: pd.Timestamp) -> pd.Timestamp:

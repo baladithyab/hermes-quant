@@ -81,6 +81,10 @@ ACTION_ONBOARD = "onboard"
 ACTION_EVICT = "evict"
 ACTION_SCORE_UPDATE = "score_update"
 
+# Default-OFF migration flag. Flipping this on is the explicit one-time step
+# that trims already-over-cap persisted watchlists down to max_per_play.
+_CAP_TRIM_FLAG = "HERMES_QUANT_WATCHLIST_CAP_TRIM"
+
 
 # -----------------------------------------------------------------------------
 # Schema
@@ -157,6 +161,10 @@ def stub_scorer(score: float = 0.5) -> PlayScorer:
         return score
 
     return _scorer
+
+
+def _watchlist_cap_trim_enabled() -> bool:
+    return os.environ.get(_CAP_TRIM_FLAG, "0") == "1"
 
 
 # -----------------------------------------------------------------------------
@@ -453,20 +461,22 @@ def _evolve_one_play(
         if existing_symbol not in seen_symbols:
             new_rows.append(existing_row)
 
-    # ---- Cap-trim (seed d641): enforce max_per_play as a HARD CEILING -------
+    # ---- Cap-trim (seed d641): optional over-cap migration -------
     # The onboard gate above only PREVENTS new onboards once active==cap; it
     # never trims an already-over-cap active set (from a lowered cap or over-cap
-    # loaded state). Run the post-scoring trim AFTER onboard/evict so the cap is
-    # a deterministic ceiling on active rows. Catalyst-protected rows are held
-    # (never trimmed out of turn). Empty events -> bit-identical to pre-d641.
-    new_rows, trim_events = _enforce_cap_trim(
-        new_rows,
-        play=play,
-        asof=asof,
-        max_per_play=max_per_play,
-        position_lookup=position_lookup,
-    )
-    events.extend(trim_events)
+    # loaded state). HERMES_QUANT_WATCHLIST_CAP_TRIM=1 is the explicit migration
+    # step: run the post-scoring trim AFTER onboard/evict so the cap becomes a
+    # deterministic ceiling on active rows. Unset keeps persisted over-cap state
+    # byte-identical to pre-d641.
+    if _watchlist_cap_trim_enabled():
+        new_rows, trim_events = _enforce_cap_trim(
+            new_rows,
+            play=play,
+            asof=asof,
+            max_per_play=max_per_play,
+            position_lookup=position_lookup,
+        )
+        events.extend(trim_events)
 
     # Rank: active first (by score desc), then candidates (by score desc),
     # then evicted (by score desc — debug aid, the rank doesn't matter
