@@ -1007,9 +1007,47 @@ def recommend(
         views.append(view)
         result.analyst_views.append(_view_to_dict(view))
 
+    # ---- Step 5.5: grounding enforcement (seed 24ba) ----
+    # Wire ClaimVerifier into the decision path at the views -> aggregator seam.
+    # A grounded analyst view (one that opted into the GroundTruthBlock via
+    # ctx.extras['ground_truth_block']) whose numeric claims fail citation
+    # verification is DROPPED from the vote — fail-CLOSED toward NOT trading on
+    # ungrounded/hallucinated numerics. ADDITIVE: when no block is present (the
+    # default advisor path) or the kill-switch HERMES_QUANT_GROUNDING_ENFORCE=0,
+    # this is identity passthrough and byte-identical to today. The dropped views
+    # remain visible in result.analyst_views (marked grounding_dropped) so the
+    # audit trail still records WHY a view didn't reach the aggregator.
+    from hermes_quant.grounding.enforcement import enforce_grounding
+
+    views, _grounding_dropped = enforce_grounding(views, ctx)
+    if _grounding_dropped:
+        # Annotate the matching analyst_views entries (appended in lockstep with
+        # the emitted views) so the audit trail records the dropped contribution
+        # and WHY. Match by analyst name, consuming records in emit order to keep
+        # multiple views from the same analyst aligned.
+        _dropped_by_analyst: dict[str, list[dict[str, Any]]] = {}
+        for _rec in _grounding_dropped:
+            _dropped_by_analyst.setdefault(_rec["analyst"], []).append(_rec)
+        for _vd in result.analyst_views:
+            _recs = _dropped_by_analyst.get(_vd["analyst"])
+            if _recs:
+                _rec = _recs.pop(0)
+                _vd["grounding_dropped"] = True
+                _vd["grounding_reason"] = _rec.get("reason")
+                _vd["grounding_uncited_claims"] = _rec.get("uncited_claims")
+        _dropped_names = ", ".join(sorted({r["analyst"] for r in _grounding_dropped}))
+        result.caveats.append(
+            f"Grounding enforcement dropped {len(_grounding_dropped)} ungrounded "
+            f"analyst view(s) from the vote: {_dropped_names}"
+        )
+
     if not views:
         # Either every analyst declined to emit (cold-start, insufficient
-        # bars) or every analyst raised. Either way, no signal to gate.
+        # bars), every analyst raised, or every emitted view was dropped by
+        # grounding enforcement (all numerics ungrounded). Either way, no
+        # signal to gate — fail-closed.
+        if _grounding_dropped:
+            return _gated_no_data(result, "all_views_dropped_ungrounded")
         return _gated_no_data(
             result,
             "no_analyst_views" if not result.analyst_errors else "all_analysts_errored",
