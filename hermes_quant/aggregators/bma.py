@@ -164,6 +164,92 @@ STACKING_CORR_WINDOW = 200
 # 2-sample correlation.
 STACKING_CORR_MIN_PAIRS = 10
 
+# c96e: recency-decay sample ring. Bounded per-analyst log of
+# (observable_asof_iso, correct) used by the recency-weighted refit when
+# HERMES_QUANT_L2_POSTERIOR_DECAY=1. Bounded so memory is O(n_analysts × window)
+# and so ancient samples (whose decay weight is ~0 anyway) are dropped.
+DECAY_SAMPLE_WINDOW = 500
+
+# Default recency half-life (days) for the decayed refit: a settled sample
+# observable one half-life before the decision contributes half the weight of a
+# brand-new one. Chosen to track skill over a quarter-ish horizon without
+# discarding the recent past.
+DEFAULT_DECAY_HALF_LIFE_DAYS = 30.0
+
+# Approximate horizon → timedelta mapping, used ONLY to stamp the *observable*
+# time of a settled sample (decision asof + horizon) so the recency refit's
+# no-lookahead filter is honest. Calendar months/quarters use fixed day counts;
+# exact calendar arithmetic is unnecessary for a recency weight.
+_HORIZON_TO_TIMEDELTA: dict[str, pd.Timedelta] = {
+    "5m": pd.Timedelta(minutes=5),
+    "15m": pd.Timedelta(minutes=15),
+    "1h": pd.Timedelta(hours=1),
+    "4h": pd.Timedelta(hours=4),
+    "1d": pd.Timedelta(days=1),
+    "1w": pd.Timedelta(weeks=1),
+    "1M": pd.Timedelta(days=30),
+    "1Q": pd.Timedelta(days=90),
+}
+
+
+def _horizon_delta(horizon: str) -> pd.Timedelta:
+    """Map a horizon label to the delay until its outcome is observable.
+
+    Unknown horizons fall back to 1 day — a positive delay, so an unrecognized
+    horizon can never make a sample observable *before* its decision (which
+    would be a lookahead).
+    """
+    return _HORIZON_TO_TIMEDELTA.get(horizon, pd.Timedelta(days=1))
+
+
+def _decay_enabled() -> bool:
+    """True iff HERMES_QUANT_L2_POSTERIOR_DECAY=1 (read at CALL TIME).
+
+    c96e recency refit (DEFAULT-OFF, separate from persistence). When unset, the
+    per-analyst weight is the plain Beta posterior accuracy (byte-identical to
+    pre-c96e). When set, the weight is a recency-weighted, asof-honest refit over
+    the per-analyst sample ring: older samples decay, and samples whose outcome
+    was not yet observable at the decision asof are excluded.
+    """
+    return os.environ.get("HERMES_QUANT_L2_POSTERIOR_DECAY", "0") == "1"
+
+
+def _per_analyst_calib_enabled() -> bool:
+    """True iff HERMES_QUANT_L2_PER_ANALYST_CALIB=1 (read at CALL TIME).
+
+    f254 (DEFAULT-OFF). When unset, each view's confidence flows through the
+    single global aggregator calibrator exactly as before (byte-identical). When
+    set, each view's confidence_raw is recalibrated through a calibrator KEYED BY
+    the analyst's own learned Beta posterior (so a skilled analyst's confidence
+    is not dragged toward the population average by the merged global fit), and
+    the global calibrator is bypassed for that view's contribution. An analyst
+    with no track record maps to the neutral prior mean — a safe, non-zero
+    fallback.
+    """
+    return os.environ.get("HERMES_QUANT_L2_PER_ANALYST_CALIB", "0") == "1"
+
+
+def _lesson_haircut_enabled() -> bool:
+    """True iff HERMES_QUANT_L2_LESSON_HAIRCUT=1 (read at CALL TIME).
+
+    57f6 (DEFAULT-OFF). When unset (or no provider is injected), the aggregate
+    confidence is untouched — byte-identical to today, and the lesson provider is
+    never even consulted. When set AND a provider is injected, a recent
+    same-symbol same-direction LOSS lesson applies a bounded, asof-honest
+    confidence haircut on the DEFAULT (non-LLM) decision path. This closes the
+    reflection->decision loop deterministically.
+    """
+    return os.environ.get("HERMES_QUANT_L2_LESSON_HAIRCUT", "0") == "1"
+
+
+# 57f6 haircut tuning. Each distinct matching loss shaves LESSON_HAIRCUT_PER
+# off confidence multiplicatively; the compounded cut is clamped so confidence
+# can never fall below LESSON_HAIRCUT_FLOOR of its pre-haircut value. The loop
+# may DAMPEN conviction on a symbol/direction that recently lost, never silence
+# it — silence remains the deterministic gate's job, not the aggregator's.
+LESSON_HAIRCUT_PER = 0.15
+LESSON_HAIRCUT_FLOOR = 0.5
+
 
 def _stacking_enabled() -> bool:
     """True iff HERMES_QUANT_STACKING=1 (read at CALL TIME, not import time).
@@ -172,6 +258,18 @@ def _stacking_enabled() -> bool:
     aggregator byte-identical to the pre-B50 BMA path.
     """
     return os.environ.get("HERMES_QUANT_STACKING", "0") == "1"
+
+
+def _posterior_persist_enabled() -> bool:
+    """True iff HERMES_QUANT_L2_POSTERIOR_PERSIST=1 (read at CALL TIME).
+
+    c96e (DEFAULT-OFF): when unset/!="1", the aggregator neither loads persisted
+    per-analyst Beta posteriors at construction nor saves them in update(), so
+    the path is byte-identical to the pre-c96e BMA. When set, learned per-analyst
+    skill survives across recommend() lifecycles and process restarts instead of
+    resetting to the prior on every fresh BMAAggregator().
+    """
+    return os.environ.get("HERMES_QUANT_L2_POSTERIOR_PERSIST", "0") == "1"
 
 
 @dataclass
@@ -192,6 +290,19 @@ class _AnalystStats:
     n_observations: int = 0
     history: deque[tuple[int, bool]] = field(
         default_factory=lambda: deque(maxlen=STACKING_CORR_WINDOW)
+    )
+    # c96e: observability timestamp of the most recent settled sample folded
+    # into this posterior. Stamped in update() from the episode asof. Persisted
+    # alongside (alpha, beta) so a recency-decay refit can reason about
+    # staleness without replaying the full sample history. None until the first
+    # settlement.
+    last_observable_asof: pd.Timestamp | None = None
+    # c96e: bounded per-analyst sample ring of (observable_asof, correct) for the
+    # recency-weighted refit. ALWAYS accumulated (cheap, additive) but consulted
+    # ONLY when HERMES_QUANT_L2_POSTERIOR_DECAY=1, so the OFF path is unaffected
+    # by its presence — exactly the B50 ``history`` discipline.
+    decay_samples: deque[tuple[pd.Timestamp, bool]] = field(
+        default_factory=lambda: deque(maxlen=DECAY_SAMPLE_WINDOW)
     )
 
     @property
@@ -229,6 +340,9 @@ class BMAAggregator:
         config: BMAConfig | None = None,
         ic_dedup_gate=None,
         regime_detector=None,
+        posterior_store_path: Path | None = None,
+        posterior_recipe_key: str | None = None,
+        loss_lesson_provider=None,
     ):
         self.prior_alpha = prior_alpha
         self.prior_beta = prior_beta
@@ -253,6 +367,25 @@ class BMAAggregator:
         self.horizon_weights = dict(self.config.horizon_weights)
 
         self._stats: dict[str, _AnalystStats] = {}
+
+        # c96e: durable per-analyst Beta posteriors (DEFAULT-OFF). When the
+        # HERMES_QUANT_L2_POSTERIOR_PERSIST flag is set, load any persisted
+        # posteriors so learned skill survives across recommend() lifecycles
+        # instead of resetting to the prior on every fresh aggregator. When the
+        # flag is off, this is a no-op and self._stats stays empty (the
+        # pre-c96e behavior). A missing/corrupt artifact degrades to cold-start.
+        self.posterior_store_path = posterior_store_path
+        self.posterior_recipe_key = posterior_recipe_key
+        if _posterior_persist_enabled():
+            self._load_persisted_posteriors()
+
+        # 57f6: optional loss-lesson provider (DEFAULT None). When None, the
+        # lesson-haircut path is a pure no-op regardless of the flag. When set
+        # AND HERMES_QUANT_L2_LESSON_HAIRCUT=1, recent same-symbol same-direction
+        # losses apply a bounded, asof-honest confidence haircut. Decoupled by
+        # design: BMA only calls provider.recent_loss_lessons(ticker, asof); the
+        # reflections/decisions JSONL join lives in the provider, not here.
+        self.loss_lesson_provider = loss_lesson_provider
 
         # Calibrator: prefer a fitted IsotonicCalibrator persisted on disk;
         # fall back to ColdStartCalibrator on missing-file or any unpickle
@@ -348,13 +481,225 @@ class BMAAggregator:
             )
         return self._stats[analyst_name]
 
-    def _weight_for(self, analyst_name: str) -> float:
-        """Posterior accuracy if calibrated, else uniform proxy."""
+    def _load_persisted_posteriors(self) -> None:
+        """c96e: hydrate self._stats from the persisted snapshot (fail-safe).
+
+        Restores the Beta posterior fields (alpha, beta, n_observations,
+        last_observable_asof) AND the c96e ``decay_samples`` recency ring — the
+        latter is required so a reloaded aggregator with the decay flag on
+        reproduces the same weight instead of refitting from an empty ring and
+        collapsing a skilled analyst to the prior mean (see fix in
+        _save_persisted_posteriors / commit history). The B50 co-observation
+        ``history`` ring is the ONE thing deliberately NOT persisted — it is a
+        bounded recent-correlation buffer consulted only when
+        HERMES_QUANT_STACKING=1 and rebuilds itself from subsequent settlements.
+        A missing/corrupt artifact yields no stats (cold-start), never an
+        exception.
+        """
+        from hermes_quant.learning.posterior_store import load_posteriors
+
+        try:
+            persisted = load_posteriors(
+                path=self.posterior_store_path,
+                recipe_key=self.posterior_recipe_key,
+            )
+        except Exception as exc:  # noqa: BLE001 — bad cache must not crash init
+            logger.warning("BMA: posterior load failed (%s); cold-start", exc)
+            return
+        for name, p in persisted.items():
+            stats = _AnalystStats(
+                name=name,
+                alpha=p.alpha,
+                beta=p.beta,
+                n_observations=p.n_observations,
+                last_observable_asof=p.last_observable_asof,
+            )
+            # Restore the recency-refit ring so a reloaded aggregator with the
+            # decay flag on reproduces the same weight instead of collapsing to
+            # the prior mean. The deque re-imposes its maxlen bound on load.
+            stats.decay_samples.extend(p.decay_samples)
+            self._stats[name] = stats
+
+    def _save_persisted_posteriors(self, asof: pd.Timestamp) -> None:
+        """c96e: atomically persist the current posteriors (fail-safe).
+
+        Called from update() only when the persist flag is on. A write failure
+        is logged but never propagates — a bad disk must not abort settlement.
+        """
+        from hermes_quant.learning.posterior_store import (
+            PersistedPosterior,
+            save_posteriors,
+        )
+
+        snapshot = {
+            name: PersistedPosterior(
+                alpha=s.alpha,
+                beta=s.beta,
+                n_observations=s.n_observations,
+                last_observable_asof=s.last_observable_asof,
+                decay_samples=tuple(s.decay_samples),
+            )
+            for name, s in self._stats.items()
+        }
+        try:
+            save_posteriors(
+                snapshot,
+                path=self.posterior_store_path,
+                asof=asof,
+                recipe_key=self.posterior_recipe_key,
+            )
+        except Exception as exc:  # noqa: BLE001 — persistence must not abort settlement
+            logger.warning("BMA: posterior save failed (%s); continuing", exc)
+
+    def _weight_for(
+        self, analyst_name: str, decision_asof: pd.Timestamp | None = None
+    ) -> float:
+        """Posterior accuracy if calibrated, else uniform proxy.
+
+        c96e recency refit (DEFAULT-OFF): when HERMES_QUANT_L2_POSTERIOR_DECAY=1
+        and a ``decision_asof`` is available, the posterior is recomputed from
+        the per-analyst sample ring with (a) a HARD no-lookahead filter — only
+        samples whose outcome was observable strictly before ``decision_asof``
+        count — and (b) an exponential recency decay so stale skill fades toward
+        the prior. When the flag is off the weight is the plain posterior
+        accuracy, byte-identical to the pre-c96e path.
+        """
         stats = self._get_or_create_stats(analyst_name)
+        if _decay_enabled() and decision_asof is not None:
+            return self._decayed_weight(stats, decision_asof)
         if stats.n_observations < self.n_min_observations:
             # Uniform proxy: use 0.5 (no information)
             return 0.5
         return stats.posterior_accuracy
+
+    def _decayed_weight(
+        self, stats: _AnalystStats, decision_asof: pd.Timestamp
+    ) -> float:
+        """Recency-weighted, asof-honest posterior accuracy from the sample ring.
+
+        Delegates to the standalone, unit-tested refit so the no-lookahead and
+        decay semantics live in exactly one place. The refit reduces to the
+        prior mean when no admissible samples exist (cold-start safe).
+        """
+        from hermes_quant.learning.posterior_refit import SkillSample, refit_beta
+
+        samples = [
+            SkillSample(observable_asof=ts, correct=correct)
+            for ts, correct in stats.decay_samples
+        ]
+        alpha, beta = refit_beta(
+            samples=samples,
+            decision_asof=decision_asof,
+            prior_alpha=self.prior_alpha,
+            prior_beta=self.prior_beta,
+            half_life_days=DEFAULT_DECAY_HALF_LIFE_DAYS,
+        )
+        return alpha / (alpha + beta)
+
+    def _per_analyst_calibrated_confidence(
+        self, analyst_name: str, confidence_raw: float, decision_asof: pd.Timestamp | None
+    ) -> float:
+        """f254: calibrate a raw confidence through the analyst's OWN posterior.
+
+        Uses the analyst's learned Beta(alpha, beta) directional-accuracy
+        posterior as the shrinkage prior (the ADR-0009 cold-start formula keyed
+        per analyst). When the recency-decay flag is also on and a decision asof
+        is available, the (alpha, beta) used are the asof-honest, recency-refit
+        posterior rather than the lifetime one — so calibration tracks current
+        skill. Cold-start safe: an unseen analyst maps to the neutral prior mean.
+        """
+        from hermes_quant.learning.per_analyst_calibration import beta_shrinkage_calibrate
+        from hermes_quant.learning.posterior_refit import SkillSample, refit_beta
+
+        stats = self._get_or_create_stats(analyst_name)
+        if _decay_enabled() and decision_asof is not None:
+            samples = [
+                SkillSample(observable_asof=ts, correct=correct)
+                for ts, correct in stats.decay_samples
+            ]
+            alpha, beta = refit_beta(
+                samples=samples,
+                decision_asof=decision_asof,
+                prior_alpha=self.prior_alpha,
+                prior_beta=self.prior_beta,
+                half_life_days=DEFAULT_DECAY_HALF_LIFE_DAYS,
+            )
+        else:
+            alpha, beta = stats.alpha, stats.beta
+        return beta_shrinkage_calibrate(confidence_raw, alpha=alpha, beta=beta)
+
+    def _lesson_haircut(
+        self,
+        confidence: float,
+        ticker: str,
+        direction: int,
+        decision_asof: pd.Timestamp,
+    ) -> tuple[float, bool, int]:
+        """57f6: apply a bounded, asof-honest loss-lesson haircut (fail-safe).
+
+        Returns ``(confidence, applied, n_lessons)``. A no-op (applied=False)
+        when the flag is off, no provider is injected, the provider raises, or no
+        lesson matches the (ticker, direction, asof). A provider error is
+        swallowed and logged — a bad reflections store must never break the
+        decision path (silence-by-default).
+        """
+        provider = self.loss_lesson_provider
+        if provider is None or not _lesson_haircut_enabled():
+            return confidence, False, 0
+
+        from hermes_quant.learning.lesson_haircut import apply_lesson_haircut
+
+        try:
+            lessons = provider.recent_loss_lessons(ticker, decision_asof)
+        except Exception as exc:  # noqa: BLE001 — bad lesson store must not break decisions
+            logger.warning("BMA: loss_lesson_provider raised (%s); skipping haircut", exc)
+            return confidence, False, 0
+
+        haircut = apply_lesson_haircut(
+            confidence=confidence,
+            ticker=ticker,
+            direction=direction,
+            decision_asof=decision_asof,
+            lessons=lessons or [],
+            per_lesson_haircut=LESSON_HAIRCUT_PER,
+            floor_fraction=LESSON_HAIRCUT_FLOOR,
+        )
+        applied = haircut < confidence
+        # Count only the matching lessons that actually drove the haircut so the
+        # audit field is honest (re-uses the same asof-honest matcher semantics).
+        n_lessons = self._count_matching_lessons(
+            lessons or [], ticker, direction, decision_asof
+        )
+        return haircut, applied, n_lessons
+
+    @staticmethod
+    def _count_matching_lessons(lessons, ticker, direction, decision_asof) -> int:
+        """Distinct same-ticker/-direction lessons observable before the decision.
+
+        Mirrors apply_lesson_haircut's matcher EXACTLY (same NaT/>= semantics) so
+        the audit count can never disagree with whether a haircut was applied.
+        """
+        decision = pd.Timestamp(decision_asof)
+        if pd.isna(decision):
+            return 0
+        if decision.tz is None:
+            decision = decision.tz_localize("UTC")
+        ticker_u = ticker.upper()
+        seen: set[str] = set()
+        for lesson in lessons:
+            if lesson.lesson_id in seen:
+                continue
+            if lesson.ticker.upper() != ticker_u or lesson.direction != direction:
+                continue
+            tau = pd.Timestamp(lesson.tau_observable)
+            if pd.isna(tau):
+                continue
+            if tau.tz is None:
+                tau = tau.tz_localize("UTC")
+            if tau >= decision:
+                continue
+            seen.add(lesson.lesson_id)
+        return len(seen)
 
     def _horizon_weight(self, horizon: str) -> float:
         """Per-ADR-0036 horizon weight multiplier.
@@ -524,7 +869,9 @@ class BMAAggregator:
                     regime_state, _regime_reason = self.regime_detector.classify(state_vars)
                     regime_state_value = str(regime_state.value)
                     # Build base weight map (analyst → base_w) so we can record multipliers
-                    base_weights_map = {v.analyst: self._weight_for(v.analyst) for v in views}
+                    base_weights_map = {
+                        v.analyst: self._weight_for(v.analyst, context.asof) for v in views
+                    }
                     adjusted_map = _apply_regime_weights(base_weights_map, regime_state)
                     regime_weight_multipliers = {
                         analyst: (
@@ -573,6 +920,27 @@ class BMAAggregator:
             # OFF/uninformative case is auditable as a no-op in metadata.
             stacking_used = any(f < 1.0 - 1e-12 for f in redundancy_factors.values())
 
+        # f254 (DEFAULT-OFF): per-analyst calibration map. When enabled, each
+        # view's confidence_raw is recalibrated through the analyst's OWN learned
+        # Beta posterior (keyed by name) so a skilled analyst is not dragged
+        # toward the population average by the merged global calibrator fit. The
+        # map is the calibrated confidence to USE in the vote in place of
+        # v.confidence; when the flag is off it stays None and the vote uses
+        # v.confidence exactly as before (byte-identical).
+        per_analyst_cal: dict[str, float] | None = None
+        if _per_analyst_calib_enabled():
+            per_analyst_cal = {
+                v.analyst: self._per_analyst_calibrated_confidence(
+                    v.analyst, v.confidence_raw, context.asof
+                )
+                for v in views
+            }
+
+        def _vote_confidence(v: AnalystView) -> float:
+            if per_analyst_cal is not None:
+                return per_analyst_cal[v.analyst]
+            return v.confidence
+
         weights = []
         signed_terms = []  # direction × magnitude × weight × confidence
         signed_dir_terms = []  # direction × weight × confidence (for direction)
@@ -581,7 +949,7 @@ class BMAAggregator:
             if _regime_adjusted and v.analyst in _regime_adjusted:
                 base_w = _regime_adjusted[v.analyst]
             else:
-                base_w = self._weight_for(v.analyst)
+                base_w = self._weight_for(v.analyst, context.asof)
             # ADR-0036: cross-horizon BMA weighting —
             #   effective weight = base_weight(analyst) × horizon_weight(horizon)
             #   The view's own confidence is multiplied in by signed_dir_terms
@@ -592,7 +960,7 @@ class BMAAggregator:
             if redundancy_factors is not None:
                 w *= redundancy_factors.get(v.analyst, 1.0)
             weights.append(w)
-            signed_dir_terms.append(v.direction * w * v.confidence)
+            signed_dir_terms.append(v.direction * w * _vote_confidence(v))
 
         weighted_dir_sum = sum(signed_dir_terms)
         if abs(weighted_dir_sum) < 1e-9:
@@ -671,10 +1039,24 @@ class BMAAggregator:
             # confidence. Downstream gates / sizing decide based on the
             # analyst's actual confidence, not synthesized unanimity.
             sole_v, _w = contributing[0]
-            confidence_raw = float(np.clip(sole_v.confidence_raw, 0.0, 1.0))
+            # f254: for a lone voice, the honest confidence IS the per-analyst
+            # calibrated value (already shrunk by that analyst's track record);
+            # otherwise fall back to the analyst's own raw confidence as before.
+            if per_analyst_cal is not None:
+                confidence_raw = float(np.clip(per_analyst_cal[sole_v.analyst], 0.0, 1.0))
+            else:
+                confidence_raw = float(np.clip(sole_v.confidence_raw, 0.0, 1.0))
         elif non_flat and all(v.direction == composite_direction for v in non_flat):
             # Multi-contributor unanimous: vote_share + agreement bonus.
-            confidence_raw = float(np.clip(vote_share + self.agreement_bonus, 0.0, 1.0))
+            if per_analyst_cal is not None:
+                # f254: in per-analyst-calibrated mode, vote_share measures
+                # agreement, not probability. Aggregate the calibrated
+                # contributor probabilities, then apply the same agreement
+                # bonus to that probability estimate.
+                calibrated_vote = sum(_vote_confidence(v) * w for v, w in contributing) / total_w
+                confidence_raw = float(np.clip(calibrated_vote + self.agreement_bonus, 0.0, 1.0))
+            else:
+                confidence_raw = float(np.clip(vote_share + self.agreement_bonus, 0.0, 1.0))
         else:
             # Multi-contributor with dissent: vote_share only.
             confidence_raw = vote_share
@@ -683,10 +1065,19 @@ class BMAAggregator:
         # prior as ColdStartCalibrator (ADR-0009 §P0-2 amendment 2026-05-26):
         # see hermes_quant/calibrators.py and
         # docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md.
-        try:
-            confidence = self.calibrator.calibrate(confidence_raw)
-        except CalibratorNotReady:
-            confidence = (confidence_raw + 2.0) / 8.0
+        #
+        # f254: when per-analyst calibration is on, confidence_raw is already a
+        # calibrated quantity (each contribution was shrunk by its analyst's own
+        # posterior). Re-running the merged global calibrator would double-shrink
+        # and re-introduce the population-average drag we are trying to remove,
+        # so the global calibrate step is BYPASSED in that mode.
+        if per_analyst_cal is not None:
+            confidence = float(np.clip(confidence_raw, 0.0, 1.0))
+        else:
+            try:
+                confidence = self.calibrator.calibrate(confidence_raw)
+            except CalibratorNotReady:
+                confidence = (confidence_raw + 2.0) / 8.0
 
         # Horizon: use the modal horizon among contributing views; default to first
         horizons = [v.horizon for v, _ in contributing]
@@ -708,7 +1099,8 @@ class BMAAggregator:
             per_horizon_dir: dict[str, float] = {}
             for v, w in zip(views, weights, strict=False):
                 per_horizon_dir[v.horizon] = (
-                    per_horizon_dir.get(v.horizon, 0.0) + v.direction * w * v.confidence
+                    per_horizon_dir.get(v.horizon, 0.0)
+                    + v.direction * w * _vote_confidence(v)
                 )
             horizon_signs = {
                 h: (1 if s > 0 else (-1 if s < 0 else 0)) for h, s in per_horizon_dir.items()
@@ -724,6 +1116,18 @@ class BMAAggregator:
                 confidence = float(
                     np.clip(confidence * self.config.horizon_disagreement_penalty, 0.0, 1.0)
                 )
+
+        # 57f6: lesson-driven confidence haircut (DEFAULT-OFF). Applied LAST, as
+        # the final word on confidence: a recent same-symbol same-direction loss
+        # dampens conviction on the deterministic path. asof-honest and bounded;
+        # a no-op (and byte-identical metadata) when the flag is off, no provider
+        # is injected, or no lesson matches.
+        lesson_haircut_applied = False
+        lesson_haircut_n = 0
+        if self.loss_lesson_provider is not None and _lesson_haircut_enabled():
+            confidence, lesson_haircut_applied, lesson_haircut_n = self._lesson_haircut(
+                confidence, context.asset, composite_direction, context.asof
+            )
 
         metadata = {
             "weights": {v.analyst: w for v, w in zip(views, weights, strict=False)},
@@ -745,6 +1149,18 @@ class BMAAggregator:
         if redundancy_factors is not None:
             metadata["stacking_redundancy_factors"] = redundancy_factors
             metadata["stacking_used"] = stacking_used
+
+        # f254 audit field — injected ONLY when per-analyst calibration is on, so
+        # the OFF-path metadata dict is byte-identical. Records the per-analyst
+        # calibrated confidence that fed the vote (vs the merged global path).
+        if per_analyst_cal is not None:
+            metadata["per_analyst_calibrated_confidence"] = per_analyst_cal
+
+        # 57f6 audit fields — injected ONLY when the haircut path ran (flag on +
+        # provider present), so the OFF-path metadata dict is byte-identical.
+        if self.loss_lesson_provider is not None and _lesson_haircut_enabled():
+            metadata["lesson_haircut_applied"] = lesson_haircut_applied
+            metadata["lesson_haircut_n_lessons"] = lesson_haircut_n
 
         signal = AggregatedSignal(
             asset=context.asset,
@@ -812,6 +1228,7 @@ class BMAAggregator:
         """
         episode_idx = self._episode_idx
         self._episode_idx += 1
+        decision_asof = pd.Timestamp(outcome.asof)
         for view in outcome.aggregated_signal.components:
             stats = self._get_or_create_stats(view.analyst)
             correct = outcome.direction_correct.get(view.analyst)
@@ -824,6 +1241,27 @@ class BMAAggregator:
                 stats.beta += 1.0
             # B50: append (episode_idx, correct) for co-observation alignment.
             stats.history.append((episode_idx, bool(correct)))
+            # c96e: stamp WHEN this outcome became observable = decision asof +
+            # the view's horizon. NOT the decision asof itself — a 1w view
+            # decided at D is only knowable at D+1w, and the recency refit's
+            # no-lookahead filter relies on this being honest. ALWAYS recorded
+            # (additive); consulted only when the decay flag is on.
+            #
+            # Source-side no-lookahead defense: if the decision asof is NaT (a
+            # malformed settlement record), the observability stamp would be NaT
+            # too, which the downstream guards must treat as "unknown" anyway.
+            # Skip recording the poisoned sample entirely rather than relying
+            # solely on the read-side guards — the alpha/beta credit above still
+            # applies (it is asof-independent), only the decay ring is spared.
+            if not pd.isna(decision_asof):
+                observable_asof = decision_asof + _horizon_delta(view.horizon)
+                stats.decay_samples.append((observable_asof, bool(correct)))
+                stats.last_observable_asof = observable_asof
+
+        # c96e: persist the evolved posteriors (DEFAULT-OFF). Stamp the snapshot
+        # with the settlement asof. Save is fail-safe (logged, never raises).
+        if _posterior_persist_enabled():
+            self._save_persisted_posteriors(decision_asof)
 
     def status(self) -> dict:
         return {
