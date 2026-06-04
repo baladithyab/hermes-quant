@@ -123,6 +123,12 @@ def test_etb_whole_share_short_not_rejected_as_fractional(autonomous_env, monkey
     short FIREs — proving it is no longer silenced as FRACTIONAL_SHORT."""
     monkeypatch.setenv("HERMES_QUANT_ADMISSIBILITY", "1")
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100_000.0)
+    # H-adm #1 (commit 72e3d8b): the autonomous short branch now fetches a LIVE
+    # paper-account buying-power via oracle.live_buying_power(). Mock it for a
+    # deterministic unit test — a generous BP so the BP hard-check passes and the
+    # ETB whole-share short FIREs (the property under test).
+    import hermes_quant.admissibility.oracle as _oracle_mod
+    monkeypatch.setattr(_oracle_mod, "live_buying_power", lambda: 200_000.0)
     oracle = _RecordingOracle()
     monkeypatch.setattr(gate_order, "select_oracle", lambda: oracle)
 
@@ -135,10 +141,11 @@ def test_etb_whole_share_short_not_rejected_as_fractional(autonomous_env, monkey
     assert isinstance(qty, int)
     assert qty != pytest.approx(0.20)  # NOT the fraction the bug passed
     # The decision-price quote we DO have is plumbed into ctx, as is account_equity
-    # (= the paper NAV) — the H-adm #1 fix. available_bp stays None (documented gap).
+    # (= the paper NAV) — the H-adm #1 fix. available_bp is now LIVE-plumbed
+    # (commit 72e3d8b) — it is the mocked buying-power, no longer None.
     assert oracle.calls[0]["ctx"].current_ask == 200.0
     assert oracle.calls[0]["ctx"].account_equity == 100_000.0
-    assert oracle.calls[0]["ctx"].available_bp is None
+    assert oracle.calls[0]["ctx"].available_bp == 200_000.0
 
     # And the ETB whole-share short FIREd — not silenced as FRACTIONAL_SHORT.
     gme = [d for d in result.decisions if d.symbol == "GME"]

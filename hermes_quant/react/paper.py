@@ -1,16 +1,10 @@
-"""hermes_quant.react.paper — Paper-only reactor for HITL mode (ADR-0015 §D5).
+"""hermes_quant.react.paper — PaperReactor execution bus writer.
 
-PaperReactor writes to ~/.hermes/quant/executions.jsonl with fill_price
-equal to decision_price. v0.1.2 deliberately does NOT simulate slippage
-on paper fills — slippage modeling lives upstream in MarketState
-(ADR-0009 §P1-12 cold-start defaults) and would conflict with the
-daemon's executions.jsonl format that real broker fills (v0.2 live
-reactors) write.
-
-The executions bus is the SAME bus the daemon's freqtrade consumer would
-fill. This is deliberate: HITL paper fills feed the same calibrator that
-autonomous-mode fills will feed in v0.2, so the calibrator's training
-data is consistent across modes.
+Per ADR-0015 and ADR-0041, PaperReactor is the canonical source of
+executions.jsonl entries for paper trading.  It is intentionally dumb
+and side-effect free beyond appending JSONL records and updating the
+materialized PortfolioState view; all higher-level orchestration lives
+in callers.
 """
 
 from __future__ import annotations
@@ -23,11 +17,33 @@ from pathlib import Path
 from typing import Any
 
 from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, append_locked
-
-from .admissibility_precondition import admissibility_reject_equity
 from .base import ExecutionRecord
+from .admissibility_precondition import admissibility_reject_equity
 
 logger = logging.getLogger(__name__)
+
+
+def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
+    """Serialize an ExecutionRecord to a JSONL-safe dict."""
+    return {
+        "proposal_id": record.proposal_id,
+        "signal_id": record.signal_id,
+        "asset": record.asset,
+        "asset_class": record.asset_class,
+        "timeframe": record.timeframe,
+        "asof_decision": record.asof_decision,
+        "asof_execution": record.asof_execution,
+        "target_position_pct": record.target_position_pct,
+        "decision_price": record.decision_price,
+        "fill_price": record.fill_price,
+        "fill_size_pct": record.fill_size_pct,
+        "reactor_name": record.reactor_name,
+        "human_in_the_loop": record.human_in_the_loop,
+        "approver_user_id": record.approver_user_id,
+        "reactor_metadata": record.reactor_metadata or {},
+        "bar_ts": record.bar_ts,  # ADR-0068: explicit bar-boundary anchor
+        "play_tag": record.play_tag,  # B13: source of the fire
+    }
 
 
 def _account_nav_usd() -> float | None:
@@ -39,6 +55,11 @@ def _account_nav_usd() -> float | None:
       1. state.db cash.equity_total (materialized NAV after fills) — the truth.
       2. paper bootstrap initial cash (no fills yet).
     Returns None on any failure so the caller fails-closed (no fabricated NAV).
+
+    NOTE (ADR-0086): this uses the cost-basis `equity_total` deliberately — the
+    admissibility share-conversion needs a NAV figure, and it must match the
+    autonomous seam's source for the two seams to agree. Read-time MTM
+    (get_marked_equity) is a SEPARATE reporting concern and must NOT be wired here.
     """
     try:
         from hermes_quant.state.portfolio_state import (
@@ -98,7 +119,7 @@ class PaperReactor:
             approver_user_id: Hermes user id of approver, if available.
             play_tag: B13 source/play_tag of the fire — "advisor" (HITL
                 approve, the default), "playbook", or "autonomous". Carried
-                onto the ExecutionRecord so the retro/settlement loop can
+            onto the ExecutionRecord so the retro/settlement loop can
                 attribute fills by source. Default "advisor" keeps existing
                 callers bit-for-bit (every fill read as advisor before B13).
 
@@ -123,6 +144,19 @@ class PaperReactor:
         )
         if admissibility_reject is not None:
             return admissibility_reject
+
+        # ADR-0087 Wave 2: portfolio-cap seam at the REACTION layer (DEFAULT-OFF).
+        # When HERMES_QUANT_PORTFOLIO_CAPS=1, this precondition reads current
+        # portfolio headroom and either SILENCES an over-cap fire or (future
+        # wave) scales it down. With the flag unset this helper is a
+        # bit-identical no-op: it returns None without touching state or the
+        # cap module.
+        cap_reject = self._portfolio_cap_reject(
+            proposal, fill_size_pct, now, play_tag=play_tag
+        )
+        if cap_reject is not None:
+            return cap_reject
+
         # ADR-0068: prefer the wall-clock decision time emitted by the advisor.
         # Fall back to `as_of` (= bar boundary) for advisor_result dicts produced
         # before the ADR-0068 split, then to `now` if neither is available.
@@ -302,6 +336,96 @@ class PaperReactor:
             play_tag=play_tag,
         )
 
+    def _portfolio_cap_reject(
+        self,
+        proposal: Any,
+        fill_size_pct: float,
+        now: str,
+        *,
+        play_tag: str = "advisor",
+    ) -> ExecutionRecord | None:
+        """Portfolio-cap precondition for paper fills (ADR-0087 Wave 2).
+
+        DEFAULT-OFF behind HERMES_QUANT_PORTFOLIO_CAPS. With the flag unset
+        this helper is a bit-identical no-op and does not import or touch
+        portfolio-normalize or PortfolioState.
+
+        When enabled and the portfolio caps gate SILENCES this fire (no
+        remaining headroom), returns an ExecutionRecord marked as silenced
+        which is NOT appended to executions.jsonl. Scale-down behavior (pick
+        partially fits within headroom) is deferred to a later wave.
+        """
+
+        if os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") != "1":
+            return None
+
+        # Flag ON path only: import the cap machinery lazily so the OFF path
+        # stays import- and IO-free.
+        from hermes_quant.state.portfolio_state import get_portfolio_state
+        from hermes_quant.risk.portfolio_normalize import (
+            PortfolioCaps,
+            PortfolioState as RiskPortfolioState,
+            clip_one_to_remaining_headroom,
+        )
+
+        ps = get_portfolio_state()
+        # Resolve the account the SAME way the bus-append path does (see execute():
+        # reactor_metadata.account_id override, else the "paper-default" sentinel).
+        # Hardcoding "paper-default" would read the wrong book for any non-default
+        # account (Phase-8 review finding 2026-06-02).
+        rmeta = getattr(proposal, "reactor_metadata", None) or {}
+        account_id = (rmeta.get("account_id") if isinstance(rmeta, dict) else None) or "paper-default"
+        positions = ps.get_positions(account_id)
+        pos_map: dict[str, float] = {}
+        for (asset_class, symbol), position in positions.items():
+            # Positions are stored as NAV-fraction quantities in v0.1 (ADR-0041).
+            # The cap seam reads them as target_position_pct by symbol.
+            pos_map[symbol] = position.quantity
+
+        state = RiskPortfolioState(positions=pos_map)
+        caps = PortfolioCaps.standard()
+        clipped = clip_one_to_remaining_headroom(
+            asset=proposal.symbol,
+            per_symbol_target_pct=fill_size_pct,
+            state=state,
+            caps=caps,
+        )
+
+        # TODO (Wave 3): handle partial headroom by scaling fill_size_pct to
+        # clipped.portfolio_target_pct and surfacing cap_scaled_from/to in
+        # reactor_metadata. For Wave 2 we implement a pure SILENCE-or-pass
+        # semantics at the seam.
+
+        if not clipped.fired or abs(clipped.portfolio_target_pct) < 1e-9:
+            # Silenced: record an audit-only ExecutionRecord that is NOT
+            # appended to executions.jsonl and does NOT update PortfolioState.
+            silence_reason = clipped.silence_reason or "no_headroom"
+            return ExecutionRecord(
+                proposal_id=proposal.proposal_id,
+                signal_id=self._extract_signal_id(proposal),
+                asset=proposal.symbol,
+                asset_class=proposal.asset_class,
+                timeframe=proposal.timeframe,
+                asof_decision=now,
+                asof_execution=now,
+                target_position_pct=fill_size_pct,
+                decision_price=self._extract_decision_price(proposal),
+                fill_price=self._extract_decision_price(proposal),
+                fill_size_pct=0.0,
+                reactor_name=self.name,
+                human_in_the_loop=True,
+                approver_user_id=None,
+                reactor_metadata={
+                    "paper": True,
+                    "silenced": True,
+                    "silence_reason": f"portfolio_cap_{silence_reason}",
+                },
+                bar_ts=(proposal.advisor_result or {}).get("bar_ts"),
+                play_tag=play_tag,
+            )
+
+        return None
+
     @staticmethod
     def _extract_decision_price(proposal: Any) -> float:
         """Pull the decision-time price from the embedded advisor_result.
@@ -336,36 +460,13 @@ class PaperReactor:
 
     @staticmethod
     def _extract_signal_id(proposal: Any) -> str | None:
-        """Pull signal_id from advisor_result. None for advisor-only proposals
-        (the advisor surface doesn't emit signals; daemon-integration will)."""
+        """Best-effort extractor for the upstream advisor's signal id.
+
+        Older proposals may not carry this field; the settlement loop
+        tolerates None and falls back to proposal_id-only joins.
+        """
         ar = proposal.advisor_result or {}
-        # Top-level (Wave B.1+ advisor)
         sid = ar.get("signal_id")
-        if sid:
-            return sid
-        # Fallback: aggregated_signal sub-dict
-        sig = ar.get("aggregated_signal") or {}
-        return sig.get("signal_id")
-
-
-def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
-    """Serialize an ExecutionRecord to a JSONL-safe dict."""
-    return {
-        "proposal_id": record.proposal_id,
-        "signal_id": record.signal_id,
-        "asset": record.asset,
-        "asset_class": record.asset_class,
-        "timeframe": record.timeframe,
-        "asof_decision": record.asof_decision,
-        "asof_execution": record.asof_execution,
-        "target_position_pct": record.target_position_pct,
-        "decision_price": record.decision_price,
-        "fill_price": record.fill_price,
-        "fill_size_pct": record.fill_size_pct,
-        "reactor_name": record.reactor_name,
-        "human_in_the_loop": record.human_in_the_loop,
-        "approver_user_id": record.approver_user_id,
-        "reactor_metadata": record.reactor_metadata or {},
-        "bar_ts": record.bar_ts,  # ADR-0068: explicit bar-boundary anchor
-        "play_tag": record.play_tag,  # B13: source of the fire
-    }
+        if sid is not None:
+            return str(sid)
+        return None

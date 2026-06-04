@@ -168,6 +168,41 @@ class ReconstructionResult:
     errors: list[tuple[int, str]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class MarkedEquity:
+    """Read-time mark-to-market equity snapshot (ADR-0086 Phase 1).
+
+    Attributes
+    ----------
+    account_id:
+        Account identifier.
+    cost_basis_equity:
+        The equity basis used for NAV reference (typically cash.equity_total or
+        _default_initial_cash()). Positions are sized as fractions of this value.
+    marked_equity:
+        cost_basis_equity + total_unrealized (mark-to-market equity).
+    total_unrealized:
+        Sum of unrealized P&L across all positions (signed; shorts profit when
+        mark < entry).
+    equity_basis:
+        'mark' if all positions have injected marks, 'entry' if none do, 'mixed'
+        if some do and some don't (fall back to avg_entry_price).
+    n_positions:
+        Number of open positions considered.
+    n_marked:
+        Number of positions that received an injected mark (vs. falling back to
+        avg_entry_price).
+    """
+
+    account_id: str
+    cost_basis_equity: float
+    marked_equity: float
+    total_unrealized: float
+    equity_basis: str  # "mark" | "entry" | "mixed"
+    n_positions: int
+    n_marked: int
+
+
 # ---------------------------------------------------------------------------
 # PortfolioState
 # ---------------------------------------------------------------------------
@@ -669,6 +704,85 @@ class PortfolioState:
             balance_usd=float(row["balance_usd"]),
             last_update_at=row["last_update_at"],
             equity_total=float(row["equity_total"]),
+        )
+
+    def get_marked_equity(
+        self,
+        account_id: str,
+        mark_prices: dict[str, float],
+        *,
+        nav_ref: float | None = None,
+    ) -> MarkedEquity:
+        """Compute read-time mark-to-market equity (ADR-0086 Phase 1).
+
+        Injected marks are used when available; positions without marks fall back
+        to avg_entry_price (no P&L contribution). No network call is made.
+
+        Args:
+            account_id: Account identifier.
+            mark_prices: dict mapping symbol → current mark price. Positions
+                without an entry in this dict fall back to avg_entry_price.
+            nav_ref: NAV reference against which position weights are sized.
+                Defaults to cash.equity_total (cost-basis equity) or
+                _default_initial_cash() if no cash record exists yet.
+
+        Returns:
+            MarkedEquity with marked_equity = cost_basis_equity + total_unrealized.
+
+        Notes:
+            Position.quantity is a SIGNED NAV-FRACTION (e.g., -0.2 = 20% short).
+            unrealized_i = quantity_i * nav_ref * (mark_i / entry_i - 1).
+            Shorts profit when mark < entry (quantity is negative, ratio < 1).
+        """
+        cash = self.get_cash(account_id)
+        cost_basis_equity = cash.equity_total if cash else _default_initial_cash()
+        if nav_ref is None:
+            nav_ref = cost_basis_equity
+        # Guard: a non-positive nav_ref would silently zero (or sign-invert) every
+        # unrealized contribution. Fall back to the bootstrap initial cash so the
+        # MTM estimate stays meaningful rather than collapsing to cost-basis
+        # (Phase-8 review finding 2026-06-02).
+        if nav_ref <= 0:
+            nav_ref = _default_initial_cash()
+
+        positions = self.get_positions(account_id)
+        total_unrealized = 0.0
+        n_marked = 0
+
+        for pos in positions.values():
+            # Guard: skip positions with invalid avg_entry_price
+            if pos.avg_entry_price <= 0:
+                continue
+
+            mark = mark_prices.get(pos.symbol)
+            if mark is not None:
+                n_marked += 1
+                # Signed MTM: quantity carries sign, shorts profit when mark < entry
+                unrealized_i = pos.quantity * nav_ref * (mark / pos.avg_entry_price - 1.0)
+                total_unrealized += unrealized_i
+            # else: no mark → fall back to avg_entry_price → zero unrealized contribution
+
+        marked_equity = cost_basis_equity + total_unrealized
+
+        # Determine equity_basis flag
+        n_positions = len(positions)
+        if n_positions == 0:
+            equity_basis = "entry"  # no positions → no marks needed
+        elif n_marked == n_positions:
+            equity_basis = "mark"
+        elif n_marked == 0:
+            equity_basis = "entry"
+        else:
+            equity_basis = "mixed"
+
+        return MarkedEquity(
+            account_id=account_id,
+            cost_basis_equity=cost_basis_equity,
+            marked_equity=marked_equity,
+            total_unrealized=total_unrealized,
+            equity_basis=equity_basis,
+            n_positions=n_positions,
+            n_marked=n_marked,
         )
 
     def get_watermark(self) -> str | None:

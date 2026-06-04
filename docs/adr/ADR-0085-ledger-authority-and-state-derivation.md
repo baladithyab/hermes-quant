@@ -2,7 +2,15 @@
 status: proposed
 date: 2026-06-01
 deciders: [codeseys]
+amended_by: ADR-0086
 ---
+
+> **Amended-by ADR-0086 (2026-06-02):** the projection's *accounting math* (units,
+> mark-to-market equity, short sign) is tightened by ADR-0086. The event-sourced
+> authority decision in this ADR (executions.jsonl authoritative, state.db a
+> derived projection) is **preserved in full** — only how the projection folds the
+> log changes.
+
 
 # ADR-0085: executions.jsonl is the authoritative event log; state.db is a derived projection
 
