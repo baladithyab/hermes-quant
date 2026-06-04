@@ -229,6 +229,28 @@ def _per_analyst_calib_enabled() -> bool:
     return os.environ.get("HERMES_QUANT_L2_PER_ANALYST_CALIB", "0") == "1"
 
 
+def _lesson_haircut_enabled() -> bool:
+    """True iff HERMES_QUANT_L2_LESSON_HAIRCUT=1 (read at CALL TIME).
+
+    57f6 (DEFAULT-OFF). When unset (or no provider is injected), the aggregate
+    confidence is untouched — byte-identical to today, and the lesson provider is
+    never even consulted. When set AND a provider is injected, a recent
+    same-symbol same-direction LOSS lesson applies a bounded, asof-honest
+    confidence haircut on the DEFAULT (non-LLM) decision path. This closes the
+    reflection->decision loop deterministically.
+    """
+    return os.environ.get("HERMES_QUANT_L2_LESSON_HAIRCUT", "0") == "1"
+
+
+# 57f6 haircut tuning. Each distinct matching loss shaves LESSON_HAIRCUT_PER
+# off confidence multiplicatively; the compounded cut is clamped so confidence
+# can never fall below LESSON_HAIRCUT_FLOOR of its pre-haircut value. The loop
+# may DAMPEN conviction on a symbol/direction that recently lost, never silence
+# it — silence remains the deterministic gate's job, not the aggregator's.
+LESSON_HAIRCUT_PER = 0.15
+LESSON_HAIRCUT_FLOOR = 0.5
+
+
 def _stacking_enabled() -> bool:
     """True iff HERMES_QUANT_STACKING=1 (read at CALL TIME, not import time).
 
@@ -320,6 +342,7 @@ class BMAAggregator:
         regime_detector=None,
         posterior_store_path: Path | None = None,
         posterior_recipe_key: str | None = None,
+        loss_lesson_provider=None,
     ):
         self.prior_alpha = prior_alpha
         self.prior_beta = prior_beta
@@ -355,6 +378,14 @@ class BMAAggregator:
         self.posterior_recipe_key = posterior_recipe_key
         if _posterior_persist_enabled():
             self._load_persisted_posteriors()
+
+        # 57f6: optional loss-lesson provider (DEFAULT None). When None, the
+        # lesson-haircut path is a pure no-op regardless of the flag. When set
+        # AND HERMES_QUANT_L2_LESSON_HAIRCUT=1, recent same-symbol same-direction
+        # losses apply a bounded, asof-honest confidence haircut. Decoupled by
+        # design: BMA only calls provider.recent_loss_lessons(ticker, asof); the
+        # reflections/decisions JSONL join lives in the provider, not here.
+        self.loss_lesson_provider = loss_lesson_provider
 
         # Calibrator: prefer a fitted IsotonicCalibrator persisted on disk;
         # fall back to ColdStartCalibrator on missing-file or any unpickle
@@ -585,6 +616,71 @@ class BMAAggregator:
         else:
             alpha, beta = stats.alpha, stats.beta
         return beta_shrinkage_calibrate(confidence_raw, alpha=alpha, beta=beta)
+
+    def _lesson_haircut(
+        self,
+        confidence: float,
+        ticker: str,
+        direction: int,
+        decision_asof: pd.Timestamp,
+    ) -> tuple[float, bool, int]:
+        """57f6: apply a bounded, asof-honest loss-lesson haircut (fail-safe).
+
+        Returns ``(confidence, applied, n_lessons)``. A no-op (applied=False)
+        when the flag is off, no provider is injected, the provider raises, or no
+        lesson matches the (ticker, direction, asof). A provider error is
+        swallowed and logged — a bad reflections store must never break the
+        decision path (silence-by-default).
+        """
+        provider = self.loss_lesson_provider
+        if provider is None or not _lesson_haircut_enabled():
+            return confidence, False, 0
+
+        from hermes_quant.learning.lesson_haircut import apply_lesson_haircut
+
+        try:
+            lessons = provider.recent_loss_lessons(ticker, decision_asof)
+        except Exception as exc:  # noqa: BLE001 — bad lesson store must not break decisions
+            logger.warning("BMA: loss_lesson_provider raised (%s); skipping haircut", exc)
+            return confidence, False, 0
+
+        haircut = apply_lesson_haircut(
+            confidence=confidence,
+            ticker=ticker,
+            direction=direction,
+            decision_asof=decision_asof,
+            lessons=lessons or [],
+            per_lesson_haircut=LESSON_HAIRCUT_PER,
+            floor_fraction=LESSON_HAIRCUT_FLOOR,
+        )
+        applied = haircut < confidence
+        # Count only the matching lessons that actually drove the haircut so the
+        # audit field is honest (re-uses the same asof-honest matcher semantics).
+        n_lessons = self._count_matching_lessons(
+            lessons or [], ticker, direction, decision_asof
+        )
+        return haircut, applied, n_lessons
+
+    @staticmethod
+    def _count_matching_lessons(lessons, ticker, direction, decision_asof) -> int:
+        """Distinct same-ticker/-direction lessons observable before the decision."""
+        decision = pd.Timestamp(decision_asof)
+        if decision.tz is None:
+            decision = decision.tz_localize("UTC")
+        ticker_u = ticker.upper()
+        seen: set[str] = set()
+        for lesson in lessons:
+            if lesson.lesson_id in seen:
+                continue
+            if lesson.ticker.upper() != ticker_u or lesson.direction != direction:
+                continue
+            tau = pd.Timestamp(lesson.tau_observable)
+            if tau.tz is None:
+                tau = tau.tz_localize("UTC")
+            if tau >= decision:
+                continue
+            seen.add(lesson.lesson_id)
+        return len(seen)
 
     def _horizon_weight(self, horizon: str) -> float:
         """Per-ADR-0036 horizon weight multiplier.
@@ -994,6 +1090,18 @@ class BMAAggregator:
                     np.clip(confidence * self.config.horizon_disagreement_penalty, 0.0, 1.0)
                 )
 
+        # 57f6: lesson-driven confidence haircut (DEFAULT-OFF). Applied LAST, as
+        # the final word on confidence: a recent same-symbol same-direction loss
+        # dampens conviction on the deterministic path. asof-honest and bounded;
+        # a no-op (and byte-identical metadata) when the flag is off, no provider
+        # is injected, or no lesson matches.
+        lesson_haircut_applied = False
+        lesson_haircut_n = 0
+        if self.loss_lesson_provider is not None and _lesson_haircut_enabled():
+            confidence, lesson_haircut_applied, lesson_haircut_n = self._lesson_haircut(
+                confidence, context.asset, composite_direction, context.asof
+            )
+
         metadata = {
             "weights": {v.analyst: w for v, w in zip(views, weights, strict=False)},
             "vote_share": float(vote_share),
@@ -1020,6 +1128,12 @@ class BMAAggregator:
         # calibrated confidence that fed the vote (vs the merged global path).
         if per_analyst_cal is not None:
             metadata["per_analyst_calibrated_confidence"] = per_analyst_cal
+
+        # 57f6 audit fields — injected ONLY when the haircut path ran (flag on +
+        # provider present), so the OFF-path metadata dict is byte-identical.
+        if self.loss_lesson_provider is not None and _lesson_haircut_enabled():
+            metadata["lesson_haircut_applied"] = lesson_haircut_applied
+            metadata["lesson_haircut_n_lessons"] = lesson_haircut_n
 
         signal = AggregatedSignal(
             asset=context.asset,
