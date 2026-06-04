@@ -49,6 +49,72 @@ def test_round_trip_preserves_posteriors(tmp_path):
     assert loaded == snap
 
 
+def test_load_skips_corrupt_numeric_rows_and_keeps_valid(tmp_path, caplog):
+    """Bad per-analyst rows cold-start that analyst; they do not crash the loader."""
+    path = tmp_path / "posteriors.json"
+    valid = {
+        "alpha": 7.0,
+        "beta": 5.0,
+        "n_observations": 2,
+        "last_observable_asof": "2026-05-30T00:00:00+00:00",
+        "decay_samples": [["2026-05-30T01:00:00+00:00", True]],
+    }
+    payload = {
+        "schema_version": 1,
+        "artifact_kind": "l2_learning_posteriors",
+        "asof": "2026-06-01T00:00:00+00:00",
+        "posteriors": {
+            "valid": valid,
+            "negative-alpha": {**valid, "alpha": -1.0},
+            "zero-beta": {**valid, "beta": 0.0},
+            "infinite-alpha": {**valid, "alpha": float("inf")},
+            "absurd-beta": {**valid, "beta": 1.0e20},
+            "negative-n": {**valid, "n_observations": -1},
+            "infinite-n": {**valid, "n_observations": float("inf")},
+            "absurd-n": {**valid, "n_observations": 10_000_001},
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    caplog.set_level("WARNING")
+    loaded = load_posteriors(path=path)
+
+    assert loaded == {
+        "valid": PersistedPosterior(
+            alpha=7.0,
+            beta=5.0,
+            n_observations=2,
+            last_observable_asof=pd.Timestamp("2026-05-30T00:00:00+00:00"),
+            decay_samples=((pd.Timestamp("2026-05-30T01:00:00+00:00"), True),),
+        )
+    }
+    assert "skipping corrupt posterior row" in caplog.text
+
+
+def test_load_skips_corrupt_decay_sample_row(tmp_path, caplog):
+    """Decay refit samples are part of the posterior state and must be finite."""
+    path = tmp_path / "posteriors.json"
+    payload = {
+        "schema_version": 1,
+        "artifact_kind": "l2_learning_posteriors",
+        "asof": "2026-06-01T00:00:00+00:00",
+        "posteriors": {
+            "bad-sample": {
+                "alpha": 7.0,
+                "beta": 5.0,
+                "n_observations": 2,
+                "last_observable_asof": "2026-05-30T00:00:00+00:00",
+                "decay_samples": [["NaT", True]],
+            }
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    caplog.set_level("WARNING")
+    assert load_posteriors(path=path) == {}
+    assert "skipping corrupt posterior row" in caplog.text
+
+
 def test_load_missing_file_returns_empty_not_crash(tmp_path):
     """Cold-start: no persisted file yet → empty dict, never an exception."""
     loaded = load_posteriors(path=tmp_path / "does-not-exist.json")

@@ -4,18 +4,15 @@
 trimmed an already-over-cap active set: lowering the cap or loading over-cap
 state left rows above the cap indefinitely (operationally confirmed 2026-06-04).
 
-This adds a deterministic post-scoring trim: after onboard/evict, if the active
-set exceeds the cap, EVICT the lowest-scored active rows down to the cap (ranked
-descending by last_score; tie-break by symbol ascending so replays are
-identical). Catalyst-eviction-protected rows are never trimmed out of turn, but
-they count as occupied cap slots — mirrors the existing slow-evict protection
-without letting unprotected rows keep extra capacity.
+This keeps the deterministic post-scoring trim helper tested, but the evolution
+seam applies it only when HERMES_QUANT_WATCHLIST_CAP_TRIM=1. The unset path must
+preserve already-over-cap persisted state so the migration is explicit.
 
 Covered:
   * helper `_enforce_cap_trim`: over-cap -> exactly cap, keeps top-by-score,
     deterministic tie-break, protection, at/under-cap no-op, never grows.
-  * end-to-end `evolve_watchlist`: seed 60 active rows, cap 50 -> 50 active,
-    10 evict events; deterministic across two runs.
+  * end-to-end `evolve_watchlist`: flag-off keeps over-cap active rows; flag-on
+    trims a seeded 60 active rows, cap 50 -> 50 active, 10 evict events.
 """
 from __future__ import annotations
 
@@ -263,8 +260,34 @@ def _seed_over_cap_state(path, n=60):
     path.write_text(json.dumps({"as_of": _ASOF.isoformat(), "plays": {"swing": rows}}))
 
 
-def test_evolve_watchlist_trims_over_cap_active_set(tmp_path):
+def test_evolve_watchlist_over_cap_flag_off_keeps_active_universe(tmp_path, monkeypatch):
+    """Unset migration flag: pre-existing over-cap active rows are not evicted."""
+    monkeypatch.delenv("HERMES_QUANT_WATCHLIST_CAP_TRIM", raising=False)
+    universe = tmp_path / "universe.json"
+    watchlist = tmp_path / "play-fit.json"
+    journal = tmp_path / "journal.jsonl"
+    syms = [_sym(i) for i in range(60)]
+    _write_universe(universe, syms)
+    _seed_over_cap_state(watchlist, n=60)
+
+    summary = evolve_watchlist(
+        universe_path=universe, watchlist_path=watchlist, journal_path=journal,
+        scorer=lambda s, p: 0.50 + int(s[1:]) * 0.001, asof=_ASOF,
+        max_per_play=50, plays=("swing",),
+    )
+
+    data = json.loads(watchlist.read_text())
+    active = [r for r in data["plays"]["swing"] if r["state"] == STATE_ACTIVE]
+    assert len(active) == 60
+    assert {r["symbol"] for r in active} == set(syms)
+    assert summary["per_play"]["swing"]["n_evicted_today"] == 0
+    assert summary["events_written"] == 0
+    assert not journal.exists()
+
+
+def test_evolve_watchlist_trims_over_cap_active_set(tmp_path, monkeypatch):
     """End-to-end: a seeded 60-active set with cap 50 trims to 50 + 10 evicts."""
+    monkeypatch.setenv("HERMES_QUANT_WATCHLIST_CAP_TRIM", "1")
     universe = tmp_path / "universe.json"
     watchlist = tmp_path / "play-fit.json"
     journal = tmp_path / "journal.jsonl"
@@ -289,8 +312,10 @@ def test_evolve_watchlist_trims_over_cap_active_set(tmp_path):
     assert summary["per_play"]["swing"]["n_active"] == 50
 
 
-def test_evolve_watchlist_trim_deterministic_across_runs(tmp_path):
+def test_evolve_watchlist_trim_deterministic_across_runs(tmp_path, monkeypatch):
     """Two identical evolves -> identical surviving active symbol set."""
+    monkeypatch.setenv("HERMES_QUANT_WATCHLIST_CAP_TRIM", "1")
+
     def run(dirpath):
         universe = dirpath / "universe.json"
         watchlist = dirpath / "play-fit.json"
@@ -312,19 +337,31 @@ def test_evolve_watchlist_trim_deterministic_across_runs(tmp_path):
     assert len(a) == 50
 
 
-def test_evolve_watchlist_under_cap_no_trim(tmp_path):
-    """An at/under-cap active set is untouched (no spurious evicts)."""
-    universe = tmp_path / "universe.json"
-    watchlist = tmp_path / "play-fit.json"
-    journal = tmp_path / "journal.jsonl"
+def test_evolve_watchlist_under_cap_unset_byte_identical_to_flag_on(tmp_path, monkeypatch):
+    """At/under-cap state is byte-identical whether the migration flag is on or off."""
     syms = [_sym(i) for i in range(30)]
-    _write_universe(universe, syms)
-    _seed_over_cap_state(watchlist, n=30)
 
-    summary = evolve_watchlist(
-        universe_path=universe, watchlist_path=watchlist, journal_path=journal,
-        scorer=lambda s, p: 0.50 + int(s[1:]) * 0.002, asof=_ASOF,
-        max_per_play=50, plays=("swing",),
-    )
-    assert summary["per_play"]["swing"]["n_evicted_today"] == 0
-    assert summary["per_play"]["swing"]["n_active"] == 30
+    def run(dirpath, flag: str | None):
+        universe = dirpath / "universe.json"
+        watchlist = dirpath / "play-fit.json"
+        journal = dirpath / "journal.jsonl"
+        _write_universe(universe, syms)
+        _seed_over_cap_state(watchlist, n=30)
+        if flag is None:
+            monkeypatch.delenv("HERMES_QUANT_WATCHLIST_CAP_TRIM", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_QUANT_WATCHLIST_CAP_TRIM", flag)
+        summary = evolve_watchlist(
+            universe_path=universe, watchlist_path=watchlist, journal_path=journal,
+            scorer=lambda s, p: 0.50 + int(s[1:]) * 0.002, asof=_ASOF,
+            max_per_play=50, plays=("swing",),
+        )
+        return summary, watchlist.read_text(encoding="utf-8")
+
+    unset_summary, unset_bytes = run(tmp_path / "unset", None)
+    on_summary, on_bytes = run(tmp_path / "on", "1")
+
+    assert unset_summary == on_summary
+    assert unset_bytes == on_bytes
+    assert unset_summary["per_play"]["swing"]["n_evicted_today"] == 0
+    assert unset_summary["per_play"]["swing"]["n_active"] == 30

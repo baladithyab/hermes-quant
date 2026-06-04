@@ -35,8 +35,8 @@ The seam is a no-op on today's default advisor path, which does NOT populate
     as the SAME object (no copy), so the aggregate is byte-identical to today.
 
 Kill-switch: ``HERMES_QUANT_GROUNDING_ENFORCE`` (read at call time, like the
-other hermes-quant feature flags). Absent or ``"1"`` → enforce (DEFAULT-ON).
-``"0"`` → identity passthrough.
+other hermes-quant feature flags). Absent or ``"0"`` → identity passthrough
+(DEFAULT-OFF). ``"1"`` → enforce.
 
 Determinism / asof-honesty
 --------------------------
@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 # Feature flag (read at call time, never cached at import — mirrors advisor.py's
 # HERMES_QUANT_EVENT_RISK / semantic.py's HERMES_QUANT_SATURATION pattern).
-# Absent or "1" => enforce (DEFAULT-ON). "0" => identity passthrough.
+# Absent or "0" => identity passthrough (DEFAULT-OFF). "1" => enforce.
 _ENFORCE_FLAG = "HERMES_QUANT_GROUNDING_ENFORCE"
 
 # Strict by default: any uncited numeric in a grounded view drops the view.
@@ -149,10 +149,11 @@ def enforce_grounding(
     Notes
     -----
     Identity passthrough (``kept == views``, ``dropped == []``) when:
-      * the kill-switch is OFF (``HERMES_QUANT_GROUNDING_ENFORCE=0``), OR
+      * enforcement is unset/OFF (``HERMES_QUANT_GROUNDING_ENFORCE`` absent or
+        ``0``), OR
       * no ``ground_truth_block`` is in ``ctx.extras`` (today's advisor default).
     """
-    if os.environ.get(_ENFORCE_FLAG, "1") != "1":
+    if os.environ.get(_ENFORCE_FLAG, "0") != "1":
         return list(views), []
 
     extras = getattr(ctx, "extras", None) or {}
