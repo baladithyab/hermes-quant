@@ -19,8 +19,8 @@
 ## TL;DR
 
 1. We ship as a **pip entry-point plugin** (`hermes_agent.plugins :: hermes-quant = hermes_quant`), `kind: standalone`. Hermes **discovers** it from `importlib.metadata` entry points — no `~/.hermes/plugins/` directory needed.
-2. `register(ctx)` is **shape-correct** for the installed `PluginContext` (all five `ctx.register_*` methods match), runs in <50 ms, spawns no daemon. It wires **16 read-only tools**, a `/quant` slash command, a `hermes quant` CLI control plane, the `pre_gateway_dispatch` hook (Discord slash install), and the bundled skill.
-3. **~~LIVE BLOCKER~~ RESOLVED 2026-05-30:** `standalone` entry-point plugins are **opt-in** — they load only if their name is in `~/.hermes/config.yaml` `plugins.enabled`. `hermes-quant` has now been **added to that list** and the gateway's plugin manager confirms it loads (16 quant tools + `quant` command + `hermes-quant` skill). **NOTE:** `hermes plugins enable hermes-quant` does NOT work for entry-point plugins — it manages only bundled/git-installed plugins and prints `"Plugin 'hermes-quant' is not installed or bundled."` (harmless). The real enable is the config.yaml allow-list (§1.3 step 2). A gateway restart is still needed for an already-running gateway to pick it up. See §5.
+2. `register(ctx)` is **shape-correct** for the installed `PluginContext` (all five `ctx.register_*` methods match), runs in <50 ms, spawns no daemon. It wires **17 read-only tools**, a `/quant` slash command, a `hermes quant` CLI control plane, the `pre_gateway_dispatch` hook (Discord slash install), and the bundled skill.
+3. **~~LIVE BLOCKER~~ RESOLVED 2026-05-30:** `standalone` entry-point plugins are **opt-in** — they load only if their name is in `~/.hermes/config.yaml` `plugins.enabled`. `hermes-quant` has now been **added to that list** and the gateway's plugin manager confirms it loads (17 quant tools + `quant` command + `hermes-quant` skill). **NOTE:** `hermes plugins enable hermes-quant` does NOT work for entry-point plugins — it manages only bundled/git-installed plugins and prints `"Plugin 'hermes-quant' is not installed or bundled."` (harmless). The real enable is the config.yaml allow-list (§1.3 step 2). A gateway restart is still needed for an already-running gateway to pick it up. See §5.
 4. **Money is CLI-only.** Hermes does not distinguish "money" from "read-only" tools — *we* enforce it by registering only read/propose/approve-a-record tools (no execution tool exists), and putting `start/stop/backtest` under `register_cli_command`. `quant_approve` fires the **`PaperReactor`** against an already-human-approved proposal record, never a live broker.
 5. The PDR pipeline (ADR-0079) runs **under Hermes** not inside `register()`: **DB-backed crons** drive the Perception→Decision→Reaction ticks (the deployed `~/.hermes/scripts/quant-*.py`), tools are read-only views into the state those crons write, and the gateway chat / Discord `/quant` is the advisor + HITL surface.
 6. Manifest drift to fix (§6 checklist): `provides_tools` undercounts (`quant_recipes` missing → 15 declared vs 16 registered); `provides_hooks` over-declares `on_session_start` (never wired); `version: "0.4.4"` lags the v0.6.x feature work. All cosmetic — none block loading.
@@ -107,15 +107,15 @@ The five `PluginContext` methods we use, all confirmed against the installed sig
 
 | Hermes method | What we register |
 |---|---|
-| `register_tool(name, toolset, schema, handler, ...)` | 16 tools, all `toolset="quant"` |
+| `register_tool(name, toolset, schema, handler, ...)` | 17 tools, all `toolset="quant"` |
 | `register_command(name, handler, description)` | the `/quant` slash (CLI + gateway) |
 | `register_cli_command(name, help, setup_fn, handler_fn)` | the `hermes quant` control-plane subcommand tree |
 | `register_hook(hook_name, callback)` | `pre_gateway_dispatch` → `install_quant_slash_on_pre_dispatch` |
 | `register_skill(name, path)` | `hermes-quant` → `hermes_quant/skills/hermes-quant/SKILL.md` |
 
-### 2.1 The 16 tools (name → kind → what it does → read-only / writes-where)
+### 2.1 The 17 tools (name → kind → what it does → read-only / writes-where)
 
-All 16 are registered in `hermes_quant/__init__.py` under `toolset="quant"`. **None is an execution tool.** "Writes" below means writes to *our own* state under `~/.hermes/quant/` (proposal store / watchlist / paper-reactor journal) — never a live broker, never Hermes core SQLite.
+All 17 are registered in `hermes_quant/__init__.py` under `toolset="quant"`. **None is an execution tool.** "Writes" below means writes to *our own* state under `~/.hermes/quant/` (proposal store / watchlist / paper-reactor journal) — never a live broker, never Hermes core SQLite.
 
 | # | Tool | Kind | What it does | Read-only? |
 |---|---|---|---|---|
@@ -135,6 +135,7 @@ All 16 are registered in `hermes_quant/__init__.py` under `toolset="quant"`. **N
 | 14 | `quant_watchlist_remove` | config write | Remove a watchlist entry | writes watchlist |
 | 15 | `quant_watchlist_list` | view | List watchlist entries | read-only |
 | 16 | `quant_doctor` | view | Health check: data feeds, calibration drift, halts | read-only |
+| 17 | `quant_insider` | view | SEC EDGAR Form-4 insider-transaction evidence (asof-honest filing dates). **Default-OFF** behind `HERMES_QUANT_INSIDER_ENABLED`; returns empty list when disabled. Unconditionally registered | read-only |
 
 Plugin tools **bypass the toolset filter** (always visible to the chat LLM once the plugin loads). Tool handlers return a **JSON string** (`json.dumps({...})`) per the Hermes tool convention.
 
@@ -158,11 +159,11 @@ Plugin tools **bypass the toolset filter** (always visible to the chat LLM once 
 
 **Hermes does not know "money" from "read-only."** Once the plugin loads, the chat LLM can call any registered tool. So the invariant — *plugin tools are read-only views; live trading is CLI-only with confirmation* (AGENTS.md "Money never goes through tools", ADR-0007) — is enforced **by us, structurally**, not by a Hermes capability check:
 
-1. **No execution tool is ever registered.** The 16-tool surface contains read views, a `recommend` that only computes, watchlist/proposal config writes, and `approve` which fires only the **`PaperReactor`** on an already-human-surfaced proposal record. There is no tool that opens a live broker order. (Confirmed: `quant_approve` imports `hermes_quant.react.PaperReactor` and `hermes_quant.proposals.get_default_store` — paper + proposal-store only.)
+1. **No execution tool is ever registered.** The 17-tool surface contains read views, a `recommend` that only computes, watchlist/proposal config writes, and `approve` which fires only the **`PaperReactor`** on an already-human-surfaced proposal record. There is no tool that opens a live broker order. (Confirmed: `quant_approve` imports `hermes_quant.react.PaperReactor` and `hermes_quant.proposals.get_default_store` — paper + proposal-store only.)
 2. **The dangerous lifecycle is CLI-only.** `start / stop / restart / backtest` live under `register_cli_command`, reachable only from a shell, never from chat.
 3. **Autonomy is off by default in tools.** `quant_autonomous_tick` defaults to dry-run; paper firing requires the armed cron env (`HERMES_QUANT_AUTONOMY=paper`, or the wrapper-set `HERMES_QUANT_AUTONOMOUS=1 + _ARMED=1`), set on the deployed cron, not reachable by an LLM "yeah do that."
 4. **The deterministic gate is the final authority** (ADR-0004/ADR-0079 D-1): LLM/committee/semantic/social are evidence that can only *silence*, never authorize. No LLM is on the action path.
-5. **No `requires_env`.** `plugin.yaml` uses `optional_env` only, so install is never gated and all 16 tools are always available; yfinance bootstrap needs zero credentials. AGENTS.md: NEVER `requires_env` (it blocks install).
+5. **No `requires_env`.** `plugin.yaml` uses `optional_env` only, so install is never gated and all 17 tools are registered (quant_insider is default-OFF behind HERMES_QUANT_INSIDER_ENABLED but still registered); yfinance bootstrap needs zero credentials. AGENTS.md: NEVER `requires_env` (it blocks install).
 
 What Hermes *does* uphold: it scopes the CLI surface to the shell (the chat LLM cannot invoke `register_cli_command` handlers), it keeps the `.env` (credentials + `HERMES_QUANT_*` flags) tool-guarded, and it runs `register()` in a try/except so a plugin fault degrades to "plugin disabled" rather than crashing the gateway.
 
@@ -174,7 +175,7 @@ ADR-0079 ratifies **Perception → Decision → Reaction** as the organizing arc
 
 ```
             ┌──────────────────────── Hermes gateway (process) ─────────────────────────┐
-            │  register(ctx) at startup → 16 read-only tools + /quant slash + hooks +    │
+            │  register(ctx) at startup → 17 read-only tools + /quant slash + hooks +    │
             │                              hermes quant CLI + skill                       │
             │                                                                             │
   operator ─┼─ chat / Discord  ──►  /quant, quant_* tools  ──►  READ ~/.hermes/quant/*    │
@@ -265,7 +266,7 @@ $ ~/.hermes/hermes-agent/venv/bin/python3 -c "import yaml,os; \
 ```
 **UPDATE 2026-05-30: DONE.** `hermes-quant` has been added to `plugins.enabled` (now
 `[discord-session-link, discord-triage, disk-cleanup, hermes-discord-plugin, hermes-s2s, hermes-quant]`).
-The gateway plugin manager confirms it loads: `hermes-quant` ∈ `pm._plugins`; all 16 quant tools
+The gateway plugin manager confirms it loads: `hermes-quant` ∈ `pm._plugins`; all 17 quant tools
 ∈ `pm._plugin_tool_names`; `quant` ∈ `pm._plugin_commands`; `hermes-quant:hermes-quant` ∈
 `pm._plugin_skills`. A running gateway must be **restarted** to pick it up (new processes/crons
 already do).
@@ -316,7 +317,7 @@ class MockCtx:
 hermes_quant.register(MockCtx())
 "
 ```
-**Expected:** 16 `tool quant_*` lines, `cmd quant`, `cli quant`, `hook pre_gateway_dispatch`, `skill hermes-quant`. If any tool is missing or a method raises, fix before enabling.
+**Expected:** 17 `tool quant_*` lines, `cmd quant`, `cli quant`, `hook pre_gateway_dispatch`, `skill hermes-quant`. If any tool is missing or a method raises, fix before enabling.
 
 ### 6.2 Discovery + load-state probe
 
