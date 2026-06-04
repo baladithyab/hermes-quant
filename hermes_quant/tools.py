@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -323,6 +324,26 @@ def _read_learn_from_rejections() -> bool:
     return bool(cal.get("learn_from_rejections", True))
 
 
+def _hitl_mode_mismatch_response(tool_name: str, mode: str) -> str:
+    return json.dumps(
+        {
+            "success": False,
+            "error": "mode_mismatch",
+            "message": f"{tool_name} requires quant.pdr.mode=hitl; "
+            f"current mode={mode!r}. Set in ~/.hermes/config.yaml.",
+            "current_mode": mode,
+        }
+    )
+
+
+def _json_safe_float(value: Any) -> float | str:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return repr(value)
+    return parsed if math.isfinite(parsed) else repr(value)
+
+
 # ---------------------------------------------------------------------------
 # HITL React tool handlers (ADR-0015)
 # ---------------------------------------------------------------------------
@@ -502,15 +523,7 @@ def quant_propose(args: dict, **_kwargs) -> str:
 
     mode = _read_pdr_mode()
     if mode != "hitl":
-        return json.dumps(
-            {
-                "success": False,
-                "error": "mode_mismatch",
-                "message": f"quant_propose requires quant.pdr.mode=hitl; "
-                f"current mode={mode!r}. Set in ~/.hermes/config.yaml.",
-                "current_mode": mode,
-            }
-        )
+        return _hitl_mode_mismatch_response("quant_propose", mode)
 
     # ── B01 multi-leg producer branch (ADR-0029). ───────────────────────────────
     # When the caller passes a multi-leg strategy_kind, route to the multi-leg
@@ -609,15 +622,29 @@ def quant_approve(args: dict, **_kwargs) -> str:
     if not proposal_id:
         return json.dumps({"success": False, "error": "proposal_id is required"})
 
+    mode = _read_pdr_mode()
+    if mode != "hitl":
+        return _hitl_mode_mismatch_response("quant_approve", mode)
+
     size_override = args.get("size_override_pct")
     if size_override is not None:
         try:
             size_override = float(size_override)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return json.dumps(
                 {
                     "success": False,
                     "error": "size_override_pct must be a number",
+                }
+            )
+        if not math.isfinite(size_override):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "fill_size_invariant",
+                    "message": "size_override_pct must be finite",
+                    "proposal_id": proposal_id,
+                    "requested_fill_size_pct": repr(size_override),
                 }
             )
 
@@ -637,6 +664,7 @@ def quant_approve(args: dict, **_kwargs) -> str:
             get_default_store,
         )
         from hermes_quant.react.dispatch import select_reactor
+        from hermes_quant.react.paper import FillSizeInvariantError
     except Exception as exc:  # noqa: BLE001
         return json.dumps(
             {
@@ -702,6 +730,20 @@ def quant_approve(args: dict, **_kwargs) -> str:
             fill_size_pct=fill_size_pct,
             approver_user_id=_kwargs.get("user_id"),
             play_tag=play_tag,  # B13: advisor (default) | playbook
+        )
+    except FillSizeInvariantError as exc:
+        logger.warning("quant_approve: fill-size invariant rejected %s: %s", proposal_id, exc)
+        return json.dumps(
+            {
+                "success": False,
+                "error": "fill_size_invariant",
+                "message": str(exc),
+                "proposal_id": proposal_id,
+                "state": "pending",
+                "requested_fill_size_pct": _json_safe_float(fill_size_pct),
+                "advisor_kelly": _json_safe_float(advisor_kelly),
+            },
+            default=str,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("quant_approve: PaperReactor failed: %s", exc, exc_info=True)
@@ -794,6 +836,11 @@ def quant_reject(args: dict, **_kwargs) -> str:
     reason = args.get("reason")
     if not proposal_id:
         return json.dumps({"success": False, "error": "proposal_id is required"})
+
+    mode = _read_pdr_mode()
+    if mode != "hitl":
+        return _hitl_mode_mismatch_response("quant_reject", mode)
+
     if not reason or not str(reason).strip():
         return json.dumps(
             {

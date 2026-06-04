@@ -122,6 +122,15 @@ def _patch_executions_path(monkeypatch, path):
     monkeypatch.setattr(bus_module, "EXECUTION_BUS_PATH", path)
 
 
+def _set_hitl_mode(monkeypatch, tmp_path):
+    """Make tool-boundary mode checks see quant.pdr.mode=hitl."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    cfg_dir = tmp_path / ".hermes"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.yaml").write_text("quant:\n  pdr:\n    mode: hitl\n")
+
+
 # ---------------------------------------------------------------------------
 # 1: Happy path — propose -> approve -> execution written
 # ---------------------------------------------------------------------------
@@ -260,6 +269,7 @@ def test_quant_propose_refuses_when_advisor_gated(monkeypatch, tmp_path):
 
 
 def test_approve_nonexistent_returns_not_found(isolated_store, monkeypatch, tmp_path):
+    _set_hitl_mode(monkeypatch, tmp_path)
     _patch_default_store(monkeypatch, isolated_store)
     _patch_executions_path(monkeypatch, tmp_path / "executions.jsonl")
 
@@ -280,6 +290,7 @@ def test_approve_admissibility_rejected_short_stays_pending_and_honest(
     admissibility_rejected and keep the proposal PENDING (operator-facing honesty).
     The live oracle here fail-closes on missing account context, which is exactly
     the reject path that would otherwise be silently rubber-stamped as approved."""
+    _set_hitl_mode(monkeypatch, tmp_path)
     _patch_default_store(monkeypatch, isolated_store)
     exec_path = tmp_path / "executions.jsonl"
     _patch_executions_path(monkeypatch, exec_path)
@@ -333,6 +344,8 @@ def test_approve_already_approved_returns_state_mismatch(isolated_store):
 
 
 def test_reject_without_reason_returns_reason_required(isolated_store, monkeypatch):
+    tmp_path = isolated_store.bus_path.parent
+    _set_hitl_mode(monkeypatch, tmp_path)
     _patch_default_store(monkeypatch, isolated_store)
 
     proposal = isolated_store.propose(

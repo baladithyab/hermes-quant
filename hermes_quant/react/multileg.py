@@ -36,6 +36,7 @@ from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, append_locked
 from .admissibility_precondition import admissibility_reject_equity
 from .base import ExecutionRecord
 from .mleg_fill import LegFill, MlegFillResult, PaperBroker
+from .paper import _enforce_fill_size_invariant
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,7 @@ class MultiLegPaperReactor:
                 "multi-leg reactor is default-OFF; set "
                 "HERMES_QUANT_MULTILEG_REACTOR=1 to enable (gated by ADR-0029 D7)"
             )
+        fill_size_pct = _enforce_fill_size_invariant(proposal, fill_size_pct)
         return self._execute_enabled(
             proposal,
             fill_size_pct=fill_size_pct,

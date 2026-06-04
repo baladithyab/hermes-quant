@@ -11,16 +11,25 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import UTC, datetime
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
 from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, append_locked
-from .base import ExecutionRecord
+
 from .admissibility_precondition import admissibility_reject_equity
+from .base import ExecutionRecord
 
 logger = logging.getLogger(__name__)
+
+HARD_FILL_CEILING = 1.0
+
+
+class FillSizeInvariantError(ValueError):
+    """fill_size_pct violated the last-seam invariant. Fail closed."""
 
 
 def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
@@ -44,6 +53,33 @@ def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
         "bar_ts": record.bar_ts,  # ADR-0068: explicit bar-boundary anchor
         "play_tag": record.play_tag,  # B13: source of the fire
     }
+
+
+def _enforce_fill_size_invariant(_proposal: Any, fill_size_pct: float) -> float:
+    """Validate the signed NAV fraction before any money-moving side effect.
+
+    This is the final sanity invariant at the paper execution seam. It rejects
+    non-finite values and obviously insane magnitudes, but it deliberately does
+    not enforce the normal position cap. The portfolio-cap seam owns clipping
+    ordinary oversized fills.
+    """
+    try:
+        fill_size = float(fill_size_pct)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FillSizeInvariantError(
+            f"fill_size_pct={fill_size_pct!r} is non-finite; refusing to execute"
+        ) from exc
+    if not isinstance(fill_size_pct, Real) or not math.isfinite(fill_size):
+        raise FillSizeInvariantError(
+            f"fill_size_pct={fill_size_pct!r} is non-finite; refusing to execute"
+        )
+
+    if abs(fill_size) > HARD_FILL_CEILING:
+        raise FillSizeInvariantError(
+            f"|fill_size_pct|={abs(fill_size):.4f} exceeds hard ceiling "
+            f"{HARD_FILL_CEILING:.4f}; refusing to execute"
+        )
+    return fill_size_pct
 
 
 def _account_nav_usd() -> float | None:
@@ -129,6 +165,7 @@ class PaperReactor:
             Reflector is triggered asynchronously.  Default OFF — behavior
             is bit-identical to pre-Wave-4 when the env var is absent.
         """
+        fill_size_pct = _enforce_fill_size_invariant(proposal, fill_size_pct)
         decision_price = self._extract_decision_price(proposal)
         signal_id = self._extract_signal_id(proposal)
         now = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -364,24 +401,24 @@ class PaperReactor:
         Returns a ``(silence_record, effective_fill_size_pct, cap_metadata)``
         triad so the seam can express all three ADR-0087 outcomes:
 
-          * **Full silence** — the clip leaves no usable headroom (not fired,
+          * **Full silence** - the clip leaves no usable headroom (not fired,
             or clipped to ~0). Returns ``(ExecutionRecord, 0.0, None)`` where
             the record is an audit-only silenced record that is NOT appended to
             executions.jsonl and does NOT update PortfolioState. The caller
             early-returns it.
-          * **Partial scale** — the clip fits the fire only partially
+          * **Partial scale** - the clip fits the fire only partially
             (``fired=True`` with ``scale_factor < 1.0``). Returns
             ``(None, clipped.portfolio_target_pct, cap_metadata)`` where
             ``cap_metadata`` carries ``cap_scaled_from`` (original
             fill_size_pct), ``cap_scaled_to`` (clipped value), and
             ``cap_scale_factor``. The caller executes a real fill at the
             CLIPPED size and merges ``cap_metadata`` into the record.
-          * **Full pass** — the fire fits entirely (``scale_factor == 1.0``).
+          * **Full pass** - the fire fits entirely (``scale_factor == 1.0``).
             Returns ``(None, fill_size_pct, None)``: the fill proceeds at the
             original size, no cap metadata, behavior unchanged.
 
         With HERMES_QUANT_PORTFOLIO_CAPS unset the return is always
-        ``(None, fill_size_pct, None)`` — bit-for-bit the pre-ADR behavior.
+        ``(None, fill_size_pct, None)`` - bit-for-bit the pre-ADR behavior.
         """
 
         if os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") != "1":
@@ -389,12 +426,14 @@ class PaperReactor:
 
         # Flag ON path only: import the cap machinery lazily so the OFF path
         # stays import- and IO-free.
-        from hermes_quant.state.portfolio_state import get_portfolio_state
         from hermes_quant.risk.portfolio_normalize import (
             PortfolioCaps,
-            PortfolioState as RiskPortfolioState,
             clip_one_to_remaining_headroom,
         )
+        from hermes_quant.risk.portfolio_normalize import (
+            PortfolioState as RiskPortfolioState,
+        )
+        from hermes_quant.state.portfolio_state import get_portfolio_state
 
         ps = get_portfolio_state()
         # Resolve the account the SAME way the bus-append path does (see execute():
@@ -405,7 +444,7 @@ class PaperReactor:
         account_id = (rmeta.get("account_id") if isinstance(rmeta, dict) else None) or "paper-default"
         positions = ps.get_positions(account_id)
         pos_map: dict[str, float] = {}
-        for (asset_class, symbol), position in positions.items():
+        for (_asset_class, symbol), position in positions.items():
             # Positions are stored as NAV-fraction quantities in v0.1 (ADR-0041).
             # The cap seam reads them as target_position_pct by symbol.
             pos_map[symbol] = position.quantity
@@ -415,27 +454,12 @@ class PaperReactor:
 
         # De-risking guard (P1 trade-correctness fix).
         #
-        # positions are stored as the LATEST signed target_position_pct per
+        # Positions are stored as the latest signed target_position_pct per
         # symbol (ADR-0041 / portfolio_normalize.PortfolioState semantics), and
-        # `fill_size_pct` here is the NEW signed target for `proposal.symbol`.
-        # A symbol's contribution to GROSS exposure is abs(its target). So this
-        # fill changes that symbol's gross contribution from abs(existing) to
-        # abs(fill_size_pct); the marginal gross change is
-        #     abs(fill_size_pct) - abs(existing).
-        #
-        # clip_one_to_remaining_headroom() shrinks abs(target) to fit the book's
-        # REMAINING headroom — correct ONLY for fills that ADD gross exposure.
-        # It does not subtract the symbol's existing position, so it wrongly
-        # treats an exposure-REDUCING fill (one that moves the symbol toward
-        # zero / flips toward flat / shrinks abs) as if it consumed headroom.
-        # Codex P1: existing AAPL=+0.75, an approved -0.20 (partial sell) was
-        # clipped to -0.05 against 0.05 cash headroom, even though selling FREES
-        # headroom and must never be capped.
-        #
-        # If abs(new target) <= abs(existing), this fill does not add gross
-        # exposure (it reduces it or holds it flat) — pass through UNCLIPPED.
-        # Only genuinely exposure-INCREASING fills hit the headroom cap below,
-        # preserving #36's partial-scale + full-silence behavior exactly.
+        # fill_size_pct here is the new signed target for proposal.symbol. A
+        # symbol's contribution to gross exposure is abs(target). If this fill
+        # lowers or preserves abs(existing), it frees or preserves headroom and
+        # must not be clipped by remaining-headroom logic.
         existing = pos_map.get(proposal.symbol, 0.0)
         if abs(fill_size_pct) <= abs(existing) + 1e-9:
             return None, fill_size_pct, None
@@ -479,14 +503,8 @@ class PaperReactor:
         # The clip fired with usable headroom. Two sub-cases:
         #   scale_factor ~= 1.0  -> full pass: nothing changes, no cap metadata.
         #   scale_factor  < 1.0  -> partial scale: rewrite fill to the clipped
-        #                           NAV-fraction (already correctly signed by the
-        #                           clip) and surface the audit trail.
-        # clip_one_to_remaining_headroom() shrinks abs(target) to the remaining
-        # headroom and re-applies the original sign, so clipped.portfolio_target_pct
-        # is the new signed fill_size_pct directly — it composes linearly with the
-        # downstream slippage + record math (which only reads fill_size_pct).
+        #                           NAV-fraction and surface the audit trail.
         if clipped.scale_factor >= 1.0 - 1e-9:
-            # Full pass — unchanged behavior.
             return None, fill_size_pct, None
 
         cap_metadata: dict[str, Any] = {

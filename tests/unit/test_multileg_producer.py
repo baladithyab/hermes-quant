@@ -493,6 +493,26 @@ def _hitl_home(monkeypatch, tmp_path) -> None:
     (cfg_dir / "config.yaml").write_text("quant:\n  pdr:\n    mode: hitl\n")
 
 
+def _patch_default_store(monkeypatch, store: ProposalStore) -> None:
+    import hermes_quant.proposals as proposals_module
+
+    monkeypatch.setattr(proposals_module, "_default_store", store)
+
+
+def _patch_multileg_executions_path(monkeypatch, path) -> None:
+    import hermes_quant.daemon.signal_bus as bus_module
+    import hermes_quant.react.multileg as multileg_module
+
+    monkeypatch.setattr(multileg_module, "EXECUTION_BUS_PATH", path)
+    monkeypatch.setattr(bus_module, "EXECUTION_BUS_PATH", path)
+
+
+def _execution_records(path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
 def test_quant_propose_equity_branch_returns_none() -> None:
     """The multi-leg helper returns None for an equity (or absent) strategy_kind, so
     the equity quant_propose path runs unchanged (byte-identical)."""
@@ -523,10 +543,8 @@ def test_quant_propose_multileg_happy_path(gate_on, monkeypatch, tmp_path) -> No
     _call_chain(reader)
 
     # Point get_default_store at an isolated store.
-    import hermes_quant.proposals as proposals_module
-
     store = ProposalStore(bus_path=tmp_path / "p.jsonl", db_path=tmp_path / "p.db")
-    monkeypatch.setattr(proposals_module, "_default_store", store)
+    _patch_default_store(monkeypatch, store)
 
     from hermes_quant.tools import quant_propose
 
@@ -560,10 +578,8 @@ def test_quant_propose_multileg_gate_reject_does_not_persist(
     reader = ChainSnapshotReader(chains_dir=chains_dir)
     _call_chain(reader)
 
-    import hermes_quant.proposals as proposals_module
-
     store = ProposalStore(bus_path=tmp_path / "p.jsonl", db_path=tmp_path / "p.db")
-    monkeypatch.setattr(proposals_module, "_default_store", store)
+    _patch_default_store(monkeypatch, store)
 
     from hermes_quant.tools import quant_propose
 
@@ -583,3 +599,78 @@ def test_quant_propose_multileg_gate_reject_does_not_persist(
     assert out["success"] is False
     assert out["error"] == "gate_rejected"
     assert store.list_pending() == []
+
+
+def test_quant_approve_multileg_over_cap_override_rejected_before_bus_write(
+    gate_on,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("HERMES_QUANT_MULTILEG_REACTOR", "1")
+    _hitl_home(monkeypatch, tmp_path)
+    exec_path = tmp_path / "executions.jsonl"
+    _patch_multileg_executions_path(monkeypatch, exec_path)
+    reader = ChainSnapshotReader(chains_dir=tmp_path / "chains")
+    _call_chain(reader)
+    store = ProposalStore(bus_path=tmp_path / "p.jsonl", db_path=tmp_path / "p.db")
+    _patch_default_store(monkeypatch, store)
+    _, record = build_and_persist_multi_leg(
+        store=store,
+        symbol="NVDA",
+        asof=ASOF,
+        strategy_kind="covered_call",
+        nav=1_000_000.0,
+        options_buying_power=500_000.0,
+        held_shares=1000,
+        reader=reader,
+    )
+    assert record is not None
+
+    from hermes_quant.tools import quant_approve
+
+    out = json.loads(
+        quant_approve({"proposal_id": record.proposal_id, "size_override_pct": 2.0})
+    )
+
+    assert out["success"] is False
+    assert out["error"] == "fill_size_invariant"
+    assert out["state"] == "pending"
+    assert store.get(record.proposal_id).state == "pending"
+    assert _execution_records(exec_path) == []
+
+
+def test_quant_approve_multileg_nan_kelly_rejected_before_bus_write(
+    gate_on,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("HERMES_QUANT_MULTILEG_REACTOR", "1")
+    _hitl_home(monkeypatch, tmp_path)
+    exec_path = tmp_path / "executions.jsonl"
+    _patch_multileg_executions_path(monkeypatch, exec_path)
+    reader = ChainSnapshotReader(chains_dir=tmp_path / "chains")
+    _call_chain(reader)
+    store = ProposalStore(bus_path=tmp_path / "p.jsonl", db_path=tmp_path / "p.db")
+    _patch_default_store(monkeypatch, store)
+    _, record = build_and_persist_multi_leg(
+        store=store,
+        symbol="NVDA",
+        asof=ASOF,
+        strategy_kind="covered_call",
+        nav=1_000_000.0,
+        options_buying_power=500_000.0,
+        held_shares=1000,
+        reader=reader,
+        advisor_result={"risk_gate": {"pass": True, "kelly_fraction": float("nan")}},
+    )
+    assert record is not None
+
+    from hermes_quant.tools import quant_approve
+
+    out = json.loads(quant_approve({"proposal_id": record.proposal_id}))
+
+    assert out["success"] is False
+    assert out["error"] == "fill_size_invariant"
+    assert out["state"] == "pending"
+    assert store.get(record.proposal_id).state == "pending"
+    assert _execution_records(exec_path) == []

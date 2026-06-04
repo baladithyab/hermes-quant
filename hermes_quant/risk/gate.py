@@ -24,6 +24,7 @@ Per ADR-0004 §Configuration profiles: ships three named profiles
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -46,6 +47,13 @@ from hermes_quant.risk.kelly import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _emit_audit(
@@ -582,6 +590,18 @@ class DefaultRiskGate:
             probability=signal.confidence,
             magnitude=abs(signal.magnitude),
         )
+        if not all(
+            _is_finite_number(value)
+            for value in (
+                edge,
+                market.commission,
+                market.spread,
+                market.slippage_estimate,
+                market.volatility,
+            )
+        ):
+            self._n_silenced_cost_gate += 1
+            return self._silence(signal, reason="non_finite_risk_input")
         # PAPER-MODE-ONLY override (per docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md):
         # when `paper_zero_costs=True`, the threshold is forced to 0.0
         # INSTEAD of computing `cost_multiple × round_trip_cost` from
@@ -626,7 +646,10 @@ class DefaultRiskGate:
 
         # Rule 6: Position size from quarter-Kelly
         # variance = volatility² (volatility per ADR-0009 §P0-1 fix is stdev)
-        variance = market.volatility**2
+        variance = float(market.volatility) ** 2
+        if not _is_finite_number(variance):
+            self._n_silenced_cost_gate += 1
+            return self._silence(signal, reason="non_finite_risk_input")
         target_size = quarter_kelly_size(
             edge=edge,
             variance=variance,
