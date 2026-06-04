@@ -540,6 +540,45 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_ftb.add_argument("signal_log")
     p_ftb.add_argument("--freqtrade-config", default=None)
 
+    # Admission-precision pre-flip audit (ADR-0075 / seed 2b63). READ-ONLY gate
+    # check for the HERMES_QUANT_CATALYST_ONBOARDING flip: of the out-of-universe
+    # names onboarding would admit, did enough beat the forward-return bar?
+    p_ap = sub.add_parser(
+        "admission-precision",
+        help=(
+            "Audit the ADR-0075 admission-precision bar from an episodes file "
+            "(pre-flip gate for HERMES_QUANT_CATALYST_ONBOARDING). Read-only; "
+            "exit 0=pass, 1=fail, 2=error."
+        ),
+    )
+    p_ap.add_argument(
+        "--episodes-file",
+        required=True,
+        help="Path to an admission-episodes JSON file (e.g. the versioned "
+        "tests/fixtures/catalyst_onboarding/admission_episodes.v1.json).",
+    )
+    p_ap.add_argument(
+        "--min-hit-rate",
+        type=float,
+        default=0.6,
+        help="Minimum admission hit-rate to pass (default 0.6).",
+    )
+    p_ap.add_argument(
+        "--tau-conf",
+        type=float,
+        default=None,
+        help="Override admission confidence floor (default: onboarding.TAU_CONF).",
+    )
+    p_ap.add_argument(
+        "--tau-mag",
+        type=float,
+        default=None,
+        help="Override admission magnitude floor (default: onboarding.TAU_MAG).",
+    )
+    p_ap.add_argument(
+        "--json", action="store_true", help="Print raw JSON instead of a summary."
+    )
+
     # Config
     p_cfg = sub.add_parser("config", help="Configuration management")
     cfg_sub = p_cfg.add_subparsers(dest="config_action", required=True)
@@ -748,6 +787,12 @@ def dispatch(args: argparse.Namespace) -> int:
         from hermes_quant.cli.halts import cmd_emergency_stop
 
         return cmd_emergency_stop(args)
+
+    # admission-precision pre-flip audit (ADR-0075 / seed 2b63) — read-only gate.
+    if cmd == "admission-precision":
+        from hermes_quant.cli.admission_precision import cmd_admission_precision
+
+        return cmd_admission_precision(args)
 
     # Everything else: scaffold notice
     print(f"hermes quant {cmd}: NOT YET IMPLEMENTED in v0.1.0 scaffold.")
