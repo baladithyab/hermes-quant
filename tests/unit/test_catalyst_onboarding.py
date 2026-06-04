@@ -58,6 +58,24 @@ def _write_packet(
         f.write(json.dumps(pkt.to_dict(include_hash=True), default=str) + "\n")
 
 
+def _raw_packet(
+    asset: str,
+    *,
+    confidence: float,
+    magnitude: float,
+    stance: str = "bullish",
+    asof: str = "2026-01-01T09:00:00Z",
+) -> dict:
+    return {
+        "asset": asset,
+        "asof": asof,
+        "horizon": "1d",
+        "stance": stance,
+        "confidence": confidence,
+        "magnitude": magnitude,
+    }
+
+
 @pytest.fixture
 def both_flags_on(monkeypatch):
     monkeypatch.setenv("HERMES_QUANT_CATALYST_ONBOARDING", "1")
@@ -106,6 +124,26 @@ def test_admissions_threshold_gate(monkeypatch, tmp_path, both_flags_on, asof):
     _write_packet(store, asset="RKLB", asof="2026-01-01T09:00:00Z", confidence=0.80, magnitude=0.06)
     out = onboarding.catalyst_admissions(set(), tradeable=lambda s: True, asof=asof)
     assert [a.symbol for a in out] == ["RKLB"]
+
+
+def test_admissions_rejects_nonfinite_packet_rank_fields(monkeypatch, both_flags_on, asof):
+    symbols = ["GOOD", "NANCONF", "NANMAG", "INFRANK"]
+    monkeypatch.setattr(
+        propagation,
+        "load_graph",
+        lambda *a, **k: (_graph_with_targets(*symbols), {}),
+    )
+    packets = {
+        "GOOD": [_raw_packet("GOOD", confidence=0.80, magnitude=0.06)],
+        "NANCONF": [_raw_packet("NANCONF", confidence=float("nan"), magnitude=0.06)],
+        "NANMAG": [_raw_packet("NANMAG", confidence=0.80, magnitude=float("nan"))],
+        "INFRANK": [_raw_packet("INFRANK", confidence=1e308, magnitude=1e308)],
+    }
+    monkeypatch.setattr(synthesize, "load_packets_for", lambda sym, _asof: packets[sym])
+
+    out = onboarding.catalyst_admissions(set(), tradeable=lambda s: True, asof=asof)
+
+    assert [a.symbol for a in out] == ["GOOD"]
 
 
 def test_admissions_magnitude_floor(monkeypatch, tmp_path, both_flags_on, asof):

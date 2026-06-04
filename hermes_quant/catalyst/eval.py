@@ -22,12 +22,19 @@ deterministic and offline-testable.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from numbers import Real
+from typing import Any
 
 from hermes_quant.catalyst.ingest import CatalystItem
 from hermes_quant.catalyst.onboarding import TAU_CONF, TAU_MAG
 from hermes_quant.catalyst.propagation import PropagationEdge
 from hermes_quant.catalyst.synthesize import synthesize_packets
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, Real) and math.isfinite(float(value))
 
 
 @dataclass(frozen=True)
@@ -190,10 +197,11 @@ def run_sign_consistency(
 
 
 def _sign_item(text: str) -> CatalystItem:
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
+
     return CatalystItem(
         title=text,
-        published_at=datetime.now(timezone.utc),
+        published_at=datetime.now(UTC),
         source="sign-eval",
         link="n/a",
     )
@@ -431,6 +439,16 @@ def _admission_reject_reason(
     conf/mag are below the act-on floor, neutral has no tradeable direction, and
     untradeable is fail-closed (admission must never mint an unfillable order).
     """
+    if not _is_finite_number(tau_conf):
+        return "non_finite_tau_conf"
+    if not _is_finite_number(tau_mag):
+        return "non_finite_tau_mag"
+    if not _is_finite_number(e.confidence):
+        return "non_finite_confidence"
+    if not _is_finite_number(e.magnitude):
+        return "non_finite_magnitude"
+    if not _is_finite_number(e.realized_forward_return):
+        return "non_finite_realized_forward_return"
     if e.in_universe:
         return "in_universe (screen artifact, not a catalyst admission)"
     if e.confidence < tau_conf:
