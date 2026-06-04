@@ -8,9 +8,10 @@ DROPPED.
 
 This module is the enforcement seam. ``enforce_grounding(views, ctx)`` runs at
 the analyst-views → aggregator boundary (``advisor.py`` Step 5.5). For every
-analyst view that OPTED INTO grounding, it verifies the view's numeric claims
-against the ``GroundTruthBlock`` carried in ``ctx.extras['ground_truth_block']``
-and DROPS the view from the vote when verification fails.
+analyst view that OPTED INTO grounding, it verifies the view's full numeric
+claim text against the ``GroundTruthBlock`` carried in
+``ctx.extras['ground_truth_block']`` and DROPS the view from the vote when
+verification fails.
 
 Fail-CLOSED (money-software posture, [[hermes-quant-posture]])
 --------------------------------------------------------------
@@ -40,8 +41,9 @@ other hermes-quant feature flags). Absent or ``"1"`` → enforce (DEFAULT-ON).
 Determinism / asof-honesty
 --------------------------
 Pure function of ``(views, ctx)``. No wall-clock ``now()``, no RNG. The verifier
-itself only reads ``view.rationale`` and the (already as-of-sliced) block, so the
-seam is replay-stable.
+reads the full semantic packet summary when available (falling back to
+``view.rationale``) and the already as-of-sliced block, so the seam is
+replay-stable.
 """
 
 from __future__ import annotations
@@ -77,6 +79,47 @@ def _opted_into_grounding(view: AnalystView) -> bool:
     """True iff *view* declared grounding participation in its metadata."""
     meta = view.metadata or {}
     return any(key in meta for key in _GROUNDING_MARKERS)
+
+
+def _iter_semantic_packet_payloads(extras: dict[str, Any]) -> list[Any]:
+    raw_packets = extras.get("semantic_packets")
+    if raw_packets is None:
+        raw_packet = extras.get("semantic_packet")
+        raw_packets = [raw_packet] if raw_packet is not None else []
+    if isinstance(raw_packets, dict):
+        raw_packets = [raw_packets]
+    if not isinstance(raw_packets, (list, tuple)):
+        return []
+    return list(raw_packets)
+
+
+def _full_claim_text_for_view(view: AnalystView, ctx: MarketContext) -> str | None:
+    """Return the untruncated semantic claim text for *view* when resolvable.
+
+    HermesSemanticAnalyst stores the selected packet hash in metadata and leaves
+    the raw packet in ``ctx.extras``. Use that packet summary for verification so
+    a display-truncated rationale cannot hide a numeric claim.
+    """
+    meta = view.metadata or {}
+    packet_hash = meta.get("packet_hash")
+    if not isinstance(packet_hash, str) or not packet_hash:
+        return None
+
+    extras = dict(getattr(ctx, "extras", None) or {})
+    payloads = _iter_semantic_packet_payloads(extras)
+    if not payloads:
+        return None
+
+    from hermes_quant.semantic import parse_semantic_packet
+
+    for raw in payloads:
+        try:
+            packet = parse_semantic_packet(raw)
+        except Exception:  # noqa: BLE001
+            continue
+        if packet_hash in {packet.packet_hash, packet.computed_hash}:
+            return packet.summary
+    return None
 
 
 def enforce_grounding(
@@ -128,7 +171,11 @@ def enforce_grounding(
             kept.append(view)
             continue
         try:
-            result = verifier.verify(view, block)
+            result = verifier.verify(
+                view,
+                block,
+                claim_text=_full_claim_text_for_view(view, ctx),
+            )
         except Exception as exc:  # noqa: BLE001
             # A verifier failure must FAIL CLOSED: a grounded view we cannot
             # verify is dropped, not trusted. (The verifier is pure and tested;

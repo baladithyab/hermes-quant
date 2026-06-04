@@ -21,9 +21,10 @@ import numpy as np
 import pandas as pd
 
 from hermes_quant.advisor import recommend
-from hermes_quant.grounding.data_grounding import Bar, build_ground_truth_block
+from hermes_quant.analysts.semantic import HermesSemanticAnalyst
+from hermes_quant.grounding.data_grounding import Bar, build_ground_truth_block, render_for_prompt
 from hermes_quant.protocol import AnalystView, MarketContext
-
+from hermes_quant.semantic import semantic_packet_from_dict
 
 # --- Fixtures ----------------------------------------------------------------
 
@@ -118,6 +119,38 @@ def _block():
     return build_ground_truth_block("AAPL", "2026-05-27", ohlcv_bars=bars)
 
 
+def _large_block():
+    from datetime import date, timedelta
+
+    bars = []
+    d = date(2026, 3, 2)
+    for i in range(60):
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        close = 170.00 + i * 0.25
+        bars.append(Bar(date_str=d.isoformat(), open=close - 0.25, high=close + 0.5,
+                        low=close - 0.5, close=close, volume=5_000_000 + i))
+        d += timedelta(days=1)
+    return build_ground_truth_block("AAPL", "2026-06-01", ohlcv_bars=bars)
+
+
+def _semantic_packet(summary: str):
+    return semantic_packet_from_dict(
+        {
+            "schema_version": 1,
+            "asset": "AAPL",
+            "asof": "2026-06-01T00:00:00Z",
+            "horizon": "1d",
+            "stance": "bullish",
+            "confidence": 0.75,
+            "magnitude": 0.02,
+            "summary": summary,
+            "sources": [{"type": "note", "ref": "unit-test"}],
+            "model": "hermes:test-model",
+        }
+    ).to_dict()
+
+
 _ASOF = "2026-06-01"
 
 
@@ -135,7 +168,6 @@ def test_ungrounded_grounded_view_dropped_from_vote():
         market_extras={"ground_truth_block": _block()},
         include_lessons=False,
     )
-    voting = {v["analyst"] for v in out["analyst_views"]}
     # The fabricated grounded analyst's view must have been verified out before
     # aggregation (it does not appear among the aggregator's components).
     agg = out["aggregated_signal"]
@@ -176,6 +208,33 @@ def test_audit_annotation_matches_the_actually_dropped_view():
     )
     assert avs[1].get("grounding_uncited_claims"), "dropped entry carries its uncited claims"
     # And the surviving vote is the cited one.
+    assert out["aggregated_signal"]["n_components"] == 1
+
+
+def test_semantic_summary_hidden_by_gt_truncation_is_still_dropped(monkeypatch):
+    """Full semantic summary is verified even when rationale truncation hides it."""
+    monkeypatch.setenv("HERMES_QUANT_GROUNDING_ENFORCE", "1")
+    block = _large_block()
+    assert len(render_for_prompt(block)) > 512
+
+    summary = "Bullish thesis. Fabricated upside target is 9999.00."
+    provider = _StubProvider(_daily_df())
+    out = recommend(
+        "AAPL", asset_class="equity", timeframe="1d", as_of=_ASOF,
+        provider=provider,
+        analysts=[HermesSemanticAnalyst(), _PlainAnalyst("classical_ta", direction=-1)],
+        market_extras={
+            "ground_truth_block": block,
+            "semantic_packets": [_semantic_packet(summary)],
+        },
+        include_lessons=False,
+    )
+
+    semantic_views = [v for v in out["analyst_views"] if v["analyst"] == "hermes_semantic"]
+    assert len(semantic_views) == 1
+    assert "9999.00" not in (semantic_views[0]["rationale"] or "")
+    assert semantic_views[0].get("grounding_dropped") is True
+    assert "9999.00" in semantic_views[0].get("grounding_uncited_claims", [])
     assert out["aggregated_signal"]["n_components"] == 1
 
 
@@ -245,8 +304,9 @@ def test_multi_horizon_drops_ungrounded_view():
 
 def test_multi_horizon_grounded_view_kept_byte_identical():
     """A fully-grounded multi-horizon view is kept identically with the seam on/off."""
-    from hermes_quant.advisor import recommend_multi_horizon
     import os
+
+    from hermes_quant.advisor import recommend_multi_horizon
 
     block = _block()
     rationale = f"Close confirmed at {block.ohlcv_60d[-1].close:.4f} on ground truth."
