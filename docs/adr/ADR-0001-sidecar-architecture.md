@@ -1,6 +1,6 @@
 # ADR-0001: Sidecar architecture — daemon decoupled from gateway
 
-**Status**: proposed
+**Status**: Accepted (2026-05-12), implemented
 **Date**: 2026-05-12
 **Deciders**: Codeseys, ARIA (Hermes Agent)
 **Supersedes**: —

@@ -1,6 +1,6 @@
 # ADR-0013: Hermes-core integration stance + dual-surface architecture
 
-**Status:** Proposed (2026-05-13), target v0.1.2
+**Status:** Accepted (2026-05-13), implemented
 **Supersedes:** none
 **Amends:** none (locks integration boundary for ADR-0001, ADR-0007)
 **Cross-cuts:** ADR-0002 (Analyst Protocol), ADR-0003 (calibrators), ADR-0004 (risk gate), ADR-0005 (data layer), ADR-0007 (plugin shape / canonical CLI), ADR-0010 (settlement journal), ADR-0011 (portfolio reconstruction), ADR-0012 (LLMAnalyst deferred)

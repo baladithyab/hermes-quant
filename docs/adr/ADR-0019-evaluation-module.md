@@ -1,6 +1,6 @@
 # ADR-0019: `evaluation/` module promotion (CV + lookahead + DSR)
 
-**Status**: Proposed
+**Status**: Accepted (2026-05-13), implemented
 **Date**: 2026-05-13
 **Target**: v0.3.0
 **Cross-cuts**: ADR-0006 (RL deferred + lookahead invariant), AGENTS.md "No look-ahead bias", founding charter §"What works — walk-forward training with embargo"

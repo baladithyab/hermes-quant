@@ -1,6 +1,6 @@
 # ADR-0018: KronosAnalyst — third voice, not the oracle
 
-**Status**: Proposed
+**Status**: Accepted (2026-05-13), implemented
 **Date**: 2026-05-13
 **Target**: v0.3.0
 **Cross-cuts**: ADR-0002 (Analyst Protocol), ADR-0003 (BMA aggregator), ADR-0012 (LLMAnalyst protocol — separate, deferred), founding charter §"Kronos is one analyst, not the whole system"

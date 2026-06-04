@@ -1,6 +1,6 @@
 # ADR-0016: Autonomous mode (silence-bias gated paper-trading)
 
-**Status**: Proposed
+**Status**: Accepted (2026-05-13), implemented
 **Date**: 2026-05-13
 **Target**: v0.2.0 (paper-only); live deferred to v0.3+
 **Cross-cuts**: ADR-0004 (risk gate), ADR-0010 (settlement journal), ADR-0013 (integration stance), ADR-0014 (advisor), ADR-0015 (HITL React), founding charter §"REACT silence-by-default gates"

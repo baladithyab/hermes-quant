@@ -1,6 +1,6 @@
 # ADR-0002: Analyst protocol contract
 
-**Status**: proposed
+**Status**: Accepted (2026-05-12), implemented
 **Date**: 2026-05-12
 
 ## Context

@@ -1,6 +1,6 @@
 # ADR-0015: HITL propose-decide-react surface
 
-**Status:** Proposed (target: v0.1.2)
+**Status:** Accepted (2026-05-13), implemented
 **Supersedes:** none
 **Amends:** none (extends ADR-0013 dual-surface; completes the third PDR mode alongside ADR-0014)
 **Cross-cuts:** ADR-0001 (sidecar), ADR-0002 (analyst protocol), ADR-0003 (calibrators), ADR-0004 (risk gate), ADR-0007 (plugin shape), ADR-0008 (signal bus), ADR-0009 (executions back-channel), ADR-0010 (settlement journal), ADR-0011 (portfolio reconstruction), ADR-0012 (LLMAnalyst deferred), ADR-0013 (integration stance), ADR-0014 (advisor surface)

@@ -1,6 +1,6 @@
 # ADR-0020: Backtest harness — `hermes_quant.backtest`
 
-**Status**: Proposed
+**Status**: Accepted (2026-05-13), implemented
 **Date**: 2026-05-13 (post v0.3.1)
 **Target**: v0.3.2
 **Cross-cuts**: ADR-0014 (advisor), ADR-0017 (ccxt), ADR-0019 (evaluation/cv + dsr), ADR-0010 (settlement journal), AGENTS.md "Reproducibility"

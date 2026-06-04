@@ -1,6 +1,6 @@
 # ADR-0006: RL aggregator deferred to v0.2 with concrete success criterion
 
-**Status**: proposed
+**Status**: Proposed (deferred to v0.2)
 **Date**: 2026-05-12
 
 ## Context

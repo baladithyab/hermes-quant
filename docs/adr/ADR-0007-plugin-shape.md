@@ -1,6 +1,6 @@
 # ADR-0007: Plugin shape — Hermes plugin tools = read-only views; daemon owns the loop
 
-**Status**: proposed
+**Status**: Accepted (2026-05-12), implemented
 **Date**: 2026-05-12
 
 ## Context

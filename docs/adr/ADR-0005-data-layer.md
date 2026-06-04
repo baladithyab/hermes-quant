@@ -1,6 +1,6 @@
 # ADR-0005: Data layer — yfinance bootstrap, ccxt for crypto, alpaca-py for equities
 
-**Status**: proposed
+**Status**: Accepted (2026-05-12), implemented
 **Date**: 2026-05-12
 
 ## Context

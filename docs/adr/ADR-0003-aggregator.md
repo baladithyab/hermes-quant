@@ -1,6 +1,6 @@
 # ADR-0003: Aggregator design — Bayesian baseline + logistic stacking, RL deferred
 
-**Status**: proposed
+**Status**: Accepted (2026-05-12), implemented
 **Date**: 2026-05-12
 
 ## Context
