@@ -438,6 +438,7 @@ class DefaultRiskGate:
         self._n_silenced_min_trade = 0
         self._n_silenced_lookahead = 0
         self._n_silenced_event_risk = 0
+        self._n_silenced_nonfinite_portfolio = 0
 
     def _audit_rejection(self, signal: AggregatedSignal, reason: str) -> None:
         """Emit a 'gate_rejection' audit event. Failures are swallowed."""
@@ -477,6 +478,22 @@ class DefaultRiskGate:
         self._audit_rejection(signal, reason)
         return None
 
+    def _flatten_nonfinite_portfolio(
+        self,
+        signal: AggregatedSignal,
+        portfolio: Portfolio,
+    ) -> Action:
+        self._n_silenced_nonfinite_portfolio += 1
+        action = Action(
+            target_position_pct=0.0,
+            reason="non_finite_portfolio_state",
+            halt=True,
+            halt_scope=(portfolio.account_id, portfolio.asset_class, None),
+            halt_until=None,
+        )
+        self._audit_rejection(signal, action.reason)
+        return action
+
     def gate(
         self,
         signal: AggregatedSignal,
@@ -511,12 +528,20 @@ class DefaultRiskGate:
                         reason=f"lookahead_tainted_{result.violations[0].evidence_id}",
                     )
 
+        try:
+            drawdown_pct = portfolio.drawdown_pct
+            daily_loss_pct = portfolio.daily_loss_pct
+        except Exception:  # noqa: BLE001 - unknowable account state fails closed
+            return self._flatten_nonfinite_portfolio(signal, portfolio)
+        if not _is_finite_number(drawdown_pct) or not _is_finite_number(daily_loss_pct):
+            return self._flatten_nonfinite_portfolio(signal, portfolio)
+
         # Rule 1: Drawdown circuit breaker
-        if portfolio.drawdown_pct > self.config.max_drawdown_pct:
+        if drawdown_pct > self.config.max_drawdown_pct:
             self._n_silenced_drawdown += 1
             action = Action(
                 target_position_pct=0.0,
-                reason=f"drawdown_circuit_breaker_{portfolio.drawdown_pct:.4f}",
+                reason=f"drawdown_circuit_breaker_{drawdown_pct:.4f}",
                 halt=True,
                 halt_scope=(portfolio.account_id, portfolio.asset_class, None),
                 halt_until=None,  # explicit resume only
@@ -525,11 +550,11 @@ class DefaultRiskGate:
             return action
 
         # Rule 2: Daily-loss circuit breaker
-        if portfolio.daily_loss_pct > self.config.max_daily_loss_pct:
+        if daily_loss_pct > self.config.max_daily_loss_pct:
             self._n_silenced_daily_loss += 1
             action = Action(
                 target_position_pct=0.0,
-                reason=f"daily_loss_circuit_breaker_{portfolio.daily_loss_pct:.4f}",
+                reason=f"daily_loss_circuit_breaker_{daily_loss_pct:.4f}",
                 halt=True,
                 halt_scope=(portfolio.account_id, portfolio.asset_class, None),
                 halt_until=_next_session_open(market.tz, portfolio.asof),
@@ -562,7 +587,12 @@ class DefaultRiskGate:
             # flat in its own direction is opening/increasing; a signal opposite
             # the current position is de-risking and is NEVER blocked. Flat
             # (current==0) is treated as opening.
-            current = portfolio.current_position_pct(signal.asset)
+            try:
+                current = portfolio.current_position_pct(signal.asset)
+            except Exception:  # noqa: BLE001 - unknowable account state fails closed
+                return self._flatten_nonfinite_portfolio(signal, portfolio)
+            if not _is_finite_number(current):
+                return self._flatten_nonfinite_portfolio(signal, portfolio)
             is_opening_or_increasing = signal.direction * current >= 0
             if is_opening_or_increasing:
                 event_risk = (signal.metadata or {}).get("event_risk")
@@ -660,7 +690,12 @@ class DefaultRiskGate:
         )
 
         # Rule 7: Minimum trade size guard (anti-churn)
-        current = portfolio.current_position_pct(signal.asset)
+        try:
+            current = portfolio.current_position_pct(signal.asset)
+        except Exception:  # noqa: BLE001 - unknowable account state fails closed
+            return self._flatten_nonfinite_portfolio(signal, portfolio)
+        if not _is_finite_number(current):
+            return self._flatten_nonfinite_portfolio(signal, portfolio)
         delta = target_size - current
         if abs(delta) < self.config.min_trade_size:
             self._n_silenced_min_trade += 1
@@ -704,6 +739,7 @@ class DefaultRiskGate:
             "n_silenced_min_trade": self._n_silenced_min_trade,
             "n_silenced_lookahead": self._n_silenced_lookahead,
             "n_silenced_event_risk": self._n_silenced_event_risk,
+            "n_silenced_nonfinite_portfolio": self._n_silenced_nonfinite_portfolio,
         }
 
 

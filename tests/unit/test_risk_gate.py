@@ -121,6 +121,34 @@ def _portfolio(
     )
 
 
+class _PortfolioStateFault:
+    account_id = "alpaca-paper"
+    asset_class = "crypto"
+    asof = pd.Timestamp("2026-05-13T00:00:00Z")
+
+    def __init__(
+        self,
+        *,
+        drawdown_pct: float | None = 0.0,
+        daily_loss_pct: float | None = 0.0,
+        current_position: float | None = 0.0,
+    ) -> None:
+        self._drawdown_pct = drawdown_pct
+        self._daily_loss_pct = daily_loss_pct
+        self._current_position = current_position
+
+    @property
+    def drawdown_pct(self):
+        return self._drawdown_pct
+
+    @property
+    def daily_loss_pct(self):
+        return self._daily_loss_pct
+
+    def current_position_pct(self, asset: str):
+        return self._current_position
+
+
 @pytest.fixture()
 def halt_state(tmp_path: Path) -> HaltStateSQLite:
     return HaltStateSQLite(
@@ -166,6 +194,61 @@ class TestRule0Halt:
         action = g.gate(_signal(), _market(), _portfolio(drawdown=0.50), halt_state)
         # But halt silences entirely — no flatten action emitted
         assert action is None
+
+
+class TestNonFinitePortfolioState:
+    @pytest.mark.parametrize(
+        ("drawdown_pct", "daily_loss_pct", "current_position"),
+        [
+            (float("nan"), 0.0, 0.0),
+            (0.0, float("nan"), 0.0),
+            (0.0, 0.0, float("nan")),
+            (None, 0.0, 0.0),
+        ],
+    )
+    def test_nonfinite_portfolio_state_flattens_and_halts(
+        self,
+        halt_state,
+        drawdown_pct,
+        daily_loss_pct,
+        current_position,
+    ):
+        g = DefaultRiskGate(
+            RiskConfig(cost_multiple=0.5, min_trade_size=0.0, max_position_pct=0.20)
+        )
+        action = g.gate(
+            _signal(direction=1, magnitude=0.10, confidence=0.90),
+            _market(volatility=0.02, commission=0.00005, spread=0.00005, slippage=0.00005),
+            _PortfolioStateFault(
+                drawdown_pct=drawdown_pct,
+                daily_loss_pct=daily_loss_pct,
+                current_position=current_position,
+            ),
+            halt_state,
+        )
+
+        assert action is not None
+        assert action.target_position_pct == 0.0
+        assert action.halt is True
+        assert action.reason == "non_finite_portfolio_state"
+        assert g.stats()["n_silenced_nonfinite_portfolio"] == 1
+        assert g.stats()["n_actions"] == 0
+
+    def test_finite_portfolio_state_still_emits_existing_action(self, halt_state):
+        g = DefaultRiskGate(
+            RiskConfig(cost_multiple=0.5, min_trade_size=0.0, max_position_pct=0.20)
+        )
+        action = g.gate(
+            _signal(direction=1, magnitude=0.10, confidence=0.90),
+            _market(volatility=0.02, commission=0.00005, spread=0.00005, slippage=0.00005),
+            _portfolio(drawdown=0.0, daily_loss=0.0, current_position=0.0),
+            halt_state,
+        )
+
+        assert action is not None
+        assert action.target_position_pct > 0.0
+        assert action.halt is False
+        assert g.stats()["n_silenced_nonfinite_portfolio"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +353,7 @@ class TestRule4Cooldown:
         loss_at = pd.Timestamp("2026-05-12T22:30:00Z")
         g.record_loss("alpaca-paper", "crypto", "BTC/USDT", loss_at)
 
-        action = g.gate(
+        g.gate(
             _signal(direction=1, magnitude=0.05, confidence=0.9),
             _market(volatility=0.02),
             _portfolio(),

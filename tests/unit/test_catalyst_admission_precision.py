@@ -211,3 +211,37 @@ def test_flat_return_admitted_but_not_scored():
     assert res.n_scored == 1  # ZZZ admitted but flat -> not scored
     assert res.hits == 1
     assert res.passed
+
+
+def test_nonfinite_admission_evidence_rejected_not_counted_as_hits():
+    eps = [
+        AdmissionEpisode("GOOD", "bullish", 0.80, 0.06, 3.0, in_universe=False),
+        AdmissionEpisode("NANCONF", "bearish", float("nan"), 0.06, -3.0, in_universe=False),
+        AdmissionEpisode("NANMAG", "bearish", 0.80, float("nan"), -3.0, in_universe=False),
+        AdmissionEpisode("NANRET", "bearish", 0.80, 0.06, float("nan"), in_universe=False),
+    ]
+
+    res = run_admission_precision(eps, min_hit_rate=MIN_HIT_RATE)
+
+    assert res.n_admitted == 1
+    assert res.n_scored == 1
+    assert res.hits == 1
+    assert {r.split(":")[0] for r in res.rejected} == {"NANCONF", "NANMAG", "NANRET"}
+
+
+def test_nonfinite_admission_thresholds_reject_all_rows():
+    eps = [
+        AdmissionEpisode("LUNR", "bullish", 0.80, 0.06, 3.0, in_universe=False),
+    ]
+
+    res_conf = run_admission_precision(eps, min_hit_rate=MIN_HIT_RATE, tau_conf=float("nan"))
+    res_mag = run_admission_precision(eps, min_hit_rate=MIN_HIT_RATE, tau_mag=float("inf"))
+
+    assert res_conf.n_admitted == 0
+    assert res_conf.n_scored == 0
+    assert not res_conf.passed
+    assert res_conf.rejected == ("LUNR:non_finite_tau_conf",)
+    assert res_mag.n_admitted == 0
+    assert res_mag.n_scored == 0
+    assert not res_mag.passed
+    assert res_mag.rejected == ("LUNR:non_finite_tau_mag",)

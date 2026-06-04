@@ -22,10 +22,13 @@ Rails (money-software, ADR-0075):
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from numbers import Real
+from typing import Any
 
 # ADR-0075 thresholds (conservative start; tune via eval-gate before flag-flip).
 TAU_CONF = 0.60  # packet confidence floor for admission
@@ -50,6 +53,24 @@ class CatalystAdmission:
 # Production wires default_tradeable, which prefers the ADR-0077 oracle's
 # is_tradeable_long(symbol) (asset.tradable AND asset.fractionable).
 TradeabilityCheck = Callable[[str], bool]
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, Real) and math.isfinite(float(value))
+
+
+def _packet_rank_fields(packet: dict) -> tuple[float, float, float] | None:
+    try:
+        conf = float(packet.get("confidence", 0.0))
+        mag = float(packet.get("magnitude", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not _is_finite_number(conf) or not _is_finite_number(mag):
+        return None
+    rank = conf * mag
+    if not _is_finite_number(rank):
+        return None
+    return conf, mag, rank
 
 
 def catalyst_admissions(
@@ -77,6 +98,8 @@ def catalyst_admissions(
         or os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "0") != "1"
     ):
         return []
+    if not _is_finite_number(tau_conf) or not _is_finite_number(tau_mag):
+        return []
     try:
         from hermes_quant.catalyst.propagation import coverage_against_universe, load_graph
         from hermes_quant.catalyst.synthesize import load_packets_for
@@ -90,9 +113,19 @@ def catalyst_admissions(
             packets = load_packets_for(sym, asof)
             if not packets:
                 continue
-            best = max(packets, key=lambda p: (p.get("confidence", 0.0), p.get("asof", "")))
-            conf = float(best.get("confidence", 0.0))
-            mag = float(best.get("magnitude", 0.0))
+            ranked_packets: list[tuple[dict, float, float, float]] = []
+            for packet in packets:
+                fields = _packet_rank_fields(packet)
+                if fields is None:
+                    continue
+                conf, mag, rank = fields
+                ranked_packets.append((packet, conf, mag, rank))
+            if not ranked_packets:
+                continue
+            best, conf, mag, _rank = max(
+                ranked_packets,
+                key=lambda p: (p[1], p[0].get("asof", "")),
+            )
             if conf < tau_conf or mag < tau_mag:
                 continue
             stance = best.get("stance", "")
