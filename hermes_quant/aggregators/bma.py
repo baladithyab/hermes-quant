@@ -164,6 +164,55 @@ STACKING_CORR_WINDOW = 200
 # 2-sample correlation.
 STACKING_CORR_MIN_PAIRS = 10
 
+# c96e: recency-decay sample ring. Bounded per-analyst log of
+# (observable_asof_iso, correct) used by the recency-weighted refit when
+# HERMES_QUANT_L2_POSTERIOR_DECAY=1. Bounded so memory is O(n_analysts × window)
+# and so ancient samples (whose decay weight is ~0 anyway) are dropped.
+DECAY_SAMPLE_WINDOW = 500
+
+# Default recency half-life (days) for the decayed refit: a settled sample
+# observable one half-life before the decision contributes half the weight of a
+# brand-new one. Chosen to track skill over a quarter-ish horizon without
+# discarding the recent past.
+DEFAULT_DECAY_HALF_LIFE_DAYS = 30.0
+
+# Approximate horizon → timedelta mapping, used ONLY to stamp the *observable*
+# time of a settled sample (decision asof + horizon) so the recency refit's
+# no-lookahead filter is honest. Calendar months/quarters use fixed day counts;
+# exact calendar arithmetic is unnecessary for a recency weight.
+_HORIZON_TO_TIMEDELTA: dict[str, pd.Timedelta] = {
+    "5m": pd.Timedelta(minutes=5),
+    "15m": pd.Timedelta(minutes=15),
+    "1h": pd.Timedelta(hours=1),
+    "4h": pd.Timedelta(hours=4),
+    "1d": pd.Timedelta(days=1),
+    "1w": pd.Timedelta(weeks=1),
+    "1M": pd.Timedelta(days=30),
+    "1Q": pd.Timedelta(days=90),
+}
+
+
+def _horizon_delta(horizon: str) -> pd.Timedelta:
+    """Map a horizon label to the delay until its outcome is observable.
+
+    Unknown horizons fall back to 1 day — a positive delay, so an unrecognized
+    horizon can never make a sample observable *before* its decision (which
+    would be a lookahead).
+    """
+    return _HORIZON_TO_TIMEDELTA.get(horizon, pd.Timedelta(days=1))
+
+
+def _decay_enabled() -> bool:
+    """True iff HERMES_QUANT_L2_POSTERIOR_DECAY=1 (read at CALL TIME).
+
+    c96e recency refit (DEFAULT-OFF, separate from persistence). When unset, the
+    per-analyst weight is the plain Beta posterior accuracy (byte-identical to
+    pre-c96e). When set, the weight is a recency-weighted, asof-honest refit over
+    the per-analyst sample ring: older samples decay, and samples whose outcome
+    was not yet observable at the decision asof are excluded.
+    """
+    return os.environ.get("HERMES_QUANT_L2_POSTERIOR_DECAY", "0") == "1"
+
 
 def _stacking_enabled() -> bool:
     """True iff HERMES_QUANT_STACKING=1 (read at CALL TIME, not import time).
@@ -172,6 +221,18 @@ def _stacking_enabled() -> bool:
     aggregator byte-identical to the pre-B50 BMA path.
     """
     return os.environ.get("HERMES_QUANT_STACKING", "0") == "1"
+
+
+def _posterior_persist_enabled() -> bool:
+    """True iff HERMES_QUANT_L2_POSTERIOR_PERSIST=1 (read at CALL TIME).
+
+    c96e (DEFAULT-OFF): when unset/!="1", the aggregator neither loads persisted
+    per-analyst Beta posteriors at construction nor saves them in update(), so
+    the path is byte-identical to the pre-c96e BMA. When set, learned per-analyst
+    skill survives across recommend() lifecycles and process restarts instead of
+    resetting to the prior on every fresh BMAAggregator().
+    """
+    return os.environ.get("HERMES_QUANT_L2_POSTERIOR_PERSIST", "0") == "1"
 
 
 @dataclass
@@ -192,6 +253,19 @@ class _AnalystStats:
     n_observations: int = 0
     history: deque[tuple[int, bool]] = field(
         default_factory=lambda: deque(maxlen=STACKING_CORR_WINDOW)
+    )
+    # c96e: observability timestamp of the most recent settled sample folded
+    # into this posterior. Stamped in update() from the episode asof. Persisted
+    # alongside (alpha, beta) so a recency-decay refit can reason about
+    # staleness without replaying the full sample history. None until the first
+    # settlement.
+    last_observable_asof: pd.Timestamp | None = None
+    # c96e: bounded per-analyst sample ring of (observable_asof, correct) for the
+    # recency-weighted refit. ALWAYS accumulated (cheap, additive) but consulted
+    # ONLY when HERMES_QUANT_L2_POSTERIOR_DECAY=1, so the OFF path is unaffected
+    # by its presence — exactly the B50 ``history`` discipline.
+    decay_samples: deque[tuple[pd.Timestamp, bool]] = field(
+        default_factory=lambda: deque(maxlen=DECAY_SAMPLE_WINDOW)
     )
 
     @property
@@ -229,6 +303,8 @@ class BMAAggregator:
         config: BMAConfig | None = None,
         ic_dedup_gate=None,
         regime_detector=None,
+        posterior_store_path: Path | None = None,
+        posterior_recipe_key: str | None = None,
     ):
         self.prior_alpha = prior_alpha
         self.prior_beta = prior_beta
@@ -253,6 +329,17 @@ class BMAAggregator:
         self.horizon_weights = dict(self.config.horizon_weights)
 
         self._stats: dict[str, _AnalystStats] = {}
+
+        # c96e: durable per-analyst Beta posteriors (DEFAULT-OFF). When the
+        # HERMES_QUANT_L2_POSTERIOR_PERSIST flag is set, load any persisted
+        # posteriors so learned skill survives across recommend() lifecycles
+        # instead of resetting to the prior on every fresh aggregator. When the
+        # flag is off, this is a no-op and self._stats stays empty (the
+        # pre-c96e behavior). A missing/corrupt artifact degrades to cold-start.
+        self.posterior_store_path = posterior_store_path
+        self.posterior_recipe_key = posterior_recipe_key
+        if _posterior_persist_enabled():
+            self._load_persisted_posteriors()
 
         # Calibrator: prefer a fitted IsotonicCalibrator persisted on disk;
         # fall back to ColdStartCalibrator on missing-file or any unpickle
@@ -348,13 +435,109 @@ class BMAAggregator:
             )
         return self._stats[analyst_name]
 
-    def _weight_for(self, analyst_name: str) -> float:
-        """Posterior accuracy if calibrated, else uniform proxy."""
+    def _load_persisted_posteriors(self) -> None:
+        """c96e: hydrate self._stats from the persisted snapshot (fail-safe).
+
+        Only the Beta posterior fields are restored: (alpha, beta,
+        n_observations, last_observable_asof). The B50 co-observation ``history``
+        ring is deliberately NOT persisted — it is a bounded recent-correlation
+        buffer consulted only when HERMES_QUANT_STACKING=1, and rebuilds itself
+        from subsequent settlements. A missing/corrupt artifact yields no stats
+        (cold-start), never an exception.
+        """
+        from hermes_quant.learning.posterior_store import load_posteriors
+
+        try:
+            persisted = load_posteriors(
+                path=self.posterior_store_path,
+                recipe_key=self.posterior_recipe_key,
+            )
+        except Exception as exc:  # noqa: BLE001 — bad cache must not crash init
+            logger.warning("BMA: posterior load failed (%s); cold-start", exc)
+            return
+        for name, p in persisted.items():
+            self._stats[name] = _AnalystStats(
+                name=name,
+                alpha=p.alpha,
+                beta=p.beta,
+                n_observations=p.n_observations,
+                last_observable_asof=p.last_observable_asof,
+            )
+
+    def _save_persisted_posteriors(self, asof: pd.Timestamp) -> None:
+        """c96e: atomically persist the current posteriors (fail-safe).
+
+        Called from update() only when the persist flag is on. A write failure
+        is logged but never propagates — a bad disk must not abort settlement.
+        """
+        from hermes_quant.learning.posterior_store import (
+            PersistedPosterior,
+            save_posteriors,
+        )
+
+        snapshot = {
+            name: PersistedPosterior(
+                alpha=s.alpha,
+                beta=s.beta,
+                n_observations=s.n_observations,
+                last_observable_asof=s.last_observable_asof,
+            )
+            for name, s in self._stats.items()
+        }
+        try:
+            save_posteriors(
+                snapshot,
+                path=self.posterior_store_path,
+                asof=asof,
+                recipe_key=self.posterior_recipe_key,
+            )
+        except Exception as exc:  # noqa: BLE001 — persistence must not abort settlement
+            logger.warning("BMA: posterior save failed (%s); continuing", exc)
+
+    def _weight_for(
+        self, analyst_name: str, decision_asof: pd.Timestamp | None = None
+    ) -> float:
+        """Posterior accuracy if calibrated, else uniform proxy.
+
+        c96e recency refit (DEFAULT-OFF): when HERMES_QUANT_L2_POSTERIOR_DECAY=1
+        and a ``decision_asof`` is available, the posterior is recomputed from
+        the per-analyst sample ring with (a) a HARD no-lookahead filter — only
+        samples whose outcome was observable strictly before ``decision_asof``
+        count — and (b) an exponential recency decay so stale skill fades toward
+        the prior. When the flag is off the weight is the plain posterior
+        accuracy, byte-identical to the pre-c96e path.
+        """
         stats = self._get_or_create_stats(analyst_name)
+        if _decay_enabled() and decision_asof is not None:
+            return self._decayed_weight(stats, decision_asof)
         if stats.n_observations < self.n_min_observations:
             # Uniform proxy: use 0.5 (no information)
             return 0.5
         return stats.posterior_accuracy
+
+    def _decayed_weight(
+        self, stats: _AnalystStats, decision_asof: pd.Timestamp
+    ) -> float:
+        """Recency-weighted, asof-honest posterior accuracy from the sample ring.
+
+        Delegates to the standalone, unit-tested refit so the no-lookahead and
+        decay semantics live in exactly one place. The refit reduces to the
+        prior mean when no admissible samples exist (cold-start safe).
+        """
+        from hermes_quant.learning.posterior_refit import SkillSample, refit_beta
+
+        samples = [
+            SkillSample(observable_asof=ts, correct=correct)
+            for ts, correct in stats.decay_samples
+        ]
+        alpha, beta = refit_beta(
+            samples=samples,
+            decision_asof=decision_asof,
+            prior_alpha=self.prior_alpha,
+            prior_beta=self.prior_beta,
+            half_life_days=DEFAULT_DECAY_HALF_LIFE_DAYS,
+        )
+        return alpha / (alpha + beta)
 
     def _horizon_weight(self, horizon: str) -> float:
         """Per-ADR-0036 horizon weight multiplier.
@@ -524,7 +707,9 @@ class BMAAggregator:
                     regime_state, _regime_reason = self.regime_detector.classify(state_vars)
                     regime_state_value = str(regime_state.value)
                     # Build base weight map (analyst → base_w) so we can record multipliers
-                    base_weights_map = {v.analyst: self._weight_for(v.analyst) for v in views}
+                    base_weights_map = {
+                        v.analyst: self._weight_for(v.analyst, context.asof) for v in views
+                    }
                     adjusted_map = _apply_regime_weights(base_weights_map, regime_state)
                     regime_weight_multipliers = {
                         analyst: (
@@ -581,7 +766,7 @@ class BMAAggregator:
             if _regime_adjusted and v.analyst in _regime_adjusted:
                 base_w = _regime_adjusted[v.analyst]
             else:
-                base_w = self._weight_for(v.analyst)
+                base_w = self._weight_for(v.analyst, context.asof)
             # ADR-0036: cross-horizon BMA weighting —
             #   effective weight = base_weight(analyst) × horizon_weight(horizon)
             #   The view's own confidence is multiplied in by signed_dir_terms
@@ -812,6 +997,7 @@ class BMAAggregator:
         """
         episode_idx = self._episode_idx
         self._episode_idx += 1
+        decision_asof = pd.Timestamp(outcome.asof)
         for view in outcome.aggregated_signal.components:
             stats = self._get_or_create_stats(view.analyst)
             correct = outcome.direction_correct.get(view.analyst)
@@ -824,6 +1010,19 @@ class BMAAggregator:
                 stats.beta += 1.0
             # B50: append (episode_idx, correct) for co-observation alignment.
             stats.history.append((episode_idx, bool(correct)))
+            # c96e: stamp WHEN this outcome became observable = decision asof +
+            # the view's horizon. NOT the decision asof itself — a 1w view
+            # decided at D is only knowable at D+1w, and the recency refit's
+            # no-lookahead filter relies on this being honest. ALWAYS recorded
+            # (additive); consulted only when the decay flag is on.
+            observable_asof = decision_asof + _horizon_delta(view.horizon)
+            stats.decay_samples.append((observable_asof, bool(correct)))
+            stats.last_observable_asof = observable_asof
+
+        # c96e: persist the evolved posteriors (DEFAULT-OFF). Stamp the snapshot
+        # with the settlement asof. Save is fail-safe (logged, never raises).
+        if _posterior_persist_enabled():
+            self._save_persisted_posteriors(decision_asof)
 
     def status(self) -> dict:
         return {
