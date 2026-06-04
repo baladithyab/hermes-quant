@@ -76,7 +76,7 @@ Status vocabulary: proposed | accepted | rejected | deprecated | superseded by A
 | [ADR-0070](ADR-0070-paper-execution-fidelity.md) | Paper-execution fidelity — slippage, queue delay, and fill realism | Accepted (2026-05-28), implemented | 2026-05-28 |
 | [ADR-0071](ADR-0071-portfolio-aware-dynamic-kelly.md) | Portfolio-aware dynamic Kelly sizing and exposure caps | Accepted (2026-05-28), implemented | 2026-05-28 |
 | [ADR-0072](ADR-0072-advisor-intraday-open-guard.md) | Advisor-layer intraday open-guard (cross-run per-symbol-per-day dedup) | Accepted | 2026-05-29 |
-| [ADR-0073](ADR-0073-event-catalyst-awareness.md) | Event/catalyst awareness — universe onboarding, semantic analyst activation, intraday cadence | Accepted (2026-05-29), implemented | 2026-05-29 |
+| [ADR-0073](ADR-0073-event-catalyst-awareness.md) | Event/catalyst awareness — universe onboarding, semantic analyst activation, intraday cadence | Accepted (2026-05-29) — semantic-analyst activation + intraday cadence implemented; universe-onboarding axis remains Proposed (gated OFF behind default-OFF flag per ADR-0075 until the eval-gate is green) | 2026-05-29 |
 | [ADR-0074](ADR-0074-catalyst-sense-semantic-fusion.md) | Catalyst Sense — semantic-numerical fusion via parallel catalyst detection | Accepted (2026-05-29), implemented | 2026-05-29 |
 | [ADR-0075](ADR-0075-catalyst-driven-universe-onboarding.md) | Catalyst-driven universe onboarding | Proposed | 2026-05-29 |
 | [ADR-0076](ADR-0076-social-arbitrage-integration.md) | Social-arbitrage integration — consumer-trend entity class, sized fusion, and a profitability-verification loop | Accepted | 2026-05-30 |

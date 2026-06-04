@@ -1,6 +1,6 @@
 # ADR-0073: Event/catalyst awareness — universe onboarding, semantic analyst activation, intraday cadence
 
-**Status:** Accepted (2026-05-29), implemented
+**Status:** Accepted (2026-05-29) — semantic-analyst activation + intraday cadence implemented; universe-onboarding axis remains Proposed (gated OFF behind default-OFF flag per ADR-0075 until the eval-gate is green)
 **Date:** 2026-05-29
 **Wave:** E (signal-surface expansion — beyond technical/liquidity)
 **Supersedes:** nothing
