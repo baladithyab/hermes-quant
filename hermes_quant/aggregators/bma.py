@@ -502,13 +502,18 @@ class BMAAggregator:
             logger.warning("BMA: posterior load failed (%s); cold-start", exc)
             return
         for name, p in persisted.items():
-            self._stats[name] = _AnalystStats(
+            stats = _AnalystStats(
                 name=name,
                 alpha=p.alpha,
                 beta=p.beta,
                 n_observations=p.n_observations,
                 last_observable_asof=p.last_observable_asof,
             )
+            # Restore the recency-refit ring so a reloaded aggregator with the
+            # decay flag on reproduces the same weight instead of collapsing to
+            # the prior mean. The deque re-imposes its maxlen bound on load.
+            stats.decay_samples.extend(p.decay_samples)
+            self._stats[name] = stats
 
     def _save_persisted_posteriors(self, asof: pd.Timestamp) -> None:
         """c96e: atomically persist the current posteriors (fail-safe).
@@ -527,6 +532,7 @@ class BMAAggregator:
                 beta=s.beta,
                 n_observations=s.n_observations,
                 last_observable_asof=s.last_observable_asof,
+                decay_samples=tuple(s.decay_samples),
             )
             for name, s in self._stats.items()
         }

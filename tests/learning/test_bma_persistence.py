@@ -131,3 +131,33 @@ def test_persisted_posterior_feeds_weight(tmp_path, monkeypatch):
     w = a2._weight_for("a")
     # 8 correct + prior -> posterior accuracy clearly above the 0.5 uniform proxy.
     assert w > 0.6
+
+
+def test_persist_plus_decay_survives_reload(tmp_path, monkeypatch):
+    """Composition guard: with BOTH persistence and decay on, a reloaded
+    aggregator must NOT silently flatten a skilled analyst to the prior mean.
+
+    The decay refit reads the per-analyst sample ring; if the ring is not
+    persisted, a new aggregator refits from an EMPTY ring and collapses the
+    weight to 0.5 even though the (alpha, beta) summary says the analyst is
+    skilled. The ring must therefore be persisted alongside (alpha, beta)."""
+    path = tmp_path / "p.json"
+    monkeypatch.setenv("HERMES_QUANT_L2_POSTERIOR_PERSIST", "1")
+    monkeypatch.setenv("HERMES_QUANT_L2_POSTERIOR_DECAY", "1")
+
+    a1 = BMAAggregator(posterior_store_path=path, n_min_observations=5)
+    a1.calibrator = ColdStartCalibrator()
+    sig = a1.aggregate([_view("a", 1)], _ctx())
+    for i in range(10):
+        a1.update(_episode(sig, asof=f"2026-05-{13 + i:02d}", correct={"a": True}))
+
+    # Decision after every sample is observable (horizon 1h -> ~same day).
+    decision = pd.Timestamp("2026-06-05", tz="UTC")
+    w1 = a1._weight_for("a", decision_asof=decision)
+    assert w1 > 0.6  # skilled
+
+    a2 = BMAAggregator(posterior_store_path=path, n_min_observations=5)
+    w2 = a2._weight_for("a", decision_asof=decision)
+    # The reloaded aggregator must reproduce the skilled weight, NOT 0.5.
+    assert w2 == pytest.approx(w1)
+    assert w2 > 0.6

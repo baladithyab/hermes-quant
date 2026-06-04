@@ -50,12 +50,20 @@ class PersistedPosterior:
     ``last_observable_asof`` is the observability timestamp of the most recent
     sample folded into this posterior — kept so a recency-decay refit can reason
     about staleness without re-reading the full sample history.
+
+    ``decay_samples`` is the bounded ``(observable_asof, correct)`` ring the
+    recency refit consumes. It MUST be persisted when the decay flag is in use:
+    the refit ignores the summary (alpha, beta) and recomputes from this ring, so
+    a reloaded aggregator with an empty ring would silently collapse a skilled
+    analyst's weight to the prior mean. Default empty for the persistence-only
+    (decay-off) case, where the ring is unused.
     """
 
     alpha: float
     beta: float
     n_observations: int
     last_observable_asof: pd.Timestamp | None = None
+    decay_samples: tuple[tuple[pd.Timestamp, bool], ...] = ()
 
 
 def _default_path(recipe_key: str | None) -> Path:
@@ -103,6 +111,11 @@ def save_posteriors(
                     if p.last_observable_asof is not None
                     else None
                 ),
+                # Recency-refit sample ring: [[observable_asof_iso, correct], ...]
+                "decay_samples": [
+                    [_as_utc(ts).isoformat(), bool(correct)]
+                    for ts, correct in p.decay_samples
+                ],
             }
             for name, p in posteriors.items()
         },
@@ -145,11 +158,16 @@ def load_posteriors(
     for name, rec in raw.items():
         try:
             last = rec.get("last_observable_asof")
+            samples_raw = rec.get("decay_samples") or []
+            decay_samples = tuple(
+                (pd.Timestamp(ts), bool(correct)) for ts, correct in samples_raw
+            )
             out[name] = PersistedPosterior(
                 alpha=float(rec["alpha"]),
                 beta=float(rec["beta"]),
                 n_observations=int(rec.get("n_observations", 0)),
                 last_observable_asof=(pd.Timestamp(last) if last is not None else None),
+                decay_samples=decay_samples,
             )
         except (KeyError, ValueError, TypeError):
             logger.warning(
