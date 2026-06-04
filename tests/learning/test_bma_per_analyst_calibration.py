@@ -105,6 +105,50 @@ def test_unknown_analyst_falls_back_safely(monkeypatch):
     assert 0.0 < calibrated["never-seen"] < 1.0
 
 
+def test_unanimous_per_analyst_calibration_does_not_turn_agreement_into_one(
+    monkeypatch,
+):
+    """Flag ON: unanimous agreement uses calibrated analyst probabilities.
+
+    Two cold-start analysts with ~0.5 calibrated confidence must not become
+    confidence=1.0 just because their vote_share agreement metric is 1.0.
+    """
+    monkeypatch.setenv("HERMES_QUANT_L2_PER_ANALYST_CALIB", "1")
+    a = BMAAggregator()
+    a.calibrator = ColdStartCalibrator()
+
+    sig = a.aggregate(
+        [_view("cold-a", 1, 0.5), _view("cold-b", 1, 0.5)],
+        _ctx(),
+    )
+
+    calibrated = sig.metadata["per_analyst_calibrated_confidence"]
+    assert calibrated["cold-a"] == pytest.approx(0.5)
+    assert calibrated["cold-b"] == pytest.approx(0.5)
+    assert sig.metadata["vote_share"] == pytest.approx(1.0)
+    assert sig.confidence_raw == pytest.approx(0.6)
+    assert sig.confidence == pytest.approx(0.6)
+    assert sig.confidence < 0.75
+    assert sig.confidence != pytest.approx(1.0)
+
+
+def test_unanimous_flag_off_keeps_legacy_vote_share_confidence(monkeypatch):
+    """Flag OFF: unanimous branch preserves the pre-f254 vote_share behavior."""
+    monkeypatch.delenv("HERMES_QUANT_L2_PER_ANALYST_CALIB", raising=False)
+    a = BMAAggregator()
+    a.calibrator = ColdStartCalibrator()
+
+    sig = a.aggregate(
+        [_view("cold-a", 1, 0.5), _view("cold-b", 1, 0.5)],
+        _ctx(),
+    )
+
+    assert "per_analyst_calibrated_confidence" not in sig.metadata
+    assert sig.metadata["vote_share"] == pytest.approx(1.0)
+    assert sig.confidence_raw == pytest.approx(1.0)
+    assert sig.confidence == pytest.approx(0.375)
+
+
 def test_flag_off_is_byte_identical(monkeypatch):
     """Flag OFF: no per_analyst_calibrated_confidence key, and the signal equals
     the signal produced with the flag never set."""

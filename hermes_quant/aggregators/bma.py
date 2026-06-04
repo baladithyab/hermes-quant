@@ -1048,7 +1048,15 @@ class BMAAggregator:
                 confidence_raw = float(np.clip(sole_v.confidence_raw, 0.0, 1.0))
         elif non_flat and all(v.direction == composite_direction for v in non_flat):
             # Multi-contributor unanimous: vote_share + agreement bonus.
-            confidence_raw = float(np.clip(vote_share + self.agreement_bonus, 0.0, 1.0))
+            if per_analyst_cal is not None:
+                # f254: in per-analyst-calibrated mode, vote_share measures
+                # agreement, not probability. Aggregate the calibrated
+                # contributor probabilities, then apply the same agreement
+                # bonus to that probability estimate.
+                calibrated_vote = sum(_vote_confidence(v) * w for v, w in contributing) / total_w
+                confidence_raw = float(np.clip(calibrated_vote + self.agreement_bonus, 0.0, 1.0))
+            else:
+                confidence_raw = float(np.clip(vote_share + self.agreement_bonus, 0.0, 1.0))
         else:
             # Multi-contributor with dissent: vote_share only.
             confidence_raw = vote_share
