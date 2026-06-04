@@ -1,6 +1,6 @@
 # ADR-0074: Catalyst Sense — semantic-numerical fusion via parallel catalyst detection
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-29), implemented
 **Date:** 2026-05-29
 **Wave:** E (signal-surface expansion)
 **Supersedes:** nothing

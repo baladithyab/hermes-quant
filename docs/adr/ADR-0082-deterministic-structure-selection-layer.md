@@ -1,6 +1,6 @@
 # ADR-0082: Deterministic structure-selection layer + registry-open plays
 
-- **Status:** proposed
+- **Status:** Accepted (2026-05-31), implemented
 - **Date:** 2026-05-31
 - **Deciders:** operator (Codeseys), hermes-quant architect
 - **Supersedes / amends:** none (additive to ADR-0027 options-aware risk gate, ADR-0029 multi-leg

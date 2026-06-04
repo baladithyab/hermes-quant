@@ -1,6 +1,6 @@
 # ADR-0083: Defer long-horizon intraday; build the horizon-neutral foundations first
 
-- **Status:** proposed
+- **Status:** Accepted (2026-05-31), implemented
 - **Date:** 2026-05-31
 - **Deciders:** operator (Codeseys), hermes-quant architect
 - **Relates to:** ADR-0068 (decision-time vs bar-time), ADR-0069 (still-forming-bar discipline),

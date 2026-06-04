@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: Accepted (2026-05-30), implemented
 date: 2026-05-30
 deciders: [lead quant-systems architect]
 consulted: [self-evolve capability-map synthesis, SOTA research pass, current-state audit]

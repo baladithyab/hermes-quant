@@ -1,6 +1,6 @@
 # ADR-0084: Scheduled-event calendar as asof-honest perception + a default-OFF pre-event REJECT/abstain guard
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-31), implemented
 **Date:** 2026-05-31
 **Wave:** Perception/Reaction extension (forward-event awareness; default-OFF, eval-gated)
 **Supersedes:** nothing
