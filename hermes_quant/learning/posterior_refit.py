@@ -91,11 +91,21 @@ def refit_beta(
     alpha = float(prior_alpha)
     beta = float(prior_beta)
 
+    # A NaT decision asof carries no information about what is "past" — refuse
+    # to admit any sample against an unknown decision time (conservative).
+    if pd.isna(decision_asof):
+        return alpha, beta
+
     for sample in samples:
         observable = _as_utc(sample.observable_asof)
         # NO-LOOKAHEAD GUARD: outcome must have been observable strictly before
         # the decision. This is the single most important line in the lane.
-        if observable >= decision_asof:
+        # NaT observability means "unknown when this became knowable" — treat it
+        # as not-yet-observable and EXCLUDE it. Critically, `NaT >= decision` is
+        # always False, so without this explicit check a NaT sample would slip
+        # past the >= guard AND get a degenerate full recency weight (age=nan ->
+        # weight 1.0). Exclusion is the asof-honest reading.
+        if pd.isna(observable) or observable >= decision_asof:
             continue
         age_seconds = (decision_asof - observable).total_seconds()
         weight = _recency_weight(age_seconds, half_life_seconds)

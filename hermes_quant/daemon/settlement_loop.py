@@ -211,6 +211,15 @@ def construct_episode_outcomes(
         if not sig_id or sig_id not in signals:
             continue
         sig = signals[sig_id]
+        # No-lookahead source guard: a signal row with a missing/None/empty/NaN
+        # 'asof' must NOT become a NaT-stamped EpisodeOutcome. Downstream c96e
+        # learning stamps observability = asof + horizon; a NaT asof would
+        # poison the recency refit's no-lookahead filter (NaT >= x is always
+        # False, silently admitting the sample). Coerce-and-skip mirrors the
+        # _coerce_asof discipline already used by the exit-fill join.
+        sig_asof = _coerce_asof(sig.get("asof"))
+        if sig_asof is None:
+            continue
         try:
             decision_price = float(exec_rec.get("decision_price", 0.0))
             fill_price = float(exec_rec["fill_price"])
@@ -251,7 +260,7 @@ def construct_episode_outcomes(
             asset=sig["asset"],
             timeframe=sig["timeframe"],
             asset_class=sig.get("asset_class", "crypto"),
-            asof=pd.Timestamp(sig["asof"]),
+            asof=sig_asof,
             direction=sig["direction"],
             magnitude=float(sig.get("magnitude", 0.0)),
             confidence=float(sig.get("confidence", 0.0)),
@@ -271,7 +280,7 @@ def construct_episode_outcomes(
         episode = EpisodeOutcome(
             asset=sig["asset"],
             timeframe=sig["timeframe"],
-            asof=pd.Timestamp(sig["asof"]),
+            asof=sig_asof,
             aggregated_signal=agg_signal,
             realized_returns={agg_signal.horizon: realized_return},
             direction_correct=direction_correct,

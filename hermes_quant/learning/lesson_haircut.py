@@ -102,6 +102,9 @@ def apply_lesson_haircut(
     Returns the haircut confidence, clipped to [0, 1]. A strict no-op (returns
     ``confidence`` unchanged) when no lesson matches.
     """
+    # A NaT decision asof is uninterpretable as a "now" — apply no haircut.
+    if pd.isna(decision_asof):
+        return confidence
     decision_asof = _as_utc(decision_asof)
     ticker_u = ticker.upper()
 
@@ -116,8 +119,11 @@ def apply_lesson_haircut(
             continue
         # NO-LOOKAHEAD GUARD: the loss must have been observable strictly before
         # the decision. Equality counts as not-yet-knowable (conservative,
-        # matching the retriever's `tau >= asof: continue`).
-        if _as_utc(lesson.tau_observable) >= decision_asof:
+        # matching the retriever's `tau >= asof: continue`). A NaT tau_observable
+        # is "unknown when this became knowable" — excluded, because `NaT >= asof`
+        # is always False and would otherwise silently admit the lesson.
+        tau = _as_utc(lesson.tau_observable)
+        if pd.isna(tau) or tau >= decision_asof:
             continue
         seen.add(lesson.lesson_id)
         n_matching += 1

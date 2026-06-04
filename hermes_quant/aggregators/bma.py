@@ -484,12 +484,17 @@ class BMAAggregator:
     def _load_persisted_posteriors(self) -> None:
         """c96e: hydrate self._stats from the persisted snapshot (fail-safe).
 
-        Only the Beta posterior fields are restored: (alpha, beta,
-        n_observations, last_observable_asof). The B50 co-observation ``history``
-        ring is deliberately NOT persisted — it is a bounded recent-correlation
-        buffer consulted only when HERMES_QUANT_STACKING=1, and rebuilds itself
-        from subsequent settlements. A missing/corrupt artifact yields no stats
-        (cold-start), never an exception.
+        Restores the Beta posterior fields (alpha, beta, n_observations,
+        last_observable_asof) AND the c96e ``decay_samples`` recency ring — the
+        latter is required so a reloaded aggregator with the decay flag on
+        reproduces the same weight instead of refitting from an empty ring and
+        collapsing a skilled analyst to the prior mean (see fix in
+        _save_persisted_posteriors / commit history). The B50 co-observation
+        ``history`` ring is the ONE thing deliberately NOT persisted — it is a
+        bounded recent-correlation buffer consulted only when
+        HERMES_QUANT_STACKING=1 and rebuilds itself from subsequent settlements.
+        A missing/corrupt artifact yields no stats (cold-start), never an
+        exception.
         """
         from hermes_quant.learning.posterior_store import load_posteriors
 
@@ -669,8 +674,14 @@ class BMAAggregator:
 
     @staticmethod
     def _count_matching_lessons(lessons, ticker, direction, decision_asof) -> int:
-        """Distinct same-ticker/-direction lessons observable before the decision."""
+        """Distinct same-ticker/-direction lessons observable before the decision.
+
+        Mirrors apply_lesson_haircut's matcher EXACTLY (same NaT/>= semantics) so
+        the audit count can never disagree with whether a haircut was applied.
+        """
         decision = pd.Timestamp(decision_asof)
+        if pd.isna(decision):
+            return 0
         if decision.tz is None:
             decision = decision.tz_localize("UTC")
         ticker_u = ticker.upper()
@@ -681,6 +692,8 @@ class BMAAggregator:
             if lesson.ticker.upper() != ticker_u or lesson.direction != direction:
                 continue
             tau = pd.Timestamp(lesson.tau_observable)
+            if pd.isna(tau):
+                continue
             if tau.tz is None:
                 tau = tau.tz_localize("UTC")
             if tau >= decision:
@@ -1225,9 +1238,17 @@ class BMAAggregator:
             # decided at D is only knowable at D+1w, and the recency refit's
             # no-lookahead filter relies on this being honest. ALWAYS recorded
             # (additive); consulted only when the decay flag is on.
-            observable_asof = decision_asof + _horizon_delta(view.horizon)
-            stats.decay_samples.append((observable_asof, bool(correct)))
-            stats.last_observable_asof = observable_asof
+            #
+            # Source-side no-lookahead defense: if the decision asof is NaT (a
+            # malformed settlement record), the observability stamp would be NaT
+            # too, which the downstream guards must treat as "unknown" anyway.
+            # Skip recording the poisoned sample entirely rather than relying
+            # solely on the read-side guards — the alpha/beta credit above still
+            # applies (it is asof-independent), only the decay ring is spared.
+            if not pd.isna(decision_asof):
+                observable_asof = decision_asof + _horizon_delta(view.horizon)
+                stats.decay_samples.append((observable_asof, bool(correct)))
+                stats.last_observable_asof = observable_asof
 
         # c96e: persist the evolved posteriors (DEFAULT-OFF). Stamp the snapshot
         # with the settlement asof. Save is fail-safe (logged, never raises).
