@@ -214,6 +214,21 @@ def _decay_enabled() -> bool:
     return os.environ.get("HERMES_QUANT_L2_POSTERIOR_DECAY", "0") == "1"
 
 
+def _per_analyst_calib_enabled() -> bool:
+    """True iff HERMES_QUANT_L2_PER_ANALYST_CALIB=1 (read at CALL TIME).
+
+    f254 (DEFAULT-OFF). When unset, each view's confidence flows through the
+    single global aggregator calibrator exactly as before (byte-identical). When
+    set, each view's confidence_raw is recalibrated through a calibrator KEYED BY
+    the analyst's own learned Beta posterior (so a skilled analyst's confidence
+    is not dragged toward the population average by the merged global fit), and
+    the global calibrator is bypassed for that view's contribution. An analyst
+    with no track record maps to the neutral prior mean — a safe, non-zero
+    fallback.
+    """
+    return os.environ.get("HERMES_QUANT_L2_PER_ANALYST_CALIB", "0") == "1"
+
+
 def _stacking_enabled() -> bool:
     """True iff HERMES_QUANT_STACKING=1 (read at CALL TIME, not import time).
 
@@ -539,6 +554,38 @@ class BMAAggregator:
         )
         return alpha / (alpha + beta)
 
+    def _per_analyst_calibrated_confidence(
+        self, analyst_name: str, confidence_raw: float, decision_asof: pd.Timestamp | None
+    ) -> float:
+        """f254: calibrate a raw confidence through the analyst's OWN posterior.
+
+        Uses the analyst's learned Beta(alpha, beta) directional-accuracy
+        posterior as the shrinkage prior (the ADR-0009 cold-start formula keyed
+        per analyst). When the recency-decay flag is also on and a decision asof
+        is available, the (alpha, beta) used are the asof-honest, recency-refit
+        posterior rather than the lifetime one — so calibration tracks current
+        skill. Cold-start safe: an unseen analyst maps to the neutral prior mean.
+        """
+        from hermes_quant.learning.per_analyst_calibration import beta_shrinkage_calibrate
+        from hermes_quant.learning.posterior_refit import SkillSample, refit_beta
+
+        stats = self._get_or_create_stats(analyst_name)
+        if _decay_enabled() and decision_asof is not None:
+            samples = [
+                SkillSample(observable_asof=ts, correct=correct)
+                for ts, correct in stats.decay_samples
+            ]
+            alpha, beta = refit_beta(
+                samples=samples,
+                decision_asof=decision_asof,
+                prior_alpha=self.prior_alpha,
+                prior_beta=self.prior_beta,
+                half_life_days=DEFAULT_DECAY_HALF_LIFE_DAYS,
+            )
+        else:
+            alpha, beta = stats.alpha, stats.beta
+        return beta_shrinkage_calibrate(confidence_raw, alpha=alpha, beta=beta)
+
     def _horizon_weight(self, horizon: str) -> float:
         """Per-ADR-0036 horizon weight multiplier.
 
@@ -758,6 +805,27 @@ class BMAAggregator:
             # OFF/uninformative case is auditable as a no-op in metadata.
             stacking_used = any(f < 1.0 - 1e-12 for f in redundancy_factors.values())
 
+        # f254 (DEFAULT-OFF): per-analyst calibration map. When enabled, each
+        # view's confidence_raw is recalibrated through the analyst's OWN learned
+        # Beta posterior (keyed by name) so a skilled analyst is not dragged
+        # toward the population average by the merged global calibrator fit. The
+        # map is the calibrated confidence to USE in the vote in place of
+        # v.confidence; when the flag is off it stays None and the vote uses
+        # v.confidence exactly as before (byte-identical).
+        per_analyst_cal: dict[str, float] | None = None
+        if _per_analyst_calib_enabled():
+            per_analyst_cal = {
+                v.analyst: self._per_analyst_calibrated_confidence(
+                    v.analyst, v.confidence_raw, context.asof
+                )
+                for v in views
+            }
+
+        def _vote_confidence(v: AnalystView) -> float:
+            if per_analyst_cal is not None:
+                return per_analyst_cal[v.analyst]
+            return v.confidence
+
         weights = []
         signed_terms = []  # direction × magnitude × weight × confidence
         signed_dir_terms = []  # direction × weight × confidence (for direction)
@@ -777,7 +845,7 @@ class BMAAggregator:
             if redundancy_factors is not None:
                 w *= redundancy_factors.get(v.analyst, 1.0)
             weights.append(w)
-            signed_dir_terms.append(v.direction * w * v.confidence)
+            signed_dir_terms.append(v.direction * w * _vote_confidence(v))
 
         weighted_dir_sum = sum(signed_dir_terms)
         if abs(weighted_dir_sum) < 1e-9:
@@ -856,7 +924,13 @@ class BMAAggregator:
             # confidence. Downstream gates / sizing decide based on the
             # analyst's actual confidence, not synthesized unanimity.
             sole_v, _w = contributing[0]
-            confidence_raw = float(np.clip(sole_v.confidence_raw, 0.0, 1.0))
+            # f254: for a lone voice, the honest confidence IS the per-analyst
+            # calibrated value (already shrunk by that analyst's track record);
+            # otherwise fall back to the analyst's own raw confidence as before.
+            if per_analyst_cal is not None:
+                confidence_raw = float(np.clip(per_analyst_cal[sole_v.analyst], 0.0, 1.0))
+            else:
+                confidence_raw = float(np.clip(sole_v.confidence_raw, 0.0, 1.0))
         elif non_flat and all(v.direction == composite_direction for v in non_flat):
             # Multi-contributor unanimous: vote_share + agreement bonus.
             confidence_raw = float(np.clip(vote_share + self.agreement_bonus, 0.0, 1.0))
@@ -868,10 +942,19 @@ class BMAAggregator:
         # prior as ColdStartCalibrator (ADR-0009 §P0-2 amendment 2026-05-26):
         # see hermes_quant/calibrators.py and
         # docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md.
-        try:
-            confidence = self.calibrator.calibrate(confidence_raw)
-        except CalibratorNotReady:
-            confidence = (confidence_raw + 2.0) / 8.0
+        #
+        # f254: when per-analyst calibration is on, confidence_raw is already a
+        # calibrated quantity (each contribution was shrunk by its analyst's own
+        # posterior). Re-running the merged global calibrator would double-shrink
+        # and re-introduce the population-average drag we are trying to remove,
+        # so the global calibrate step is BYPASSED in that mode.
+        if per_analyst_cal is not None:
+            confidence = float(np.clip(confidence_raw, 0.0, 1.0))
+        else:
+            try:
+                confidence = self.calibrator.calibrate(confidence_raw)
+            except CalibratorNotReady:
+                confidence = (confidence_raw + 2.0) / 8.0
 
         # Horizon: use the modal horizon among contributing views; default to first
         horizons = [v.horizon for v, _ in contributing]
@@ -893,7 +976,8 @@ class BMAAggregator:
             per_horizon_dir: dict[str, float] = {}
             for v, w in zip(views, weights, strict=False):
                 per_horizon_dir[v.horizon] = (
-                    per_horizon_dir.get(v.horizon, 0.0) + v.direction * w * v.confidence
+                    per_horizon_dir.get(v.horizon, 0.0)
+                    + v.direction * w * _vote_confidence(v)
                 )
             horizon_signs = {
                 h: (1 if s > 0 else (-1 if s < 0 else 0)) for h, s in per_horizon_dir.items()
@@ -930,6 +1014,12 @@ class BMAAggregator:
         if redundancy_factors is not None:
             metadata["stacking_redundancy_factors"] = redundancy_factors
             metadata["stacking_used"] = stacking_used
+
+        # f254 audit field — injected ONLY when per-analyst calibration is on, so
+        # the OFF-path metadata dict is byte-identical. Records the per-analyst
+        # calibrated confidence that fed the vote (vs the merged global path).
+        if per_analyst_cal is not None:
+            metadata["per_analyst_calibrated_confidence"] = per_analyst_cal
 
         signal = AggregatedSignal(
             asset=context.asset,
