@@ -20,12 +20,10 @@ Post-match normalization strips punctuation ($ , %) for lookup in ground-truth t
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 from hermes_quant.grounding.data_grounding import GroundTruthBlock, render_for_prompt
 from hermes_quant.protocol import AnalystView
-
 
 # ---------------------------------------------------------------------------
 # Numerical claim extraction regex
@@ -79,7 +77,7 @@ def _number_in_gt_text(norm: str, gt_text: str) -> bool:
     # Escape the normalized number for regex use
     escaped = re.escape(norm)
     # Word boundaries: not preceded/followed by digit or decimal point
-    pattern = r"(?<![0-9.]){}(?![0-9.])".format(escaped)
+    pattern = rf"(?<![0-9.]){escaped}(?![0-9.])"
     return bool(re.search(pattern, gt_text))
 
 
@@ -113,7 +111,7 @@ class VerificationResult:
     accepted: bool
     citation_coverage: float
     uncited_claims: list[str]
-    reason: Optional[str] = None
+    reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -144,13 +142,19 @@ class ClaimVerifier:
     # Public API
     # ------------------------------------------------------------------
 
-    def verify(self, view: AnalystView, block: GroundTruthBlock) -> VerificationResult:
-        """Verify that *view.rationale* cites numbers from *block*.
+    def verify(
+        self,
+        view: AnalystView,
+        block: GroundTruthBlock,
+        *,
+        claim_text: str | None = None,
+    ) -> VerificationResult:
+        """Verify that the full claim text cites numbers from *block*.
 
         Returns VerificationResult with accepted=True iff citation_coverage
         meets self.threshold.
         """
-        rationale = view.rationale or ""
+        rationale = claim_text if claim_text is not None else (view.rationale or "")
 
         claims = extract_numerical_claims(rationale)
 

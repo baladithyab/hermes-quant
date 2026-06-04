@@ -453,6 +453,21 @@ def _evolve_one_play(
         if existing_symbol not in seen_symbols:
             new_rows.append(existing_row)
 
+    # ---- Cap-trim (seed d641): enforce max_per_play as a HARD CEILING -------
+    # The onboard gate above only PREVENTS new onboards once active==cap; it
+    # never trims an already-over-cap active set (from a lowered cap or over-cap
+    # loaded state). Run the post-scoring trim AFTER onboard/evict so the cap is
+    # a deterministic ceiling on active rows. Catalyst-protected rows are held
+    # (never trimmed out of turn). Empty events -> bit-identical to pre-d641.
+    new_rows, trim_events = _enforce_cap_trim(
+        new_rows,
+        play=play,
+        asof=asof,
+        max_per_play=max_per_play,
+        position_lookup=position_lookup,
+    )
+    events.extend(trim_events)
+
     # Rank: active first (by score desc), then candidates (by score desc),
     # then evicted (by score desc — debug aid, the rank doesn't matter
     # operationally for evicted rows).
@@ -509,6 +524,110 @@ def _catalyst_eviction_protected(
         return bool(position_lookup(row.symbol))
     except Exception:  # noqa: BLE001 — missing position feed -> fail-safe hold
         return True
+
+
+def _enforce_cap_trim(
+    rows: list[WatchlistEntry],
+    *,
+    play: str,
+    asof: pd.Timestamp,
+    max_per_play: int,
+    position_lookup: Callable[[str], bool] | None,
+) -> tuple[list[WatchlistEntry], list[dict[str, Any]]]:
+    """Trim an over-cap active set down to ``max_per_play`` (seed d641).
+
+    ``max_per_play`` historically gated ONBOARDS only (a new symbol could not
+    onboard once ``active_count >= max_per_play``). It never trimmed an
+    already-over-cap active set, so lowering the cap or loading over-cap state
+    left rows above the cap indefinitely. This is the post-scoring HARD CEILING:
+    after onboard/evict, if the active count exceeds the cap, evict the
+    lowest-scored active rows until the count is back at the cap.
+
+    Determinism
+    -----------
+    Active rows are ranked by ``(-last_score, symbol)`` — descending score, then
+    symbol ascending as a stable tie-break — so two runs over identical input
+    trim the identical set (no RNG, no wall-clock in the ranking). The rows kept
+    are the protected rows plus the best unprotected rows that fit the residual
+    capacity; the remaining unprotected rows are evicted with reason
+    ``over_cap_trim``.
+
+    Protection
+    ----------
+    A catalyst-eviction-protected row (``_catalyst_eviction_protected``) is NEVER
+    trimmed out of turn. Protected rows still count as occupied cap slots, so
+    unprotected rows only keep the residual capacity after all protected rows are
+    preserved. When protection alone keeps more than ``max_per_play`` rows
+    active, the active set legitimately stays above the cap until those rows'
+    horizons elapse; the trim still removes every UNPROTECTED row.
+
+    The active set only ever gets SMALLER or stays equal — never larger.
+
+    Returns ``(new_rows, events)``. Non-active rows pass through untouched and
+    are not counted toward the cap.
+    """
+    if max_per_play < 0:
+        max_per_play = 0
+
+    active = [r for r in rows if r.state == STATE_ACTIVE]
+    if len(active) <= max_per_play:
+        return rows, []
+
+    # Deterministic rank: highest score first, symbol ascending on ties.
+    # NaN-safe: a NaN last_score (corrupt state, or a misbehaving scorer)
+    # otherwise breaks Python's sort — all NaN comparisons are False, so the
+    # ordering becomes input-order-dependent and the trim non-deterministic
+    # (HARD INVARIANT violation). Sort NaN rows to the tail (treated as lowest
+    # score → trimmed first), tie-broken by symbol like every other row.
+    def _rank_key(r: WatchlistEntry) -> tuple[int, float, str]:
+        score = r.last_score
+        is_nan = score != score  # True only for NaN (no math import needed)
+        return (1 if is_nan else 0, 0.0 if is_nan else -score, r.symbol)
+
+    ranked = sorted(active, key=_rank_key)
+
+    protected: list[WatchlistEntry] = []
+    unprotected: list[WatchlistEntry] = []
+    for r in ranked:
+        if _catalyst_eviction_protected(r, asof, position_lookup):
+            protected.append(r)
+        else:
+            unprotected.append(r)
+
+    residual_capacity = max(max_per_play - len(protected), 0)
+    evict_symbols = [r.symbol for r in unprotected[residual_capacity:]]
+
+    if not evict_symbols:
+        return rows, []
+
+    evict_set = set(evict_symbols)
+    events: list[dict[str, Any]] = []
+    new_rows: list[WatchlistEntry] = []
+    for r in rows:
+        if r.symbol in evict_set and r.state == STATE_ACTIVE:
+            events.append(
+                _event(
+                    asof=asof,
+                    play=play,
+                    symbol=r.symbol,
+                    action=ACTION_EVICT,
+                    reason=f"over_cap_trim (cap={max_per_play})",
+                    score_before=r.last_score,
+                    score_after=r.last_score,
+                )
+            )
+            new_rows.append(
+                replace(
+                    r,
+                    state=STATE_EVICTED,
+                    eviction_reason=f"over_cap_trim (cap={max_per_play})",
+                    consecutive_days_above_floor=0,
+                )
+            )
+        else:
+            new_rows.append(r)
+
+    return new_rows, events
 
 
 def _event(
