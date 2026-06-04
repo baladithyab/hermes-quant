@@ -23,10 +23,16 @@ from __future__ import annotations
 
 from .base import ExecutionRecord, Reactor
 from .multileg import MultiLegPaperReactor
-from .paper import PaperReactor
+from .paper import FillSizeInvariantError, PaperReactor
 
 # ADR-0029 B01 go-live: MultiLegPaperReactor is exported in THIS wave so the
 # quant_approve dispatch (react/dispatch.py) can import it from the package. It
 # remains DEFAULT-OFF (HERMES_QUANT_MULTILEG_REACTOR set NOWHERE) — un-fired unless
 # the operator deliberately flips the flag after the ADR-0029 D7 evidence window.
-__all__ = ["ExecutionRecord", "Reactor", "PaperReactor", "MultiLegPaperReactor"]
+__all__ = [
+    "ExecutionRecord",
+    "Reactor",
+    "PaperReactor",
+    "FillSizeInvariantError",
+    "MultiLegPaperReactor",
+]

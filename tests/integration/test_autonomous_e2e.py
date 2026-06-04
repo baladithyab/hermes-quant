@@ -25,6 +25,7 @@ from hermes_quant.autonomous import (
     tick,
     trip_kill_switch,
 )
+from hermes_quant.react.paper import FillSizeInvariantError
 from hermes_quant.watchlist import WatchlistEntry
 
 
@@ -200,6 +201,29 @@ def test_no_dry_run_calls_react_on_fire(
     assert result.fires == 1
     assert react_calls == [("AAPL", 0.05)]
     assert result.decisions[0].execution_id == "exec_AAPL"
+
+
+def test_fill_size_invariant_rejection_silences_not_errors(
+    isolate_config,
+    isolate_quant_home,
+):
+    _set_mode_autonomous(isolate_config)
+
+    with mock.patch(
+        "hermes_quant.autonomous._react",
+        side_effect=FillSizeInvariantError("fill size rejected"),
+    ):
+        result = tick(
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+        )
+
+    assert result.fires == 0
+    assert result.silences == 1
+    assert result.errors == 0
+    assert result.decisions[0].gate == "SILENCE_FILL_SIZE_INVARIANT"
+    assert result.decisions[0].execution_id is None
 
 
 # ---------------------------------------------------------------------------

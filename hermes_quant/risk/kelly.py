@@ -148,6 +148,8 @@ def quarter_kelly_size(
     """
     if direction == 0 or edge == 0.0:
         return 0.0
+    if not math.isfinite(edge) or not math.isfinite(variance):
+        return 0.0
     safe_var = max(variance, 1e-8)
     raw_size = quarter_kelly * (edge / safe_var)
     # Clip to max position; preserve sign

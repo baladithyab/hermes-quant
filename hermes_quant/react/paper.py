@@ -11,16 +11,26 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import UTC, datetime
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
 from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, append_locked
-from .base import ExecutionRecord
+
 from .admissibility_precondition import admissibility_reject_equity
+from .base import ExecutionRecord
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_POSITION_PCT = 0.20
+_FILL_SIZE_EPSILON = 1e-9
+
+
+class FillSizeInvariantError(ValueError):
+    """fill_size_pct violated the last-seam invariant. Fail closed."""
 
 
 def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
@@ -44,6 +54,48 @@ def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
         "bar_ts": record.bar_ts,  # ADR-0068: explicit bar-boundary anchor
         "play_tag": record.play_tag,  # B13: source of the fire
     }
+
+
+def _enforce_fill_size_invariant(proposal: Any, fill_size_pct: float) -> float:
+    """Validate the signed NAV fraction before any money-moving side effect.
+
+    This is the final per-symbol safety invariant at the paper execution seam:
+    reject non-finite or over-cap fills, never silently clamp them.
+    """
+    try:
+        fill_size = float(fill_size_pct)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FillSizeInvariantError(
+            f"fill_size_pct={fill_size_pct!r} is non-finite; refusing to execute"
+        ) from exc
+    if not isinstance(fill_size_pct, Real) or not math.isfinite(fill_size):
+        raise FillSizeInvariantError(
+            f"fill_size_pct={fill_size_pct!r} is non-finite; refusing to execute"
+        )
+
+    advisor_result = getattr(proposal, "advisor_result", None) or {}
+    risk_gate = advisor_result.get("risk_gate") if isinstance(advisor_result, dict) else None
+    risk_gate = risk_gate if isinstance(risk_gate, dict) else {}
+    raw_cap = risk_gate.get("max_position_pct", _DEFAULT_MAX_POSITION_PCT)
+    if raw_cap is None:
+        raw_cap = _DEFAULT_MAX_POSITION_PCT
+    try:
+        cap = float(raw_cap)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FillSizeInvariantError(
+            f"max_position_pct={raw_cap!r} is invalid; refusing to execute"
+        ) from exc
+    if not math.isfinite(cap) or cap < 0.0:
+        raise FillSizeInvariantError(
+            f"max_position_pct={raw_cap!r} is invalid; refusing to execute"
+        )
+
+    if abs(fill_size) > cap + _FILL_SIZE_EPSILON:
+        raise FillSizeInvariantError(
+            f"|fill_size_pct|={abs(fill_size):.4f} exceeds per-symbol cap "
+            f"{cap:.4f}; refusing to execute"
+        )
+    return fill_size_pct
 
 
 def _account_nav_usd() -> float | None:
@@ -129,6 +181,7 @@ class PaperReactor:
             Reflector is triggered asynchronously.  Default OFF — behavior
             is bit-identical to pre-Wave-4 when the env var is absent.
         """
+        fill_size_pct = _enforce_fill_size_invariant(proposal, fill_size_pct)
         decision_price = self._extract_decision_price(proposal)
         signal_id = self._extract_signal_id(proposal)
         now = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -389,12 +442,14 @@ class PaperReactor:
 
         # Flag ON path only: import the cap machinery lazily so the OFF path
         # stays import- and IO-free.
-        from hermes_quant.state.portfolio_state import get_portfolio_state
         from hermes_quant.risk.portfolio_normalize import (
             PortfolioCaps,
-            PortfolioState as RiskPortfolioState,
             clip_one_to_remaining_headroom,
         )
+        from hermes_quant.risk.portfolio_normalize import (
+            PortfolioState as RiskPortfolioState,
+        )
+        from hermes_quant.state.portfolio_state import get_portfolio_state
 
         ps = get_portfolio_state()
         # Resolve the account the SAME way the bus-append path does (see execute():
@@ -405,7 +460,7 @@ class PaperReactor:
         account_id = (rmeta.get("account_id") if isinstance(rmeta, dict) else None) or "paper-default"
         positions = ps.get_positions(account_id)
         pos_map: dict[str, float] = {}
-        for (asset_class, symbol), position in positions.items():
+        for (_asset_class, symbol), position in positions.items():
             # Positions are stored as NAV-fraction quantities in v0.1 (ADR-0041).
             # The cap seam reads them as target_position_pct by symbol.
             pos_map[symbol] = position.quantity

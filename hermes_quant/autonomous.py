@@ -41,6 +41,7 @@ from hermes_quant.gates.silence_bias import (
     GateConfig,
     silence_bias_gate,
 )
+from hermes_quant.react.paper import FillSizeInvariantError
 from hermes_quant.watchlist import WatchlistEntry, list_watchlist
 
 logger = logging.getLogger(__name__)
@@ -612,6 +613,22 @@ def tick(
                         # PortfolioState is frozen — the dict is the inner mutable
                         # container that we update without reconstructing the wrapper.
                         portfolio_state.positions[entry.symbol] = effective_size
+                except FillSizeInvariantError as exc:
+                    logger.warning(
+                        "autonomous: fill-size invariant rejected %s: %s",
+                        entry.symbol,
+                        exc,
+                    )
+                    decision.gate = "SILENCE_FILL_SIZE_INVARIANT"
+                    decision.details = {
+                        "reason": str(exc),
+                        "would_have_fired": True,
+                        "original_gate": gate_result.decision.value,
+                        "requested_fill_size_pct": effective_size,
+                    }
+                    result.silences += 1
+                    result.decisions.append(decision)
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "autonomous: React failed for %s: %s",
