@@ -185,6 +185,63 @@ def test_fully_grounded_view_byte_identical_to_no_verifier():
     assert on["aggregated_signal"]["n_components"] == 2
 
 
+def test_multi_horizon_drops_ungrounded_view():
+    """recommend_multi_horizon must ALSO enforce grounding (second entry point).
+
+    Adversarial review (A-sneak-ungrounded): recommend_multi_horizon returned
+    views straight to the caller's aggregator without the Step-5.5 seam, so a
+    grounded view with a fabricated number bypassed enforcement entirely.
+    """
+    from hermes_quant.advisor import recommend_multi_horizon
+
+    provider = _StubProvider(_daily_df())
+    bad = _GroundedAnalyst("hermes_semantic", "Moonshot target 9999.00 imminent.")
+    plain = _PlainAnalyst("classical_ta")
+    views = recommend_multi_horizon(
+        "AAPL", horizons=("1d",), asset_class="equity", as_of=_ASOF,
+        provider=provider, analysts=[bad, plain],
+        market_extras={"ground_truth_block": _block()},
+    )
+    analysts_voting = {v.analyst for v in views}
+    assert "hermes_semantic" not in analysts_voting, (
+        "ungrounded grounded view must be dropped from the multi-horizon fan-out"
+    )
+    assert "classical_ta" in analysts_voting, "non-grounded analyst must survive"
+
+
+def test_multi_horizon_grounded_view_kept_byte_identical():
+    """A fully-grounded multi-horizon view is kept identically with the seam on/off."""
+    from hermes_quant.advisor import recommend_multi_horizon
+    import os
+
+    block = _block()
+    rationale = f"Close confirmed at {block.ohlcv_60d[-1].close:.4f} on ground truth."
+
+    def _run(enforce: str):
+        prev = os.environ.get("HERMES_QUANT_GROUNDING_ENFORCE")
+        os.environ["HERMES_QUANT_GROUNDING_ENFORCE"] = enforce
+        try:
+            provider = _StubProvider(_daily_df())
+            good = _GroundedAnalyst("hermes_semantic", rationale)
+            plain = _PlainAnalyst("classical_ta")
+            return recommend_multi_horizon(
+                "AAPL", horizons=("1d",), asset_class="equity", as_of=_ASOF,
+                provider=provider, analysts=[good, plain],
+                market_extras={"ground_truth_block": block},
+            )
+        finally:
+            if prev is None:
+                os.environ.pop("HERMES_QUANT_GROUNDING_ENFORCE", None)
+            else:
+                os.environ["HERMES_QUANT_GROUNDING_ENFORCE"] = prev
+
+    on = {v.analyst for v in _run("1")}
+    off = {v.analyst for v in _run("0")}
+    assert on == off == {"hermes_semantic", "classical_ta"}, (
+        "fully-grounded inputs must survive identically with the seam on/off"
+    )
+
+
 def test_no_block_path_unaffected_by_seam():
     """With no ground_truth_block (default advisor path), seam on==off byte-identical."""
     def _run(enforce: str):

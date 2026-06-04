@@ -607,6 +607,7 @@ def recommend_multi_horizon(
             extras=ctx_extras_base,
         )
 
+        horizon_views: list[AnalystView] = []
         for analyst in analysts:
             analyst_name = getattr(analyst, "name", type(analyst).__name__)
             try:
@@ -638,7 +639,27 @@ def recommend_multi_horizon(
             # carry the horizon under which it was produced.
             if view.horizon != h:
                 view = dataclasses.replace(view, horizon=h)
-            all_views.append(view)
+            horizon_views.append(view)
+
+        # Grounding enforcement (seed 24ba) — the SECOND advisor entry point.
+        # recommend() enforces at its Step 5.5 seam; this fan-out is an equally
+        # valid path into a downstream aggregator (ops/scripts/quant-playbook-tick.py),
+        # so it must drop ungrounded grounded-views too — fail-CLOSED. Enforce
+        # per-horizon against THIS horizon's ctx (carries the same extras incl.
+        # ground_truth_block). ADDITIVE: no block / no grounding marker / flag-OFF
+        # -> identity passthrough, byte-identical to today.
+        from hermes_quant.grounding.enforcement import enforce_grounding
+
+        horizon_views, _dropped = enforce_grounding(horizon_views, ctx)
+        if _dropped:
+            logger.info(
+                "recommend_multi_horizon: grounding enforcement dropped %d "
+                "ungrounded view(s) at horizon %s: %s",
+                len(_dropped),
+                h,
+                ", ".join(sorted({r["analyst"] for r in _dropped})),
+            )
+        all_views.extend(horizon_views)
 
     return all_views
 
