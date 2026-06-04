@@ -309,3 +309,211 @@ def test_trader_node_llm_never_raises(monkeypatch):
             # For now we just ensure no crash propagates to the test runner
             # since the __call__ has an outer guard only on the LLM call itself.
             pass
+
+
+# ===========================================================================
+# B41-d (ADR-4665 §5.3/§7.4): the v0.2 LLM-success path MUST re-run the SAME
+# deterministic price-level helper v0.1 uses and OVERWRITE the LLM's numeric
+# entry/stop/target. LLM numbers can NEVER reach the gate un-recomputed.
+#
+# The risk gate re-derives size_fraction (quarter-Kelly), but NOTHING
+# downstream re-derives the price triple — risk_committee/personas.py reads
+# proposal.entry_price / proposal.stop_loss verbatim. So the producing seam
+# (TraderNodeLLM) is the last place to enforce determinism on those numbers.
+# ===========================================================================
+
+
+# A deliberately-hallucinated LLM proposal. Note the price regime is a total
+# fabrication relative to the advisor signal (real last_close = 100.0):
+#   - entry 200.0  (2× the real close)
+#   - stop  199.0  (valid for *its own* fake entry, but absurd vs reality;
+#                   would be on the WRONG side — above — the deterministic
+#                   entry of 100.0 if it were naively kept)
+#   - target 9999.0 (absurd moonshot)
+_HALLUCINATED_LLM_PROPOSAL_DICT = {
+    "action": "BUY",
+    "size_fraction": 0.15,
+    "entry_price": 200.0,
+    "stop_loss": 199.0,
+    "target_price": 9999.0,
+    "time_horizon_days": 30,
+    "confidence": 0.95,
+    "rationale": "LLM qualitative rationale that may legitimately pass through.",
+    "warning_message": None,
+}
+
+
+def _deterministic_triple(action: TraderAction, advisor_signal: dict) -> tuple:
+    """Compute the price triple via the EXACT v0.1 helper the gate trusts."""
+    return TraderNode()._price_levels(
+        action=action,
+        recommendation="Buy",  # unused by _price_levels body; side comes from action
+        advisor_signal=advisor_signal,
+    )
+
+
+def test_v02_overwrites_llm_numbers_with_deterministic_recompute(monkeypatch):
+    """The proposal that LEAVES TraderNodeLLM carries deterministic numbers."""
+    monkeypatch.setenv("HERMES_QUANT_TRADER_LLM", "1")
+
+    hallucinated = TraderProposal(**_HALLUCINATED_LLM_PROPOSAL_DICT)
+    mock_caller = _mock_llm_caller(available=True, return_proposal=hallucinated)
+
+    # The deterministic triple from the SAME helper v0.1 uses.
+    det_entry, det_stop, det_target = _deterministic_triple(
+        TraderAction.BUY, _ADVISOR_SIGNAL
+    )
+    # close=100, atr_relative=0.02, 2×ATR ⇒ entry=100, stop=96, target=104.
+    assert (det_entry, det_stop, det_target) == (100.0, 96.0, 104.0)
+
+    audit_calls = []
+    with patch("hermes_quant.agents.llm_caller._audit_append") as mock_audit:
+        mock_audit.side_effect = lambda kind, source, payload: audit_calls.append(payload)
+        node = TraderNodeLLM(llm_caller=mock_caller)
+        result = node(_RESEARCH_PLAN, _ADVISOR_SIGNAL)
+
+    # It is still the v0.2 LLM-success path (qualitative fields preserved).
+    assert any(c["path"] == "v02_llm_succeeded" for c in audit_calls)
+    assert result.rationale == _HALLUCINATED_LLM_PROPOSAL_DICT["rationale"]
+    assert result.action == TraderAction.BUY  # LLM may influence direction
+
+    # The numeric fields that feed the gate are the DETERMINISTIC ones …
+    assert result.entry_price == pytest.approx(100.0)
+    assert result.stop_loss == pytest.approx(96.0)
+    assert result.target_price == pytest.approx(104.0)
+    # … and NEVER the LLM's hallucinated numbers.
+    assert result.entry_price != _HALLUCINATED_LLM_PROPOSAL_DICT["entry_price"]
+    assert result.stop_loss != _HALLUCINATED_LLM_PROPOSAL_DICT["stop_loss"]
+    assert result.target_price != _HALLUCINATED_LLM_PROPOSAL_DICT["target_price"]
+
+
+def test_v02_wrong_side_stop_cannot_reach_gate(monkeypatch):
+    """A genuinely WRONG-SIDE LLM stop (above entry on a BUY) — one that bypasses
+    the schema validator, as a permissive parser could conceivably emit — must be
+    overwritten with the deterministic losing-side stop. The LLM's wrong-side
+    number can NEVER reach the gate. This is a true RED-driver: against the
+    unfixed seam the rogue 150.0 would flow straight through.
+    """
+    monkeypatch.setenv("HERMES_QUANT_TRADER_LLM", "1")
+
+    # model_construct() bypasses the cross-field validator, simulating the worst
+    # case: a parsed BUY proposal whose stop (150) sits ABOVE entry (100) — the
+    # wrong (winning) side. There is no valid TraderProposal(**dict) for this.
+    rogue = TraderProposal.model_construct(
+        action=TraderAction.BUY,
+        size_fraction=0.15,
+        entry_price=100.0,
+        stop_loss=150.0,  # WRONG side: above entry on a BUY
+        target_price=0.5,  # absurd / wrong side
+        time_horizon_days=30,
+        confidence=0.9,
+        rationale="Rogue LLM stop on the wrong (winning) side of entry.",
+        warning_message=None,
+        research_plan_recommendation=None,
+        research_plan_id=None,
+    )
+    mock_caller = _mock_llm_caller(available=True, return_proposal=rogue)
+
+    with patch("hermes_quant.agents.llm_caller._audit_append"):
+        node = TraderNodeLLM(llm_caller=mock_caller)
+        result = node(_RESEARCH_PLAN, _ADVISOR_SIGNAL)
+
+    # The deterministic recompute puts the stop back on the losing side …
+    assert result.stop_loss == pytest.approx(96.0)
+    assert result.target_price == pytest.approx(104.0)
+    # … strictly below entry (BUY invariant the gate trusts) …
+    assert result.stop_loss is not None and result.entry_price is not None
+    assert result.stop_loss < result.entry_price
+    # … and the rogue 150.0 is GONE — it never reached the proposal that leaves.
+    assert result.stop_loss != 150.0
+
+
+def test_v02_overwrites_numbers_for_sell_direction(monkeypatch):
+    """SELL: deterministic stop is ABOVE entry; LLM's numbers are discarded."""
+    monkeypatch.setenv("HERMES_QUANT_TRADER_LLM", "1")
+
+    sell_plan = {**_RESEARCH_PLAN, "recommendation": "Sell"}
+    # LLM hallucination valid for a SELL (stop above its own entry) but absurd.
+    sell_llm_dict = {
+        **_HALLUCINATED_LLM_PROPOSAL_DICT,
+        "action": "SELL",
+        "entry_price": 200.0,
+        "stop_loss": 201.0,
+        "target_price": 0.01,
+    }
+    hallucinated = TraderProposal(**sell_llm_dict)
+    mock_caller = _mock_llm_caller(available=True, return_proposal=hallucinated)
+
+    det_entry, det_stop, det_target = _deterministic_triple(
+        TraderAction.SELL, _ADVISOR_SIGNAL
+    )
+    # close=100, 2×ATR ⇒ entry=100, stop=104, target=96.
+    assert (det_entry, det_stop, det_target) == (100.0, 104.0, 96.0)
+
+    with patch("hermes_quant.agents.llm_caller._audit_append"):
+        node = TraderNodeLLM(llm_caller=mock_caller)
+        result = node(sell_plan, _ADVISOR_SIGNAL)
+
+    assert result.action == TraderAction.SELL
+    assert result.entry_price == pytest.approx(100.0)
+    assert result.stop_loss == pytest.approx(104.0)
+    assert result.target_price == pytest.approx(96.0)
+    assert result.stop_loss > result.entry_price  # SELL ⇒ stop above entry
+
+
+def test_v02_no_price_data_drops_llm_stop_to_none(monkeypatch):
+    """If there is no deterministic basis (no price/ATR), the LLM's stop/target
+    are STILL overwritten — to None — never kept. Silence-by-default."""
+    monkeypatch.setenv("HERMES_QUANT_TRADER_LLM", "1")
+
+    hallucinated = TraderProposal(**_HALLUCINATED_LLM_PROPOSAL_DICT)
+    mock_caller = _mock_llm_caller(available=True, return_proposal=hallucinated)
+
+    no_price_signal: dict[str, Any] = {"direction": 1, "confidence": 0.7}
+
+    with patch("hermes_quant.agents.llm_caller._audit_append"):
+        node = TraderNodeLLM(llm_caller=mock_caller)
+        result = node(_RESEARCH_PLAN, no_price_signal)
+
+    # No deterministic stop/target available ⇒ both None (NOT the LLM's 199/9999).
+    assert result.entry_price is None
+    assert result.stop_loss is None
+    assert result.target_price is None
+
+
+def test_v02_recompute_matches_v01_node_exactly(monkeypatch):
+    """The overwritten numbers must equal what the v0.1 node produces for the
+    same inputs — proving we re-run the SAME helper the gate trusts."""
+    monkeypatch.setenv("HERMES_QUANT_TRADER_LLM", "1")
+
+    hallucinated = TraderProposal(**_HALLUCINATED_LLM_PROPOSAL_DICT)
+    mock_caller = _mock_llm_caller(available=True, return_proposal=hallucinated)
+
+    v01_proposal = TraderNode()(_RESEARCH_PLAN, _ADVISOR_SIGNAL)
+
+    with patch("hermes_quant.agents.llm_caller._audit_append"):
+        node = TraderNodeLLM(llm_caller=mock_caller)
+        result = node(_RESEARCH_PLAN, _ADVISOR_SIGNAL)
+
+    assert result.entry_price == v01_proposal.entry_price
+    assert result.stop_loss == v01_proposal.stop_loss
+    assert result.target_price == v01_proposal.target_price
+
+
+def test_flag_off_byte_identical_to_v01_full_dump(monkeypatch):
+    """Flag OFF: TraderNodeLLM output is byte-identical to TraderNode — every
+    field, via full model_dump() equality (not just a sampled subset)."""
+    monkeypatch.setenv("HERMES_QUANT_TRADER_LLM", "0")
+
+    # A caller that, if ever consulted, would inject hallucinated numbers.
+    poison = TraderProposal(**_HALLUCINATED_LLM_PROPOSAL_DICT)
+    mock_caller = _mock_llm_caller(available=True, return_proposal=poison)
+
+    expected = TraderNode()(_RESEARCH_PLAN, _ADVISOR_SIGNAL)
+
+    with patch("hermes_quant.agents.llm_caller._audit_append"):
+        node = TraderNodeLLM(llm_caller=mock_caller)
+        result = node(_RESEARCH_PLAN, _ADVISOR_SIGNAL)
+
+    assert result.model_dump() == expected.model_dump()
+    mock_caller.call.assert_not_called()  # LLM never even consulted when OFF

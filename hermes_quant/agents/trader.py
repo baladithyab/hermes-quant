@@ -594,9 +594,37 @@ class TraderNodeLLM:
 
         # --- Validate returned object ---
         if isinstance(obj, TraderProposal):
-            logger.info("TraderNodeLLM: v0.2 LLM path succeeded.")
-            self._record_path("v02_llm_succeeded", obj)
-            return obj
+            # ADR-4665 §5.3/§7.4 (Gate-1 byte-identical gap): the LLM may
+            # influence DIRECTION and QUALITATIVE fields, but its numeric
+            # entry/stop/target MUST NOT reach the risk gate un-recomputed.
+            # Re-run the SAME deterministic helper v0.1 uses and OVERWRITE the
+            # price triple, so a hallucinated stop/target can never flow
+            # downstream as if it were the deterministic value. NEVER raise —
+            # on any failure fall back to the pure v0.1 deterministic proposal.
+            try:
+                grounded = self._overwrite_price_levels_deterministic(
+                    obj, research_plan, advisor_signal
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "TraderNodeLLM: deterministic price-level recompute failed "
+                    "(%s); falling back to v0.1.",
+                    exc,
+                )
+                proposal = self._v01_node(research_plan, advisor_signal)
+                self._record_path(
+                    "v02_llm_fallback_to_v01",
+                    proposal,
+                    reason=f"recompute_failed: {exc}",
+                )
+                return proposal
+
+            logger.info(
+                "TraderNodeLLM: v0.2 LLM path succeeded "
+                "(numeric stop/target deterministically re-grounded)."
+            )
+            self._record_path("v02_llm_succeeded", grounded)
+            return grounded
 
         # LLM returned None or non-TraderProposal — fall back
         logger.warning(
@@ -615,6 +643,49 @@ class TraderNodeLLM:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _overwrite_price_levels_deterministic(
+        self,
+        llm_proposal: TraderProposal,
+        research_plan: dict[str, Any],
+        advisor_signal: dict[str, Any],
+    ) -> TraderProposal:
+        """Re-ground a v0.2 LLM proposal's numeric price levels.
+
+        ADR-4665 §5.3/§7.4. The LLM's raw entry_price / stop_loss /
+        target_price are DISCARDED and replaced with the deterministic
+        recomputation produced by the EXACT same ``TraderNode._price_levels``
+        helper that the v0.1 path feeds to the risk gate. Everything else the
+        LLM produced (action, size_fraction, time_horizon_days, confidence,
+        rationale, research-plan links) is preserved.
+
+        We rebuild a fresh ``TraderProposal`` rather than ``model_copy`` so the
+        cross-field model-validator (stop must be on the losing side of entry)
+        re-runs against the deterministic numbers — the LLM cannot smuggle a
+        wrong-side or absurd stop past the producing seam.
+
+        Returns a NEW TraderProposal. May raise (caller wraps with try/except
+        → v0.1 fallback); never mutates the input.
+        """
+        # Recompute from the LLM's chosen ACTION so the deterministic stop sits
+        # on the correct losing side for the direction the LLM proposed. The
+        # magnitude/side come entirely from advisor-signal metadata (2×ATR from
+        # last_close), never from the LLM's numbers. ``recommendation`` carries
+        # the rating-domain value from the research plan (NOT action.value) so
+        # the helper's contract — ``_build`` passes "Buy"/"Sell"/… — is honored
+        # even if ``_price_levels`` is later extended to consume the rating.
+        recommendation = research_plan.get("recommendation")
+        det_entry, det_stop, det_target = self._v01_node._price_levels(
+            action=llm_proposal.action,
+            recommendation=recommendation,
+            advisor_signal=advisor_signal,
+        )
+
+        data = llm_proposal.model_dump()
+        data["entry_price"] = det_entry
+        data["stop_loss"] = det_stop
+        data["target_price"] = det_target
+        return TraderProposal(**data)
 
     def _record_path(
         self,
