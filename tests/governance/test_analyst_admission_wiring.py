@@ -53,6 +53,74 @@ def test_load_admission_decisions_missing_file_is_empty(tmp_path: Path):
     assert load_admission_decisions(tmp_path / "nope.json") == {}
 
 
+def test_load_admission_decisions_string_admitted_fails_closed(tmp_path: Path):
+    """REGRESSION (adversarial review, L3): a record whose ``admitted`` is the JSON
+    STRING "false" must NOT admit. `bool("false")` is True in Python, and the loader's
+    try/except (TypeError, ValueError) never fires for str coercion — so naive
+    `bool(rec["admitted"])` would fail OPEN (silently admit a corrupted/hand-edited
+    record), violating the fail-closed contract. Only a real JSON boolean ``true``
+    admits; every other value is held."""
+    path = tmp_path / "decisions.json"
+    path.write_text(
+        json.dumps(
+            {
+                "stringy_false": {"admitted": "false", "plateau_stable": "false",
+                                  "beats_prior_best": "false", "holdout_dsr": 0.9,
+                                  "prior_best_dsr": 0.1, "reason": "corrupt"},
+                "stringy_true": {"admitted": "true", "holdout_dsr": 0.9,
+                                 "prior_best_dsr": 0.1, "reason": "corrupt"},
+                "int_one": {"admitted": 1, "holdout_dsr": 0.9,
+                            "prior_best_dsr": 0.1, "reason": "corrupt"},
+                "real_true": {"admitted": True, "plateau_stable": True,
+                              "beats_prior_best": True, "holdout_dsr": 0.9,
+                              "prior_best_dsr": 0.1, "reason": "ok"},
+            }
+        )
+    )
+    decisions = load_admission_decisions(path)
+    # The string "false" must NOT admit (the bug: bool("false") is True).
+    assert decisions["stringy_false"].admitted is False
+    # Defense-in-depth: any non-bool admitted value fails closed, even truthy ones —
+    # only a genuine JSON boolean `true` is honored.
+    assert decisions["stringy_true"].admitted is False
+    assert decisions["int_one"].admitted is False
+    # A real boolean True still admits (the honest round-trip path is unaffected).
+    assert decisions["real_true"].admitted is True
+
+
+def test_string_admitted_decision_does_not_join_committee(tmp_path: Path, monkeypatch):
+    """End-to-end fail-closed: a corrupted decisions file claiming admitted="false"
+    for a real analyst must NOT let it join the committee when the flag is ON."""
+    from hermes_quant import advisor
+    from hermes_quant.governance import analyst_admission
+
+    monkeypatch.delenv("HERMES_QUANT_ANALYST_ADMISSION", raising=False)
+    baseline_names = [
+        getattr(a, "name", type(a).__name__) for a in advisor._build_default_analysts()
+    ]
+    assert baseline_names
+    target = baseline_names[0]
+
+    # Every analyst gets a string-"false" admitted (the fail-open vector).
+    decisions = {
+        name: {"admitted": "false", "holdout_dsr": 0.9, "prior_best_dsr": 0.1,
+               "plateau_stable": "false", "beats_prior_best": "false", "reason": "corrupt"}
+        for name in baseline_names
+    }
+    decisions_file = tmp_path / "decisions.json"
+    decisions_file.write_text(json.dumps(decisions))
+
+    monkeypatch.setenv("HERMES_QUANT_ANALYST_ADMISSION", "1")
+    monkeypatch.setattr(
+        analyst_admission, "_DEFAULT_DECISIONS_PATH", decisions_file, raising=False
+    )
+    admitted_names = [
+        getattr(a, "name", type(a).__name__) for a in advisor._build_default_analysts()
+    ]
+    assert target not in admitted_names
+    assert admitted_names == []  # all string-"false" -> all held (fail-closed)
+
+
 # ---------------------------------------------------------------------------
 # the WIRING: default-OFF byte-identical, ON filters
 # ---------------------------------------------------------------------------

@@ -293,9 +293,17 @@ def load_admission_decisions(
                 analyst_id=analyst_id,
                 holdout_dsr=float(rec.get("holdout_dsr", float("-inf"))),
                 prior_best_dsr=float(rec.get("prior_best_dsr", float("-inf"))),
-                plateau_stable=bool(rec.get("plateau_stable", False)),
-                beats_prior_best=bool(rec.get("beats_prior_best", False)),
-                admitted=bool(rec.get("admitted", False)),
+                # STRICT booleans (fail-closed): bool("false") is True in Python and
+                # bool() raises neither TypeError nor ValueError, so a corrupted or
+                # hand-edited record like {"admitted": "false"} would fail OPEN
+                # (silently admit). `is True` admits ONLY a genuine JSON boolean
+                # `true`; every other value (string, int, null, absent) holds —
+                # preserving the loader's fail-closed contract. The honest write path
+                # (AnalystAdmissionDecision.to_dict -> json.dumps) emits real bools,
+                # so it round-trips unchanged.
+                plateau_stable=rec.get("plateau_stable") is True,
+                beats_prior_best=rec.get("beats_prior_best") is True,
+                admitted=rec.get("admitted") is True,
                 reason=str(rec.get("reason", "")),
             )
         except (TypeError, ValueError):
