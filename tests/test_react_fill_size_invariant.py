@@ -10,6 +10,7 @@ import pytest
 from hermes_quant.proposals import Proposal, ProposalStore
 from hermes_quant.protocol import AggregatedSignal, MarketState, Portfolio
 from hermes_quant.react.paper import (
+    HARD_FILL_CEILING,
     FillSizeInvariantError,
     PaperReactor,
     _record_to_dict,
@@ -111,25 +112,28 @@ def test_execute_inf_fill_size_raises_and_bus_unchanged(tmp_path: Path) -> None:
     assert _bus_records(bus) == before
 
 
-def test_execute_over_default_cap_raises_and_bus_unchanged(tmp_path: Path) -> None:
+def test_execute_spoofed_proposal_cap_over_hard_ceiling_raises_and_bus_unchanged(
+    tmp_path: Path,
+) -> None:
     bus = tmp_path / "executions.jsonl"
     reactor = PaperReactor(executions_path=bus)
     before = _bus_records(bus)
 
     with pytest.raises(FillSizeInvariantError):
-        reactor.execute(_proposal(), fill_size_pct=2.0)
+        reactor.execute(_proposal(max_position_pct=2.0), fill_size_pct=2.0)
 
     assert _bus_records(bus) == before
 
 
-def test_execute_honors_aggressive_play_cap(tmp_path: Path) -> None:
+def test_execute_valid_oversized_fill_does_not_read_proposal_cap(tmp_path: Path) -> None:
     bus = tmp_path / "executions.jsonl"
     reactor = PaperReactor(executions_path=bus)
 
-    record = reactor.execute(_proposal(max_position_pct=0.40), fill_size_pct=-0.40)
+    record = reactor.execute(_proposal(max_position_pct=0.01), fill_size_pct=0.90)
 
-    assert record.fill_size_pct == pytest.approx(-0.40)
-    assert _bus_records(bus)[0]["fill_size_pct"] == pytest.approx(-0.40)
+    assert 0.90 < HARD_FILL_CEILING
+    assert record.fill_size_pct == pytest.approx(0.90)
+    assert _bus_records(bus)[0]["fill_size_pct"] == pytest.approx(0.90)
 
 
 def test_execute_default_cap_happy_path_writes_unchanged_record(tmp_path: Path) -> None:

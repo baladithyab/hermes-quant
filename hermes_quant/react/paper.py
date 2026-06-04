@@ -25,8 +25,7 @@ from .base import ExecutionRecord
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_POSITION_PCT = 0.20
-_FILL_SIZE_EPSILON = 1e-9
+HARD_FILL_CEILING = 1.0
 
 
 class FillSizeInvariantError(ValueError):
@@ -56,11 +55,13 @@ def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
     }
 
 
-def _enforce_fill_size_invariant(proposal: Any, fill_size_pct: float) -> float:
+def _enforce_fill_size_invariant(_proposal: Any, fill_size_pct: float) -> float:
     """Validate the signed NAV fraction before any money-moving side effect.
 
-    This is the final per-symbol safety invariant at the paper execution seam:
-    reject non-finite or over-cap fills, never silently clamp them.
+    This is the final sanity invariant at the paper execution seam. It rejects
+    non-finite values and obviously insane magnitudes, but it deliberately does
+    not enforce the normal position cap. The portfolio-cap seam owns clipping
+    ordinary oversized fills.
     """
     try:
         fill_size = float(fill_size_pct)
@@ -73,27 +74,10 @@ def _enforce_fill_size_invariant(proposal: Any, fill_size_pct: float) -> float:
             f"fill_size_pct={fill_size_pct!r} is non-finite; refusing to execute"
         )
 
-    advisor_result = getattr(proposal, "advisor_result", None) or {}
-    risk_gate = advisor_result.get("risk_gate") if isinstance(advisor_result, dict) else None
-    risk_gate = risk_gate if isinstance(risk_gate, dict) else {}
-    raw_cap = risk_gate.get("max_position_pct", _DEFAULT_MAX_POSITION_PCT)
-    if raw_cap is None:
-        raw_cap = _DEFAULT_MAX_POSITION_PCT
-    try:
-        cap = float(raw_cap)
-    except (TypeError, ValueError, OverflowError) as exc:
+    if abs(fill_size) > HARD_FILL_CEILING:
         raise FillSizeInvariantError(
-            f"max_position_pct={raw_cap!r} is invalid; refusing to execute"
-        ) from exc
-    if not math.isfinite(cap) or cap < 0.0:
-        raise FillSizeInvariantError(
-            f"max_position_pct={raw_cap!r} is invalid; refusing to execute"
-        )
-
-    if abs(fill_size) > cap + _FILL_SIZE_EPSILON:
-        raise FillSizeInvariantError(
-            f"|fill_size_pct|={abs(fill_size):.4f} exceeds per-symbol cap "
-            f"{cap:.4f}; refusing to execute"
+            f"|fill_size_pct|={abs(fill_size):.4f} exceeds hard ceiling "
+            f"{HARD_FILL_CEILING:.4f}; refusing to execute"
         )
     return fill_size_pct
 
@@ -417,24 +401,24 @@ class PaperReactor:
         Returns a ``(silence_record, effective_fill_size_pct, cap_metadata)``
         triad so the seam can express all three ADR-0087 outcomes:
 
-          * **Full silence** — the clip leaves no usable headroom (not fired,
+          * **Full silence** - the clip leaves no usable headroom (not fired,
             or clipped to ~0). Returns ``(ExecutionRecord, 0.0, None)`` where
             the record is an audit-only silenced record that is NOT appended to
             executions.jsonl and does NOT update PortfolioState. The caller
             early-returns it.
-          * **Partial scale** — the clip fits the fire only partially
+          * **Partial scale** - the clip fits the fire only partially
             (``fired=True`` with ``scale_factor < 1.0``). Returns
             ``(None, clipped.portfolio_target_pct, cap_metadata)`` where
             ``cap_metadata`` carries ``cap_scaled_from`` (original
             fill_size_pct), ``cap_scaled_to`` (clipped value), and
             ``cap_scale_factor``. The caller executes a real fill at the
             CLIPPED size and merges ``cap_metadata`` into the record.
-          * **Full pass** — the fire fits entirely (``scale_factor == 1.0``).
+          * **Full pass** - the fire fits entirely (``scale_factor == 1.0``).
             Returns ``(None, fill_size_pct, None)``: the fill proceeds at the
             original size, no cap metadata, behavior unchanged.
 
         With HERMES_QUANT_PORTFOLIO_CAPS unset the return is always
-        ``(None, fill_size_pct, None)`` — bit-for-bit the pre-ADR behavior.
+        ``(None, fill_size_pct, None)`` - bit-for-bit the pre-ADR behavior.
         """
 
         if os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") != "1":
@@ -470,27 +454,12 @@ class PaperReactor:
 
         # De-risking guard (P1 trade-correctness fix).
         #
-        # positions are stored as the LATEST signed target_position_pct per
+        # Positions are stored as the latest signed target_position_pct per
         # symbol (ADR-0041 / portfolio_normalize.PortfolioState semantics), and
-        # `fill_size_pct` here is the NEW signed target for `proposal.symbol`.
-        # A symbol's contribution to GROSS exposure is abs(its target). So this
-        # fill changes that symbol's gross contribution from abs(existing) to
-        # abs(fill_size_pct); the marginal gross change is
-        #     abs(fill_size_pct) - abs(existing).
-        #
-        # clip_one_to_remaining_headroom() shrinks abs(target) to fit the book's
-        # REMAINING headroom — correct ONLY for fills that ADD gross exposure.
-        # It does not subtract the symbol's existing position, so it wrongly
-        # treats an exposure-REDUCING fill (one that moves the symbol toward
-        # zero / flips toward flat / shrinks abs) as if it consumed headroom.
-        # Codex P1: existing AAPL=+0.75, an approved -0.20 (partial sell) was
-        # clipped to -0.05 against 0.05 cash headroom, even though selling FREES
-        # headroom and must never be capped.
-        #
-        # If abs(new target) <= abs(existing), this fill does not add gross
-        # exposure (it reduces it or holds it flat) — pass through UNCLIPPED.
-        # Only genuinely exposure-INCREASING fills hit the headroom cap below,
-        # preserving #36's partial-scale + full-silence behavior exactly.
+        # fill_size_pct here is the new signed target for proposal.symbol. A
+        # symbol's contribution to gross exposure is abs(target). If this fill
+        # lowers or preserves abs(existing), it frees or preserves headroom and
+        # must not be clipped by remaining-headroom logic.
         existing = pos_map.get(proposal.symbol, 0.0)
         if abs(fill_size_pct) <= abs(existing) + 1e-9:
             return None, fill_size_pct, None
@@ -534,14 +503,8 @@ class PaperReactor:
         # The clip fired with usable headroom. Two sub-cases:
         #   scale_factor ~= 1.0  -> full pass: nothing changes, no cap metadata.
         #   scale_factor  < 1.0  -> partial scale: rewrite fill to the clipped
-        #                           NAV-fraction (already correctly signed by the
-        #                           clip) and surface the audit trail.
-        # clip_one_to_remaining_headroom() shrinks abs(target) to the remaining
-        # headroom and re-applies the original sign, so clipped.portfolio_target_pct
-        # is the new signed fill_size_pct directly — it composes linearly with the
-        # downstream slippage + record math (which only reads fill_size_pct).
+        #                           NAV-fraction and surface the audit trail.
         if clipped.scale_factor >= 1.0 - 1e-9:
-            # Full pass — unchanged behavior.
             return None, fill_size_pct, None
 
         cap_metadata: dict[str, Any] = {

@@ -30,6 +30,7 @@ from hermes_quant.react.multileg import (
     MultiLegPaperReactor,
     MultiLegReactorDisabled,
 )
+from hermes_quant.react.paper import FillSizeInvariantError
 from hermes_quant.risk.options_gate import OptionsGateResult, StructureBucket
 
 
@@ -110,6 +111,20 @@ def test_gate_rejected_proposal_raises_before_any_write(
     with pytest.raises(GateRejectedProposal):
         reactor.execute(_cc_proposal(risk_gate_pass=False), fill_size_pct=0.05)
     # The gate check is BEFORE any bus mkdir/touch — nothing written.
+    assert not bus.exists()
+
+
+@pytest.mark.parametrize("fill_size_pct", [float("nan"), 2.0])
+def test_fill_size_invariant_raises_before_multileg_write(
+    monkeypatch, tmp_path, fill_size_pct: float
+) -> None:
+    monkeypatch.setenv("HERMES_QUANT_MULTILEG_REACTOR", "1")
+    bus = tmp_path / "executions.jsonl"
+    reactor = MultiLegPaperReactor(executions_path=bus)
+
+    with pytest.raises(FillSizeInvariantError):
+        reactor.execute(_cc_proposal(), fill_size_pct=fill_size_pct)
+
     assert not bus.exists()
 
 
