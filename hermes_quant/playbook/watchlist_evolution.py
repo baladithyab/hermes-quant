@@ -573,7 +573,17 @@ def _enforce_cap_trim(
         return rows, []
 
     # Deterministic rank: highest score first, symbol ascending on ties.
-    ranked = sorted(active, key=lambda r: (-r.last_score, r.symbol))
+    # NaN-safe: a NaN last_score (corrupt state, or a misbehaving scorer)
+    # otherwise breaks Python's sort — all NaN comparisons are False, so the
+    # ordering becomes input-order-dependent and the trim non-deterministic
+    # (HARD INVARIANT violation). Sort NaN rows to the tail (treated as lowest
+    # score → trimmed first), tie-broken by symbol like every other row.
+    def _rank_key(r: WatchlistEntry) -> tuple[int, float, str]:
+        score = r.last_score
+        is_nan = score != score  # True only for NaN (no math import needed)
+        return (1 if is_nan else 0, 0.0 if is_nan else -score, r.symbol)
+
+    ranked = sorted(active, key=_rank_key)
 
     # Keep the top `max_per_play`; the rest are eviction candidates, minus any
     # catalyst-protected rows (which are held even in the over-cap tail).

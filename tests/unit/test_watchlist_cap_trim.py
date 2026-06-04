@@ -133,6 +133,35 @@ def test_protected_row_not_trimmed_even_if_low_scored():
     assert {ev["symbol"] for ev in events} == {_sym(i) for i in range(1, 10)}
 
 
+def test_trim_nan_score_is_deterministic():
+    """A NaN last_score must not make the trim non-deterministic (adversarial B1).
+
+    NaN breaks Python's sort ordering (NaN comparisons are all False), so a naive
+    `sorted(key=(-score, symbol))` produced input-order-dependent eviction sets.
+    NaN rows must be treated as lowest (trimmed first) deterministically.
+    """
+    import random
+
+    base = [_active_row(_sym(i), 0.500 + i * 0.001) for i in range(58)]
+    nan_rows = [_active_row("NANA", float("nan")), _active_row("NANB", float("nan"))]
+    rows = base + nan_rows  # 60 active, cap 50
+
+    evicted_sets = []
+    for seed in range(6):
+        shuffled = list(rows)
+        random.Random(seed).shuffle(shuffled)
+        new_rows, events = _enforce_cap_trim(
+            shuffled, play="swing", asof=_ASOF, max_per_play=50, position_lookup=None
+        )
+        evicted_sets.append(frozenset(ev["symbol"] for ev in events))
+
+    assert len(set(evicted_sets)) == 1, (
+        f"NaN scores produced non-deterministic eviction sets: {evicted_sets}"
+    )
+    # NaN rows are lowest -> always among the trimmed.
+    assert {"NANA", "NANB"} <= evicted_sets[0]
+
+
 def test_at_cap_untouched():
     """Exactly cap active -> no trim, no events."""
     rows = [_active_row(_sym(i), 0.500 + i * 0.001) for i in range(50)]
