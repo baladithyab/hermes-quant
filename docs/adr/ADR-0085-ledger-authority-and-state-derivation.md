@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: Accepted (2026-06-01), implemented
 date: 2026-06-01
 deciders: [codeseys]
 amended_by: ADR-0086

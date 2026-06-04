@@ -1,6 +1,6 @@
 # ADR-0017: CcxtProvider for crypto OHLCV bars
 
-**Status**: Proposed
+**Status**: Accepted (2026-05-13), implemented
 **Date**: 2026-05-13
 **Target**: v0.3.0
 **Cross-cuts**: ADR-0005 (data layer Protocol), ADR-0006 (lookahead enforcement), ADR-0009 §P0-A (as_of leaf filter), founding charter §"What I'd build first" (BTC/USDT MVP)

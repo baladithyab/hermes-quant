@@ -1,6 +1,6 @@
 # ADR-0070: Paper-execution fidelity — slippage, queue delay, and fill realism
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-28), implemented
 **Date:** 2026-05-28
 **Wave:** D (paper-trading fidelity)
 **Supersedes:** nothing

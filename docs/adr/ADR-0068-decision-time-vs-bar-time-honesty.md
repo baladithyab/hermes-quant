@@ -1,6 +1,6 @@
 # ADR-0068: Decision-time vs bar-time honesty — `asof_decision` semantics
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-28), implemented
 **Date:** 2026-05-28
 **Wave:** D (paper-trading fidelity)
 **Supersedes:** nothing

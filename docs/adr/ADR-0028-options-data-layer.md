@@ -1,6 +1,6 @@
 # ADR-0028: Options data layer — `OptionContract`, `OptionChain`, provider abstraction, greek completion
 
-**Status**: Proposed
+**Status**: Accepted (2026-05-24), implemented
 **Date**: 2026-05-24
 **Target**: v0.5.0 (Wave A + Wave B of `docs/plans/2026-05-23-options-daily-retro.md`)
 **Extends**: ADR-0005 (data layer Protocol + provider chain)

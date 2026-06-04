@@ -1,6 +1,6 @@
 # ADR-0037: LLM-Backed Committee Turns (Bull/Bear/Risk-Mgmt Debate)
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-26), implemented
 **Date:** 2026-05-26
 **Wave:** Multi-agent deliberation (port TradingAgents bull/bear + risk-mgmt patterns)
 **Related:** ADR-0023 (Deliberative Committee), ADR-0026 (Retrospective Amendment Loop), ADR-0035 (Cadence), ADR-0036 (Multi-Timeframe Fan-Out), TradingAgents reference research at `docs/research/reference-projects/2026-05-24-r1-tradingagents.md`

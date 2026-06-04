@@ -1,6 +1,6 @@
 # ADR-0014: Chat-mode advisor surface
 
-**Status:** Proposed (target: v0.1.2)
+**Status:** Accepted (2026-05-13), implemented
 **Supersedes:** none
 **Amends:** none (extends ADR-0013)
 **Cross-cuts:** ADR-0013 (dual surface), ADR-0010 (settlement journal — read path), ADR-0012 (LLMAnalyst deferred), ADR-0005 (data layer + as_of plumbing), ADR-0007 (plugin / CLI tree), ADR-0002 / ADR-0003 / ADR-0004 (analyst, BMA, risk gate)

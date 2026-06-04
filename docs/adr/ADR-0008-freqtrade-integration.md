@@ -1,6 +1,6 @@
 # ADR-0008: Freqtrade integration via signal bus (sidecar consumer)
 
-**Status**: proposed
+**Status**: Accepted (2026-05-12), implemented
 **Date**: 2026-05-12
 
 ## Context

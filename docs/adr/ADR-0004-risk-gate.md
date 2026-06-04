@@ -1,6 +1,6 @@
 # ADR-0004: Risk gate — deterministic rules, silence-by-default
 
-**Status**: proposed
+**Status**: Accepted (2026-05-12), implemented
 **Date**: 2026-05-12
 
 ## Context

@@ -1,6 +1,6 @@
 # ADR-0027: Options-aware risk gate — extends ADR-0004 with Greek limits, BPR, and assignment risk
 
-**Status**: Proposed
+**Status**: Accepted (2026-05-24), implemented
 **Date**: 2026-05-24
 **Target**: v0.5.0 (Wave B of `docs/plans/2026-05-23-options-daily-retro.md`)
 **Extends**: ADR-0004 (deterministic risk gate), ADR-0009 §P0-1 (Kelly σ² fix), §P0-5 (rule ordering), §P1-9 (asset-class isolation)

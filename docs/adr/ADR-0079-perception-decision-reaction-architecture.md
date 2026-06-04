@@ -1,6 +1,6 @@
 # ADR-0079: Unified Perception → Decision → Reaction architecture + signal-source unification
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-30), implemented
 **Date:** 2026-05-30
 **Wave:** Capstone (organizing architecture; ratifies the PDR model, builds nothing here)
 **Supersedes:** nothing

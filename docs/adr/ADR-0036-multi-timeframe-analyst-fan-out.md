@@ -1,6 +1,6 @@
 # ADR-0036: Multi-Timeframe Analyst Fan-Out
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-26), implemented
 **Date:** 2026-05-26
 **Wave:** Multi-timeframe analysis (interday/interweek/intermonth/interquarter)
 **Related:** ADR-0002 (Analyst Protocol), ADR-0003 (Aggregator), ADR-0009 (P0-2 calibrator), ADR-0018 (Kronos), ADR-0023 (Deliberative Committee), ADR-0035 (Cadence)

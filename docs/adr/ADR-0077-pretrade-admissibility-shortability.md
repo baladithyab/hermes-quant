@@ -1,6 +1,6 @@
 # ADR-0077: Pre-trade admissibility engine + ShortabilityOracle (paper→live fidelity foundation)
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-30), implemented
 **Date:** 2026-05-30
 **Wave:** B (paper→live fidelity foundation — the six-model P0)
 **Supersedes:** nothing
