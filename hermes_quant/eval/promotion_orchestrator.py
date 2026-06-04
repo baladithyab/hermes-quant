@@ -115,6 +115,11 @@ class PromotionRecord(BaseModel):
     window_end: date
     stockbench_result_summary: dict[str, Any] = Field(default_factory=dict)
     decision: dict[str, Any]
+    # OUT-OF-SAMPLE fold-rate the decision was made on (seed 3767). None when no
+    # walk-forward evidence was supplied (in-sample-only decision). Recorded so an
+    # operator can audit WHY a strong-in-sample candidate was held. Optional with a
+    # default → old rows (which lack the key) still deserialize at schema_version 1.
+    oos_fold_rate: float | None = None
     recorded_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -134,6 +139,7 @@ class PromotionRecord(BaseModel):
         strategy_name: str,
         hypothesis_id: str | None = None,
         recorded_by: str = "system",
+        oos_fold_rate: float | None = None,
     ) -> "PromotionRecord":
         """Build a record from a harness result + gate decision."""
         summary = _summarise_result(result)
@@ -148,6 +154,7 @@ class PromotionRecord(BaseModel):
                 "reasons": list(decision.reasons),
                 "suggested_action": decision.suggested_action,
             },
+            oos_fold_rate=oos_fold_rate,
             recorded_by=recorded_by,
         )
 
@@ -390,6 +397,7 @@ class PromotionOrchestrator:
         strategy_name: str | None = None,
         auto_record: bool = True,
         recorded_by: str = "system",
+        oos_fold_rate: float | None = None,
     ) -> PromotionRecord:
         """Run harness → gate → record; return the PromotionRecord.
 
@@ -415,6 +423,15 @@ class PromotionOrchestrator:
             When True (default), append the PromotionRecord to the log.
         recorded_by:
             Identity string for audit trail (default ``"system"``).
+        oos_fold_rate:
+            Optional out-of-sample walk-forward fold-rate (seed 3767) — the
+            fraction of folds whose excess-return beats buy-and-hold, from
+            ``walk_forward_replay(...).positive_excess_fold_rate``. When supplied,
+            it is forwarded to ``gate.check`` (the candidate must clear the gate's
+            ``oos_fold_rate_floor`` IN ADDITION to the in-sample criteria) and
+            recorded on the PromotionRecord for audit. Default None reproduces the
+            in-sample-only behavior. The orchestrator does NOT compute this itself
+            (it has no bars) — the walk-forward caller passes it in.
 
         Returns
         -------
@@ -440,13 +457,19 @@ class PromotionOrchestrator:
             window_end=window_end,
         )
 
-        # Step 2 — evaluate through PromotionGate
-        decision: PromotionDecision = self.gate.check(result)
+        # Step 2 — evaluate through PromotionGate. Only forward oos_fold_rate when
+        # supplied, so the default path calls gate.check(result) exactly as before
+        # (preserves compatibility with gates whose check() predates seed 3767).
+        if oos_fold_rate is None:
+            decision: PromotionDecision = self.gate.check(result)
+        else:
+            decision = self.gate.check(result, oos_fold_rate=oos_fold_rate)
 
         logger.info(
-            "promotion-orchestrator: gate decision promote=%s reasons=%d",
+            "promotion-orchestrator: gate decision promote=%s reasons=%d oos_fold_rate=%s",
             decision.promote,
             len(decision.reasons),
+            oos_fold_rate,
         )
 
         # Step 3 — build PromotionRecord
@@ -456,6 +479,7 @@ class PromotionOrchestrator:
             strategy_name=eff_name,
             hypothesis_id=hypothesis_id,
             recorded_by=recorded_by,
+            oos_fold_rate=oos_fold_rate,
         )
 
         # Step 4 — persist if requested
