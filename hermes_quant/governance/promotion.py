@@ -3,17 +3,23 @@
 
 Read-only: gathers metrics from the audit log and produces a
 `PromotionDecision`. Thresholds are NOT hardcoded here on purpose —
-`hermes_quant.react.live.LiveTradingApproval` is the single source of
-truth (ADR-0029 D7). If that module is not yet available in the tree,
-`_LATE_BIND_THRESHOLDS` mirrors ADR-0029's numbers as a sentinel
-fallback.
+`hermes_quant.react.live` is the single source of truth for the
+numerical bounds (ADR-0029 D7). It exports both `LiveTradingApproval`
+(the Pydantic validator that ENFORCES the bounds at approval-construction
+time) and `LIVE_APPROVAL_THRESHOLDS` (the dict this read-only evaluator
+CONSUMES to pre-check those same bounds against audit-log metrics).
 
-# TODO(integration): remove fallback once react.live lands.
+react.live is the live binding and a guaranteed-present core module. If
+it cannot be imported, or has dropped a key this evaluator depends on, we
+fail CLOSED and LOUD (raise) rather than promote on guessed numbers:
+duplicating the authoritative thresholds here is exactly the failure mode
+ADR-0031 D5 consolidates against, so no local fallback copy survives.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -28,37 +34,95 @@ logger = logging.getLogger(__name__)
 # Threshold binding
 # ---------------------------------------------------------------------------
 
-# Mirrors ADR-0029 D7 numbers verbatim. Used only when react.live import
-# fails (sibling task hasn't landed). Tests rely on this fallback path.
-_LATE_BIND_THRESHOLDS: dict[str, float] = {
-    "min_paper_outcomes": 100,
-    "min_sharpe_95ci_lower": 1.0,
-    "max_rolling_30d_drawdown_pct": 0.01,
-    "max_calibrator_drift": 0.05,
-    "killswitch_window_days": 14,
-    "immutable_breach_window_days": 30,
-}
+# The prefix-style keys this evaluator reads out of
+# `react.live.LIVE_APPROVAL_THRESHOLDS`. react.live owns the *values*
+# (ADR-0029 D7); this set is only the contract of *which keys* must be
+# present for the gate to make a decision. If react.live ever drops one,
+# `_load_thresholds()` raises rather than silently reading a default —
+# `test_promotion_threshold_keys_match_react_live` pins this contract so a
+# future key rename in react.live fails CI instead of failing open in prod.
+_REQUIRED_THRESHOLD_KEYS: frozenset[str] = frozenset(
+    {
+        "min_paper_outcomes",
+        "min_sharpe_95ci_lower",
+        "max_rolling_30d_drawdown_pct",
+        "max_calibrator_drift",
+        "killswitch_window_days",
+    }
+)
 
 
 def _load_thresholds() -> dict[str, float]:
-    """Try to import LiveTradingApproval thresholds from react.live; fall
-    back to `_LATE_BIND_THRESHOLDS` on ImportError. The fallback is
-    intentional decoupling per ADR-0031.
+    """Return the live promotion thresholds from `react.live` — the single
+    source of truth (ADR-0029 D7 / ADR-0031 D5).
 
     Wire shape: react.live exports both `LiveTradingApproval` (the Pydantic
-    model whose validator enforces the bounds) AND `LIVE_APPROVAL_THRESHOLDS`
-    (a dict mirroring those bounds for cross-module consumption — this exact
-    function). The dict is the integration handle; the validator is the
-    enforcement.
+    model whose validator ENFORCES the bounds at approval-construction time)
+    AND `LIVE_APPROVAL_THRESHOLDS` (a dict mirroring those bounds for
+    cross-module consumption — this exact function). The dict is the
+    integration handle; the validator is the enforcement.
+
+    Fails CLOSED and LOUD. react.live is a guaranteed-present core module,
+    so an import failure, a non-dict export, a missing required key, or a
+    degenerate value (non-numeric / non-finite / non-positive) is a contract
+    breach — not a routine condition to paper over with a local copy of the
+    numbers. We raise so the gate never promotes on guessed or meaningless
+    thresholds (a silent fallback that drifted from ADR-0029, or a poisoned
+    bound, would fail OPEN — the one failure mode a promotion gate must never
+    have).
     """
     try:
-        from hermes_quant.react.live import LIVE_APPROVAL_THRESHOLDS  # type: ignore[attr-defined]
-    except (ImportError, AttributeError):
-        return dict(_LATE_BIND_THRESHOLDS)
+        from hermes_quant.react.live import LIVE_APPROVAL_THRESHOLDS
+    except ImportError as exc:
+        raise RuntimeError(
+            "hermes_quant.react.live is the single source of truth for "
+            "promotion thresholds (ADR-0029 D7) but could not be imported. "
+            "Refusing to evaluate the paper→live gate on guessed numbers."
+        ) from exc
 
-    if isinstance(LIVE_APPROVAL_THRESHOLDS, dict) and LIVE_APPROVAL_THRESHOLDS:
-        return dict(LIVE_APPROVAL_THRESHOLDS)
-    return dict(_LATE_BIND_THRESHOLDS)
+    if not isinstance(LIVE_APPROVAL_THRESHOLDS, dict) or not LIVE_APPROVAL_THRESHOLDS:
+        raise RuntimeError(
+            "react.live.LIVE_APPROVAL_THRESHOLDS is not a non-empty dict; "
+            "cannot evaluate the paper→live gate. Got: "
+            f"{type(LIVE_APPROVAL_THRESHOLDS).__name__}."
+        )
+
+    missing = _REQUIRED_THRESHOLD_KEYS - LIVE_APPROVAL_THRESHOLDS.keys()
+    if missing:
+        raise RuntimeError(
+            "react.live.LIVE_APPROVAL_THRESHOLDS is missing keys this "
+            f"evaluator depends on: {sorted(missing)}. react.live must keep "
+            "these prefix-style keys in sync with ADR-0029 D7 (see "
+            "_REQUIRED_THRESHOLD_KEYS)."
+        )
+
+    # Structural value sanity — NOT policy magnitudes. A required key present
+    # with a degenerate value (None, NaN, a string, 0, or negative) would NOT
+    # crash: it would flow into evaluate()'s `metric < threshold` blocks and
+    # quietly flip the gate OPEN (`x < 0` / `x < NaN` never blocks). We reject
+    # any non-finite or non-positive bound so that "thresholds present" cannot
+    # mean "thresholds meaningless". We deliberately do NOT re-assert the
+    # ADR-0029 numbers (>=100, >=1.0, ...) here — that magnitude policy lives
+    # in react.live alone (ADR-0031 D5); duplicating it is the failure mode
+    # this module avoids. We only require each bound be a finite, positive
+    # number so the comparison operators in evaluate() behave.
+    for key in _REQUIRED_THRESHOLD_KEYS:
+        value = LIVE_APPROVAL_THRESHOLDS[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError(
+                f"react.live.LIVE_APPROVAL_THRESHOLDS[{key!r}] must be a "
+                f"number, got {type(value).__name__}={value!r}. Refusing to "
+                "evaluate the paper→live gate on a non-numeric bound."
+            )
+        if not math.isfinite(value) or value <= 0:
+            raise RuntimeError(
+                f"react.live.LIVE_APPROVAL_THRESHOLDS[{key!r}]={value!r} is "
+                "not a finite positive number. A non-finite or non-positive "
+                "bound would fail the gate OPEN (e.g. `x < NaN` never blocks); "
+                "refusing to evaluate."
+            )
+
+    return dict(LIVE_APPROVAL_THRESHOLDS)
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +131,11 @@ def _load_thresholds() -> dict[str, float]:
 
 
 class PromotionDecision(BaseModel):
-    """Result of `evaluate()`. `promoted=True` only when every field passes
-    the LiveTradingApproval validator (ADR-0029 D7)."""
+    """Result of `evaluate()`. `promoted=True` only when every promotion
+    check passes — a SUPERSET of the LiveTradingApproval validator (ADR-0029
+    D7): in addition to the validator's five fields, `evaluate()` also blocks
+    on calibrator drift and weekly-retro readiness, so it is strictly at
+    least as conservative as the validator, never looser."""
 
     promoted: bool
     blocked_by: list[str] = Field(default_factory=list)
