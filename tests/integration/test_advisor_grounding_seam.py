@@ -145,6 +145,40 @@ def test_ungrounded_grounded_view_dropped_from_vote():
     assert any("grounding" in c.lower() for c in out["caveats"]), out["caveats"]
 
 
+def test_audit_annotation_matches_the_actually_dropped_view():
+    """Annotation must mark the DROPPED view, not a same-named kept view.
+
+    Code review (Issue 1): when two views share an analyst name and only the
+    LATER one is dropped, name-based annotation falsely stamped the first
+    (kept) view as grounding_dropped and left the dropped one unannotated.
+    Identity-based matching must annotate exactly the dropped entry.
+    """
+    block = _block()
+    real_close = block.ohlcv_60d[-1].close
+    good = _GroundedAnalyst("hermes_semantic", f"Close confirmed at {real_close:.4f}.", direction=1)
+    bad = _GroundedAnalyst("hermes_semantic", "Target 9999.00 imminent.", direction=1)
+    provider = _StubProvider(_daily_df())
+    out = recommend(
+        "AAPL", asset_class="equity", timeframe="1d", as_of=_ASOF,
+        provider=provider, analysts=[good, bad],
+        market_extras={"ground_truth_block": block},
+        include_lessons=False,
+    )
+    avs = out["analyst_views"]
+    assert len(avs) == 2, "both views are recorded in the audit trail"
+    # entry[0] is the cited view (kept, voted) — must NOT be marked dropped.
+    assert not avs[0].get("grounding_dropped"), (
+        "the KEPT (cited) view must not be falsely marked grounding_dropped"
+    )
+    # entry[1] is the fabricated view (dropped) — must be marked dropped.
+    assert avs[1].get("grounding_dropped") is True, (
+        "the actually-dropped view must be annotated grounding_dropped"
+    )
+    assert avs[1].get("grounding_uncited_claims"), "dropped entry carries its uncited claims"
+    # And the surviving vote is the cited one.
+    assert out["aggregated_signal"]["n_components"] == 1
+
+
 def test_fully_grounded_view_byte_identical_to_no_verifier():
     """A grounded view whose numbers all trace to GT aggregates identically.
 

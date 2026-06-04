@@ -1040,22 +1040,24 @@ def recommend(
     # audit trail still records WHY a view didn't reach the aggregator.
     from hermes_quant.grounding.enforcement import enforce_grounding
 
+    _views_before = views
     views, _grounding_dropped = enforce_grounding(views, ctx)
     if _grounding_dropped:
-        # Annotate the matching analyst_views entries (appended in lockstep with
-        # the emitted views) so the audit trail records the dropped contribution
-        # and WHY. Match by analyst name, consuming records in emit order to keep
-        # multiple views from the same analyst aligned.
-        _dropped_by_analyst: dict[str, list[dict[str, Any]]] = {}
-        for _rec in _grounding_dropped:
-            _dropped_by_analyst.setdefault(_rec["analyst"], []).append(_rec)
-        for _vd in result.analyst_views:
-            _recs = _dropped_by_analyst.get(_vd["analyst"])
-            if _recs:
-                _rec = _recs.pop(0)
-                _vd["grounding_dropped"] = True
-                _vd["grounding_reason"] = _rec.get("reason")
-                _vd["grounding_uncited_claims"] = _rec.get("uncited_claims")
+        # Annotate the analyst_views entries for the views that were dropped so
+        # the audit trail records the dropped contribution and WHY. result.
+        # analyst_views was appended in lockstep with _views_before, so match by
+        # POSITION using object identity (kept views are the SAME objects). This
+        # is robust to two analysts sharing a name where only one view is dropped
+        # (a name-keyed match would mis-stamp the kept same-named view).
+        _kept_ids = {id(v) for v in views}
+        _dropped_iter = iter(_grounding_dropped)
+        for _orig_view, _vd in zip(_views_before, result.analyst_views):
+            if id(_orig_view) not in _kept_ids:
+                _rec = next(_dropped_iter, None)
+                if _rec is not None:
+                    _vd["grounding_dropped"] = True
+                    _vd["grounding_reason"] = _rec.get("reason")
+                    _vd["grounding_uncited_claims"] = _rec.get("uncited_claims")
         _dropped_names = ", ".join(sorted({r["analyst"] for r in _grounding_dropped}))
         result.caveats.append(
             f"Grounding enforcement dropped {len(_grounding_dropped)} ungrounded "

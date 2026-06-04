@@ -585,14 +585,13 @@ def _enforce_cap_trim(
 
     ranked = sorted(active, key=_rank_key)
 
-    # Keep the top `max_per_play`; the rest are eviction candidates, minus any
-    # catalyst-protected rows (which are held even in the over-cap tail).
-    keep: set[str] = {r.symbol for r in ranked[:max_per_play]}
+    # Keep the top `max_per_play`. Of the over-cap tail, evict every row that is
+    # NOT catalyst-protected; a protected row is held even above the cap (the
+    # `continue` is the protection — it never reaches evict_symbols).
     evict_symbols: list[str] = []
     for r in ranked[max_per_play:]:
         if _catalyst_eviction_protected(r, asof, position_lookup):
-            keep.add(r.symbol)  # protected -> held above cap
-            continue
+            continue  # protected -> held above cap, never trimmed out of turn
         evict_symbols.append(r.symbol)
 
     if not evict_symbols:
