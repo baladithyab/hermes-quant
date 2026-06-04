@@ -1,6 +1,6 @@
 # ADR-0033: Evidence Store + Three-Timestamp Invariant
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-24), implemented
 **Date:** 2026-05-24
 **Wave:** B.5 (parallel with ADR-0031 Governance plane, ADR-0032 Trading flow contract)
 **Cost:** $0 (local storage, no LLM calls; 50GB local disk cap)

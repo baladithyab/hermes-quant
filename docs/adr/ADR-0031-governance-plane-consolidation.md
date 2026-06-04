@@ -1,6 +1,6 @@
 # ADR-0031: Governance Plane Consolidation
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-24), implemented
 **Date:** 2026-05-24
 **Related:** ADR-0026 (retrospective amendment loop), ADR-0027 (options-aware risk gate), ADR-0028 (options data layer), ADR-0029 (multi-leg paper reactor), ADR-0030 (daily picker recipe), AGENTS.md (`Things to NEVER do`)
 

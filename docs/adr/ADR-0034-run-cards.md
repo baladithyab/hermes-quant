@@ -1,6 +1,6 @@
 # ADR-0034: Run Cards
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-24), implemented
 **Date:** 2026-05-24
 **Wave:** A.5 follow-up (port from Vibe-Trading reference)
 **Cost:** $0

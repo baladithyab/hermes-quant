@@ -1,6 +1,6 @@
 # ADR-0029: Multi-Leg Paper Reactor
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-24), implemented
 **Date:** 2026-05-24
 **Related:** ADR-0008 (signal bus), ADR-0014 (chat-mode advisor), ADR-0015 (HITL propose-decide-react), ADR-0016 (autonomous mode), ADR-0027 (options risk gate), ADR-0028 (options data layer)
 

@@ -1,6 +1,6 @@
 # ADR-0035: Playbook Cadence — Daily / Weekly / Quarterly (NOT Intraday)
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-26), implemented
 **Date:** 2026-05-26
 **Wave:** Cadence shift — interday/interweek/interquarter scheduler
 **Supersedes:** Implicit assumption in `ops/scripts/quant-hourly-tick.py` and any
