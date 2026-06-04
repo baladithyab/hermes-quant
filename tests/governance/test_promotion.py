@@ -166,58 +166,196 @@ def test_promotion_gate_emits_audit_event(audit_path: Path) -> None:
     assert n_after == n_before + 1
 
 
-def test_promotion_uses_late_bind_thresholds_when_react_live_missing() -> None:
-    """The fallback path is exercised whenever hermes_quant.react.live
-    is not importable. After react.live lands the live path is used; this
-    test still asserts the THRESHOLD VALUES match because react.live is
-    the single source of truth and the fallback mirrors it."""
+def test_load_thresholds_returns_react_live_values() -> None:
+    """react.live HAS LANDED — `_load_thresholds()` reads the live binding,
+    which mirrors ADR-0029 D7 verbatim. There is no local fallback copy of
+    these numbers anymore (ADR-0031 D5: duplication is the failure mode)."""
     thresholds = promotion._load_thresholds()
     assert thresholds["min_paper_outcomes"] == 100
     assert thresholds["min_sharpe_95ci_lower"] == 1.0
     assert thresholds["max_rolling_30d_drawdown_pct"] == 0.01
     assert thresholds["max_calibrator_drift"] == 0.05
+    assert thresholds["killswitch_window_days"] == 14
 
 
-def test_promotion_threshold_path_actually_uses_react_live() -> None:
-    """Integration test: with both modules present, _load_thresholds()
-    must return the dict from react.live, NOT the local fallback. We
-    verify by mutating react.live's dict and observing the change."""
+def test_promotion_threshold_path_actually_uses_react_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Integration test: `_load_thresholds()` returns the dict from
+    react.live, not a local copy. We verify by mutating react.live's dict
+    and observing the change flow through."""
     from hermes_quant.react import live as react_live
 
-    # Sanity: both modules are importable now
+    # Sanity: react.live is present and exports the handle.
     assert hasattr(react_live, "LIVE_APPROVAL_THRESHOLDS")
 
-    # The wire works: bumping a number in react.live shows up here
-    original = react_live.LIVE_APPROVAL_THRESHOLDS["min_paper_outcomes"]
-    try:
-        react_live.LIVE_APPROVAL_THRESHOLDS["min_paper_outcomes"] = 999
-        thresholds = promotion._load_thresholds()
-        assert thresholds["min_paper_outcomes"] == 999, (
-            "Late-bind isn't actually wired — _load_thresholds is "
-            "returning the local _LATE_BIND_THRESHOLDS sentinel instead "
-            "of pulling from react.live."
-        )
-    finally:
-        react_live.LIVE_APPROVAL_THRESHOLDS["min_paper_outcomes"] = original
+    # The wire works: bumping a number in react.live shows up here.
+    # monkeypatch.setitem auto-restores the original after the test.
+    monkeypatch.setitem(react_live.LIVE_APPROVAL_THRESHOLDS, "min_paper_outcomes", 999)
+    thresholds = promotion._load_thresholds()
+    assert thresholds["min_paper_outcomes"] == 999, (
+        "Binding isn't wired — _load_thresholds is not pulling the live "
+        "value from react.live.LIVE_APPROVAL_THRESHOLDS."
+    )
 
 
-def test_promotion_threshold_keys_match_late_bind_keys() -> None:
-    """Both naming styles in react.live must include every key
-    governance.promotion expects — missing keys silently fall back."""
+def test_promotion_threshold_keys_match_react_live() -> None:
+    """Every key this evaluator depends on must exist in react.live. The
+    required set is the module's own `_REQUIRED_THRESHOLD_KEYS`, so this
+    test stays in lockstep with what `evaluate()` actually reads — a future
+    key rename in react.live fails HERE instead of failing open in prod."""
     from hermes_quant.react import live as react_live
 
-    required_keys = {
-        "min_paper_outcomes",
-        "min_sharpe_95ci_lower",
-        "max_rolling_30d_drawdown_pct",
-        "max_calibrator_drift",
-        "killswitch_window_days",
-        "immutable_breach_window_days",
-    }
     actual = set(react_live.LIVE_APPROVAL_THRESHOLDS.keys())
-    missing = required_keys - actual
+    missing = promotion._REQUIRED_THRESHOLD_KEYS - actual
     assert not missing, (
         f"react.live.LIVE_APPROVAL_THRESHOLDS is missing keys that "
-        f"governance.promotion expects: {missing}. Either add them to "
-        f"react.live or rename governance.promotion's lookups."
+        f"governance.promotion depends on: {sorted(missing)}. Either add "
+        f"them to react.live or update promotion._REQUIRED_THRESHOLD_KEYS."
     )
+
+
+def test_load_thresholds_fails_closed_when_react_live_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The old `_LATE_BIND_THRESHOLDS` fallback is GONE (option (a)). If
+    react.live cannot be imported, the gate must fail CLOSED — raise, never
+    promote on guessed numbers. Setting sys.modules[...] = None forces the
+    in-function import to raise ImportError."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "hermes_quant.react.live", None)
+    with pytest.raises(RuntimeError, match="single source of truth"):
+        promotion._load_thresholds()
+
+
+def test_load_thresholds_fails_closed_when_required_key_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If react.live drops a key this evaluator reads, fail CLOSED rather
+    than silently substitute a default. A missing key sliding through would
+    read as a too-lenient (or absent) bound — a fail-OPEN we must prevent."""
+    from hermes_quant.react import live as react_live
+
+    truncated = {
+        k: v
+        for k, v in react_live.LIVE_APPROVAL_THRESHOLDS.items()
+        if k != "min_paper_outcomes"
+    }
+    monkeypatch.setattr(react_live, "LIVE_APPROVAL_THRESHOLDS", truncated)
+    with pytest.raises(RuntimeError, match="missing keys"):
+        promotion._load_thresholds()
+
+
+def test_load_thresholds_fails_closed_when_export_not_a_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-dict / empty export is also a contract breach → raise."""
+    from hermes_quant.react import live as react_live
+
+    monkeypatch.setattr(react_live, "LIVE_APPROVAL_THRESHOLDS", None)
+    with pytest.raises(RuntimeError, match="non-empty dict"):
+        promotion._load_thresholds()
+
+
+@pytest.mark.parametrize(
+    "poisoned_value",
+    [
+        0,  # `paper_outcomes < 0` never blocks → fail-OPEN
+        -50,  # negative bound → fail-OPEN
+        float("nan"),  # `x < NaN` is always False → fail-OPEN
+        float("inf"),  # non-finite bound is meaningless
+        "100",  # non-numeric: would crash int()/float() by luck, not design
+        None,  # non-numeric
+        True,  # bool is an int subclass — must NOT be accepted as a count/bound
+    ],
+)
+def test_load_thresholds_fails_closed_on_degenerate_value(
+    monkeypatch: pytest.MonkeyPatch, poisoned_value: object
+) -> None:
+    """A required key PRESENT but with a degenerate value must fail CLOSED.
+
+    This guards the subtlest fail-OPEN: `min_paper_outcomes=0` or
+    `min_sharpe_95ci_lower=NaN` would sail through a key-presence-only check
+    and flip the gate OPEN, because evaluate() blocks via `metric < threshold`
+    and `x < 0` / `x < NaN` never fires. The loader must reject the bound
+    before it can poison a decision."""
+    from hermes_quant.react import live as react_live
+
+    poisoned = dict(react_live.LIVE_APPROVAL_THRESHOLDS)
+    poisoned["min_paper_outcomes"] = poisoned_value
+    monkeypatch.setattr(react_live, "LIVE_APPROVAL_THRESHOLDS", poisoned)
+    with pytest.raises(RuntimeError):
+        promotion._load_thresholds()
+
+
+def test_evaluate_blocks_low_sharpe_even_though_drawdown_uses_gt(
+    audit_path: Path,
+) -> None:
+    """End-to-end fail-OPEN regression: with valid ADR-0029 bounds, a run
+    whose sharpe is below 1.0 MUST be blocked. This is the live counterpart
+    to the degenerate-value unit test — it proves the `<`-comparison bound is
+    actually load-bearing on a real evaluate() path, so a future NaN/0 bound
+    slipping past the loader would visibly break this test too."""
+    # Seed a fully-passing run, then override sharpe to a sub-threshold value.
+    for _ in range(100):
+        audit_log.append(
+            GovernanceEvent(
+                kind="fill",
+                asof=NOW - timedelta(days=15),
+                source="paper_reactor",
+                payload={"broker": "paper", "realized_pnl": 1.0},
+            )
+        )
+    audit_log.append(
+        GovernanceEvent(
+            kind="promotion_event",
+            asof=NOW - timedelta(days=1),
+            source="weekly_retro",
+            payload={
+                "calibrator_drift": 0.01,
+                "sharpe_95ci_lower": 0.2,  # < 1.0 → must block
+                "rolling_30d_max_drawdown_pct": 0.005,
+                "weekly_retro_promotion_readiness": True,
+            },
+        )
+    )
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is False
+    assert any("sharpe_95ci_lower" in r for r in decision.blocked_by)
+
+
+def test_react_live_threshold_spellings_do_not_diverge() -> None:
+    """KEY-SHAPE PARITY GUARD (the single most likely real bug).
+
+    react.live carries every authoritative number under TWO spellings — a
+    suffix style (its own primary naming) and a prefix style (the one this
+    evaluator reads). They are hand-maintained copies, so editing one and
+    forgetting the other would silently feed the gate a stale threshold.
+    This test FAILS the instant the two spellings of the same bound diverge,
+    and pins both to ADR-0029 D7's verbatim numbers."""
+    from hermes_quant.react import live as react_live
+
+    t = react_live.LIVE_APPROVAL_THRESHOLDS
+
+    # (suffix_spelling, prefix_spelling, ADR-0029 D7 authoritative value)
+    synonyms = [
+        ("paper_outcomes_count_min", "min_paper_outcomes", 100),
+        ("sharpe_95ci_lower_min", "min_sharpe_95ci_lower", 1.0),
+        ("rolling_30d_max_drawdown_pct_max", "max_rolling_30d_drawdown_pct", 0.01),
+        ("calibrator_drift_max", "max_calibrator_drift", 0.05),
+    ]
+    for suffix_key, prefix_key, adr_value in synonyms:
+        assert t[suffix_key] == t[prefix_key], (
+            f"react.live spellings diverged: {suffix_key}={t[suffix_key]} "
+            f"!= {prefix_key}={t[prefix_key]}. Edit BOTH or neither."
+        )
+        assert t[prefix_key] == adr_value, (
+            f"react.live.{prefix_key}={t[prefix_key]} no longer matches "
+            f"ADR-0029 D7 (={adr_value}). react.live is the source of truth; "
+            f"if ADR-0029 amended this, update react.live AND this test."
+        )
+
+    # The window-length keys have no duplicate spelling; pin them to ADR-0029.
+    assert t["killswitch_window_days"] == 14
+    assert t["immutable_breach_window_days"] == 30
