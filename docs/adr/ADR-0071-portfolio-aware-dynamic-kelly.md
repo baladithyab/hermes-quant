@@ -1,6 +1,6 @@
 # ADR-0071: Portfolio-aware dynamic Kelly sizing and exposure caps
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-28), implemented
 **Date:** 2026-05-28
 **Wave:** D (paper-trading fidelity → risk control)
 **Supersedes:** nothing

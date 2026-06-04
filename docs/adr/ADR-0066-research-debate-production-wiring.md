@@ -1,6 +1,6 @@
 # ADR-0066: Production Wiring for ResearchDebateStage (v0.6.2)
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-28), implemented
 **Date:** 2026-05-28
 **Target:** v0.6.2
 **Supersedes / extends:** ADR-0065 §Implementation Plan §7 (deferred from v0.6.1)

@@ -2,7 +2,7 @@
 
 > Note (2026-05-27): renumbered from ADR-0040 → ADR-0042. See ADR-0041 ¶Note for context.
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-27), implemented
 **Date:** 2026-05-27
 **Related:** ADR-0033 (Evidence Store), ADR-0034 (Run Cards), ADR-0037 (LLM Committee)
 **Author:** ARIA (deep-work-loop on hermes-quant; research synthesis)

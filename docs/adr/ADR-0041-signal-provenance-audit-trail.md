@@ -2,7 +2,7 @@
 
 > Note (2026-05-27): renumbered from ADR-0039 → ADR-0041 to avoid conflict with the upstream-merged ADR-0039 (Robinhood Agentic Trading MCP Reactor) on origin/main. ADR-0040 is also taken downstream (by docs/adr/ADR-0040-persistent-memory-reflection.md, which we renumbered to ADR-0042 in the same pass).
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-27), implemented
 **Date:** 2026-05-27
 **Supersedes:** Amendment to ADR-0031 (Governance Plane Consolidation)
 **Author:** ARIA (deep-work-loop on hermes-quant; research synthesis from TauricResearch/TradingAgents, HKUDS/Vibe-Trading, virattt/ai-hedge-fund, Mai0313/TradingAgents)

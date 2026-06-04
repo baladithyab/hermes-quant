@@ -1,6 +1,6 @@
 # ADR-0069: Still-forming-bar discipline for daily timeframe mid-session
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-28), implemented
 **Date:** 2026-05-28
 **Wave:** D (paper-trading fidelity)
 **Supersedes:** nothing
