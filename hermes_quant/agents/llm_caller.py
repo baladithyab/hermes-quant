@@ -56,6 +56,16 @@ _DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 _DEFAULT_TIMEOUT = 30.0
 _DEFAULT_AUDIT_KIND = "llm_call"
 
+# B41-f (ADR-4665 §7.6) — pinned, reproducible generation config. temperature=0
+# and top_p=1 make the provider as deterministic as it allows; max_tokens bounds
+# every call (also the precondition the B41-a budget guard enforces). These are
+# the DEFAULTS; a caller may override max_tokens per-call (e.g. the budget guard
+# clamps it downward), but temperature/top_p are pinned at construction time so a
+# stray call cannot silently introduce sampling noise into the decision path.
+_PINNED_TEMPERATURE = 0.0
+_PINNED_TOP_P = 1.0
+_DEFAULT_MAX_TOKENS = 1024
+
 # Audit-log event kind for LLM calls — registered as an extension kind.
 # The governance audit_log validates against VALID_KINDS, so we write via
 # the raw append path with kind="llm_call" using the _append_extension helper
@@ -134,12 +144,21 @@ class LLMCaller:
         base_url: str = _DEFAULT_BASE_URL,
         timeout: float = _DEFAULT_TIMEOUT,
         audit_kind: str = _DEFAULT_AUDIT_KIND,
+        max_tokens: int = _DEFAULT_MAX_TOKENS,
+        budget_guard: Any | None = None,
     ) -> None:
         self.model_id = model_id
         self._api_key = api_key  # None → read from env at call time
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.audit_kind = audit_kind
+        # B41-f: default output ceiling pinned on the caller. Every request
+        # carries an explicit max_tokens (reproducibility + a hard token bound).
+        self.max_tokens = int(max_tokens)
+        # B41-a: optional pre-call budget gate. None → no gate (byte-identical
+        # to pre-B41-a). When set, .call() consults it before spending money
+        # and falls back to the deterministic ($0) path when exhausted.
+        self._budget_guard = budget_guard
 
     # ------------------------------------------------------------------
     # Public API
@@ -160,6 +179,9 @@ class LLMCaller:
         user_prompt: str,
         *,
         schema: Optional[Type[BaseModel]] = None,
+        max_tokens: int | None = None,
+        decision_id: str | None = None,
+        tick_id: str | None = None,
     ) -> tuple[BaseModel | str | None, dict[str, Any]]:
         """Call the LLM with optional structured-output binding.
 
@@ -169,6 +191,12 @@ class LLMCaller:
             schema:        Optional Pydantic model class.  When provided,
                            uses bind_structured() for provider-native JSON output
                            and validates the response.  When None, returns raw text.
+            max_tokens:    Per-call output ceiling. Defaults to ``self.max_tokens``.
+                           Always sent on the request (B41-f reproducibility).
+            decision_id:   B41-a budget key — the parent decision this call bills
+                           to. A research debate's N sub-calls share one
+                           decision_id so child cost counts against the parent.
+            tick_id:       B41-a budget key — the tick this call bills to.
 
         Returns:
             (parsed_obj, raw_response_dict):
@@ -176,12 +204,19 @@ class LLMCaller:
               - On parse failure:      (None, raw dict)
               - On network/auth error: (None, {"error": "<msg>"})
               - On no api_key:         (None, {"error": "no_api_key"})
+              - On budget-exhausted:   (None, {"error": "budget_<axis>"})
 
         Never raises.
         """
         api_key = self._resolve_api_key()
         prompt_hash = _sha256_hash(system_prompt + user_prompt)
         start_ms = time.monotonic()
+
+        # B41-f: resolve the pinned generation config for this call. max_tokens
+        # is always present and positive on the wire.
+        resolved_max_tokens = int(max_tokens) if max_tokens is not None else self.max_tokens
+        if resolved_max_tokens <= 0:
+            resolved_max_tokens = self.max_tokens
 
         if not api_key:
             err_msg = "no_api_key: OPENROUTER_API_KEY is not set"
@@ -193,17 +228,56 @@ class LLMCaller:
                 parsed_dump=None,
                 latency_ms=0.0,
                 error=err_msg,
+                max_tokens=resolved_max_tokens,
             )
             return None, raw
+
+        # ---- B41-a: pre-call budget gate (fail-closed, silence-by-default) ---
+        # Only consults the guard when one is wired in (default None → no-op,
+        # byte-identical to pre-B41-a). A blocked check returns the deterministic
+        # ($0/no-network) fallback signal — (None, {"error": "budget_*"}) — which
+        # every caller already treats as "fall back to v0.1". NEVER raises.
+        if self._budget_guard is not None:
+            guard_result = self._budget_check(
+                prompt=system_prompt + user_prompt,
+                requested_max_tokens=resolved_max_tokens,
+                decision_id=decision_id,
+                tick_id=tick_id,
+            )
+            if not guard_result.allowed:
+                err_msg = f"budget_{guard_result.reason or 'exhausted'}"
+                logger.warning(
+                    "LLMCaller.call: budget gate blocked call (%s); falling "
+                    "back to deterministic path.",
+                    err_msg,
+                )
+                raw = {"error": err_msg}
+                self._record_audit(
+                    prompt_hash=prompt_hash,
+                    raw_response=raw,
+                    parsed_dump=None,
+                    latency_ms=0.0,
+                    error=err_msg,
+                    max_tokens=0,
+                )
+                return None, raw
+            # The guard may clamp the output ceiling downward when a token
+            # budget is near exhaustion.
+            resolved_max_tokens = guard_result.allowed_max_tokens
 
         # ---- Build request payload ----------------------------------------
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+        # B41-f: pin model snapshot + temperature=0 + top_p=1 + max_tokens on
+        # EVERY request so a logged response is reproducible (Gate 1).
         body: dict[str, Any] = {
             "model": self.model_id,
             "messages": messages,
+            "temperature": _PINNED_TEMPERATURE,
+            "top_p": _PINNED_TOP_P,
+            "max_tokens": resolved_max_tokens,
         }
         if schema is not None:
             extra = bind_structured(self.model_id, schema)
@@ -246,6 +320,23 @@ class LLMCaller:
             # Free-text mode: return raw text as the "parsed" result
             parsed_obj = raw_text
 
+        # B41-f: capture the provider's system_fingerprint (when present) so the
+        # exact backend snapshot that produced this output is on the audit row.
+        system_fingerprint = _extract_system_fingerprint(raw_response)
+
+        # ---- B41-a: record actual spend against the durable ledger -----------
+        # Only on a real (non-error) call. Uses provider-reported usage when
+        # available; otherwise falls back to the requested ceiling so spend is
+        # never under-counted. Never raises (record() is itself fail-safe).
+        if self._budget_guard is not None and error_msg is None:
+            self._budget_record(
+                prompt=system_prompt + user_prompt,
+                requested_max_tokens=resolved_max_tokens,
+                raw_response=raw_response,
+                decision_id=decision_id,
+                tick_id=tick_id,
+            )
+
         # ---- Audit -----------------------------------------------------------
         self._record_audit(
             prompt_hash=prompt_hash,
@@ -253,6 +344,8 @@ class LLMCaller:
             parsed_dump=parsed_dump,
             latency_ms=latency_ms,
             error=error_msg,
+            max_tokens=resolved_max_tokens,
+            system_fingerprint=system_fingerprint,
         )
 
         return parsed_obj, raw_response
@@ -324,8 +417,15 @@ class LLMCaller:
         parsed_dump: dict[str, Any] | None,
         latency_ms: float,
         error: str | None,
+        max_tokens: int,
+        system_fingerprint: str | None = None,
     ) -> None:
-        """Write one audit-log event. Never raises."""
+        """Write one audit-log event. Never raises.
+
+        B41-f: the pinned generation config (temperature/top_p/max_tokens) and
+        the provider's ``system_fingerprint`` are recorded on every row so a
+        logged response is fully reproducible from the journal (Gate 1).
+        """
         payload: dict[str, Any] = {
             "model_id": self.model_id,
             "prompt_hash": prompt_hash,
@@ -335,12 +435,83 @@ class LLMCaller:
             "error": error,
             "audit_kind": self.audit_kind,
             "timestamp": datetime.now(UTC).isoformat(),
+            # B41-f pinned config + reproducibility fingerprint.
+            "temperature": _PINNED_TEMPERATURE,
+            "top_p": _PINNED_TOP_P,
+            "max_tokens": int(max_tokens),
+            "system_fingerprint": system_fingerprint,
         }
         _audit_append(
             kind=self.audit_kind,
             source="hermes_quant.agents.llm_caller",
             payload=payload,
         )
+
+    # ------------------------------------------------------------------
+    # B41-a budget-guard helpers (no-ops when no guard is wired in)
+    # ------------------------------------------------------------------
+
+    def _budget_check(
+        self,
+        *,
+        prompt: str,
+        requested_max_tokens: int,
+        decision_id: str | None,
+        tick_id: str | None,
+    ) -> Any:
+        """Consult the budget guard before a call. Never raises.
+
+        On any unexpected guard error we fail CLOSED (synthesize a blocked
+        verdict) — money-software must not spend when the guard is in doubt.
+        """
+        from hermes_quant.agents.llm_budget import BudgetCheck
+
+        try:
+            return self._budget_guard.check(
+                model_id=self.model_id,
+                prompt_tokens=_estimate_tokens(prompt),
+                max_tokens=requested_max_tokens,
+                decision_id=decision_id or "unkeyed_decision",
+                tick_id=tick_id or "unkeyed_tick",
+            )
+        except Exception as exc:  # noqa: BLE001 — fail closed on guard error
+            logger.warning(
+                "LLMCaller: budget guard.check raised (%s); failing closed.", exc
+            )
+            return BudgetCheck(allowed=False, allowed_max_tokens=0, reason="guard_error")
+
+    def _budget_record(
+        self,
+        *,
+        prompt: str,
+        requested_max_tokens: int,
+        raw_response: dict[str, Any],
+        decision_id: str | None,
+        tick_id: str | None,
+    ) -> None:
+        """Fold the actual cost of a completed call into the budget ledger.
+
+        Uses provider-reported ``usage`` when present; otherwise bills the
+        prompt estimate + the requested ceiling so spend is never under-counted.
+        Never raises.
+        """
+        usage = raw_response.get("usage") if isinstance(raw_response, dict) else None
+        if isinstance(usage, dict):
+            prompt_tokens = int(usage.get("prompt_tokens", _estimate_tokens(prompt)))
+            completion_tokens = int(usage.get("completion_tokens", requested_max_tokens))
+        else:
+            prompt_tokens = _estimate_tokens(prompt)
+            completion_tokens = requested_max_tokens
+        try:
+            self._budget_guard.record(
+                model_id=self.model_id,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                decision_id=decision_id or "unkeyed_decision",
+                tick_id=tick_id or "unkeyed_tick",
+            )
+        except Exception as exc:  # noqa: BLE001 — accounting must not crash a call
+            logger.warning("LLMCaller: budget guard.record raised (%s).", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +522,31 @@ class LLMCaller:
 def _sha256_hash(text: str) -> str:
     """Return the SHA-256 hex digest of *text* (UTF-8 encoded)."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _extract_system_fingerprint(raw_response: Any) -> str | None:
+    """Pull the provider's ``system_fingerprint`` from an OAI-style response.
+
+    Returns None when the provider does not report one (OpenRouter passes it
+    through only for some backends). B41-f records it for reproducibility.
+    """
+    if not isinstance(raw_response, dict):
+        return None
+    fp = raw_response.get("system_fingerprint")
+    return fp if isinstance(fp, str) and fp else None
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap, deterministic token estimate for pre-call budget projection.
+
+    Uses the ~4-chars-per-token heuristic. This is ONLY used to project a call's
+    cost before we have the provider's exact usage; the post-call ``record``
+    prefers provider-reported usage when present. Deterministic so the budget
+    gate's decisions are replayable.
+    """
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
 
 
 def _safe_truncate(obj: Any, max_chars: int = 4096) -> Any:
