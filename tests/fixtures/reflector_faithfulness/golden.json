@@ -1,0 +1,166 @@
+{
+  "_doc": "Golden fixtures for the reflector faithfulness eval gate (B41-c, ADR-4665 §7.3). DETERMINISTIC, no live LLM. The judge_verdicts block is a RECORDED golden LLM-as-judge response — production wires a real LLMCaller-backed judge, tests replay these. All times UTC. The 'trade_record' is the GROUND TRUTH the reflection reflects on; grounding recomputes raw/alpha from it (does NOT trust the reflection's self-reported numbers).",
+
+  "trade_record": {
+    "decision_id": "dec_20260401T100000_NVDA_aabbcc",
+    "ticker": "NVDA",
+    "direction": 1,
+    "rating": "Buy",
+    "entry_price": 800.0,
+    "exit_price": 860.0,
+    "benchmark_return": 0.02,
+    "benchmark": "SPY",
+    "asof_decision": "2026-04-01T10:00:00+00:00",
+    "asof_resolution": "2026-04-21T14:00:00+00:00"
+  },
+
+  "_derived_ground_truth": {
+    "_doc": "Recomputed by the gate from trade_record; shown here for fixture reviewers. raw=(860-800)/800=0.075 (+7.5%); alpha=0.075-0.02=0.055 (+5.5%); holding_days=20; tau_floor=max(2026-04-21T14:00, 2026-04-01T10:00 + 20d + 6h = 2026-04-21T16:00) = 2026-04-21T16:00:00+00:00",
+    "raw_return": 0.075,
+    "alpha_return": 0.055,
+    "holding_days": 20,
+    "tau_floor": "2026-04-21T16:00:00+00:00"
+  },
+
+  "faithful_reflection": {
+    "schema_version": 1,
+    "reflection_id": "ref_20260421T160000_NVDA_faith",
+    "decision_id": "dec_20260401T100000_NVDA_aabbcc",
+    "asof_resolution": "2026-04-21T14:00:00+00:00",
+    "tau_observable": "2026-04-21T16:00:00+00:00",
+    "ticker": "NVDA",
+    "raw_return": 0.075,
+    "alpha_return": 0.055,
+    "benchmark": "SPY",
+    "holding_days": 20,
+    "outcome_quality": 5,
+    "reflection_text": "The long call was correct; alpha of +5.5% over the 20-day hold beat the +2.0% SPY benchmark. Entry at $800.00 rising to $860.00 (raw +7.5%) confirmed the thesis. Lesson: maintain size when the directional read is validated by realized alpha.",
+    "lesson_category": "correct_call_too_early",
+    "reflector_model": "anthropic/claude-haiku-4-5",
+    "reflector_prompt_hash": "llm-v02:abc123def456"
+  },
+
+  "invented_number_reflection": {
+    "schema_version": 1,
+    "reflection_id": "ref_20260421T160000_NVDA_invent",
+    "decision_id": "dec_20260401T100000_NVDA_aabbcc",
+    "asof_resolution": "2026-04-21T14:00:00+00:00",
+    "tau_observable": "2026-04-21T16:00:00+00:00",
+    "ticker": "NVDA",
+    "raw_return": 0.075,
+    "alpha_return": 0.055,
+    "benchmark": "SPY",
+    "holding_days": 20,
+    "outcome_quality": 5,
+    "reflection_text": "The call was correct; +5.5% alpha confirmed the read. Earnings showed 22% data-center revenue growth, validating the super-cycle narrative. Lesson: size up on confirmed segment growth.",
+    "lesson_category": "correct_call_too_early",
+    "reflector_model": "anthropic/claude-haiku-4-5",
+    "reflector_prompt_hash": "llm-v02:invent00fabe"
+  },
+
+  "future_date_reflection": {
+    "schema_version": 1,
+    "reflection_id": "ref_20260421T160000_NVDA_future",
+    "decision_id": "dec_20260401T100000_NVDA_aabbcc",
+    "asof_resolution": "2026-04-21T14:00:00+00:00",
+    "tau_observable": "2026-04-21T16:00:00+00:00",
+    "ticker": "NVDA",
+    "raw_return": 0.075,
+    "alpha_return": 0.055,
+    "benchmark": "SPY",
+    "holding_days": 20,
+    "outcome_quality": 5,
+    "reflection_text": "The long thesis held; +5.5% alpha beat the +2.0% benchmark. The 2026-05-15 GTC keynote later validated the demand read. Lesson: stay patient with structural winners.",
+    "lesson_category": "correct_call_too_early",
+    "reflector_model": "anthropic/claude-haiku-4-5",
+    "reflector_prompt_hash": "llm-v02:future00cafe"
+  },
+
+  "understated_tau_reflection": {
+    "schema_version": 1,
+    "reflection_id": "ref_20260421T160000_NVDA_undertau",
+    "decision_id": "dec_20260401T100000_NVDA_aabbcc",
+    "asof_resolution": "2026-04-21T14:00:00+00:00",
+    "tau_observable": "2026-04-02T00:00:00+00:00",
+    "ticker": "NVDA",
+    "raw_return": 0.075,
+    "alpha_return": 0.055,
+    "benchmark": "SPY",
+    "holding_days": 20,
+    "outcome_quality": 5,
+    "reflection_text": "The long call was correct; alpha of +5.5% over the 20-day hold beat the +2.0% SPY benchmark. Entry at $800.00 rising to $860.00 (raw +7.5%) confirmed the thesis. Lesson: maintain size when the directional read is validated by realized alpha.",
+    "lesson_category": "correct_call_too_early",
+    "reflector_model": "anthropic/claude-haiku-4-5",
+    "reflector_prompt_hash": "llm-v02:undertau0bad"
+  },
+
+  "stability_pair": [
+    {
+      "schema_version": 1,
+      "reflection_id": "ref_20260421T160000_NVDA_stabA",
+      "decision_id": "dec_20260401T100000_NVDA_aabbcc",
+      "asof_resolution": "2026-04-21T14:00:00+00:00",
+      "tau_observable": "2026-04-21T16:00:00+00:00",
+      "ticker": "NVDA",
+      "raw_return": 0.075,
+      "alpha_return": 0.055,
+      "benchmark": "SPY",
+      "holding_days": 20,
+      "outcome_quality": 5,
+      "reflection_text": "The long call was correct; +5.5% alpha over a 20-day hold. Lesson: hold winners.",
+      "lesson_category": "correct_call_too_early",
+      "reflector_model": "anthropic/claude-haiku-4-5",
+      "reflector_prompt_hash": "llm-v02:stabA0000001"
+    },
+    {
+      "schema_version": 1,
+      "reflection_id": "ref_20260421T160000_NVDA_stabB",
+      "decision_id": "dec_20260401T100000_NVDA_aabbcc",
+      "asof_resolution": "2026-04-21T14:00:00+00:00",
+      "tau_observable": "2026-04-21T16:00:00+00:00",
+      "ticker": "NVDA",
+      "raw_return": 0.075,
+      "alpha_return": 0.055,
+      "benchmark": "SPY",
+      "holding_days": 20,
+      "outcome_quality": 5,
+      "reflection_text": "The long call was correct; +5.5% alpha over a 20-day hold. Lesson: hold winners.",
+      "lesson_category": "unknown",
+      "reflector_model": "anthropic/claude-haiku-4-5",
+      "reflector_prompt_hash": "llm-v02:stabB0000002"
+    }
+  ],
+
+  "judge_verdicts": {
+    "ref_20260421T160000_NVDA_faith": {
+      "grounded": true,
+      "lesson_category": "correct_call_too_early",
+      "reason": "Every figure (+5.5% alpha, +7.5% raw, $800/$860 entry/exit, +2.0% benchmark) traces to the logged trade record; the prose makes no unsupported claim."
+    },
+    "ref_20260421T160000_NVDA_invent": {
+      "grounded": false,
+      "lesson_category": "correct_call_too_early",
+      "reason": "The '22% data-center revenue growth' figure is fabricated — it is absent from the logged trade record (entry/exit/benchmark only)."
+    },
+    "ref_20260421T160000_NVDA_future": {
+      "grounded": true,
+      "lesson_category": "correct_call_too_early",
+      "reason": "Numbers trace to the record, but the prose references an event (2026-05-15 keynote) dated after the outcome became knowable."
+    },
+    "ref_20260421T160000_NVDA_undertau": {
+      "grounded": true,
+      "lesson_category": "correct_call_too_early",
+      "reason": "Prose is grounded; the failure is the understated tau_observable, not the text."
+    },
+    "ref_20260421T160000_NVDA_stabA": {
+      "grounded": true,
+      "lesson_category": "correct_call_too_early",
+      "reason": "Grounded; category matches a winning early-correct directional call."
+    },
+    "ref_20260421T160000_NVDA_stabB": {
+      "grounded": true,
+      "lesson_category": "unknown",
+      "reason": "Grounded; but category drifted to 'unknown' on an identical trade-class input."
+    }
+  }
+}
