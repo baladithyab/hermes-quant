@@ -412,6 +412,34 @@ class PaperReactor:
 
         state = RiskPortfolioState(positions=pos_map)
         caps = PortfolioCaps.standard()
+
+        # De-risking guard (P1 trade-correctness fix).
+        #
+        # positions are stored as the LATEST signed target_position_pct per
+        # symbol (ADR-0041 / portfolio_normalize.PortfolioState semantics), and
+        # `fill_size_pct` here is the NEW signed target for `proposal.symbol`.
+        # A symbol's contribution to GROSS exposure is abs(its target). So this
+        # fill changes that symbol's gross contribution from abs(existing) to
+        # abs(fill_size_pct); the marginal gross change is
+        #     abs(fill_size_pct) - abs(existing).
+        #
+        # clip_one_to_remaining_headroom() shrinks abs(target) to fit the book's
+        # REMAINING headroom — correct ONLY for fills that ADD gross exposure.
+        # It does not subtract the symbol's existing position, so it wrongly
+        # treats an exposure-REDUCING fill (one that moves the symbol toward
+        # zero / flips toward flat / shrinks abs) as if it consumed headroom.
+        # Codex P1: existing AAPL=+0.75, an approved -0.20 (partial sell) was
+        # clipped to -0.05 against 0.05 cash headroom, even though selling FREES
+        # headroom and must never be capped.
+        #
+        # If abs(new target) <= abs(existing), this fill does not add gross
+        # exposure (it reduces it or holds it flat) — pass through UNCLIPPED.
+        # Only genuinely exposure-INCREASING fills hit the headroom cap below,
+        # preserving #36's partial-scale + full-silence behavior exactly.
+        existing = pos_map.get(proposal.symbol, 0.0)
+        if abs(fill_size_pct) <= abs(existing) + 1e-9:
+            return None, fill_size_pct, None
+
         clipped = clip_one_to_remaining_headroom(
             asset=proposal.symbol,
             per_symbol_target_pct=fill_size_pct,
