@@ -7,8 +7,9 @@ state left rows above the cap indefinitely (operationally confirmed 2026-06-04).
 This adds a deterministic post-scoring trim: after onboard/evict, if the active
 set exceeds the cap, EVICT the lowest-scored active rows down to the cap (ranked
 descending by last_score; tie-break by symbol ascending so replays are
-identical). Catalyst-eviction-protected rows are never trimmed out of turn
-(fail-safe toward holding) — mirrors the existing slow-evict protection.
+identical). Catalyst-eviction-protected rows are never trimmed out of turn, but
+they count as occupied cap slots — mirrors the existing slow-evict protection
+without letting unprotected rows keep extra capacity.
 
 Covered:
   * helper `_enforce_cap_trim`: over-cap -> exactly cap, keeps top-by-score,
@@ -110,8 +111,36 @@ def test_trim_deterministic_across_two_runs():
     assert len(ev_a) == len(ev_b) == 10
 
 
+def test_protected_row_counts_against_cap_and_backfills_eviction():
+    """cap=3, 5 active, lowest protected -> keep protected + two best unprotected."""
+    rows = [
+        _active_row("TOP", 0.90),
+        _active_row("MID", 0.80),
+        _active_row("DROP1", 0.70),
+        _active_row("DROP2", 0.60),
+        _active_row(
+            "CAT",
+            0.10,
+            extras={"admitted_via": "catalyst", "catalyst_horizon": "1w"},
+            onboarded=_ASOF - pd.Timedelta(days=2),  # 2 days into a 1w horizon
+        ),
+    ]
+    new_rows, events = _enforce_cap_trim(
+        rows, play="swing", asof=_ASOF, max_per_play=3,
+        position_lookup=lambda s: True,  # open position -> protected
+    )
+    active = {r.symbol for r in new_rows if r.state == STATE_ACTIVE}
+    evicted = {r.symbol for r in new_rows if r.state == STATE_EVICTED}
+
+    assert len(active) <= 3
+    assert "CAT" in active, "protected row must NOT be trimmed even if lowest-scored"
+    assert active == {"CAT", "TOP", "MID"}
+    assert evicted == {"DROP1", "DROP2"}
+    assert {ev["symbol"] for ev in events} == {"DROP1", "DROP2"}
+
+
 def test_protected_row_not_trimmed_even_if_low_scored():
-    """A low-scored catalyst-protected row in the over-cap tail survives the trim."""
+    """A low-scored catalyst-protected row survives while total active lands at cap."""
     rows = [_active_row(_sym(i), 0.500 + i * 0.001) for i in range(60)]
     # Make the LOWEST-scored row (S00) catalyst-protected + within horizon.
     rows[0] = _active_row(
@@ -126,11 +155,11 @@ def test_protected_row_not_trimmed_even_if_low_scored():
     )
     active = {r.symbol for r in new_rows if r.state == STATE_ACTIVE}
     assert _sym(0) in active, "protected row must NOT be trimmed even if lowest-scored"
-    # 9 of the next-lowest (S01..S09) are trimmed instead; protection leaves us at
-    # 51 active (above cap) rather than evicting a protected row out of turn.
-    assert len(active) == 51
-    assert len(events) == 9
-    assert {ev["symbol"] for ev in events} == {_sym(i) for i in range(1, 10)}
+    # S00 counts as an occupied slot, so the 10 next-lowest unprotected rows
+    # (S01..S10) are trimmed instead and the active set lands back at cap.
+    assert len(active) == 50
+    assert len(events) == 10
+    assert {ev["symbol"] for ev in events} == {_sym(i) for i in range(1, 11)}
 
 
 def test_trim_nan_score_is_deterministic():

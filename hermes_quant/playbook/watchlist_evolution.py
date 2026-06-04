@@ -548,17 +548,18 @@ def _enforce_cap_trim(
     Active rows are ranked by ``(-last_score, symbol)`` — descending score, then
     symbol ascending as a stable tie-break — so two runs over identical input
     trim the identical set (no RNG, no wall-clock in the ranking). The rows kept
-    are the top ``max_per_play`` of that ranking; the remainder are evicted with
-    reason ``over_cap_trim``.
+    are the protected rows plus the best unprotected rows that fit the residual
+    capacity; the remaining unprotected rows are evicted with reason
+    ``over_cap_trim``.
 
     Protection
     ----------
     A catalyst-eviction-protected row (``_catalyst_eviction_protected``) is NEVER
-    trimmed out of turn — it is excluded from the eviction candidates and held
-    even if it sits in the over-cap tail (fail-safe toward holding, mirroring the
-    slow-evict path). When protection keeps more than ``max_per_play`` rows
+    trimmed out of turn. Protected rows still count as occupied cap slots, so
+    unprotected rows only keep the residual capacity after all protected rows are
+    preserved. When protection alone keeps more than ``max_per_play`` rows
     active, the active set legitimately stays above the cap until those rows'
-    horizons elapse; the trim still removes every UNPROTECTED over-cap row.
+    horizons elapse; the trim still removes every UNPROTECTED row.
 
     The active set only ever gets SMALLER or stays equal — never larger.
 
@@ -585,14 +586,16 @@ def _enforce_cap_trim(
 
     ranked = sorted(active, key=_rank_key)
 
-    # Keep the top `max_per_play`. Of the over-cap tail, evict every row that is
-    # NOT catalyst-protected; a protected row is held even above the cap (the
-    # `continue` is the protection — it never reaches evict_symbols).
-    evict_symbols: list[str] = []
-    for r in ranked[max_per_play:]:
+    protected: list[WatchlistEntry] = []
+    unprotected: list[WatchlistEntry] = []
+    for r in ranked:
         if _catalyst_eviction_protected(r, asof, position_lookup):
-            continue  # protected -> held above cap, never trimmed out of turn
-        evict_symbols.append(r.symbol)
+            protected.append(r)
+        else:
+            unprotected.append(r)
+
+    residual_capacity = max(max_per_play - len(protected), 0)
+    evict_symbols = [r.symbol for r in unprotected[residual_capacity:]]
 
     if not evict_symbols:
         return rows, []
