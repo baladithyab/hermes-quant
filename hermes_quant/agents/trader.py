@@ -603,7 +603,7 @@ class TraderNodeLLM:
             # on any failure fall back to the pure v0.1 deterministic proposal.
             try:
                 grounded = self._overwrite_price_levels_deterministic(
-                    obj, advisor_signal
+                    obj, research_plan, advisor_signal
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -647,6 +647,7 @@ class TraderNodeLLM:
     def _overwrite_price_levels_deterministic(
         self,
         llm_proposal: TraderProposal,
+        research_plan: dict[str, Any],
         advisor_signal: dict[str, Any],
     ) -> TraderProposal:
         """Re-ground a v0.2 LLM proposal's numeric price levels.
@@ -669,10 +670,14 @@ class TraderNodeLLM:
         # Recompute from the LLM's chosen ACTION so the deterministic stop sits
         # on the correct losing side for the direction the LLM proposed. The
         # magnitude/side come entirely from advisor-signal metadata (2×ATR from
-        # last_close), never from the LLM's numbers.
+        # last_close), never from the LLM's numbers. ``recommendation`` carries
+        # the rating-domain value from the research plan (NOT action.value) so
+        # the helper's contract — ``_build`` passes "Buy"/"Sell"/… — is honored
+        # even if ``_price_levels`` is later extended to consume the rating.
+        recommendation = research_plan.get("recommendation")
         det_entry, det_stop, det_target = self._v01_node._price_levels(
             action=llm_proposal.action,
-            recommendation=llm_proposal.action.value,
+            recommendation=recommendation,
             advisor_signal=advisor_signal,
         )
 
