@@ -381,6 +381,21 @@ def _build_default_analysts() -> list[Any]:
             analysts.append(HermesSemanticAnalyst())
         except ImportError:
             pass
+
+    # ADR-0080 / seed 908e (anti-overfit lane L3): DSR/walk-forward OOS ADMISSION
+    # gate for analysts joining the committee. Factors clear this eval-gate before
+    # any live weight; analysts previously joined with NO overfit check. DEFAULT-OFF
+    # behind HERMES_QUANT_ANALYST_ADMISSION (read at call time, mirroring the flags
+    # above + the factor proposer's boundary-only flag). With the flag OFF the
+    # roster is byte-identical to today; with it ON, an analyst whose persisted
+    # admission decision is not `admitted` (or that has no decision — fail-closed) is
+    # dropped before it can vote. The gate module reads no env; the flag lives here.
+    from hermes_quant.governance.analyst_admission import apply_admission_gate
+
+    analysts = apply_admission_gate(
+        analysts,
+        enabled=os.environ.get("HERMES_QUANT_ANALYST_ADMISSION", "0") == "1",
+    )
     return analysts
 
 
