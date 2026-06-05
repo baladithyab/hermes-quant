@@ -128,7 +128,7 @@ def _print_broker_snapshot() -> None:
 
         client = _build_paper_trading_client()
         account = client.get_account()
-        positions = client.get_positions()  # read-only
+        positions = client.get_all_positions()  # read-only (alpaca-py: get_all_positions)
     except Exception as exc:  # noqa: BLE001 — read-only snapshot is best-effort
         print(f"  (broker read failed — skipping live snapshot): {exc}")
         return
