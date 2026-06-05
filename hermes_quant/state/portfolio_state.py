@@ -613,9 +613,18 @@ class PortfolioState:
                     cash_balance = initial_cash
 
                 # Long fill: cash decreases; short fill: cash increases.
-                # delta_cash = -fill_size_pct * fill_price
-                # (fill_size_pct positive = long → decrease cash)
-                delta_cash = -fill_size_pct * fill_price
+                # When the record carries a true share/contract count
+                # (reactor_metadata.quantity, e.g. the Alpaca-paper reactor),
+                # the cash delta MUST use real notional = signed_shares ×
+                # per-share price, NOT fill_size_pct × price. fill_size_pct is a
+                # NAV FRACTION; multiplying a fraction by a per-share price
+                # (the legacy "0da3" unit bug) understates cash by orders of
+                # magnitude and corrupts the partition NAV. We branch the cash
+                # math the SAME way the position math is branched above
+                # (leg_quantity present → true units). With no leg_quantity the
+                # legacy NAV-fraction path is bit-identical.
+                cash_basis = pos_delta if leg_quantity is not None else fill_size_pct
+                delta_cash = -cash_basis * fill_price
                 new_cash = cash_balance + delta_cash
 
                 # equity_total: recompute from all positions for this account
@@ -959,7 +968,12 @@ def _replay_record(
     }
 
     # Update cash: long fill decreases cash, short fill increases cash.
-    cash_map[acct] -= fill_size_pct * fill_price
+    # Mirror apply_execution: when a true share/contract count is present
+    # (leg_quantity), cash uses real notional (signed_shares × price), not the
+    # NAV-fraction × price "0da3" unit bug. Legacy path (no leg_quantity) is
+    # bit-identical.
+    cash_basis = pos_delta if leg_quantity is not None else fill_size_pct
+    cash_map[acct] -= cash_basis * fill_price
 
     # Track latest timestamp per account
     if acct not in last_ts or asof > last_ts[acct]:

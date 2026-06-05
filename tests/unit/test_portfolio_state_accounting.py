@@ -268,3 +268,57 @@ def test_marked_equity_zero_avg_entry_price_skipped(tmp_path) -> None:
     assert result.n_positions == 1
     assert result.n_marked == 0  # skipped before marking
     assert result.equity_basis == "entry"
+
+
+def test_cash_unit_true_shares_vs_legacy_navfraction(tmp_path) -> None:
+    """REGRESSION LOCK (P1-A / "0da3" unit bug): when a record carries a true
+    share/contract count in reactor_metadata.quantity (the Alpaca-paper reactor
+    path), the CASH delta must use real notional = signed_shares * price, NOT
+    fill_size_pct (NAV fraction) * price. The legacy path (no quantity) must stay
+    bit-identical to the NAV-fraction proxy.
+
+    Buying 100 shares @ $50 = $5,000 real cash out. The pre-fix bug computed
+    0.05 * 50 = $2.50, understating cash by 3 orders of magnitude and corrupting
+    partition NAV.
+    """
+    from hermes_quant.state.portfolio_state import _default_initial_cash
+
+    ps = PortfolioState(state_db_path=tmp_path / "state.db")
+    init = _default_initial_cash()
+
+    # Alpaca-style: explicit signed shares in reactor_metadata.quantity.
+    ps.apply_execution(
+        _exec_rec(
+            account_id="alpaca-paper",
+            asset="X",
+            symbol="X",
+            fill_size_pct=0.05,  # NAV-fraction proxy (must NOT drive cash here)
+            fill_price=50.0,
+            proposal_id="alpaca_x",
+            reactor_metadata={"quantity": 100.0},  # true shares
+        )
+    )
+    alpaca_cash = ps.get_cash("alpaca-paper")
+    # Cash dropped by the REAL notional 100 * 50 = 5000, not 0.05 * 50 = 2.5.
+    assert abs((init - alpaca_cash.balance_usd) - 5000.0) < 1e-6, (
+        f"alpaca-paper cash drop {init - alpaca_cash.balance_usd} != 5000 "
+        "(P1-A unit fix regressed)"
+    )
+
+    # Legacy path: no quantity -> NAV-fraction proxy, bit-identical to before.
+    ps.apply_execution(
+        _exec_rec(
+            account_id="paper-default",
+            asset="Y",
+            symbol="Y",
+            fill_size_pct=0.05,
+            fill_price=50.0,
+            proposal_id="legacy_y",
+            reactor_metadata={},
+        )
+    )
+    legacy_cash = ps.get_cash("paper-default")
+    assert abs((init - legacy_cash.balance_usd) - 2.5) < 1e-6, (
+        f"paper-default cash drop {init - legacy_cash.balance_usd} != 2.5 "
+        "(legacy NAV-fraction path must be unchanged)"
+    )
