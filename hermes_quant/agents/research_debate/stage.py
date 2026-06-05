@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from dataclasses import replace
 from typing import Any
 
 from hermes_quant.agents.research_debate.schemas import (
@@ -48,6 +49,7 @@ MAX_ALLOWED_ROUNDS: int = 3
 RESEARCH_ROUNDS_ENV_VAR: str = "HERMES_QUANT_RESEARCH_DEBATE_ROUNDS"
 RESEARCH_DEBATE_FLAG_ENV_VAR: str = "HERMES_QUANT_RESEARCH_DEBATE"
 RESEARCH_DEBATE_AUDIT_KIND: str = "research_debate"
+_BUDGETED_DEBATE_DEFAULT_MAX_TOKENS: int = 800
 
 # ADR-0080 W7 (default-OFF): the standing Socratic devil's-advocate turn flag.
 # Mirror of the dispatch flag idiom (llm_committee.py). Default OFF; flag-unset
@@ -137,6 +139,186 @@ def _resolve_max_rounds(explicit: int | None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Debate-level budget envelope (B41-e)
+# ---------------------------------------------------------------------------
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap deterministic token estimate matching LLMCaller budget posture."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def _budget_tick_id(ctx: Any) -> str:
+    asset = getattr(ctx, "asset", None) or "unknown"
+    asof = getattr(ctx, "asof", None)
+    return f"{asset}:{asof}"
+
+
+def _budget_model_for_role(role: str, config: Any) -> str:
+    deep_model = getattr(config, "deep_model", "anthropic/claude-sonnet-4.6")
+    quick_model = getattr(config, "quick_model", "anthropic/claude-haiku-4.5")
+    return deep_model if role == "research_manager" else quick_model
+
+
+def _budget_requested_max_tokens(config: Any) -> int:
+    raw = getattr(config, "max_tokens_per_turn", _BUDGETED_DEBATE_DEFAULT_MAX_TOKENS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _BUDGETED_DEBATE_DEFAULT_MAX_TOKENS
+    return value if value > 0 else _BUDGETED_DEBATE_DEFAULT_MAX_TOKENS
+
+
+def _budget_prompt_tokens(
+    *,
+    role: str,
+    ctx: Any,
+    baseline_signal: Any,
+    analyst_views: list[Any],
+    state: InvestDebateState,
+) -> int:
+    """Conservative deterministic prompt-size estimate for reservation checks.
+
+    The actual LLM adapter owns prompt rendering. The stage-level budget gate
+    therefore reserves against a stable context summary plus accumulated debate
+    history, erring upward with a fixed overhead so an empty prompt estimate does
+    not become a free call.
+    """
+    context = {
+        "role": role,
+        "asset": getattr(ctx, "asset", None),
+        "asof": str(getattr(ctx, "asof", "")),
+        "baseline": {
+            "direction": getattr(baseline_signal, "direction", None),
+            "magnitude": getattr(baseline_signal, "magnitude", None),
+            "confidence": getattr(baseline_signal, "confidence", None),
+            "horizon": getattr(baseline_signal, "horizon", None),
+        },
+        "analyst_count": len(analyst_views),
+        "history": state.history,
+        "current_response": state.current_response,
+        "bull_history": state.bull_history,
+        "bear_history": state.bear_history,
+    }
+    return max(64, _estimate_tokens(str(context)) + 64)
+
+
+def _config_with_max_tokens(config: Any, max_tokens: int) -> Any:
+    if config is None or getattr(config, "max_tokens_per_turn", None) == max_tokens:
+        return config
+    try:
+        return replace(config, max_tokens_per_turn=int(max_tokens))
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "ResearchDebateStage: could not clamp max_tokens_per_turn on config; "
+            "continuing with original config"
+        )
+        return config
+
+
+def _resolve_budget_guard(budget_guard: Any | None) -> Any | None:
+    if budget_guard is not None:
+        return budget_guard
+    try:
+        from hermes_quant.agents.llm_budget import LLMBudgetGuard
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ResearchDebateStage: could not import LLMBudgetGuard (%s); "
+            "budget guard remains OFF",
+            exc,
+        )
+        return None
+    try:
+        return LLMBudgetGuard.from_env()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ResearchDebateStage: LLMBudgetGuard.from_env raised (%s); "
+            "failing closed for the debate",
+            exc,
+        )
+        raise
+
+
+def _budget_prepare_call(
+    *,
+    budget_guard: Any | None,
+    role: str,
+    ctx: Any,
+    baseline_signal: Any,
+    analyst_views: list[Any],
+    state: InvestDebateState,
+    config: Any,
+    decision_id: str,
+    tick_id: str,
+) -> tuple[bool, Any, str | None]:
+    """Reserve one LLM call against the shared debate decision bucket.
+
+    ``budget_guard=None`` is the byte-identical OFF path. When a guard is
+    present, every bull/bear/judge/red-team call uses the same ``decision_id``.
+    A successful check is immediately recorded as a worst-case reservation so
+    later turns see the cumulative debate spend and cannot pass independently.
+    """
+    if budget_guard is None:
+        return True, config, None
+
+    model_id = _budget_model_for_role(role, config)
+    requested_max_tokens = _budget_requested_max_tokens(config)
+    prompt_tokens = _budget_prompt_tokens(
+        role=role,
+        ctx=ctx,
+        baseline_signal=baseline_signal,
+        analyst_views=analyst_views,
+        state=state,
+    )
+    try:
+        check = budget_guard.check(
+            model_id=model_id,
+            prompt_tokens=prompt_tokens,
+            max_tokens=requested_max_tokens,
+            decision_id=decision_id,
+            tick_id=tick_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ResearchDebateStage: budget_guard.check raised (%s); failing closed",
+            exc,
+        )
+        return False, config, "guard_error"
+
+    if not check.allowed:
+        return False, config, check.reason or "exhausted"
+
+    allowed_max_tokens = int(check.allowed_max_tokens)
+    if allowed_max_tokens <= 0:
+        return False, config, "no_max_tokens"
+
+    call_config = _config_with_max_tokens(config, allowed_max_tokens)
+    if getattr(call_config, "max_tokens_per_turn", None) != allowed_max_tokens:
+        return False, config, "max_tokens_clamp_failed"
+
+    before = budget_guard.snapshot(decision_id=decision_id, tick_id=tick_id)
+    before_calls = int(before.get("decision_calls", 0))
+    budget_guard.record(
+        model_id=model_id,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=allowed_max_tokens,
+        decision_id=decision_id,
+        tick_id=tick_id,
+    )
+    after = budget_guard.snapshot(decision_id=decision_id, tick_id=tick_id)
+    if after.get("corrupt") or int(after.get("decision_calls", 0)) <= before_calls:
+        logger.warning(
+            "ResearchDebateStage: budget reservation did not persist; "
+            "failing closed before spending another call"
+        )
+        return False, config, "reservation_failed"
+
+    return True, call_config, None
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -153,6 +335,7 @@ def run_research_debate(
     run_one_turn: Any = None,
     run_judge: Any = None,
     run_red_team: Any = None,
+    budget_guard: Any | None = None,
 ) -> InvestDebateState:
     """Run the bull/bear adversarial debate stage and return the final state.
 
@@ -170,6 +353,9 @@ def run_research_debate(
             ``llm_committee._run_one_turn_with_history`` (lazy import below).
         run_judge: optional injection point for tests; defaults to
             ``llm_committee._run_research_manager_judge`` (lazy import below).
+        budget_guard: optional ``LLMBudgetGuard``. ``None`` resolves through
+            ``LLMBudgetGuard.from_env()``; with env unset that returns ``None``
+            and this function follows the byte-identical historical path.
 
     Returns:
         Final ``InvestDebateState`` with ``judge_decision`` populated
@@ -186,6 +372,12 @@ def run_research_debate(
     rounds = _resolve_max_rounds(max_rounds)
     pid = proposal_id or f"rdp-{uuid.uuid4().hex[:12]}"
     state = InvestDebateState()
+    budget_tick_id = _budget_tick_id(ctx)
+    try:
+        budget_guard = _resolve_budget_guard(budget_guard)
+    except Exception:  # noqa: BLE001
+        state.terminated_reason = "budget_exhausted:guard_error"
+        budget_guard = "fail_closed"
 
     # ADR-0066 (v0.6.2): production turn/judge wiring is live. The default
     # injection points are the helpers in ``llm_committee``:
@@ -233,11 +425,26 @@ def run_research_debate(
             )
             round_index = (state.count // 2) + 1
 
+            budget_ok, call_config, budget_reason = _budget_prepare_call(
+                budget_guard=budget_guard,
+                role=role,
+                ctx=ctx,
+                baseline_signal=baseline_signal,
+                analyst_views=analyst_views or [],
+                state=state,
+                config=config,
+                decision_id=pid,
+                tick_id=budget_tick_id,
+            )
+            if not budget_ok:
+                state.terminated_reason = f"budget_exhausted:{budget_reason}"
+                break
+
             try:
                 turn = run_one_turn(
                     role=role,
                     client=client,
-                    config=config,
+                    config=call_config,
                     market_context=ctx,
                     analyst_views=analyst_views or [],
                     baseline_signal=baseline_signal,
@@ -314,21 +521,40 @@ def run_research_debate(
         )
         state.terminated_reason = f"exception:{type(exc).__name__}"
 
-    # Always attempt the judge, even on partial state. The deep-tier judge has
-    # its own try/except + Pydantic validator inside _run_research_manager_judge.
-    try:
-        judge_plan = run_judge(
-            client=client,
-            config=config,
-            market_context=ctx,
-            analyst_views=analyst_views or [],
+    # Attempt the judge on partial state unless the budget envelope has already
+    # failed closed. The deep-tier judge has its own try/except + Pydantic
+    # validator inside _run_research_manager_judge.
+    judge_plan = None
+    if state.terminated_reason.startswith("budget_exhausted:"):
+        budget_ok, judge_config, budget_reason = False, config, "exhausted"
+    else:
+        budget_ok, judge_config, budget_reason = _budget_prepare_call(
+            budget_guard=budget_guard,
+            role="research_manager",
+            ctx=ctx,
             baseline_signal=baseline_signal,
-            bull_turns=state.bull_turns,
-            bear_turns=state.bear_turns,
+            analyst_views=analyst_views or [],
+            state=state,
+            config=config,
+            decision_id=pid,
+            tick_id=budget_tick_id,
         )
-    except Exception:  # noqa: BLE001
-        logger.exception("ResearchDebateStage: judge invocation raised; using None")
-        judge_plan = None
+    if budget_ok:
+        try:
+            judge_plan = run_judge(
+                client=client,
+                config=judge_config,
+                market_context=ctx,
+                analyst_views=analyst_views or [],
+                baseline_signal=baseline_signal,
+                bull_turns=state.bull_turns,
+                bear_turns=state.bear_turns,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("ResearchDebateStage: judge invocation raised; using None")
+            judge_plan = None
+    else:
+        state.terminated_reason = f"budget_exhausted:{budget_reason}"
 
     if judge_plan is not None and not isinstance(judge_plan, ResearchPlan):
         # The committee module returns a CommitteeTurn-shaped object today; if a
@@ -364,17 +590,32 @@ def run_research_debate(
                 )
                 run_red_team = None
         if run_red_team is not None:
-            try:
-                rt = run_red_team(
-                    client=client,
-                    config=config,
-                    market_context=ctx,
-                    analyst_views=analyst_views or [],
-                    baseline_signal=baseline_signal,
-                    leading_view=state.judge_decision,
-                )
-            except Exception:  # noqa: BLE001 — failure-closed; no dissent on failure
-                logger.exception("W7: red-team turn raised; treating as no-dissent")
+            budget_ok, redteam_config, budget_reason = _budget_prepare_call(
+                budget_guard=budget_guard,
+                role="devils_advocate",
+                ctx=ctx,
+                baseline_signal=baseline_signal,
+                analyst_views=analyst_views or [],
+                state=state,
+                config=config,
+                decision_id=pid,
+                tick_id=budget_tick_id,
+            )
+            if budget_ok:
+                try:
+                    rt = run_red_team(
+                        client=client,
+                        config=redteam_config,
+                        market_context=ctx,
+                        analyst_views=analyst_views or [],
+                        baseline_signal=baseline_signal,
+                        leading_view=state.judge_decision,
+                    )
+                except Exception:  # noqa: BLE001 — failure-closed; no dissent on failure
+                    logger.exception("W7: red-team turn raised; treating as no-dissent")
+                    rt = None
+            else:
+                state.terminated_reason = f"budget_exhausted:{budget_reason}"
                 rt = None
             if rt is not None:
                 state.red_team_turn = rt

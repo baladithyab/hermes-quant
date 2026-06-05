@@ -15,8 +15,18 @@ Lives BESIDE PromotionGate (does not modify it):
     TraderAxis          — proposal-quality axis (trader position ∈ [-1,1]).
     Episode / GateConfig / GateVerdict / CriterionResult — the corpus + verdict
                           model. Flips no flag; produces a verdict a human reads.
+
+ResearchDebate dissent-quality gate (B41-e / seed hermes-quant-0956) — an
+OFFLINE, deterministic, advisory-plane gate proving debate-ON beats the legacy
+committee on realized downstream decision quality OOS. It flips no flags:
+    DebateDissentGate / DebateDissentEpisode / DebateDissentGateConfig.
 """
 
+from hermes_quant.eval.debate_dissent_gate import (
+    DebateDissentEpisode,
+    DebateDissentGate,
+    DebateDissentGateConfig,
+)
 from hermes_quant.eval.llm_beats_fallback_gate import (
     CriterionResult,
     Episode,
@@ -44,4 +54,7 @@ __all__ = [
     "CriterionResult",
     "RiskCommitteeAxis",
     "TraderAxis",
+    "DebateDissentEpisode",
+    "DebateDissentGateConfig",
+    "DebateDissentGate",
 ]
