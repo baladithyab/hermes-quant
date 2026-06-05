@@ -173,12 +173,14 @@ ignore = ["E501"]   # long lines OK in docstrings and ADR-derived comments
 testpaths = ["tests"]
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]
-# Global per-test wall-clock cap so a single hung test (e.g. an unguarded
-# live-network call, or a slow integration test) can never stall the whole
-# suite. pytest-timeout is in the dev deps; tests that legitimately need
-# longer override with @pytest.mark.timeout(N). 90s is generous for this
-# suite (the slowest legit tests run in low double-digit seconds).
-timeout = 90
+# Global per-test wall-clock cap so a single genuinely-HUNG test (deadlock,
+# infinite loop, unguarded live-network call that never returns) can't stall
+# the whole suite forever. Set generously: this suite has legitimate
+# model-loading backtests (Kronos/torch init + SSL fetches) that run ~175s,
+# so the cap must clear those — it exists to kill INFINITE hangs, not slow-but-
+# valid tests. pytest-timeout is in dev deps; a test that needs even longer
+# overrides with @pytest.mark.timeout(N).
+timeout = 300
 markers = [
     "requires_network: tests that hit live network (skipped in CI; manually run before release)",
     "timeout(N): per-test timeout in seconds (pytest-timeout)",
