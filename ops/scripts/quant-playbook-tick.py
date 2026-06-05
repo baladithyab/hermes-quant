@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import traceback
@@ -78,6 +79,7 @@ PER_FIRE_NOTIONAL_USD = 1000.0  # cap per equity proposal (paper account, conser
 PER_FIRE_NOTIONAL_FLOOR_USD = 100.0
 GAP_ATR_MULTIPLIER = 1.5
 EARNINGS_LOCKOUT_DAYS = 5  # silence if days_until_earnings < 5
+PLAYBOOK_AGGREGATE_CAP_ENV = "HERMES_QUANT_PLAYBOOK_AGGREGATE_CAP"
 
 # ---------- utilities ----------
 def utcnow_iso() -> str:
@@ -252,6 +254,183 @@ def place_paper_market_order(symbol: str, notional_usd: float, *, side: str = "b
         return {"error": f"http_{e.code}", "detail": body_txt[:300]}
     except Exception as e:
         return {"error": type(e).__name__, "detail": str(e)[:300]}
+
+
+# ---------- tick-level aggregate cap ----------
+def _aggregate_cap_enabled() -> bool:
+    return os.environ.get(PLAYBOOK_AGGREGATE_CAP_ENV, "").strip() == "1"
+
+
+def read_alpaca_account_equity() -> float | None:
+    """Return Alpaca paper account equity from /account, or None on any uncertainty.
+
+    This is used only when HERMES_QUANT_PLAYBOOK_AGGREGATE_CAP=1. None is a
+    fail-closed input: callers silence would-be fires rather than assuming a
+    nominal account size.
+    """
+    import urllib.error
+    import urllib.request
+
+    creds = _load_creds()
+    key = creds.get("ALPACA_API_KEY_ID")
+    secret = creds.get("ALPACA_API_SECRET_KEY")
+    base = creds.get("ALPACA_BASE_URL")
+    if not (key and secret and base):
+        return None
+
+    req = urllib.request.Request(f"{base.rstrip('/')}/account", method="GET")
+    req.add_header("APCA-API-KEY-ID", key)
+    req.add_header("APCA-API-SECRET-KEY", secret)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            account = json.loads(r.read())
+    except (urllib.error.HTTPError, OSError, json.JSONDecodeError):
+        return None
+    except Exception:
+        return None
+
+    try:
+        equity = float(account.get("equity"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(equity) or equity <= 0:
+        return None
+    return equity
+
+
+class AggregateTickBudget:
+    """Tick-local notional accumulator for playbook/hourly direct Alpaca fires.
+
+    This is intentionally a tick-level guard, not the durable ADR-0087 seam
+    implementation. It reuses the canonical PortfolioCaps/PortfolioState
+    headroom math to derive the gross cap, then counts only successful orders
+    placed by this cron invocation.
+    """
+
+    def __init__(
+        self,
+        *,
+        ceiling_usd: float | None,
+        consumed_usd: float = 0.0,
+        failure_reason: str | None = None,
+    ) -> None:
+        self.ceiling_usd = ceiling_usd
+        self.consumed_usd = consumed_usd
+        self.failure_reason = failure_reason
+
+    @staticmethod
+    def finite_positive_or_none(value: Any) -> float | None:
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(f) or f <= 0:
+            return None
+        return f
+
+    def check(self, notional_usd: float) -> tuple[bool, str | None]:
+        if self.failure_reason:
+            return False, f"portfolio_cap_aggregate_breach: {self.failure_reason}"
+
+        notional = self.finite_positive_or_none(notional_usd)
+        if notional is None:
+            return (
+                False,
+                f"portfolio_cap_aggregate_breach: non_finite_notional notional_usd={notional_usd!r}",
+            )
+
+        if (
+            self.ceiling_usd is None
+            or not math.isfinite(self.ceiling_usd)
+            or self.ceiling_usd <= 0
+        ):
+            return (
+                False,
+                f"portfolio_cap_aggregate_breach: invalid_ceiling ceiling_usd={self.ceiling_usd!r}",
+            )
+
+        if not math.isfinite(self.consumed_usd) or self.consumed_usd < 0:
+            return (
+                False,
+                f"portfolio_cap_aggregate_breach: invalid_consumed consumed_usd={self.consumed_usd!r}",
+            )
+
+        prospective = self.consumed_usd + notional
+        if not math.isfinite(prospective):
+            return (
+                False,
+                "portfolio_cap_aggregate_breach: non_finite_prospective_notional",
+            )
+
+        if prospective > self.ceiling_usd + 1e-9:
+            return (
+                False,
+                "portfolio_cap_aggregate_breach: "
+                f"requested_notional_usd={notional:.2f} "
+                f"consumed_usd={self.consumed_usd:.2f} "
+                f"ceiling_usd={self.ceiling_usd:.2f}",
+            )
+
+        return True, None
+
+    def record_placed(self, notional_usd: float) -> None:
+        notional = self.finite_positive_or_none(notional_usd)
+        if notional is not None:
+            self.consumed_usd += notional
+
+    def journal_fields(self) -> dict[str, Any]:
+        return {
+            "aggregate_cap_ceiling_usd": self.ceiling_usd,
+            "aggregate_cap_consumed_usd": self.consumed_usd,
+        }
+
+
+def build_aggregate_tick_budget() -> AggregateTickBudget | None:
+    """Build the tick-local aggregate cap budget when the operator flag is ON.
+
+    OFF returns None without importing risk helpers or reading Alpaca, preserving
+    the current per-fire-only behavior.
+    """
+    if not _aggregate_cap_enabled():
+        return None
+
+    equity = read_alpaca_account_equity()
+    if equity is None or not math.isfinite(equity) or equity <= 0:
+        return AggregateTickBudget(
+            ceiling_usd=None,
+            failure_reason="account_equity_unavailable_or_non_finite",
+        )
+
+    try:
+        from hermes_quant.risk.portfolio_normalize import (
+            PortfolioCaps,
+            PortfolioState,
+            headroom_summary,
+        )
+
+        caps = PortfolioCaps.standard()
+        state = PortfolioState()
+        gross_headroom = float(headroom_summary(state, caps).get("gross_headroom"))
+    except Exception as exc:
+        return AggregateTickBudget(
+            ceiling_usd=None,
+            failure_reason=f"portfolio_headroom_unavailable:{type(exc).__name__}",
+        )
+
+    if not math.isfinite(gross_headroom) or gross_headroom <= 0:
+        return AggregateTickBudget(
+            ceiling_usd=None,
+            failure_reason=f"gross_headroom_non_finite_or_non_positive:{gross_headroom!r}",
+        )
+
+    ceiling = equity * gross_headroom
+    if not math.isfinite(ceiling) or ceiling <= 0:
+        return AggregateTickBudget(
+            ceiling_usd=None,
+            failure_reason=f"aggregate_ceiling_non_finite_or_non_positive:{ceiling!r}",
+        )
+
+    return AggregateTickBudget(ceiling_usd=ceiling)
 
 
 # ---------- snapshot + silence rules ----------
@@ -609,7 +788,6 @@ def _run_committee_safe(
         from hermes_quant.protocol import (
             AggregatedSignal,
             AnalystView,
-            Direction,
             MarketContext,
         )
 
@@ -831,6 +1009,7 @@ def process_pair(
     tick_id: str,
     fired_set: set[tuple[str, str]],
     dry_run: bool,
+    aggregate_budget: AggregateTickBudget | None = None,
 ) -> dict[str, Any]:
     """Process a single (symbol, play) pair. Returns the journal record."""
     base = {
@@ -881,6 +1060,18 @@ def process_pair(
                 "order_id": None,
                 "dry_run_note": "no order placed (--dry-run)"}
 
+    if aggregate_budget is not None:
+        cap_ok, cap_reason = aggregate_budget.check(notional)
+        if not cap_ok:
+            journal_notional = AggregateTickBudget.finite_positive_or_none(notional)
+            return {**base,
+                    "decision": "silenced",
+                    "gate": "FIRE",
+                    "confidence": confidence,
+                    "reason": cap_reason or "portfolio_cap_aggregate_breach",
+                    "notional_usd": journal_notional,
+                    **aggregate_budget.journal_fields()}
+
     order = place_paper_market_order(symbol, notional, side="buy")
     if "error" in order:
         return {**base, "decision": "gate_reject",
@@ -888,6 +1079,9 @@ def process_pair(
                 "confidence": confidence,
                 "reason": f"alpaca route failed: {order.get('error')}: {order.get('detail','')}",
                 "notional_usd": notional}
+
+    if aggregate_budget is not None:
+        aggregate_budget.record_placed(notional)
 
     return {**base,
             "decision": "fire",
@@ -948,6 +1142,7 @@ def run_tick(*, dry_run: bool) -> dict[str, Any]:
         return summary
 
     fired_set = fired_today_pairs()
+    aggregate_budget = build_aggregate_tick_budget() if not dry_run else None
 
     for symbol, play, score in pairs:
         try:
@@ -957,6 +1152,7 @@ def run_tick(*, dry_run: bool) -> dict[str, Any]:
                 tick_id=tick_id,
                 fired_set=fired_set,
                 dry_run=dry_run,
+                aggregate_budget=aggregate_budget,
             )
         except Exception as e:
             summary["errors"] += 1
