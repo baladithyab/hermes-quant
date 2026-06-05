@@ -34,8 +34,13 @@ from typing import Any
 from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, append_locked
 
 from .admissibility_precondition import admissibility_reject_equity
+from .backend import (
+    BrokerBackend,
+    FillResult,
+    select_backend,
+)
 from .base import ExecutionRecord
-from .mleg_fill import LegFill, MlegFillResult, PaperBroker
+from .mleg_fill import LegFill
 from .paper import _enforce_fill_size_invariant
 
 logger = logging.getLogger(__name__)
@@ -212,11 +217,15 @@ class MultiLegPaperReactor:
                 # the bus (the caller persists it as the proposal's audit trail).
                 return reject
 
-        # ── Step 5: submit + poll the fill (react/mleg_fill.py). ────────────────
-        broker = PaperBroker(paper=True)
+        # ── Step 5: submit + poll the fill via the pluggable backend (ADR-0088). ─
+        # select_backend() routes to AlpacaBackend when HERMES_QUANT_ALPACA_PAPER=1
+        # AND creds are present, else the DeterministicBackend simulator (the default
+        # everywhere / in CI). The deterministic path mirrors the OLD PaperBroker
+        # deterministic fill math, so default behavior is preserved bit-for-bit.
+        backend = select_backend()
         try:
             leg_fills, parent_status, net_fill = self._fill(
-                proposal, broker, client_order_id=client_order_id, net_price=net_price
+                proposal, backend, client_order_id=client_order_id, net_price=net_price
             )
         except MultiLegFillRejected as exc:
             logger.warning("multileg-react: %s — writing no-fill record", exc)
@@ -330,40 +339,64 @@ class MultiLegPaperReactor:
     def _fill(
         self,
         proposal: Any,
-        broker: PaperBroker,
+        backend: BrokerBackend,
         *,
         client_order_id: str,
         net_price: float,
     ) -> tuple[list[LegFill], str, float]:
-        """Route per strategy_kind, return (leg_fills, parent_status, net_fill).
+        """Route per strategy_kind via the pluggable BrokerBackend (ADR-0088).
+
+        Returns ``(leg_fills, parent_status, net_fill)`` in the SAME shape the rest
+        of the reactor (``_apply_equity_slippage`` / ``_build_records`` /
+        ``_reconcile_state``) already consumes — the backend's ``FillResult`` (and
+        its mleg child ``FillResult``s) are converted to ``LegFill`` via
+        ``_fillresult_to_legfill``.
 
         CC: equity BUY + single-leg SELL the call. CSP: single-leg SELL the put.
-        mleg structures (>=2 option legs): ONE submit_mleg_order. Raises
-        MultiLegFillRejected on a broker rejection / zero-fill.
+        mleg structures (>=2 option legs): ONE ``submit_option_mleg``. A backend that
+        returns a reject/expire status OR RAISES (BP / unavailable / submit reject)
+        is converted to ``MultiLegFillRejected`` so the caller's existing except
+        writes the no-fill parent — a backend exception NEVER crashes the reactor.
         """
         fills: list[LegFill] = []
         if proposal.is_mleg:
-            res: MlegFillResult = broker.submit_mleg_order(
-                proposal.option_legs,
-                outer_qty=proposal.outer_qty,
-                net_limit_price=net_price,
-                tif="day",
-                client_order_id=client_order_id,
-            )
-            self._guard_fill(res.status, proposal)
-            return list(res.legs), res.status, res.net_fill_price
+            try:
+                parent: FillResult = backend.submit_option_mleg(
+                    proposal.option_legs,
+                    outer_qty=proposal.outer_qty,
+                    net_limit_price=net_price,
+                    client_order_id=client_order_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — any backend failure -> no-fill
+                raise self._as_fill_rejected(exc, proposal) from exc
+            self._guard_result(parent, proposal)
+            leg_fills = [_fillresult_to_legfill(child) for child in parent.legs]
+            # ADR-0088 F2: an mleg parent's filled_qty is the outer spread count
+            # (>=1), so _guard_result on the parent alone can pass even if every
+            # child filled 0 (a degenerate "parent filled, children empty" venue
+            # snapshot). Guard the CHILDREN: if no leg actually moved, treat the
+            # whole structure as a no-fill rather than emitting empty children.
+            if not any(lf.filled_qty != 0.0 for lf in leg_fills):
+                raise MultiLegFillRejected(
+                    f"{proposal.proposal_id}: mleg parent status={parent.status!r} "
+                    "but no child leg filled (zero-fill children); no-fill"
+                )
+            net_fill = parent.net_fill_price if parent.net_fill_price is not None else net_price
+            return leg_fills, parent.status, net_fill
 
         # Single option leg (CC short call / CSP short put).
         option_leg = proposal.option_legs[0]
-        leg_fill = broker.submit_single_leg_option(
-            option_leg,
-            qty=proposal.outer_qty,
-            limit_price=net_price,
-            tif="day",
-            client_order_id=client_order_id,
-        )
-        self._guard_fill(leg_fill.status, proposal)
-        fills.append(leg_fill)
+        try:
+            opt_res: FillResult = backend.submit_option_single(
+                option_leg,
+                qty=proposal.outer_qty,
+                limit_price=net_price,
+                client_order_id=client_order_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — any backend failure -> no-fill
+            raise self._as_fill_rejected(exc, proposal) from exc
+        self._guard_result(opt_res, proposal)
+        fills.append(_fillresult_to_legfill(opt_res))
 
         # Covered-call equity leg: a SEPARATE equity order (research §1.3).
         if proposal.stock_leg is not None:
@@ -372,17 +405,42 @@ class MultiLegPaperReactor:
                 if proposal.stock_leg.basis_per_share
                 else 0.0
             )
-            eq_fill = broker.submit_equity(
-                symbol=proposal.underlying,
-                qty=proposal.stock_leg.qty,
-                decision_price=basis,
-                client_order_id=client_order_id + "-eq",
-            )
-            self._guard_fill(eq_fill.status, proposal)
-            fills.append(eq_fill)
+            try:
+                eq_res: FillResult = backend.submit_equity(
+                    symbol=proposal.underlying,
+                    signed_qty=float(proposal.stock_leg.qty),
+                    decision_price=basis,
+                    client_order_id=client_order_id + "-eq",
+                )
+            except Exception as exc:  # noqa: BLE001 — any backend failure -> no-fill
+                raise self._as_fill_rejected(exc, proposal) from exc
+            self._guard_result(eq_res, proposal)
+            fills.append(_fillresult_to_legfill(eq_res))
 
         net_fill = sum(f.filled_avg_price * _leg_sign(f) for f in fills if _is_option(f))
         return fills, "filled", net_fill if net_fill else net_price
+
+    @staticmethod
+    def _guard_result(res: FillResult, proposal: Any) -> None:
+        """Guard a backend FillResult: a reject/expire/timeout surfaces as a no-fill
+        (MultiLegFillRejected). Preserves the old _guard_fill reject semantics and
+        also treats a non-fill terminal (e.g. ``unfilled_timeout``) as a no-fill."""
+        if res.status in {"rejected", "expired"} or not res.is_fill:
+            raise MultiLegFillRejected(
+                f"backend_status={res.status} for {proposal.proposal_id}"
+            )
+
+    @staticmethod
+    def _as_fill_rejected(exc: Exception, proposal: Any) -> MultiLegFillRejected:
+        """Convert a backend exception into a MultiLegFillRejected no-fill reason so
+        _execute_enabled's existing except writes the no-fill parent (a backend BP /
+        unavailable / submit reject must NEVER crash the reactor — fail to a no-fill,
+        never a fabricated fill)."""
+        if isinstance(exc, MultiLegFillRejected):
+            return exc
+        return MultiLegFillRejected(
+            f"backend_error={type(exc).__name__}: {exc} for {proposal.proposal_id}"
+        )
 
     @staticmethod
     def _guard_fill(status: str, proposal: Any) -> None:
@@ -737,6 +795,23 @@ def _is_option(f: LegFill) -> bool:
         return True
     except OccParseError:
         return False
+
+
+def _fillresult_to_legfill(fr: FillResult) -> LegFill:
+    """Adapt a backend ``FillResult`` to the ``LegFill`` the reactor's record-builder
+    consumes (ADR-0088 wiring). Maps the four position-moving fields verbatim:
+    symbol / filled_avg_price / filled_qty (signed TRUE units) / status /
+    position_intent. The parent mleg ``FillResult`` is expanded BY THE CALLER (one
+    ``LegFill`` per ``fr.legs`` child); this adapter handles a single leg/equity/
+    child result. The conversion is lossless for everything ``_build_records`` /
+    ``_reconcile_state`` read, so those stay unchanged."""
+    return LegFill(
+        symbol=fr.symbol,
+        filled_avg_price=fr.filled_avg_price,
+        filled_qty=fr.filled_qty,
+        status=fr.status,
+        position_intent=fr.position_intent,
+    )
 
 
 def _leg_sign(f: LegFill) -> float:

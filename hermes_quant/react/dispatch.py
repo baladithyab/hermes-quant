@@ -13,11 +13,17 @@ changed — no autonomous multi-leg this wave (ADR-0016 deferred).
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from .base import Reactor
 from .multileg import MultiLegPaperReactor
 from .paper import PaperReactor
+
+# Flag that ROUTES equity paper fills through Alpaca's paper broker instead of
+# the synthetic append-only book. ADDITIVE + DEFAULT-OFF: with the flag unset,
+# select_reactor() returns PaperReactor for equity exactly as before.
+ALPACA_PAPER_FLAG = "HERMES_QUANT_ALPACA_PAPER"
 
 
 def is_multi_leg_proposal(proposal: Any) -> bool:
@@ -46,4 +52,13 @@ def select_reactor(proposal: Any) -> Reactor:
     """
     if is_multi_leg_proposal(proposal):
         return MultiLegPaperReactor()
+    # ADDITIVE + DEFAULT-OFF: route equity fills through Alpaca's paper broker
+    # (real buying-power/margin/shorting enforcement + real fills) ONLY when the
+    # flag is explicitly set. With the flag unset the equity path is bit-for-bit
+    # the legacy PaperReactor — no import, no behavior change. The multi-leg
+    # branch above is untouched.
+    if os.environ.get(ALPACA_PAPER_FLAG, "0") == "1":
+        from .alpaca_paper import AlpacaPaperReactor
+
+        return AlpacaPaperReactor()
     return PaperReactor()

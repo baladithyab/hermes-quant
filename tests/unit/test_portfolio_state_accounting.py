@@ -268,3 +268,89 @@ def test_marked_equity_zero_avg_entry_price_skipped(tmp_path) -> None:
     assert result.n_positions == 1
     assert result.n_marked == 0  # skipped before marking
     assert result.equity_basis == "entry"
+
+
+def test_cash_unit_true_shares_vs_legacy_navfraction(tmp_path) -> None:
+    """REGRESSION LOCK (P1-A / "0da3" unit bug): when a record carries a true
+    share/contract count in reactor_metadata.quantity (the Alpaca-paper reactor
+    path), the CASH delta must use real notional = signed_shares * price, NOT
+    fill_size_pct (NAV fraction) * price. The legacy path (no quantity) must stay
+    bit-identical to the NAV-fraction proxy.
+
+    Buying 100 shares @ $50 = $5,000 real cash out. The pre-fix bug computed
+    0.05 * 50 = $2.50, understating cash by 3 orders of magnitude and corrupting
+    partition NAV.
+    """
+    from hermes_quant.state.portfolio_state import _default_initial_cash
+
+    ps = PortfolioState(state_db_path=tmp_path / "state.db")
+    init = _default_initial_cash()
+
+    # Alpaca-style: explicit signed shares in reactor_metadata.quantity.
+    ps.apply_execution(
+        _exec_rec(
+            account_id="alpaca-paper",
+            asset="X",
+            symbol="X",
+            fill_size_pct=0.05,  # NAV-fraction proxy (must NOT drive cash here)
+            fill_price=50.0,
+            proposal_id="alpaca_x",
+            reactor_metadata={"quantity": 100.0},  # true shares
+        )
+    )
+    alpaca_cash = ps.get_cash("alpaca-paper")
+    # Cash dropped by the REAL notional 100 * 50 = 5000, not 0.05 * 50 = 2.5.
+    assert abs((init - alpaca_cash.balance_usd) - 5000.0) < 1e-6, (
+        f"alpaca-paper cash drop {init - alpaca_cash.balance_usd} != 5000 "
+        "(P1-A unit fix regressed)"
+    )
+
+    # Legacy path: no quantity -> NAV-fraction proxy, bit-identical to before.
+    ps.apply_execution(
+        _exec_rec(
+            account_id="paper-default",
+            asset="Y",
+            symbol="Y",
+            fill_size_pct=0.05,
+            fill_price=50.0,
+            proposal_id="legacy_y",
+            reactor_metadata={},
+        )
+    )
+    legacy_cash = ps.get_cash("paper-default")
+    assert abs((init - legacy_cash.balance_usd) - 2.5) < 1e-6, (
+        f"paper-default cash drop {init - legacy_cash.balance_usd} != 2.5 "
+        "(legacy NAV-fraction path must be unchanged)"
+    )
+
+
+def test_option_cash_uses_contract_multiplier_x100(tmp_path):
+    """ADR-0088 F1: a us_option fill_price is a PER-CONTRACT premium; cash impact
+    must be premium x contracts x 100. A short put @ $2.00 credits $200 (not $2.00);
+    a long call @ $1.50 x2 debits $300. Equity fills stay x1 (bit-identical)."""
+    from hermes_quant.state.portfolio_state import PortfolioState
+
+    def _rec(asset, asset_class, qty, price):
+        return {
+            "account_id": "t",
+            "asset": asset,
+            "asset_class": asset_class,
+            "fill_price": price,
+            "fill_size_pct": 0.0,
+            "asof_execution": "2026-06-05T12:00:00Z",
+            "reactor_metadata": {"quantity": qty},
+        }
+
+    ps = PortfolioState(state_db_path=tmp_path / "s.db")
+    # SHORT 1 put @ $2.00 -> CREDIT $200 (premium 2.00 x 1 contract x 100).
+    ps.apply_execution(_rec("AAPL260101P00150000", "us_option", -1.0, 2.00))
+    c = ps.get_cash("t")
+    assert c.balance_usd == 100_200.0, f"short put credit wrong: {c.balance_usd}"
+    # equity_total values the short option position at qty*avg*100.
+    assert c.equity_total == 100_400.0, f"option equity_total wrong: {c.equity_total}"
+    # LONG 2 calls @ $1.50 -> DEBIT $300 (1.50 x 2 x 100).
+    ps.apply_execution(_rec("AAPL260101C00160000", "us_option", 2.0, 1.50))
+    assert ps.get_cash("t").balance_usd == 99_900.0
+    # EQUITY 100 sh @ $50 -> DEBIT $5000 (multiplier 1, NOT 100).
+    ps.apply_execution(_rec("MSFT", "equity", 100.0, 50.0))
+    assert ps.get_cash("t").balance_usd == 94_900.0, "equity multiplier must be 1"

@@ -781,6 +781,22 @@ def quant_approve(args: dict, **_kwargs) -> str:
             default=str,
         )
 
+    # P1-B (shadow wiring): when HERMES_QUANT_ALPACA_SHADOW=1 and the fill we
+    # just made went through the SYNTHETIC PaperReactor (reactor_name=="paper"),
+    # ALSO submit the same proposal to Alpaca paper and log the divergence. This
+    # is the validation path the shadow-first cutover plan depends on — without
+    # this call the flag is a silent no-op. Gated to reactor_name=="paper" so we
+    # NEVER double-submit when HERMES_QUANT_ALPACA_PAPER already routed the real
+    # fill through Alpaca. Strictly non-blocking / fail-closed: run_shadow swallows
+    # every error so the (already-committed) synthetic fill is never disturbed.
+    try:
+        from hermes_quant.react.alpaca_shadow import run_shadow, shadow_enabled
+
+        if shadow_enabled() and getattr(execution, "reactor_name", None) == "paper":
+            run_shadow(proposal, execution, fill_size_pct=fill_size_pct)
+    except Exception as _shadow_exc:  # noqa: BLE001 — shadow must never break approve
+        logger.warning("quant_approve: shadow hook failed (non-blocking): %s", _shadow_exc)
+
     # Now advance state machine. If this fails, we have a paper exec on the
     # bus without a corresponding approved proposal — we surface a warning
     # and keep going. The settlement loop reconciles via signal_id.
