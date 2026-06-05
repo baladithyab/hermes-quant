@@ -24,7 +24,7 @@
 ### A.1 What hermes-quant is, to Hermes
 A **pip entry-point plugin** (`hermes_agent.plugins :: hermes-quant = hermes_quant`), `kind: standalone`.
 Hermes discovers it from `importlib.metadata` entry points — **no `~/.hermes/plugins/` directory**. On
-load, `register(ctx)` runs once at gateway startup and wires: **16 read-only tools** (`toolset="quant"`),
+load, `register(ctx)` runs once at gateway startup and wires: **17 read-only tools** (`toolset="quant"`),
 the `/quant` slash, the `hermes quant` CLI control plane, the `pre_gateway_dispatch` hook, and the bundled
 skill. It spawns no daemon (<50 ms). See HERMES-INTEGRATION §1-2 for the full surface.
 
