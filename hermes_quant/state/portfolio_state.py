@@ -74,6 +74,13 @@ DEFAULT_EXECUTIONS_PATH = QUANT_HOME / "executions.jsonl"
 _INITIAL_CASH_ENV = "HERMES_QUANT_PAPER_INITIAL_CASH"
 _DEFAULT_INITIAL_CASH = 100_000.0
 
+# US equity-option contract multiplier (shares controlled per contract). A
+# us_option fill_price is a PER-CONTRACT premium; cash/equity impact = premium ×
+# contracts × 100. Mirrors options.data._CONTRACT_MULTIPLIER; defined locally so
+# state.db reconciliation does not import the options package (keeps the state
+# layer dependency-light). ADR-0088 F1.
+_CONTRACT_MULTIPLIER = 100.0
+
 
 def _default_initial_cash() -> float:
     raw = os.environ.get(_INITIAL_CASH_ENV, "")
@@ -407,10 +414,14 @@ class PortfolioState:
                 # Upsert cash
                 for acct, balance in cash_map.items():
                     ts = last_ts.get(acct, _utc_now_iso())
-                    # equity_total: cash + open position notionals
+                    # equity_total: cash + open position notionals. ADR-0088 F1:
+                    # value us_option positions at qty × avg × 100 (the contract
+                    # multiplier; key[1] is the position's asset_class), equity ×1.
                     equity = balance + sum(
-                        abs(p["quantity"]) * p["avg_entry_price"]
-                        for (a, _, _), p in positions.items()
+                        abs(p["quantity"])
+                        * p["avg_entry_price"]
+                        * (_CONTRACT_MULTIPLIER if a_cls == "us_option" else 1.0)
+                        for (a, a_cls, _), p in positions.items()
                         if a == acct and abs(p["quantity"]) >= 1e-12
                     )
                     conn.execute(
@@ -512,6 +523,20 @@ class PortfolioState:
             pos_delta = fill_size_pct  # NAV-fraction proxy (legacy path)
             dedup_asset = ""
             dedup_asset_class = ""
+        # Contract multiplier (ADR-0088 F1 fix): a us_option fill_price is the
+        # PER-CONTRACT premium, but a contract controls 100 shares, so the cash
+        # and equity-valuation impact is premium × contracts × 100. An equity
+        # fill_price is already per-share (multiplier 1). Omitting this booked a
+        # $150 option credit as $1.50 and undervalued option positions 100× —
+        # which then corrupts equity_total and, transitively, the deterministic
+        # backend's NAV/BP reads. The multiplier applies ONLY on the true-unit
+        # path (leg_quantity present, where pos_delta is real contracts); the
+        # legacy NAV-fraction path is unaffected (multiplier 1).
+        contract_multiplier = (
+            _CONTRACT_MULTIPLIER
+            if (leg_quantity is not None and asset_class == "us_option")
+            else 1.0
+        )
         # Cross-model review C2 (Claude Opus): future-bound asof. A crafted
         # asof of "9999-12-31..." would wedge the watermark and silently
         # cause future delta-replays to skip every legitimate record.
@@ -624,18 +649,28 @@ class PortfolioState:
                 # (leg_quantity present → true units). With no leg_quantity the
                 # legacy NAV-fraction path is bit-identical.
                 cash_basis = pos_delta if leg_quantity is not None else fill_size_pct
-                delta_cash = -cash_basis * fill_price
+                # ADR-0088 F1: apply the contract multiplier so a us_option fill's
+                # cash uses real notional (premium × contracts × 100), not premium ×
+                # contracts. equity-class fills use multiplier 1 (bit-identical).
+                delta_cash = -cash_basis * fill_price * contract_multiplier
                 new_cash = cash_balance + delta_cash
 
                 # equity_total: recompute from all positions for this account
-                # (approximation: use avg_entry_price, not mark price)
+                # (approximation: use avg_entry_price, not mark price). ADR-0088
+                # F1: value each position at qty × avg × its own contract
+                # multiplier (us_option ×100, equity ×1) so an option position is
+                # not undervalued 100×. asof_execution per-position asset_class
+                # drives the multiplier.
                 all_pos = conn.execute(
-                    "SELECT quantity, avg_entry_price FROM positions "
+                    "SELECT asset_class, quantity, avg_entry_price FROM positions "
                     "WHERE account_id=? AND ABS(quantity) >= 1e-12",
                     (acct,),
                 ).fetchall()
                 equity = new_cash + sum(
-                    abs(float(p["quantity"])) * float(p["avg_entry_price"]) for p in all_pos
+                    abs(float(p["quantity"]))
+                    * float(p["avg_entry_price"])
+                    * (_CONTRACT_MULTIPLIER if p["asset_class"] == "us_option" else 1.0)
+                    for p in all_pos
                 )
 
                 conn.execute(
@@ -973,7 +1008,14 @@ def _replay_record(
     # NAV-fraction × price "0da3" unit bug. Legacy path (no leg_quantity) is
     # bit-identical.
     cash_basis = pos_delta if leg_quantity is not None else fill_size_pct
-    cash_map[acct] -= cash_basis * fill_price
+    # ADR-0088 F1: us_option fill_price is a per-contract premium → cash impact is
+    # premium × contracts × 100. equity path uses multiplier 1 (bit-identical).
+    contract_multiplier = (
+        _CONTRACT_MULTIPLIER
+        if (leg_quantity is not None and asset_class == "us_option")
+        else 1.0
+    )
+    cash_map[acct] -= cash_basis * fill_price * contract_multiplier
 
     # Track latest timestamp per account
     if acct not in last_ts or asof > last_ts[acct]:

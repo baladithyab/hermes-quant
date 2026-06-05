@@ -313,19 +313,24 @@ def test_broker_reject_yields_nofill(enabled, state_db, tmp_path, monkeypatch) -
     bus = tmp_path / "executions.jsonl"
     reactor = MultiLegPaperReactor(executions_path=bus)
 
-    # Force the single-leg fill to return status="rejected".
-    from hermes_quant.react.mleg_fill import LegFill, PaperBroker
+    # Force the single-leg backend fill to return status="rejected" (ADR-0088:
+    # the reactor now fills through the pluggable BrokerBackend, not PaperBroker;
+    # the default backend is DeterministicBackend). A backend reject must surface
+    # as a no-fill parent, never a fabricated fill.
+    from hermes_quant.react.backend import FillResult
+    from hermes_quant.react.backends.deterministic_backend import DeterministicBackend
 
-    def _rej(self, leg, *, qty, limit_price, tif="day", client_order_id):
-        return LegFill(
+    def _rej(self, leg, *, qty, limit_price, client_order_id):
+        return FillResult(
             symbol=leg.symbol,
             filled_avg_price=0.0,
             filled_qty=0.0,
             status="rejected",
             position_intent=leg.position_intent,
+            source="deterministic",
         )
 
-    monkeypatch.setattr(PaperBroker, "submit_single_leg_option", _rej)
+    monkeypatch.setattr(DeterministicBackend, "submit_option_single", _rej)
 
     parent = reactor.execute(_csp(), fill_size_pct=0.05)
     assert (parent.reactor_metadata or {}).get("no_fill") is True
