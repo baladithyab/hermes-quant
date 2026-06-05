@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from .backend import BACKEND_DETERMINISTIC, resolve_backend_choice
 from .base import Reactor
 from .multileg import MultiLegPaperReactor
 from .paper import PaperReactor
@@ -24,6 +25,13 @@ from .paper import PaperReactor
 # the synthetic append-only book. ADDITIVE + DEFAULT-OFF: with the flag unset,
 # select_reactor() returns PaperReactor for equity exactly as before.
 ALPACA_PAPER_FLAG = "HERMES_QUANT_ALPACA_PAPER"
+
+# Flag that ROUTES equity paper fills through the BP-enforcing DeterministicBackend
+# (ADR-0088 follow-up) instead of the synthetic append-only book. ADDITIVE +
+# DEFAULT-OFF + EXPLICIT OPT-IN: resolve_backend_choice() returns 'deterministic' by
+# DEFAULT, so gating on it ALONE would silently change everyone's equity path — this
+# REQUIRES the explicit flag so a flag-OFF run is bit-for-bit the legacy PaperReactor.
+DETERMINISTIC_EQUITY_FLAG = "HERMES_QUANT_DETERMINISTIC_EQUITY"
 
 
 def is_multi_leg_proposal(proposal: Any) -> bool:
@@ -61,4 +69,18 @@ def select_reactor(proposal: Any) -> Reactor:
         from .alpaca_paper import AlpacaPaperReactor
 
         return AlpacaPaperReactor()
+    # ADDITIVE + DEFAULT-OFF + EXPLICIT OPT-IN: route equity fills through the
+    # BP-enforcing DeterministicBackend (enforces buying power + tracks true shares,
+    # closing the 880%-gross root cause on the equity path) ONLY when the explicit
+    # HERMES_QUANT_DETERMINISTIC_EQUITY=1 flag is set AND the resolved backend is the
+    # deterministic simulator. We require BOTH: resolve_backend_choice() returns
+    # 'deterministic' by default, so gating on it alone would silently change every
+    # equity path — the explicit flag keeps flag-OFF bit-for-bit the legacy reactor.
+    if (
+        os.environ.get(DETERMINISTIC_EQUITY_FLAG, "0") == "1"
+        and resolve_backend_choice() == BACKEND_DETERMINISTIC
+    ):
+        from .deterministic_equity import DeterministicEquityReactor
+
+        return DeterministicEquityReactor()
     return PaperReactor()
