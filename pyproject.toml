@@ -76,6 +76,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-mock>=3.12",
     "pytest-xdist>=3.5",
+    "pytest-timeout>=2.1",
     "ruff>=0.1",
     "mypy>=1.7",
 ]
@@ -172,6 +173,12 @@ ignore = ["E501"]   # long lines OK in docstrings and ADR-derived comments
 testpaths = ["tests"]
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]
+# Global per-test wall-clock cap so a single hung test (e.g. an unguarded
+# live-network call, or a slow integration test) can never stall the whole
+# suite. pytest-timeout is in the dev deps; tests that legitimately need
+# longer override with @pytest.mark.timeout(N). 90s is generous for this
+# suite (the slowest legit tests run in low double-digit seconds).
+timeout = 90
 markers = [
     "requires_network: tests that hit live network (skipped in CI; manually run before release)",
     "timeout(N): per-test timeout in seconds (pytest-timeout)",
