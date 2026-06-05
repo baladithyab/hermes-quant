@@ -284,8 +284,23 @@ def test_jsonl_parity_default(monkeypatch, ctx, view, signal, action, task, env_
         f"JSONL key sets differ.\nNEW only: {set(new) - set(legacy)}\n"
         f"LEGACY only: {set(legacy) - set(new)}"
     )
+    # ADR-0068: `asof_decision` is wall-clock-at-emit (non-deterministic) and
+    # `bar_ts` is the snapshot's own derived bar-close (from ctx OHLCV), which
+    # the test's _build_signal_record call sources differently. Both are
+    # excluded from byte-equality and checked for shape instead; every other
+    # field must match the canonical tick_loop record bit-for-bit.
+    _construction_divergent = {"asof_decision", "bar_ts"}
     for k in legacy:
+        if k in _construction_divergent:
+            continue
         assert new[k] == legacy[k], f"Key {k!r} differs: new={new[k]!r} legacy={legacy[k]!r}"
+    # asof_decision + bar_ts must be present and ISO-8601 UTC strings.
+    for k in _construction_divergent:
+        assert isinstance(new[k], str) and new[k].endswith("Z"), (
+            f"{k!r} must be an ISO-8601 UTC string, got {new[k]!r}"
+        )
+        # Round-trips as a timestamp.
+        pd.Timestamp(new[k])
 
 
 def test_jsonl_parity_with_halt(monkeypatch, ctx, view, signal, task) -> None:
@@ -310,7 +325,17 @@ def test_jsonl_parity_with_halt(monkeypatch, ctx, view, signal, task) -> None:
     legacy["id"] = sig_id
     new = snap.to_jsonl_row()
 
-    assert new == legacy
+    # ADR-0068: asof_decision (wall-clock) + bar_ts (snapshot-derived) diverge
+    # by construction — compare all other keys bit-for-bit, shape-check these.
+    _construction_divergent = {"asof_decision", "bar_ts"}
+    assert set(new.keys()) == set(legacy.keys())
+    for k in legacy:
+        if k in _construction_divergent:
+            continue
+        assert new[k] == legacy[k], f"Key {k!r} differs: new={new[k]!r} legacy={legacy[k]!r}"
+    for k in _construction_divergent:
+        assert isinstance(new[k], str) and new[k].endswith("Z")
+        pd.Timestamp(new[k])
 
 
 def test_jsonl_parity_packet_hash_extraction(monkeypatch, ctx, signal, action, task) -> None:

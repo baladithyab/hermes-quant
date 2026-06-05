@@ -437,9 +437,13 @@ class BarSnapshot(BaseModel):
         ]
 
         return {
-            "schema_version": self.meta.schema_version,
+            "schema_version": 2,  # ADR-0068: split bar_ts (replay anchor) from asof_decision (wall-clock). Mirrors tick_loop._build_signal_record.
             "id": self.meta.signal_id,
             "asof": _format_legacy_ts(self.asof_decision),
+            # ADR-0068: explicit named aliases. `asof` retains its historical
+            # meaning for v1 readers; new consumers prefer the fields below.
+            "bar_ts": _format_legacy_ts(self.bar_ts),
+            "asof_decision": _format_legacy_ts(self.asof_decision),
             "asset": self.symbol,
             "exchange": self.meta.exchange,
             "timeframe": self.meta.timeframe,

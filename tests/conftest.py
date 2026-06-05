@@ -110,17 +110,24 @@ def _isolate_portfolio_state_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 @pytest.fixture(autouse=True)
 def _autouse_dummy_third_party_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """Inject placeholder env vars for every third-party SDK so CI never
-    blocks on missing creds. Real tests that need real creds opt out by
-    overriding via their own monkeypatch.setenv() calls.
+    blocks on missing creds — and, more importantly, so the offline unit
+    suite can NEVER accidentally authenticate a real LLM/exchange call with
+    a real key inherited from the surrounding environment (e.g. when pytest
+    runs inside a gateway process that has a live OPENROUTER_API_KEY).
 
-    BACKFILL ONLY: if the env var is already set (e.g. live-integration
-    runs with `HERMES_QUANT_LIVE_LLM=1` and a real OPENROUTER_API_KEY
-    in the environment), do NOT overwrite it. This preserves existing
-    credentials so live tests can authenticate while still defaulting
-    every absent key to the placeholder for offline-CI reliability.
+    SCRUB BY DEFAULT: every listed key is forced to the ``"test-placeholder"``
+    sentinel, overwriting any real value present in the environment. This is
+    the security-correct default — a unit test that reaches the network with
+    a real key is a cost + nondeterminism + leakage hazard.
+
+    LIVE OPT-IN: when ``HERMES_QUANT_LIVE_LLM=1`` is set, real keys already in
+    the environment are PRESERVED (only absent keys get the placeholder), so
+    explicit live-integration runs can authenticate. Tests that need a
+    specific value still override via their own ``monkeypatch.setenv()``.
 
     ADR-0038 §D.4 (P8) — TradingAgents pattern backfill, Wave D Track A.
     """
+    live = os.environ.get("HERMES_QUANT_LIVE_LLM", "").strip() == "1"
     placeholders = {
         # LLM providers
         "OPENROUTER_API_KEY": "test-placeholder",
@@ -138,8 +145,11 @@ def _autouse_dummy_third_party_keys(monkeypatch: pytest.MonkeyPatch) -> None:
         "COINBASE_SECRET": "test-placeholder",
     }
     for key, val in placeholders.items():
-        if key not in os.environ:
-            monkeypatch.setenv(key, val)
+        if live and key in os.environ:
+            # Live opt-in: preserve a real credential so integration runs auth.
+            continue
+        # Default + absent-key path: force the placeholder (scrub real keys).
+        monkeypatch.setenv(key, val)
 
 
 @pytest.fixture(autouse=True)
