@@ -1,0 +1,38 @@
+HERMES_QUANT_SHADOW_RULE_MINING | PROMOTE-CAND | Fresh default-off advisory rule-mining path writes candidate rules only and needs evaluation, so it is not safe dead code.
+HERMES_QUANT_TREND_VELOCITY | PROMOTE-CAND | It changes catalyst/perception magnitude synthesis when enabled, so it is a real decision-input feature requiring backtest before promotion.
+HERMES_QUANT_CONVERGENCE | KEEP | Inventory marks it SET, and the code gates convergence evidence plus packet drop/haircut behavior in the perception/catalyst path.
+HERMES_QUANT_TRADER_LLM | PROMOTE-CAND | Default-off trader LLM changes proposal generation but has deterministic fallback, so it is an evaluation candidate, not deletion material.
+HERMES_QUANT_RESEARCH_DEBATE | PROMOTE-CAND | It routes the LLM committee through the newer debate stage and was touched recently, so it needs eval rather than retirement.
+HERMES_QUANT_RESEARCH_DEBATE_ROUNDS | KEEP | This is a bounded runtime/cost knob for debate depth, not a dead feature branch.
+HERMES_QUANT_REDTEAM_TURN | PROMOTE-CAND | Recent default-off red-team debate turn changes dissent metadata/evaluation behavior and should be evaluated.
+HERMES_QUANT_SNAPSHOT_V2 | KEEP | It is a schema compatibility/migration flag for signal bus row shape, so deleting it could break consumers.
+HERMES_QUANT_STRUCTURE_SELECT | INVESTIGATE | The ON-path is fresh ADR-0082 options structure selection, but I found no production caller, so intent/wiring needs confirmation before deletion.
+HERMES_QUANT_MEMORY_SPLIT | PROMOTE-CAND | It changes LLM committee memory prompt construction, which can affect recommendations and needs evaluation.
+HERMES_QUANT_ANALYST_ADMISSION | PROMOTE-CAND | It gates the analyst roster in the advisor, making it decision-core and default-off eval material.
+HERMES_QUANT_ANALYSTS_USE_REGIME | PROMOTE-CAND | It modifies analyst confidence from regime extras, directly affecting aggregation inputs.
+HERMES_QUANT_WATCHLIST_CAP_TRIM | INVESTIGATE | It appears to be a persisted-state cap-trim migration, but I cannot verify whether the live watchlist state still needs it.
+HERMES_QUANT_WATERMARK_ENABLED | KEEP | This controls daemon bar watermark idempotency/replay skipping, a legitimate operational safety knob.
+HERMES_QUANT_REGIME_HMM | PROMOTE-CAND | It swaps in HMM regime classification with fallback, affecting regime-aware confidence paths.
+HERMES_QUANT_PREWARM_WORKERS | KEEP | This is a concurrency/cost knob for playbook snapshot prewarming.
+HERMES_QUANT_LOAD_TEST | KEEP | Source read count is effectively zero for live code; it is a test/operator load harness flag, not trading logic to retire.
+HERMES_QUANT_CALIBRATOR_AUTO_REFIT | KEEP | Inventory marks it SET and the cron path can update calibrator artifacts, so it is live maintenance config.
+HERMES_QUANT_HORIZONS | KEEP | Inventory marks it SET and ops playbook code reads it to choose requested horizons/primary timeframe.
+HERMES_QUANT_PLAYS_OPEN | KEEP | It is a permission boundary for loading external plays and should remain explicit.
+HERMES_QUANT_CATALYST_ONBOARDING | KEEP | Inventory marks it SET and watchlist evolution can union admitted catalyst names into the candidate universe.
+HERMES_QUANT_RESEARCH_RISK_TIER_BLOCK | KEEP | This is a governance safety block for live-authority hypotheses, not a stale feature.
+HERMES_QUANT_MCP_READS_ENABLED | KEEP | It is a read-only MCP bridge permission boundary with fail-closed behavior.
+HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD | KEEP | This is a threshold/config knob for research hypothesis novelty filtering.
+HERMES_QUANT_SATURATION | KEEP | Inventory marks it SET and it dampens semantic confidence from saturation evidence.
+HERMES_QUANT_STACKING | PROMOTE-CAND | It gates fresh BMA redundancy/stacking behavior in the decision core.
+HERMES_QUANT_L2_POSTERIOR_DECAY | PROMOTE-CAND | It changes BMA analyst posterior weighting with recency decay, so it needs evaluation.
+HERMES_QUANT_L2_PER_ANALYST_CALIB | PROMOTE-CAND | It changes per-analyst calibration inside BMA confidence fusion.
+HERMES_QUANT_L2_LESSON_HAIRCUT | PROMOTE-CAND | It applies learned lesson haircuts to BMA confidence, directly changing decision scores.
+HERMES_QUANT_L2_POSTERIOR_PERSIST | PROMOTE-CAND | It persists learned BMA posteriors across runs, which is decision-core behavior.
+HERMES_QUANT_ADMISSIBILITY | KEEP | Inventory marks it SET and it is a REJECT-only pre-trade admissibility safety gate.
+HERMES_QUANT_EVENT_RISK | PROMOTE-CAND | It gates default-off scheduled-event risk silencing in advisor/risk/options paths and needs replay evaluation.
+HERMES_QUANT_BORROW_COST | KEEP | It is a legitimate borrow-cost/accounting control and should remain explicit even if not fully wired live.
+HERMES_QUANT_GROUNDING_ENFORCE | PROMOTE-CAND | It can drop ungrounded analyst views before aggregation, making it decision-path safety logic needing eval.
+
+SUMMARY: RETIRE=0, KEEP=16, PROMOTE-CAND=16, INVESTIGATE=2
+
+RETIRE set: NONE — nothing is safely deletable
