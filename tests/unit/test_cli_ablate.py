@@ -135,3 +135,60 @@ def test_dispatch_routes_ablate(capsys, monkeypatch):
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["flag"] == "HERMES_QUANT_STACKING"
+
+
+# ---------------------------------------------------------------------------
+# NOT-MEASURABLE + multi-symbol guards (codex review). The CLI must refuse to
+# emit a misleading verdict for a flag the AdvisorStrategy path cannot exercise,
+# and must hard-error on multi-symbol real-data rather than silently mismeasure.
+# ---------------------------------------------------------------------------
+
+
+def test_not_measurable_flag_refuses_verdict(capsys, monkeypatch):
+    """A reactor/extras-seam flag prints NOT_MEASURABLE, not a confident HOLD —
+    so a null is never misread as a measured rejection (false-NULL guard)."""
+    monkeypatch.setenv("HERMES_QUANT_RUN_BACKTEST", "1")  # prove it bails BEFORE running
+    for flag in (
+        "HERMES_QUANT_BORROW_COST",
+        "HERMES_QUANT_ADMISSIBILITY",
+        "HERMES_QUANT_EVENT_RISK",
+        "HERMES_QUANT_GROUNDING_ENFORCE",
+        "HERMES_QUANT_L2_LESSON_HAIRCUT",
+    ):
+        rc = cmd_ablate(_ns(flag=flag, synthetic=True, json=True))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ran"] is False, flag
+        assert payload["verdict"] == "NOT_MEASURABLE", flag
+        assert "NOTES_ABLATION" in payload["message"], flag
+
+
+def test_measurable_flag_is_not_blocked_by_guard(capsys, monkeypatch):
+    """STACKING IS measurable through AdvisorStrategy — must NOT trip the guard."""
+    monkeypatch.delenv("HERMES_QUANT_RUN_BACKTEST", raising=False)
+    rc = cmd_ablate(_ns(flag="HERMES_QUANT_STACKING", synthetic=True, json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["verdict"] in {"PROMOTE", "HOLD"}
+
+
+def test_multi_symbol_real_data_hard_errors(capsys, monkeypatch):
+    """Real-data fetch is single-symbol; multi-symbol must hard-error, not reuse
+    one frame for every ticker (which would silently mismeasure)."""
+    monkeypatch.setenv("HERMES_QUANT_RUN_BACKTEST", "1")
+    rc = cmd_ablate(_ns(flag="HERMES_QUANT_STACKING", universe="AAPL,MSFT", json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is False
+    assert payload["error"] == "multi_symbol_unsupported"
+
+
+def test_multi_symbol_synthetic_is_unaffected(capsys, monkeypatch):
+    """--synthetic is single-symbol SYN by construction; a multi-symbol arg on the
+    synthetic path must NOT trip the real-data multi-symbol guard."""
+    monkeypatch.delenv("HERMES_QUANT_RUN_BACKTEST", raising=False)
+    rc = cmd_ablate(_ns(flag="HERMES_QUANT_STACKING", universe="AAPL,MSFT", synthetic=True, json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True

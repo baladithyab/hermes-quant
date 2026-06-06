@@ -286,3 +286,29 @@ def test_verdict_hold_on_inf_drawdown():
     on = _wfr(sharpe=1.50, max_drawdown=float("-inf"))
     res = _build(off, on)
     assert verdict(res) == "HOLD"
+
+
+def test_verdict_hold_on_nonfinite_dsr():
+    """Regression (codex review, claim 1): a NaN/inf ON deflated-Sharpe must force
+    HOLD. The pre-fix finite-guard only checked d_sharpe + the two drawdowns, NOT
+    dsr_on; since `NaN <= 0.50` is False AND `dsr_on is None` is False, a NaN DSR
+    would fall through to PROMOTE despite a healthy Sharpe delta + drawdown. Build
+    the result directly so we can pin dsr_on independent of the NAV series.
+    """
+    off = _wfr(sharpe=0.20, max_drawdown=-0.10)
+    on = _wfr(sharpe=1.50, max_drawdown=-0.09)  # +1.30 Sharpe, drawdown fine
+    for bad in (float("nan"), float("inf")):
+        res = AblationResult(
+            flag="HERMES_QUANT_X",
+            off_value="0",
+            on_value="1",
+            off=off,
+            on=on,
+            d_sharpe=on.sharpe - off.sharpe,  # +1.30 — passes the Sharpe gate
+            d_maxdd=on.max_drawdown - off.max_drawdown,
+            dsr_off=0.60,
+            dsr_on=bad,  # the degenerate axis
+        )
+        assert verdict(res) == "HOLD", bad
+        assert "deflated-sharpe" in res.verdict_reason.lower()
+        assert "finite" in res.verdict_reason.lower()

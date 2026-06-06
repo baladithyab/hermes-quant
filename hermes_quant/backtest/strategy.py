@@ -530,7 +530,26 @@ class AdvisorStrategy:
             self._owned_tmpdir = tempfile.TemporaryDirectory(prefix="hq-ablation-posteriors-")
             posterior_store_path = Path(self._owned_tmpdir.name) / "posteriors.json"
 
-        agg = BMAAggregator(posterior_store_path=posterior_store_path)
+        # Hermeticity (codex review, claim 4): a stock BMAAggregator() resolves
+        # calibrator_path to the host's ~/.hermes/quant/calibrators/isotonic.pkl
+        # and UNPICKLES it in __init__ — a real host-state read (+ pickle side-
+        # effect risk) that happens BEFORE we overwrite agg.calibrator below, so
+        # overwriting alone does NOT make the eval hermetic. Point calibrator_path
+        # at a guaranteed-absent path inside our sandbox temp dir: BMAAggregator's
+        # _load_calibrator hits the missing-file branch -> ColdStart fallback (no
+        # host read, no host unpickle), and we then pin the deterministic
+        # calibrator. Net: the eval reads/loads ZERO real on-disk state.
+        sandbox_dir = (
+            posterior_store_path.parent
+            if isinstance(posterior_store_path, Path)
+            else Path(str(posterior_store_path)).parent
+        )
+        absent_calibrator_path = sandbox_dir / "no-such-calibrator.pkl"
+
+        agg = BMAAggregator(
+            calibrator_path=absent_calibrator_path,
+            posterior_store_path=posterior_store_path,
+        )
         agg.calibrator = calibrator if calibrator is not None else IdentityCalibrator()
         return agg
 

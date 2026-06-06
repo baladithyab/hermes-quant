@@ -198,6 +198,71 @@ def cmd_ablate(args: argparse.Namespace) -> int:
     synthetic = bool(getattr(args, "synthetic", False))
     want_json = bool(getattr(args, "json", False))
 
+    # NOT-MEASURABLE guard (codex review, "other defects"): the CLI always uses
+    # AdvisorStrategy, which exercises the analyst-pool→BMA→gate chain but NOT the
+    # reactor/admissibility seam and does not populate ctx.extras carriers. So
+    # some advertised flags would run, produce a confident-looking HOLD card, and
+    # silently report a FALSE NULL — the flag never actually toggled any decision.
+    # Refuse to emit a verdict for those flags rather than mislead the operator;
+    # point at NOTES_ABLATION.md (§ "ADMISSIBILITY / EVENT_RISK / ...") for why.
+    # This is a documented scope boundary, not a measurement.
+    flag = args.flag
+    not_measurable = {
+        # Reactor/admissibility-precondition seam — downstream of the advisor
+        # signal; needs a reactor-level ablation harness (follow-up lane).
+        "HERMES_QUANT_ADMISSIBILITY": "reactor/admissibility precondition (downstream of the advisor signal)",
+        "HERMES_QUANT_BORROW_COST": "reactor borrow-carry precondition (downstream of the advisor signal)",
+        # Gate/views seams that only bite when a ctx.extras carrier is supplied,
+        # which the offline AdvisorStrategy path leaves empty.
+        "HERMES_QUANT_EVENT_RISK": "risk-gate pre-event reject — needs an event_risk payload on ctx.extras / signal metadata",
+        "HERMES_QUANT_GROUNDING_ENFORCE": "views→aggregator grounding seam — needs a ground_truth_block on ctx.extras",
+        # BMA lesson-haircut: real but only bites with an injected loss_lesson
+        # provider, which the default hermetic aggregator does not wire.
+        "HERMES_QUANT_L2_LESSON_HAIRCUT": "BMA lesson-haircut — needs an injected loss_lesson_provider (default aggregator has none)",
+    }
+    if flag in not_measurable:
+        reason = not_measurable[flag]
+        msg = (
+            f"hermes quant ablate: {flag} is NOT measurable through this CLI path. "
+            f"It acts on the {reason}, which AdvisorStrategy does not exercise "
+            f"offline — running it would print a misleading null verdict. See "
+            f"NOTES_ABLATION.md for the measurability matrix and how to measure it "
+            f"(inject the carrier/provider, or use a reactor-level harness)."
+        )
+        if want_json:
+            print(
+                json.dumps(
+                    {
+                        "ran": False,
+                        "flag": flag,
+                        "verdict": "NOT_MEASURABLE",
+                        "reason": reason,
+                        "message": msg,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(msg)
+        return 0
+
+    # Multi-symbol real-data ablations are silently wrong (codex review): the
+    # real-data fetch loads only universe[0] and the engine then reuses that one
+    # frame for every symbol. Hard-error rather than mismeasure. (--synthetic is
+    # single-symbol "SYN" by construction, so it is unaffected.)
+    if not synthetic and len(universe) > 1:
+        msg = (
+            f"hermes quant ablate: multi-symbol real-data ablation is not supported "
+            f"(got {universe}). The real-data path is single-symbol in v0.1.2 — pass "
+            f"exactly one symbol via --universe, or use --synthetic for the offline "
+            f"smoke test."
+        )
+        if want_json:
+            print(json.dumps({"ran": False, "error": "multi_symbol_unsupported", "message": msg}))
+        else:
+            print(msg)
+        return 0
+
     # Release-gate: the real-data path needs the bar cache + yfinance history.
     # --synthetic bypasses the gate (it fabricates offline bars).
     if not synthetic and os.environ.get(_RUN_FLAG, "0") != "1":

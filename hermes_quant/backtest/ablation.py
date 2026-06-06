@@ -331,6 +331,15 @@ def verdict(result: AblationResult) -> str:
 
     if result.dsr_on is None:
         reasons.append("ON deflated-Sharpe uncomputable (< 30 observations) — cannot confirm edge")
+    elif not math.isfinite(result.dsr_on):
+        # NaN/inf DSR is NOT < 0.50 (any comparison against NaN is False), so it
+        # would slip past the `<= DSR_MIN` gate below and reach PROMOTE. A
+        # degenerate significance estimate is never evidence of a real edge —
+        # fail closed to HOLD (codex review, claim 1).
+        reasons.append(
+            f"ON deflated-Sharpe {result.dsr_on} is not finite — "
+            "degenerate significance estimate cannot confirm edge"
+        )
     elif result.dsr_on <= DSR_MIN:
         reasons.append(
             f"ON deflated-Sharpe {result.dsr_on:.3f} <= {DSR_MIN:.2f} "
