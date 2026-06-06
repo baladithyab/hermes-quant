@@ -24,6 +24,22 @@ from hermes_quant.protocol import AggregatedSignal, AnalystView, MarketContext
 _FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "llm_committee_prompts"
 
 
+@pytest.fixture(autouse=True)
+def _pin_memory_flags_off(monkeypatch):
+    """Pin the memory-injection flags OFF for the golden-prompt suite.
+
+    MEMORY_INJECT and WEEKLY_RETRO were promoted to default-ON (FLAGS.md Tier A,
+    2026-06-05). The golden fixtures capture the no-injection render, and the PM /
+    research_manager prompts would otherwise read the real ~/.hermes reflections /
+    beliefs stores at render time — making the goldens machine-dependent and drift
+    on any box with memory data. Pinning =0 keeps the rendered prompts byte-stable
+    and environment-independent (the injection behavior is covered by
+    test_weekly_retro_injection.py / test_memory_split_injection.py).
+    """
+    monkeypatch.setenv("HERMES_QUANT_MEMORY_INJECT", "0")
+    monkeypatch.setenv("HERMES_QUANT_WEEKLY_RETRO", "0")
+
+
 def _fixed_ctx() -> MarketContext:
     """Build a deterministic context. All timestamps and floats are fixed
     so the rendered prompt is byte-stable across runs."""

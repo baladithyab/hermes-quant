@@ -301,13 +301,15 @@ def _render_prompt(
     role_direction = "bullish" if role == "bull_researcher" else "bearish"
 
     # -----------------------------------------------------------------------
-    # Wave 4 memory injection (HERMES_QUANT_MEMORY_INJECT=1, default OFF).
-    # Only portfolio_manager (and research_manager) see the lessons block.
-    # Debaters (bull/bear/risk) are deliberately kept clean (ADR-0042).
+    # Wave 4 memory injection (HERMES_QUANT_MEMORY_INJECT, default ON; set =0 to
+    # opt out — promoted 2026-06-05, FLAGS.md Tier A). Only portfolio_manager
+    # (and research_manager) see the lessons block. Debaters (bull/bear/risk)
+    # are deliberately kept clean (ADR-0042). With no lessons available the
+    # retriever yields "(none)" — ON-by-default is a no-op without memory data.
     # -----------------------------------------------------------------------
     lessons_block = "(none)"
     if role in ("portfolio_manager", "research_manager"):
-        if os.environ.get("HERMES_QUANT_MEMORY_INJECT", "0") == "1":
+        if os.environ.get("HERMES_QUANT_MEMORY_INJECT", "1") == "1":
             try:
                 from hermes_quant.memory.retriever import (
                     format_context_block,
@@ -339,10 +341,13 @@ def _render_prompt(
                     role,
                 )
 
-        # W2 weekly-retro beliefs digest (HERMES_QUANT_WEEKLY_RETRO=1, default OFF).
-        # PREPENDED above the raw per-trade lessons. Selective: only the role the
-        # belief was distilled FOR. Belief-level Oracle guard applied in the retriever.
-        if os.environ.get("HERMES_QUANT_WEEKLY_RETRO", "0") == "1":
+        # W2 weekly-retro beliefs digest (HERMES_QUANT_WEEKLY_RETRO, default ON;
+        # set =0 to opt out — promoted 2026-06-05, FLAGS.md Tier A). PREPENDED
+        # above the raw per-trade lessons. Selective: only the role the belief
+        # was distilled FOR. Belief-level Oracle guard applied in the retriever.
+        # With no beliefs.jsonl the digest is "" (load_active_beliefs returns [])
+        # so ON-by-default prepends nothing — a no-op without retro data.
+        if os.environ.get("HERMES_QUANT_WEEKLY_RETRO", "1") == "1":
             try:
                 from datetime import UTC, datetime
 

@@ -1,8 +1,10 @@
 """hermes_quant.memory.retriever — Layer 3: BM25 retriever + Oracle Fallacy guard
 (ADR-0042).
 
-Gated by env var HERMES_QUANT_MEMORY_INJECT=1. Default OFF — bit-identical
-pre-Wave-4 behavior when the env var is absent.
+Gated by env var HERMES_QUANT_MEMORY_INJECT (default ON, FLAGS.md Tier A; set
+=0 to opt out). With the flag explicitly =0 the injection site is skipped and
+behavior is bit-identical to the pre-Wave-4 path; ON-by-default with no lessons
+available also yields "(none)" (a no-op without memory data).
 
 Oracle Fallacy guard (arxiv:2605.19337 §4.2)
 ---------------------------------------------------

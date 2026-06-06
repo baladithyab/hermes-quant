@@ -166,13 +166,14 @@ def build_perception_frame(
         frame_extras.setdefault("regime_classifier_kind", "unavailable")
 
     # ---- Step 5: semantic slice (absorbs catalyst/wiring.py:semantic_market_extras) ----
-    # Silence-by-default: OFF / no packets / any error -> empty. decision_asof
-    # defaults to wall-clock now (live path); pass explicit for backtests
-    # (ADR-0068/0074). Mirrors wiring.semantic_market_extras exactly.
+    # Default ON (FLAGS.md Tier A); set HERMES_QUANT_SEMANTIC_ENABLED=0 to opt out.
+    # Silence-by-default: explicitly-OFF / no packets / any error -> empty.
+    # decision_asof defaults to wall-clock now (live path); pass explicit for
+    # backtests (ADR-0068/0074). Mirrors wiring.semantic_market_extras exactly.
     semantic_packets: tuple[Any, ...] = ()
     import os
 
-    if os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "0") == "1":
+    if os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "1") == "1":
         try:
             from hermes_quant.catalyst.synthesize import load_packets_for
 

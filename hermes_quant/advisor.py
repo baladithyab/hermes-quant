@@ -366,15 +366,17 @@ def _build_default_analysts() -> list[Any]:
             analysts.append(FundamentalsAnalyst())
         except ImportError:
             pass
-    # ADR-0074: Catalyst Sense semantic analyst — default OFF until the
-    # negative-control + precision eval (hermes_quant.catalyst.eval) passes.
-    # When enabled, it consumes SemanticPackets the advisor loads into
+    # ADR-0074: Catalyst Sense semantic analyst — default ON; set
+    # HERMES_QUANT_SEMANTIC_ENABLED=0 to opt out. Promoted to default-ON
+    # 2026-06-05 (FLAGS.md Tier A) after weeks live in .env=1 with no crash.
+    # The negative-control + precision eval (hermes_quant.catalyst.eval) has
+    # cleared. When enabled, it consumes SemanticPackets the advisor loads into
     # ctx.extras["semantic_packets"] (via catalyst.synthesize.load_packets_for)
     # and emits a PEER AnalystView into BMA — never an override. No-ops to an
-    # abstain when no packet is present, so it is safe to enable before full
-    # packet coverage. Gate read at call time (tests / cron flips take effect
-    # immediately).
-    if os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "0") == "1":
+    # abstain when no packet is present, so it is safe ON-by-default even before
+    # full packet coverage. Gate read at call time (tests / cron flips take
+    # effect immediately).
+    if os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "1") == "1":
         try:
             from hermes_quant.analysts.semantic import HermesSemanticAnalyst
 
@@ -991,9 +993,10 @@ def recommend(
                 analysts.append(FundamentalsAnalyst())
             except ImportError:
                 pass
-        # ADR-0074: Catalyst Sense semantic analyst — default OFF.
+        # ADR-0074: Catalyst Sense semantic analyst — default ON; set
+        # HERMES_QUANT_SEMANTIC_ENABLED=0 to opt out.
         # See _build_default_analysts() comment for context.
-        if os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "0") == "1":
+        if os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "1") == "1":
             try:
                 from hermes_quant.analysts.semantic import HermesSemanticAnalyst
 

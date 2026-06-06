@@ -399,17 +399,30 @@ def test_eval_gate_sign_consistency_all_sectors():
 
 
 # ---------------------------------------------------------------------------
-# analyst loadout wiring (ADR-0074): env-gated, default OFF
+# analyst loadout wiring (ADR-0074): env-gated, default ON (FLAGS.md Tier A,
+# promoted 2026-06-05). The explicit =0 off-switch still removes the analyst.
 # ---------------------------------------------------------------------------
 
-def test_semantic_analyst_off_by_default(monkeypatch):
-    monkeypatch.delenv("HERMES_QUANT_SEMANTIC_ENABLED", raising=False)
+def test_semantic_analyst_off_when_explicitly_disabled(monkeypatch):
+    """Off-switch: HERMES_QUANT_SEMANTIC_ENABLED=0 removes the analyst from the
+    roster (bit-identical to the pre-promotion default-OFF behavior)."""
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "0")
     from hermes_quant.advisor import _build_default_analysts
     names = [type(a).__name__ for a in _build_default_analysts()]
     assert "HermesSemanticAnalyst" not in names
 
 
-def test_semantic_analyst_on_when_enabled(monkeypatch):
+def test_semantic_analyst_on_by_default(monkeypatch):
+    """Promotion: with NO env var set, the semantic analyst is ACTIVE by default."""
+    monkeypatch.delenv("HERMES_QUANT_SEMANTIC_ENABLED", raising=False)
+    from hermes_quant.advisor import _build_default_analysts
+    names = [type(a).__name__ for a in _build_default_analysts()]
+    assert "HermesSemanticAnalyst" in names
+    # still a PEER — the numerical analysts are present alongside it
+    assert "ClassicalTAAnalyst" in names
+
+
+def test_semantic_analyst_on_when_explicitly_enabled(monkeypatch):
     monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "1")
     from hermes_quant.advisor import _build_default_analysts
     names = [type(a).__name__ for a in _build_default_analysts()]

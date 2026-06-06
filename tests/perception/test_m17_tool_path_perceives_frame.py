@@ -158,10 +158,12 @@ def test_tool_path_perceives_semantic_frame(monkeypatch, tmp_path):
 
 
 def test_tool_path_flag_off_builds_no_frame(monkeypatch, tmp_path):
-    """Flag OFF: tick must NOT build a frame (no redundant fetch / no provider
-    resolution) — perception_frame stays None, byte-identical to today. We assert
-    the default provider resolver is never called when the flag is OFF."""
-    monkeypatch.delenv("HERMES_QUANT_SEMANTIC_ENABLED", raising=False)
+    """Off-switch: SEMANTIC_ENABLED=0 => tick must NOT build a frame (no redundant
+    fetch / no provider resolution) — perception_frame stays None, bit-identical to
+    the pre-promotion path. We assert the default provider resolver is never called
+    when the flag is OFF. (Default is now ON per FLAGS.md Tier A; the inert path is
+    requested explicitly.)"""
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "0")
     _set_mode_autonomous(monkeypatch, tmp_path)
 
     calls = {"n": 0}

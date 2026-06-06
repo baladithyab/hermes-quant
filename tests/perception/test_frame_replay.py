@@ -107,7 +107,9 @@ def _assert_replay_identical(symbol, asset_class, asof, bars, *, lookback_bars=2
 @pytest.mark.parametrize("seed", [42, 7, 123])
 @pytest.mark.parametrize("trend", [0.5, -0.4, 0.0])
 def test_replay_byte_identical_flag_off(monkeypatch, seed, trend):
-    monkeypatch.delenv("HERMES_QUANT_SEMANTIC_ENABLED", raising=False)
+    # Off-switch: SEMANTIC_ENABLED=0 (FLAGS.md Tier A promoted the default to ON,
+    # so the inert path must be requested explicitly).
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "0")
     bars = _make_bars(120, trend=trend, seed=seed)
     asof = bars["timestamp"].iloc[60].isoformat()
     _assert_replay_identical("TEST", "equity", asof, bars)
@@ -118,7 +120,8 @@ def test_replay_byte_identical_convergence_off(monkeypatch, trend):
     """PDR-3 (HERMES_QUANT_CONVERGENCE) absent => the full-pipeline recommend()
     replay is byte-identical no-frame vs frame-built (no live-path divergence from
     the builder's Step 5c convergence stamp when the flag is OFF)."""
-    monkeypatch.delenv("HERMES_QUANT_SEMANTIC_ENABLED", raising=False)
+    # Off-switch: SEMANTIC_ENABLED=0 (default promoted to ON, FLAGS.md Tier A).
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "0")
     monkeypatch.delenv("HERMES_QUANT_CONVERGENCE", raising=False)
     bars = _make_bars(120, trend=trend, seed=42)
     asof = bars["timestamp"].iloc[60].isoformat()
@@ -128,7 +131,8 @@ def test_replay_byte_identical_convergence_off(monkeypatch, trend):
 
 
 def test_replay_byte_identical_full_history(monkeypatch):
-    monkeypatch.delenv("HERMES_QUANT_SEMANTIC_ENABLED", raising=False)
+    # Off-switch: SEMANTIC_ENABLED=0 (default promoted to ON, FLAGS.md Tier A).
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "0")
     bars = _make_bars(120, trend=0.5, seed=42)
     asof = bars["timestamp"].iloc[-1].isoformat()
     r_today, r_frame, frame = _assert_replay_identical("TEST", "equity", asof, bars)

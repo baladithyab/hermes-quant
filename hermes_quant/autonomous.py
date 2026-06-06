@@ -414,11 +414,13 @@ def tick(
     # producer BOTH the cron and the quant_autonomous_tick TOOL path reach — so
     # the tool path perceives the same frame the cron does (closes the GAP-D /
     # M17 tool-vs-cron semantic decoupling structurally, not via a second
-    # monkey-patch). Only build when semantic is ON: with the flag OFF there are
-    # no packets to carry, perception_frame=None is byte-identical to today, and
-    # we skip the redundant fetch. build_perception_frame_live never raises
-    # (returns None on any error) and a None frame is identical to not passing one.
-    _inject_frame = os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "0") == "1"
+    # monkey-patch). Semantic is default ON (FLAGS.md Tier A); set
+    # HERMES_QUANT_SEMANTIC_ENABLED=0 to opt out — with the flag explicitly OFF
+    # there are no packets to carry, perception_frame=None is byte-identical to
+    # the pre-promotion path, and we skip the redundant fetch.
+    # build_perception_frame_live never raises (returns None on any error) and a
+    # None frame is identical to not passing one.
+    _inject_frame = os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "1") == "1"
 
     for entry in watchlist:
         try:

@@ -149,7 +149,9 @@ def test_split_flag_off_is_byte_identical_noop(monkeypatch, tmp_path) -> None:
     _point_retriever_at(monkeypatch, rpath)
 
     monkeypatch.setenv("HERMES_QUANT_MEMORY_INJECT", "1")
-    monkeypatch.delenv("HERMES_QUANT_WEEKLY_RETRO", raising=False)
+    # WEEKLY_RETRO default is now ON (FLAGS.md Tier A); pin =0 so this test isolates
+    # the MEMORY_SPLIT render behavior and never reads the real beliefs.jsonl store.
+    monkeypatch.setenv("HERMES_QUANT_WEEKLY_RETRO", "0")
 
     monkeypatch.delenv("HERMES_QUANT_MEMORY_SPLIT", raising=False)
     rendered_unset = _render_pm()
@@ -185,7 +187,9 @@ def test_split_flag_on_keeps_same_ticker_rich_cross_lean(monkeypatch, tmp_path) 
 
     monkeypatch.setenv("HERMES_QUANT_MEMORY_INJECT", "1")
     monkeypatch.setenv("HERMES_QUANT_MEMORY_SPLIT", "1")
-    monkeypatch.delenv("HERMES_QUANT_WEEKLY_RETRO", raising=False)
+    # WEEKLY_RETRO default is now ON (FLAGS.md Tier A); pin =0 so this test isolates
+    # the MEMORY_SPLIT render behavior and never reads the real beliefs.jsonl store.
+    monkeypatch.setenv("HERMES_QUANT_WEEKLY_RETRO", "0")
 
     rendered = _render_pm()
 
@@ -223,7 +227,9 @@ def test_split_flag_on_does_not_leak_future_asof_reflection(monkeypatch, tmp_pat
 
     monkeypatch.setenv("HERMES_QUANT_MEMORY_INJECT", "1")
     monkeypatch.setenv("HERMES_QUANT_MEMORY_SPLIT", "1")
-    monkeypatch.delenv("HERMES_QUANT_WEEKLY_RETRO", raising=False)
+    # WEEKLY_RETRO default is now ON (FLAGS.md Tier A); pin =0 so this test isolates
+    # the MEMORY_SPLIT render behavior and never reads the real beliefs.jsonl store.
+    monkeypatch.setenv("HERMES_QUANT_WEEKLY_RETRO", "0")
 
     rendered = _render_pm()
 
