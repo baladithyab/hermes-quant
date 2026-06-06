@@ -136,12 +136,17 @@ def _clean_env(monkeypatch):
     for var in (
         "HERMES_QUANT_ADMISSIBILITY",
         "HERMES_QUANT_PORTFOLIO_CAPS",
-        "HERMES_QUANT_REFLECTION",
         "HERMES_QUANT_BROKER_BACKEND",
         "HERMES_QUANT_ALPACA_PAPER",
         "HERMES_QUANT_DETERMINISTIC_EQUITY",
     ):
         monkeypatch.delenv(var, raising=False)
+    # REFLECTION now DEFAULTS to "1" (FLAGS.md Tier-A promotion), so delenv would
+    # leave the reflection hook ON. These tests exercise the plain fill path; pin
+    # it OFF so the deterministic-equity fill assertions aren't perturbed by the
+    # (non-blocking, best-effort) reflection bookkeeping. The hook has its own
+    # dedicated coverage.
+    monkeypatch.setenv("HERMES_QUANT_REFLECTION", "0")
     # Slippage now DEFAULTS to v0.2 (FLAGS.md Tier-A promotion), so delenv would
     # leave it ON. These tests exercise BP-enforcement + NAV->shares math against
     # the unslipped (decision==fill) price; pin the legacy v0.1 passthrough so the
@@ -587,3 +592,58 @@ def test_unexpected_backend_exception_becomes_nofill_not_crash(tmp_path, monkeyp
     assert md.get("backend_error") is True, "unexpected exception not tagged backend_error"
     # No-fill moves no position.
     assert ps.applied == [], "reconciled state.db on a no-fill"
+
+
+# --------------------------------------------------------------------------- #
+# REFLECTION default-ON promotion (FLAGS.md Tier A, 2026-06-05)
+# --------------------------------------------------------------------------- #
+
+
+def test_reflection_default_on_invokes_hook(tmp_path, monkeypatch):
+    """With NO env var set, REFLECTION now DEFAULTS to ON -> the reflection hook
+    fires on a fill. Promoted 2026-06-05 (FLAGS.md Tier A)."""
+    import hermes_quant.memory._paper_reflection_hook as hook_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        hook_mod, "maybe_record_decision_on_open",
+        lambda record, proposal: calls.append("open"),
+    )
+    monkeypatch.setattr(
+        hook_mod, "maybe_reflect_on_close",
+        lambda record, proposal: calls.append("close"),
+    )
+    # The autouse _clean_env fixture pins REFLECTION=0; override to the real
+    # default by DELETING it so os.environ.get(...,"1") sees the code default.
+    monkeypatch.delenv("HERMES_QUANT_REFLECTION", raising=False)
+
+    backend = _FakeBackend(equity=100_000.0, bp=100_000.0)
+    ps = _CapturePS()
+    reactor = _reactor_with_backend(tmp_path, backend, ps, monkeypatch)
+    reactor.execute(_proposal(), fill_size_pct=0.10)
+
+    assert calls, "REFLECTION default-ON must invoke the reflection hook on a fill"
+
+
+def test_reflection_explicit_off_skips_hook(tmp_path, monkeypatch):
+    """Off-switch: HERMES_QUANT_REFLECTION=0 still skips the hook (bit-identical
+    to the old default). Proves the promotion kept a working opt-out."""
+    import hermes_quant.memory._paper_reflection_hook as hook_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        hook_mod, "maybe_record_decision_on_open",
+        lambda record, proposal: calls.append("open"),
+    )
+    monkeypatch.setattr(
+        hook_mod, "maybe_reflect_on_close",
+        lambda record, proposal: calls.append("close"),
+    )
+    monkeypatch.setenv("HERMES_QUANT_REFLECTION", "0")
+
+    backend = _FakeBackend(equity=100_000.0, bp=100_000.0)
+    ps = _CapturePS()
+    reactor = _reactor_with_backend(tmp_path, backend, ps, monkeypatch)
+    reactor.execute(_proposal(), fill_size_pct=0.10)
+
+    assert calls == [], "REFLECTION=0 must skip the reflection hook (off-switch)"
