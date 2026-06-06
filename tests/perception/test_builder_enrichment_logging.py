@@ -106,9 +106,11 @@ def test_enabled_semantic_load_failure_logs_warning(monkeypatch, caplog):
 
 
 def test_disabled_feature_logs_nothing(monkeypatch, caplog):
-    """Flag OFF (default) => the Step-5 block is never entered, so a broken loader
-    is never called and NO warning is emitted (byte-identical to today)."""
-    monkeypatch.delenv("HERMES_QUANT_SEMANTIC_ENABLED", raising=False)
+    """Off-switch: SEMANTIC_ENABLED=0 => the Step-5 block is never entered, so a
+    broken loader is never called and NO warning is emitted (bit-identical to the
+    pre-promotion default-OFF path; the default is now ON per FLAGS.md Tier A, so
+    the inert path is requested explicitly)."""
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "0")
 
     def _boom_load(*_a, **_k):  # would raise IF called — but it must not be
         raise RuntimeError("must not be reached when the flag is OFF")

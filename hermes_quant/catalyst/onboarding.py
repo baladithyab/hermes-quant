@@ -93,9 +93,13 @@ def catalyst_admissions(
       3. tradeable(sym) gate (ADR-0077 oracle in prod; fail-closed on error)
       4. rank by confidence*magnitude, cap to max_admissions, tag admitted_via=catalyst
     """
+    # SEMANTIC_ENABLED is default ON (FLAGS.md Tier A); CATALYST_ONBOARDING
+    # stays default-OFF (its own promotion is out of scope), so onboarding
+    # remains inert unless an operator explicitly sets CATALYST_ONBOARDING=1.
+    # Either flag explicitly =0 still disables (off-switch preserved).
     if (
         os.environ.get("HERMES_QUANT_CATALYST_ONBOARDING", "0") != "1"
-        or os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "0") != "1"
+        or os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "1") != "1"
     ):
         return []
     if not _is_finite_number(tau_conf) or not _is_finite_number(tau_mag):

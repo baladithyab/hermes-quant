@@ -15,9 +15,10 @@ Design constraints (from spike 001-003 caveats, ADR-0074):
     Do NOT conflate them.
   * Edge SIGN is the highest-risk modeling choice — curated v1, surfaced for
     review, every propagation logged so a learned graph can replace it later.
-  * Default OFF (HERMES_QUANT_SEMANTIC_ENABLED) until the negative-control eval
-    (hermes_quant.catalyst.eval) passes. A butterfly engine that cries wolf is
-    worse than none.
+  * Default ON (HERMES_QUANT_SEMANTIC_ENABLED, FLAGS.md Tier A; set =0 to opt
+    out) — the negative-control eval (hermes_quant.catalyst.eval) has cleared
+    and it ran weeks live in .env=1. Abstains when no packet is present, so a
+    butterfly engine that cries wolf never fires on empty data.
 
 This subsystem is purely ADDITIVE: it writes packets that the advisor loads via
 the existing ``market_extras`` param. No change to the core advisor/gate.

@@ -1,12 +1,12 @@
 """hermes_quant.memory — 3-layer persistent memory system (ADR-0042).
 
-Wave 4 of the hermes-quant pipeline uplift.  Three layers, all default OFF
-behind env vars so pre-Wave-4 behavior is bit-identical:
+Wave 4 of the hermes-quant pipeline uplift.  Three layers, env-var gated; each
+flag's explicit =0 path stays bit-identical to pre-Wave-4 behavior:
 
   Layer 1  decisions.py   — append-only JSONL decision log
-  Layer 2  reflector.py   — deferred post-trade reflection (HERMES_QUANT_REFLECTION=1)
+  Layer 2  reflector.py   — deferred post-trade reflection (HERMES_QUANT_REFLECTION=1, default OFF)
   Layer 3  retriever.py   — BM25 retriever + Oracle-Fallacy guard
-                            (HERMES_QUANT_MEMORY_INJECT=1)
+                            (HERMES_QUANT_MEMORY_INJECT, default ON; set =0 to opt out)
 
 Oracle Fallacy guard (arxiv:2605.19337 §4.2):
   Any reflection whose tau_observable >= asof is EXCLUDED from retrieval.

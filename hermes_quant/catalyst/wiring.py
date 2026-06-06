@@ -42,7 +42,7 @@ def semantic_market_extras(
     decision time, not the stale last-daily-bar close (ADR-0068/0074). Pass an
     explicit asof for backtests so the strict bar-time clamp holds.
     """
-    if os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "0") != "1":
+    if os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "1") != "1":
         return None
     try:
         from hermes_quant.catalyst.synthesize import load_packets_for

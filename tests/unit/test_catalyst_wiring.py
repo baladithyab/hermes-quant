@@ -97,7 +97,10 @@ def _write_packet(
 
 
 def test_semantic_market_extras_off_returns_none(monkeypatch):
-    monkeypatch.delenv("HERMES_QUANT_SEMANTIC_ENABLED", raising=False)
+    # Off-switch: SEMANTIC_ENABLED=0 short-circuits to None (bit-identical to the
+    # pre-promotion default-OFF path). FLAGS.md Tier A promoted the default to ON,
+    # so the disabled path must be requested explicitly.
+    monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "0")
     assert wiring.semantic_market_extras("AAPL") is None
 
 
