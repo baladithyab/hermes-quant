@@ -33,13 +33,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import pandas as pd
 
 from hermes_quant.backtest.stub_llm import StubLLMCommittee
 from hermes_quant.agents.trader import TraderNode, TraderAction
 from hermes_quant.agents.risk_committee.committee import RiskCommittee
+
+if TYPE_CHECKING:
+    from hermes_quant.protocol import MarketContext
 
 logger = logging.getLogger(__name__)
 
@@ -358,3 +361,426 @@ class BuyAndHoldStrategy:
             )
             for sym in self._universe
         ]
+
+
+# ---------------------------------------------------------------------------
+# AdvisorStrategy (D3 — makes the analyst-pool / BMA flags measurable)
+# ---------------------------------------------------------------------------
+
+
+class AdvisorStrategy:
+    """Backtestable strategy that drives the REAL analyst-pool -> BMA -> risk-gate chain.
+
+    Why this exists
+    ---------------
+    ``HermesQuantStrategy`` is a momentum stand-in: it never runs the analyst
+    pool or the BMA aggregator, so ablating the analyst-pool / aggregator flags
+    (the L2 learning-loop cluster — ``HERMES_QUANT_STACKING`` /
+    ``L2_POSTERIOR_DECAY`` / ``L2_PER_ANALYST_CALIB`` / ``L2_LESSON_HAIRCUT`` /
+    ``L2_POSTERIOR_PERSIST``, all in ``aggregators/bma.py``) through it would show
+    a FALSE NULL — the flags can't change a decision the path never makes.
+
+    ``AdvisorStrategy`` closes that gap. On each ``decide(asof, lookback)`` it:
+      1. Builds a ``MarketContext`` from ``lookback`` (which the engine has
+         already filtered to dates <= asof — no-lookahead).
+      2. Runs every injected analyst -> collects ``AnalystView`` s.
+      3. Aggregates them through a PERSISTENT ``BMAAggregator`` (reused across
+         days so per-analyst Beta posteriors accumulate — the state the
+         accumulation-biting L2 flags read).
+      4. Gates the signal through the deterministic ``DefaultRiskGate`` against a
+         synthetic flat portfolio + bootstrap market state (same posture as
+         ``advisor.recommend`` — the size is informational, not a live order).
+      5. Emits a ``Decision``.
+
+    Settlement loop (the asof-honest part)
+    --------------------------------------
+    The ``WalkForwardEngine`` has no settlement hook, but the accumulation-biting
+    L2 flags only bite once the BMA has accrued per-analyst skill via
+    ``update(EpisodeOutcome)``. So this strategy keeps its OWN settlement loop:
+    each day, BEFORE deciding, it settles any pending decision whose outcome is
+    now observable — ``observable_asof = decision_asof + horizon_delta`` — using
+    ONLY ``lookback`` close prices (all <= asof by the engine's contract). The
+    realized direction-correctness feeds ``aggregator.update(...)``. This mirrors
+    the live settlement loop's c96e ``observable_asof`` discipline EXACTLY, so the
+    flags accrue the same skill they would in production — never peeking past
+    asof. ``learn_from_fills=False`` disables the loop (then only the cold-start-
+    biting flags ``L2_PER_ANALYST_CALIB`` / ``L2_LESSON_HAIRCUT`` move output).
+
+    Offline + deterministic
+    -----------------------
+    No LLM, no network: analysts are injected (default = the canonical offline
+    committee), the aggregator/gate are deterministic, and there is no RNG. Same
+    inputs + same flag -> same decisions.
+
+    Parameters
+    ----------
+    universe:
+        Ticker symbols to decide on (single-symbol is the common case).
+    analysts:
+        Injected analyst list. When None, the canonical offline committee
+        (ClassicalTA + MicrostructureLite + Kronos, each degrading gracefully if
+        its optional dep is missing) is built via the advisor's loadout helper.
+    aggregator:
+        Injected aggregator. When None, a fresh ``BMAAggregator`` is built. The
+        SAME instance is reused for the whole run so posteriors accumulate.
+    risk_gate:
+        Injected risk gate. When None, a fresh ``DefaultRiskGate`` is built.
+    asset_class / timeframe:
+        Context fields for the analysts (default equity / 1d).
+    learn_from_fills:
+        When True (default), run the internal asof-honest settlement loop so the
+        accumulation-biting L2 flags accrue skill. When False, skip it.
+    min_history_bars:
+        Minimum lookback rows before the strategy will emit a non-HOLD decision
+        (analyst warm-up). Default 30.
+    """
+
+    def __init__(
+        self,
+        universe: list[str],
+        *,
+        analysts: list[Any] | None = None,
+        aggregator: Any = None,
+        risk_gate: Any = None,
+        asset_class: str = "equity",
+        timeframe: str = "1d",
+        learn_from_fills: bool = True,
+        min_history_bars: int = 30,
+    ) -> None:
+        self._universe = universe
+        self._asset_class = asset_class
+        self._timeframe = timeframe
+        self._learn_from_fills = learn_from_fills
+        self._min_history_bars = min_history_bars
+
+        if analysts is None:
+            from hermes_quant.advisor import _build_default_analysts
+
+            analysts = _build_default_analysts()
+        self._analysts = analysts
+
+        if aggregator is None:
+            from hermes_quant.aggregators.bma import BMAAggregator
+
+            aggregator = BMAAggregator()
+        self._aggregator = aggregator
+
+        if risk_gate is None:
+            from hermes_quant.risk.gate import DefaultRiskGate
+
+            risk_gate = DefaultRiskGate()
+        self._risk_gate = risk_gate
+
+        # Pending decisions awaiting settlement, per symbol:
+        #   list of (decision_asof, observable_asof, direction, signal).
+        self._pending: dict[str, list[tuple]] = {sym: [] for sym in universe}
+
+    # ------------------------------------------------------------------
+
+    def decide(
+        self,
+        asof: pd.Timestamp,
+        lookback_data: pd.DataFrame,
+    ) -> list[Decision]:
+        """Run the real advisor chain for every symbol; emit one Decision each."""
+        # Settlement FIRST (asof-honest): credit any pending decision now
+        # observable, so the BMA posteriors are up to date before we decide.
+        if self._learn_from_fills:
+            self._settle_due(asof, lookback_data)
+
+        decisions: list[Decision] = []
+        for symbol in self._universe:
+            try:
+                decisions.append(self._decide_one(symbol, asof, lookback_data))
+            except Exception as exc:  # noqa: BLE001 — one bad symbol can't kill the run
+                logger.warning(
+                    "AdvisorStrategy.decide failed for %s at %s: %s", symbol, asof, exc
+                )
+                decisions.append(self._hold(symbol, f"error: {exc}"))
+        return decisions
+
+    # ------------------------------------------------------------------
+    # Per-symbol decision
+    # ------------------------------------------------------------------
+
+    def _decide_one(
+        self, symbol: str, asof: pd.Timestamp, lookback_data: pd.DataFrame
+    ) -> Decision:
+        from hermes_quant.protocol import AnalystView
+
+        sym_bars = self._symbol_bars(lookback_data, symbol)
+        if sym_bars is None or len(sym_bars) < self._min_history_bars:
+            return self._hold(symbol, "insufficient history for advisor warmup")
+
+        ctx = self._build_context(symbol, asof, sym_bars)
+
+        views: list[AnalystView] = []
+        for analyst in self._analysts:
+            try:
+                if hasattr(analyst, "analyze"):
+                    view = analyst.analyze(ctx)
+                elif hasattr(analyst, "observe"):
+                    view = analyst.observe(ctx)
+                else:
+                    continue
+            except Exception as exc:  # noqa: BLE001 — one bad analyst can't kill the fan-out
+                logger.warning("AdvisorStrategy: analyst %s raised: %s", analyst, exc)
+                continue
+            if view is not None:
+                views.append(view)
+
+        if not views:
+            return self._hold(symbol, "no analyst views")
+
+        signal = self._aggregator.aggregate(views, ctx)
+        if signal.direction == 0 or signal.confidence <= 0.0:
+            self._record_pending(symbol, asof, signal)
+            return self._hold(symbol, "aggregator silent/flat")
+
+        action = self._gate(symbol, signal, asof)
+        self._record_pending(symbol, asof, signal)
+
+        if action is None or action.target_position_pct == 0.0:
+            return self._hold(symbol, "risk gate silenced")
+
+        target = action.target_position_pct
+        return Decision(
+            symbol=symbol,
+            action="BUY" if target > 0 else "SELL",
+            size_fraction=abs(target),
+            confidence=float(signal.confidence),
+            rationale=(action.reason or "advisor")[:512],
+            metadata={
+                "direction": int(signal.direction),
+                "agg_confidence": float(signal.confidence),
+                "agg_confidence_raw": float(signal.confidence_raw),
+                "target_position_pct": float(target),
+                "n_views": signal.metadata.get("n_views") if signal.metadata else None,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Settlement loop (asof-honest)
+    # ------------------------------------------------------------------
+
+    def _settle_due(self, asof: pd.Timestamp, lookback_data: pd.DataFrame) -> None:
+        """Settle pending decisions whose outcome is observable by ``asof``.
+
+        For each pending (decision_asof, observable_asof, direction, signal) with
+        observable_asof <= asof, compute whether the realized close move from the
+        decision bar to the observable bar agreed with the decision direction —
+        using ONLY ``lookback_data`` (all dates <= asof, by the engine's
+        contract — never a peek). Feed the result to ``aggregator.update`` so the
+        per-analyst Beta posteriors (and the B50 / decay rings) accumulate.
+        """
+        from hermes_quant.protocol import EpisodeOutcome
+
+        for symbol in self._universe:
+            sym_bars = self._symbol_bars(lookback_data, symbol)
+            still_pending: list[tuple] = []
+            for decision_asof, observable_asof, direction, signal in self._pending.get(
+                symbol, []
+            ):
+                if observable_asof > asof:
+                    still_pending.append(
+                        (decision_asof, observable_asof, direction, signal)
+                    )
+                    continue
+                realized = self._realized_return(sym_bars, decision_asof, observable_asof)
+                if realized is None:
+                    # Outcome bar not present in lookback yet — keep waiting.
+                    still_pending.append(
+                        (decision_asof, observable_asof, direction, signal)
+                    )
+                    continue
+                direction_correct = {
+                    v.analyst: (
+                        (realized > 0 and v.direction > 0)
+                        or (realized < 0 and v.direction < 0)
+                    )
+                    for v in signal.components
+                }
+                horizon = signal.horizon if signal.horizon not in ("0m", "") else self._timeframe
+                try:
+                    self._aggregator.update(
+                        EpisodeOutcome(
+                            asset=symbol,
+                            timeframe=self._timeframe,
+                            asof=pd.Timestamp(decision_asof),
+                            aggregated_signal=signal,
+                            realized_returns={horizon: float(realized)},
+                            direction_correct=direction_correct,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 — settlement must not abort the run
+                    logger.warning("AdvisorStrategy: aggregator.update raised: %s", exc)
+            self._pending[symbol] = still_pending
+
+    def _record_pending(self, symbol: str, asof: pd.Timestamp, signal) -> None:
+        """Queue a decision for later asof-honest settlement."""
+        if not self._learn_from_fills:
+            return
+        if not signal.components:
+            return  # nothing to credit
+        horizon = signal.horizon if signal.horizon not in ("0m", "") else self._timeframe
+        observable = pd.Timestamp(asof) + _horizon_to_timedelta(horizon)
+        self._pending.setdefault(symbol, []).append(
+            (pd.Timestamp(asof), observable, int(signal.direction), signal)
+        )
+
+    @staticmethod
+    def _realized_return(
+        sym_bars: pd.DataFrame | None,
+        decision_asof: pd.Timestamp,
+        observable_asof: pd.Timestamp,
+    ) -> float | None:
+        """Close-to-close return from the decision bar to the first bar at/after
+        ``observable_asof``. Returns None when the outcome bar isn't in the frame.
+
+        Reads ONLY bars in ``sym_bars`` (dates <= asof by contract), so it can
+        never look ahead of the engine's current step.
+        """
+        if sym_bars is None or len(sym_bars) < 2:
+            return None
+        idx = sym_bars.index
+        dec = pd.Timestamp(decision_asof)
+        obs = pd.Timestamp(observable_asof)
+        if getattr(idx, "tz", None) is not None:
+            if dec.tzinfo is None:
+                dec = dec.tz_localize(idx.tz)
+            if obs.tzinfo is None:
+                obs = obs.tz_localize(idx.tz)
+        dec_pos = idx.searchsorted(dec, side="right") - 1
+        if dec_pos < 0:
+            return None
+        obs_pos = idx.searchsorted(obs, side="left")
+        if obs_pos >= len(idx):
+            return None  # outcome bar not observable yet
+        try:
+            dec_px = float(sym_bars["close"].iloc[dec_pos])
+            obs_px = float(sym_bars["close"].iloc[obs_pos])
+        except (KeyError, IndexError, TypeError):
+            return None
+        if dec_px <= 0:
+            return None
+        return obs_px / dec_px - 1.0
+
+    # ------------------------------------------------------------------
+    # Context + gate helpers
+    # ------------------------------------------------------------------
+
+    def _build_context(
+        self, symbol: str, asof: pd.Timestamp, sym_bars: pd.DataFrame
+    ) -> MarketContext:
+        from hermes_quant.protocol import MarketContext
+
+        asof_ts = pd.Timestamp(asof)
+        if asof_ts.tzinfo is None:
+            asof_ts = asof_ts.tz_localize("UTC")
+        return MarketContext(
+            asset=symbol,
+            timeframe=self._timeframe,
+            asset_class=self._asset_class,
+            exchange=None,
+            bars=sym_bars,
+            last_close=float(sym_bars["close"].iloc[-1]),
+            last_volume=float(sym_bars["volume"].iloc[-1]),
+            asof=asof_ts,
+        )
+
+    def _gate(self, symbol: str, signal, asof: pd.Timestamp):
+        from hermes_quant.advisor import _bootstrap_market_state, _synthetic_portfolio
+
+        asof_ts = pd.Timestamp(asof)
+        if asof_ts.tzinfo is None:
+            asof_ts = asof_ts.tz_localize("UTC")
+        market = _bootstrap_market_state(symbol, self._asset_class, asof_ts)
+        portfolio = _synthetic_portfolio(symbol, self._asset_class, asof_ts)
+        try:
+            return self._risk_gate.gate(signal, market, portfolio, _NoHaltState())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AdvisorStrategy: risk gate raised: %s", exc)
+            return None
+
+    def _symbol_bars(
+        self, lookback_data: pd.DataFrame, symbol: str
+    ) -> pd.DataFrame | None:
+        """Project the engine's lookback frame into a canonical OHLCV frame with a
+        ``timestamp`` COLUMN (the analyst/advisor contract), indexed for the
+        settlement search.
+
+        The engine passes a DatetimeIndex'd frame; analysts expect a
+        ``timestamp`` column. Multi-symbol (MultiIndex columns) is sliced to the
+        symbol's OHLCV.
+        """
+        if isinstance(lookback_data.columns, pd.MultiIndex):
+            try:
+                cols = {
+                    c: lookback_data[(c, symbol)]
+                    for c in ["open", "high", "low", "close", "volume"]
+                    if (c, symbol) in lookback_data.columns
+                }
+            except KeyError:
+                return None
+            if not cols:
+                return None
+            df = pd.DataFrame(cols, index=lookback_data.index)
+        else:
+            needed = ["open", "high", "low", "close", "volume"]
+            if not all(c in lookback_data.columns for c in needed):
+                return None
+            df = lookback_data[needed].copy()
+        df = df.dropna(subset=["close"])
+        if len(df) == 0:
+            return None
+        df = df.copy()
+        df["timestamp"] = df.index
+        return df
+
+    @staticmethod
+    def _hold(symbol: str, reason: str) -> Decision:
+        return Decision(
+            symbol=symbol,
+            action="HOLD",
+            size_fraction=0.0,
+            confidence=0.0,
+            rationale=f"HOLD: {reason}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# AdvisorStrategy helpers
+# ---------------------------------------------------------------------------
+
+
+# Horizon -> observability delay. Mirrors aggregators/bma.py::_HORIZON_TO_TIMEDELTA
+# so the settlement loop's observable_asof matches the BMA's c96e stamp exactly.
+# Unknown horizons fall back to 1 day (a POSITIVE delay — never makes a sample
+# observable before its decision, which would be lookahead).
+_HORIZON_TIMEDELTA: dict[str, pd.Timedelta] = {
+    "5m": pd.Timedelta(minutes=5),
+    "15m": pd.Timedelta(minutes=15),
+    "30m": pd.Timedelta(minutes=30),
+    "1h": pd.Timedelta(hours=1),
+    "4h": pd.Timedelta(hours=4),
+    "1d": pd.Timedelta(days=1),
+    "1w": pd.Timedelta(weeks=1),
+    "1M": pd.Timedelta(days=30),
+    "1Q": pd.Timedelta(days=90),
+}
+
+
+def _horizon_to_timedelta(horizon: str) -> pd.Timedelta:
+    return _HORIZON_TIMEDELTA.get(horizon, pd.Timedelta(days=1))
+
+
+class _NoHaltState:
+    """No-op halt state — backtests have no real halt registry (mirrors the
+    advisor's _EmptyHaltState). Returns "never halted" so the gate evaluates the
+    signal on its own merits."""
+
+    def is_halted(self, account_id: str, asset_class: str, asset: str | None = None) -> bool:
+        return False
+
+    def active_halts(self) -> list:
+        return []
