@@ -268,6 +268,16 @@ class TestLayersDriveTheSeam:
         store at it, instrument ``PaperReactor.execute``, and call ``quant_approve``.
         The spy proves the advisor approve path drives the seam.
         """
+        # Pin reactor selection to the legacy PaperReactor this test spies on.
+        # select_reactor() routes to DeterministicEquityReactor when
+        # HERMES_QUANT_DETERMINISTIC_EQUITY=1 (or AlpacaPaperReactor when
+        # ALPACA_PAPER=1), and those flags can leak in from the ambient
+        # environment (.env / cron wrappers set DETERMINISTIC_EQUITY=1 live).
+        # Without this isolation the spy on PaperReactor.execute sees 0 calls.
+        monkeypatch.setenv("HERMES_QUANT_DETERMINISTIC_EQUITY", "0")
+        monkeypatch.setenv("HERMES_QUANT_ALPACA_PAPER", "0")
+        monkeypatch.setenv("HERMES_QUANT_MULTILEG_REACTOR", "0")
+
         import hermes_quant.proposals as proposals_mod
         from hermes_quant.proposals import ProposalStore
 
