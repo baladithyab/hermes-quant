@@ -534,7 +534,11 @@ def test_audit_trail_every_transition_appends_jsonl(isolated_store, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_paper_reactor_writes_executions_record(tmp_path):
+def test_paper_reactor_writes_executions_record(tmp_path, monkeypatch):
+    # Slippage now DEFAULTS to v0.2 (FLAGS.md Tier-A); this test asserts the record
+    # SHAPE against the legacy passthrough (fill_price == decision_price, v0.1), so
+    # pin the off-switch. Slippage behavior is covered by the v0.2 tests below.
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
     exec_path = tmp_path / "executions.jsonl"
     reactor = PaperReactor(executions_path=exec_path)
 
@@ -575,9 +579,14 @@ def test_paper_reactor_writes_executions_record(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_paper_reactor_v01_passthrough_when_env_unset(tmp_path, monkeypatch):
-    """Default behavior: HERMES_QUANT_PAPER_SLIPPAGE_MODEL unset → fill = decision."""
-    monkeypatch.delenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", raising=False)
+def test_paper_reactor_v01_passthrough_when_opted_out(tmp_path, monkeypatch):
+    """Off-switch behavior: HERMES_QUANT_PAPER_SLIPPAGE_MODEL=v0.1 → fill = decision.
+
+    Post-promotion (FLAGS.md Tier-A) the DEFAULT is v0.2; the legacy passthrough is
+    now reached only by explicitly opting out with v0.1. This pins that the off-switch
+    still yields the bit-identical passthrough (fill_price == decision_price).
+    """
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
     exec_path = tmp_path / "executions.jsonl"
     reactor = PaperReactor(executions_path=exec_path)
     proposal = Proposal(
@@ -671,6 +680,47 @@ def test_paper_reactor_v02_replay_determinism(tmp_path, monkeypatch):
         asset_class="equity",
     )
     assert fp1 == fp2
+
+
+def test_paper_reactor_default_is_v02_with_v01_offswitch(tmp_path, monkeypatch):
+    """FLAGS.md Tier-A promotion: the DEFAULT (no env var) now models v0.2 slippage,
+    and setting HERMES_QUANT_PAPER_SLIPPAGE_MODEL=v0.1 is the preserved off-switch.
+
+    This pins the promotion invariant directly:
+      * unset  -> v0.2 envelope applies, fill_price != decision_price for a sized fill.
+      * =v0.1  -> legacy passthrough, fill_price == decision_price (bit-identical).
+    """
+    exec_path = tmp_path / "executions.jsonl"
+    advisor = _sample_advisor_result()
+    advisor["decision_price"] = 100.0
+
+    def _proposal(pid: str) -> Proposal:
+        return Proposal(
+            proposal_id=pid,
+            state="pending",
+            symbol="AAPL",
+            asset_class="equity",
+            timeframe="1d",
+            created_at="2026-05-13T18:00:00Z",
+            expires_at="2026-05-13T18:15:00Z",
+            advisor_result=dict(advisor),
+        )
+
+    # NEW DEFAULT: env var unset -> v0.2 slippage fires for a non-trivial (20% NAV) fill.
+    monkeypatch.delenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", raising=False)
+    reactor = PaperReactor(executions_path=exec_path)
+    default_rec = reactor.execute(_proposal("prop_default_v02_abc"), fill_size_pct=0.20)
+    assert default_rec.fill_price != default_rec.decision_price
+    assert default_rec.reactor_metadata["slippage_model"] == "v0.2"
+    assert default_rec.reactor_metadata["slippage_breakdown"]["total_bps"] > 0
+
+    # OFF-SWITCH: explicit v0.1 -> legacy passthrough, fill_price == decision_price.
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
+    reactor_off = PaperReactor(executions_path=tmp_path / "executions_off.jsonl")
+    off_rec = reactor_off.execute(_proposal("prop_offswitch_v01_abc"), fill_size_pct=0.20)
+    assert off_rec.fill_price == off_rec.decision_price
+    assert off_rec.reactor_metadata["slippage_model"] == "v0.1"
+    assert off_rec.reactor_metadata["slippage_breakdown"] is None
 
 
 def test_proposal_id_format_per_adr():

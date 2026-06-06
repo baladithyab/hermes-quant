@@ -100,6 +100,10 @@ def test_flag_off_short_executes_bit_identical(reactor, monkeypatch):
     """Flag OFF: a SHORT equity fill executes EXACTLY as today. The gate is never
     consulted (oracle/NAV untouched) and a normal fill lands on the bus."""
     monkeypatch.delenv("HERMES_QUANT_ADMISSIBILITY", raising=False)
+    # Slippage now DEFAULTS to v0.2 (FLAGS.md Tier-A); pin v0.1 so this test keeps
+    # asserting the legacy passthrough fill (fill_price == decision_price). The
+    # subject here is the admissibility seam, not slippage.
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
 
     def _boom_select():
         raise AssertionError("select_oracle must NOT be called when the flag is OFF")
@@ -125,6 +129,9 @@ def test_flag_off_matches_pre_gate_record(reactor, monkeypatch):
     """The flag-OFF record is byte-identical to a reactor whose admissibility code never
     runs: every persisted field except the wall-clock asof_execution matches."""
     monkeypatch.delenv("HERMES_QUANT_ADMISSIBILITY", raising=False)
+    # Pin the v0.1 off-switch: this test asserts the persisted record is byte-identical
+    # to a no-slippage passthrough (fill_price == decision_price, slippage_model v0.1).
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
     rec = reactor.execute(_proposal(), fill_size_pct=-0.20, approver_user_id="u1")
 
     from hermes_quant.react.paper import _record_to_dict
@@ -204,6 +211,9 @@ def test_flag_on_admissible_short_executes(reactor, monkeypatch):
     """Flag ON + ACCEPTED short: executes normally; the oracle saw a WHOLE-SHARE qty
     (0.20*100k/200 = 100 shares), not the NAV fraction; a real fill lands on the bus."""
     monkeypatch.setenv("HERMES_QUANT_ADMISSIBILITY", "1")
+    # Pin v0.1: this test asserts the admissible short fills at the unslipped
+    # decision price (fill_price == 200.0). Slippage is not its subject.
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
     monkeypatch.setattr(paper_mod, "_account_nav_usd", lambda: 100_000.0)
     oracle = _AcceptingOracle()
     monkeypatch.setattr(gate_order, "select_oracle", lambda: oracle)

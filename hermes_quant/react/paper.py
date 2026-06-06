@@ -215,12 +215,12 @@ class PaperReactor:
         )
         bar_ts = adv.get("bar_ts") or adv.get("as_of")  # = old as_of for v1 records
 
-        # ADR-0070: opt-in slippage model. Default OFF (legacy passthrough,
-        # fill_price = decision_price) unless HERMES_QUANT_PAPER_SLIPPAGE_MODEL=v0.2.
-        # When enabled, we model spread + impact + latency drift + auction premium
-        # with a deterministic per-fill RNG seed so replays of the same fill
-        # produce the same slipped fill price.
-        slippage_mode = os.environ.get("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
+        # ADR-0070: slippage model. Default ON (v0.2 envelope) per FLAGS.md Tier-A
+        # promotion — set HERMES_QUANT_PAPER_SLIPPAGE_MODEL=v0.1 to opt OUT and get
+        # the legacy passthrough (fill_price = decision_price). When enabled, we model
+        # spread + impact + latency drift + auction premium with a deterministic
+        # per-fill RNG seed so replays of the same fill produce the same slipped price.
+        slippage_mode = os.environ.get("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.2")
         slippage_breakdown: dict[str, float] | None = None
         if slippage_mode == "v0.2":
             from hermes_quant.react.slippage_model import (

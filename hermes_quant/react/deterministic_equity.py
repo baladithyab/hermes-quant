@@ -423,12 +423,13 @@ class DeterministicEquityReactor:
     ) -> tuple[float, str, dict[str, float] | None]:
         """Return (fill_price, slippage_mode, slippage_breakdown).
 
-        Bit-identical to PaperReactor.execute's slippage block: passthrough
-        (fill_price = decision_price) unless HERMES_QUANT_PAPER_SLIPPAGE_MODEL=v0.2,
-        in which case the deterministic per-fill envelope is applied; a bad input
-        degrades to passthrough with an error breakdown (never fails the fill).
+        Bit-identical to PaperReactor.execute's slippage block: the deterministic
+        per-fill envelope is applied by DEFAULT (v0.2, per FLAGS.md Tier-A promotion);
+        set HERMES_QUANT_PAPER_SLIPPAGE_MODEL=v0.1 to opt OUT to the legacy passthrough
+        (fill_price = decision_price). A bad input degrades to passthrough with an
+        error breakdown (never fails the fill).
         """
-        slippage_mode = os.environ.get("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
+        slippage_mode = os.environ.get("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.2")
         slippage_breakdown: dict[str, float] | None = None
         if slippage_mode != "v0.2":
             return decision_price, slippage_mode, None
