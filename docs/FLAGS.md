@@ -88,26 +88,33 @@ adopted → **retire**, or (b) a real feature awaiting a decision → **trial th
 This is where the sprawl actually lives — ~25 flags that are pure latent surface.
 
 **Likely RETIRE (experiments that never graduated — confirm no recent commits reference them as active):**
-`HERMES_QUANT_STACKING`, `HERMES_QUANT_SATURATION`, `HERMES_QUANT_SHADOW_RULE_MINING`,
+`HERMES_QUANT_SHADOW_RULE_MINING`(deferred-live skeleton — keep, don't delete),
 `HERMES_QUANT_TREND_VELOCITY`, `HERMES_QUANT_CONVERGENCE`, `HERMES_QUANT_TRADER_LLM`,
 `HERMES_QUANT_RESEARCH_DEBATE`(+`_ROUNDS`), `HERMES_QUANT_REDTEAM_TURN`,
-`HERMES_QUANT_L2_*` (posterior decay/persist, per-analyst calib, lesson haircut — the
-whole L2 experiment cluster), `HERMES_QUANT_SNAPSHOT_V2`, `HERMES_QUANT_STRUCTURE_SELECT`,
+`HERMES_QUANT_SNAPSHOT_V2`(wave-d backfill — verify before retiring), `HERMES_QUANT_STRUCTURE_SELECT`,
 `HERMES_QUANT_MEMORY_SPLIT`, `HERMES_QUANT_ANALYST_ADMISSION`, `HERMES_QUANT_ANALYSTS_USE_REGIME`,
-`HERMES_QUANT_TREND_VELOCITY`, `HERMES_QUANT_WATCHLIST_CAP_TRIM`, `HERMES_QUANT_WATERMARK_ENABLED`,
-`HERMES_QUANT_REGIME_HMM`, `HERMES_QUANT_PREWARM_WORKERS`, `HERMES_QUANT_LOAD_TEST`,
-`HERMES_QUANT_CALIBRATOR_AUTO_REFIT`, `HERMES_QUANT_HORIZONS`, `HERMES_QUANT_PLAYS_OPEN`,
-`HERMES_QUANT_CATALYST_ONBOARDING`, `HERMES_QUANT_IC_DEDUP_*`, `HERMES_QUANT_GROUNDING_ENFORCE`,
-`HERMES_QUANT_DATA_FALLBACK`, `HERMES_QUANT_ADMISSIBILITY`, `HERMES_QUANT_EVENT_RISK`,
-`HERMES_QUANT_BORROW_COST`, `HERMES_QUANT_RESEARCH_RISK_TIER_BLOCK`, `HERMES_QUANT_MCP_READS_ENABLED`,
-`HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD`.
+`HERMES_QUANT_WATCHLIST_CAP_TRIM`, `HERMES_QUANT_WATERMARK_ENABLED`, `HERMES_QUANT_REGIME_HMM`,
+`HERMES_QUANT_PREWARM_WORKERS`, `HERMES_QUANT_LOAD_TEST`, `HERMES_QUANT_CALIBRATOR_AUTO_REFIT`,
+`HERMES_QUANT_HORIZONS`, `HERMES_QUANT_PLAYS_OPEN`, `HERMES_QUANT_CATALYST_ONBOARDING`,
+`HERMES_QUANT_IC_DEDUP_*`, `HERMES_QUANT_RESEARCH_RISK_TIER_BLOCK`, `HERMES_QUANT_MCP_READS_ENABLED`,
+`HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD`, `HERMES_QUANT_SATURATION`.
 
-> **Do NOT mass-delete.** Each needs a one-line check: is it referenced by a recent ADR
-> as "the path forward" (→ keep, trial it) or is it a stale spike (→ retire)? Several of
-> these (`ADMISSIBILITY`, `EVENT_RISK`, `BORROW_COST`, `GROUNDING_ENFORCE`) are
-> *risk/honesty* features that arguably SHOULD be on — they're Tier-C only because nobody
-> flipped them. Those are promotion candidates, not retirement candidates. The retire-vs-
-> adopt triage is the real follow-up work this doc surfaces.
+> **CORRECTION (2026-06-05):** an earlier draft of this list wrongly bucketed the **L2 learning-loop
+> cluster** (`HERMES_QUANT_STACKING`, `HERMES_QUANT_L2_POSTERIOR_DECAY`, `_L2_PER_ANALYST_CALIB`,
+> `_L2_LESSON_HAIRCUT`, `_L2_POSTERIOR_PERSIST`) as dead spikes. They are NOT — they shipped
+> **2026-06-04 in PR #49** ("close the learning loop": per-analyst calibration + persisted Beta
+> posteriors + reflection→decision haircut), all in `aggregators/bma.py`, default-OFF pending eval.
+> These are **PROMOTION candidates after an eval pass**, not retirements — flipping them on changes how
+> the BMA decision core weights analysts on the live path, so they need a backtest/shadow eval before
+> default-on, not a blind flip. Treat `ADMISSIBILITY`/`EVENT_RISK`/`BORROW_COST`/`GROUNDING_ENFORCE`
+> (ADR-0077/0084) the same way: ADR-backed, live-path-wired, promote-after-eval.
+
+> **Do NOT mass-delete.** Each needs a one-line check: is it referenced by a recent ADR/PR as the
+> path forward (→ keep, eval, promote) or is it a stale spike (→ retire)? The git-blame recency check
+> (`git log -1 -S HERMES_QUANT_<flag> -- <file>`) is the fast triage: anything touched in the last
+> ~2 weeks is fresh work, not a spike. Several Tier-C flags (`ADMISSIBILITY`, `EVENT_RISK`,
+> `BORROW_COST`, `GROUNDING_ENFORCE`, the whole L2 cluster) are promotion candidates, not retirement
+> candidates. The retire-vs-adopt triage is the real follow-up work this doc surfaces.
 
 ---
 
