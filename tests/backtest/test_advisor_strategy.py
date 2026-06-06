@@ -322,3 +322,25 @@ def test_posterior_persist_ablation_never_writes_real_store(monkeypatch, tmp_pat
     assert not sentinel_dir.exists() or not list(sentinel_dir.glob("*")), (
         "L2_POSTERIOR_PERSIST ablation wrote into the production posterior store"
     )
+
+
+def test_explicit_str_posterior_store_path_is_normalized(monkeypatch, tmp_path):
+    """Regression (codex re-review): an explicit STR posterior_store_path must be
+    normalized to Path. BMAAggregator + the posterior store call .exists()/.parent
+    on it; a raw str would AttributeError on save and silently fail-closed on load
+    under L2_POSTERIOR_PERSIST. The CLI never hits this (None -> Path), but a direct
+    caller can — so normalize at the seam."""
+    from pathlib import Path
+
+    monkeypatch.setenv("HERMES_QUANT_L2_POSTERIOR_PERSIST", "1")
+    str_path = str(tmp_path / "posteriors.json")  # a STR, not a Path
+    strat = AdvisorStrategy(["SYN"], posterior_store_path=str_path)
+    psp = strat._aggregator.posterior_store_path
+    assert isinstance(psp, Path), "explicit str posterior_store_path was not normalized to Path"
+    # .exists() must be callable (would AttributeError on a str).
+    assert psp.exists() is False
+    # Calibrator is still the deterministic pin, and the absent-calibrator path
+    # was derived from the (now-Path) store parent.
+    from hermes_quant.calibrators import IdentityCalibrator
+
+    assert isinstance(strat._aggregator.calibrator, IdentityCalibrator)

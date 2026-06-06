@@ -529,6 +529,13 @@ class AdvisorStrategy:
         if posterior_store_path is None:
             self._owned_tmpdir = tempfile.TemporaryDirectory(prefix="hq-ablation-posteriors-")
             posterior_store_path = Path(self._owned_tmpdir.name) / "posteriors.json"
+        else:
+            # Normalize an explicit str path to Path (codex re-review): BMAAggregator
+            # and the posterior store call `.exists()` / `.parent` on it, which a raw
+            # str does not support — an explicit str would silently fail-closed to
+            # cold-start (load) or raise (save) under L2_POSTERIOR_PERSIST. The CLI
+            # never hits this (None -> Path above), but a direct caller might.
+            posterior_store_path = Path(posterior_store_path)
 
         # Hermeticity (codex review, claim 4): a stock BMAAggregator() resolves
         # calibrator_path to the host's ~/.hermes/quant/calibrators/isotonic.pkl
@@ -539,12 +546,7 @@ class AdvisorStrategy:
         # _load_calibrator hits the missing-file branch -> ColdStart fallback (no
         # host read, no host unpickle), and we then pin the deterministic
         # calibrator. Net: the eval reads/loads ZERO real on-disk state.
-        sandbox_dir = (
-            posterior_store_path.parent
-            if isinstance(posterior_store_path, Path)
-            else Path(str(posterior_store_path)).parent
-        )
-        absent_calibrator_path = sandbox_dir / "no-such-calibrator.pkl"
+        absent_calibrator_path = posterior_store_path.parent / "no-such-calibrator.pkl"
 
         agg = BMAAggregator(
             calibrator_path=absent_calibrator_path,
