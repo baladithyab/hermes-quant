@@ -591,12 +591,17 @@ class DeterministicEquityReactor:
     # ------------------------------------------------------------------
     @staticmethod
     def _maybe_reflect(record: ExecutionRecord, proposal: Any) -> None:
-        """Trigger the Wave-4 reflection hooks on a fill (default OFF).
+        """Trigger the Wave-4 reflection hooks on a fill (default ON).
+
+        Set HERMES_QUANT_REFLECTION=0 to opt out. Promoted to default-ON
+        2026-06-05 (FLAGS.md Tier A) — the hook is deterministic (Reflector
+        stub formatter unless REFLECTOR_LLM=1), cheap, and a no-op when no
+        pending decision matches the fill.
 
         Bit-identical gating to PaperReactor: only runs when
         HERMES_QUANT_REFLECTION=1; non-blocking on any failure.
         """
-        if os.environ.get("HERMES_QUANT_REFLECTION", "0") != "1":
+        if os.environ.get("HERMES_QUANT_REFLECTION", "1") != "1":
             return
         try:
             from hermes_quant.memory._paper_reflection_hook import (

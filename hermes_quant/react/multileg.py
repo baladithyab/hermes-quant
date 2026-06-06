@@ -275,8 +275,8 @@ class MultiLegPaperReactor:
         if proposal.strategy_kind == "pmcc":
             self._record_pmcc_shadow(proposal, multi_leg_id=multi_leg_id)
 
-        # ── Step 11: reflection hook on a close (default OFF). ──────────────────
-        if os.environ.get("HERMES_QUANT_REFLECTION", "0") == "1":
+        # ── Step 11: reflection hook on a close (default ON; set REFLECTION=0 to opt out). ──
+        if os.environ.get("HERMES_QUANT_REFLECTION", "1") == "1":
             self._maybe_reflect(parent, proposal)
 
         # ── Step 12: audit + return parent. ─────────────────────────────────────

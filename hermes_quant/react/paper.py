@@ -330,7 +330,7 @@ class PaperReactor:
         # close detector (daemon/settlement_loop.py).
         # -----------------------------------------------------------------------
         import os as _os
-        if _os.environ.get("HERMES_QUANT_REFLECTION", "0") == "1":
+        if _os.environ.get("HERMES_QUANT_REFLECTION", "1") == "1":
             try:
                 from hermes_quant.memory._paper_reflection_hook import (
                     maybe_record_decision_on_open,
