@@ -42,6 +42,14 @@ from typing import Any
 
 from hermes_quant.memory.decisions import MEMORY_HOME
 
+# Read-site belief-freshness horizon (silence-by-default safety rail). A
+# distilled belief is dropped at injection time once it is older than this many
+# tier half-lives since asof_distilled — so a paused/dead weekly-retro PRODUCER
+# cron degrades to "no beliefs injected" rather than leaking stale beliefs into a
+# live capital decision. 2x half-life => weekly beliefs go stale after ~28d,
+# monthly after ~120d. Enforced on every read, independent of producer liveness.
+STALE_BELIEF_HALF_LIVES = 2.0
+
 logger = logging.getLogger(__name__)
 
 REFLECTIONS_PATH = MEMORY_HOME / "reflections.jsonl"
@@ -626,6 +634,29 @@ def load_active_beliefs(
     for b in active:
         if b.role != role:
             continue  # selective propagation: only this role's beliefs
+        # Read-site freshness guard (silence-by-default): a belief is only as
+        # trustworthy as the producer that last refreshed it. The weekly-retro
+        # PRODUCER cron (ops/scripts/quant-weekly-retro.py) decays/expires beliefs,
+        # but it is opt-in — if it is paused, dead, or unset, beliefs would
+        # otherwise materialize forever. We refuse to inject any belief older than
+        # STALE_BELIEF_HALF_LIVES x its tier half-life since asof_distilled, so a
+        # silent producer degrades to "no beliefs injected" (true silence) rather
+        # than "stale beliefs injected into a live capital decision". Independent
+        # of producer liveness; enforced on every read.
+        _asof_distilled = _parse_dt(getattr(b, "asof_distilled", ""))
+        _hl = float(getattr(b, "half_life_days", 0.0) or 0.0)
+        if _asof_distilled is not None and _hl > 0.0:
+            age_days = (asof - _asof_distilled).total_seconds() / 86400.0
+            if age_days > STALE_BELIEF_HALF_LIVES * _hl:
+                logger.info(
+                    "load_active_beliefs: dropping STALE belief %s "
+                    "(age %.1fd > %.1fx half-life %.1fd) — producer may be paused",
+                    b.belief_id,
+                    age_days,
+                    STALE_BELIEF_HALF_LIVES,
+                    _hl,
+                )
+                continue
         out.append(
             {
                 "belief_id": b.belief_id,

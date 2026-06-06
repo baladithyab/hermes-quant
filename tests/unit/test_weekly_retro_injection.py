@@ -161,3 +161,48 @@ def test_flag_on_with_empty_store_is_noop(monkeypatch, tmp_path) -> None:
         "empty belief store under ON-by-default must be a byte-identical no-op"
     )
     assert "Distilled beliefs (weekly retro)" not in on_default_empty
+
+
+def test_stale_belief_is_dropped_at_read_site(monkeypatch, tmp_path) -> None:
+    """STALENESS GUARD: a belief older than STALE_BELIEF_HALF_LIVES x its tier
+    half-life (weekly => 2x14 = 28d) is NOT injected, even with WEEKLY_RETRO ON.
+
+    This is the silence-by-default rail for a paused/dead weekly-retro PRODUCER
+    cron: if the producer stops refreshing/expiring beliefs, the consumer refuses
+    to leak stale beliefs into a live capital decision. Seed a belief distilled
+    40 days before the consumer's asof (_ASOF=2026-06-10 => distilled 2026-05-01,
+    age 40d > 28d) and confirm the digest is suppressed. Contrast with
+    test_flag_on_prepends_selective_digest (5d old => fresh => injected).
+    """
+    from hermes_quant.memory import weekly_retro
+
+    bpath = tmp_path / "beliefs.jsonl"
+    # Distill the belief 40 days before the read asof => stale past 2x weekly HL.
+    _seed_belief(bpath, datetime(2026, 5, 1, tzinfo=UTC))  # 40d before _ASOF=2026-06-10
+    monkeypatch.setattr(weekly_retro, "BELIEFS_PATH", bpath)
+    monkeypatch.setenv("HERMES_QUANT_MEMORY_INJECT", "0")
+    monkeypatch.setenv("HERMES_QUANT_WEEKLY_RETRO", "1")
+
+    rendered = _render_pm()
+    assert "Distilled beliefs (weekly retro)" not in rendered, (
+        "a belief older than 2x its tier half-life must be dropped at the read "
+        "site (stale-producer safety), not injected into the PM prompt"
+    )
+
+
+def test_fresh_belief_still_injected_after_guard(monkeypatch, tmp_path) -> None:
+    """Guard is age-gated, not a blanket suppressor: a belief well within the
+    freshness horizon (5d << 28d) still injects under ON. Locks the guard's
+    boundary so it can't regress into dropping fresh beliefs too."""
+    from hermes_quant.memory import weekly_retro
+
+    bpath = tmp_path / "beliefs.jsonl"
+    _seed_belief(bpath, datetime(2026, 6, 5, tzinfo=UTC))  # 5d before _ASOF -> fresh
+    monkeypatch.setattr(weekly_retro, "BELIEFS_PATH", bpath)
+    monkeypatch.setenv("HERMES_QUANT_MEMORY_INJECT", "0")
+    monkeypatch.setenv("HERMES_QUANT_WEEKLY_RETRO", "1")
+
+    rendered = _render_pm()
+    assert "Distilled beliefs (weekly retro)" in rendered, (
+        "a fresh belief (5d, well under the 28d weekly horizon) must still inject"
+    )
