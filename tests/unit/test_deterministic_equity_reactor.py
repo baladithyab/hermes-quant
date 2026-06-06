@@ -136,13 +136,17 @@ def _clean_env(monkeypatch):
     for var in (
         "HERMES_QUANT_ADMISSIBILITY",
         "HERMES_QUANT_PORTFOLIO_CAPS",
-        "HERMES_QUANT_PAPER_SLIPPAGE_MODEL",
         "HERMES_QUANT_REFLECTION",
         "HERMES_QUANT_BROKER_BACKEND",
         "HERMES_QUANT_ALPACA_PAPER",
         "HERMES_QUANT_DETERMINISTIC_EQUITY",
     ):
         monkeypatch.delenv(var, raising=False)
+    # Slippage now DEFAULTS to v0.2 (FLAGS.md Tier-A promotion), so delenv would
+    # leave it ON. These tests exercise BP-enforcement + NAV->shares math against
+    # the unslipped (decision==fill) price; pin the legacy v0.1 passthrough so the
+    # exact share/price assertions stay about the BP seam, not the slippage model.
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
 
 
 def _reactor_with_backend(

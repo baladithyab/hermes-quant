@@ -23,7 +23,10 @@ from hermes_quant.risk.kelly import quarter_kelly_size
 def _paper_reactor_flags_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HERMES_QUANT_ADMISSIBILITY", raising=False)
     monkeypatch.delenv("HERMES_QUANT_PORTFOLIO_CAPS", raising=False)
-    monkeypatch.delenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", raising=False)
+    # Slippage now DEFAULTS to v0.2 (FLAGS.md Tier-A); delenv would leave it ON.
+    # These invariant tests assert exact fill_size_pct/persistence on the passthrough
+    # record, so pin the legacy v0.1 off-switch to keep the seam truly OFF.
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
 
 
 def _proposal(

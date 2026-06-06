@@ -460,7 +460,9 @@ class MultiLegPaperReactor:
         fill_size_pct: float,
         asof_execution: str,
     ) -> list[LegFill]:
-        if os.environ.get("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1") != "v0.2":
+        # ADR-0070 / FLAGS.md Tier-A: default ON (v0.2). Set
+        # HERMES_QUANT_PAPER_SLIPPAGE_MODEL=v0.1 to opt OUT (legacy passthrough).
+        if os.environ.get("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.2") != "v0.2":
             return leg_fills  # passthrough (option + equity)
         if proposal.stock_leg is None:
             return leg_fills  # no equity leg => nothing asymmetric to slip
