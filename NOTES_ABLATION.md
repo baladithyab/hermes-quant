@@ -81,8 +81,9 @@ math, not a harness defect. STACKING only changes the output when there is
 shifts the net vote toward the dissenter. Verified end-to-end:
 
 ```
-STACKING, committee = {2 correlated longs + 1 short dissenter}, settlement on:
-  OFF n_trades=125  ON n_trades=10   nav_series differ: True   d_sharpe=+74.5
+STACKING, committee = {2 correlated longs + 1 short dissenter}, settlement on,
+  hermetic IdentityCalibrator (clean-machine simulation):
+  OFF n_trades=24  ON n_trades=0   decisions differ: True
 STACKING, committee = {2 correlated longs} (unanimous):
   OFF == ON  (no-op — correct per BMA vote-share math)
 ```
@@ -91,6 +92,56 @@ STACKING, committee = {2 correlated longs} (unanimous):
 fed to `AdvisorStrategy` (or the live analyst roster on the chosen window) must
 actually disagree at least sometimes. A perfectly-unanimous roster will report a
 true (and correct) null for STACKING.
+
+## Hermetic by default — the calibrator-dependence trap (and how it's closed)
+
+There is a THIRD false-null trap, subtler than the strategy one, that an
+adversarial review surfaced and the harness now closes:
+
+A stock `BMAAggregator()` loads the host's private
+`~/.hermes/quant/calibrators/isotonic.pkl` if it exists. So an ablation built on
+a default aggregator would produce numbers that depend on whatever fitted
+calibrator the author's machine happens to have — NON-reproducible across
+machines. Worse: on a CLEAN machine (CI, a fresh deploy) there is no pickle, the
+cold-start fallback caps confidence at **0.375**, the deterministic risk gate
+silences **every** signal, and so **zero trades fire on both legs** → a FALSE
+NULL for every accumulation-biting flag. The trap just relocates from the
+strategy to the calibrator dependency.
+
+`AdvisorStrategy` closes this by building its default aggregator **hermetic**:
+
+- **Pinned `IdentityCalibrator`** (deterministic passthrough) instead of the
+  on-disk pickle, so the eval measures the FLAG's effect, not the host's
+  calibrator, and confident signals can actually fire. Inject your own
+  `calibrator=` (or a fully-built `aggregator=`) to evaluate against a specific
+  calibrator — e.g. an operator running the release-gated real-data path who
+  wants production-calibrator behavior.
+- **Sandboxed posterior store** (a per-instance temp file) so ablating
+  `HERMES_QUANT_L2_POSTERIOR_PERSIST` can NEVER write the production
+  `~/.hermes/quant/l2_learning_posteriors/` — the "read-only" eval stays
+  read-only.
+
+**Re-verified on a simulated clean machine** (default-calibrator path pointed at
+a nonexistent file, dissenting committee, settlement on):
+
+```
+HERMES_QUANT_STACKING            off_trades=24 on_trades=0  decisions differ: True
+HERMES_QUANT_L2_POSTERIOR_DECAY  off_trades=24 on_trades=31 decisions differ: True
+HERMES_QUANT_L2_PER_ANALYST_CALIB off_trades=24 on_trades=6 decisions differ: True
+HERMES_QUANT_L2_POSTERIOR_PERSIST: production store dir NOT created, no files written
+```
+
+These hold WITHOUT any private calibrator pickle — the measurability is a
+property of the harness, not the host. (Regression-guarded by
+`tests/backtest/test_advisor_strategy.py::test_accumulation_l2_flags_measurable_on_clean_machine`
+and `::test_posterior_persist_ablation_never_writes_real_store`.)
+
+> **Note on absolute metric magnitudes.** Because the eval pins a passthrough
+> calibrator (not a fitted one), the absolute Sharpe/return numbers are NOT a
+> forecast of live performance — they are a controlled A/B where the only moving
+> part is the flag. The harness reports the OFF-vs-ON *delta* and a conservative
+> verdict; treat the magnitudes as relative evidence, not a P&L claim. To
+> measure a flag against the production calibrator, inject it explicitly.
 
 ## ADMISSIBILITY / EVENT_RISK / BORROW_COST / GROUNDING_ENFORCE
 

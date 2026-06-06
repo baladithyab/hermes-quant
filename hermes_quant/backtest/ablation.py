@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -289,11 +290,32 @@ def verdict(result: AblationResult) -> str:
          not a real edge, not a false discovery).
 
     Any single failure -> HOLD, with the first failing reason recorded. A
-    marginal/noisy delta is HOLD, never PROMOTE.
+    marginal/noisy delta is HOLD, never PROMOTE. NON-FINITE inputs (NaN/inf
+    Sharpe or drawdown — degenerate legs) force HOLD: a comparison against NaN is
+    always False, which would otherwise let a NaN delta silently bypass the
+    Sharpe gate and emit a spurious PROMOTE.
     """
     reasons: list[str] = []
 
-    if result.d_sharpe < PROMOTE_MIN_D_SHARPE:
+    # Non-finite guard FIRST — a degenerate leg (NaN/inf Sharpe or drawdown) can
+    # never be evidence of a real, repeatable edge. Fail closed to HOLD before
+    # any `<` comparison (which is False against NaN and would let it slip).
+    if not (
+        math.isfinite(result.d_sharpe)
+        and math.isfinite(result.on.max_drawdown)
+        and math.isfinite(result.off.max_drawdown)
+    ):
+        result.verdict = "HOLD"
+        result.verdict_reason = (
+            f"non-finite metric (d_sharpe={result.d_sharpe}, "
+            f"on.maxdd={result.on.max_drawdown}, off.maxdd={result.off.max_drawdown}) "
+            "— cannot confirm a real edge"
+        )
+        return result.verdict
+
+    # Use `not (a >= b)` rather than `a < b` so a NaN that somehow reaches here
+    # still fails closed (NaN >= x is False -> the gate is treated as failed).
+    if not (result.d_sharpe >= PROMOTE_MIN_D_SHARPE):
         reasons.append(
             f"d_sharpe {result.d_sharpe:+.3f} < required +{PROMOTE_MIN_D_SHARPE:.2f} "
             "(improvement within noise band)"

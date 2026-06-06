@@ -267,3 +267,22 @@ def test_verdict_hold_when_dsr_uncomputable():
     res = _build(off, on)
     assert verdict(res) == "HOLD"
     assert res.dsr_on is None
+
+
+def test_verdict_hold_on_nan_sharpe():
+    """Regression: a NaN d_sharpe must force HOLD, never a spurious PROMOTE. A
+    `<` comparison against NaN is always False, which would otherwise bypass the
+    Sharpe gate; verdict() guards non-finite metrics explicitly (fail-closed)."""
+    off = _wfr(sharpe=0.20, max_drawdown=-0.10)
+    on = _wfr(sharpe=float("nan"), max_drawdown=-0.09)  # degenerate ON leg
+    res = _build(off, on)
+    assert verdict(res) == "HOLD"
+    assert "non-finite" in res.verdict_reason.lower()
+
+
+def test_verdict_hold_on_inf_drawdown():
+    """A non-finite drawdown (e.g. -inf) also fails closed to HOLD."""
+    off = _wfr(sharpe=0.20, max_drawdown=-0.10)
+    on = _wfr(sharpe=1.50, max_drawdown=float("-inf"))
+    res = _build(off, on)
+    assert verdict(res) == "HOLD"

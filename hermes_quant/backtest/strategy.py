@@ -421,10 +421,21 @@ class AdvisorStrategy:
         (ClassicalTA + MicrostructureLite + Kronos, each degrading gracefully if
         its optional dep is missing) is built via the advisor's loadout helper.
     aggregator:
-        Injected aggregator. When None, a fresh ``BMAAggregator`` is built. The
-        SAME instance is reused for the whole run so posteriors accumulate.
+        Injected aggregator. When None, a HERMETIC ``BMAAggregator`` is built
+        (see "Hermetic by default" below). The SAME instance is reused for the
+        whole run so posteriors accumulate.
     risk_gate:
         Injected risk gate. When None, a fresh ``DefaultRiskGate`` is built.
+    calibrator:
+        Injected calibrator for the DEFAULT aggregator. When None, an
+        ``IdentityCalibrator`` (deterministic passthrough) is pinned. Ignored
+        when ``aggregator`` is supplied (the caller owns that aggregator's
+        calibrator). See "Hermetic by default".
+    posterior_store_path:
+        Path for the DEFAULT aggregator's L2 posterior persistence. When None, a
+        per-instance temp file is used so an ``L2_POSTERIOR_PERSIST`` ablation can
+        NEVER write the real production store. Ignored when ``aggregator`` is
+        supplied.
     asset_class / timeframe:
         Context fields for the analysts (default equity / 1d).
     learn_from_fills:
@@ -433,6 +444,27 @@ class AdvisorStrategy:
     min_history_bars:
         Minimum lookback rows before the strategy will emit a non-HOLD decision
         (analyst warm-up). Default 30.
+
+    Hermetic by default (money-software / repro discipline)
+    -------------------------------------------------------
+    When ``aggregator`` is None, the default ``BMAAggregator`` is built HERMETIC
+    so an ablation is reproducible and READ-ONLY regardless of the host machine:
+
+      * **Pinned calibrator.** A stock ``BMAAggregator()`` loads
+        ``~/.hermes/quant/calibrators/isotonic.pkl`` if present — so its output
+        would depend on whatever private, fitted calibrator the host happens to
+        have. That makes an ablation NON-reproducible across machines (and on a
+        clean box the cold-start fallback caps confidence at 0.375, silencing
+        every signal -> a FALSE NULL for every flag). We pin an
+        ``IdentityCalibrator`` (deterministic passthrough): the eval measures the
+        FLAG's effect, not the host's calibrator. Inject your own ``calibrator``
+        (or a fully-built ``aggregator``) to evaluate against a specific one.
+      * **Sandboxed posterior store.** A stock ``BMAAggregator()`` persists L2
+        posteriors to the canonical production path when
+        ``HERMES_QUANT_L2_POSTERIOR_PERSIST=1`` — so ablating THAT flag through a
+        default aggregator would WRITE production state from a "read-only" eval.
+        We point the store at a per-instance temp file so settlement can never
+        touch the real store.
     """
 
     def __init__(
@@ -442,6 +474,8 @@ class AdvisorStrategy:
         analysts: list[Any] | None = None,
         aggregator: Any = None,
         risk_gate: Any = None,
+        calibrator: Any = None,
+        posterior_store_path: Any = None,
         asset_class: str = "equity",
         timeframe: str = "1d",
         learn_from_fills: bool = True,
@@ -452,6 +486,9 @@ class AdvisorStrategy:
         self._timeframe = timeframe
         self._learn_from_fills = learn_from_fills
         self._min_history_bars = min_history_bars
+        # Owns a temp dir ONLY when we built the default aggregator; cleaned up by
+        # GC of the TemporaryDirectory handle stored on self.
+        self._owned_tmpdir = None
 
         if analysts is None:
             from hermes_quant.advisor import _build_default_analysts
@@ -460,9 +497,9 @@ class AdvisorStrategy:
         self._analysts = analysts
 
         if aggregator is None:
-            from hermes_quant.aggregators.bma import BMAAggregator
-
-            aggregator = BMAAggregator()
+            aggregator = self._build_hermetic_aggregator(
+                calibrator=calibrator, posterior_store_path=posterior_store_path
+            )
         self._aggregator = aggregator
 
         if risk_gate is None:
@@ -474,6 +511,28 @@ class AdvisorStrategy:
         # Pending decisions awaiting settlement, per symbol:
         #   list of (decision_asof, observable_asof, direction, signal).
         self._pending: dict[str, list[tuple]] = {sym: [] for sym in universe}
+
+    def _build_hermetic_aggregator(self, *, calibrator: Any, posterior_store_path: Any):
+        """Build a reproducible, READ-ONLY default ``BMAAggregator`` for ablation.
+
+        See the class docstring's "Hermetic by default" section for WHY. Pins a
+        deterministic calibrator (default ``IdentityCalibrator``) and a sandboxed
+        posterior-store path (default a per-instance temp file) so the eval is
+        machine-independent and can never write the production posterior store.
+        """
+        import tempfile
+        from pathlib import Path
+
+        from hermes_quant.aggregators.bma import BMAAggregator
+        from hermes_quant.calibrators import IdentityCalibrator
+
+        if posterior_store_path is None:
+            self._owned_tmpdir = tempfile.TemporaryDirectory(prefix="hq-ablation-posteriors-")
+            posterior_store_path = Path(self._owned_tmpdir.name) / "posteriors.json"
+
+        agg = BMAAggregator(posterior_store_path=posterior_store_path)
+        agg.calibrator = calibrator if calibrator is not None else IdentityCalibrator()
+        return agg
 
     # ------------------------------------------------------------------
 

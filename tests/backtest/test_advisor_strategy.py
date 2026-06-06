@@ -19,6 +19,7 @@ no LLM / network.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -229,3 +230,95 @@ def test_decide_does_not_read_future_data():
     assert lookback.index.max() == asof
     decisions = strat.decide(pd.Timestamp(asof), lookback)
     assert len(decisions) == 1
+
+
+# ---------------------------------------------------------------------------
+# Accumulation-biting L2 flags are measurable MACHINE-INDEPENDENTLY.
+#
+# Regression for the adversarial finding: a stock BMAAggregator() loads the
+# host's private ~/.hermes/.../isotonic.pkl, and on a clean machine the cold-
+# start fallback caps confidence at 0.375 -> the gate silences EVERY signal ->
+# zero trades on both legs -> a FALSE NULL for STACKING/DECAY. AdvisorStrategy's
+# hermetic default (pinned IdentityCalibrator) fixes this. These tests pin the
+# default-calibrator path to a NONEXISTENT file to SIMULATE a clean machine, and
+# assert the flags still move the decisions (trades fire AND OFF != ON).
+# ---------------------------------------------------------------------------
+
+
+def _dissent_committee():
+    """Two correlated longs + one short dissenter — so STACKING's redundancy
+    discount has directional dissent to bite (a unanimous committee is a genuine
+    STACKING no-op per BMA vote-share math; see NOTES_ABLATION.md)."""
+    return [
+        _DeterministicAnalyst("s1", 1, conf=0.7),
+        _DeterministicAnalyst("s2", 1, conf=0.7),
+        _DeterministicAnalyst("dis", -1, conf=0.4),
+    ]
+
+
+def _decisions_under_flag(flag: str, value: str, ohlcv: pd.DataFrame) -> tuple[list, int]:
+    prior = os.environ.get(flag)
+    try:
+        os.environ[flag] = value
+        strat = AdvisorStrategy(["SYN"], analysts=_dissent_committee(), learn_from_fills=True)
+        out = []
+        for i in range(40, len(ohlcv) - 1):
+            asof = ohlcv.index[i]
+            d = strat.decide(pd.Timestamp(asof), ohlcv.loc[ohlcv.index <= asof])
+            out.append((d[0].action, round(d[0].size_fraction, 4)))
+        n_trades = sum(1 for a, _ in out if a != "HOLD")
+        return out, n_trades
+    finally:
+        if prior is None:
+            os.environ.pop(flag, None)
+        else:
+            os.environ[flag] = prior
+
+
+def test_accumulation_l2_flags_measurable_on_clean_machine(monkeypatch):
+    """STACKING + POSTERIOR_DECAY (accumulation-biting) change decisions even with
+    NO host calibrator — proving measurability is not an artifact of a private
+    on-disk isotonic.pkl. This is the regression guard for the false-null the
+    adversarial review surfaced."""
+    import hermes_quant.aggregators.bma as bma_mod
+
+    # Simulate a clean machine: the default calibrator path points at nothing.
+    monkeypatch.setattr(
+        bma_mod, "_DEFAULT_CALIBRATOR_PATH", Path("/nonexistent/hq-isotonic.pkl"), raising=True
+    )
+    ohlcv = _gbm_ohlcv(n_days=110, mu=0.002)
+
+    for flag in ("HERMES_QUANT_STACKING", "HERMES_QUANT_L2_POSTERIOR_DECAY"):
+        off, n_off = _decisions_under_flag(flag, "0", ohlcv)
+        on, n_on = _decisions_under_flag(flag, "1", ohlcv)
+        # Trades actually fire on at least one leg (NOT the cold-start false-null
+        # where every signal is silenced and both legs are all-HOLD).
+        assert n_off > 0 or n_on > 0, f"{flag}: both legs all-HOLD — false null (calibrator regression)"
+        assert off != on, f"{flag}: decisions identical OFF vs ON — flag not measurable"
+
+
+def test_posterior_persist_ablation_never_writes_real_store(monkeypatch, tmp_path):
+    """Ablating HERMES_QUANT_L2_POSTERIOR_PERSIST through the DEFAULT aggregator
+    must NOT write the production posterior store. Regression for the CRITICAL
+    finding: the 'read-only' eval tool was creating/writing
+    ~/.hermes/quant/l2_learning_posteriors/. AdvisorStrategy's hermetic default
+    sandboxes the store path, so settlement can never touch the real one."""
+    import hermes_quant.learning.posterior_store as ps_mod
+
+    # Point the REAL store at a tmp dir and confirm NOTHING lands there: the
+    # hermetic aggregator uses its OWN temp file, not POSTERIOR_DIR.
+    sentinel_dir = tmp_path / "real_store"
+    monkeypatch.setattr(ps_mod, "POSTERIOR_DIR", sentinel_dir, raising=True)
+    monkeypatch.setenv("HERMES_QUANT_L2_POSTERIOR_PERSIST", "1")
+
+    ohlcv = _gbm_ohlcv(n_days=90)
+    strat = AdvisorStrategy(["SYN"], analysts=_dissent_committee(), learn_from_fills=True)
+    for i in range(40, 80):
+        asof = ohlcv.index[i]
+        strat.decide(pd.Timestamp(asof), ohlcv.loc[ohlcv.index <= asof])
+
+    # The hermetic aggregator wrote to its own temp file; the production-store
+    # location was never created.
+    assert not sentinel_dir.exists() or not list(sentinel_dir.glob("*")), (
+        "L2_POSTERIOR_PERSIST ablation wrote into the production posterior store"
+    )
