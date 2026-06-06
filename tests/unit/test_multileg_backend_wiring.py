@@ -46,7 +46,11 @@ def enabled(monkeypatch):
     monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
     monkeypatch.delenv("HERMES_QUANT_ALPACA_PAPER", raising=False)
     monkeypatch.delenv("HERMES_QUANT_BROKER_BACKEND", raising=False)
-    monkeypatch.delenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", raising=False)
+    # These backend-wiring tests assert decision-basis (passthrough) fill prices
+    # — e.g. equity leg == 160.0, option == mid. Pin v0.1 so the v0.2 slippage
+    # envelope (now the default per FLAGS.md Tier-A) doesn't perturb those exact
+    # prices; slippage behavior is covered by the dedicated slippage tests.
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
     monkeypatch.delenv("HERMES_QUANT_ADMISSIBILITY", raising=False)
 
 
