@@ -85,19 +85,36 @@ promoting them to always-on would be wrong. They stay forever, by design.
 These are read in code, default `"0"`, and are set in NEITHER `.env` NOR any wrapper.
 They are doing nothing right now. Each is either (a) an experiment that was never
 adopted → **retire**, or (b) a real feature awaiting a decision → **trial then adopt**.
-This is where the sprawl actually lives — ~25 flags that are pure latent surface.
 
-**Likely RETIRE (experiments that never graduated — confirm no recent commits reference them as active):**
-`HERMES_QUANT_SHADOW_RULE_MINING`(deferred-live skeleton — keep, don't delete),
-`HERMES_QUANT_TREND_VELOCITY`, `HERMES_QUANT_CONVERGENCE`, `HERMES_QUANT_TRADER_LLM`,
-`HERMES_QUANT_RESEARCH_DEBATE`(+`_ROUNDS`), `HERMES_QUANT_REDTEAM_TURN`,
-`HERMES_QUANT_SNAPSHOT_V2`(wave-d backfill — verify before retiring), `HERMES_QUANT_STRUCTURE_SELECT`,
-`HERMES_QUANT_MEMORY_SPLIT`, `HERMES_QUANT_ANALYST_ADMISSION`, `HERMES_QUANT_ANALYSTS_USE_REGIME`,
-`HERMES_QUANT_WATCHLIST_CAP_TRIM`, `HERMES_QUANT_WATERMARK_ENABLED`, `HERMES_QUANT_REGIME_HMM`,
-`HERMES_QUANT_PREWARM_WORKERS`, `HERMES_QUANT_LOAD_TEST`, `HERMES_QUANT_CALIBRATOR_AUTO_REFIT`,
-`HERMES_QUANT_HORIZONS`, `HERMES_QUANT_PLAYS_OPEN`, `HERMES_QUANT_CATALYST_ONBOARDING`,
-`HERMES_QUANT_IC_DEDUP_*`, `HERMES_QUANT_RESEARCH_RISK_TIER_BLOCK`, `HERMES_QUANT_MCP_READS_ENABLED`,
-`HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD`, `HERMES_QUANT_SATURATION`.
+> **VERIFIED 2026-06-06 — RETIRE set is EMPTY. Nothing here is safe to delete.**
+> A 34-flag audit was cross-checked by TWO independent reviewers reading the actual
+> read-sites (Hermes/Opus-4.8 and OpenAI/Codex, different training distributions).
+> **Both independently returned RETIRE = 0.** Convergent finding: every flag's ON-path
+> is live, wired, and behavior-changing — there are no unreachable/superseded no-op
+> spikes. The codebase is fresh (HEAD 2026-06-05; nearly every flag touched within the
+> prior ~2 weeks), so the "experiments that never graduated" premise does not hold here.
+> The flags split cleanly into two buckets, NEITHER of which is "delete":
+>
+> **KEEP (16) — already SET in deploy env/wrappers OR a genuine config/safety/cost/test knob (mis-tiered as C):**
+> `CONVERGENCE`, `CALIBRATOR_AUTO_REFIT`, `HORIZONS`, `CATALYST_ONBOARDING`, `SATURATION`,
+> `ADMISSIBILITY` (all SET in env/wrappers — live config, not Tier-C); plus the legitimate
+> knobs `TRADER_LLM`, `RESEARCH_DEBATE_ROUNDS`, `WATERMARK_ENABLED`, `PREWARM_WORKERS`,
+> `LOAD_TEST` (test/CI-only, 0 src files), `PLAYS_OPEN`, `RESEARCH_RISK_TIER_BLOCK`,
+> `MCP_READS_ENABLED`, `HYPOTHESIS_NOVELTY_THRESHOLD` (config/safety/cost — Tier B by nature).
+>
+> **PROMOTE-CANDIDATE (16–18) — real default-OFF features that change the decision/risk
+> core and need a backtest/replay EVAL before default-on (the flag-ablation harness gates these):**
+> the L2 learning-loop cluster (`STACKING`, `L2_POSTERIOR_DECAY`, `L2_PER_ANALYST_CALIB`,
+> `L2_LESSON_HAIRCUT`, `L2_POSTERIOR_PERSIST`), the ADR risk/honesty rails (`EVENT_RISK`,
+> `BORROW_COST`*, `GROUNDING_ENFORCE`), and the analyst/perception features `TREND_VELOCITY`,
+> `RESEARCH_DEBATE`, `REDTEAM_TURN`, `MEMORY_SPLIT`, `ANALYST_ADMISSION`, `ANALYSTS_USE_REGIME`,
+> `REGIME_HMM`, `SNAPSHOT_V2`*, `SHADOW_RULE_MINING`*, `STRUCTURE_SELECT`*.
+> (* = reviewers split KEEP-vs-PROMOTE-CAND or flagged INVESTIGATE; immaterial — none is RETIRE.)
+>
+> **Net: the flag count does NOT drop via deletion.** The reduction path is PROMOTION
+> (proven features → code defaults, deleting the flag) gated on the ablation eval — not
+> retirement. Do not dispatch a "retire dead flags" pass; there are none. Re-audit only if
+> a future flag's ON-path is genuinely orphaned (run the same two-reviewer check first).
 
 > **CORRECTION (2026-06-05):** an earlier draft of this list wrongly bucketed the **L2 learning-loop
 > cluster** (`HERMES_QUANT_STACKING`, `HERMES_QUANT_L2_POSTERIOR_DECAY`, `_L2_PER_ANALYST_CALIB`,
@@ -126,9 +143,11 @@ This is where the sprawl actually lives — ~25 flags that are pure latent surfa
    delete the `.env`/wrapper lines. Removes 5 lines of config drift.
 2. **Bake DETERMINISTIC_EQUITY** after ~1 week of clean autonomous ticks → default `1`,
    then **delete PORTFOLIO_CAPS** from the wrapper (BP enforcement replaces it).
-3. **Triage Tier C**: for each flag, grep the ADRs; adopt the risk/honesty ones
-   (`ADMISSIBILITY`, `EVENT_RISK`, `BORROW_COST`, `GROUNDING_ENFORCE` are the prime
-   suspects), retire the stale spikes. This is where the count drops from ~50 to ~20.
+3. **Triage Tier C** — DONE (2026-06-06, two-reviewer audit): **RETIRE set is empty.** Every
+   Tier-C flag is either live config mis-tiered as C (→ KEEP) or a real default-OFF feature
+   needing eval (→ PROMOTE-CANDIDATE). The count does NOT drop via deletion. Reduction comes
+   from PROMOTION gated on the flag-ablation eval harness (run `hermes quant ablate <flag>`,
+   read the Sharpe/DSR delta, promote only what earns it).
 4. **Leave Tier B alone** — those are config and safety switches that correctly stay flags.
 
 End-state target: ~15–20 genuine config/safety flags (Tier B) + a handful of
