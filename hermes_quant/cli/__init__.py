@@ -523,6 +523,42 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     )
     p_bt.add_argument("--json", action="store_true", help="Print JSON to stdout instead of report")
 
+    # Flag-ablation harness (D1/D2): A/B walk-forward with a feature flag OFF vs
+    # ON, reporting the Sharpe/Sortino/maxDD/DSR delta + a PROMOTE/HOLD verdict.
+    # Heavy real-data path gated behind HERMES_QUANT_RUN_BACKTEST=1 (release-gate
+    # convention); --synthetic runs an offline smoke test. READ-ONLY (ADR-0007).
+    p_ablate = sub.add_parser(
+        "ablate",
+        help=(
+            "A/B walk-forward a feature flag (OFF vs ON) and report the "
+            "Sharpe/maxDD/DSR delta + PROMOTE/HOLD verdict. Real-data path is "
+            "release-gated behind HERMES_QUANT_RUN_BACKTEST=1; --synthetic runs "
+            "offline."
+        ),
+    )
+    p_ablate.add_argument("flag", help="Feature flag to ablate (e.g. HERMES_QUANT_STACKING)")
+    p_ablate.add_argument(
+        "--from", dest="from_date", required=True, help="Window start (ISO date, e.g. 2024-01-02)"
+    )
+    p_ablate.add_argument(
+        "--to", dest="to_date", required=True, help="Window end (ISO date, e.g. 2024-06-01)"
+    )
+    p_ablate.add_argument(
+        "--universe",
+        default="SYN",
+        help="Comma-separated symbols (single-symbol path in v0.1.2; default SYN)",
+    )
+    p_ablate.add_argument("--on", default="1", help="Flag value for the ON leg (default '1')")
+    p_ablate.add_argument("--off", default="0", help="Flag value for the OFF leg (default '0')")
+    p_ablate.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Run on deterministic offline GBM bars (no network); bypasses the data gate",
+    )
+    p_ablate.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON instead of the card"
+    )
+
     p_btr = sub.add_parser(
         "backtest-replay", help="Replay a signal log through freqtrade backtester"
     )
@@ -769,6 +805,11 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if cmd == "backtest":
         return _dispatch_backtest(args)
+
+    if cmd == "ablate":
+        from hermes_quant.cli.ablate import cmd_ablate
+
+        return cmd_ablate(args)
 
     if cmd == "config" and args.config_action == "show":
         _show_config()

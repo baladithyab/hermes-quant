@@ -21,28 +21,28 @@ Original public API (ADR-0020):
 - WalkForwardBacktestResult / WalkForwardFoldResult / walk_forward_replay
 """
 
-from .portfolio import PaperPortfolio
-from .replay import BacktestResult, replay
-from .walk_forward import (
-    WalkForwardBacktestResult,
-    WalkForwardFoldResult,
-    walk_forward_replay,
-)
-
 # Wave 6a additions
-from .cost_model import CostModel, LIQUID_EQUITY, MIDCAP_EQUITY, ILLIQUID
+from .cost_model import ILLIQUID, LIQUID_EQUITY, MIDCAP_EQUITY, CostModel
 from .engine import (
     LookaheadViolation,
     WalkForwardConfig,
     WalkForwardEngine,
     WalkForwardResult,
 )
-from .stub_llm import StubLLMCommittee
+from .portfolio import PaperPortfolio
+from .replay import BacktestResult, replay
 from .strategy import (
+    AdvisorStrategy,
     BuyAndHoldStrategy,
     Decision,
     HermesQuantStrategy,
     Strategy,
+)
+from .stub_llm import StubLLMCommittee
+from .walk_forward import (
+    WalkForwardBacktestResult,
+    WalkForwardFoldResult,
+    walk_forward_replay,
 )
 
 __all__ = [
@@ -65,6 +65,7 @@ __all__ = [
     "WalkForwardResult",
     # Wave 6a — stub + strategies
     "StubLLMCommittee",
+    "AdvisorStrategy",
     "BuyAndHoldStrategy",
     "Decision",
     "HermesQuantStrategy",
