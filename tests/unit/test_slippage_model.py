@@ -175,7 +175,9 @@ def test_max_total_bps_caps_extreme_drift() -> None:
 
 
 def test_invalid_decision_price_raises() -> None:
-    with pytest.raises(ValueError, match="decision_price must be > 0"):
+    # Message wording widened (deep-review 2026-06-07) to "finite and > 0";
+    # match the stable prefix so both the >0 and non-finite guards are covered.
+    with pytest.raises(ValueError, match=r"decision_price must be"):
         apply_slippage(
             decision_price=0.0,
             target_pct=0.20,
@@ -183,6 +185,20 @@ def test_invalid_decision_price_raises() -> None:
             proposal_id="prop_bad",
             asset_class="equity",
         )
+
+
+def test_nonfinite_decision_price_raises() -> None:
+    # NaN-fail-CLOSED: a NaN/inf decision_price must raise rather than produce a
+    # NaN fill_price that corrupts the P&L ledger.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match=r"decision_price must be"):
+            apply_slippage(
+                decision_price=bad,
+                target_pct=0.20,
+                asof_execution="2026-05-28T17:09:00Z",
+                proposal_id="prop_bad",
+                asset_class="equity",
+            )
 
 
 # ---------------------------------------------------------------------------

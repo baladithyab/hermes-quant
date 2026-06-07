@@ -1,0 +1,13 @@
+**Findings**
+HIGH: [protocol.py](/mnt/e/CS/github/hermes-quant/hermes_quant/protocol.py:284) / [protocol.py](/mnt/e/CS/github/hermes-quant/hermes_quant/protocol.py:290) mask NaN account equity into `0.0` drawdown/daily loss via `max(0.0, NaN)`. Then [gate.py](/mnt/e/CS/github/hermes-quant/hermes_quant/risk/gate.py:531) sees finite `0.0` and can emit an action instead of `_flatten_nonfinite_portfolio`. I confirmed `equity_total=NaN` produced a `+0.20` action.
+
+HIGH: [oracle.py](/mnt/e/CS/github/hermes-quant/hermes_quant/admissibility/oracle.py:202) and [oracle.py](/mnt/e/CS/github/hermes-quant/hermes_quant/admissibility/oracle.py:227) do `None` checks but no `math.isfinite` checks. `account_equity=NaN`, `current_ask=NaN`, or `limit_price=NaN` can all reach `ACCEPTED` because `<` comparisons against NaN are false. This is a direct NaN-fail-open in admissibility.
+
+MED: [paper.py](/mnt/e/CS/github/hermes-quant/hermes_quant/react/paper.py:447) copies stored `position.quantity` into portfolio-cap math without finite validation. With `HERMES_QUANT_PORTFOLIO_CAPS=1`, a NaN existing exposure makes headroom comparisons in `portfolio_normalize` fail open and a new `+0.20` fill full-pass. This is paper-only/default-off, but still corrupts the reaction-layer cap.
+
+MED: [gate.py](/mnt/e/CS/github/hermes-quant/hermes_quant/risk/gate.py:612) computes cooldown elapsed time without validating `portfolio.asof` or `last_loss_at`. `pd.NaT` yields NaN elapsed; [gate.py](/mnt/e/CS/github/hermes-quant/hermes_quant/risk/gate.py:613) then skips cooldown because `NaN < threshold` is false.
+
+LOW: [order_state.py](/mnt/e/CS/github/hermes-quant/hermes_quant/admissibility/order_state.py:75) asserts non-amplification only for finite targets. NaN targets evade `abs(adjusted) > abs(target_pct)`. `PaperReactor` blocks NaN fill sizes earlier, but the shared admissibility helper itself is finite-input-only.
+
+**Verified OK**
+Explicit nonfinite `drawdown_pct`, `daily_loss_pct`, and `current_position_pct` do reach `_flatten_nonfinite_portfolio`; explicit drawdown/daily-loss breakers flatten to `target_position_pct=0.0` with `halt=True`; finite admissibility rejects never amplify or flip side.

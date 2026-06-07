@@ -35,6 +35,7 @@ Sign conventions:
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -175,8 +176,11 @@ def apply_slippage(
         target_pct < 0 (short): fill_price < decision_price (received less)
         target_pct = 0:         fill_price = decision_price (no fill)
     """
-    if decision_price <= 0:
-        raise ValueError(f"decision_price must be > 0, got {decision_price}")
+    # NaN-fail-CLOSED (deep-review 2026-06-07): reject non-finite decision_price
+    # too, not just <= 0. A NaN/inf would pass `<= 0` (NaN <= 0 is False) and
+    # produce fill_price=NaN, silently corrupting the P&L ledger.
+    if not math.isfinite(decision_price) or decision_price <= 0:
+        raise ValueError(f"decision_price must be finite and > 0, got {decision_price}")
 
     cfg = config if config is not None else config_for_asset_class(asset_class)
 
