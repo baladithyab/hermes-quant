@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -241,6 +242,61 @@ def reset_kill_switch() -> bool:
         return False
 
 
+def compute_cumulative_realized_pnl_pct(
+    executions_path: Path | None = None,
+) -> float:
+    """Cumulative realized P&L as a signed NAV fraction, from the executions bus.
+
+    The kill-switch basis (ADR-0016 §D9). Uses the canonical FIFO matcher
+    (`settlement_loop.join_exit_fills`) so this rail agrees with the daemon's
+    settlement accounting rather than reimplementing lot-matching. Each settled
+    round-trip contributes `realized_return × entry_notional`; we divide the sum
+    by current NAV to express the cumulative loss/gain as a fraction comparable
+    to `kill_switch_pct`.
+
+    Returns a SIGNED fraction: negative = net loss (e.g. -0.12 = down 12% of NAV
+    on realized round-trips). Returns 0.0 on any error or empty book — the rail
+    fails OPEN (does not trip) on a read failure, because tripping the kill-switch
+    on a transient parse error would halt a healthy system. The trip decision in
+    the tick treats 0.0 as "no breach"; a genuinely catastrophic book will still
+    parse and trip. Unrealized (still-open) positions are NOT counted — the
+    kill-switch reacts to LOCKED-IN losses, consistent with "closed-position"
+    semantics in the post-mortem.
+    """
+    try:
+        from hermes_quant.daemon.settlement_loop import join_exit_fills
+
+        path = executions_path or (QUANT_HOME / "executions.jsonl")
+        if not path.exists():
+            return 0.0
+        records: list[dict] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except (ValueError, TypeError):
+                continue
+        if not records:
+            return 0.0
+        round_trips, _open = join_exit_fills(records)
+        realized_pnl_usd = 0.0
+        for rt in round_trips:
+            entry_notional = abs(rt.qty) * abs(rt.entry_price)
+            if not math.isfinite(rt.realized_return) or not math.isfinite(entry_notional):
+                continue
+            realized_pnl_usd += rt.realized_return * entry_notional
+        nav = _account_nav_usd()
+        if nav is None or nav <= 0 or not math.isfinite(nav):
+            return 0.0
+        frac = realized_pnl_usd / nav
+        return frac if math.isfinite(frac) else 0.0
+    except Exception as exc:  # noqa: BLE001 - fail-OPEN: never trip on read error
+        logger.warning("autonomous: cumulative-PnL computation failed: %s", exc)
+        return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Tick orchestration
 # ---------------------------------------------------------------------------
@@ -352,7 +408,8 @@ def tick(
             kill_switch_state=_read_kill_switch(),
         )
 
-    # Kill-switch check
+    # Kill-switch check — STORED state first (operator-tripped or a prior
+    # live-trip). A tripped file always wins and halts the tick.
     ks = _read_kill_switch()
     if ks.tripped:
         return TickResult(
@@ -363,6 +420,43 @@ def tick(
             decisions=[],
             errors=0,
             kill_switch_state=ks,
+        )
+
+    # LIVE kill-switch trip (ADR-0016 §D9). Compute cumulative realized P&L as a
+    # signed NAV fraction; if the loss breaches -kill_switch_pct, trip the switch
+    # and halt. This is the rail that was previously DEAD CODE — the tick only
+    # honored an already-tripped file and never computed live P&L (deep-review
+    # 2026-06-07). On a DRY RUN we DETECT-but-do-not-WRITE (report would_trip in
+    # the returned state; never persist the trip file on the dry path).
+    _ks_threshold = float(_read_safety_rails().get("kill_switch_pct", 0.10))
+    _cum_pnl = compute_cumulative_realized_pnl_pct()
+    if _ks_threshold > 0 and _cum_pnl <= -abs(_ks_threshold):
+        reason = (
+            f"cumulative realized P&L {_cum_pnl:+.4f} breached "
+            f"kill_switch_pct=-{abs(_ks_threshold):.4f}"
+        )
+        if not dry_run:
+            trip_kill_switch(
+                cumulative_pnl_pct=_cum_pnl,
+                threshold_pct=abs(_ks_threshold),
+                reason=reason,
+            )
+            logger.warning("autonomous: LIVE kill-switch TRIPPED — %s", reason)
+        tripped_state = KillSwitchState(
+            tripped=True,
+            tripped_at=asof,
+            cumulative_pnl_pct=_cum_pnl,
+            threshold_pct=abs(_ks_threshold),
+            reason=reason + (" [dry-run: not persisted]" if dry_run else ""),
+        )
+        return TickResult(
+            asof=asof,
+            mode=mode,
+            dry_run=dry_run,
+            watchlist_size=0,
+            decisions=[],
+            errors=0,
+            kill_switch_state=tripped_state,
         )
 
     # Lazy advisor import (avoid heavy deps if dry-run + no symbols)
@@ -386,6 +480,31 @@ def tick(
 
     fires_this_tick = 0
     journal_lessons_cache: dict[str, list[dict]] = {}
+
+    # ADR-0016 §D9 safety rail: max_concurrent_positions. Count the CURRENT open
+    # book once at tick start (independent of the portfolio-caps opt-in flag —
+    # this is a hard safety rail, not a sizing refinement, so it is always on).
+    # reconstruct_portfolio_state() returns {symbol: target_pct} for non-zero
+    # (open) positions only, so len() == current concurrent position count.
+    # Fail-OPEN to 0 only if reconstruction itself errors (never block the tick
+    # on a transient read failure), but log it so the gap is visible.
+    open_positions_at_tick_start = 0
+    open_symbols_at_tick_start: set[str] = set()
+    try:
+        from hermes_quant.portfolio.state import reconstruct_portfolio_state as _recon
+
+        # Read from QUANT_HOME's bus explicitly (not the helper's hard-coded
+        # default) so the rail honors the same home the rest of this module uses
+        # — keeps it test-isolatable via the QUANT_HOME monkeypatch and correct
+        # when the home is reconfigured.
+        _open = _recon(QUANT_HOME / "executions.jsonl").positions
+        open_symbols_at_tick_start = set(_open)
+        open_positions_at_tick_start = len(_open)
+    except Exception as _exc:  # noqa: BLE001 - never block tick on a read error
+        logger.warning(
+            "autonomous: could not count open positions for concurrent-cap rail: %s",
+            _exc,
+        )
 
     # ADR-0071: portfolio-aware Stage-2 sizing. When the operator opts in
     # via HERMES_QUANT_PORTFOLIO_CAPS=1, each fire is clipped greedily
@@ -491,6 +610,31 @@ def tick(
                     ),
                     "would_have_fired": True,
                     "original_gate": gate_result.decision.value,
+                }
+                result.silences += 1
+                result.decisions.append(decision)
+                continue
+
+            # Concurrent-positions safety rail (ADR-0016 §D9). The book already
+            # at the cap must not grow. Count = open positions at tick start +
+            # fires already executed this tick. A FIRE on a symbol we ALREADY
+            # hold is an adjustment (not a new slot), so it is exempt from the
+            # cap — only genuinely-new symbols consume a concurrency slot.
+            max_concurrent = rails["max_concurrent_positions"]
+            is_new_symbol = entry.symbol not in open_symbols_at_tick_start
+            projected_concurrent = open_positions_at_tick_start + fires_this_tick
+            if is_new_symbol and projected_concurrent >= max_concurrent:
+                decision.gate = "SILENCE_CONCURRENT_CAP"
+                decision.details = {
+                    "reason": (
+                        f"max_concurrent_positions={max_concurrent} reached "
+                        f"({open_positions_at_tick_start} open at tick start "
+                        f"+ {fires_this_tick} fired this tick); this NEW-symbol "
+                        "signal would have fired but the book is at the cap"
+                    ),
+                    "would_have_fired": True,
+                    "original_gate": gate_result.decision.value,
+                    "open_positions_at_tick_start": open_positions_at_tick_start,
                 }
                 result.silences += 1
                 result.decisions.append(decision)
