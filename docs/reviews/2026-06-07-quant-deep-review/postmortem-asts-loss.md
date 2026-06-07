@@ -59,13 +59,13 @@ no-stop-loss issues are NOT yet fixed — see Action items.
 
 | # | Action | Owner | Status |
 |---|---|---|---|
-| 1 | Fix 5 NaN-fail-open sites (protocol/slippage/silence_bias/oracle) | done | ✅ this PR |
-| 2 | **Block full-size fires with `stop_loss: None`** in autonomous/HITL path | open | P0 — capital-adjacent |
-| 3 | **BMA: down-weight correlated same-direction voices; cap unanimity confidence** (`bma.py:1049`) | open | P1 |
-| 4 | **Confidence-weight the BMA, don't equal-weight** — a 0.85-conviction contrarian shouldn't be averaged into noise by two 0.3–0.47 voices | open | P1 |
+| 1 | Fix 5 NaN-fail-open sites (protocol/slippage/silence_bias/oracle) | done | ✅ `f22b6b1` |
+| 2 | **Block full-size fires with `stop_loss: None`** in autonomous/HITL path | done | ✅ `660d853` (root-cause trader pct-stop fallback + flag-gated tick backstop) |
+| 3 | **BMA: down-weight correlated same-direction voices; cap unanimity confidence** (`bma.py:1049`) | done | ✅ `c3db1b3` (dissent-aware confidence cap, `HERMES_QUANT_DISSENT_CAP`) |
+| 4 | **Confidence-weight the BMA, don't equal-weight** — a 0.85-conviction contrarian shouldn't be averaged into noise | open | P2 — deferred (higher-blast-radius; the dissent-cap addresses the confidence symptom; conviction-weighting would change *direction* selection and wants its own backtest) |
 | 5 | Semantic propagation: discount `sector_member`-only catalysts vs direct-ticker news | open | P2 |
-| 6 | Enforce `max_concurrent_positions` (currently dead) | open | P1 |
-| 7 | Wire `kill_switch_pct` cumulative-PnL live (currently only honors pre-tripped file) | open | P1 |
+| 6 | Enforce `max_concurrent_positions` (currently dead) | done | ✅ `dea6d27` |
+| 7 | Wire `kill_switch_pct` cumulative-PnL live (currently only honors pre-tripped file) | done | ✅ `dea6d27` |
 
 ## Lesson
 
