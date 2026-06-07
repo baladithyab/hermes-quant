@@ -106,6 +106,19 @@ def _read_safety_rails() -> dict:
         # Consumed by the autonomous tick when constructing RiskConfig and
         # enforced fail-closed in _react() against the active reactor name.
         "paper_zero_costs": bool(risk.get("paper_zero_costs", False)),
+        # Stop-loss backstop (deep-review 2026-06-07, defense-in-depth for the
+        # June-4 ASTS stopless-loss). The trader now derives a stop even without
+        # ATR (root-cause fix), but this is the LAST line: if a FIRE still
+        # arrives with stop_loss=None and a size above the threshold, act.
+        #   require_stop_loss: master enable (default False = byte-identical
+        #     legacy behavior; opt-in so it can be validated before defaulting).
+        #   stopless_max_size_pct: a stopless position is allowed up to this NAV
+        #     fraction; above it, the backstop engages.
+        #   stopless_mode: "size_down" (cap to the threshold, keep trading) or
+        #     "silence" (refuse the trade entirely).
+        "require_stop_loss": bool(auto.get("require_stop_loss", False)),
+        "stopless_max_size_pct": float(auto.get("stopless_max_size_pct", 0.05)),
+        "stopless_mode": str(auto.get("stopless_mode", "size_down")),
     }
 
 
@@ -646,6 +659,46 @@ def tick(
             kelly = float(rg.get("kelly_fraction", 0.0))
             sig = (advisor_result or {}).get("aggregated_signal") or {}
 
+            # Stop-loss backstop (ADR-0016 §D9 defense-in-depth; deep-review
+            # 2026-06-07). Last line against a stopless full-size fire. Opt-in
+            # via rails["require_stop_loss"] (default False = legacy byte-
+            # identical). The trader's root-cause fix should mean stop_loss is
+            # never None here, but if it still is and the would-be size exceeds
+            # the allowed stopless band, either size DOWN to the band or SILENCE.
+            stopless_meta: dict[str, Any] | None = None
+            if rails.get("require_stop_loss"):
+                tp = (advisor_result or {}).get("trader_proposal") or {}
+                stop = tp.get("stop_loss")
+                stopless = stop is None or (
+                    isinstance(stop, (int, float)) and not math.isfinite(float(stop))
+                )
+                limit = float(rails["stopless_max_size_pct"])
+                if stopless and abs(kelly) > limit:
+                    if rails["stopless_mode"] == "silence":
+                        decision.gate = "SILENCE_NO_STOP_LOSS"
+                        decision.details = {
+                            "reason": (
+                                f"stop_loss is None and size {kelly:+.3f} exceeds "
+                                f"stopless_max_size_pct={limit:.3f}; silenced "
+                                "(stopless_mode=silence)"
+                            ),
+                            "would_have_fired": True,
+                            "original_gate": gate_result.decision.value,
+                        }
+                        result.silences += 1
+                        result.decisions.append(decision)
+                        continue
+                    # size_down (default): clamp magnitude to the allowed band,
+                    # preserving direction.
+                    capped = math.copysign(limit, kelly)
+                    stopless_meta = {
+                        "stopless_backstop": True,
+                        "kelly_before": kelly,
+                        "kelly_after": capped,
+                        "stopless_max_size_pct": limit,
+                    }
+                    kelly = capped
+
             # ADR-0071: portfolio-aware Stage-2 clip. Greedy first-come-first-served
             # — earlier picks consume the budget, later picks see the residual room.
             # Order-dependent but operationally simpler than batching the loop.
@@ -740,6 +793,8 @@ def tick(
             }
             if portfolio_clip_meta is not None:
                 decision.action["portfolio_clip"] = portfolio_clip_meta
+            if stopless_meta is not None:
+                decision.action["stopless_backstop"] = stopless_meta
 
             if not dry_run:
                 try:
