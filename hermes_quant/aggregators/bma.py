@@ -132,6 +132,23 @@ class BMAConfig:
     horizon_agreement_bonus: float = HORIZON_AGREEMENT_BONUS
     horizon_disagreement_penalty: float = HORIZON_DISAGREEMENT_PENALTY
 
+    # Dissent-aware confidence cap (deep-review 2026-06-07). The June-4 ASTS
+    # loss fired because the BMA emitted confidence 0.688 LONG while the single
+    # highest-conviction analyst (Kronos, raw 0.85) voted SHORT — equal-weight
+    # vote_share buried a high-conviction dissenter. This does NOT flip the
+    # direction (that is conviction-weighting, a separate higher-blast-radius
+    # change); it refuses to be CONFIDENT when a high-conviction minority
+    # dissents, so the downstream gate/sizer pull back. ENTIRELY gated on
+    # HERMES_QUANT_DISSENT_CAP=1 — when the flag is absent the cap is never
+    # applied and confidence is byte-identical to pre-fix.
+    #   dissent_high_conf_threshold: a dissenting voice at/above this RAW
+    #     confidence is treated as a "high-conviction dissent" that triggers
+    #     the cap. Default 0.70.
+    #   dissent_confidence_ceiling: when triggered, aggregate confidence_raw is
+    #     capped at this value (a haircut, not a flip). Default 0.50.
+    dissent_high_conf_threshold: float = 0.70
+    dissent_confidence_ceiling: float = 0.50
+
 # Canonical persistence location for the bootstrapped IsotonicCalibrator.
 # Mirrors hermes_quant.training.bootstrap_calibrator.DEFAULT_CALIBRATOR_PATH;
 # we don't import that module here to keep the BMA dependency surface clean.
@@ -1060,6 +1077,32 @@ class BMAAggregator:
         else:
             # Multi-contributor with dissent: vote_share only.
             confidence_raw = vote_share
+
+        # Dissent-aware confidence cap (deep-review 2026-06-07). Flag-gated:
+        # HERMES_QUANT_DISSENT_CAP=1. When a voice DISSENTS from the composite
+        # direction with high raw conviction, refuse to be confident about the
+        # aggregate — cap confidence_raw (a haircut, never a direction flip).
+        # This is the surgical fix for the June-4 ASTS loss, where Kronos's
+        # 0.85-conviction SHORT was averaged into a confident 0.688 LONG.
+        if os.environ.get("HERMES_QUANT_DISSENT_CAP") == "1" and composite_direction != 0:
+            dissent_confs = [
+                float(v.confidence_raw)
+                for v in non_flat
+                if v.direction != composite_direction
+                and isinstance(getattr(v, "confidence_raw", None), (int, float))
+                and np.isfinite(float(v.confidence_raw))
+            ]
+            max_dissent = max(dissent_confs) if dissent_confs else 0.0
+            if max_dissent >= self.config.dissent_high_conf_threshold:
+                ceiling = self.config.dissent_confidence_ceiling
+                if confidence_raw > ceiling:
+                    logger.debug(
+                        "BMA dissent-cap: %s confidence_raw %.3f -> %.3f "
+                        "(high-conviction dissent at %.3f)",
+                        context.asset if context else "?",
+                        confidence_raw, ceiling, max_dissent,
+                    )
+                    confidence_raw = ceiling
 
         # Calibrate. CalibratorNotReady fallback uses the same Beta(2,5)
         # prior as ColdStartCalibrator (ADR-0009 §P0-2 amendment 2026-05-26):
