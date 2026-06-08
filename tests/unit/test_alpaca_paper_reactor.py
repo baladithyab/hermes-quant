@@ -447,7 +447,12 @@ def test_reconcile_writes_alpaca_paper_partition(tmp_path, monkeypatch):
 
 
 def test_select_reactor_flag_off_returns_paper(monkeypatch):
+    # Clear BOTH equity-routing flags so the test asserts the documented legacy
+    # default (PaperReactor) hermetically — independent of ambient env. The operator
+    # shell / daemon may export HERMES_QUANT_DETERMINISTIC_EQUITY=1, which would
+    # otherwise correctly route to DeterministicEquityReactor and fail this assertion.
     monkeypatch.delenv("HERMES_QUANT_ALPACA_PAPER", raising=False)
+    monkeypatch.delenv("HERMES_QUANT_DETERMINISTIC_EQUITY", raising=False)
     from hermes_quant.react.dispatch import select_reactor
     from hermes_quant.react.paper import PaperReactor
 

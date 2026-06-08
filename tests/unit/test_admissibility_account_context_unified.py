@@ -184,7 +184,7 @@ def _proposal(*, decision_price: float = 200.0) -> Proposal:
 
 
 @pytest.fixture
-def autonomous_env(monkeypatch):
+def autonomous_env(monkeypatch, tmp_path):
     monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
     monkeypatch.setattr(
         auto,
@@ -195,6 +195,12 @@ def autonomous_env(monkeypatch):
         ),
     )
     monkeypatch.delenv("HERMES_QUANT_PORTFOLIO_CAPS", raising=False)
+    # Isolate QUANT_HOME to an EMPTY tmp book so the always-on concurrent-cap rail
+    # (dea6d27, ADR-0016 §D9) counts 0 open positions and does NOT fire
+    # SILENCE_CONCURRENT_CAP. The rail reads QUANT_HOME/executions.jsonl at tick start;
+    # without this isolation it reads the operator's REAL book and silences the FIRE
+    # under test. The rail was wired live AFTER these tests were authored.
+    monkeypatch.setattr(auto, "QUANT_HOME", tmp_path)
     return monkeypatch
 
 
