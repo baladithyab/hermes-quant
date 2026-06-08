@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from hermes_quant.aggregators.bma import BMAAggregator, BMAConfig
+from hermes_quant.calibrators import IdentityCalibrator
 from hermes_quant.protocol import AnalystView, MarketContext
 
 
@@ -50,7 +51,19 @@ def _asts_panel():
 def _agg():
     # require_ensemble False so the multi-contributor path runs;
     # default dissent thresholds (0.70 trigger, 0.50 ceiling).
-    return BMAAggregator(require_ensemble=False, config=BMAConfig())
+    #
+    # HERMETIC: pin an IdentityCalibrator so the uncapped confidence equals the
+    # raw aggregated vote-share, deterministically. Without this the aggregator
+    # loads whatever IsotonicCalibrator happens to be persisted at
+    # ~/.hermes/quant/calibrators/isotonic.pkl, which makes these assertions
+    # depend on global disk state and test ORDERING (a fitted calibrator left by
+    # an earlier test in the full suite maps the strong panel to ~0.31, below the
+    # 0.50 precondition — the CI combinatorial-pollution failure). Identity
+    # calibration removes that coupling: production code is unchanged; the test
+    # now measures the cap's behavior on a controlled, reproducible input.
+    agg = BMAAggregator(require_ensemble=False, config=BMAConfig())
+    agg.calibrator = IdentityCalibrator()  # type: ignore[assignment]
+    return agg
 
 
 def test_dissent_cap_off_by_default(monkeypatch):
