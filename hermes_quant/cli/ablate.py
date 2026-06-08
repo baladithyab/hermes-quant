@@ -214,7 +214,12 @@ def cmd_ablate(args: argparse.Namespace) -> int:
         "HERMES_QUANT_BORROW_COST": "reactor borrow-carry precondition (downstream of the advisor signal)",
         # Gate/views seams that only bite when a ctx.extras carrier is supplied,
         # which the offline AdvisorStrategy path leaves empty.
-        "HERMES_QUANT_EVENT_RISK": "risk-gate pre-event reject — needs an event_risk payload on ctx.extras / signal metadata",
+        #
+        # NOTE: HERMES_QUANT_EVENT_RISK is NO LONGER here — it is measurable via
+        # the EventRiskAblationStrategy path below (C2a / ADR-0084 follow-up),
+        # which injects an asof-honest synthetic macro calendar into
+        # signal.metadata['event_risk'] so the gate's pre-event blackout guard
+        # genuinely bites. See backtest/event_risk_ablation.py + NOTES_ABLATION.md.
         "HERMES_QUANT_GROUNDING_ENFORCE": "views→aggregator grounding seam — needs a ground_truth_block on ctx.extras",
         # BMA lesson-haircut: real but only bites with an injected loss_lesson
         # provider, which the default hermetic aggregator does not wire.
@@ -320,9 +325,35 @@ def cmd_ablate(args: argparse.Namespace) -> int:
     # full production committee (analysts=None -> _build_default_analysts()).
     from hermes_quant.backtest.strategy import AdvisorStrategy
 
+    _idx = pd.DatetimeIndex(ohlcv.index)
+    _win_start = _idx[0]
+    _win_end = _idx[-1]
+    _event_calendar = None
+    if flag == "HERMES_QUANT_EVENT_RISK":
+        # C2a: make EVENT_RISK genuinely measurable by injecting an asof-honest
+        # synthetic macro calendar (FOMC/CPI/NFP) spanning the ablation window
+        # into signal.metadata['event_risk'], so the gate's pre-event blackout
+        # guard has data to bite on. Without this the flag would toggle a guard
+        # that never fires → a FALSE NULL (which is why the CLI used to refuse it).
+        from hermes_quant.backtest.event_risk_ablation import synthetic_macro_calendar
+
+        # Span the OHLCV window so events land inside the holdout (where returns
+        # are measured). Both legs get the IDENTICAL calendar → the only OFF-vs-ON
+        # difference is the flag value.
+        _event_calendar = synthetic_macro_calendar(_win_start, _win_end)
+
     def _factory():
         # synthetic -> lightweight committee; real -> None (full production loadout).
         analysts = _synthetic_committee() if synthetic else None
+        if _event_calendar is not None:
+            from hermes_quant.backtest.event_risk_ablation import EventRiskAblationStrategy
+
+            return EventRiskAblationStrategy(
+                universe,
+                calendar=_event_calendar,
+                analysts=analysts,
+                learn_from_fills=True,
+            )
         return AdvisorStrategy(universe, analysts=analysts, learn_from_fills=True)
 
     result = run_flag_ablation(

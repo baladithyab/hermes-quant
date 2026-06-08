@@ -146,11 +146,28 @@ and `::test_posterior_persist_ablation_never_writes_real_store`.)
 ## ADMISSIBILITY / EVENT_RISK / BORROW_COST / GROUNDING_ENFORCE
 
 These (ADR-0077 / 0084) are wired on the gate / advisor seams, not the BMA
-fusion. `EVENT_RISK` is measurable through the gate path (it adds a pre-event
-reject condition; it needs an `event_risk` payload on `ctx.extras` / signal
-metadata to bite). `GROUNDING_ENFORCE` acts at the views→aggregator seam and
+fusion.
+
+**`EVENT_RISK` is now GENUINELY MEASURABLE (C2a, 2026-06-08).** It adds a
+pre-event reject condition that reads its carrier from `signal.metadata['event_risk']`
+(`risk/gate.py` ~line 598). The plain `AdvisorStrategy` never populates that
+carrier, so it used to be REFUSED (`NOT_MEASURABLE`) to avoid a false null.
+`hermes_quant/backtest/event_risk_ablation.py` closes the gap:
+`EventRiskAblationStrategy` (an `AdvisorStrategy` subclass) stamps an
+asof-honest synthetic macro calendar (`synthetic_macro_calendar`, FOMC/CPI/NFP,
+reusing the production `CalendarEvent` dataclass so `announced_at <= scheduled_for`
+is enforced by construction) into `signal.metadata['event_risk']` before the
+gate, filtered to `announced_at <= asof` (defense-in-depth no-lookahead). The
+guard then bites on blackout days (verified: ON suppresses ≥1 fresh open vs OFF,
+`d_n_trades < 0`). `cli/ablate.py` routes `HERMES_QUANT_EVENT_RISK` to this
+strategy automatically — no operator action needed. Tests:
+`tests/backtest/test_event_risk_ablation.py` (12 tests: calendar asof-honesty,
+carrier filter, gate stamping, blackout-bites, env no-leakage, CLI-not-refused).
+
+`GROUNDING_ENFORCE` acts at the views→aggregator seam and
 needs a `ground_truth_block` in `ctx.extras` to drop ungrounded views — a
-synthetic OHLCV ablation will show a null unless that block is supplied.
+synthetic OHLCV ablation will show a null unless that block is supplied (still
+REFUSED; same carrier-injection pattern as EVENT_RISK could close it — follow-up).
 `ADMISSIBILITY` / `BORROW_COST` act in the reactor/admissibility precondition,
 downstream of the advisor's signal — measuring them needs a reactor-level
 ablation harness, which is **not built in this lane** (follow-up).

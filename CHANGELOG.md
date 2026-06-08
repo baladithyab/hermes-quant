@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Event-risk ablation measurability** (C2a, ADR-0084 follow-up):
+  `hermes_quant/backtest/event_risk_ablation.py` makes
+  `HERMES_QUANT_EVENT_RISK` genuinely measurable by the flag-ablation harness.
+  `EventRiskAblationStrategy` (an `AdvisorStrategy` subclass) stamps an
+  asof-honest synthetic macro calendar (`synthetic_macro_calendar`, FOMC/CPI/NFP,
+  reusing the production `CalendarEvent` dataclass so `announced_at <=
+  scheduled_for` holds by construction) into `signal.metadata['event_risk']`
+  before the risk gate, filtered to `announced_at <= asof` (no lookahead). The
+  pre-event blackout guard then bites in the ablation (ON suppresses ≥1 fresh
+  open vs OFF; `d_n_trades < 0`). `cli/ablate.py` now routes
+  `HERMES_QUANT_EVENT_RISK` to this strategy instead of refusing it with
+  `NOT_MEASURABLE`. 12 new tests (`tests/backtest/test_event_risk_ablation.py`)
+  lock in calendar asof-honesty, carrier filtering, gate stamping, blackout-bites,
+  env no-leakage, and the CLI-not-refused path. READ-ONLY eval tooling — no
+  production decision path, flag default, or behavior changes. The real-data
+  promote/hold decision still requires `HERMES_QUANT_RUN_BACKTEST=1` over a real
+  macro calendar; C2a built the honest instrument, not a rubber-stamp.
 - **Research notes** (`docs/research/2026-06-08-*`): three cited empirical grounding
   notes for upcoming perception/risk work — the overnight-return anomaly
   (tradeable as a hold-through conviction modulator, NOT a harvestable round-trip;

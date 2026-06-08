@@ -104,3 +104,24 @@ What's MISSING (the real C2 deliverable, larger than "low-med"): a **return-impa
 - **C2b:** enable EVENT_RISK default-ON on the *mechanism's* unit-test strength alone, accepting we have NO return-impact evidence yet. **NOT recommended** on money-software — it's the rubber-stamp the operator explicitly dislikes.
 
 **Decision surfaced to operator.** Do NOT silently pick C2b.
+
+---
+
+## 2026-06-08 (later still) — C2a SHIPPED: EVENT_RISK is now measurable
+
+Built the missing gate-level measurement (operator directive: "make it robust"). The flag-ablation harness now genuinely measures `HERMES_QUANT_EVENT_RISK` instead of refusing it.
+
+**New module** `hermes_quant/backtest/event_risk_ablation.py`:
+- `synthetic_macro_calendar(...)` — deterministic, asof-honest FOMC/CPI/NFP calendar reusing the production `CalendarEvent` dataclass (`announced_at <= scheduled_for` enforced by construction). Release schedules are public ~a year out → asof-honest by construction (the reel's own principle: schedule is knowable, outcome never peeked).
+- `build_event_risk_payload(cal, asof)` — builds the `{"events":[...]}` carrier the gate reads, FILTERED to `announced_at <= asof` (defense-in-depth no-lookahead).
+- `EventRiskAblationStrategy(AdvisorStrategy)` — overrides ONLY `_gate`: stamps the carrier into the frozen `signal.metadata` via `dataclasses.replace` before delegating to the parent gate.
+
+**Wiring** (`cli/ablate.py`): removed `HERMES_QUANT_EVENT_RISK` from the `NOT_MEASURABLE` refusal set; routes it to `EventRiskAblationStrategy` with a window-spanning synthetic calendar. Both OFF/ON legs get the IDENTICAL calendar → only the flag differs.
+
+**Verified the carrier BITES (not a false null):** end-to-end synthetic ablation shows `d_n_trades < 0` — the blackout guard suppresses ≥1 fresh open inside an event window when ON. Verdict flows honestly (HOLD on synthetic GBM — no real event edge there, exactly right).
+
+**Tests:** `tests/backtest/test_event_risk_ablation.py` (12) — calendar asof-honesty, carrier filter (excludes not-yet-announced = no lookahead), gate stamping, blackout-bites-when-ON, env no-leakage, CLI-not-refused. `test_cli_ablate.py` updated (EVENT_RISK moved from refused-list to a new `test_event_risk_is_measurable`). 161 passed in the backtest+event-risk+cli-ablate slice.
+
+**Honest scope:** this measures the guard's MECHANICAL impact on a synthetic calendar — it proves the flag is now eval-gateable, NOT that enabling it improves real returns. The real-data verdict needs `HERMES_QUANT_RUN_BACKTEST=1` + a real macro calendar over a real window (the vendored FOMC seed exists via `load_fomc_seed`). That run is the actual promote/hold decision; C2a built the instrument that makes it honest. `GROUNDING_ENFORCE` remains refused (same carrier-injection pattern would close it — follow-up).
+
+**C2 status: a→ instrument SHIPPED. Promote/hold decision = a real-data ablation run, no longer a rubber-stamp.**
