@@ -33,6 +33,7 @@ import pytest
 from hermes_quant.backtest.event_risk_ablation import (
     EventRiskAblationStrategy,
     build_event_risk_payload,
+    historical_fomc_calendar,
     synthetic_macro_calendar,
 )
 from hermes_quant.catalyst.calendar import CalendarEvent
@@ -79,6 +80,43 @@ def test_calendar_high_impact_only_for_tier1_macro():
 def test_calendar_rejects_inverted_window():
     with pytest.raises(ValueError):
         synthetic_macro_calendar("2024-04-01", "2024-01-01")
+
+
+# ---------------------------------------------------------------------------
+# historical_fomc_calendar — real public-record dates for real-data verdicts
+# ---------------------------------------------------------------------------
+
+
+def test_historical_fomc_calendar_has_8_meetings_per_year():
+    cal = historical_fomc_calendar()
+    # 2023 + 2024 = 16 meetings (the Fed holds 8/year).
+    assert len(cal) == 16
+    years = {e.scheduled_for.year for e in cal}
+    assert years == {2023, 2024}
+    for yr in (2023, 2024):
+        assert sum(1 for e in cal if e.scheduled_for.year == yr) == 8
+
+
+def test_historical_fomc_calendar_is_asof_honest_and_high_impact():
+    cal = historical_fomc_calendar()
+    assert cal == sorted(cal, key=lambda e: e.scheduled_for)
+    for e in cal:
+        assert e.kind == "fomc"
+        assert e.impact == "high"  # FOMC is Tier-1 — bites the blackout
+        assert e.scheduled_for.tzinfo is not None
+        assert e.announced_at.tzinfo is not None
+        assert e.announced_at <= e.scheduled_for  # no lookahead
+        assert e.outcome is None  # outcome-free
+
+
+def test_historical_fomc_known_dates_present():
+    """Spot-check a few well-known FOMC decision days are in the calendar (guards
+    against a typo silently shifting an event off the real decision day)."""
+    cal = historical_fomc_calendar()
+    days = {e.scheduled_for.date().isoformat() for e in cal}
+    # A few hard public-record FOMC decision dates.
+    for known in ("2023-03-22", "2023-07-26", "2024-09-18", "2024-12-18"):
+        assert known in days, known
 
 
 # ---------------------------------------------------------------------------

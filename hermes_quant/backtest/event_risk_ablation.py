@@ -71,6 +71,64 @@ UTC = timezone.utc
 _HIGH_IMPACT_KINDS = frozenset({"fomc", "cpi"})
 
 
+# Public-record FOMC rate-decision dates (day-2 of each two-day meeting), 2023–2024.
+# Source: federalreserve.gov/monetarypolicy/fomccalendars.htm. These are HARD PAST
+# FACTS — used so a real-data ablation over a historical price window has events
+# that actually land inside the window (the production seed at
+# catalyst/fomc_calendar.seed.yaml carries the FORWARD year only). 8 meetings/yr.
+# Decision released 2:00 PM ET (≈18:00 UTC during EDT, 19:00 UTC during EST).
+_HISTORICAL_FOMC_DATES: tuple[str, ...] = (
+    # 2023 (EST→EDT→EST): Feb 1, Mar 22, May 3, Jun 14, Jul 26, Sep 20, Nov 1, Dec 13
+    "2023-02-01", "2023-03-22", "2023-05-03", "2023-06-14",
+    "2023-07-26", "2023-09-20", "2023-11-01", "2023-12-13",
+    # 2024: Jan 31, Mar 20, May 1, Jun 12, Jul 31, Sep 18, Nov 7, Dec 18
+    "2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12",
+    "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
+)
+
+
+def historical_fomc_calendar(
+    *,
+    announce_lead_days: int = 365,
+) -> list[CalendarEvent]:
+    """The real, public-record 2023–2024 FOMC rate-decision dates as CalendarEvents.
+
+    Use this for a REAL-DATA ablation over a 2023–2024 price window: the events
+    land on the actual FOMC decision days, so the pre-event blackout guard fires
+    on the days it would have fired live. Each decision is "announced"
+    ``announce_lead_days`` before it happens — the Fed publishes the annual FOMC
+    schedule ~a year ahead, so 365 days is the honest, conservative anchor (and
+    `CalendarEvent` enforces `announced_at <= scheduled_for`).
+
+    Distinct from `synthetic_macro_calendar` (fabricated dates on a cadence, for
+    offline plumbing tests) and from the production `load_fomc_seed` (the FORWARD
+    year only). This is real historical event placement for a real verdict.
+
+    Returns
+    -------
+    list[CalendarEvent]
+        Sorted by ``scheduled_for``; all HIGH impact (FOMC is Tier-1).
+    """
+    events: list[CalendarEvent] = []
+    lead = timedelta(days=int(announce_lead_days))
+    for d in _HISTORICAL_FOMC_DATES:
+        # 18:00 UTC ≈ 2pm ET (close enough across DST for a 1-day daily-bar window).
+        scheduled_for = _to_utc(d).replace(hour=18, minute=0, second=0, microsecond=0)
+        events.append(
+            CalendarEvent(
+                kind="fomc",
+                scheduled_for=scheduled_for,
+                announced_at=scheduled_for - lead,
+                market="US",
+                impact="high",
+                title=f"FOMC rate decision {d} (historical, 2:00pm ET)",
+                source="historical-fomc-public-record",
+            )
+        )
+    events.sort(key=lambda e: e.scheduled_for)
+    return events
+
+
 def synthetic_macro_calendar(
     start: Any,
     end: Any,

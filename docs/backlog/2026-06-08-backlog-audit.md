@@ -125,3 +125,18 @@ Built the missing gate-level measurement (operator directive: "make it robust").
 **Honest scope:** this measures the guard's MECHANICAL impact on a synthetic calendar — it proves the flag is now eval-gateable, NOT that enabling it improves real returns. The real-data verdict needs `HERMES_QUANT_RUN_BACKTEST=1` + a real macro calendar over a real window (the vendored FOMC seed exists via `load_fomc_seed`). That run is the actual promote/hold decision; C2a built the instrument that makes it honest. `GROUNDING_ENFORCE` remains refused (same carrier-injection pattern would close it — follow-up).
 
 **C2 status: a→ instrument SHIPPED. Promote/hold decision = a real-data ablation run, no longer a rubber-stamp.**
+
+
+---
+
+## 2026-06-08 (final) — C2 CLOSED: real-data EVENT_RISK verdict = HOLD (evidence-backed)
+
+Ran the real-data ablation the C2a instrument enables. **SPY, 2023-01-01 to 2024-12-31, real yfinance bars, real public-record FOMC decision dates** (`historical_fomc_calendar`: the 16 actual 2023-2024 FOMC days, asof-honest, announced_at = scheduled_for minus 365d).
+
+**Verdict: HOLD** (keep EVENT_RISK default-OFF). The carrier genuinely bit (`d_n_trades = -1` — the guard silenced one fresh open on an FOMC day, 63 to 62), and ON was marginally better (Sharpe -7.64 to -7.57, shallower DD), but `d_sharpe +0.075` is below the required `+0.10` and `DSR 0.000` is at-or-below `0.50` — the improvement is within the noise band; not more-likely-than-not a real edge.
+
+**Honest caveat:** the absolute Sharpes are deeply negative (-7.6) because this is a single-symbol SPY passthrough through the eval harness's advisor loadout, NOT a representative live multi-name book — so the absolute magnitudes are a harness artifact. The VERDICT gates on the OFF-vs-ON delta (the valid signal under identical-window/identical-strategy), not the absolute level. On this window the delta does not clear the conservative promote bar.
+
+This is the deliberate opposite of the C2b rubber-stamp: the data does not yet justify enabling the blackout guard, so it stays OFF. Re-run conditions: a multi-name universe, a longer window, or per-event tiering (FOMC-only vs all-Tier-1) could move the delta — but flipping the default now would be unsupported. New `historical_fomc_calendar` helper (plus 3 tests, 15/15 green) makes this verdict reproducible.
+
+**C2 status: CLOSED — instrument built (C2a) plus verdict rendered (HOLD, evidence-backed). EVENT_RISK stays default-OFF until a real-data ablation clears the +0.10 d_sharpe and DSR>0.50 bars.**
