@@ -98,7 +98,7 @@ def _short_advisor(*, kelly: float = -0.20, decision_price: float = 200.0):
 
 
 @pytest.fixture
-def autonomous_env(monkeypatch):
+def autonomous_env(monkeypatch, tmp_path):
     """Put the orchestrator into a state where a FIRE can reach the admissibility
     seam: PDR mode autonomous, kill-switch clear, conservative-but-passable gate."""
     monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
@@ -111,6 +111,13 @@ def autonomous_env(monkeypatch):
     )
     # Disable portfolio caps so the kelly short reaches the admissibility block intact.
     monkeypatch.delenv("HERMES_QUANT_PORTFOLIO_CAPS", raising=False)
+    # Isolate QUANT_HOME to an EMPTY tmp book so the always-on concurrent-cap rail
+    # (dea6d27, ADR-0016 §D9) counts 0 open positions and does NOT fire
+    # SILENCE_CONCURRENT_CAP. The rail reads QUANT_HOME/executions.jsonl at tick start;
+    # without this isolation it reads the operator's REAL book and silences the FIRE
+    # under test. Matches this module's "no ~/.hermes writes" isolation contract — the
+    # rail was wired live AFTER these tests were authored, so the fixture had a gap.
+    monkeypatch.setattr(auto, "QUANT_HOME", tmp_path)
     return monkeypatch
 
 

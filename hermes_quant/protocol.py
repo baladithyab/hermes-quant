@@ -18,11 +18,28 @@ version bump. New fields have sensible defaults. Consumers ignore unknown fields
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import pandas as pd
+
+
+def _finite_or(value: Any, fallback: float) -> float:
+    """Return float(value) only if finite; else `fallback`.
+
+    NaN-fail-open defense (deep-review 2026-06-07): callers pass a fallback that
+    is the SAFE / max-risk value for their context, so a non-finite (NaN/inf)
+    account-state field can never be laundered into a benign finite number that
+    bypasses the risk gate's own finite checks. Used by the drawdown / daily-loss
+    / position-pct properties below.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    return f if math.isfinite(f) else fallback
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -281,22 +298,43 @@ class Portfolio:
 
     @property
     def drawdown_pct(self) -> float:
-        if self.peak_equity <= 0:
-            return 0.0
-        return max(0.0, (self.peak_equity - self.equity_total) / self.peak_equity)
+        # NaN-fail-CLOSED (deep-review 2026-06-07): a non-finite peak_equity or
+        # equity_total must NOT be laundered into a benign 0.0 drawdown — that
+        # would let the gate emit a trade instead of flattening. Return a
+        # sentinel ABOVE any plausible max_drawdown_pct so the Rule-1 circuit
+        # breaker trips (flatten + halt) on unknowable state.
+        peak = _finite_or(self.peak_equity, fallback=float("nan"))
+        eq = _finite_or(self.equity_total, fallback=float("nan"))
+        if not (math.isfinite(peak) and math.isfinite(eq)) or peak <= 0:
+            return 0.0 if (math.isfinite(peak) and peak <= 0) else 1.0
+        return max(0.0, (peak - eq) / peak)
 
     @property
     def daily_loss_pct(self) -> float:
-        if self.daily_open_equity <= 0:
-            return 0.0
-        return max(0.0, (self.daily_open_equity - self.equity_total) / self.daily_open_equity)
+        # NaN-fail-CLOSED: same rationale as drawdown_pct. Non-finite inputs
+        # return a sentinel above any plausible max_daily_loss_pct.
+        base = _finite_or(self.daily_open_equity, fallback=float("nan"))
+        eq = _finite_or(self.equity_total, fallback=float("nan"))
+        if not (math.isfinite(base) and math.isfinite(eq)) or base <= 0:
+            return 0.0 if (math.isfinite(base) and base <= 0) else 1.0
+        return max(0.0, (base - eq) / base)
 
     def current_position_pct(self, asset: str) -> float:
-        """Position size as fraction of total equity. 0 if no position."""
+        """Position size as fraction of total equity. 0 if no position.
+
+        NaN-fail-CLOSED: a non-finite qty / mark_price / equity_total returns a
+        non-finite sentinel so the gate's `_is_finite_number(current)` check
+        trips `_flatten_nonfinite_portfolio` rather than acting on garbage.
+        """
         pos = self.positions.get(asset)
-        if pos is None or self.equity_total <= 0:
-            return 0.0
-        return (pos.qty * pos.mark_price) / self.equity_total
+        eq = _finite_or(self.equity_total, fallback=float("nan"))
+        if pos is None or not math.isfinite(eq) or eq <= 0:
+            return 0.0 if (pos is None and math.isfinite(eq)) else (0.0 if pos is None else float("nan"))
+        qty = _finite_or(pos.qty, fallback=float("nan"))
+        mark = _finite_or(pos.mark_price, fallback=float("nan"))
+        if not (math.isfinite(qty) and math.isfinite(mark)):
+            return float("nan")
+        return (qty * mark) / eq
 
     def is_halted(self, halt_state: HaltState, asset: str | None = None) -> bool:
         """True if (account, asset_class, asset?) is in halt."""

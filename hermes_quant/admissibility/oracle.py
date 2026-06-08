@@ -194,7 +194,7 @@ def evaluate_admissibility(
     # equity is a missing hard-precondition input, not an implicit pass -> REJECT (never assume
     # capable). The offline audit (require_account_context=False) scopes itself to shortability
     # and skips this precondition when equity is absent — but still REJECTS a PRESENT sub-floor.
-    if ctx.account_equity is None:
+    if ctx.account_equity is None or not math.isfinite(ctx.account_equity):
         if require_account_context:
             return ShortabilityVerdict(
                 AdmissibilityState.REJECTED, REASON_MISSING_ACCOUNT_CONTEXT, 0.0
@@ -215,10 +215,10 @@ def evaluate_admissibility(
     # quote we cannot value the order; without BP we cannot prove it fits. Either unknown =>
     # REJECT. The offline audit skips the check ONLY when an input is missing; a PRESENT-and-
     # -failing BP still REJECTS (INSUFFICIENT_BPR), so the audit never under-reports a breach.
-    if ctx.current_ask is None:
+    if ctx.current_ask is None or not math.isfinite(ctx.current_ask):
         if require_account_context:
             return ShortabilityVerdict(AdmissibilityState.REJECTED, REASON_MISSING_QUOTE, 0.0)
-    elif ctx.available_bp is None:
+    elif ctx.available_bp is None or not math.isfinite(ctx.available_bp):
         if require_account_context:
             return ShortabilityVerdict(
                 AdmissibilityState.REJECTED, REASON_MISSING_ACCOUNT_CONTEXT, 0.0

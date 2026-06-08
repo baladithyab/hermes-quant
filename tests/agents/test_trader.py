@@ -396,13 +396,43 @@ class TestTraderNodePriceLevels:
         proposal = node(self._plan("Buy"), signal)
         assert proposal.entry_price is None  # 0 is not positive
 
-    def test_nan_atr_produces_none_stop(self):
-        import math
-        node = TraderNode()
+    def test_nan_atr_falls_back_to_pct_stop(self):
+        # Deep-review 2026-06-07 root-cause fix: ATR unusable (NaN) but we HAVE a
+        # price -> the trader now places a DEFAULT PERCENTAGE stop rather than
+        # leaving stop_loss=None (the June-4 ASTS stopless-loss bug). Previously
+        # this asserted stop_loss is None — that encoded the buggy behavior.
+        node = TraderNode(default_stop_pct=0.08)
         signal = {"metadata": {"last_close": 100.0, "atr_relative": float("nan")}}
         proposal = node(self._plan("Buy"), signal)
         assert proposal.entry_price == pytest.approx(100.0)
-        assert proposal.stop_loss is None
+        assert proposal.stop_loss is not None
+        # 8% below 100 for a BUY = 92
+        assert proposal.stop_loss == pytest.approx(92.0)
+        assert proposal.stop_loss < proposal.entry_price  # type: ignore[operator]
+
+    def test_missing_atr_falls_back_to_pct_stop_buy(self):
+        node = TraderNode(default_stop_pct=0.08)
+        signal = {"metadata": {"last_close": 50.0}}  # no atr_relative at all
+        proposal = node(self._plan("Buy"), signal)
+        assert proposal.stop_loss == pytest.approx(46.0)  # 50 * (1 - 0.08)
+        assert proposal.target_price == pytest.approx(54.0)
+
+    def test_missing_atr_falls_back_to_pct_stop_sell(self):
+        node = TraderNode(default_stop_pct=0.10)
+        signal = {"metadata": {"last_close": 50.0}}
+        proposal = node(self._plan("Sell"), signal)
+        # SELL: stop ABOVE entry = 55; target below = 45
+        assert proposal.stop_loss == pytest.approx(55.0)
+        assert proposal.stop_loss > proposal.entry_price  # type: ignore[operator]
+        assert proposal.target_price == pytest.approx(45.0)
+
+    def test_no_price_still_produces_none_stop(self):
+        # The fallback needs a PRICE; with no price at all, stop stays None
+        # (can't anchor a percentage to nothing). HOLD also stays stopless.
+        node = TraderNode()
+        assert node(self._plan("Buy"), {}).stop_loss is None
+        signal = {"metadata": {"last_close": 100.0, "atr_relative": float("nan")}}
+        assert node(self._plan("Hold"), signal).stop_loss is None
 
 
 # ==========================================================================

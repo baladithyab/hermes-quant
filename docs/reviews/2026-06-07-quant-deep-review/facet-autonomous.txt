@@ -1,0 +1,15 @@
+**HIGH**
+
+- NaN fail-open in autonomous silence-bias gate. `confidence`, `magnitude`, `vol`, and NaN thresholds are not checked with `math.isfinite`; comparisons like `nan < min` are false, so the gate can reach `FIRE`. See [silence_bias.py](/mnt/e/CS/github/hermes-quant/hermes_quant/gates/silence_bias.py:190), [silence_bias.py](/mnt/e/CS/github/hermes-quant/hermes_quant/gates/silence_bias.py:211), [silence_bias.py](/mnt/e/CS/github/hermes-quant/hermes_quant/gates/silence_bias.py:237), [silence_bias.py](/mnt/e/CS/github/hermes-quant/hermes_quant/gates/silence_bias.py:278). The deterministic risk gate is better: it finite-checks risk inputs before action at [gate.py](/mnt/e/CS/github/hermes-quant/hermes_quant/risk/gate.py:623).
+
+- `max_concurrent_positions` is not enforced. It is read into rails at [autonomous.py](/mnt/e/CS/github/hermes-quant/hermes_quant/autonomous.py:94), but only `max_per_tick_opens` is checked before `_react()` at [autonomous.py](/mnt/e/CS/github/hermes-quant/hermes_quant/autonomous.py:483) and [autonomous.py](/mnt/e/CS/github/hermes-quant/hermes_quant/autonomous.py:600). So this is not TOCTOU; the concurrent-position guard is absent.
+
+- `kill_switch_pct` cumulative-PnL threshold is effectively dead code. The tick only honors an already-tripped file at [autonomous.py](/mnt/e/CS/github/hermes-quant/hermes_quant/autonomous.py:355); I found no live cumulative-PnL computation or comparison to `kill_switch_pct`. `_read_kill_switch()` also fail-opens on parse/read errors by returning `tripped=False` at [autonomous.py](/mnt/e/CS/github/hermes-quant/hermes_quant/autonomous.py:204). Monotonicity is not enforced; `trip_kill_switch()` overwrites arbitrary values at [autonomous.py](/mnt/e/CS/github/hermes-quant/hermes_quant/autonomous.py:215).
+
+**MED**
+
+- Malformed config can fail-closed autonomous to `advise`, but the cause is opaque. `autonomous._read_config()` catches YAML/read errors and returns `{}`, then `_read_pdr_mode()` returns `advise` at [autonomous.py](/mnt/e/CS/github/hermes-quant/hermes_quant/autonomous.py:66) and [autonomous.py](/mnt/e/CS/github/hermes-quant/hermes_quant/autonomous.py:75). `quant_autonomous_tick` surfaces `mode_mismatch`, and CLI exits nonzero, so not fully silent, but operators cannot distinguish “intentionally advise” from “config corrupted.” Duplicate `tools._read_pdr_mode()` also swallows parse errors and uses a non-profile-aware path at [tools.py](/mnt/e/CS/github/hermes-quant/hermes_quant/tools.py:288).
+
+**LOW**
+
+- `dry_run=True` does not reach `_react()`, so no `executions.jsonl`, journal, or `PortfolioState.apply_execution()` write path is reached. See [autonomous.py](/mnt/e/CS/github/hermes-quant/hermes_quant/autonomous.py:600), [paper.py](/mnt/e/CS/github/hermes-quant/hermes_quant/react/paper.py:287), [paper.py](/mnt/e/CS/github/hermes-quant/hermes_quant/react/paper.py:305). Caveat: with portfolio caps enabled, dry-run mutates the local reconstructed `portfolio_state.positions` for simulation at [autonomous.py](/mnt/e/CS/github/hermes-quant/hermes_quant/autonomous.py:647); I found no durable state mutation there.

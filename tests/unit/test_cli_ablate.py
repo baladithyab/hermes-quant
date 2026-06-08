@@ -146,12 +146,16 @@ def test_dispatch_routes_ablate(capsys, monkeypatch):
 
 def test_not_measurable_flag_refuses_verdict(capsys, monkeypatch):
     """A reactor/extras-seam flag prints NOT_MEASURABLE, not a confident HOLD —
-    so a null is never misread as a measured rejection (false-NULL guard)."""
+    so a null is never misread as a measured rejection (false-NULL guard).
+
+    NOTE: HERMES_QUANT_EVENT_RISK was REMOVED from this list (C2a, 2026-06-08) —
+    it is now measurable via EventRiskAblationStrategy (carrier injection). See
+    test_event_risk_is_measurable below.
+    """
     monkeypatch.setenv("HERMES_QUANT_RUN_BACKTEST", "1")  # prove it bails BEFORE running
     for flag in (
         "HERMES_QUANT_BORROW_COST",
         "HERMES_QUANT_ADMISSIBILITY",
-        "HERMES_QUANT_EVENT_RISK",
         "HERMES_QUANT_GROUNDING_ENFORCE",
         "HERMES_QUANT_L2_LESSON_HAIRCUT",
     ):
@@ -161,6 +165,19 @@ def test_not_measurable_flag_refuses_verdict(capsys, monkeypatch):
         assert payload["ran"] is False, flag
         assert payload["verdict"] == "NOT_MEASURABLE", flag
         assert "NOTES_ABLATION" in payload["message"], flag
+
+
+def test_event_risk_is_measurable(capsys, monkeypatch):
+    """C2a: HERMES_QUANT_EVENT_RISK is no longer refused — the CLI runs a real
+    OFF-vs-ON ablation via EventRiskAblationStrategy (asof-honest synthetic
+    macro calendar injected into signal.metadata['event_risk'])."""
+    monkeypatch.delenv("HERMES_QUANT_RUN_BACKTEST", raising=False)
+    rc = cmd_ablate(_ns(flag="HERMES_QUANT_EVENT_RISK", synthetic=True, json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True
+    assert payload["verdict"] != "NOT_MEASURABLE"
+    assert payload["verdict"] in {"PROMOTE", "HOLD"}
 
 
 def test_measurable_flag_is_not_blocked_by_guard(capsys, monkeypatch):

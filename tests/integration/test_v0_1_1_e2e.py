@@ -142,11 +142,15 @@ class TestE2ETickEmits:
         signals = [r for r in records if r.get("type") != "heartbeat"]
         assert len(signals) >= 1
         sig = signals[-1]
-        # ADR-0008 schema
-        assert sig["schema_version"] == 1
+        # ADR-0008 schema, bumped to v2 by ADR-0068 (split bar_ts replay anchor
+        # from asof_decision wall-clock; `asof` retains its v1 meaning == bar_ts).
+        assert sig["schema_version"] == 2
         assert sig["asset"] == "BTC/USDT"
         assert "id" in sig
         assert "asof" in sig
+        # ADR-0068 explicit aliases must be present on a v2 record.
+        assert "bar_ts" in sig, "ADR-0068 bar_ts missing from v2 bus record"
+        assert "asof_decision" in sig, "ADR-0068 asof_decision missing from v2 bus record"
         assert sig["direction"] in (-1, 1)
         assert "target_position_pct" in sig
         assert "components" in sig

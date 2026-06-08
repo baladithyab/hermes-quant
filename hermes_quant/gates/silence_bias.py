@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import UTC
 from typing import Any
@@ -187,8 +188,11 @@ def silence_bias_gate(
         )
 
     # ---- Dim 1: Confidence ----
+    # NaN-fail-CLOSED (deep-review 2026-06-07): a non-finite confidence must
+    # SILENCE, not slip through. `NaN < min_confidence` is False, so without the
+    # explicit finite check a NaN confidence would pass this gate dim toward FIRE.
     confidence = float(sig.get("confidence", 0.0))
-    if confidence < cfg.min_confidence:
+    if not math.isfinite(confidence) or confidence < cfg.min_confidence:
         return GateResult(
             decision=GateDecision.SILENCE_LOW_CONFIDENCE,
             details={
@@ -238,7 +242,10 @@ def silence_bias_gate(
         vol = 0.01
     urgency = abs(expected_signed_edge) / vol
 
-    if urgency < cfg.min_urgency:
+    # NaN-fail-CLOSED (deep-review 2026-06-07): a non-finite urgency (from a NaN
+    # magnitude/confidence/vol) must SILENCE. `NaN < min_urgency` is False, so
+    # without this check a NaN urgency would slip through toward FIRE.
+    if not math.isfinite(urgency) or urgency < cfg.min_urgency:
         return GateResult(
             decision=GateDecision.SILENCE_LOW_URGENCY,
             details={

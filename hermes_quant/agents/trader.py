@@ -92,6 +92,14 @@ _RATING_HORIZON_DAYS: dict[str, int] = {
 # Default ATR multiplier for stop placement
 _ATR_STOP_MULTIPLIER: float = 2.0
 
+# Default percentage stop used when ATR is unavailable but we DO have a price.
+# Root-cause fix (deep-review 2026-06-07): the June-4 ASTS loss ran with
+# stop_loss=None because ATR was missing and the trader left the stop unset. A
+# stopless position has no invalidation level, so a -21% move ran uncapped. With
+# a price but no ATR we now place a default 8% stop (a reasonable single-name
+# equity invalidation band) rather than emitting None. Tunable per-instance.
+_DEFAULT_STOP_PCT: float = 0.08
+
 # Conservative fallback values when inputs are incomplete
 _FALLBACK_SIZE: float = 0.05
 _FALLBACK_CONF: float = 0.50
@@ -258,8 +266,13 @@ class TraderNode:
             Stop = entry ± (atr_multiplier × ATR_absolute).
     """
 
-    def __init__(self, atr_multiplier: float = _ATR_STOP_MULTIPLIER) -> None:
+    def __init__(
+        self,
+        atr_multiplier: float = _ATR_STOP_MULTIPLIER,
+        default_stop_pct: float = _DEFAULT_STOP_PCT,
+    ) -> None:
         self.atr_multiplier = atr_multiplier
+        self.default_stop_pct = default_stop_pct
 
     def __call__(
         self,
@@ -393,6 +406,19 @@ class TraderNode:
                 stop_loss = last_close + stop_dist
                 target_price = last_close - stop_dist
             # HOLD: no meaningful stop/target from ATR alone
+        elif last_close is not None and action in (TraderAction.BUY, TraderAction.SELL):
+            # Root-cause fix (deep-review 2026-06-07): ATR missing but we have a
+            # price — fall back to a default PERCENTAGE stop rather than leaving
+            # stop_loss=None. A stopless position has no invalidation level (the
+            # June-4 ASTS -21% loss ran uncapped for exactly this reason). The
+            # default band is wider/cruder than an ATR stop but bounds the loss.
+            stop_dist = self.default_stop_pct * last_close
+            if action == TraderAction.BUY:
+                stop_loss = max(last_close - stop_dist, 0.01)
+                target_price = last_close + stop_dist
+            else:  # SELL
+                stop_loss = last_close + stop_dist
+                target_price = max(last_close - stop_dist, 0.01)
 
         return entry_price, stop_loss, target_price
 

@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Event-risk ablation measurability** (C2a, ADR-0084 follow-up):
+  `hermes_quant/backtest/event_risk_ablation.py` makes
+  `HERMES_QUANT_EVENT_RISK` genuinely measurable by the flag-ablation harness.
+  `EventRiskAblationStrategy` (an `AdvisorStrategy` subclass) stamps an
+  asof-honest synthetic macro calendar (`synthetic_macro_calendar`, FOMC/CPI/NFP,
+  reusing the production `CalendarEvent` dataclass so `announced_at <=
+  scheduled_for` holds by construction) into `signal.metadata['event_risk']`
+  before the risk gate, filtered to `announced_at <= asof` (no lookahead). The
+  pre-event blackout guard then bites in the ablation (ON suppresses ≥1 fresh
+  open vs OFF; `d_n_trades < 0`). `cli/ablate.py` now routes
+  `HERMES_QUANT_EVENT_RISK` to this strategy instead of refusing it with
+  `NOT_MEASURABLE`. 12 new tests (`tests/backtest/test_event_risk_ablation.py`)
+  lock in calendar asof-honesty, carrier filtering, gate stamping, blackout-bites,
+  env no-leakage, and the CLI-not-refused path. READ-ONLY eval tooling — no
+  production decision path, flag default, or behavior changes. The real-data
+  promote/hold decision still requires `HERMES_QUANT_RUN_BACKTEST=1` over a real
+  macro calendar; C2a built the honest instrument, not a rubber-stamp.
+- **Research notes** (`docs/research/2026-06-08-*`): three cited empirical grounding
+  notes for upcoming perception/risk work — the overnight-return anomaly
+  (tradeable as a hold-through conviction modulator, NOT a harvestable round-trip;
+  L/S cross-sectional dies to cost), scheduled macro-event risk (pre-FOMC drift =
+  ~80% of the equity premium → blackout NEW opens but HOLD existing through events;
+  tier FOMC ≥ CPI > NFP ≈ PPI), and a defined-risk LEAPS convex sleeve (small stock
+  beats LEAPS on high-IV illiquid names; LEAPS only earn their place on liquid,
+  normalized-IV names). Doc-only; no code/behavior change.
+- **Backlog audit** (`docs/backlog/2026-06-08-backlog-audit.md`): ground-state +
+  prioritized backlog snapshot.
+
+### Fixed
+- **Test isolation** (`b7ff2ad`): repaired 9 false "regressions" on
+  `fix/bma-dissent-cap` — all test-isolation gaps, not behavioral bugs. (1) The
+  always-on concurrent-cap rail (ADR-0016 §D9) reads `QUANT_HOME/executions.jsonl`
+  at tick start; the `autonomous_env` fixtures now isolate `QUANT_HOME → tmp_path`
+  so the rail counts an empty book instead of the operator's real positions.
+  (2) Default-path `select_reactor()` tests now clear BOTH equity-routing flags
+  (`HERMES_QUANT_ALPACA_PAPER` + `HERMES_QUANT_DETERMINISTIC_EQUITY`) so they assert
+  the legacy `PaperReactor` default hermetically regardless of ambient operator env.
+  Zero production-code changes.
+- **Stale schema assertion** (`tests/integration/test_v0_1_1_e2e.py`): bus
+  `schema_version` expectation updated 1 → 2 per ADR-0068 (split `bar_ts` replay
+  anchor from `asof_decision` wall-clock); added explicit `bar_ts` / `asof_decision`
+  presence assertions on the v2 record.
+
+### Build
+- `pytest-timeout>=2.1` materialized in `uv.lock` (already declared in
+  `pyproject.toml` dev deps; per-test default 300s, override via
+  `@pytest.mark.timeout(N)`).
+
 ## [0.6.4] — 2026-06-01
 
 This release consolidates the 0.5.x → 0.6.4 line. Headline since 0.4.4 (see

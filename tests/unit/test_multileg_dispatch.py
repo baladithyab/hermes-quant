@@ -74,7 +74,13 @@ def _ml() -> MultiLegProposal:
     )
 
 
-def test_equity_proposal_routes_to_paper() -> None:
+def test_equity_proposal_routes_to_paper(monkeypatch) -> None:
+    # Clear BOTH equity-routing flags so this asserts the documented legacy default
+    # (PaperReactor) hermetically — the operator shell / daemon may export
+    # HERMES_QUANT_DETERMINISTIC_EQUITY=1, which correctly routes to the deterministic
+    # reactor and would otherwise fail this default-path assertion.
+    monkeypatch.delenv("HERMES_QUANT_ALPACA_PAPER", raising=False)
+    monkeypatch.delenv("HERMES_QUANT_DETERMINISTIC_EQUITY", raising=False)
     assert isinstance(select_reactor(_EquityProposal()), PaperReactor)
     assert is_multi_leg_proposal(_EquityProposal()) is False
 
