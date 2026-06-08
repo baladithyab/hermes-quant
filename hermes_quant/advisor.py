@@ -384,6 +384,24 @@ def _build_default_analysts() -> list[Any]:
         except ImportError:
             pass
 
+    # ADR-0089: OvernightDriftAnalyst — a zero-turnover conviction modulator on
+    # hold-through-close daily positions. DEFAULT-OFF behind
+    # HERMES_QUANT_OVERNIGHT_DRIFT (read at call time, mirroring the flags above).
+    # With the flag absent the analyst is never constructed and the roster is
+    # byte-identical to today. When enabled it emits a PEER AnalystView (the
+    # trailing overnight-minus-intraday spread nudges the daily long thesis); it
+    # never sizes, never proposes a round-trip, and is subject to the same BMA
+    # dissent-aware capping as every analyst. Stays default-OFF until a real-data
+    # flag-ablation clears the promote bar (ADR-0089 acceptance gate; the C2
+    # EVENT_RISK HOLD is the precedent).
+    if os.environ.get("HERMES_QUANT_OVERNIGHT_DRIFT", "0") == "1":
+        try:
+            from hermes_quant.analysts.overnight_drift import OvernightDriftAnalyst
+
+            analysts.append(OvernightDriftAnalyst())
+        except ImportError:
+            pass
+
     # ADR-0080 / seed 908e (anti-overfit lane L3): DSR/walk-forward OOS ADMISSION
     # gate for analysts joining the committee. Factors clear this eval-gate before
     # any live weight; analysts previously joined with NO overfit check. DEFAULT-OFF

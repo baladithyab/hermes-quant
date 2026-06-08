@@ -1,6 +1,6 @@
 # ADR-0089: OvernightDriftAnalyst — a zero-turnover conviction modulator on hold-through-close daily positions
 
-**Status:** Proposed (2026-06-08) — design pinned, NOT yet implemented
+**Status:** Proposed (2026-06-08) — IMPLEMENTED + eval-gated; analyst stays DEFAULT-OFF (real-data ablation returned HOLD, see Acceptance gate)
 **Date:** 2026-06-08
 **Wave:** Perception extension (overnight-drift awareness; default-OFF, eval-gated)
 **Supersedes:** nothing
@@ -65,7 +65,30 @@ An `OvernightDriftAnalyst` that, per name, computes the trailing rolling overnig
 - Risk of scope-creep into Option B. Mitigated by D-2 (zero-turnover is a hard design invariant; a round-trip proposal is out of scope by ADR).
 
 ## Acceptance gate (must be green before status → Accepted)
-1. `OvernightDriftAnalyst` emits an asof-honest `AnalystView` (trailing rolling spread; reads only bars ≤ asof). Unit-tested for no-lookahead.
-2. Wired into the loadout behind `HERMES_QUANT_OVERNIGHT_DRIFT=1` ONLY; flag-OFF is byte-identical (test).
-3. Zero-turnover invariant test: enabling the analyst changes conviction/weights but introduces NO new open/close round-trip vs the flag-OFF book.
-4. A real-data flag-ablation (C2a-style carrier harness, the OvernightDrift flag) clears `d_sharpe ≥ +0.10` AND `DSR > 0.50` on a representative window. Until then it stays default-OFF — measured, not assumed (the C2 EVENT_RISK HOLD is the precedent).
+1. ✅ `OvernightDriftAnalyst` emits an asof-honest `AnalystView` (trailing rolling spread; reads only bars ≤ asof). Unit-tested for no-lookahead. — DONE (`hermes_quant/analysts/overnight_drift.py`; `tests/unit/test_overnight_drift_analyst.py::test_no_lookahead_future_bar_does_not_change_view`).
+2. ✅ Wired into the loadout behind `HERMES_QUANT_OVERNIGHT_DRIFT=1` ONLY; flag-OFF is byte-identical (test). — DONE (`advisor._build_default_analysts`; `test_loadout_excludes_when_flag_off` / `..._includes_when_flag_on`).
+3. ✅ Zero-turnover invariant: enabling the analyst modulates conviction but the view never proposes a round-trip. — DONE (long-only-nudge default + `zero_turnover` metadata tag; `test_zero_turnover_invariant_on_every_view`, `test_intraday_tilt_abstains_in_long_only_mode`).
+4. ❌→ **HOLD (real-data verdict, 2026-06-08).** The flag-ablation (SPY 2023-01-01→2024-12-31, real yfinance bars, full production loadout, OFF vs ON) returned:
+
+   | | OFF | ON | Δ |
+   |---|---|---|---|
+   | Sharpe | −7.642 | −8.530 | **−0.887** |
+   | n_trades | 63 | 75 | +12 |
+   | max drawdown | −0.0126 | −0.0149 | worse |
+   | DSR | 0.000 | 0.000 | — |
+
+   **Verdict: HOLD — keep DEFAULT-OFF.** Enabling the analyst on this window
+   *worsened* Sharpe (−0.887, far below the required +0.10) and ADDED trades — the
+   LONG nudge added conviction that didn't pay off, consistent with the spike's
+   finding that SPY's overnight tilt was weak (+1.6% ann) and the high-beta names
+   were intraday-driven in 2023–2024. **This is the eval-gate working as designed:**
+   the analyst is built, correct, and unit-tested, but the data says it does not
+   earn a live default on this window — caught BEFORE any capital moved.
+
+   **Re-open conditions** (what would flip HOLD→PROMOTE in a future ablation): a
+   universe weighted toward the strong-overnight cohort the research identifies
+   (high-retail-attention / meme / ARKK-like names, NOT broad SPY), a longer window
+   with more regime variety, or a tuned `spread_to_conf_scale` / `min_abs_spread`
+   so the nudge fires only on a clearly-positive tilt. Until a real-data ablation
+   clears `d_sharpe ≥ +0.10` AND `DSR > 0.50`, it stays OFF — measured, not assumed
+   (the C2 EVENT_RISK HOLD is the precedent; same conservative bar).
