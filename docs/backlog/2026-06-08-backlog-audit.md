@@ -88,3 +88,19 @@ C4 (full from-reel pipeline, ADR-0030) is a large separate build — flagged, no
 deferred. It is the strategic home for reel ingestion but is its own multi-wave effort;
 this directive's reel links are handled in the near term via C1/C2/C3 + a methodology-stub,
 with C4 recommended as the next major initiative.
+
+---
+
+## 2026-06-08 (later) — Wave progress + C2 honest re-scope
+
+**Wave 0 DONE.** A1 (`target_weight.py`) committed `98fd52c`; A2 CHANGELOG done. B5 (`fix/bma-dissent-cap`) → **PR #75**, rebased onto current main (incl. #72/#73/#74), 8 commits, **4151 passed / 0 failed minus Kronos**, auto-merge watchdog armed (`pr75-automerge` cron, 3min). The "9 regressions" were false — test-isolation gaps, fixed `b7ff2ad`, zero prod-code change.
+
+**C2 re-scoped — HONEST FINDING (changes the estimate):** The audit assumed C2 = "evaluate → eval-gate → enable → tune (low-med)" using the #74 ablation harness. **The harness REFUSES `HERMES_QUANT_EVENT_RISK` by design** — `cli/ablate.py` returns `verdict: NOT_MEASURABLE` because the offline `AdvisorStrategy` path doesn't populate `ctx.extras['event_risk']`, so an ablation would print a misleading null. Confirmed empirically (JSON verdict) + in `NOTES_ABLATION.md` §146.
+
+What IS solid: the event-risk **mechanism** is fully unit-tested and green — `test_event_risk_guard.py` + `test_event_risk_carrier.py` + `test_event_risk_builder.py` = **58/58 pass**. The `in_event_blackout` predicate, the ctx.extras carrier, and perception wiring all work and are asof-honest (ADR-0084 Negative: missing data ⇒ NO blackout, never fabricated).
+
+What's MISSING (the real C2 deliverable, larger than "low-med"): a **return-impact measurement**. We can't eval-gate "should we enable EVENT_RISK" without a gate/reactor-level ablation that injects a synthetic event_risk carrier (e.g. a synthetic FOMC-blackout day) and measures OFF-vs-ON Sharpe/DSR on a window containing the event. Two honest paths:
+- **C2a (recommended):** build a small gate-level event-risk ablation (inject carrier → measure blackout-new/hold-existing impact). Bounded — carrier schema + predicate already exist. Turns "flip and hope" into real evidence. New ADR or extend ADR-0084.
+- **C2b:** enable EVENT_RISK default-ON on the *mechanism's* unit-test strength alone, accepting we have NO return-impact evidence yet. **NOT recommended** on money-software — it's the rubber-stamp the operator explicitly dislikes.
+
+**Decision surfaced to operator.** Do NOT silently pick C2b.
