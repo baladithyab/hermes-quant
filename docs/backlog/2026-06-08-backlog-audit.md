@@ -140,3 +140,20 @@ Ran the real-data ablation the C2a instrument enables. **SPY, 2023-01-01 to 2024
 This is the deliberate opposite of the C2b rubber-stamp: the data does not yet justify enabling the blackout guard, so it stays OFF. Re-run conditions: a multi-name universe, a longer window, or per-event tiering (FOMC-only vs all-Tier-1) could move the delta — but flipping the default now would be unsupported. New `historical_fomc_calendar` helper (plus 3 tests, 15/15 green) makes this verdict reproducible.
 
 **C2 status: CLOSED — instrument built (C2a) plus verdict rendered (HOLD, evidence-backed). EVENT_RISK stays default-OFF until a real-data ablation clears the +0.10 d_sharpe and DSR>0.50 bars.**
+
+
+---
+
+## 2026-06-08 — GROUNDING_ENFORCE measurability DEFERRED (decision, not built)
+
+Considered applying the C2a carrier-injection pattern to make `HERMES_QUANT_GROUNDING_ENFORCE` measurable too. **Deferred** after scoping — it is lower-value than C1 right now:
+
+- GROUNDING_ENFORCE acts at the views→aggregator seam (`grounding/enforcement.py::enforce_grounding`), dropping views that opted into grounding (`with_grounding`/`ground_truth_symbol`/`citation_ids` markers) whose numeric claims fail citation against `ctx.extras['ground_truth_block']`. ONLY `HermesSemanticAnalyst` produces such views.
+- A measurement fixture needs FOUR coupled pieces: a semantic packet with a numeric claim, a `ground_truth_block` that fails to cite it, the semantic analyst in the committee, AND wiring the `enforce_grounding` call (which `AdvisorStrategy` does NOT currently make — it's only in `advisor.recommend()` lines 653/1047). vs EVENT_RISK's single-seam `signal.metadata` stamp.
+- It gates a subsystem (semantic analyst, ADR-0074) that is ITSELF default-OFF and eval-gated — measuring a flag that gates an already-disabled path is third-order value.
+
+The carrier-injection PATTERN is proven and documented (wiki) and remains the right approach when GROUNDING_ENFORCE measurement is prioritized. Not abandoned — sequenced behind C1 (a real signal affecting every name vs a semantic-only path).
+
+## 2026-06-08 — C1 ADR-0089 written (OvernightDriftAnalyst, design pinned)
+
+`docs/adr/ADR-0089-overnight-drift-conviction-modulator.md` (Proposed). Grounded in the research note + a read-only spike (SPY/AAPL/TSLA/GME/KO, 2023-24 real bars). Design: zero-turnover conviction modulator on hold-through-close daily positions (NOT a round-trip L/S sleeve — that form dies to cost), default-OFF, eval-gated, no new feed (overnight = open[t]/close[t-1]-1 from existing bars). Spike surfaced a load-bearing nuance: the overnight/intraday tilt is REGIME/PERIOD-dependent (intraday dominated the high-beta names in 2023-24, opposite the meme-cohort overnight tilt of the longer-horizon studies) — ratifies the trailing-rolling-spread (adaptive, not static-cohort) design. ADR carries a 4-point acceptance gate; implementation deferred to its own branch. C1 status: design pinned (ADR), build deferred.
