@@ -169,3 +169,16 @@ Built C1 on `feat/overnight-drift-analyst` (PR #76, off clean post-#75 main). `h
 **C1 status: CLOSED — analyst built + unit-tested + measured. OVERNIGHT_DRIFT stays default-OFF (HOLD). ADR-0089 status: IMPLEMENTED + eval-gated.**
 
 **Both perception-extension flags from the reels (C2 EVENT_RISK, C1 OVERNIGHT_DRIFT) are now BUILT, MEASURED, and HOLD — the measure-then-promote discipline held on both: neither earned a live default on the conservative bar, and both stay OFF with documented re-open conditions. Zero rubber-stamps.**
+
+## 2026-06-08 — Multi-name FAIR re-test of both perception flags (eval-honesty)
+
+The single-SPY HOLD verdicts for EVENT_RISK + OVERNIGHT_DRIFT were on a degenerate universe (each verdict doc flagged it). Built `scripts/quant-multiname-ablation.py` (committed + 3 unit tests) — the harness already supported multi-name via (field,symbol) MultiIndex ohlcv; single-symbol was a choice. Re-ran both on representative cohorts:
+
+- **OVERNIGHT_DRIFT** (QQQ/ARKK/TSLA/NVDA/GME/COIN): HOLD, **decisively worse** — d_sharpe −1.273, +100 trades, win-rate 76%→54%. NOT a universe artifact; conclusively default-OFF. Re-open now needs signal re-design, not a universe.
+- **EVENT_RISK** (SPY/QQQ/TLT/XLF/IWM): HOLD, but **Sharpe gate NOW CLEARS** (d_sharpe +0.231 > +0.10; single-SPY was +0.075). Holds only on the DSR sub-gate, which is suspect under the passthrough's deeply-negative absolute Sharpe. **Now the leading PROMOTE candidate** — blocked only by DSR. Next: a sizing-aware multi-name portfolio harness so DSR is meaningful, then re-judge. NOT enabled.
+
+Full card: `docs/research/2026-06-08-multiname-fair-verdict-retest.md`. **The single→multi-name re-test changed the picture for BOTH flags — proof that fair evaluation was worth doing before building anything new.** Next backlog candidate identified: sizing-aware multi-name backtest harness (to de-artifact the DSR gate and unblock the EVENT_RISK promote decision).
+
+## 2026-06-08 — ADR-0090 written: sizing-aware portfolio backtest mode (Proposed, build deferred)
+
+The multi-name re-test surfaced that the EVENT_RISK promote decision is BLOCKED by a harness limitation, not the flag: DSR is the PSR of the observed leg Sharpe, and the passthrough's −11.43 absolute Sharpe makes DSR≈0.000 un-passable by construction — even though EVENT_RISK's Sharpe-DELTA gate cleared (+0.231). `docs/adr/ADR-0090-sizing-aware-portfolio-backtest-mode.md` proposes a portfolio backtest mode (target-weight construction + rebalancing + turnover-on-delta costing + exposure accounting) so the absolute Sharpe is non-degenerate and the DSR gate becomes meaningful for ALL flags. **Status: Proposed, build DEFERRED to operator greenlight** — it's a substantial new harness mode with money-software design choices (wrong cost model flatters every flag), warranting its own branch + test suite + checkpoint rather than a silent mid-session embark. This is the identified highest-value next step on the quant eval lane; it directly unblocks the stuck EVENT_RISK promote/HOLD decision.

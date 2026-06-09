@@ -1,6 +1,6 @@
 # ADR-0089: OvernightDriftAnalyst — a zero-turnover conviction modulator on hold-through-close daily positions
 
-**Status:** Proposed (2026-06-08) — IMPLEMENTED + eval-gated; analyst stays DEFAULT-OFF (real-data ablation returned HOLD, see Acceptance gate)
+**Status:** Proposed (2026-06-08) — IMPLEMENTED + eval-gated; analyst stays DEFAULT-OFF. Single-SPY ablation returned HOLD; **multi-name fair re-test (QQQ/ARKK/TSLA/NVDA/GME/COIN) CONFIRMS HOLD decisively** (d_sharpe −1.273, worse on every axis even on the research-favored cohort). Re-open now needs signal RE-DESIGN, not a universe change. See Acceptance gate + `docs/research/2026-06-08-multiname-fair-verdict-retest.md`.
 **Date:** 2026-06-08
 **Wave:** Perception extension (overnight-drift awareness; default-OFF, eval-gated)
 **Supersedes:** nothing
