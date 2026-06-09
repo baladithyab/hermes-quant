@@ -232,3 +232,60 @@ def test_loadout_includes_when_flag_on(monkeypatch):
 
     names = [getattr(a, "name", "?") for a in _build_default_analysts()]
     assert "overnight-drift" in names
+
+
+# ---------------------------------------------------------------------------
+# Scope guard (Codex review #76 P2): abstain outside declared 1d-equity/etf scope
+# ---------------------------------------------------------------------------
+
+
+def test_abstains_on_non_daily_timeframe():
+    """recommend_multi_horizon() runs every analyst for each horizon (incl. '1w');
+    a weekly-resampled open/close is NOT an overnight spread -> must abstain."""
+    a = OvernightDriftAnalyst()
+    ctx = _ctx(_overnight_tilted())
+    ctx_wk = MarketContext(
+        asset=ctx.asset, timeframe="1w", asset_class="equity", exchange=None,
+        bars=ctx.bars, last_close=ctx.last_close, last_volume=ctx.last_volume, asof=ctx.asof,
+    )
+    assert a.analyze(ctx_wk) is None
+    # sanity: the same bars on the in-scope 1d context DO emit (guard is scope, not data)
+    assert a.analyze(ctx) is not None
+
+
+def test_abstains_on_non_equity_asset_class():
+    a = OvernightDriftAnalyst()
+    ctx = _ctx(_overnight_tilted())
+    ctx_crypto = MarketContext(
+        asset="BTC/USDT", timeframe="1d", asset_class="crypto", exchange=None,
+        bars=ctx.bars, last_close=ctx.last_close, last_volume=ctx.last_volume, asof=ctx.asof,
+    )
+    assert a.analyze(ctx_crypto) is None
+
+
+def test_etf_asset_class_is_in_scope():
+    a = OvernightDriftAnalyst()
+    ctx = _ctx(_overnight_tilted())
+    ctx_etf = MarketContext(
+        asset="SPY", timeframe="1d", asset_class="etf", exchange=None,
+        bars=ctx.bars, last_close=ctx.last_close, last_volume=ctx.last_volume, asof=ctx.asof,
+    )
+    assert a.analyze(ctx_etf) is not None
+
+
+# ---------------------------------------------------------------------------
+# Canonical recommend() roster wiring (Codex review #76 P2)
+# ---------------------------------------------------------------------------
+
+
+def test_recommend_inline_roster_includes_flag():
+    """The canonical advisor.recommend() builds its OWN inline default roster
+    (not _build_default_analysts). The flag must reach BOTH so operator
+    recommendations + flag ablations through recommend() exercise ADR-0089."""
+    import inspect
+
+    import hermes_quant.advisor as adv
+
+    src = inspect.getsource(adv.recommend)
+    assert "HERMES_QUANT_OVERNIGHT_DRIFT" in src
+    assert "OvernightDriftAnalyst" in src

@@ -1021,6 +1021,20 @@ def recommend(
                 analysts.append(HermesSemanticAnalyst())
             except ImportError:
                 pass
+        # ADR-0089: OvernightDriftAnalyst — default-OFF behind
+        # HERMES_QUANT_OVERNIGHT_DRIFT. Mirrored from _build_default_analysts()
+        # so the canonical recommend() surface (operator tool calls + flag
+        # ablations through recommend()) actually exercises the flag, not just
+        # the recommend_multi_horizon()/backtest helper path. The analyst
+        # self-scopes to 1d equity/etf (see its analyze() scope guard), so it is
+        # safe to construct here and abstains in any non-matching context.
+        if os.environ.get("HERMES_QUANT_OVERNIGHT_DRIFT", "0") == "1":
+            try:
+                from hermes_quant.analysts.overnight_drift import OvernightDriftAnalyst
+
+                analysts.append(OvernightDriftAnalyst())
+            except ImportError:
+                pass
 
     views: list[AnalystView] = []
     for analyst in analysts:

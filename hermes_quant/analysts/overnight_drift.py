@@ -122,6 +122,21 @@ class OvernightDriftAnalyst:
             if "open" not in bars.columns or "close" not in bars.columns:
                 return None
 
+            # SCOPE GUARD (ADR-0089): this analyst is a DAILY EQUITY/ETF
+            # hold-through-close modulator. recommend_multi_horizon() runs every
+            # analyst for each requested horizon (default ('1d','1w')) and
+            # injected providers can drive other asset classes — so we MUST
+            # abstain outside our declared scope rather than treating, e.g., a
+            # weekly-resampled open/close as an "overnight" spread (which it is
+            # not). The class-level timeframes/asset_classes are advertised
+            # metadata; this enforces them at the analyze() seam.
+            tf = getattr(ctx, "timeframe", None)
+            ac = getattr(ctx, "asset_class", None)
+            if tf is not None and tf not in self.timeframes:
+                return None
+            if ac is not None and ac not in self.asset_classes:
+                return None
+
             opens = bars["open"].to_numpy(dtype=float)
             closes = bars["close"].to_numpy(dtype=float)
 
