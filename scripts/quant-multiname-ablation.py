@@ -116,6 +116,32 @@ def main() -> None:
 
         cal = historical_fomc_calendar()
 
+        # FAIL CLOSED (Codex #77 review): historical_fomc_calendar() only contains
+        # 2023–2024 FOMC dates. The CLI accepts arbitrary [START END], so a window
+        # outside that range would inject ZERO in-window events -> the blackout
+        # never fires -> a FALSE HOLD/null that looks like "the flag does nothing"
+        # when really the calendar was empty. For an eval tool whose job is
+        # trustworthy verdicts, a silent false-null is the worst outcome. Refuse
+        # rather than report a degenerate verdict.
+        w_start = pd.Timestamp(start)
+        w_end = pd.Timestamp(end)
+        in_window = [
+            e
+            for e in cal
+            if w_start <= pd.Timestamp(e.scheduled_for).tz_localize(None) <= w_end
+        ]
+        if not in_window:
+            cal_dates = sorted(pd.Timestamp(e.scheduled_for).date() for e in cal)
+            raise SystemExit(
+                f"EVENT_RISK: historical_fomc_calendar() has NO events within the "
+                f"requested window {w_start.date()}..{w_end.date()}. Its coverage is "
+                f"{cal_dates[0]}..{cal_dates[-1]} ({len(cal_dates)} FOMC dates). "
+                f"Running anyway would inject zero events and report a FALSE HOLD. "
+                f"Extend _HISTORICAL_FOMC_DATES in event_risk_ablation.py to cover "
+                f"this window, or choose a window within the calendar's coverage."
+            )
+        print(f"# EVENT_RISK: {len(in_window)} in-window FOMC events ({in_window[0].scheduled_for.date()}..{in_window[-1].scheduled_for.date()})")
+
         def _factory():
             return EventRiskAblationStrategy(present, calendar=cal, learn_from_fills=True)
     else:
