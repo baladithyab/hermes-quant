@@ -70,3 +70,30 @@ passthrough) so the DSR gate becomes meaningful — then re-judge.
 Both remain measured, not assumed. Zero rubber-stamps. The single→multi-name re-test
 changed the picture for BOTH flags — which is exactly why fair evaluation was worth
 doing before building anything new.
+
+---
+
+## DSR clarification (post-review, 2026-06-08) — the gate is CORRECT, not an artifact
+
+On re-reading `_leg_dsr`: DSR here is the Probabilistic Sharpe Ratio (n_trials=1) of
+the *observed leg Sharpe* — P(true Sharpe > 0 | observed). The EVENT_RISK ON leg's
+Sharpe is −11.43, so PSR ≈ 0.000 is **genuinely correct**, not a numerical artifact:
+an observed Sharpe that negative is overwhelmingly likely to be a real losing leg.
+
+So the earlier "DSR is plausibly a harness artifact" wording was too generous. The
+precise truth: the absolute Sharpe is deeply negative because the harness runs the
+advisor's raw decisions as a **single-cohort equal-notional passthrough with no real
+position sizing / portfolio construction** — both legs structurally lose, and the
+OFF-vs-ON DELTA (+0.231 Sharpe, −5 trades, better DD) is the only valid signal. The
+DSR gate is faithfully measuring the absolute leg (dominated by the passthrough's
+structural loss), which is exactly why it can't certify a −11.43-Sharpe leg.
+
+**Corrected disposition for EVENT_RISK:** the delta is genuinely encouraging and the
+Sharpe-delta gate clears, but the flag CANNOT be promoted on a passthrough whose
+absolute Sharpe makes DSR meaningless-by-construction. The blocker is the harness's
+lack of portfolio construction, not the flag and not a DSR bug. To get a trustworthy
+promote/hold decision, EVENT_RISK must be re-judged on a **sizing-aware multi-name
+portfolio backtest** (real weights, rebalancing, a non-degenerate absolute Sharpe).
+That is a substantial new harness mode — flagged as the next candidate, NOT built in
+this pass (it warrants an ADR + its own branch + an operator checkpoint, not a
+silent mid-session embark). EVENT_RISK stays default-OFF until then.
