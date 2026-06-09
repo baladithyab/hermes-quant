@@ -56,3 +56,17 @@ A real-data ablation clearing **both** `d_sharpe ≥ +0.10` **and** `DSR > 0.50`
 representative window. Candidate changes to try: multi-name universe, longer
 window (more FOMC events = more statistical power), FOMC-only vs all-Tier-1 tiering,
 or a wider `event_risk_window_days`.
+
+---
+
+## UPDATE 2026-06-08 — multi-name fair re-test: Sharpe gate NOW CLEARS (HOLD on DSR only)
+
+The re-open condition ("multi-name universe") was tested. On SPY/QQQ/TLT/XLF/IWM
+(rate-sensitive cohort), EVENT_RISK's Sharpe delta is now **+0.231 — ABOVE the +0.10
+bar** (single-SPY was +0.075, below). The blackout silenced 5 FOMC-day opens; every
+metric improved. It HOLDs ONLY on the DSR sub-gate (`DSR 0.000 ≤ 0.50`), which is
+suspect under the deeply-negative single-cohort-passthrough absolute Sharpe.
+**EVENT_RISK is now the leading PROMOTE candidate** — blocked only by a DSR gate that
+is plausibly a harness artifact. Next: a sizing-aware multi-name portfolio harness to
+make DSR meaningful, then re-judge. NOT enabled yet. Full card:
+`docs/research/2026-06-08-multiname-fair-verdict-retest.md`.

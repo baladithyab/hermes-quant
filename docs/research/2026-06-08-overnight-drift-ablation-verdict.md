@@ -64,3 +64,15 @@ A real-data ablation clearing **both** `d_sharpe ≥ +0.10` **and** `DSR > 0.50`
   clearly-positive tilt.
 
 Until then, OVERNIGHT_DRIFT stays default-OFF.
+
+---
+
+## UPDATE 2026-06-08 — multi-name fair re-test CONFIRMS HOLD (decisively)
+
+The re-open condition above ("cohort-weighted universe") was tested. On
+QQQ/ARKK/TSLA/NVDA/GME/COIN (the research-favored high-retail-beta cohort),
+OVERNIGHT_DRIFT was **worse on every axis**: `d_sharpe −1.273`, `d_n_trades +100`,
+win-rate 76%→54%, deeper drawdown. The single-SPY HOLD was NOT a universe artifact —
+the fair test is more damning. **Conclusively default-OFF.** Re-open now requires a
+different signal CONSTRUCTION (regime-conditioned nudge / significance-gated subset),
+not a different universe. Full card: `docs/research/2026-06-08-multiname-fair-verdict-retest.md`.

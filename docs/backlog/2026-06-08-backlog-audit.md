@@ -169,3 +169,12 @@ Built C1 on `feat/overnight-drift-analyst` (PR #76, off clean post-#75 main). `h
 **C1 status: CLOSED — analyst built + unit-tested + measured. OVERNIGHT_DRIFT stays default-OFF (HOLD). ADR-0089 status: IMPLEMENTED + eval-gated.**
 
 **Both perception-extension flags from the reels (C2 EVENT_RISK, C1 OVERNIGHT_DRIFT) are now BUILT, MEASURED, and HOLD — the measure-then-promote discipline held on both: neither earned a live default on the conservative bar, and both stay OFF with documented re-open conditions. Zero rubber-stamps.**
+
+## 2026-06-08 — Multi-name FAIR re-test of both perception flags (eval-honesty)
+
+The single-SPY HOLD verdicts for EVENT_RISK + OVERNIGHT_DRIFT were on a degenerate universe (each verdict doc flagged it). Built `scripts/quant-multiname-ablation.py` (committed + 3 unit tests) — the harness already supported multi-name via (field,symbol) MultiIndex ohlcv; single-symbol was a choice. Re-ran both on representative cohorts:
+
+- **OVERNIGHT_DRIFT** (QQQ/ARKK/TSLA/NVDA/GME/COIN): HOLD, **decisively worse** — d_sharpe −1.273, +100 trades, win-rate 76%→54%. NOT a universe artifact; conclusively default-OFF. Re-open now needs signal re-design, not a universe.
+- **EVENT_RISK** (SPY/QQQ/TLT/XLF/IWM): HOLD, but **Sharpe gate NOW CLEARS** (d_sharpe +0.231 > +0.10; single-SPY was +0.075). Holds only on the DSR sub-gate, which is suspect under the passthrough's deeply-negative absolute Sharpe. **Now the leading PROMOTE candidate** — blocked only by DSR. Next: a sizing-aware multi-name portfolio harness so DSR is meaningful, then re-judge. NOT enabled.
+
+Full card: `docs/research/2026-06-08-multiname-fair-verdict-retest.md`. **The single→multi-name re-test changed the picture for BOTH flags — proof that fair evaluation was worth doing before building anything new.** Next backlog candidate identified: sizing-aware multi-name backtest harness (to de-artifact the DSR gate and unblock the EVENT_RISK promote decision).
