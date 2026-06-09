@@ -334,6 +334,15 @@ merges. Schema-validated JSONL out, clean upgrade path when LLM analysts
 add their own slot. Aligns with how freqtrade stores `populate_indicators`
 columns.
 
+When the v0.3 analyst slot includes social inputs, treat Hermes Tweet as an
+optional read-only Hermes Agent X/Twitter plugin source, not an action surface.
+It can populate `sentiment_report` with public X/Twitter evidence: search
+Twitter/X, scrape/search tweets, read tweet replies, look up users, monitor
+tweets, and export follower context. Keep `tweet_action` out of hermes-quant:
+no post tweets/replies, send DMs, or automate X actions from a trading workflow.
+Every X/Twitter item stays untrusted evidence with source URL, capture time, and
+confidence, and the deterministic risk gate can ignore stale or weak signals.
+
 ### 6. `MessageBuffer` content-presence-driven status (for `quant_doctor`) ⭐⭐ P1
 
 **Their location**: `cli/main.py:MessageBuffer` — `agent_status` derived
