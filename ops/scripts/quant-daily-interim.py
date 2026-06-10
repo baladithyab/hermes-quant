@@ -329,6 +329,7 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
     _clip = None
     _caps = None
     _running = None  # dict[str, float] running signed target weights
+    _cap_init_failed = False  # P1 (Codex #82): fail CLOSED, not open, on init failure
     if caps_enabled:
         try:
             from hermes_quant.risk.portfolio_normalize import (
@@ -352,20 +353,42 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
                 live[_sym] = float(_qty)
             _con.close()
             _running = dict(live)
-        except Exception as exc:  # fail-OPEN to prior behavior, but log loudly
+        except Exception as exc:
+            # P1 (Codex review #82): FAIL CLOSED. This layer IS the backported
+            # guard for the 2026-06-02 advisor-runaway incident. If we can't read
+            # the live book (fresh deploy w/ no positions table, lock timeout, old
+            # schema, …) we CANNOT know remaining headroom — firing uncapped is the
+            # exact behavior the flag exists to prevent. Block every actionable
+            # instead of falling back to the runaway path. (Was: fail-open with a
+            # _cap_warn — that defeated the gate on the one path that matters.)
             _clip = None
+            _cap_init_failed = True
             for v in actionables:
-                v.setdefault("_cap_warn", f"cap gate init failed (firing uncapped): {type(exc).__name__}: {exc}")
+                v["auto_approve_error"] = (
+                    f"cap_gate_init_failed (BLOCKED — refusing to fire uncapped; "
+                    f"HERMES_QUANT_PORTFOLIO_CAPS=1 but live-book read failed): "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     fired = 0
     capped = 0
     for v in actionables:
+        # P1 (Codex #82): when cap init failed under caps_enabled, every row was
+        # already marked with auto_approve_error above — do NOT fire.
+        if _cap_init_failed:
+            continue
         pid = v.get("proposal_id")
         if not pid:
             v["auto_approve_error"] = "no_proposal_id (proposal creation likely failed)"
             continue
 
-        # Portfolio-cap clip BEFORE firing.
+        # Portfolio-cap clip BEFORE firing. The clipped size is passed into
+        # quant_approve via size_override_pct so EVERY downstream route fires the
+        # capped size — including routes that do NOT reapply this home-grown cap
+        # (e.g. AlpacaPaperReactor.execute, which skips it). Without the override,
+        # quant_approve re-derives the original (uncapped) Kelly size from the
+        # stored proposal and the clip becomes cosmetic. (Codex P1 #82.)
+        _size_override = None
         if _clip is not None:
             sym = v.get("symbol") or v.get("asset")
             tgt, tgt_src = _resolve_target_weight(v)
@@ -395,16 +418,31 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
                     continue
                 # Accept the (possibly down-scaled) target into running state.
                 _running[sym] = _running.get(sym, 0.0) + clipped.portfolio_target_pct
+                # ALWAYS pass the post-cap size downstream (not only when scaled):
+                # the reactor must fire exactly what the cap admitted, on every route.
+                _size_override = clipped.portfolio_target_pct
                 if abs(clipped.scale_factor - 1.0) > 1e-6:
                     v["_cap_scaled_to"] = clipped.portfolio_target_pct
             except Exception as exc:
-                v.setdefault("_cap_warn", f"clip failed (firing uncapped): {type(exc).__name__}: {exc}")
+                # P1 (Codex #82): a clip EXCEPTION under caps_enabled must also fail
+                # closed — we attempted to cap and couldn't, so we don't know the
+                # admissible size. Block this actionable rather than firing uncapped.
+                v["auto_approve_error"] = (
+                    f"cap_clip_failed (BLOCKED — refusing to fire uncapped): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
 
+        _appr_args = {
+            "proposal_id": pid,
+            "approval_note": "autonomy=paper auto-approve via quant-daily-interim.py",
+        }
+        # Pass the cap-admitted size so downstream reactors (incl. ones that skip
+        # the home-grown cap) fire the clipped size, not the stored Kelly size.
+        if _size_override is not None:
+            _appr_args["size_override_pct"] = _size_override
         try:
-            res = json.loads(_qa({
-                "proposal_id": pid,
-                "approval_note": "autonomy=paper auto-approve via quant-daily-interim.py",
-            }))
+            res = json.loads(_qa(_appr_args))
         except Exception as exc:
             v["auto_approve_error"] = f"{type(exc).__name__}: {exc}"
             continue
@@ -421,6 +459,7 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
         actionables[0]["_autonomy_summary"]["total"] = len(actionables)
         actionables[0]["_autonomy_summary"]["cap_silenced"] = capped
         actionables[0]["_autonomy_summary"]["caps_enabled"] = caps_enabled
+        actionables[0]["_autonomy_summary"]["cap_init_failed"] = _cap_init_failed
     return actionables
 
 
