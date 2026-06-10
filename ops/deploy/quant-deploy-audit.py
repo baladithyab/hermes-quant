@@ -36,6 +36,24 @@ REPO_SCRIPTS = Path(__file__).resolve().parents[2] / "ops" / "scripts"
 DEFAULT_DEPLOYED = Path.home() / ".hermes" / "scripts"
 MANIFEST = Path(__file__).resolve().parent / "deploy-manifest.json"
 
+# Scripts that are intentionally REPO-ONLY tooling — they operate on the repo
+# itself or are run in-place from the checkout, and are NOT meant to be deployed
+# to ~/.hermes/scripts/. Excluding them keeps the audit honest: without this they
+# show as perpetual REPO_ONLY_NEW "drift", training the operator to ignore the
+# alert (the cry-wolf failure that would defeat the whole point of the watchdog).
+#   - quant-adr-index.py / quant-flag-inventory.py: regenerate repo docs from
+#     source; they read/write repo files, never run on the box.
+#   - quant-deploy-drift-watch.py: the drift watchdog itself — runs FROM the repo
+#     checkout (the audit resolves repo paths relative to itself), wired to cron
+#     via quant-deploy-drift-watch-armed.sh, never deployed flat.
+REPO_ONLY_TOOLING: frozenset[str] = frozenset(
+    {
+        "quant-adr-index.py",
+        "quant-flag-inventory.py",
+        "quant-deploy-drift-watch.py",
+    }
+)
+
 
 def _sha(p: Path) -> str | None:
     """Return the sha256 of a file, or None if it does not exist."""
@@ -54,9 +72,21 @@ def audit(deployed_dir: Path) -> dict:
       REPO_ONLY_NEW   — exists in repo, not deployed (e.g. the 2 new crons not yet deployed)
       DEPLOYED_ONLY   — exists deployed, not in repo (live-only script never vendored)
       DRIFT           — both exist but differ (the dangerous case — reconcile, don't clobber)
+
+    Scripts in REPO_ONLY_TOOLING are excluded entirely — they are repo-only by
+    design (doc generators, the watchdog itself) and would otherwise be perpetual
+    false-positive REPO_ONLY_NEW noise.
     """
-    repo_files = {p.name: p for p in sorted(REPO_SCRIPTS.glob("quant-*.py"))}
-    deployed_files = {p.name: p for p in sorted(deployed_dir.glob("quant-*.py"))}
+    repo_files = {
+        p.name: p
+        for p in sorted(REPO_SCRIPTS.glob("quant-*.py"))
+        if p.name not in REPO_ONLY_TOOLING
+    }
+    deployed_files = {
+        p.name: p
+        for p in sorted(deployed_dir.glob("quant-*.py"))
+        if p.name not in REPO_ONLY_TOOLING
+    }
     all_names = sorted(set(repo_files) | set(deployed_files))
 
     results: list[dict] = []
