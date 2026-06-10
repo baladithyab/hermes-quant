@@ -161,6 +161,31 @@ def test_unknown_when_trend_is_none():
     assert "trend_strength is None" in reason
 
 
+def test_unknown_when_trend_is_nan():
+    """Codex P2 (NaN-fail-open): a NaN trend must map to UNKNOWN, NOT fall
+    through to NEUTRAL. All NaN comparisons are False, so without the finite
+    guard NaN would silently land in the flat-regime no-op and mark bad data
+    as a valid regime."""
+    det = RegimeDetector()
+    state, reason = det.classify(_sv(vol_pct=0.50, trend=float("nan")))
+    assert state == RegimeState.UNKNOWN
+    assert "non-finite" in reason
+
+
+def test_unknown_when_trend_is_inf():
+    det = RegimeDetector()
+    state, _ = det.classify(_sv(vol_pct=0.50, trend=float("inf")))
+    assert state == RegimeState.UNKNOWN
+
+
+def test_unknown_when_vol_pct_is_nan():
+    """A NaN vol_pct must map to UNKNOWN before any threshold comparison."""
+    det = RegimeDetector()
+    state, reason = det.classify(_sv(vol_pct=float("nan"), trend=0.8))
+    assert state == RegimeState.UNKNOWN
+    assert "non-finite" in reason
+
+
 def test_bull_weak_on_moderate_positive_trend():
     det = RegimeDetector()
     # Wave 7.1: trend=0.3 (in [0.15, 0.5)) + vol_pct=0.5 → BULL_WEAK (was UNKNOWN).

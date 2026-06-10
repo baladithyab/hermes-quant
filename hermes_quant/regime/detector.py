@@ -23,6 +23,7 @@ Reference: Mantshimuli & Mwamba, Springer 2026.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections.abc import Callable
 from enum import Enum
@@ -166,6 +167,12 @@ class RegimeDetector:
         vol_pct = state_vars.realized_vol_percentile
         if vol_pct is None:
             return RegimeState.UNKNOWN, "realized_vol_percentile is None"
+        # NaN/inf guard (Codex P2, NaN-fail-open defect class): a non-finite
+        # vol_pct must NOT pass any `vol_pct > x` / `vol_pct <= x` comparison
+        # (all NaN comparisons are False → it would silently fall through to a
+        # weak/neutral zone). Treat non-finite as insufficient data → UNKNOWN.
+        if not math.isfinite(vol_pct):
+            return RegimeState.UNKNOWN, f"realized_vol_percentile is non-finite ({vol_pct!r})"
 
         # --- VOLATILE: high volatility overrides trend signal ---
         if vol_pct > VOLATILE_VOL_MIN:
@@ -182,6 +189,16 @@ class RegimeDetector:
             return (
                 RegimeState.UNKNOWN,
                 f"trend_strength is None; realized_vol_percentile={vol_pct:.3f}",
+            )
+        # NaN/inf guard (Codex P2): a non-finite trend would fail every
+        # `trend <= / >= x` comparison and fall through to NEUTRAL, mislabeling
+        # bad data as a valid flat regime. Map to UNKNOWN (insufficient data)
+        # so downstream takes the silence/default diagnostic path.
+        if not math.isfinite(trend):
+            return (
+                RegimeState.UNKNOWN,
+                f"trend_strength is non-finite ({trend!r}); "
+                f"realized_vol_percentile={vol_pct:.3f}",
             )
 
         # --- BEAR ---
