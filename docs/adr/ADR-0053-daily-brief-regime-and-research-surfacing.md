@@ -210,3 +210,51 @@ labels.
 - ADR-0049 — Shadow account counterfactual runner (Wave 8b)
 - ADR-0043 — Three-way risk committee (surfaced in brief since v0.2-2)
 - ADR-0044 — Trader stage and structured output (surfaced in brief since v0.2-1)
+
+---
+
+## Amendment — Wave 7.1: regime dead-zone fill (2026-06-09)
+
+### Context
+
+The v0.1 rule set left a **classification dead zone** in `0.60 < vol_pct <= 0.70`:
+a clearly-trending market (|trend| >= 0.5) with moderately-elevated vol matched
+no rule and fell to `UNKNOWN`. Because `UNKNOWN` is a deliberate no-op (identity
+weights), the regime system contributed nothing in this band — silently inert
+exactly when a directional regime is most actionable. On 6y of real SPY history
+this band was **14.1% of all days** (37% of dead-zone-band days as UNKNOWN),
+including obviously-bullish days like 2023-01-26 (trend +1.61, vol_pct 0.67).
+
+A 3-state HMM (`regime/hmm.py`) was evaluated as an alternative and **rejected
+for production**: its `classify()` passes a length-1 sequence, collapsing Viterbi
+to a memoryless argmax (the transition matrix — the whole point of an HMM — is
+never exercised), and the default model is fit on *synthetic* seed=42 data. On
+the same 6y SPY history it classified 100% of days BULL with 0 regime flips over
+120 days. Not shippable without sequence-windowed inference + real training data.
+
+### Decision
+
+Fill the dead zone with **more zones**, preserving silence-by-default:
+
+| State | Rule | Weights |
+|-------|------|---------|
+| `VOLATILE` | vol_pct > 0.70 | full (unchanged) |
+| `BEAR` | trend <= -0.5 AND vol_pct <= 0.70 | full (unchanged) |
+| `BULL` | trend >= +0.5 AND vol_pct <= **0.70** | full (ceiling widened 0.60 → 0.70, symmetric with BEAR) |
+| `BULL_WEAK` | +0.15 <= trend < +0.5, vol_pct <= 0.70 | **gentle** — midpoint of identity and full BULL |
+| `BEAR_WEAK` | -0.5 < trend <= -0.15, vol_pct <= 0.70 | **gentle** — midpoint of identity and full BEAR |
+| `NEUTRAL` | \|trend\| < 0.15, vol_pct <= 0.70 | **identity** (no-op) — honest "no edge", named so the brief doesn't imply breakage |
+| `UNKNOWN` | vol_pct or trend is None | identity (no-op) — now reserved STRICTLY for insufficient data |
+
+`apply_regime_weights` short-circuits BOTH `UNKNOWN` and `NEUTRAL` to identity, so
+widening the taxonomy never adds conviction the old code wouldn't have had. On 6y
+SPY the change drops UNKNOWN from 173 days (14.1%) to 0; only 2.9% are genuinely
+NEUTRAL.
+
+### Validation gate
+
+This change ships behind hypothesis `hyp_SPY_20260609_4eed8d` (issue #80). The
+threshold/zone change is reviewed and merged by a human; the empirical Sharpe
+delta vs the old UNKNOWN no-op is confirmed by purged walk-forward before the
+weak-zone weights are tuned further. No-lookahead CI gate passes on the new
+detector. Brief emoji: `bull_weak`=🌱 `bear_weak`=🍂 `neutral`=⚖️.

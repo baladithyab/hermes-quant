@@ -51,6 +51,43 @@ def test_default_volatile_ta_boosted():
 
 
 # ---------------------------------------------------------------------------
+# Wave 7.1 weak-lean + neutral zones
+# ---------------------------------------------------------------------------
+
+
+def test_neutral_multipliers_all_one():
+    """NEUTRAL row must be all-1.0 — genuinely flat market, honest no-edge."""
+    for analyst, mult in DEFAULT_REGIME_WEIGHTS[RegimeState.NEUTRAL].items():
+        assert mult == 1.0, f"NEUTRAL multiplier for {analyst!r} should be 1.0, got {mult}"
+
+
+def test_neutral_is_noop_identity():
+    """apply_regime_weights(NEUTRAL) must short-circuit to identity, like UNKNOWN."""
+    base = {"semantic": 0.5, "sentiment": 0.7, "kronos": 0.3}
+    result = apply_regime_weights(base, RegimeState.NEUTRAL)
+    assert result == base
+
+
+def test_weak_zones_lean_between_identity_and_full():
+    """BULL_WEAK / BEAR_WEAK sentiment multipliers must sit strictly between the
+    identity (1.0) and the corresponding full-conviction BULL/BEAR multiplier."""
+    bull = DEFAULT_REGIME_WEIGHTS[RegimeState.BULL]["sentiment"]
+    bull_weak = DEFAULT_REGIME_WEIGHTS[RegimeState.BULL_WEAK]["sentiment"]
+    assert 1.0 < bull_weak < bull, f"BULL_WEAK sentiment {bull_weak} not between 1.0 and {bull}"
+
+    bear = DEFAULT_REGIME_WEIGHTS[RegimeState.BEAR]["sentiment"]
+    bear_weak = DEFAULT_REGIME_WEIGHTS[RegimeState.BEAR_WEAK]["sentiment"]
+    assert bear < bear_weak < 1.0, f"BEAR_WEAK sentiment {bear_weak} not between {bear} and 1.0"
+
+
+def test_all_regime_states_have_weight_rows():
+    """Every RegimeState enum value must have a DEFAULT_REGIME_WEIGHTS row, so a
+    newly-added state can never silently fall through to the table-miss path."""
+    for regime in RegimeState:
+        assert regime in DEFAULT_REGIME_WEIGHTS, f"missing weight row for {regime}"
+
+
+# ---------------------------------------------------------------------------
 # apply_regime_weights
 # ---------------------------------------------------------------------------
 

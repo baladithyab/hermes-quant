@@ -60,6 +60,10 @@ _MIN_MULTIPLIER = 1e-6
 #             and fundamentals suppressed (delayed reaction in high noise);
 #             kronos boosted slightly (high-frequency signal useful in spikes).
 #   UNKNOWN:  All 1.0 — no adjustment; equivalent to the pre-Wave-7 baseline.
+#   NEUTRAL:  All 1.0 — genuinely flat market, honest "no edge" (Wave 7.1).
+#   BULL_WEAK/BEAR_WEAK: gentle lean — multipliers halfway between identity (1.0)
+#             and the full BULL/BEAR conviction (Wave 7.1). A moderate trend in
+#             the mid-vol band deserves *some* tilt, but not full conviction.
 DEFAULT_REGIME_WEIGHTS: RegimeWeightTable = {
     RegimeState.BULL: {
         "semantic": 1.0,
@@ -81,6 +85,29 @@ DEFAULT_REGIME_WEIGHTS: RegimeWeightTable = {
         "classical_ta": 1.5,
         "fundamentals": 0.8,
         "kronos": 1.2,
+    },
+    # Wave 7.1: weak-lean multipliers = midpoint between 1.0 and the full
+    # BULL/BEAR row, i.e. (1.0 + full) / 2. Gentle conviction for moderate trend.
+    RegimeState.BULL_WEAK: {
+        "semantic": 1.0,
+        "sentiment": 1.1,
+        "classical_ta": 0.95,
+        "fundamentals": 1.05,
+        "kronos": 1.0,
+    },
+    RegimeState.BEAR_WEAK: {
+        "semantic": 1.0,
+        "sentiment": 0.8,
+        "classical_ta": 1.15,
+        "fundamentals": 1.05,
+        "kronos": 1.0,
+    },
+    RegimeState.NEUTRAL: {
+        "semantic": 1.0,
+        "sentiment": 1.0,
+        "classical_ta": 1.0,
+        "fundamentals": 1.0,
+        "kronos": 1.0,
     },
     RegimeState.UNKNOWN: {
         "semantic": 1.0,
@@ -129,7 +156,10 @@ def apply_regime_weights(
     # was previously enforced only by convention in DEFAULT_REGIME_WEIGHTS.
     # A user-edited weights.json or a custom RegimeWeightTable could
     # silently break the invariant. Short-circuit here for defense.
-    if regime == RegimeState.UNKNOWN:
+    # Wave 7.1: NEUTRAL is likewise a no-op identity (genuinely flat market,
+    # honest "no edge") — short-circuit it too so a misconfigured table can't
+    # accidentally add conviction to a flat regime.
+    if regime in (RegimeState.UNKNOWN, RegimeState.NEUTRAL):
         return dict(base_weights)
 
     # Fallback: if regime not in table at all, use UNKNOWN row if present

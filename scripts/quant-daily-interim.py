@@ -394,7 +394,9 @@ def _compute_regime_section_inner(bars_by_symbol: dict | None) -> str:
 
     # Regime emoji
     regime_emoji = {
-        "bull": "🟢", "bear": "🔴", "volatile": "🌪️", "unknown": "⚪"
+        "bull": "🟢", "bear": "🔴", "volatile": "🌪️",
+        "bull_weak": "🌱", "bear_weak": "🍂", "neutral": "⚖️",
+        "unknown": "⚪",
     }.get(regime.value, "⚪")
 
     lines = ["## 🌡️ Market Regime", ""]
