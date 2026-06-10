@@ -95,8 +95,17 @@ def test_bull_fires():
 
 def test_bull_at_exact_thresholds():
     det = RegimeDetector()
-    # trend == BULL_TREND_MIN (0.5) AND vol_pct == BULL_VOL_MAX (0.6) → BULL
+    # trend == BULL_TREND_MIN (0.5) AND vol_pct == BULL_VOL_MAX (0.7) → BULL
+    # (Wave 7.1: BULL_VOL_MAX widened 0.6 -> 0.7 to be symmetric with BEAR.)
     state, _ = det.classify(_sv(vol_pct=BULL_VOL_MAX, trend=BULL_TREND_MIN))
+    assert state == RegimeState.BULL
+
+
+def test_bull_fires_in_former_deadzone():
+    """Wave 7.1 regression: a strong uptrend at vol_pct=0.65 (the old 0.60–0.70
+    dead zone) now classifies BULL, not UNKNOWN."""
+    det = RegimeDetector()
+    state, _ = det.classify(_sv(vol_pct=0.65, trend=0.8))
     assert state == RegimeState.BULL
 
 
@@ -134,26 +143,36 @@ def test_bear_suppressed_when_vol_too_high():
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_on_moderate_conditions():
+def test_neutral_on_flat_trend():
     det = RegimeDetector()
-    # trend=0.0 (no trend) + vol_pct=0.50 (moderate) → UNKNOWN
+    # Wave 7.1: trend=0.0 (flat) + vol_pct=0.50 (moderate) → NEUTRAL (was UNKNOWN).
+    # NEUTRAL is an honest "no edge" state with identity weights — the old
+    # UNKNOWN no-op behavior, just named so the brief doesn't imply breakage.
     state, reason = det.classify(_sv(vol_pct=0.50, trend=0.0))
-    assert state == RegimeState.UNKNOWN
-    assert "UNKNOWN" in reason
+    assert state == RegimeState.NEUTRAL
+    assert "NEUTRAL" in reason
 
 
 def test_unknown_when_trend_is_none():
     det = RegimeDetector()
+    # UNKNOWN is now reserved STRICTLY for insufficient/missing data.
     state, reason = det.classify(_sv(vol_pct=0.50, trend=None))
     assert state == RegimeState.UNKNOWN
     assert "trend_strength is None" in reason
 
 
-def test_unknown_on_boundary_neither_bull_nor_bear():
+def test_bull_weak_on_moderate_positive_trend():
     det = RegimeDetector()
-    # trend=0.3 < BULL_TREND_MIN=0.5 and vol_pct=0.5 → no rule → UNKNOWN
+    # Wave 7.1: trend=0.3 (in [0.15, 0.5)) + vol_pct=0.5 → BULL_WEAK (was UNKNOWN).
     state, _ = det.classify(_sv(vol_pct=0.50, trend=0.3))
-    assert state == RegimeState.UNKNOWN
+    assert state == RegimeState.BULL_WEAK
+
+
+def test_bear_weak_on_moderate_negative_trend():
+    det = RegimeDetector()
+    # Wave 7.1: trend=-0.3 (in (-0.5, -0.15]) + vol_pct=0.5 → BEAR_WEAK.
+    state, _ = det.classify(_sv(vol_pct=0.50, trend=-0.3))
+    assert state == RegimeState.BEAR_WEAK
 
 
 # ---------------------------------------------------------------------------

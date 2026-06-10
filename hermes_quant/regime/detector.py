@@ -47,6 +47,20 @@ class RegimeState(str, Enum):
     BULL = "bull"
     BEAR = "bear"
     VOLATILE = "volatile"
+    # Wave 7.1 (ADR-0053 amendment): weak-lean + neutral zones fill the former
+    # 0.60–0.70 vol dead zone. These are real states, not no-ops:
+    #   BULL_WEAK / BEAR_WEAK — moderate trend in the mid/elevated-vol band;
+    #     gentle conviction (multipliers halfway between identity and full BULL/BEAR).
+    #   NEUTRAL — genuinely flat trend at moderate vol; an honest "no edge" state
+    #     (identity weights, like the old UNKNOWN no-op) but named so the brief
+    #     reports "flat" rather than implying the classifier is broken.
+    BULL_WEAK = "bull_weak"
+    BEAR_WEAK = "bear_weak"
+    NEUTRAL = "neutral"
+    # UNKNOWN is now reserved STRICTLY for insufficient/missing data (vol_pct or
+    # trend is None). Silence-by-default is preserved: NEUTRAL and UNKNOWN both
+    # carry identity weights, so widening the taxonomy never adds conviction the
+    # old code wouldn't have had.
     UNKNOWN = "unknown"
 
 
@@ -56,7 +70,9 @@ class RegimeState(str, Enum):
 
 # BULL: trend_strength >= BULL_TREND_MIN AND vol_percentile <= BULL_VOL_MAX
 BULL_TREND_MIN: float = 0.5
-BULL_VOL_MAX: float = 0.6
+# Wave 7.1: widened 0.60 -> 0.70 to be symmetric with BEAR_VOL_MAX. The old
+# 0.60 ceiling left a 0.60–0.70 hole where strong uptrends fell to UNKNOWN.
+BULL_VOL_MAX: float = 0.7
 
 # BEAR: trend_strength <= BEAR_TREND_MAX AND vol_percentile <= BEAR_VOL_MAX
 BEAR_TREND_MAX: float = -0.5
@@ -64,6 +80,11 @@ BEAR_VOL_MAX: float = 0.7
 
 # VOLATILE: vol_percentile > VOLATILE_VOL_MIN
 VOLATILE_VOL_MIN: float = 0.7
+
+# Wave 7.1 weak-lean band: a moderate (sub-strong) trend at non-volatile vol.
+# |trend| in [WEAK_TREND_MIN, BULL_TREND_MIN) leans BULL_WEAK / BEAR_WEAK.
+# Below WEAK_TREND_MIN the market is genuinely flat → NEUTRAL.
+WEAK_TREND_MIN: float = 0.15
 
 
 # ---------------------------------------------------------------------------
@@ -181,13 +202,33 @@ class RegimeDetector:
             logger.debug("regime: %s", reason)
             return RegimeState.BULL, reason
 
-        # --- UNKNOWN: middle zone (moderate vol, moderate trend) ---
+        # --- Wave 7.1 weak-lean zones (fill the former dead zone) ---
+        # We are here iff vol_pct <= 0.70 and neither strong-BULL nor strong-BEAR
+        # fired (i.e. |trend| < 0.5). Lean by trend sign with gentle conviction;
+        # a genuinely flat trend is NEUTRAL (honest "no edge", identity weights).
+        if trend >= WEAK_TREND_MIN:
+            reason = (
+                f"trend_strength={trend:.3f} in [{WEAK_TREND_MIN}, {BULL_TREND_MIN}) AND "
+                f"realized_vol_percentile={vol_pct:.3f} <= {BULL_VOL_MAX} → BULL_WEAK"
+            )
+            logger.debug("regime: %s", reason)
+            return RegimeState.BULL_WEAK, reason
+
+        if trend <= -WEAK_TREND_MIN:
+            reason = (
+                f"trend_strength={trend:.3f} in ({BEAR_TREND_MAX}, -{WEAK_TREND_MIN}] AND "
+                f"realized_vol_percentile={vol_pct:.3f} <= {BEAR_VOL_MAX} → BEAR_WEAK"
+            )
+            logger.debug("regime: %s", reason)
+            return RegimeState.BEAR_WEAK, reason
+
+        # --- NEUTRAL: genuinely flat trend at moderate vol (no edge, no-op) ---
         reason = (
-            f"trend_strength={trend:.3f}, "
-            f"realized_vol_percentile={vol_pct:.3f}: no regime rule matched → UNKNOWN"
+            f"trend_strength={trend:.3f} within ±{WEAK_TREND_MIN}, "
+            f"realized_vol_percentile={vol_pct:.3f}: flat → NEUTRAL"
         )
         logger.debug("regime: %s", reason)
-        return RegimeState.UNKNOWN, reason
+        return RegimeState.NEUTRAL, reason
 
     def status(self) -> dict[str, Any]:
         """Diagnostic snapshot for health checks and audit logs."""
