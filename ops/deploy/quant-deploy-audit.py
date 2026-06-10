@@ -73,20 +73,21 @@ def audit(deployed_dir: Path) -> dict:
       DEPLOYED_ONLY   — exists deployed, not in repo (live-only script never vendored)
       DRIFT           — both exist but differ (the dangerous case — reconcile, don't clobber)
 
-    Scripts in REPO_ONLY_TOOLING are excluded entirely — they are repo-only by
-    design (doc generators, the watchdog itself) and would otherwise be perpetual
-    false-positive REPO_ONLY_NEW noise.
+    Scripts in REPO_ONLY_TOOLING are excluded from the REPO side only — they are
+    repo-only by design (doc generators, the watchdog itself), so a repo copy is
+    expected and would otherwise be perpetual false-positive REPO_ONLY_NEW noise.
+    They are NOT excluded from the deployed side: these tools must NEVER be
+    deployed, so an accidental deployed copy SHOULD surface (as DEPLOYED_ONLY) for
+    cleanup rather than being silently ignored (Codex P2, 2026-06-10).
     """
     repo_files = {
         p.name: p
         for p in sorted(REPO_SCRIPTS.glob("quant-*.py"))
         if p.name not in REPO_ONLY_TOOLING
     }
-    deployed_files = {
-        p.name: p
-        for p in sorted(deployed_dir.glob("quant-*.py"))
-        if p.name not in REPO_ONLY_TOOLING
-    }
+    # Deployed side is NOT filtered: an unexpected deployed copy of a repo-only
+    # tool is itself a drift signal (it should be cleaned up, not hidden).
+    deployed_files = {p.name: p for p in sorted(deployed_dir.glob("quant-*.py"))}
     all_names = sorted(set(repo_files) | set(deployed_files))
 
     results: list[dict] = []

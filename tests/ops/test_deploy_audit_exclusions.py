@@ -43,12 +43,18 @@ def test_excluded_tooling_never_appears_in_audit(tmp_path):
     )
 
 
-def test_excluded_tooling_not_counted_as_deployed_only(tmp_path):
-    """A repo-only tool that somehow got deployed must also not be flagged
-    (exclusion applies to BOTH sides of the comparison)."""
+def test_accidental_deployed_copy_IS_surfaced(tmp_path):
+    """A repo-only tool that somehow got deployed MUST surface as DEPLOYED_ONLY —
+    these tools must never be deployed, so an accidental copy is a real drift
+    signal to clean up, NOT something to hide (Codex P2, PR #84). The exclusion
+    applies to the REPO side only (kills REPO_ONLY_NEW noise), not the deployed
+    side (preserves visibility of accidental deployed copies)."""
     mod = _load_audit()
-    # Simulate a deployed dir containing ONLY an excluded tool.
-    (tmp_path / "quant-deploy-drift-watch.py").write_text("# deployed copy\n")
+    # Simulate a deployed dir containing ONLY an excluded tool (accidental copy).
+    (tmp_path / "quant-deploy-drift-watch.py").write_text("# accidental deployed copy\n")
     report = mod.audit(tmp_path)
-    audited = {r["script"] for r in report["files"]}
-    assert "quant-deploy-drift-watch.py" not in audited
+    verdicts = {r["script"]: r["verdict"] for r in report["files"]}
+    assert verdicts.get("quant-deploy-drift-watch.py") == "DEPLOYED_ONLY", (
+        "an accidental deployed copy of a repo-only tool must surface as "
+        f"DEPLOYED_ONLY, got {verdicts.get('quant-deploy-drift-watch.py')!r}"
+    )
