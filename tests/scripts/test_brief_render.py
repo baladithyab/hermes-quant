@@ -191,10 +191,14 @@ def test_research_section_renders_running_hypothesis(tmp_path):
             "related_adrs": ["ADR-0048"],
         },
         {
+            # REAL registry schema: status_change rows carry "new_status",
+            # NOT "status". (Previously this fixture cheated with "status",
+            # which is why the new_status->status parse bug went undetected.)
             "kind": "status_change",
             "hypothesis_id": "hyp_SPY_20260101_abc123",
-            "status": "running",
-            "created_at": "2026-05-01T00:00:00+00:00",
+            "new_status": "running",
+            "previous_status": "open",
+            "asof": "2026-05-01T00:00:00+00:00",
         },
     ])
     with patch.object(_mod, "_HYPOTHESES_PATH", hyp_path):
@@ -202,6 +206,40 @@ def test_research_section_renders_running_hypothesis(tmp_path):
     assert "🔬 Active Research" in section
     assert "hyp_SPY_20260101_abc123" in section
     assert "ADR-0048" in section
+
+
+def test_research_section_status_change_new_status_flips_running(tmp_path):
+    """Regression: a status_change row with new_status='running' must make
+    the hypothesis surface as active.
+
+    The brief reads raw hypotheses.jsonl and merges status_change rows. The
+    registry writes the transitioned state under "new_status" (never
+    "status"), so a naive dict.update() left the original "open" status in
+    place and running hypotheses never appeared. This pins the new_status ->
+    status mapping.
+    """
+    hyp_path = tmp_path / "hypotheses.jsonl"
+    _write_hypothesis_jsonl(hyp_path, [
+        {
+            "kind": "hypothesis",
+            "hypothesis_id": "hyp_REG_20260609_deadzone",
+            "claim": "Closing the regime dead-zone improves risk-adjusted returns",
+            "status": "open",
+            "created_at": "2026-06-09T00:00:00+00:00",
+            "related_adrs": ["ADR-0053"],
+        },
+        {
+            "kind": "status_change",
+            "hypothesis_id": "hyp_REG_20260609_deadzone",
+            "new_status": "running",
+            "previous_status": "open",
+            "asof": "2026-06-09T01:00:00+00:00",
+        },
+    ])
+    with patch.object(_mod, "_HYPOTHESES_PATH", hyp_path):
+        section = _mod._compute_research_section()
+    assert "hyp_REG_20260609_deadzone" in section
+    assert "no active research" not in section.lower()
 
 
 # ===========================================================================

@@ -473,7 +473,15 @@ def _compute_research_section_inner() -> str:
         if kind == "hypothesis":
             hypotheses.setdefault(hid, {}).update(row)
         elif kind == "status_change":
-            hypotheses.setdefault(hid, {}).update(row)
+            # status_change rows carry the new state under "new_status", NOT
+            # "status". A naive .update(row) leaves the original "status" from
+            # the hypothesis row untouched, so every transition was silently
+            # invisible to the brief (running hypotheses never surfaced). Map
+            # new_status -> status so the latest transition wins.
+            patch = dict(row)
+            if "new_status" in patch:
+                patch["status"] = patch["new_status"]
+            hypotheses.setdefault(hid, {}).update(patch)
 
     # Filter to running hypotheses
     running = [h for h in hypotheses.values() if h.get("status") == "running"]
