@@ -55,6 +55,31 @@ def _stub_quant_approve(monkeypatch, sink):
     monkeypatch.setattr(qt, "quant_approve", fake_qa)
 
 
+def _stub_live_book_empty(monkeypatch):
+    """Make the cap gate's live-book seeding succeed with an EMPTY book.
+
+    The brief does `import sqlite3 as _sq; _sq.connect("~/.hermes/quant/state.db")`
+    then `SELECT symbol, quantity FROM positions ...`. CI has no state.db (no
+    positions table) → the real read raises OperationalError, which the
+    fail-closed guard (correctly) treats as cap-init failure. For the
+    cap-SUCCESS tests we stub sqlite3.connect to hand back an in-memory DB with
+    an empty positions table so init succeeds and we exercise the clip path."""
+    import sqlite3
+
+    real_connect = sqlite3.connect
+
+    def fake_connect(path, *a, **k):
+        if "state.db" in str(path):
+            con = real_connect(":memory:")
+            con.execute(
+                "CREATE TABLE positions (account_id TEXT, symbol TEXT, quantity REAL)"
+            )
+            return con
+        return real_connect(path, *a, **k)
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+
+
 # ---------------------------------------------------------------------------
 # P1-A: size_override_pct pass-through
 # ---------------------------------------------------------------------------
@@ -70,6 +95,7 @@ def test_clipped_size_passed_as_size_override(monkeypatch):
 
     calls: list[dict] = []
     _stub_quant_approve(monkeypatch, calls)
+    _stub_live_book_empty(monkeypatch)
 
     # Cap admits a DOWN-SCALED 0.05 (from kelly 0.20).
     clipped = SimpleNamespace(
