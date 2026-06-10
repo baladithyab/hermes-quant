@@ -9,10 +9,15 @@ no_agent watchdog re-asserts the desired mode if it ever drifts.
 Behavior (classic watchdog / silence-by-default):
   - Reads quant.pdr.mode from ~/.hermes/config.yaml.
   - If it already equals DESIRED_MODE  -> print NOTHING, exit 0 (silent).
-  - If it drifted (missing/empty/other) -> re-assert DESIRED_MODE via an
-    atomic, full-dict-preserving write (never rebuilds from a schema, so
-    no other config keys are touched), append a forensic line to a drift
-    log, and print ONE alert line so the operator learns a revert occurred.
+  - If it is a VALID non-autonomous mode (hitl/advise) -> treat as an INTENTIONAL
+    operator downgrade (a safety pause) and LEAVE IT ALONE: print nothing, exit 0.
+    Re-arming autonomous adds capital risk and must require positive intent; a
+    downgrade removes risk and is the operator's call to make (Codex P1, 2026-06-10).
+  - If it drifted to MISSING/EMPTY/INVALID (the documented clobber — the `quant:`
+    block being dropped/emptied) -> re-assert DESIRED_MODE via an atomic,
+    full-dict-preserving write (never rebuilds from a schema, so no other config
+    keys are touched), append a forensic line to a drift log, and print ONE alert
+    line so the operator learns a revert occurred.
   - If config.yaml is missing or unparseable -> print an error line, exit 1
     (the cron's error path alerts; a broken guard must never fail silently).
 
@@ -74,7 +79,20 @@ def main() -> int:
         # No drift — stay silent (empty stdout => no operator message).
         return 0
 
-    # Drift detected. Re-assert the desired mode, preserving every other key.
+    # SAFETY ASYMMETRY (Codex P1 review, 2026-06-10): re-arming autonomous ADDS
+    # capital risk and must require positive intent; an operator downgrade to a
+    # valid non-autonomous mode REMOVES risk and MUST be respected. This guard
+    # exists for the *clobber* case — the `quant:` block being dropped/emptied so
+    # `mode` goes missing/None — NOT to override a deliberate safety pause. So we
+    # ONLY re-assert when the mode is missing/empty/invalid. A valid explicit
+    # `hitl`/`advise` is treated as an intentional operator downgrade and left
+    # alone (stay silent, do not re-arm — that pause is the operator's call).
+    if isinstance(current, str) and current.strip().lower() in (VALID_MODES - {DESIRED_MODE}):
+        # Intentional downgrade to a valid non-autonomous mode — respect it.
+        return 0
+
+    # Otherwise the mode is missing / empty / garbage — the documented clobber.
+    # Re-assert the desired mode, preserving every other key.
     quant = cfg.setdefault("quant", {})
     if not isinstance(quant, dict):
         quant = cfg["quant"] = {}
