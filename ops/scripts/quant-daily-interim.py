@@ -274,6 +274,20 @@ def create_proposals_for_actionables(actionables: list[dict]) -> list[dict]:
     return actionables
 
 
+# P2-3 hoist (2026-06-03 review): the signed target-weight resolver now lives in
+# the importable package module `hermes_quant.risk.target_weight` so production
+# (this script) AND tests import the IDENTICAL object — no spec_from_file_location
+# file-load harness, no sys.executable execv dance. `_resolve_target_weight` is
+# kept as a backward-compat alias for the call site below and the existing
+# tests/ops/test_quant_daily_interim_cap_target.py. This import is safe at module
+# scope: the execv guard above already re-execs into the venv (where hermes_quant
+# is installed) BEFORE this line is reached on the second pass, so the module
+# imports cleanly. Behavior is identical to the prior inline definition.
+from hermes_quant.risk.target_weight import (
+    resolve_target_weight as _resolve_target_weight,
+)
+
+
 def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
     """If HERMES_QUANT_AUTONOMY=paper is set, auto-fire approve on each actionable.
 
@@ -303,12 +317,89 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
             v["auto_approve_error"] = f"tools import failed: {type(exc).__name__}: {exc}"
         return actionables
 
+    # ADR-0071 portfolio-cap gate for the ADVISOR layer (added 2026-06-02 after
+    # the uncapped-advisor 41.6x-gross runaway incident — see
+    # docs/architecture/INCIDENT-2026-06-02-advisor-leverage-runaway.md).
+    # The autonomous-tick layer already clipped each fire against running
+    # headroom; the advisor auto-fire loop did NOT, so premarket/midday/EOD
+    # crons stacked the paper-default book to 4160% gross with zero portfolio
+    # awareness. Gate this layer the same way, behind the same env flag.
+    # Default-OFF preserves prior behavior; ops wrapper sets it to "1".
+    caps_enabled = os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") == "1"
+    _clip = None
+    _caps = None
+    _running = None  # dict[str, float] running signed target weights
+    if caps_enabled:
+        try:
+            from hermes_quant.risk.portfolio_normalize import (
+                clip_one_to_remaining_headroom,
+                PortfolioCaps,
+                PortfolioState,
+            )
+            _clip = clip_one_to_remaining_headroom
+            _caps = PortfolioCaps.standard()  # 200% gross / 100% net / 20% cash
+            _PState = PortfolioState
+            # Seed running state from the CURRENT live book so the cap is
+            # account-aware, not just per-run. state.db.positions.quantity is
+            # the net cumulative target weight per (asset_class, symbol).
+            import sqlite3 as _sq
+            import os as _os
+            _con = _sq.connect(_os.path.expanduser("~/.hermes/quant/state.db"), timeout=10)
+            live = {}
+            for _sym, _qty in _con.execute(
+                "SELECT symbol, quantity FROM positions WHERE account_id='paper-default'"
+            ).fetchall():
+                live[_sym] = float(_qty)
+            _con.close()
+            _running = dict(live)
+        except Exception as exc:  # fail-OPEN to prior behavior, but log loudly
+            _clip = None
+            for v in actionables:
+                v.setdefault("_cap_warn", f"cap gate init failed (firing uncapped): {type(exc).__name__}: {exc}")
+
     fired = 0
+    capped = 0
     for v in actionables:
         pid = v.get("proposal_id")
         if not pid:
             v["auto_approve_error"] = "no_proposal_id (proposal creation likely failed)"
             continue
+
+        # Portfolio-cap clip BEFORE firing.
+        if _clip is not None:
+            sym = v.get("symbol") or v.get("asset")
+            tgt, tgt_src = _resolve_target_weight(v)
+            v["_cap_target_weight"] = tgt
+            v["_cap_target_source"] = tgt_src
+            # GUARD: a None source means NO size field was resolvable. This is a
+            # plumbing break (the actionable reached the cap with no kelly /
+            # trader size / explicit target), NOT a benign "cap full". Fail it
+            # LOUDLY so it is distinguishable from a real headroom silence, and
+            # do not launder it into a zero_target silence (the 2026-06-03 bug).
+            if tgt_src is None:
+                v["auto_approve_error"] = (
+                    "size_field_missing (no kelly_fraction / trader_size_fraction / "
+                    "target_position_pct on actionable — cannot size; NOT a cap silence)"
+                )
+                continue
+            try:
+                state = _PState(positions=dict(_running))
+                clipped = _clip(sym, tgt, state, _caps)
+                # clipped is a NormalizedTarget; if not fired or scaled to ~0, skip
+                if not clipped.fired or abs(clipped.portfolio_target_pct) < 1e-6:
+                    v["auto_approve_error"] = (
+                        f"portfolio_cap_silenced ({clipped.silence_reason or 'no_headroom'})"
+                    )
+                    v["_cap_silenced"] = True
+                    capped += 1
+                    continue
+                # Accept the (possibly down-scaled) target into running state.
+                _running[sym] = _running.get(sym, 0.0) + clipped.portfolio_target_pct
+                if abs(clipped.scale_factor - 1.0) > 1e-6:
+                    v["_cap_scaled_to"] = clipped.portfolio_target_pct
+            except Exception as exc:
+                v.setdefault("_cap_warn", f"clip failed (firing uncapped): {type(exc).__name__}: {exc}")
+
         try:
             res = json.loads(_qa({
                 "proposal_id": pid,
@@ -328,6 +419,8 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
     if actionables:
         actionables[0].setdefault("_autonomy_summary", {})["fired"] = fired
         actionables[0]["_autonomy_summary"]["total"] = len(actionables)
+        actionables[0]["_autonomy_summary"]["cap_silenced"] = capped
+        actionables[0]["_autonomy_summary"]["caps_enabled"] = caps_enabled
     return actionables
 
 
@@ -462,7 +555,9 @@ def _compute_regime_section_inner(bars_by_symbol: dict | None) -> str:
 
     # Regime emoji
     regime_emoji = {
-        "bull": "🟢", "bear": "🔴", "volatile": "🌪️", "unknown": "⚪"
+        "bull": "🟢", "bear": "🔴", "volatile": "🌪️",
+        "bull_weak": "🌱", "bear_weak": "🍂", "neutral": "⚖️",
+        "unknown": "⚪",
     }.get(regime.value, "⚪")
 
     lines = ["## 🌡️ Market Regime", ""]
@@ -543,7 +638,13 @@ def _compute_research_section_inner() -> str:
         if kind == "hypothesis":
             hypotheses.setdefault(hid, {}).update(row)
         elif kind == "status_change":
-            hypotheses.setdefault(hid, {}).update(row)
+            # status_change rows carry the new state under "new_status", NOT
+            # "status". Map new_status -> status so the latest transition wins.
+            # (Synced from repo PR #79; deployed copy predated the fix.)
+            patch = dict(row)
+            if "new_status" in patch:
+                patch["status"] = patch["new_status"]
+            hypotheses.setdefault(hid, {}).update(patch)
 
     # Filter to running hypotheses
     running = [h for h in hypotheses.values() if h.get("status") == "running"]
