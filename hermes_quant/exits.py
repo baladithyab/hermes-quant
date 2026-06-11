@@ -285,6 +285,27 @@ def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
     _wsum: dict[str, float] = {}
     _wq: dict[str, float] = {}
     _poison: dict[str, bool] = {}
+    # FIX-2 (Codex round-3 P1): the |net| below which a symbol is treated as FLAT
+    # (a fully-closed round-trip). An exact offset (x + -x) is exactly 0.0 in
+    # IEEE-754, so this only absorbs trivial accumulated float noise.
+    flat_eps = 1e-9
+
+    def _reset_symbol(asset: str, *, net: float, poison: bool) -> None:
+        """Wipe a symbol's blended-basis + cumulative + carried entry state when
+        it returns to flat (or flips sign) so a re-entry starts fresh. Mutates the
+        enclosing accumulators in place (closure over _wsum/_wq/_poison/_entry_ts/
+        meta). ``net`` is the residual signed position to carry (0.0 on a clean
+        flat; the post-flip residual on a sign flip)."""
+        _wsum[asset] = 0.0
+        _wq[asset] = 0.0
+        _poison[asset] = poison
+        _entry_ts.pop(asset, None)
+        mm = meta[asset]
+        mm.cumulative_fill = net
+        mm.play_tag = "advisor"
+        mm.trader_stop_loss = None
+        mm.asset_class = "equity"
+        mm.timeframe = "1d"
 
     if not executions_path.exists():
         return meta
@@ -293,6 +314,15 @@ def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
     except OSError:
         return meta
 
+    # Collect the paper fills, then REPLAY them in ascending asof_execution order.
+    # The file is normally append-ordered already; a STABLE sort by asof_execution
+    # preserves file order on ties (matching the existing "latest fill on a tie =
+    # last in file" semantics the `ts >=` checks below rely on) and defends against
+    # any out-of-order append — which the round-trip reset (FIX-2) depends on to
+    # see a close BEFORE the re-entry it precedes. Fail-soft: malformed / non-paper
+    # / keyless / non-string-ts lines are skipped (one bad append must not crash
+    # the whole recovery — a non-string ts would also break the `ts >=` compares).
+    records: list[dict] = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -305,10 +335,14 @@ def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
             continue
         if rec.get("reactor_name") != "paper":
             continue
-        asset = rec.get("asset")
-        ts = rec.get("asof_execution")
-        if asset is None or ts is None:
+        if rec.get("asset") is None or not isinstance(rec.get("asof_execution"), str):
             continue
+        records.append(rec)
+    records.sort(key=lambda r: r["asof_execution"])  # stable: ties keep file order
+
+    for rec in records:
+        asset = rec["asset"]
+        ts = rec["asof_execution"]
         m = meta.setdefault(asset, _PosMeta())
 
         dp = rec.get("decision_price")
@@ -323,13 +357,19 @@ def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
         # FIX-A (Codex P1): accumulate the SIGNED fill for EVERY paper fill (open
         # legs, adds, and prior partial closes) so cumulative_fill == the net open
         # quantity the settlement FIFO matcher tracks. This is the offset the
-        # close must use, not the latest target snapshot.
+        # close must use, not the latest target snapshot. FIX-2 reads the running
+        # NET off this accumulator (prev_net -> new_net) to detect a flat/flip.
+        prev_net = m.cumulative_fill or 0.0
         fsp = rec.get("fill_size_pct")
+        fsp_f: float | None = None
         if fsp is not None:
             try:
-                m.cumulative_fill = (m.cumulative_fill or 0.0) + float(fsp)
+                fsp_f = float(fsp)
             except (TypeError, ValueError):
-                pass
+                fsp_f = None
+        if fsp_f is not None:
+            m.cumulative_fill = prev_net + fsp_f
+        new_net = m.cumulative_fill or 0.0
 
         # entry / play_tag / stop: latest NON-ZERO-target fill (an opening leg)
         target = rec.get("target_position_pct")
@@ -344,10 +384,7 @@ def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
             # The weight is |fill_size_pct| so the blend matches the cumulative
             # quantity; the sign comes from cumulative_fill at evaluation time.
             leg_basis = _fill_entry_basis(rec)
-            try:
-                w = abs(float(fsp)) if fsp is not None else 0.0
-            except (TypeError, ValueError):
-                w = 0.0
+            w = abs(fsp_f) if fsp_f is not None else 0.0
             if leg_basis is None or not math.isfinite(w) or w <= 0:
                 # An opening leg with no usable price (or no usable size) makes the
                 # whole blend untrustworthy => fail-closed: skip this symbol.
@@ -370,6 +407,33 @@ def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
                         )
                     except (TypeError, ValueError):
                         m.trader_stop_loss = None
+
+        # FIX-2 (Codex round-3 P1): RESET the accumulators on a return-to-FLAT or a
+        # sign FLIP. FIX-1/FIX-A accrue monotonically over the WHOLE file with no
+        # notion of a position having closed, so a CLOSED round-trip's opening legs
+        # stayed blended into a later re-entry's basis (and its fills stayed in
+        # cumulative_fill) — the basis reflected dead lots the settlement FIFO
+        # matcher no longer holds open. Evaluated AFTER this fill's contribution so
+        # the transition is read off (prev_net -> new_net).
+        if abs(prev_net) > flat_eps and abs(new_net) <= flat_eps:
+            # FLAT: a position that HELD a non-zero net just fully closed. Wipe
+            # basis + cumulative + carried entry state so any later opening leg
+            # rebuilds for the NEW position only (cumulative snaps to a clean 0.0).
+            # Gated on prev_net != 0 to match "RETURNS to ~0" — a first fill that
+            # merely lands at 0 (a zero-size leg) never held a position to reset
+            # (and would build no usable basis anyway). The common never-closed
+            # case never reaches |net|<=eps, so its behavior is UNCHANGED.
+            _reset_symbol(asset, net=0.0, poison=False)
+        elif (prev_net > flat_eps and new_net < -flat_eps) or (
+            prev_net < -flat_eps and new_net > flat_eps
+        ):
+            # OVER-CLOSE that flips the sign in one fill: the reversing fill is part
+            # exit, part entry, so the residual position's cost basis is ambiguous.
+            # SAFE simplification (spec): reset the dead side's accumulators and
+            # fail-closed POISON the residual (=> blended_entry=None => skipped),
+            # never auto-trade on a guessed basis. A later clean round-trip to flat
+            # clears the poison.
+            _reset_symbol(asset, net=new_net, poison=True)
 
     # Finalize the blended basis. Fail-closed: a poisoned symbol, a zero total
     # weight, or a non-finite/<=0 blend all leave blended_entry=None (the

@@ -121,6 +121,50 @@ def _append_open(
         f.write(line)
 
 
+def _append_close(
+    qhome: Path,
+    symbol: str,
+    fill_size_pct: float,
+    exit_mark: float,
+    *,
+    ts: str,
+    proposal_id: str,
+    play_tag: str = "advisor",
+    asset_class: str = "equity",
+    timeframe: str = "1d",
+) -> None:
+    """Append a synthetic CLOSE paper fill (target_position_pct=0.0) — the exit
+    leg shape manage_open_positions itself writes.
+
+    ``fill_size_pct`` is the signed offsetting size that drives the running net
+    toward 0; ``exit_mark`` is the fill_price (an EXIT price, NOT an entry — the
+    blended-basis accumulators must exclude it). Used to model a full round-trip
+    so a later re-entry can be tested for basis/cumulative reset.
+    """
+    rec = {
+        "proposal_id": proposal_id,
+        "signal_id": f"sig_{symbol}",
+        "asset": symbol,
+        "asset_class": asset_class,
+        "timeframe": timeframe,
+        "asof_decision": ts,
+        "asof_execution": ts,
+        "target_position_pct": 0.0,
+        "decision_price": exit_mark,
+        "fill_price": exit_mark,
+        "fill_size_pct": fill_size_pct,
+        "reactor_name": "paper",
+        "human_in_the_loop": False,
+        "approver_user_id": "test",
+        "reactor_metadata": {"paper": True},
+        "bar_ts": ts,
+        "play_tag": play_tag,
+    }
+    line = json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n"
+    with open(qhome / "executions.jsonl", "a", encoding="utf-8") as f:
+        f.write(line)
+
+
 def _bus_records(qhome: Path) -> list[dict]:
     path = qhome / "executions.jsonl"
     if not path.exists():
@@ -986,3 +1030,159 @@ def test_blended_basis_short(qhome, exit_config):
     assert exit_rec["fill_size_pct"] == pytest.approx(0.20)  # offset of -0.20
     # Short pnl = -(170/150 - 1) = -2/15 ≈ -13.3%.
     assert exit_rec["reactor_metadata"]["exit_pnl_pct"] == pytest.approx(-2 / 15)
+
+
+# ---------------------------------------------------------------------------
+# FIX-2 (Codex round-3 P1): RESET the blended-basis + cumulative_fill
+# accumulators when a symbol round-trips to FLAT and is later re-entered. FIX-1
+# blended EVERY opening leg in the file monotonically, with no notion of a
+# position having closed. So a closed round-trip's opening legs stayed blended
+# into a later re-entry's basis (and its fills stayed in cumulative_fill) — the
+# basis reflected dead lots the settlement FIFO matcher no longer sees as open.
+#
+# The fix tracks a running NET signed position as it replays fills (in ascending
+# asof_execution order); when the net returns to ~0 the position is FLAT, so it
+# resets that symbol's _wsum/_wq/_poison/cumulative_fill + carried entry state.
+# Opening legs AFTER the reset rebuild the basis for the new position only.
+# A close leg that OVER-closes (net flips sign) leaves an ambiguous residual
+# basis => fail-closed poison (skip), per the SAFE simplification in the spec.
+# ---------------------------------------------------------------------------
+
+
+def test_blended_basis_resets_after_full_close_then_reentry(qhome, exit_config):
+    """The exact Codex round-3 repro. +0.10@100, FULL close to flat, then
+    +0.10@200. The current real position is +0.10 @ 200, so a mark of 170 is
+    -15% => the stop MUST fire. The pre-fix code still blended the DEAD 100 leg
+    with the live 200 leg => basis 150 => read +13% (a phantom profit) and
+    SKIPPED a real stop-loss (a wrongful non-exit, the money bug)."""
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    # Leg 1: open +0.10 @ 100 (this lot is fully closed below — must NOT survive
+    # into the re-entry's basis).
+    _append_open(
+        qhome, "AAPL", 0.10, 100.0, fill_price=100.0,
+        proposal_id="prop_open1", ts="2026-06-10T15:00:00Z",
+    )
+    # Leg 2: full close to FLAT (offset -0.10, target=0.0) at some exit mark.
+    _append_close(
+        qhome, "AAPL", -0.10, 105.0,
+        proposal_id="prop_close1", ts="2026-06-10T15:05:00Z",
+    )
+    # Leg 3: RE-ENTRY +0.10 @ 200 — the only currently-open lot.
+    _append_open(
+        qhome, "AAPL", 0.10, 200.0, fill_price=200.0,
+        proposal_id="prop_open2", ts="2026-06-10T15:10:00Z",
+    )
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 170.0},  # -15% vs the LIVE basis 200
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    assert "AAPL" in result.exited_symbols  # the real stop fires (basis reset to 200)
+    assert "AAPL" not in result.skipped_bad_mark
+    exit_rec = _bus_records(qhome)[-1]
+    assert exit_rec["target_position_pct"] == 0.0
+    # Offsets ONLY the re-entry's +0.10 (the dead round-trip nets out).
+    assert exit_rec["fill_size_pct"] == pytest.approx(-0.10)
+    # pnl is the live -15% (vs 200), not a blended-with-dead-lot number.
+    assert exit_rec["reactor_metadata"]["exit_pnl_pct"] == pytest.approx(-0.15)
+
+
+def test_blended_basis_no_reset_when_never_flat(qhome, exit_config):
+    """Regression guard: the average-up case (+0.10@100, +0.10@200 with NO
+    intervening close) must be UNCHANGED — the running net never returns to 0, so
+    no reset triggers, the blend stays 150, mark 170 reads +13% and does NOT
+    stop. (The reset must fire ONLY on a genuine round-trip to flat.)"""
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    _append_open(
+        qhome, "AAPL", 0.10, 100.0, fill_price=100.0,
+        proposal_id="prop_add1", ts="2026-06-10T15:00:00Z",
+    )
+    _append_open(
+        qhome, "AAPL", 0.10, 200.0, fill_price=200.0,
+        proposal_id="prop_add2", ts="2026-06-10T15:05:00Z",
+    )
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 170.0},  # +13.3% vs blended 150
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    assert result.exited_symbols == []  # blend stays 150 => no false stop
+    assert "AAPL" not in result.skipped_bad_mark
+
+
+def test_cumulative_fill_resets_after_roundtrip(qhome, exit_config):
+    """After a full close + a DIFFERENT-sized re-entry, cumulative_fill must
+    reflect ONLY the re-entry — so the next close offsets the right quantity AND
+    the basis is the re-entry's. +0.10@100, close to flat, +0.20@200, mark 170.
+    The live position is +0.20 @ 200 => -15% => stop fires, offsetting exactly
+    -0.20. Pre-fix the basis blended the dead 100 leg ((100*0.10+200*0.20)/0.30 =
+    166.7) so mark 170 read +2% and the position never even breached — no exit
+    record was written at all."""
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    _append_open(
+        qhome, "AAPL", 0.10, 100.0, fill_price=100.0,
+        proposal_id="prop_open1", ts="2026-06-10T15:00:00Z",
+    )
+    _append_close(
+        qhome, "AAPL", -0.10, 105.0,
+        proposal_id="prop_close1", ts="2026-06-10T15:05:00Z",
+    )
+    # Re-entry of a DIFFERENT size (+0.20) so the cumulative offset is not
+    # accidentally equal to the original lot's size.
+    _append_open(
+        qhome, "AAPL", 0.20, 200.0, fill_price=200.0,
+        proposal_id="prop_open2", ts="2026-06-10T15:10:00Z",
+    )
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 170.0},  # -15% vs the LIVE basis 200
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    assert "AAPL" in result.exited_symbols
+    exit_rec = _bus_records(qhome)[-1]
+    assert exit_rec["target_position_pct"] == 0.0
+    # Offsets the re-entry's +0.20 ONLY (dead round-trip excluded).
+    assert exit_rec["fill_size_pct"] == pytest.approx(-0.20)
+    assert exit_rec["reactor_metadata"]["exit_pnl_pct"] == pytest.approx(-0.15)
+
+
+def test_over_close_sign_flip_fails_closed(qhome, exit_config):
+    """A leg that OVER-closes and flips the net sign (long +0.10 -> short -0.20
+    in one fill) leaves a residual whose cost basis is ambiguous (the reversing
+    fill price is part exit, part entry). Fail-closed: poison the symbol =>
+    blended_entry=None => SKIP (skipped_bad_mark), never auto-trade on a guessed
+    basis. Pre-fix the code blended both opening legs into a fabricated basis
+    (~92.5) and exited the short on it — a wrongful exit."""
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    # Open long +0.10 @ 100.
+    _append_open(
+        qhome, "AAPL", 0.10, 100.0, fill_price=100.0,
+        proposal_id="prop_open1", ts="2026-06-10T15:00:00Z",
+    )
+    # Reverse in one fill: delta -0.30 takes the net to -0.20 (a short). This is
+    # an OPENING leg (target=-0.20 != 0) so reconstruct keeps AAPL in the book.
+    _append_open(
+        qhome, "AAPL", -0.20, 90.0, fill_price=90.0, fill_size_pct=-0.30,
+        proposal_id="prop_reverse", ts="2026-06-10T15:05:00Z",
+    )
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 110.0},  # would breach a fabricated basis
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    assert "AAPL" not in result.exited_symbols  # never trades on an ambiguous basis
+    assert "AAPL" in result.skipped_bad_mark
+    # Nothing appended beyond the two seed legs.
+    assert len(_bus_records(qhome)) == 2
