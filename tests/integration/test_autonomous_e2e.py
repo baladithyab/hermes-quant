@@ -25,8 +25,43 @@ from hermes_quant.autonomous import (
     tick,
     trip_kill_switch,
 )
+from hermes_quant.exits import manage_open_positions
 from hermes_quant.react.paper import FillSizeInvariantError
 from hermes_quant.watchlist import WatchlistEntry
+
+
+def _append_open_position(
+    qhome: Path,
+    symbol: str,
+    *,
+    target_pct: float = 0.10,
+    price: float = 100.0,
+    ts: str = "2026-06-10T15:00:00Z",
+) -> None:
+    """Append a synthetic OPEN paper fill to the isolated executions bus so
+    reconstruct_portfolio_state (the concurrency-rail / exit-pass source) sees it."""
+    rec = {
+        "proposal_id": f"prop_open_{symbol}",
+        "signal_id": None,
+        "asset": symbol,
+        "asset_class": "equity",
+        "timeframe": "1d",
+        "asof_decision": ts,
+        "asof_execution": ts,
+        "target_position_pct": target_pct,
+        "decision_price": price,
+        "fill_price": price,
+        "fill_size_pct": target_pct,
+        "reactor_name": "paper",
+        "human_in_the_loop": True,
+        "approver_user_id": "test",
+        "reactor_metadata": {"paper": True},
+        "bar_ts": ts,
+        "play_tag": "advisor",
+    }
+    path = qhome / "executions.jsonl"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
 
 
 @pytest.fixture
@@ -258,25 +293,149 @@ def test_max_per_tick_opens_caps_fires(
 
 
 # ---------------------------------------------------------------------------
+# Wave 2: same-tick re-open prevention (ULTRACODE-REVIEW Q5)
+# ---------------------------------------------------------------------------
+
+
+def test_exited_symbol_not_reopened_same_tick(isolate_config, isolate_quant_home):
+    """A symbol flattened by the pre-entry exit pass MUST NOT be re-opened by the
+    entry loop in the same tick. Passing exited_symbols=[X] makes the entry loop
+    skip X entirely (the catastrophic stop-loss/re-fill churn loop the review
+    flagged)."""
+    _set_mode_autonomous(isolate_config)
+    # AAPL is open at tick start; the exit pass just flattened it this tick.
+    _append_open_position(isolate_quant_home, "AAPL", target_pct=0.10, price=100.0)
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        result = tick(
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+            exited_symbols=["AAPL"],
+        )
+
+    # AAPL must NOT be re-fired.
+    assert "AAPL" not in react_calls
+    assert result.fires == 0
+    aapl = [d for d in result.decisions if d.symbol == "AAPL"][0]
+    assert aapl.gate == "SILENCE_EXITED_THIS_TICK"
+
+
+def test_exited_symbol_frees_concurrency_slot(isolate_config, isolate_quant_home):
+    """A symbol exited this tick must be DECREMENTED from the concurrency
+    snapshot, not left consuming a slot. With max_concurrent=5 and a book of
+    [A,B,C,D,E] where E was exited this tick, a NEW symbol F must be allowed to
+    open (E freed the 5th slot)."""
+    import yaml
+
+    _set_mode_autonomous(isolate_config, max_per_tick_opens=10)
+    cfg = yaml.safe_load(isolate_config.read_text(encoding="utf-8")) or {}
+    cfg["quant"]["autonomous"]["max_concurrent_positions"] = 5
+    isolate_config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    for sym in ("A", "B", "C", "D", "E"):
+        _append_open_position(isolate_quant_home, sym, target_pct=0.10, price=100.0)
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        result = tick(
+            dry_run=False,
+            symbols=[WatchlistEntry("F", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+            exited_symbols=["E"],  # E flattened this tick => slot freed
+        )
+
+    # Without the decrement, F would be SILENCE_CONCURRENT_CAP (book reads as 5).
+    assert "F" in react_calls
+    assert result.fires == 1
+
+
+def test_exited_symbols_default_none_is_unchanged(isolate_config, isolate_quant_home):
+    """exited_symbols defaulting to None must be byte-identical to today: a NEW
+    symbol fires normally with no exit pass in play."""
+    _set_mode_autonomous(isolate_config)
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        result = tick(
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+        )
+
+    assert react_calls == ["AAPL"]
+    assert result.fires == 1
+
+
+# ---------------------------------------------------------------------------
 # Kill-switch
 # ---------------------------------------------------------------------------
 
 
-def test_kill_switch_trip_halts_tick(isolate_config, isolate_quant_home):
+def test_kill_switch_trip_halts_entries_but_exits_still_run(
+    isolate_config, isolate_quant_home
+):
+    """REVIEWED CHANGE (ULTRACODE-REVIEW Q2, the blocking finding): a tripped
+    kill-switch must halt ENTRIES while EXITS still fire. Entries and exits have
+    opposite desired behavior under a tripped switch — the switch trips precisely
+    when the book is bleeding, which is exactly when stops must still cut losers.
+
+    tick() (entries) still aborts before evaluating symbols — unchanged. The
+    SEPARATE manage_open_positions() pass NEVER reads the kill-switch, so it still
+    closes a breaching position even with the switch tripped. This test documents
+    both halves of the contract (was: test_kill_switch_trip_halts_tick, which only
+    asserted the entry-halt half)."""
     _set_mode_autonomous(isolate_config)
+    # Enable the exit pass + put one breaching position in the isolated book.
+    import yaml
+
+    cfg = yaml.safe_load(isolate_config.read_text(encoding="utf-8")) or {}
+    cfg["quant"]["autonomous"]["manage_positions"] = True
+    cfg["quant"]["autonomous"]["stop_loss_pct"] = 0.10
+    isolate_config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    _append_open_position(isolate_quant_home, "AAPL", target_pct=0.10, price=100.0)
+
     trip_kill_switch(
         cumulative_pnl_pct=-0.15,
         threshold_pct=0.10,
         reason="manual_test_trip",
     )
+
+    # ENTRIES halt — tick aborts before evaluating symbols (unchanged).
     result = tick(
         dry_run=True,
-        symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+        symbols=[WatchlistEntry("MSFT", "equity", "1d")],
         advisor_recommend=lambda **kw: _make_advisor_result(),
     )
     assert result.kill_switch_state.tripped is True
     assert result.fires == 0
-    assert result.decisions == []  # tick aborts before evaluating symbols
+    assert result.decisions == []
+
+    # EXITS still run — the separate pass closes the breaching AAPL despite the
+    # tripped switch.
+    exit_result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 85.0},  # -15% < -10% stop
+        clock_provider=lambda: True,
+        quant_home=isolate_quant_home,
+    )
+    assert "AAPL" in exit_result.exited_symbols
 
 
 def test_reset_kill_switch_resumes_normal_operation(

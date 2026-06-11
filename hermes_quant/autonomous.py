@@ -386,6 +386,7 @@ def tick(
     dry_run: bool = True,
     symbols: list[WatchlistEntry] | None = None,
     advisor_recommend=None,
+    exited_symbols: list[str] | None = None,
 ) -> TickResult:
     """Single autonomous tick across the watchlist (ADR-0016 §D8).
 
@@ -397,6 +398,11 @@ def tick(
         symbols: Optional override of the watchlist (for tests). Default
             reads from quant.autonomous.watchlist.
         advisor_recommend: Optional override of advisor.recommend (for tests).
+        exited_symbols: symbols flattened by a pre-entry exit pass
+            (manage_open_positions) THIS tick. The entry loop SKIPS them and
+            decrements them from the concurrency snapshot, so a stop-loss cannot
+            be undone by a same-tick re-open (ULTRACODE-REVIEW Q5). Default None
+            => byte-identical to the pre-Wave-2 path (no exit pass in play).
 
     Returns:
         TickResult with structured per-symbol decisions + fires/silences/
@@ -519,6 +525,19 @@ def tick(
             _exc,
         )
 
+    # Wave 2 (ULTRACODE-REVIEW Q5): a symbol flattened by the pre-entry exit pass
+    # this tick must NOT still occupy the concurrency snapshot — otherwise a
+    # re-fire on it reads as a cap-exempt "adjustment" (re-opening it and undoing
+    # the exit) AND wrongly consumes a slot. Drop each exited symbol from both
+    # the symbol set and the position count BEFORE the entry loop runs. The
+    # entry loop also skips exited symbols entirely (below). Default None =>
+    # byte-identical to the pre-Wave-2 path.
+    exited_this_tick: set[str] = set(exited_symbols or [])
+    for _sym in exited_this_tick:
+        if _sym in open_symbols_at_tick_start:
+            open_symbols_at_tick_start.discard(_sym)
+            open_positions_at_tick_start = max(0, open_positions_at_tick_start - 1)
+
     # ADR-0071: portfolio-aware Stage-2 sizing. When the operator opts in
     # via HERMES_QUANT_PORTFOLIO_CAPS=1, each fire is clipped greedily
     # against running portfolio headroom (gross / net / cash caps). The
@@ -555,6 +574,28 @@ def tick(
     _inject_frame = os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "1") == "1"
 
     for entry in watchlist:
+        # Wave 2 (ULTRACODE-REVIEW Q5): a symbol the exit pass flattened this
+        # tick must not be re-opened by the entry loop — a stop-loss that re-fills
+        # on the same tick is catastrophic churn. Skip it before the advisor call
+        # (no point recomputing a recommendation for a symbol we will not fire).
+        if entry.symbol in exited_this_tick:
+            result.decisions.append(
+                SymbolDecision(
+                    symbol=entry.symbol,
+                    asset_class=entry.asset_class,
+                    timeframe=entry.timeframe,
+                    gate="SILENCE_EXITED_THIS_TICK",
+                    details={
+                        "reason": (
+                            "position flattened by the exit pass this tick; "
+                            "entry suppressed to prevent same-tick re-open"
+                        ),
+                    },
+                )
+            )
+            result.silences += 1
+            continue
+
         try:
             _frame = None
             if _inject_frame:
