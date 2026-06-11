@@ -255,6 +255,91 @@ field) merges.
 
 ---
 
+## Round-2 Codex fixes (newest, NOT pushed)
+
+A Codex re-review of the Wave 3.5/4a/5 commits found 2 issues. Both fixed here,
+TDD (failing test first), one small commit each, no push, no rebase. The running
+gateway/daemon and the deployed `~/.hermes/scripts/*` were NOT touched.
+
+| SHA | Pri | Summary |
+|-----|-----|---------|
+| `672437c` | P1 | fix(exits): blended size-weighted cost basis for cumulative exits |
+| `d9bb0a2` | P2 | fix(autonomous): dry-run cycle suppresses would_exit entries |
+
+### FIX-1 [P1] — BLENDED cost basis for cumulative exits (`672437c`)
+**File:** `hermes_quant/exits.py` (`_PosMeta.blended_entry`, new `_fill_entry_basis`
+helper, the `_recover_position_meta` walk, the per-symbol consumer).
+**Bug (Codex, runnable repro):** FIX-A made the close QUANTITY cumulative
+(`cumulative_fill` = sum of signed `fill_size_pct`), but the entry PRICE basis
+still came from only the LATEST non-zero fill. A position added at two prices was
+evaluated against the wrong entry. Repro: `+0.10@100` then `+0.10@200`, mark 170.
+The true size-weighted blended basis is `(0.10*100 + 0.10*200)/0.20 = 150`, so
+mark 170 is **+13% (a profit — must NOT stop out)**. The latest-fill basis (200)
+read it as **-15%** and fired a stop, liquidating the whole `+0.20` book. A
+false-exit money bug.
+**Fix:** recover a SIZE-WEIGHTED blended entry basis over ALL opening legs —
+`sum(basis_i * |fill_size_pct_i|) / sum(|fill_size_pct_i|)`. Each leg's basis is
+FIX-B's precedence (positive `fill_price` first, `decision_price` fallback).
+Closing legs (`target_position_pct == 0`) are excluded (their `fill_price` is the
+EXIT mark, which would corrupt the entry basis); the exit pass only does full
+closes, so a live position's legs are pure adds. `pnl_pct = qty_sign *
+(mark/blended - 1)` with `qty_sign` from the TRUE cumulative direction (short side
+correct). Fail-closed: a poisoned leg (no usable price/size), a zero total weight,
+or a non-finite/`<=0` blend all yield `blended_entry=None` => the symbol is
+skipped exactly like a bad mark — never a fabricated breach.
+**Proven by** (`tests/test_exits.py`):
+- `test_blended_basis_two_adds_profit_no_stop` — the exact Codex repro: blended
+  150, mark 170 => +13% => NO exit.
+- `test_blended_basis_two_adds_real_loss_exits` — blended 150, mark 120 => -20%
+  => stop fires, closes full `-0.20`, `exit_pnl_pct == -0.20` (not the latest-fill
+  `-0.40`).
+- `test_blended_basis_short` — a short added at two prices evaluates pnl with the
+  correct sign against the blended basis.
+- the FIX-A cumulative-qty + settlement-flat tests stay green. **35 passed.**
+
+### FIX-2 [P2] — dry-run cycle suppresses would_exit entries (`d9bb0a2`)
+**File:** `hermes_quant/autonomous.py` (`run_autonomous_cycle` suppression set).
+**Bug:** in `run_autonomous_cycle(dry_run=True)`, `manage_open_positions` appends
+nothing so `exit_result.exited_symbols` is empty. Passing only `exited_symbols`
+to `tick()` meant a symbol that WOULD exit AND is on the entry watchlist reported
+a FIRE in the dry-run forecast, while the real (non-dry) cycle suppresses that
+same-tick re-open. The forecast diverged from live.
+**Fix:** `dry_run=True` => suppress `union(exited_symbols, would_exit)` (the set
+the live cycle would flatten then suppress); `dry_run=False` => suppress
+`exited_symbols` (the actually-flattened set — `would_exit` on the live path is
+the cap-selected pre-append set and is NOT what got suppressed). The dry-run
+forecast now predicts live behavior.
+**Proven by** (`tests/integration/test_autonomous_e2e.py`):
+- `test_dry_run_cycle_suppresses_entry_for_would_exit_symbol` — a would-exit
+  symbol on the watchlist is `SILENCE_EXITED_THIS_TICK` in a dry-run cycle, not a
+  FIRE.
+- `test_non_dry_cycle_suppresses_only_actually_exited` — the live-path contrast:
+  both paths agree on the suppressed symbol. **37 passed.**
+
+### Round-2 verification (named files only)
+```
+PYTHONPATH=/tmp/wt-quant-automanage ~/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_exits.py \
+  tests/integration/test_autonomous_e2e.py \
+  tests/state/test_portfolio_state.py \
+  tests/test_react_fill_size_invariant.py
+```
+| File | Result |
+|------|--------|
+| tests/test_exits.py | 35 passed |
+| tests/integration/test_autonomous_e2e.py | 37 passed |
+| tests/state/test_portfolio_state.py | 52 passed |
+| tests/test_react_fill_size_invariant.py | 13 passed |
+| **Total** | **137 passed, 0 failed** |
+
+**Flag-OFF byte-identical invariant** still holds: `test_flag_off_is_byte_identical_noop`,
+`test_cycle_manage_positions_off_skips_exit_pass`, `test_cycle_dry_run_honored_end_to_end`,
+and `test_exited_symbols_default_none_is_unchanged` all green (the new suppression
+set is only consulted when `manage_positions` is enabled and a symbol breaches;
+default-OFF the cycle is still a plain `tick()`).
+
+---
+
 ## Still deferred (NOT in this lane — operator review gate)
 
 - Wave 4b: brief-feeds-tick, the `precomputed_advisor_results` tick() param, and
