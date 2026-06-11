@@ -340,6 +340,75 @@ default-OFF the cycle is still a plain `tick()`).
 
 ---
 
+## Round-3 Codex fix (newest, NOT pushed)
+
+A Codex final-pass on the Round-2 blended-basis commit found 1 P1. Fixed here,
+TDD (failing test first), one commit, no push, no rebase. The running
+gateway/daemon and the deployed `~/.hermes/scripts/*` were NOT touched (the
+helper is not duplicated under `ops/` — no backport required).
+
+| SHA | Pri | Summary |
+|-----|-----|---------|
+| `ea021f3` | P1 | fix(exits): reset blended basis + cumulative_fill on round-trip to flat |
+
+### FIX-2 [P1] — reset accumulators when a symbol round-trips to FLAT (`ea021f3`)
+**File:** `hermes_quant/exits.py` (`_recover_position_meta` — fills now replayed
+in `asof_execution` order; new `_reset_symbol` closure; a running-net flat/flip
+check after each fill's contribution).
+**Bug (Codex, runnable repro):** FIX-1 (blended basis) and FIX-A
+(`cumulative_fill`) accrue MONOTONICALLY over every paper fill in the file, with
+no notion of a position having closed. A fully-closed round-trip's opening legs
+stayed blended into a LATER re-entry's basis, and its fills stayed in
+`cumulative_fill` — the basis reflected dead lots the settlement FIFO matcher no
+longer holds open. Repro: `+0.10@100`, full close to flat, `+0.10@200`. The live
+position is `+0.10 @ 200`, so mark 170 is **-15% (must STOP)**. The stale code
+blended the dead 100 leg with the live 200 leg => basis 150 => read **+13%** (a
+phantom profit) and SKIPPED a real stop-loss — a wrongful non-exit money bug
+(the mirror case wrongful-exits).
+**Fix:** replay fills in ascending `asof_execution` order (STABLE sort — the file
+is already append-ordered, so ties keep file order, matching the existing
+`ts >=` "latest wins" semantics) while tracking a running NET signed position per
+symbol off `cumulative_fill`. When a HELD position RETURNS to ~0
+(`|prev_net|>eps and |new_net|<=eps`, `eps=1e-9`) it is FLAT => reset
+`_wsum/_wq/_poison/cumulative_fill` + the carried entry/play_tag/stop/asset_class/
+timeframe state, so opening legs AFTER the reset rebuild the basis for the NEW
+position only. Multiple round-trips reset on EACH return-to-flat. An over-close
+that FLIPS the sign in one fill leaves a residual whose cost basis is ambiguous
+(the reversing fill is part exit, part entry) => fail-closed POISON the residual
+(`blended_entry=None` => skipped, never auto-traded on a guessed basis), the SAFE
+simplification in the spec. The never-closed common case never reaches
+`|net|<=eps` => behavior UNCHANGED; flag-OFF stays byte-identical.
+**Proven by** (`tests/test_exits.py`):
+- `test_blended_basis_resets_after_full_close_then_reentry` — the exact Codex
+  repro: basis resets to 200, mark 170 => -15% => stop fires, offsets `-0.10`,
+  `exit_pnl_pct == -0.15`.
+- `test_blended_basis_no_reset_when_never_flat` — the average-up case (no
+  intervening close) still blends 150, mark 170 => +13% => NO stop (regression
+  guard for the unchanged path).
+- `test_cumulative_fill_resets_after_roundtrip` — full close + a DIFFERENT-sized
+  re-entry (`+0.20`) offsets exactly `-0.20`, basis is the re-entry's `200`.
+- `test_over_close_sign_flip_fails_closed` — a one-fill `+0.10`->`-0.20` reversal
+  poisons => `skipped_bad_mark`, nothing appended.
+- all FIX-1 / FIX-A / FIX-B / FIX-C tests stay green.
+
+### Round-3 verification (named files only)
+```
+PYTHONPATH=/tmp/wt-quant-automanage ~/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_exits.py \
+  tests/integration/test_autonomous_e2e.py
+```
+| File | Result |
+|------|--------|
+| tests/test_exits.py | 39 passed |
+| tests/integration/test_autonomous_e2e.py | 37 passed |
+| **Total** | **76 passed, 0 failed** |
+
+**Flag-OFF byte-identical invariant** still holds: `test_flag_off_is_byte_identical_noop`
+green (the reset only fires when `manage_positions` is enabled and a held position
+returns to flat; default-OFF the recovery walk is never even reached).
+
+---
+
 ## Still deferred (NOT in this lane — operator review gate)
 
 - Wave 4b: brief-feeds-tick, the `precomputed_advisor_results` tick() param, and
