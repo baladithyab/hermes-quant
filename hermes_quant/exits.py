@@ -114,6 +114,14 @@ class _PosMeta:
     trader_stop_loss: float | None = None
     asset_class: str = "equity"
     timeframe: str = "1d"
+    # FIX-A (Codex P1): the TRUE cumulative open quantity = sum of signed
+    # fill_size_pct across this symbol's paper fills. The reconstruct view is
+    # latest-target-supersedes (every add stamps target=fill, so two +0.1 adds
+    # read as held=0.1), but settlement FIFO sums the signed fills (=+0.2). The
+    # close must offset the CUMULATIVE, not the latest target snapshot, or it
+    # leaves a residual lot hidden from settlement + future reconstruct passes.
+    # None => no paper fill seen for the symbol (defensive; falls back to held).
+    cumulative_fill: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +221,14 @@ def _default_marks_provider(symbols: list[str]) -> dict[str, float]:
 def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
     """Walk executions.jsonl once and recover, per symbol:
 
-      * entry_price      : latest NON-ZERO-target fill's decision_price (pnl basis)
+      * entry_price      : latest NON-ZERO-target fill's entry (pnl basis). FIX-B:
+                           the actual fill_price (positive) wins; decision_price is
+                           the fallback only for older records lacking a fill_price.
       * play_tag         : latest non-zero-target fill's play_tag (attribution)
       * trader_stop_loss : that fill's reactor_metadata.trader_stop_loss (price)
       * last_bus_price   : latest fill's decision_price overall (sanity-clamp basis)
+      * cumulative_fill  : FIX-A — sum of signed fill_size_pct across ALL paper
+                           fills (the settlement-FIFO basis the close must offset)
       * asset_class/timeframe : carried onto the close record
 
     Fail-soft: a malformed line is skipped (one bad append must not black-hole
@@ -261,6 +273,17 @@ def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
             except (TypeError, ValueError):
                 pass
 
+        # FIX-A (Codex P1): accumulate the SIGNED fill for EVERY paper fill (open
+        # legs, adds, and prior partial closes) so cumulative_fill == the net open
+        # quantity the settlement FIFO matcher tracks. This is the offset the
+        # close must use, not the latest target snapshot.
+        fsp = rec.get("fill_size_pct")
+        if fsp is not None:
+            try:
+                m.cumulative_fill = (m.cumulative_fill or 0.0) + float(fsp)
+            except (TypeError, ValueError):
+                pass
+
         # entry / play_tag / stop: latest NON-ZERO-target fill (an opening leg)
         target = rec.get("target_position_pct")
         try:
@@ -269,11 +292,25 @@ def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
             is_open_leg = False
         if is_open_leg and ts >= _entry_ts.get(asset, ""):
             _entry_ts[asset] = ts
-            if dp is not None:
+            # FIX-B (Codex P2): the threshold/pnl basis is the ACTUAL entry the
+            # v0.2 slippage model filled at and settlement realizes against —
+            # i.e. fill_price. decision_price (the pre-slippage quote) is only a
+            # fallback for older records that never recorded a fill_price.
+            entry_basis: float | None = None
+            fp = rec.get("fill_price")
+            if fp is not None:
                 try:
-                    m.entry_price = float(dp)
+                    fp_f = float(fp)
+                    if math.isfinite(fp_f) and fp_f > 0:
+                        entry_basis = fp_f
                 except (TypeError, ValueError):
-                    m.entry_price = None
+                    entry_basis = None
+            if entry_basis is None and dp is not None:
+                try:
+                    entry_basis = float(dp)
+                except (TypeError, ValueError):
+                    entry_basis = None
+            m.entry_price = entry_basis
             m.play_tag = str(rec.get("play_tag") or "advisor")
             m.asset_class = str(rec.get("asset_class") or "equity")
             m.timeframe = str(rec.get("timeframe") or "1d")
@@ -370,12 +407,21 @@ def manage_open_positions(
 
     # ----- Per-symbol classification -----
     # A "breach" is a candidate exit (stop / take / per-position-stop cross).
-    breaches: list[tuple[str, float, float]] = []  # (symbol, pnl_pct, held)
+    # The third tuple element is the TRUE cumulative held quantity (FIX-A), the
+    # offset the close leg must use — not the reconstruct latest-target snapshot.
+    breaches: list[tuple[str, float, float]] = []  # (symbol, pnl_pct, true_held)
     valid_marked = 0
 
     for sym in symbols:
         held = open_book[sym]
         m = meta.get(sym, _PosMeta())
+        # FIX-A (Codex P1): close the cumulative signed fill, not the latest
+        # target snapshot. reconstruct's `held` is latest-target-supersedes; the
+        # settlement FIFO matcher nets cumulative fill_size_pct. Offsetting only
+        # the latest target leaves a residual lot hidden from settlement + future
+        # exit passes. Fall back to `held` only if the cumulative is somehow
+        # unrecoverable (defensive; the symbol IS in the reconstruct open book).
+        true_held = m.cumulative_fill if m.cumulative_fill is not None else held
         mark = marks.get(sym)
 
         # VALID-MARK GATE (NaN-safe, mandatory exact form). NaN <= 0 is False, so
@@ -403,14 +449,17 @@ def manage_open_positions(
 
         valid_marked += 1
 
-        qty_sign = 1.0 if held >= 0 else -1.0
+        # Direction comes from the TRUE cumulative position (FIX-A): a sequence
+        # of fills can net long while the latest target snapshot's sign differs,
+        # so the pnl sign must follow the quantity we will actually flatten.
+        qty_sign = 1.0 if true_held >= 0 else -1.0
         pnl_pct = qty_sign * (mark / entry - 1.0)
 
         # Per-position stop-loss override (a PRICE): fires on a cross even when
         # the default pct band is not breached.
         stop_price_cross = False
         if m.trader_stop_loss is not None and math.isfinite(m.trader_stop_loss):
-            if held >= 0:
+            if true_held >= 0:
                 stop_price_cross = mark <= m.trader_stop_loss
             else:
                 stop_price_cross = mark >= m.trader_stop_loss
@@ -418,7 +467,7 @@ def manage_open_positions(
         hit_stop = pnl_pct <= -stop or stop_price_cross
         hit_take = take is not None and pnl_pct >= abs(take)
         if hit_stop or hit_take:
-            breaches.append((sym, pnl_pct, held))
+            breaches.append((sym, pnl_pct, true_held))
 
     # ----- CROSS-SECTIONAL ANOMALY BREAKER -----
     # The per-symbol rails are all independent; that independence is exactly the
@@ -524,5 +573,41 @@ def manage_open_positions(
             mark,
             m.play_tag,
         )
+
+    # FIX-C (Codex P2): the direct append bypasses PaperReactor.execute(), which
+    # is what normally rebuilds state.db incrementally. Without this, after a stop
+    # closes a symbol the bus is flat but state.db (+ derived cash / NAV) still
+    # shows the stale open => the NAV kill-switch, status, sizing, and
+    # admissibility all run on stale state. Rebuild state.db from the bus — the
+    # SAME reconstruct_from() call ops/scripts/quant-flatten-paper-default.py uses
+    # (@149-154) — so the source-of-truth bus and the derived cache agree.
+    #
+    # Guarded: only on a REAL exit (dry-run appended nothing, so nothing to
+    # reconcile), and NEVER let a reconcile failure crash the exit — the bus is
+    # the source of truth and the close already landed there; a stale cache is
+    # recoverable, a crashed exit is not (log + continue).
+    if not dry_run and result.exited_symbols:
+        try:
+            from hermes_quant.state.portfolio_state import PortfolioState
+
+            state_db = quant_home / "state.db"
+            res = PortfolioState(state_db_path=state_db).reconstruct_from(
+                executions_path
+            )
+            logger.info(
+                "exits: state.db reconciled after %d exit(s) "
+                "(processed=%d accounts=%s errors=%d)",
+                len(result.exited_symbols),
+                res.executions_processed,
+                sorted(res.accounts_seen),
+                len(res.errors),
+            )
+        except Exception as exc:  # noqa: BLE001 — bus is source of truth; never crash
+            result.alerts.append(
+                f"STATE.DB RECONCILE FAILED after exit ({exc}); bus is flat and is "
+                f"the source of truth — run quant-flatten-paper-default to rebuild "
+                f"the cache."
+            )
+            logger.warning("exits: %s", result.alerts[-1])
 
     return result

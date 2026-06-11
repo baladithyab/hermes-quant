@@ -81,15 +81,24 @@ def _append_open(
     asset_class: str = "equity",
     timeframe: str = "1d",
     metadata: dict | None = None,
+    fill_price: float | None = None,
+    fill_size_pct: float | None = None,
+    proposal_id: str | None = None,
 ) -> None:
     """Append a synthetic OPEN paper fill so reconstruct_portfolio_state sees it.
 
-    decision_price == entry_price doubles as the 'last bus price' the per-symbol
-    sanity clamp reads, so tests control both the pnl basis and the clamp basis
-    with one number.
+    ``entry_price`` is the decision_price (the pre-slippage quote). By default
+    ``fill_price`` equals it, so the pnl basis and the clamp basis are the same
+    number — every existing test is byte-identical. Pass ``fill_price`` explicitly
+    to model the v0.2 slippage model (fill_price != decision_price) for FIX-B.
+
+    ``fill_size_pct`` defaults to ``target_pct`` (PaperReactor.execute stamps them
+    equal); pass it explicitly only when modelling a divergent cumulative fill.
+    ``proposal_id`` is overridable so multi-add fills do not collide on the
+    state.db idempotency key (proposal_id, asof, asset, asset_class).
     """
     rec = {
-        "proposal_id": f"prop_open_{symbol}",
+        "proposal_id": proposal_id or f"prop_open_{symbol}",
         "signal_id": f"sig_{symbol}",
         "asset": symbol,
         "asset_class": asset_class,
@@ -98,8 +107,8 @@ def _append_open(
         "asof_execution": ts,
         "target_position_pct": target_pct,
         "decision_price": entry_price,
-        "fill_price": entry_price,
-        "fill_size_pct": target_pct,
+        "fill_price": entry_price if fill_price is None else fill_price,
+        "fill_size_pct": target_pct if fill_size_pct is None else fill_size_pct,
         "reactor_name": "paper",
         "human_in_the_loop": True,
         "approver_user_id": "test",
@@ -674,3 +683,213 @@ def test_empty_book_is_noop(qhome, exit_config):
     assert result.exited_symbols == []
     assert result.would_exit == []
     assert (qhome / "executions.jsonl").read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# FIX-A (Codex P1): close the CUMULATIVE held quantity, not the latest target
+# snapshot. reconstruct_portfolio_state is latest-supersedes (every add stamps
+# target=fill, so two +0.1 adds read as held=0.1), but settlement FIFO sums the
+# signed fills (= +0.2). Offsetting -held=-0.1 marks target=0 (reader sees flat)
+# yet leaves a +0.1 ghost lot in the settlement view => wrong realized P&L and a
+# lot invisible to future reconstruct-based exit passes.
+# ---------------------------------------------------------------------------
+
+
+def test_exit_closes_cumulative_not_latest_target(qhome, exit_config):
+    """Two +0.1 adds then a stop must append fill_size_pct=-0.2 (the cumulative
+    signed fill) and target_position_pct=0.0 — not -0.1 (the latest target)."""
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    # Two adds: each PaperReactor add stamps target=fill=+0.1. Distinct
+    # proposal_ids so neither the bus nor state.db idempotency-collapses them.
+    _append_open(qhome, "AAPL", 0.10, 100.0, proposal_id="prop_add1")
+    _append_open(
+        qhome, "AAPL", 0.10, 100.0, proposal_id="prop_add2",
+        ts="2026-06-10T15:05:00Z",
+    )
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 85.0},  # -15% < -10% stop
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    assert "AAPL" in result.exited_symbols
+    exit_rec = _bus_records(qhome)[-1]
+    assert exit_rec["target_position_pct"] == 0.0
+    assert exit_rec["fill_size_pct"] == pytest.approx(-0.20)  # NOT -0.10
+
+
+def test_exit_nets_settlement_flat(qhome, exit_config):
+    """After the cumulative close, the settlement FIFO matcher must leave NO
+    residual open lot for the symbol — the dual-ledger divergence is gone."""
+    from hermes_quant.daemon.settlement_loop import join_exit_fills
+
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    _append_open(qhome, "AAPL", 0.10, 100.0, proposal_id="prop_add1")
+    _append_open(
+        qhome, "AAPL", 0.10, 100.0, proposal_id="prop_add2",
+        ts="2026-06-10T15:05:00Z",
+    )
+
+    manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 85.0},
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    _round_trips, open_lots = join_exit_fills(_bus_records(qhome))
+    # The real position bucket (paper-default, equity, AAPL) must be fully
+    # settled — no leftover long lot. (Namespaced ('_deferred', ...) keys are
+    # not position lots; the real bucket must simply be absent / empty.)
+    real = {k: v for k, v in open_lots.items() if not (k and k[0] == "_deferred")}
+    assert ("paper-default", "equity", "AAPL") not in real
+
+
+# ---------------------------------------------------------------------------
+# FIX-B (Codex P2): evaluate thresholds against fill_price (the actual entry the
+# v0.2 slippage model + settlement use), not decision_price (the pre-slippage
+# quote). Storing decision_price as the pnl/clamp basis makes the exit's
+# exit_pnl_pct disagree with settlement's realized P&L.
+# ---------------------------------------------------------------------------
+
+
+def test_stop_evaluated_against_fill_price_not_decision_price(qhome, exit_config):
+    """A long bought at fill_price=120 (decision_price=100, +20% slippage). At
+    mark=95: against fill_price pnl=-20.8% (breaches -10% stop); against
+    decision_price pnl=-5% (no breach). The stop MUST fire => fill_price basis."""
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    # decision_price=100 (clamp basis), fill_price=120 (true entry).
+    _append_open(qhome, "AAPL", 0.10, 100.0, fill_price=120.0)
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 95.0},  # -5% vs decision, -20.8% vs fill
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    assert "AAPL" in result.exited_symbols
+
+
+def test_threshold_falls_back_to_decision_price_when_no_fill_price(qhome, exit_config):
+    """An older record lacking fill_price must still evaluate (fall back to
+    decision_price) — fill_price recovery is a preference, not a hard require."""
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    # Append a record with fill_price explicitly null (legacy shape).
+    import json as _json
+
+    rec = {
+        "proposal_id": "prop_legacy_AAPL",
+        "signal_id": "sig_AAPL",
+        "asset": "AAPL",
+        "asset_class": "equity",
+        "timeframe": "1d",
+        "asof_decision": "2026-06-10T15:00:00Z",
+        "asof_execution": "2026-06-10T15:00:00Z",
+        "target_position_pct": 0.10,
+        "decision_price": 100.0,
+        "fill_price": None,  # legacy: no fill price recorded
+        "fill_size_pct": 0.10,
+        "reactor_name": "paper",
+        "human_in_the_loop": True,
+        "approver_user_id": "test",
+        "reactor_metadata": {"paper": True},
+        "bar_ts": "2026-06-10T15:00:00Z",
+        "play_tag": "advisor",
+    }
+    with open(qhome / "executions.jsonl", "a", encoding="utf-8") as f:
+        f.write(_json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n")
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 85.0},  # -15% vs decision_price=100
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    assert "AAPL" in result.exited_symbols  # fell back to decision_price
+
+
+# ---------------------------------------------------------------------------
+# FIX-C (Codex P2): a non-dry exit appends directly (bypassing
+# PaperReactor.execute, which rebuilds state.db), so state.db keeps showing the
+# closed symbol open => status / NAV-kill-switch / sizing run on stale state.
+# After a real exit, rebuild state.db from the bus (flatten-script pattern).
+# ---------------------------------------------------------------------------
+
+
+def test_non_dry_exit_reconciles_state_db(qhome, exit_config):
+    """After a non-dry exit, state.db (quant_home/state.db) must NOT show the
+    closed symbol open — the direct append also rebuilds the derived cache."""
+    from hermes_quant.state.portfolio_state import PortfolioState
+
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    _append_open(qhome, "AAPL", 0.10, 100.0)
+
+    state_db = qhome / "state.db"
+    # Seed state.db so it shows AAPL open (the stale-open precondition).
+    PortfolioState(state_db_path=state_db).reconstruct_from(qhome / "executions.jsonl")
+    seeded = PortfolioState(state_db_path=state_db).get_positions("paper-default")
+    assert ("equity", "AAPL") in seeded
+
+    manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 85.0},
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    after = PortfolioState(state_db_path=state_db).get_positions("paper-default")
+    assert ("equity", "AAPL") not in after
+
+
+def test_dry_run_does_not_reconcile_state_db(qhome, exit_config):
+    """A dry-run appends nothing AND must not touch state.db (reconcile is
+    guarded to real exits only)."""
+    from hermes_quant.state.portfolio_state import PortfolioState
+
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    _append_open(qhome, "AAPL", 0.10, 100.0)
+    state_db = qhome / "state.db"
+    PortfolioState(state_db_path=state_db).reconstruct_from(qhome / "executions.jsonl")
+
+    manage_open_positions(
+        dry_run=True,
+        marks_provider=lambda syms: {"AAPL": 85.0},
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    # Dry-run did not append a close, so a reconcile (if it wrongly ran) would
+    # still show AAPL open; the contract is simply that the dry path is a no-op
+    # against state.db AND the bus. AAPL is still open in both.
+    after = PortfolioState(state_db_path=state_db).get_positions("paper-default")
+    assert ("equity", "AAPL") in after
+
+
+def test_state_db_reconcile_failure_does_not_crash_exit(qhome, exit_config, monkeypatch):
+    """A reconcile failure must be logged and swallowed — the bus is the source
+    of truth, so the exit append must stand even if the cache rebuild fails."""
+    import hermes_quant.state.portfolio_state as ps_mod
+
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    _append_open(qhome, "AAPL", 0.10, 100.0)
+
+    def _boom(self, *a, **k):
+        raise OSError("state.db locked")
+
+    monkeypatch.setattr(ps_mod.PortfolioState, "reconstruct_from", _boom)
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 85.0},
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    # The exit still succeeded (bus is source of truth); reconcile failure is
+    # non-fatal.
+    assert "AAPL" in result.exited_symbols
+    assert _bus_records(qhome)[-1]["target_position_pct"] == 0.0
