@@ -951,6 +951,94 @@ def tick(
     return result
 
 
+@dataclass
+class CycleResult:
+    """Outcome of one full autonomous cycle (exit pass THEN entry tick).
+
+    exit_result : the ExitResult from manage_open_positions() (empty when the
+                  master flag quant.autonomous.manage_positions is off).
+    tick_result : the TickResult from the entry tick().
+    """
+
+    exit_result: Any  # hermes_quant.exits.ExitResult
+    tick_result: TickResult
+
+    def to_dict(self) -> dict:
+        return {
+            "exit": self.exit_result.to_dict(),
+            "tick": self.tick_result.to_dict(),
+        }
+
+
+def run_autonomous_cycle(
+    *,
+    dry_run: bool = True,
+    symbols: list[WatchlistEntry] | None = None,
+    advisor_recommend=None,
+    marks_provider=None,
+    clock_provider=None,
+    quant_home: Path | None = None,
+) -> CycleResult:
+    """One autonomous cycle: position management FIRST, then entries (ADR-0016).
+
+    This is the SINGLE importable seam both the cron-script and the
+    quant_autonomous_tick tool call, so exits and entries are always ordered and
+    coupled the same way (Codex P1#1: the exit pass previously had no production
+    caller).
+
+    Ordering and the kill-switch asymmetry are the whole point (ULTRACODE-REVIEW
+    Q2, the blocking finding):
+
+      1. manage_open_positions() runs FIRST, and ONLY when
+         quant.autonomous.manage_positions is enabled (default off => the exit
+         pass is a byte-identical no-op and this is just a plain tick()). It
+         NEVER reads the kill-switch, so a tripped switch — which trips precisely
+         when the book is bleeding — does NOT freeze losers open. Cutting losses
+         is the one action a tripped system must still take.
+
+      2. tick() runs SECOND with exited_symbols = the symbols just flattened, so
+         the entry loop skips them (no catastrophic same-tick re-open, Q5) and
+         frees their concurrency slots. tick() early-returns on a tripped
+         kill-switch, so ENTRIES halt while the exits above still fired.
+
+    Args:
+        dry_run: threaded to BOTH passes — exit pass reports would_exit + appends
+            nothing; entry tick reports FIREs without calling React.
+        symbols / advisor_recommend: forwarded to tick() (test-injectable).
+        marks_provider / clock_provider: forwarded to manage_open_positions()
+            (test-injectable; default = live Alpaca, fail-closed).
+        quant_home: the ~/.hermes/quant home passed explicitly to the exit pass
+            for test-isolation. Defaults at CALL TIME to this module's QUANT_HOME
+            (NOT bound at def time) so the e2e fixture's monkeypatch is honored.
+
+    Returns:
+        CycleResult{exit_result, tick_result}. Raises nothing externally-visible
+        (both passes catch their own errors).
+    """
+    from hermes_quant.exits import manage_open_positions
+
+    home = quant_home if quant_home is not None else QUANT_HOME
+
+    # 1. EXITS FIRST — even under a tripped kill-switch. manage_open_positions
+    #    is itself master-flag gated (manage_positions, default off => no-op).
+    exit_result = manage_open_positions(
+        dry_run=dry_run,
+        marks_provider=marks_provider,
+        clock_provider=clock_provider,
+        quant_home=home,
+    )
+
+    # 2. ENTRIES SECOND — with the just-exited symbols suppressed for this cycle.
+    tick_result = tick(
+        dry_run=dry_run,
+        symbols=symbols,
+        advisor_recommend=advisor_recommend,
+        exited_symbols=exit_result.exited_symbols,
+    )
+
+    return CycleResult(exit_result=exit_result, tick_result=tick_result)
+
+
 def _react(
     advisor_result: dict[str, Any],
     entry: WatchlistEntry,

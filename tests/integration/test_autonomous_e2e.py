@@ -22,6 +22,7 @@ import pytest
 
 from hermes_quant.autonomous import (
     reset_kill_switch,
+    run_autonomous_cycle,
     tick,
     trip_kill_switch,
 )
@@ -873,3 +874,154 @@ def test_portfolio_caps_dry_run_simulates_state_consumption(
         d for d in result.decisions if d.gate == "SILENCE_PORTFOLIO_CAP"
     ]
     assert len(portfolio_silences) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Wave 4a: run_autonomous_cycle — the ONE importable seam the cron + the
+# quant_autonomous_tick tool call. Runs manage_open_positions() BEFORE entries
+# when manage_positions is enabled, passes exited_symbols into tick(), and the
+# exit pass runs EVEN under a tripped kill-switch (cutting losses) while entries
+# halt.
+# ---------------------------------------------------------------------------
+
+
+def _enable_manage_positions(cfg_path: Path, *, stop_loss_pct: float = 0.10) -> None:
+    import yaml
+
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    auto = cfg.setdefault("quant", {}).setdefault("autonomous", {})
+    auto["manage_positions"] = True
+    auto["stop_loss_pct"] = stop_loss_pct
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+
+def test_cycle_runs_exits_before_entries_and_blocks_reopen(
+    isolate_config, isolate_quant_home
+):
+    """The cycle flattens a breaching position FIRST, then runs entries with that
+    symbol in exited_symbols so the entry loop cannot re-open it the same cycle."""
+    _set_mode_autonomous(isolate_config)
+    _enable_manage_positions(isolate_config)
+    # AAPL is open and breaching; it is also on the entry watchlist.
+    _append_open_position(isolate_quant_home, "AAPL", target_pct=0.10, price=100.0)
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        out = run_autonomous_cycle(
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+            marks_provider=lambda syms: {"AAPL": 85.0},  # -15% < -10% stop
+            clock_provider=lambda: True,
+            quant_home=isolate_quant_home,
+        )
+
+    # Exit pass closed AAPL.
+    assert "AAPL" in out.exit_result.exited_symbols
+    # Entry loop did NOT re-open it the same cycle.
+    assert "AAPL" not in react_calls
+    assert out.tick_result.fires == 0
+    aapl = [d for d in out.tick_result.decisions if d.symbol == "AAPL"][0]
+    assert aapl.gate == "SILENCE_EXITED_THIS_TICK"
+
+
+def test_cycle_exits_run_under_tripped_kill_switch_entries_halt(
+    isolate_config, isolate_quant_home
+):
+    """THE load-bearing asymmetry: a tripped kill-switch must HALT ENTRIES but the
+    exit pass must STILL FIRE (cutting losses). One seam, both behaviors."""
+    _set_mode_autonomous(isolate_config)
+    _enable_manage_positions(isolate_config)
+    _append_open_position(isolate_quant_home, "AAPL", target_pct=0.10, price=100.0)
+    trip_kill_switch(cumulative_pnl_pct=-0.15, threshold_pct=0.10, reason="bleeding")
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        out = run_autonomous_cycle(
+            dry_run=False,
+            symbols=[WatchlistEntry("MSFT", "equity", "1d")],  # a NEW entry candidate
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+            marks_provider=lambda syms: {"AAPL": 85.0},
+            clock_provider=lambda: True,
+            quant_home=isolate_quant_home,
+        )
+
+    # EXITS still ran despite the tripped switch.
+    assert "AAPL" in out.exit_result.exited_symbols
+    # ENTRIES halted: tick early-returns on the tripped switch, no React.
+    assert react_calls == []
+    assert out.tick_result.fires == 0
+    assert out.tick_result.kill_switch_state.tripped is True
+
+
+def test_cycle_manage_positions_off_skips_exit_pass(
+    isolate_config, isolate_quant_home
+):
+    """manage_positions unset (default) => the exit pass is a byte-identical
+    no-op and the cycle is just a plain tick() (no exited_symbols)."""
+    _set_mode_autonomous(isolate_config)
+    # NOTE: manage_positions NOT enabled.
+    _append_open_position(isolate_quant_home, "AAPL", target_pct=0.10, price=100.0)
+    before = (isolate_quant_home / "executions.jsonl").read_bytes()
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        out = run_autonomous_cycle(
+            dry_run=False,
+            symbols=[WatchlistEntry("MSFT", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+            marks_provider=lambda syms: {"AAPL": 50.0},  # would breach hard if run
+            clock_provider=lambda: True,
+            quant_home=isolate_quant_home,
+        )
+
+    # Exit pass did nothing (flag off): no exits, bus untouched by the exit leg.
+    assert out.exit_result.exited_symbols == []
+    assert (isolate_quant_home / "executions.jsonl").read_bytes() == before
+    # Entry path is unaffected — MSFT fires normally.
+    assert react_calls == ["MSFT"]
+    assert out.tick_result.fires == 1
+
+
+def test_cycle_dry_run_honored_end_to_end(isolate_config, isolate_quant_home):
+    """dry_run=True must thread to BOTH the exit pass (would_exit, no append) and
+    the entry tick (no React)."""
+    _set_mode_autonomous(isolate_config)
+    _enable_manage_positions(isolate_config)
+    _append_open_position(isolate_quant_home, "AAPL", target_pct=0.10, price=100.0)
+    before = (isolate_quant_home / "executions.jsonl").read_bytes()
+
+    react_calls = []
+
+    with mock.patch(
+        "hermes_quant.autonomous._react",
+        side_effect=lambda *a, **k: react_calls.append(a) or "x",
+    ):
+        out = run_autonomous_cycle(
+            dry_run=True,
+            symbols=[WatchlistEntry("MSFT", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+            marks_provider=lambda syms: {"AAPL": 85.0},
+            clock_provider=lambda: True,
+            quant_home=isolate_quant_home,
+        )
+
+    assert "AAPL" in out.exit_result.would_exit
+    assert out.exit_result.exited_symbols == []
+    assert react_calls == []  # entry dry-run: no React
+    assert (isolate_quant_home / "executions.jsonl").read_bytes() == before
