@@ -505,10 +505,20 @@ def tick(
     # this is a hard safety rail, not a sizing refinement, so it is always on).
     # reconstruct_portfolio_state() returns {symbol: target_pct} for non-zero
     # (open) positions only, so len() == current concurrent position count.
-    # Fail-OPEN to 0 only if reconstruction itself errors (never block the tick
-    # on a transient read failure), but log it so the gap is visible.
+    #
+    # Wave 3 (ULTRACODE-REVIEW Q6): FAIL CLOSED on a reconstruct EXCEPTION. An
+    # unreadable bus means open-book headroom is UNKNOWN — and we cannot prove the
+    # book has room — so the firing path must REFUSE new opens (mirrors the brief
+    # gate's fail-closed reasoning at quant-daily-interim.py:365-379 that PR#82
+    # locked). Previously this failed OPEN to 0, which read an unreadable bus as
+    # "zero open positions" and let opens proceed up to max_concurrent — the exact
+    # 41.6x-gross runaway window. NOTE: a genuinely empty/missing bus is NOT an
+    # exception — reconstruct_portfolio_state swallows missing-file/OSError and
+    # returns an empty snapshot (state.py:72,81), so the legitimate "0 open" book
+    # still fires. Only a true reconstruction EXCEPTION trips the unknown flag.
     open_positions_at_tick_start = 0
     open_symbols_at_tick_start: set[str] = set()
+    concurrent_cap_unknown = False
     try:
         from hermes_quant.portfolio.state import reconstruct_portfolio_state as _recon
 
@@ -519,9 +529,11 @@ def tick(
         _open = _recon(QUANT_HOME / "executions.jsonl").positions
         open_symbols_at_tick_start = set(_open)
         open_positions_at_tick_start = len(_open)
-    except Exception as _exc:  # noqa: BLE001 - never block tick on a read error
+    except Exception as _exc:  # noqa: BLE001 - fail CLOSED: headroom unknown
+        concurrent_cap_unknown = True
         logger.warning(
-            "autonomous: could not count open positions for concurrent-cap rail: %s",
+            "autonomous: open-position count UNKNOWN (reconstruct failed: %s) — "
+            "FAILING CLOSED, refusing new opens this tick",
             _exc,
         )
 
@@ -554,12 +566,33 @@ def tick(
             headroom_summary,
         )
 
-        portfolio_state = reconstruct_portfolio_state()
-        portfolio_caps = PortfolioCaps()
-        logger.info(
-            "autonomous: portfolio-caps gate ENABLED. initial state: %s",
-            headroom_summary(portfolio_state, portfolio_caps),
-        )
+        # Wave 3 (ULTRACODE-REVIEW Q6): FAIL CLOSED if the cap-seeding read fails.
+        # This is the firing-path re-homing of the brief gate's
+        # test_cap_init_failure_blocks_not_fires guarantee: with caps enabled an
+        # unreadable book means headroom is UNKNOWN, so refuse every open rather
+        # than (a) crash the cron — tick()'s contract is "raises nothing
+        # externally-visible" — or (b) proceed uncapped (the 2026-06-02 runaway).
+        # Read QUANT_HOME's bus EXPLICITLY (not the helper's hard-coded default)
+        # so the seed honors the same home the rest of the tick uses and is
+        # test-isolatable via the QUANT_HOME monkeypatch.
+        try:
+            portfolio_state = reconstruct_portfolio_state(
+                QUANT_HOME / "executions.jsonl"
+            )
+            portfolio_caps = PortfolioCaps()
+            logger.info(
+                "autonomous: portfolio-caps gate ENABLED. initial state: %s",
+                headroom_summary(portfolio_state, portfolio_caps),
+            )
+        except Exception as _cap_exc:  # noqa: BLE001 - fail CLOSED on cap-seed error
+            concurrent_cap_unknown = True
+            portfolio_state = None
+            portfolio_caps = None
+            logger.warning(
+                "autonomous: portfolio-caps seed FAILED (%s) — FAILING CLOSED, "
+                "refusing new opens this tick",
+                _cap_exc,
+            )
 
     # ADR-0079 PDR-1 / M17: build the ONE PerceptionFrame here (inside tick), the
     # producer BOTH the cron and the quant_autonomous_tick TOOL path reach — so
@@ -661,6 +694,25 @@ def tick(
                     "reason": (
                         f"max_per_tick_opens={rails['max_per_tick_opens']} "
                         "reached; this signal would have fired but tick is at cap"
+                    ),
+                    "would_have_fired": True,
+                    "original_gate": gate_result.decision.value,
+                }
+                result.silences += 1
+                result.decisions.append(decision)
+                continue
+
+            # Wave 3 (ULTRACODE-REVIEW Q6): FAIL CLOSED when the open-book count
+            # is UNKNOWN (reconstruct raised above). We cannot prove the book has
+            # headroom, so refuse the open rather than fire blind. This is the
+            # firing-path re-homing of the brief gate's fail-closed posture, done
+            # BEFORE Wave 4 deletes that gate.
+            if concurrent_cap_unknown:
+                decision.gate = "SILENCE_CONCURRENT_CAP_UNKNOWN"
+                decision.details = {
+                    "reason": (
+                        "open-position count unknown (executions bus unreadable); "
+                        "failing closed — refusing to open with unknown headroom"
                     ),
                     "would_have_fired": True,
                     "original_gate": gate_result.decision.value,

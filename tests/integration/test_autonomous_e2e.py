@@ -384,6 +384,135 @@ def test_exited_symbols_default_none_is_unchanged(isolate_config, isolate_quant_
 
 
 # ---------------------------------------------------------------------------
+# Wave 3: Q6 concurrent-cap fail-CLOSED on reconstruct error
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_cap_reconstruct_error_fails_closed_firing(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    """A reconstruct ERROR means open-book headroom is UNKNOWN. On the firing
+    path tick() must FAIL CLOSED — refuse to open new positions (an unreadable
+    bus = 'can't prove the book has room'). Previously this failed OPEN to 0,
+    re-opening the 41.6x-gross runaway window PR#82 closed (ULTRACODE-REVIEW Q6)."""
+    _set_mode_autonomous(isolate_config)
+
+    def _boom(*a, **k):
+        raise OSError("bus unreadable")
+
+    monkeypatch.setattr(
+        "hermes_quant.portfolio.state.reconstruct_portfolio_state", _boom
+    )
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        result = tick(
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+        )
+
+    assert react_calls == []  # KEY: no open fired when headroom is unknown
+    assert result.fires == 0
+    aapl = [d for d in result.decisions if d.symbol == "AAPL"][0]
+    assert aapl.gate == "SILENCE_CONCURRENT_CAP_UNKNOWN"
+    assert aapl.details.get("would_have_fired") is True
+
+
+def test_concurrent_cap_reconstruct_error_fails_closed_dry_run(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    """Dry-run is a faithful preview of the firing path: when headroom is unknown
+    the dry-run also reports the open as cap-unknown-silenced (the FAIL-CLOSED
+    choice — a dry-run that reported 'would fire' would lie about what the real
+    path does)."""
+    _set_mode_autonomous(isolate_config)
+
+    def _boom(*a, **k):
+        raise OSError("bus unreadable")
+
+    monkeypatch.setattr(
+        "hermes_quant.portfolio.state.reconstruct_portfolio_state", _boom
+    )
+
+    result = tick(
+        dry_run=True,
+        symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+        advisor_recommend=lambda **kw: _make_advisor_result(),
+    )
+
+    assert result.fires == 0
+    aapl = [d for d in result.decisions if d.symbol == "AAPL"][0]
+    assert aapl.gate == "SILENCE_CONCURRENT_CAP_UNKNOWN"
+
+
+def test_caps_seeding_reconstruct_error_fails_closed(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    """Re-home of the brief gate's test_cap_init_failure_blocks_not_fires onto
+    tick(): with HERMES_QUANT_PORTFOLIO_CAPS=1, if the cap-seeding reconstruct
+    raises, tick() must FAIL CLOSED (block every open, surface no fire) — never
+    crash the cron (tick's contract is 'raises nothing externally-visible') and
+    never proceed uncapped (the 2026-06-02 runaway behavior)."""
+    monkeypatch.setenv("HERMES_QUANT_PORTFOLIO_CAPS", "1")
+    _set_mode_autonomous(isolate_config, max_per_tick_opens=10)
+
+    def _boom(*a, **k):
+        raise RuntimeError("cap-seed bus read failed")
+
+    monkeypatch.setattr(
+        "hermes_quant.portfolio.state.reconstruct_portfolio_state", _boom
+    )
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        result = tick(  # must NOT raise
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+        )
+
+    assert react_calls == []  # no uncapped fire
+    assert result.fires == 0
+
+
+def test_empty_book_still_fires_not_fail_closed(
+    isolate_config, isolate_quant_home
+):
+    """A genuinely empty/missing bus (reconstruct returns empty cleanly, no
+    exception) is the truth '0 open' — NOT a read error. The fail-closed change
+    must NOT block fires here; only a reconstruct EXCEPTION fails closed."""
+    _set_mode_autonomous(isolate_config)
+    # No executions.jsonl written => reconstruct returns empty (no raise).
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        result = tick(
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+        )
+
+    assert react_calls == ["AAPL"]
+    assert result.fires == 1
+
+
+# ---------------------------------------------------------------------------
 # Kill-switch
 # ---------------------------------------------------------------------------
 
