@@ -893,3 +893,96 @@ def test_state_db_reconcile_failure_does_not_crash_exit(qhome, exit_config, monk
     # non-fatal.
     assert "AAPL" in result.exited_symbols
     assert _bus_records(qhome)[-1]["target_position_pct"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# FIX-1 (Codex round-2 P1): BLENDED cost basis for cumulative exits. FIX-A made
+# the close QUANTITY cumulative, but the entry PRICE basis still came from only
+# the latest non-zero fill — so a position added at two different prices was
+# evaluated against the wrong entry. The fix recovers a SIZE-WEIGHTED blended
+# entry basis (sum(fill_price_i * |fill_size_pct_i|) / sum(|fill_size_pct_i|))
+# that matches the cumulative quantity being closed.
+# ---------------------------------------------------------------------------
+
+
+def test_blended_basis_two_adds_profit_no_stop(qhome, exit_config):
+    """The exact Codex round-2 repro: +0.10@100 then +0.10@200, mark 170. The
+    size-weighted blended entry basis is (0.10*100 + 0.10*200)/0.20 = 150, so a
+    mark of 170 is +13.3% — a PROFIT. The stop MUST NOT fire. The pre-fix code
+    used the LATEST fill (200) as the basis => read -15% => wrongly stopped out
+    the whole +0.20 book (a false-exit money bug)."""
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    _append_open(qhome, "AAPL", 0.10, 100.0, fill_price=100.0, proposal_id="prop_add1")
+    _append_open(
+        qhome, "AAPL", 0.10, 200.0, fill_price=200.0, proposal_id="prop_add2",
+        ts="2026-06-10T15:05:00Z",
+    )
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 170.0},  # +13.3% vs blended 150
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    assert result.exited_symbols == []  # NO false stop-out
+    # It had a valid mark + recoverable blended entry — it simply did not breach.
+    assert "AAPL" not in result.skipped_bad_mark
+
+
+def test_blended_basis_two_adds_real_loss_exits(qhome, exit_config):
+    """+0.10@100, +0.10@200, mark 120: blended basis 150 => -20% => the stop
+    fires and closes the FULL cumulative -0.20. The recorded exit_pnl_pct is the
+    blended -20%, NOT the -40% the latest-fill (200) basis would have computed."""
+    # mark_jump_max loosened so the UNRELATED sanity clamp (vs the latest bus
+    # price 200) does not skip a legitimate -40%-from-200 mark; the blended-basis
+    # pnl (-20% vs 150) is what this test exercises.
+    _write_exit_config(
+        exit_config, manage_positions=True, stop_loss_pct=0.10, mark_jump_max=0.50
+    )
+    _append_open(qhome, "AAPL", 0.10, 100.0, fill_price=100.0, proposal_id="prop_add1")
+    _append_open(
+        qhome, "AAPL", 0.10, 200.0, fill_price=200.0, proposal_id="prop_add2",
+        ts="2026-06-10T15:05:00Z",
+    )
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"AAPL": 120.0},
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    assert "AAPL" in result.exited_symbols
+    exit_rec = _bus_records(qhome)[-1]
+    assert exit_rec["target_position_pct"] == 0.0
+    assert exit_rec["fill_size_pct"] == pytest.approx(-0.20)  # full cumulative
+    # The blended -20%, NOT the latest-fill -40%.
+    assert exit_rec["reactor_metadata"]["exit_pnl_pct"] == pytest.approx(-0.20)
+
+
+def test_blended_basis_short(qhome, exit_config):
+    """A short added at two prices: -0.10@100, -0.10@200, mark 170. The blended
+    basis is 150; a short's pnl = -(170/150 - 1) = -13.3% => breaches the -10%
+    stop. Against the latest-fill basis (200) the short would read +15% (a
+    profit) and NOT exit — so this locks the blended basis AND the short sign
+    together."""
+    _write_exit_config(exit_config, manage_positions=True, stop_loss_pct=0.10)
+    _append_open(qhome, "TSLA", -0.10, 100.0, fill_price=100.0, proposal_id="prop_s1")
+    _append_open(
+        qhome, "TSLA", -0.10, 200.0, fill_price=200.0, proposal_id="prop_s2",
+        ts="2026-06-10T15:05:00Z",
+    )
+
+    result = manage_open_positions(
+        dry_run=False,
+        marks_provider=lambda syms: {"TSLA": 170.0},
+        clock_provider=_open_market,
+        quant_home=qhome,
+    )
+
+    assert "TSLA" in result.exited_symbols
+    exit_rec = _bus_records(qhome)[-1]
+    assert exit_rec["fill_size_pct"] == pytest.approx(0.20)  # offset of -0.20
+    # Short pnl = -(170/150 - 1) = -2/15 ≈ -13.3%.
+    assert exit_rec["reactor_metadata"]["exit_pnl_pct"] == pytest.approx(-2 / 15)

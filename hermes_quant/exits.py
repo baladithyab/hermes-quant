@@ -108,7 +108,15 @@ class ExitResult:
 class _PosMeta:
     """Per-symbol data recovered by walking executions.jsonl."""
 
-    entry_price: float | None = None
+    # FIX-1 (Codex round-2 P1): a SIZE-WEIGHTED BLENDED entry basis over the
+    # symbol's opening legs — sum(fill_price_i * |fill_size_pct_i|) divided by
+    # sum(|fill_size_pct_i|). FIX-A made the close QUANTITY cumulative but left
+    # the price basis at the LATEST fill, so a position added at two prices
+    # (+0.1@100, +0.1@200) was evaluated against 200 instead of the true blended
+    # 150 — a mark of 170 read as -15% (false stop) instead of +13% (profit).
+    # The basis must match the cumulative quantity it is closing. None => no
+    # usable opening leg (fail-closed: the symbol is skipped, like a bad mark).
+    blended_entry: float | None = None
     last_bus_price: float | None = None
     play_tag: str = "advisor"
     trader_stop_loss: float | None = None
@@ -218,12 +226,43 @@ def _default_marks_provider(symbols: list[str]) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 
+def _fill_entry_basis(rec: dict) -> float | None:
+    """The per-fill entry basis (FIX-B precedence): the actual ``fill_price``
+    (positive, finite) the v0.2 slippage model filled at — which settlement
+    realizes against — falling back to ``decision_price`` (the pre-slippage
+    quote) only for older records that never recorded a fill_price. Returns None
+    when neither yields a usable number (=> the leg cannot be weighted)."""
+    fp = rec.get("fill_price")
+    if fp is not None:
+        try:
+            fp_f = float(fp)
+            if math.isfinite(fp_f) and fp_f > 0:
+                return fp_f
+        except (TypeError, ValueError):
+            pass
+    dp = rec.get("decision_price")
+    if dp is not None:
+        try:
+            dp_f = float(dp)
+            if math.isfinite(dp_f) and dp_f > 0:
+                return dp_f
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
     """Walk executions.jsonl once and recover, per symbol:
 
-      * entry_price      : latest NON-ZERO-target fill's entry (pnl basis). FIX-B:
-                           the actual fill_price (positive) wins; decision_price is
-                           the fallback only for older records lacking a fill_price.
+      * blended_entry    : FIX-1 — the SIZE-WEIGHTED blended entry basis over ALL
+                           opening legs (sum(basis_i * |fill_size_pct_i|) /
+                           sum(|fill_size_pct_i|)). Each leg's basis is FIX-B's
+                           precedence (positive fill_price first, decision_price
+                           fallback). This matches the cumulative quantity the
+                           close offsets — a position added at two prices is
+                           evaluated against its true average cost, not the
+                           latest add. None if any opening leg lacks a usable
+                           price or the total weight is 0 (fail-closed => skip).
       * play_tag         : latest non-zero-target fill's play_tag (attribution)
       * trader_stop_loss : that fill's reactor_metadata.trader_stop_loss (price)
       * last_bus_price   : latest fill's decision_price overall (sanity-clamp basis)
@@ -238,6 +277,14 @@ def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
     # symbol -> ts of the latest non-zero-target fill we've recorded entry for
     _entry_ts: dict[str, str] = {}
     _bus_ts: dict[str, str] = {}
+    # FIX-1 blended-basis accumulators over opening legs:
+    #   _wsum = sum(basis_i * |fill_size_pct_i|), _wq = sum(|fill_size_pct_i|).
+    # _poison marks a symbol whose blended basis is untrustworthy (an opening leg
+    # with no usable price, or a leg whose |fill_size_pct| is unreadable) — such a
+    # symbol is fail-closed to blended_entry=None (skipped, like a bad mark).
+    _wsum: dict[str, float] = {}
+    _wq: dict[str, float] = {}
+    _poison: dict[str, bool] = {}
 
     if not executions_path.exists():
         return meta
@@ -290,39 +337,53 @@ def _recover_position_meta(executions_path: Path) -> dict[str, _PosMeta]:
             is_open_leg = target is not None and float(target) != 0.0
         except (TypeError, ValueError):
             is_open_leg = False
-        if is_open_leg and ts >= _entry_ts.get(asset, ""):
-            _entry_ts[asset] = ts
-            # FIX-B (Codex P2): the threshold/pnl basis is the ACTUAL entry the
-            # v0.2 slippage model filled at and settlement realizes against —
-            # i.e. fill_price. decision_price (the pre-slippage quote) is only a
-            # fallback for older records that never recorded a fill_price.
-            entry_basis: float | None = None
-            fp = rec.get("fill_price")
-            if fp is not None:
-                try:
-                    fp_f = float(fp)
-                    if math.isfinite(fp_f) and fp_f > 0:
-                        entry_basis = fp_f
-                except (TypeError, ValueError):
-                    entry_basis = None
-            if entry_basis is None and dp is not None:
-                try:
-                    entry_basis = float(dp)
-                except (TypeError, ValueError):
-                    entry_basis = None
-            m.entry_price = entry_basis
-            m.play_tag = str(rec.get("play_tag") or "advisor")
-            m.asset_class = str(rec.get("asset_class") or "equity")
-            m.timeframe = str(rec.get("timeframe") or "1d")
-            rmeta = rec.get("reactor_metadata") or {}
-            if isinstance(rmeta, dict):
-                stop = rmeta.get("trader_stop_loss")
-                try:
-                    m.trader_stop_loss = (
-                        None if stop is None else float(stop)
-                    )
-                except (TypeError, ValueError):
-                    m.trader_stop_loss = None
+        if is_open_leg:
+            # FIX-1: blend EVERY opening leg into the size-weighted basis (NOT just
+            # the latest). Closing legs (target == 0) are excluded — their
+            # fill_price is the EXIT mark, which would corrupt the entry basis.
+            # The weight is |fill_size_pct| so the blend matches the cumulative
+            # quantity; the sign comes from cumulative_fill at evaluation time.
+            leg_basis = _fill_entry_basis(rec)
+            try:
+                w = abs(float(fsp)) if fsp is not None else 0.0
+            except (TypeError, ValueError):
+                w = 0.0
+            if leg_basis is None or not math.isfinite(w) or w <= 0:
+                # An opening leg with no usable price (or no usable size) makes the
+                # whole blend untrustworthy => fail-closed: skip this symbol.
+                _poison[asset] = True
+            else:
+                _wsum[asset] = _wsum.get(asset, 0.0) + leg_basis * w
+                _wq[asset] = _wq.get(asset, 0.0) + w
+
+            if ts >= _entry_ts.get(asset, ""):
+                _entry_ts[asset] = ts
+                m.play_tag = str(rec.get("play_tag") or "advisor")
+                m.asset_class = str(rec.get("asset_class") or "equity")
+                m.timeframe = str(rec.get("timeframe") or "1d")
+                rmeta = rec.get("reactor_metadata") or {}
+                if isinstance(rmeta, dict):
+                    stop = rmeta.get("trader_stop_loss")
+                    try:
+                        m.trader_stop_loss = (
+                            None if stop is None else float(stop)
+                        )
+                    except (TypeError, ValueError):
+                        m.trader_stop_loss = None
+
+    # Finalize the blended basis. Fail-closed: a poisoned symbol, a zero total
+    # weight, or a non-finite/<=0 blend all leave blended_entry=None (the
+    # per-symbol loop then skips them exactly like a bad mark).
+    for asset, m in meta.items():
+        if _poison.get(asset):
+            m.blended_entry = None
+            continue
+        wq = _wq.get(asset, 0.0)
+        if wq <= 0:
+            m.blended_entry = None
+            continue
+        blended = _wsum.get(asset, 0.0) / wq
+        m.blended_entry = blended if (math.isfinite(blended) and blended > 0) else None
     return meta
 
 
@@ -431,8 +492,12 @@ def manage_open_positions(
             continue
 
         # Entry must be usable, else pnl is undefined (0.0 entry is the
-        # decision_price sentinel for gated-anyway proposals).
-        entry = m.entry_price
+        # decision_price sentinel for gated-anyway proposals). FIX-1: this is the
+        # SIZE-WEIGHTED blended basis over all opening legs — a position added at
+        # two prices is evaluated against its true average cost, matching the
+        # cumulative quantity we close. None => fail-closed skip (same as a bad
+        # mark): a poisoned/zero-weight/non-finite blend never fabricates a breach.
+        entry = m.blended_entry
         if entry is None or not math.isfinite(entry) or entry <= 0:
             result.skipped_bad_mark.append(sym)
             continue
