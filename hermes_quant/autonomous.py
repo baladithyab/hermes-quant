@@ -1045,11 +1045,28 @@ def run_autonomous_cycle(
     )
 
     # 2. ENTRIES SECOND — with the just-exited symbols suppressed for this cycle.
+    #
+    # Round-2 Codex FIX-2: the suppression set must make the DRY-RUN forecast
+    # predict LIVE behavior. On the live path manage_open_positions appends and
+    # populates exited_symbols, so suppressing exited_symbols is exactly the set
+    # the entry loop would skip. On the dry-run path it appends NOTHING, so
+    # exited_symbols is empty — but would_exit names the symbols the live cycle
+    # WOULD flatten and then suppress. Using exited_symbols alone in dry-run would
+    # report a FIRE for a would-exit symbol that the real cycle suppresses
+    # (forecast diverges from live). So: dry_run => union(exited, would_exit);
+    # live => exited_symbols (the actually-flattened set, would_exit is the
+    # cap-selected pre-append set there and is NOT what was suppressed).
+    if dry_run:
+        suppressed = sorted(
+            set(exit_result.exited_symbols) | set(exit_result.would_exit)
+        )
+    else:
+        suppressed = exit_result.exited_symbols
     tick_result = tick(
         dry_run=dry_run,
         symbols=symbols,
         advisor_recommend=advisor_recommend,
-        exited_symbols=exit_result.exited_symbols,
+        exited_symbols=suppressed,
         mode_override=mode_override,
     )
 

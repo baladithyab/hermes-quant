@@ -1098,3 +1098,88 @@ def test_cycle_threads_mode_override(isolate_config, isolate_quant_home):
 
     assert out.tick_result.mode == "autonomous"
     assert out.tick_result.fires == 1
+
+
+# ---------------------------------------------------------------------------
+# Round-2 Codex FIX-2: a dry-run cycle must suppress entries for would_exit
+# symbols, not just actually-exited ones. In dry_run, manage_open_positions
+# appends nothing so exited_symbols is empty — but would_exit names the symbols
+# the LIVE cycle would have flattened (and then suppressed from re-opening the
+# same tick). If the dry-run forecast only suppressed exited_symbols, a symbol
+# that WOULD exit AND sits on the entry watchlist would report a FIRE in the
+# forecast while the real cycle suppresses it. The dry-run forecast must predict
+# live behavior, so it suppresses union(exited_symbols, would_exit).
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_cycle_suppresses_entry_for_would_exit_symbol(
+    isolate_config, isolate_quant_home
+):
+    """A symbol breaching an exit AND on the entry watchlist is NOT reported as a
+    FIRE in a dry-run cycle — it is SILENCE_EXITED_THIS_TICK, matching the
+    non-dry path's suppression (which uses the actually-flattened set)."""
+    _set_mode_autonomous(isolate_config)
+    _enable_manage_positions(isolate_config)
+    # AAPL is open and breaching (-15% < -10% stop) AND on the entry watchlist.
+    _append_open_position(isolate_quant_home, "AAPL", target_pct=0.10, price=100.0)
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        out = run_autonomous_cycle(
+            dry_run=True,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+            marks_provider=lambda syms: {"AAPL": 85.0},  # -15% < -10% stop
+            clock_provider=lambda: True,
+            quant_home=isolate_quant_home,
+        )
+
+    # The exit pass would have flattened AAPL (dry-run: reported, not appended).
+    assert "AAPL" in out.exit_result.would_exit
+    assert out.exit_result.exited_symbols == []  # dry-run appends nothing
+    # The dry-run forecast must NOT report AAPL as a FIRE — it predicts the live
+    # same-tick suppression instead.
+    assert out.tick_result.fires == 0
+    assert react_calls == []  # dry-run never Reacts anyway
+    aapl = [d for d in out.tick_result.decisions if d.symbol == "AAPL"][0]
+    assert aapl.gate == "SILENCE_EXITED_THIS_TICK"
+
+
+def test_non_dry_cycle_suppresses_only_actually_exited(
+    isolate_config, isolate_quant_home
+):
+    """The contrast to the dry-run forecast: a NON-dry cycle suppresses the
+    actually-flattened set (exited_symbols), NOT would_exit (which is empty on
+    the live path). AAPL is genuinely closed this tick, so it is still
+    SILENCE_EXITED_THIS_TICK — the two paths agree on the suppressed symbol."""
+    _set_mode_autonomous(isolate_config)
+    _enable_manage_positions(isolate_config)
+    _append_open_position(isolate_quant_home, "AAPL", target_pct=0.10, price=100.0)
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        out = run_autonomous_cycle(
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+            marks_provider=lambda syms: {"AAPL": 85.0},
+            clock_provider=lambda: True,
+            quant_home=isolate_quant_home,
+        )
+
+    assert "AAPL" in out.exit_result.exited_symbols
+    assert out.exit_result.would_exit == []  # live path: cap-selected then exited
+    assert "AAPL" not in react_calls
+    assert out.tick_result.fires == 0
+    aapl = [d for d in out.tick_result.decisions if d.symbol == "AAPL"][0]
+    assert aapl.gate == "SILENCE_EXITED_THIS_TICK"
