@@ -584,3 +584,57 @@ def test_watchlist_entry_round_trip():
     assert restored.state == STATE_ACTIVE
     assert restored.consecutive_days_above_floor == 4
     assert restored.onboarded_at == pd.Timestamp("2026-01-01", tz="UTC")
+
+
+# --------------------------------------------------------------------------- #
+# Wave 5c: label disabled buckets "disabled" (not active=0)
+# --------------------------------------------------------------------------- #
+
+
+def test_bucket_with_no_active_rows_is_labeled_disabled(universe_file, state_paths):
+    """A play with zero active rows must be LABELED 'disabled' in the summary,
+    not silently shown as active=0 (operator-facing clarity)."""
+    summary = _run(
+        universe_file,
+        state_paths,
+        score=0.7,  # 1 day above floor => candidates, NOT active yet
+        asof=pd.Timestamp("2026-01-01", tz="UTC"),
+        sticky_onboard_days=3,
+    )
+    cc = summary["per_play"]["covered_call"]
+    assert cc["n_active"] == 0
+    assert cc["status"] == "disabled"
+
+
+def test_bucket_with_active_rows_is_labeled_active(universe_file, state_paths):
+    """A play that has onboarded active rows is labeled 'active'."""
+    sticky = 3
+    for i in range(sticky):
+        summary = _run(
+            universe_file,
+            state_paths,
+            score=0.7,
+            asof=pd.Timestamp(f"2026-01-{i + 1:02d}", tz="UTC"),
+            sticky_onboard_days=sticky,
+        )
+    cc = summary["per_play"]["covered_call"]
+    assert cc["n_active"] == 3
+    assert cc["status"] == "active"
+
+
+def test_empty_universe_buckets_labeled_disabled(tmp_path, state_paths):
+    """The empty-universe early-return summary also labels every bucket
+    'disabled' (no active rows anywhere)."""
+    empty_universe = tmp_path / "empty_universe.json"
+    empty_universe.write_text(json.dumps({"asof": "2026-01-01T00:00:00+00:00",
+                                           "count": 0, "symbols": []}))
+    watchlist_path, journal_path = state_paths
+    summary = evolve_watchlist(
+        universe_path=empty_universe,
+        watchlist_path=watchlist_path,
+        journal_path=journal_path,
+        scorer=stub_scorer(0.7),
+        asof=pd.Timestamp("2026-01-01", tz="UTC"),
+    )
+    for play in PLAY_NAMES:
+        assert summary["per_play"][play]["status"] == "disabled"

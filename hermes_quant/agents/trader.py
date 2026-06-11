@@ -339,8 +339,18 @@ class TraderNode:
         # --- Derive sizing and action ---
         size_fraction = abs(_RATING_SIZE_FRACTION[recommendation])
         action = _rating_to_action(recommendation)
+        # Wave 5c (horizon contract): the holding horizon must follow the
+        # aggregate's DETECTION horizon when the advisor signal carries one — a
+        # 5m-detected signal must not be positioned for a 30-day "Buy" hold just
+        # because the rating ladder says so (the horizon-contract mismatch). The
+        # aggregate's AggregatedSignal.horizon rides through advisor_signal as a
+        # canonical label ("5m".."1Q"); map it to a representative day-count.
+        # Precedence: aggregate horizon -> rating ladder -> horizon_emphasis text.
+        # When the signal has no horizon (every legacy call shape), this is
+        # byte-identical to the prior ladder-first behavior.
         horizon_days = (
-            _RATING_HORIZON_DAYS.get(recommendation)
+            _aggregate_horizon_to_days(advisor_signal.get("horizon"))
+            or _RATING_HORIZON_DAYS.get(recommendation)
             or _parse_horizon(research_plan.get("horizon_emphasis"))
         )
 
@@ -467,6 +477,36 @@ def _coerce_positive_float(val: Any) -> Optional[float]:
     if not math.isfinite(f) or f <= 0:
         return None
     return f
+
+
+# Aggregate (AggregatedSignal.horizon) canonical label -> representative
+# holding-period day-count. Intraday/daily detection windows map to a 1-day
+# hold (the position is opened against a same-day signal); weekly/monthly/
+# quarterly scale up. Wave 5c: keeps the trader's holding horizon aligned to the
+# detection horizon the BMA actually aggregated, instead of a rating default.
+_AGGREGATE_HORIZON_DAYS: dict[str, int] = {
+    "1m": 1,
+    "5m": 1,
+    "15m": 1,
+    "30m": 1,
+    "1h": 1,
+    "4h": 1,
+    "1d": 1,
+    "1w": 7,
+    "1M": 30,
+    "1Q": 90,
+}
+
+
+def _aggregate_horizon_to_days(horizon: Any) -> Optional[int]:
+    """Map an aggregate signal's canonical horizon label to a day-count.
+
+    Returns None for a missing/unknown label so the caller falls back to the
+    rating ladder — an unrecognized horizon must never crash or zero the hold.
+    """
+    if not isinstance(horizon, str):
+        return None
+    return _AGGREGATE_HORIZON_DAYS.get(horizon)
 
 
 def _parse_horizon(horizon_emphasis: Any) -> Optional[int]:

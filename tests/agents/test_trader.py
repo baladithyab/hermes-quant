@@ -489,6 +489,67 @@ class TestTraderNodeGracefulFallback:
 
 
 # ==========================================================================
+# 4b. TraderNode — horizon aligned to the aggregate (Wave 5c)
+# ==========================================================================
+
+
+class TestTraderNodeHorizonAlignment:
+    """The holding horizon must follow the aggregate's DETECTION horizon when the
+    advisor signal carries one — not blindly use the rating ladder. A 5m-detected
+    signal must NOT get a 30-day 'Buy' hold (the horizon-contract mismatch)."""
+
+    def _plan(self, rating: str = "Buy") -> dict:
+        return {
+            "recommendation": rating,
+            "confidence": 0.70,
+            "rationale": "Rationale from research manager.",
+            "strategic_actions": "Enter at market.",
+            "horizon_emphasis": None,
+        }
+
+    def _signal(self, horizon: str | None) -> dict:
+        sig: dict = {
+            "direction": 1,
+            "confidence": 0.75,
+            "magnitude": 0.02,
+            "metadata": {"last_close": 100.0, "atr_relative": 0.02},
+            "data_quality": {"bars_received": 252},
+        }
+        if horizon is not None:
+            sig["horizon"] = horizon
+        return sig
+
+    @pytest.mark.parametrize("horizon,expected_days", [
+        ("5m", 1),
+        ("1h", 1),
+        ("1d", 1),
+        ("1w", 7),
+        ("1M", 30),
+        ("1Q", 90),
+    ])
+    def test_horizon_from_aggregate_takes_precedence(self, horizon, expected_days):
+        """A 'Buy' would default to 30 days from the ladder; the aggregate's
+        horizon must override that to its representative day-count."""
+        node = TraderNode()
+        proposal = node(self._plan("Buy"), self._signal(horizon))
+        assert proposal.time_horizon_days == expected_days
+
+    def test_no_aggregate_horizon_falls_back_to_rating_ladder(self):
+        """Signal without a horizon (the legacy shape used by every existing
+        test) => byte-identical: 'Buy' still maps to the 30-day ladder default."""
+        node = TraderNode()
+        proposal = node(self._plan("Buy"), self._signal(None))
+        assert proposal.time_horizon_days == 30  # _RATING_HORIZON_DAYS["Buy"]
+
+    def test_unrecognized_aggregate_horizon_falls_back(self):
+        """An unknown horizon string must not crash or zero the hold — fall back
+        to the rating ladder."""
+        node = TraderNode()
+        proposal = node(self._plan("Buy"), self._signal("17q"))
+        assert proposal.time_horizon_days == 30
+
+
+# ==========================================================================
 # 5. bind_structured — provider routing
 # ==========================================================================
 

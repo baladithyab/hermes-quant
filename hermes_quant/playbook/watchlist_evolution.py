@@ -76,6 +76,19 @@ STATE_CANDIDATE = "candidate"
 STATE_ACTIVE = "active"
 STATE_EVICTED = "evicted"
 
+# Per-play bucket status labels for the evolve summary (Wave 5c). A bucket
+# holding no active rows is "disabled" — surfaced explicitly so the operator
+# does not read the ambiguous active=0 (a play with zero active names is doing
+# nothing, which is a different signal from a play with 3 active names).
+BUCKET_STATUS_ACTIVE = "active"
+BUCKET_STATUS_DISABLED = "disabled"
+
+
+def _bucket_status(n_active: int) -> str:
+    """Label a play bucket from its active-row count: 'disabled' when none are
+    active, else 'active'."""
+    return BUCKET_STATUS_ACTIVE if n_active > 0 else BUCKET_STATUS_DISABLED
+
 # Journal action verbs.
 ACTION_ONBOARD = "onboard"
 ACTION_EVICT = "evict"
@@ -741,11 +754,19 @@ def evolve_watchlist(
                 universe.append(s)
                 _seen.add(s)
     if not universe:
-        # Silence-by-default — return an empty-but-valid summary.
+        # Silence-by-default — return an empty-but-valid summary. Wave 5c: a
+        # bucket with no active rows is LABELED "disabled" rather than shown as
+        # active=0 (operator-facing clarity); every bucket is disabled here.
         return {
             "as_of": asof.isoformat(),
             "per_play": {
-                p: {"n_active": 0, "n_onboarded_today": 0, "n_evicted_today": 0, "top5": []}
+                p: {
+                    "n_active": 0,
+                    "n_onboarded_today": 0,
+                    "n_evicted_today": 0,
+                    "top5": [],
+                    "status": _bucket_status(0),
+                }
                 for p in plays
             },
             "events_written": 0,
@@ -794,6 +815,9 @@ def evolve_watchlist(
             "n_onboarded_today": n_onboarded,
             "n_evicted_today": n_evicted,
             "top5": top5,
+            # Wave 5c: an explicit status label so a play holding no active rows
+            # reads as "disabled" instead of the ambiguous active=0.
+            "status": _bucket_status(len(active)),
         }
 
     # Persist new state + journal. B14(a): STATE FIRST, journal second.

@@ -387,6 +387,7 @@ def tick(
     symbols: list[WatchlistEntry] | None = None,
     advisor_recommend=None,
     exited_symbols: list[str] | None = None,
+    mode_override: str | None = None,
 ) -> TickResult:
     """Single autonomous tick across the watchlist (ADR-0016 §D8).
 
@@ -403,6 +404,14 @@ def tick(
             decrements them from the concurrency snapshot, so a stop-loss cannot
             be undone by a same-tick re-open (ULTRACODE-REVIEW Q5). Default None
             => byte-identical to the pre-Wave-2 path (no exit pass in play).
+        mode_override: Wave 5a — an EXPLICIT PDR-mode override, replacing the
+            cron's process-scope monkeypatch of ``_read_pdr_mode`` (3a). The cron
+            runs the pipeline even though config.yaml does not set
+            quant.pdr.mode=autonomous; it passes mode_override="autonomous" here
+            instead of mutating module state (which leaked to every other
+            importer and broke silently on a rename). Default None => read config
+            via _read_pdr_mode(), byte-identical to the pre-Wave-5 path. An
+            invalid value falls through to the mode gate as a mismatch.
 
     Returns:
         TickResult with structured per-symbol decisions + fires/silences/
@@ -413,7 +422,10 @@ def tick(
         via SymbolDecision.error.
     """
     asof = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    mode = _read_pdr_mode()
+    # Wave 5a: explicit override beats the config read. None => read config
+    # (byte-identical). This is the scoped replacement for the cron's
+    # auto._read_pdr_mode monkeypatch.
+    mode = mode_override if mode_override is not None else _read_pdr_mode()
 
     # Mode gate
     if mode != "autonomous":
@@ -978,6 +990,7 @@ def run_autonomous_cycle(
     marks_provider=None,
     clock_provider=None,
     quant_home: Path | None = None,
+    mode_override: str | None = None,
 ) -> CycleResult:
     """One autonomous cycle: position management FIRST, then entries (ADR-0016).
 
@@ -1010,6 +1023,9 @@ def run_autonomous_cycle(
         quant_home: the ~/.hermes/quant home passed explicitly to the exit pass
             for test-isolation. Defaults at CALL TIME to this module's QUANT_HOME
             (NOT bound at def time) so the e2e fixture's monkeypatch is honored.
+        mode_override: Wave 5a — forwarded to tick() so the cron bypasses the
+            config mode gate explicitly (mode_override="autonomous") instead of
+            monkey-patching _read_pdr_mode. None => read config (byte-identical).
 
     Returns:
         CycleResult{exit_result, tick_result}. Raises nothing externally-visible
@@ -1034,6 +1050,7 @@ def run_autonomous_cycle(
         symbols=symbols,
         advisor_recommend=advisor_recommend,
         exited_symbols=exit_result.exited_symbols,
+        mode_override=mode_override,
     )
 
     return CycleResult(exit_result=exit_result, tick_result=tick_result)

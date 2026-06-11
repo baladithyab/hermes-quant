@@ -29,10 +29,12 @@ Flags:
   --json       Emit a single-line JSON summary on stdout instead of the human one.
 
 Mode-gate bypass: The autonomous.tick() public API requires
-quant.pdr.mode=autonomous in config.yaml. This script monkey-patches the mode
-reader at process scope so the underlying PDR pipeline always runs regardless
-of config. The actual safety lives in --dry-run + halt_state + idempotency.
-This keeps the user's config.yaml clean and unchanged.
+quant.pdr.mode=autonomous in config.yaml. This script passes
+mode_override="autonomous" EXPLICITLY to tick() (Wave 5a) so the underlying PDR
+pipeline always runs regardless of config — replacing the old process-scope
+monkeypatch of auto._read_pdr_mode (which leaked to every importer in the
+process and broke silently on a rename). The actual safety lives in --dry-run +
+halt_state + idempotency. This keeps the user's config.yaml clean and unchanged.
 
 Audit trail is APPEND-ONLY JSONL — never deleted, never overwritten.
 """
@@ -241,11 +243,15 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
     # --- Idempotency lookup ---
     already_fired = fired_today() if armed else set()
 
-    # --- Lazy import + monkey-patch mode gate ---
+    # --- Lazy import + explicit mode override (Wave 5a) ---
     # The user's config.yaml does NOT set quant.pdr.mode=autonomous (that's a
     # bigger live-go decision). We still want to run the PDR pipeline because
     # the actual safety lives in --dry-run + halt_state + idempotency, all of
-    # which we own here. Override the mode reader at process scope.
+    # which we own here. We pass mode_override="autonomous" EXPLICITLY to
+    # auto.tick (below) instead of monkey-patching auto._read_pdr_mode at
+    # process scope — the old patch mutated module state for every other
+    # importer in the process and broke silently if the reader was renamed
+    # (Codex P1 3a). config.yaml stays untouched.
     try:
         import hermes_quant.autonomous as auto  # type: ignore
     except Exception as exc:  # noqa: BLE001
@@ -258,8 +264,6 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
             "trace": traceback.format_exc(),
         })
         return summary
-
-    auto._read_pdr_mode = lambda: "autonomous"  # type: ignore[attr-defined]
 
     from hermes_quant.watchlist import WatchlistEntry  # type: ignore
 
@@ -378,11 +382,14 @@ def run_tick(*, armed: bool) -> dict[str, Any]:
 
     # --- Run the canonical PDR pipeline tick ---
     # dry_run flips REACT — when True, no PaperReactor.execute call.
+    # mode_override="autonomous" (Wave 5a) bypasses the config mode gate
+    # explicitly, replacing the old auto._read_pdr_mode monkeypatch.
     try:
         result = auto.tick(
             dry_run=not armed,
             symbols=entries,
             advisor_recommend=_direction_screened_recommend,
+            mode_override="autonomous",
         )
     except Exception as exc:  # noqa: BLE001
         summary["errors"] += 1

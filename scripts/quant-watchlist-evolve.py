@@ -266,8 +266,17 @@ def main() -> int:
     for play, stats in summary["per_play"].items():
         if stats["n_active"] or stats["n_onboarded_today"] or stats["n_evicted_today"]:
             top = ", ".join(f"{s}:{sc:.2f}" for s, sc in stats["top5"])
+            # Wave 5c: render the explicit bucket status. A play with active rows
+            # shows its count; a play with none reads "disabled" rather than the
+            # ambiguous active=0.
+            status = stats.get("status", "active" if stats["n_active"] else "disabled")
+            active_field = (
+                f"active={stats['n_active']:3d}"
+                if status == "active"
+                else f"{'disabled':>10s}"
+            )
             print(
-                f"  {play:14s} active={stats['n_active']:3d} "
+                f"  {play:14s} {active_field} "
                 f"+{stats['n_onboarded_today']:2d} -{stats['n_evicted_today']:2d}  "
                 f"top5: {top}"
             )

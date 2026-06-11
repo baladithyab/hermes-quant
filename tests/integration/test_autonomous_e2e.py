@@ -1025,3 +1025,76 @@ def test_cycle_dry_run_honored_end_to_end(isolate_config, isolate_quant_home):
     assert out.exit_result.exited_symbols == []
     assert react_calls == []  # entry dry-run: no React
     assert (isolate_quant_home / "executions.jsonl").read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Wave 5a: explicit mode_override replaces the cron's _read_pdr_mode monkeypatch
+# ---------------------------------------------------------------------------
+
+
+def test_mode_override_runs_pipeline_without_config_mode(
+    isolate_config, isolate_quant_home
+):
+    """The cron runs the PDR pipeline even though config.yaml does NOT set
+    quant.pdr.mode=autonomous. Previously it monkey-patched auto._read_pdr_mode
+    at process scope (brittle + leaks to every importer). tick(mode_override=...)
+    is the explicit, scoped replacement: pass 'autonomous' and the pipeline runs;
+    config is left untouched (still 'advise')."""
+    # NOTE: config mode deliberately NOT set to autonomous (default advise).
+
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        result = tick(
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+            mode_override="autonomous",
+        )
+
+    assert result.mode == "autonomous"
+    assert result.fires == 1
+    assert react_calls == ["AAPL"]
+
+
+def test_mode_override_none_reads_config_byte_identical(
+    isolate_config, isolate_quant_home
+):
+    """mode_override=None (default) is byte-identical to today: read config. With
+    config unset (advise), the tick mode-mismatches exactly as before."""
+    result = tick(
+        dry_run=True,
+        symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+        advisor_recommend=lambda **kw: _make_advisor_result(),
+    )
+    assert result.mode == "advise"
+    assert result.errors == 1
+    assert result.decisions == []
+
+
+def test_cycle_threads_mode_override(isolate_config, isolate_quant_home):
+    """run_autonomous_cycle forwards mode_override to tick() so the cron can call
+    the ONE seam without touching config or monkey-patching."""
+    react_calls = []
+
+    def fake_react(advisor_result, entry, kelly, **kwargs):
+        react_calls.append(entry.symbol)
+        return f"exec_{entry.symbol}"
+
+    with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
+        out = run_autonomous_cycle(
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+            marks_provider=lambda syms: {},
+            clock_provider=lambda: True,
+            quant_home=isolate_quant_home,
+            mode_override="autonomous",
+        )
+
+    assert out.tick_result.mode == "autonomous"
+    assert out.tick_result.fires == 1
