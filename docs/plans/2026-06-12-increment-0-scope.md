@@ -75,6 +75,36 @@ Mirror of the ADR-0091 Option-E gate (see the ADR). The load-bearing additions:
 3. Confirming the live `executions.jsonl` still holds the incident's genuinely-distinct re-affirmation records (12 AAPL `proposal_id`s, BA 6×) before enabling, so the heal produces the expected `AAPL=33.33sh/5%`, `BA=−0.20`.
 4. Whether to also consolidate the dual reconstructor at the source long-term (E converges all three folds on the same semantics; full consolidation is a later rearchitecture seed, not Increment 0).
 
-## Estimated shape
+## Implementation status (2026-06-13) — what landed vs what remains
 
-Front-loaded but bounded: the normalizer + wiring + parity tests are the bulk; no historical-log mutation and no broker-statement *repair* (only reconciliation read) means the highest-risk B-era step is gone. **Earliest kill criterion:** if the single shared normalizer cannot make all three folds agree on the AAPL/BA parity fixture without per-consumer special-casing, Option E's shared-derivation premise is false → escalate (the consumers' state shapes are genuinely incompatible, which the code map judged unlikely but not impossible).
+**LANDED (committed, default-OFF behind `HERMES_QUANT_DELTA_NORMALIZER`):**
+- §0.0 conftest isolation (QUANT_HOME + executions/signals bus) — `cc9a2f9`.
+- §0.1 `ExecutionRecord.schema_version` + `is_absolute_target_record` + contract docstring — `18a04d4`.
+- §0.2 `FillDeltaNormalizer` (the one shared carry-forward, 7 unit tests) — `de23eb9`.
+- §0.3 wired into the **rebuild fold** (`reconstruct_from`); cr09 keystone flipped xfail→PASS — `a5dc0a6`.
+- Adversarial review: all 6 failure-mode checks HOLD; flag-OFF bit-for-bit (169 passed); cr09 non-vacuous.
+
+> **⚠️ OPERATOR CONSTRAINT — the flag is REBUILD-ONLY; do NOT flip it on a live daemon yet.**
+> Increment 0 wired the normalizer into `reconstruct_from` (the source-of-truth rebuild fold used
+> by heal/reconcile). The **incremental** `apply_execution` path that PaperReactor calls live on
+> every fill is NOT yet normalized. So with the flag ON, a live session would inflate incrementally
+> while a rebuild deflates to the correct value — the live `state.db` and a rebuild would DIVERGE
+> mid-session. Safe uses today: (a) offline `reconstruct_from` / `quant-ledger-reconcile` heals, and
+> (b) the test suite. The live-daemon flip waits on the incremental-path wiring below.
+
+**REMAINS (scoped follow-ups, filed as seeds):**
+- **Incremental-path wiring** (the reviewer's gap): wire the normalizer into `apply_execution`
+  (`portfolio_state.py:517-717`) with `running_net` seeded from the persisted positions row, so the
+  incremental and rebuild folds agree. This is the prerequisite for flipping the flag live.
+- **asof-ordering guard**: the carry-forward is file-sequential; the final net is order-invariant for
+  a true append log, but the "executions.jsonl is asof-ascending per bucket" invariant is load-bearing
+  and currently unverified at the read site — add a guard or an explicit per-bucket sort.
+- **Settlement-FIFO pre-pass**: wire the same normalizer into `daemon/settlement_loop.join_exit_fills`
+  (currently has no production caller; needed when settlement is wired).
+- **det-equity quantity-lane unit-unification (cr00)**: a single `(paper-default, equity, SYM)` bucket
+  can receive BOTH a paper NAV-fraction fill and a det-equity true-shares fill (same account+class);
+  the position fold then mixes units. The normalizer keeps the two lanes separate internally but the
+  downstream fold mixing is pre-existing (occurs flag-OFF too) — needs the read-time mark seam
+  (`position_pct = qty×mark/equity`). Out of Increment-0 scope.
+
+**Earliest kill criterion (unchanged):** if the single shared normalizer cannot make all three folds agree on the AAPL/BA parity fixture without per-consumer special-casing, Option E's shared-derivation premise is false → escalate. (Not tripped: the rebuild fold + cr09 parity pass cleanly.)
