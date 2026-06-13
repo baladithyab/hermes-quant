@@ -361,9 +361,25 @@ class PortfolioState:
 
         initial_cash = _default_initial_cash()
 
+        # ADR-0091 Option E (default-OFF behind HERMES_QUANT_DELTA_NORMALIZER):
+        # convert each absolute-target fill into its TRADED DELTA at fold time via
+        # the ONE shared normalizer, so a re-affirmed unchanged target folds to a
+        # no-op instead of inflating (the AAPL-12x / BA-6x defect). The records are
+        # replayed in file order — the canonical per-bucket ordering the normalizer
+        # requires (executions.jsonl is append-ordered by asof_execution). Flag OFF
+        # ⇒ override is None ⇒ _replay_record reads the raw field, bit-for-bit legacy.
+        _normalizer = None
+        if os.environ.get("HERMES_QUANT_DELTA_NORMALIZER", "0") == "1":
+            from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
+
+            _normalizer = FillDeltaNormalizer()
+
         for line_no, rec in enumerate(records, start=1):
             try:
-                _replay_record(rec, positions, cash_map, last_ts, initial_cash)
+                _override = _normalizer.delta_for(rec) if _normalizer is not None else None
+                _replay_record(
+                    rec, positions, cash_map, last_ts, initial_cash, _override
+                )
                 result.executions_processed += 1
                 acct = rec.get("account_id", "paper-default")
                 result.accounts_seen.add(acct)
@@ -957,6 +973,7 @@ def _replay_record(
     cash_map: dict[str, float],
     last_ts: dict[str, str],
     initial_cash: float,
+    pos_delta_override: float | None = None,
 ) -> None:
     """Apply one record to the in-memory accumulators during full rebuild.
 
@@ -968,6 +985,11 @@ def _replay_record(
         cash_map:     account_id → cash balance
         last_ts:      account_id → most recent asof_execution seen
         initial_cash: bootstrap cash for first-seen accounts
+        pos_delta_override: ADR-0091 Option E — when the
+            HERMES_QUANT_DELTA_NORMALIZER fold is active, reconstruct_from passes
+            the carry-forward-derived TRADED DELTA here (in the record's own size
+            unit), replacing the raw absolute-target size field. None ⇒ legacy
+            behavior (read the raw field), bit-for-bit unchanged.
     """
     acct = rec.get("account_id", "paper-default")
     asset_class = rec.get("asset_class", "equity")
@@ -981,7 +1003,17 @@ def _replay_record(
     # Without it, the legacy NAV-fraction proxy is used (equity path bit-identical).
     rmeta = rec.get("reactor_metadata") or {}
     leg_quantity = rmeta.get("quantity") if isinstance(rmeta, dict) else None
-    pos_delta = float(leg_quantity) if leg_quantity is not None else fill_size_pct
+    if pos_delta_override is not None:
+        # Option E: the normalizer already derived the traded delta from the
+        # absolute target. Use it for BOTH the position fold and the cash basis
+        # below (cash_basis tracks pos_delta), so a re-affirmation (delta 0) is a
+        # true no-op in position AND cash.
+        pos_delta = pos_delta_override
+        fill_size_pct = pos_delta_override if leg_quantity is None else fill_size_pct
+        if leg_quantity is not None:
+            leg_quantity = pos_delta_override
+    else:
+        pos_delta = float(leg_quantity) if leg_quantity is not None else fill_size_pct
 
     # Bootstrap cash for new accounts
     if acct not in cash_map:

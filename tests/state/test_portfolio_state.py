@@ -285,41 +285,29 @@ class TestMultipleSymbols:
         expected_avg = (0.05 * 100.0 + 0.05 * 120.0) / 0.10
         assert pos.avg_entry_price == pytest.approx(expected_avg, rel=1e-9)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "RED until Increment-0 Option-E normalizer lands (cr09/ra01). "
-            "ADR-0091 re-affirmation inflation defect: react/paper.py:266,269 "
-            "writes the ABSOLUTE target into fill_size_pct on every fire, and "
-            "portfolio_state.py:929 _update_position folds new_qty=old_qty+pos_delta. "
-            "So N distinct fires of the SAME 0.05 target (distinct proposal_ids, "
-            "effective delta 0 after the first) inflate state.db to N*0.05 instead "
-            "of staying 0.05. The Option-E shared fold-time normalizer (Increment 0 "
-            "of ADR-0092) makes a re-affirmation fold to delta 0; this spec flips "
-            "to PASS when that ships. Reproduces the AAPL-12x / BA-6x inflation."
-        ),
-    )
     def test_reaffirmation_does_not_inflate(
-        self, ps: PortfolioState, executions_path: Path
+        self, ps: PortfolioState, executions_path: Path, monkeypatch
     ):
         """N re-affirmations of the SAME target fold to ONE intended position.
 
-        Canonical ADR-0091 re-affirmation scenario (regression spec for the
-        defect Option E fixes). Each record carries the SAME absolute target
-        (0.05 for AAPL long, -0.2 for BA short) but a DISTINCT proposal_id —
-        i.e. the advisor re-affirmed an already-held, unchanged target N times.
+        Canonical ADR-0091 re-affirmation scenario. Each record carries the SAME
+        absolute target (0.05 for AAPL long, -0.2 for BA short) but a DISTINCT
+        proposal_id — i.e. the advisor re-affirmed an already-held, unchanged
+        target N times.
 
         CORRECT end state: a single intended position (AAPL 0.05, BA -0.2),
         because every fire after the first is an effective-delta-0 re-affirmation
         of the same target. Cost basis stays at the first-fire fill_price; cash
         moves only once per symbol (the genuine open).
 
-        Under the CURRENT (broken) fold this RED-fails: the absolute target is
-        treated as an incremental delta, so the position inflates to N*target
-        (AAPL 12 x 0.05 = 0.60; BA 6 x -0.2 = -1.20). The xfail(strict=True)
-        marker makes this a committed regression spec that flips to PASS when
-        the Increment-0 Option-E normalizer lands.
+        This was a strict-xfail regression spec (cr09) until the Increment-0
+        Option-E shared fold-time normalizer landed (cr09/ra01). With
+        HERMES_QUANT_DELTA_NORMALIZER=1 it now PASSES: a re-affirmation folds to
+        delta 0 instead of inflating to N*target (AAPL 12 x 0.05 = 0.60;
+        BA 6 x -0.2 = -1.20 under the legacy fold). The flag-OFF legacy inflation
+        is covered separately in tests/state/test_normalizer_wired_fold.py.
         """
+        monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
         # AAPL: 12 re-affirmations of the same 0.05 long target (distinct ids).
         aapl_records = [
             _make_record(
