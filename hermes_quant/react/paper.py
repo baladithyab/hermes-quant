@@ -326,7 +326,7 @@ class PaperReactor:
 
         # -----------------------------------------------------------------------
         # Wave 4 (ADR-0042): trigger Reflector on position close.
-        # Gated by HERMES_QUANT_REFLECTION=1 — default OFF.
+        # Gated by HERMES_QUANT_REFLECTION — default ON (code default "1"; set =0 to opt out).
         # "Position close" heuristic: fill_size_pct has the opposite sign to
         # the existing open position (detected via PortfolioState), OR the
         # resulting net exposure rounds to zero. We use a simple sign-flip
