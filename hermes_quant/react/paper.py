@@ -52,6 +52,10 @@ def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
         "reactor_metadata": record.reactor_metadata or {},
         "bar_ts": record.bar_ts,  # ADR-0068: explicit bar-boundary anchor
         "play_tag": record.play_tag,  # B13: source of the fire
+        # ADR-0091 Option E: tag how the fold interprets the per-fill size field.
+        # None (legacy) reads as absolute-target; serialized verbatim so a new
+        # record can stamp SCHEMA_ABSOLUTE_TARGET while old records stay None.
+        "schema_version": record.schema_version,
     }
 
 
