@@ -83,20 +83,20 @@ Mirror of the ADR-0091 Option-E gate (see the ADR). The load-bearing additions:
 - §0.2 `FillDeltaNormalizer` (the one shared carry-forward, 7 unit tests) — `de23eb9`.
 - §0.3 wired into the **rebuild fold** (`reconstruct_from`); cr09 keystone flipped xfail→PASS — `a5dc0a6`.
 - Adversarial review: all 6 failure-mode checks HOLD; flag-OFF bit-for-bit (169 passed); cr09 non-vacuous.
+- **i0a: wired into the INCREMENTAL fold (`apply_execution`)** via the shared `delta_from_net` derivation; incremental==rebuild parity gate green — `f1aa12e`. **ADR-0091 Option E is now complete on BOTH folds.**
 
-> **⚠️ OPERATOR CONSTRAINT — the flag is REBUILD-ONLY; do NOT flip it on a live daemon yet.**
-> Increment 0 wired the normalizer into `reconstruct_from` (the source-of-truth rebuild fold used
-> by heal/reconcile). The **incremental** `apply_execution` path that PaperReactor calls live on
-> every fill is NOT yet normalized. So with the flag ON, a live session would inflate incrementally
-> while a rebuild deflates to the correct value — the live `state.db` and a rebuild would DIVERGE
-> mid-session. Safe uses today: (a) offline `reconstruct_from` / `quant-ledger-reconcile` heals, and
-> (b) the test suite. The live-daemon flip waits on the incremental-path wiring below.
+> **✅ CONSTRAINT LIFTED (i0a, 2026-06-13): the flag is no longer rebuild-only.** Both the rebuild
+> (`reconstruct_from`) and the incremental (`apply_execution`) folds now derive the delta through the
+> ONE shared `delta_from_net`, so a live session and a rebuild AGREE (parity gate:
+> `test_normalizer_incremental_parity.py::test_incremental_matches_rebuild_flag_on`). The flag is now
+> technically safe to flip live — but the **live-daemon flip remains the operator's eval-gated call**
+> (default-OFF eval-gated rollout; paper-only observation first), and the i0c settlement-FIFO pre-pass +
+> cr00 det-equity unit-unification are still open (they don't block the position/cash fold, but a live
+> flip should weigh them).
 
 **REMAINS (scoped follow-ups, filed as seeds):**
-- **Incremental-path wiring** (the reviewer's gap): wire the normalizer into `apply_execution`
-  (`portfolio_state.py:517-717`) with `running_net` seeded from the persisted positions row, so the
-  incremental and rebuild folds agree. This is the prerequisite for flipping the flag live.
-- **asof-ordering guard**: the carry-forward is file-sequential; the final net is order-invariant for
+- ~~Incremental-path wiring~~ — **DONE (i0a, `f1aa12e`).**
+- **asof-ordering guard** (i0b): the carry-forward is file-sequential; the final net is order-invariant for
   a true append log, but the "executions.jsonl is asof-ascending per bucket" invariant is load-bearing
   and currently unverified at the read site — add a guard or an explicit per-bucket sort.
 - **Settlement-FIFO pre-pass**: wire the same normalizer into `daemon/settlement_loop.join_exit_fills`
