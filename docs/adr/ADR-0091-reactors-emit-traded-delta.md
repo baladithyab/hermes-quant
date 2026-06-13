@@ -16,7 +16,40 @@ amends: ADR-0086
 > traded delta, keeping `executions.jsonl` a faithful transaction log. ADR-0086's
 > Phase-1 read-time MTM and its Phase-2 end-state target are otherwise preserved.
 
-# ADR-0091: Reactors must emit the traded delta in `fill_size_pct`, not the absolute target
+# ADR-0091: Resolve the fill-size delta-vs-target accounting defect (carry-forward fold, not producer rewrite)
+
+> **RESOLUTION (2026-06-12) — Option C supersedes the Option-B draft below.** This ADR's
+> first draft chose **Option B** (producer emits the delta + one-time log repair). A
+> 5-agent code-grounded adjudication (workflow `wf_61006ff6`, 2026-06-12) scored the options
+> against the four money-software principles and reversed that choice:
+> **Option C — versioned carry-forward fold — wins (34/40 vs B 20/40).**
+> - **Producers stay UNCHANGED** (they keep writing the absolute target they already know;
+>   `react/base.py:31` "paper=target" is now documented as intentional). This preserves the
+>   det-equity backend's true `filled_qty` (`deterministic_equity.py:385`) as a live-broker
+>   reconciliation anchor.
+> - **`executions.jsonl` is NEVER mutated.** A new nullable `schema_version` field tags
+>   records; absent/legacy version reads as absolute-target (which every historical record
+>   already is). The historical correction is the new *interpretation* applied on the next
+>   full rebuild — no repair script, no byte rewrite.
+> - **ONE shared stream-ordered normalizer**, keyed `(account_id, asset_class, asset)`, emits
+>   `delta = target − carried_forward_net` and feeds the **unchanged** ADR-0011
+>   OPEN/ADD/REDUCE/FLIP algebra in BOTH consumers (`state/portfolio_state.py` rebuild +
+>   incremental, and the `daemon/settlement_loop.py` FIFO). Re-affirmation → delta 0 → no-op;
+>   genuine ADD → blended cost basis.
+> - **Why B lost (both P0s confirmed against current code):** (b1) `paper.py`'s position read
+>   sits OUTSIDE the `append_locked` block (`:291`), so producer read-compute-append is
+>   non-atomic — concurrent fires append inflation into the immutable log; (b2) B's one-time
+>   repair mutates the authoritative append-only log (a corrupt append cannot be un-appended).
+> - **C's one residual (the burden of proof):** the no-divergence property is contingent on a
+>   SINGLE shared normalizer with ONE canonical per-bucket ordering — implemented as two
+>   independent carry-forwards, C drifts back into the rejected two-views failure. This is a
+>   hard architectural gate, captured in the revised Acceptance Gate below.
+>
+> **Status stays `proposed`:** the *decision* (C over B) is resolved; *acceptance* awaits the
+> revised gate (tests green + cross-family review + operator-gated live heal). Implementation
+> is Increment 0 of the ADR-0092 rearchitecture (`docs/plans/2026-06-12-shared-pdr-core-rearchitecture.md`).
+> The Option A/B analysis below is preserved as decision history. Resolution detail:
+> `docs/reviews/2026-06-12-adr0091-resolution/verdict.md`.
 
 ## Context and Problem Statement
 
@@ -158,13 +191,49 @@ re-emitted records carry true deltas and the rebuild produces the intended posit
 - **D. Consumer-only fix (EOD reads the paper projection).** Rejected: treats one symptom,
   leaves the corrupt log feeding settlement P&L, status, retro, and every future reader.
 
+- **E. Versioned carry-forward fold — producers UNCHANGED; one shared fold-time normalizer.**
+  *(The round-2 review and `~/wiki` call this "Option C"; renumbered E here to avoid collision
+  with the rejected option C above.)* Producers keep writing the **absolute target** they
+  already know (`react/base.py:31` "paper=target" documented as intentional), preserving the
+  det-equity backend's true `filled_qty` as a live-broker reconciliation anchor. Records gain a
+  nullable `schema_version`; absent/legacy reads as absolute-target (what every historical
+  record already is). **One shared stream-ordered normalizer**, keyed `(account_id, asset_class,
+  asset)`, emits `delta = target − carried_forward_net` and feeds the **unchanged** ADR-0011
+  OPEN/ADD/REDUCE/FLIP algebra in BOTH consumers. `executions.jsonl` is never mutated; the
+  historical correction is the new *interpretation* applied on the next full rebuild.
+
 ## Decision Outcome
 
-Chosen option: **B — producer-side delta emission + one-time log repair**, because the
+> **RESOLVED 2026-06-12: chosen option is E (versioned carry-forward fold), NOT B.** See the
+> resolution banner at the top of this ADR and `docs/reviews/2026-06-12-adr0091-resolution/verdict.md`.
+> The Option-B text immediately below is **preserved decision history** — it was the first
+> resolution and is retained per the "supersede, don't delete" rule. Implementation follows the
+> Option-E directive, not the Option-B steps.
+
+Chosen option: **E — versioned carry-forward fold**, because it satisfies all four binding
+money-software principles at once where B does not: it never touches the authoritative
+append-only log (interpretation changes, bytes do not), requires no producer state-read at
+write time (the carry-forward runs at fold time over the already-persisted ordered stream),
+makes BOTH delta-consumers correct through one shared normalizer, and preserves the ADR-0011
+cost-basis algebra (a genuine ADD blends `avg_entry_price`; a re-affirmation yields delta 0 →
+no-op — the precise structural difference from the rejected Option A, which *set* qty and
+overwrote the average). A code-grounded 5-agent adjudication scored E 34/40 vs B 20/40; B was
+floored by two confirmed P0s against current code — its producer position read sits **outside**
+`paper.py`'s `append_locked` block (`:291`), making read-compute-append non-atomic, and its
+one-time repair **mutates** the immutable log. E's sole residual — that the no-divergence
+property is contingent on a *single* shared normalizer with *one* canonical per-bucket ordering
+— is made a hard gate in the revised Acceptance Gate.
+
+---
+
+<details>
+<summary><b>PRESERVED DECISION HISTORY — the superseded Option-B resolution (do not implement)</b></summary>
+
+Original chosen option: **B — producer-side delta emission + one-time log repair**, because the
 defect is that fill records misstate what was traded; fixing the producer makes the
 authoritative log correct so *all* delta-consuming readers (state.db projection AND the
 ADR-0010 settlement FIFO) become correct with **no fold-time branching and no new
-per-record semantics flag to keep in sync**. (This reverses the first draft's Option A
+per-record semantics flag to keep in sync**. (This reversed the first draft's Option A
 after a 4-family adversarial review unanimously found Option A corrupts cost basis on
 target *changes* and cannot fix the settlement-journal view — see More Information.)
 
@@ -269,7 +338,7 @@ Concretely:
 - Bad, because the corrupt log keeps feeding settlement P&L, status, retro, and every future
   reader.
 
-## Acceptance gate (must be green before status flips to accepted)
+### Acceptance gate (SUPERSEDED — the Option-B gate, preserved as history)
 
 - [ ] `tests/unit/test_reactor_fill_delta.py::test_paper_reactor_emits_delta_not_target` — a fill into an existing matching position emits `fill_size_pct = target − current`; a re-affirmation of an unchanged target emits `fill_size_pct == 0`. RED on current `react/paper.py:269`.
 - [ ] `::test_deterministic_equity_emits_delta_shares` — `reactor_metadata.quantity` is the delta share count `(target−current)×NAV/price`, 0 on re-affirmation. RED on current ADR-0082 reactor.
@@ -281,6 +350,28 @@ Concretely:
 - [ ] Live heal verified end-to-end on the real book: `quant-repair-fill-deltas --apply` (backup written) → `quant-ledger-reconcile --apply` → `state.db` shows AAPL=33.33sh/5%, BA=−0.20, the seven paper symbols at their single intended target; EOD snapshot shows no phantom positions; both backups present.
 - [ ] Full `pytest` sweep green; firing/cap path (PR #85's `reconstruct_portfolio_state` seed) unchanged; `executions.jsonl` record *count* unchanged by the repair.
 - [ ] Cross-family adversarial review (≥3 families) of the REVISED ADR finds no P0 (the prior review's P0s — cost-basis overwrite, settlement desync, compat-shim fragility — must be confirmed resolved by the producer-side approach).
+
+</details>
+
+## Acceptance gate — Option E (must be green before status flips to accepted)
+
+> Implemented as Increment 0 of ADR-0092 (`docs/plans/2026-06-12-shared-pdr-core-rearchitecture.md`),
+> default-OFF behind `HERMES_QUANT_DELTA_NORMALIZER`; flag-OFF is bit-for-bit current behavior.
+> **No script touches `executions.jsonl`** — the historical correction is the new interpretation
+> applied on the next full rebuild with the flag on.
+
+- [ ] **Contract fix:** `react/base.py` docstring (lines 16-17 and the `:31` `paper=target` comment) amended to state the per-fill size field is the ABSOLUTE signed target for absolute-target schema versions and the delta is DERIVED at fold time. A new nullable `schema_version` field is added (back-compat pattern of `bar_ts`/`play_tag`); absent ⇒ absolute-target.
+- [ ] **Producers UNCHANGED:** `test_paper_reactor_still_writes_absolute_target` (`fill_size_pct == target`, the Option-E contract) and `test_record_stamps_schema_version` — the inverse of the deleted B-era "emits delta" tests.
+- [ ] **One shared normalizer:** `tests/unit/test_fill_delta_normalizer_shared.py` — (a) PARITY: `state/portfolio_state.py` rebuild AND incremental, the `daemon/settlement_loop.py` FIFO, AND the immune `portfolio/state.py::reconstruct_portfolio_state` all report the SAME net for the AAPL/BA fixtures; (b) ORDERING: same-asof-tie records produce identical delta streams in both consumers (closes the ordering-divergence P0); (c) INCREMENTAL-vs-REBUILD parity (`_apply_execution_unsafe` seeded from persisted state.db == `_replay_record`); (d) ARCHITECTURAL: only ONE module computes the carry-forward (both consumers import the same symbol).
+- [ ] `tests/unit/test_portfolio_state_accounting.py::test_reaffirmation_does_not_inflate` — replaying N absolute-target re-affirmation records under the normalizer folds to ONE intended position; cost basis + cash unchanged; `avg_entry_price` never overwritten on a re-affirm. (Reproduces AAPL 12× / BA 6× WITHOUT touching the file.)
+- [ ] `::test_target_change_and_flip` — 5%→7%→7% yields deltas +5,+2,0 (cost basis blends on the +2); +5%→−5% flip drains the long lot and opens a 5% short residual (FIFO) with `new_avg=fill_price` (state.db flip branch).
+- [ ] `::test_det_equity_quantity_path` — the det-equity AAPL-12× inflation (via `reactor_metadata.quantity`, not `fill_size_pct`) is corrected by the normalizer's quantity-path carry-forward.
+- [ ] `test_legacy_records_interpreted_as_absolute_target` — records lacking `schema_version` fold as absolute-target (no log rewrite needed).
+- [ ] **Reconcile semantics:** a test asserts `quant-ledger-reconcile` compares DERIVED net (not raw `fill_size_pct`) so log-vs-projection no longer falsely reports 0 divergence; and OLD-fold vs NEW-fold over historical data reports NON-zero divergence (proving the fix moved the projection).
+- [ ] **Conftest isolation** extended to `state.db`/`executions.jsonl`/`QUANT_HOME` (per the state-db-test-isolation-leak incident) so parity tests run against a clean book, not test-leaked state.
+- [ ] Full `pytest` sweep green; firing/cap path (`reconstruct_portfolio_state` seed) unchanged; **`executions.jsonl` byte-identical** before/after (checksum gate — proves no mutation).
+- [ ] **Operator-gated live heal** (human call, see resolution banner): enable flag → `quant-ledger-reconcile --apply` (rebuild state.db from the UNCHANGED log) → AAPL=33.33sh/5%, BA=−0.20, seven paper symbols at single target; EOD snapshot clean; log checksum unchanged.
+- [ ] Cross-family adversarial review (≥3 families) confirms Option-E's residual (single-shared-normalizer + one canonical ordering) is structurally enforced and finds no new P0.
 
 ## More Information
 
