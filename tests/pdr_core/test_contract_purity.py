@@ -48,6 +48,15 @@ FORBIDDEN_HERMES_SUBMODULES: tuple[str, ...] = (
     "hermes_quant.cli",
     "hermes_quant.discord_slash",
     "hermes_quant.committee_runner",
+    # pg1: ADR-0092 forbids the core reaching into governance/evidence/state — the
+    # core keeps its OWN ladder copy (contracts.py) PRECISELY for this reason, and
+    # the gate/BMA/kelly port (Increment 1-cont) is the layer most tempted to
+    # `from hermes_quant.governance.invariants import ACTION_SPACE` or reach into
+    # state/evidence. Without these the port would import them and stay green,
+    # defeating the extraction contract before the port even lands.
+    "hermes_quant.governance",
+    "hermes_quant.evidence",
+    "hermes_quant.state",
 )
 
 # Forbidden third-party infra / broker / heavy-IO top-level packages.
@@ -62,6 +71,10 @@ FORBIDDEN_TOP_LEVEL: tuple[str, ...] = (
     "requests",
     "httpx",
     "aiohttp",
+    # pg1: pydantic is the agents-shell dependency the contract docstring says the
+    # core must never reach (governance.audit_log pulls it transitively). The core is
+    # stdlib-only frozen dataclasses; a lazy governance import would drag pydantic in.
+    "pydantic",
 )
 
 

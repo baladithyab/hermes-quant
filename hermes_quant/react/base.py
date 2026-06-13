@@ -14,7 +14,12 @@ from typing import Any, Protocol, runtime_checkable
 #     normalizer derives delta = target - carried_forward_net at fold time.
 #   - a future "true-delta" version would mean the size field is already the traded
 #     delta and the normalizer passes it through untouched (never double-difference).
-SCHEMA_ABSOLUTE_TARGET = "absolute-target-v1"
+#
+# The canonical sentinel is defined in pdr_core.contracts (the host-agnostic contract
+# layer) and imported here, so the contract and this classifier agree by construction
+# (sv1: a duplicated/divergent sentinel re-inflated Fill-driven records). host -> core
+# import is allowed by the purity contract (only core -> host is forbidden).
+from hermes_quant.pdr_core.contracts import SCHEMA_ABSOLUTE_TARGET
 
 
 def is_absolute_target_record(rec: dict[str, Any]) -> bool:

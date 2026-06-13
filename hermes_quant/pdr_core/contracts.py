@@ -190,7 +190,14 @@ class Proposal:
 # Fill — the REACTION feedback the shell pushes back after execution.
 # ---------------------------------------------------------------------------
 
-FILL_SCHEMA_VERSION: int = 1
+# The canonical Option-E schema sentinel lives HERE (the contract layer) so the
+# host fold classifier (react.base.is_absolute_target_record) and this contract
+# agree by construction — react.base imports THIS, removing the duplicate string.
+# It is a string (not an int) because that is the wire value already persisted in
+# every ExecutionRecord and the value the fold classifier matches. sv1: an int here
+# silently classified a Fill-driven record as true-delta and re-inflated positions.
+SCHEMA_ABSOLUTE_TARGET: str = "absolute-target-v1"
+FILL_SCHEMA_VERSION: str = SCHEMA_ABSOLUTE_TARGET
 """Current Fill feedback-contract schema version (Option E absolute-target semantics)."""
 
 
@@ -215,5 +222,23 @@ class Fill:
     fill_price: float
     fill_size_pct: float  # ABSOLUTE post-fill target (NAV fraction), per Option E
     asof_execution: Any  # execution timestamp (ISO str or pandas.Timestamp)
-    schema_version: int = FILL_SCHEMA_VERSION
+    schema_version: str = FILL_SCHEMA_VERSION
     metadata: Mapping[str, Any] | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        # fl1: Fill is the reaction feedback the carry-forward fold trusts; a
+        # non-finite fill_size_pct poisons FillDeltaNormalizer.running_net for the
+        # whole (account,asset_class,asset) bucket (target - NaN = NaN forever), and
+        # a non-positive fill_price zeroes/sign-flips the cash basis. Reject at the
+        # contract boundary so the core stays the trustworthy seam (parity with the
+        # finiteness validation AnalystView/Proposal already enforce).
+        if not math.isfinite(self.fill_size_pct):
+            raise ValueError(
+                f"Fill.fill_size_pct must be finite, got {self.fill_size_pct!r} "
+                "(a NaN/inf target poisons the carry-forward running_net)."
+            )
+        if not math.isfinite(self.fill_price) or self.fill_price <= 0.0:
+            raise ValueError(
+                f"Fill.fill_price must be finite and > 0, got {self.fill_price!r} "
+                "(a 0/negative/NaN price corrupts the cash basis)."
+            )
