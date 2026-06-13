@@ -31,6 +31,7 @@ RAILS (the whole producer path is inert by default):
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -129,6 +130,25 @@ def parse_strike(symbol: str) -> Decimal:
     return parse_occ(symbol).strike
 
 
+def _finite_mid(mid) -> float:  # noqa: ANN001 — Decimal | float | None at the seam
+    """Coerce a snapshot mid to a finite non-negative float, else 0.0.
+
+    `_eligible_snapshots` rejects ``mid is None`` and ``mid <= 0``, but a NaN mid
+    slips through both (``NaN <= 0`` is False) and ``mid or 0.0`` does not catch
+    it either (NaN is truthy). A NaN premium would then flow into options_gate's
+    CSP BPR math and poison the O6 buffer compare (cs06). Fail-closed to 0.0 on
+    any non-finite or sub-zero value; never raises."""
+    if mid is None:
+        return 0.0
+    try:
+        v = float(mid)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(v) or v < 0.0:
+        return 0.0
+    return v
+
+
 def _pick_by_target_delta(
     snaps: list[OptionSnapshot], *, target_delta: float
 ) -> OptionSnapshot:
@@ -222,7 +242,13 @@ def build_multi_leg_proposal(
     short_leg = _snapshot_to_short_leg(short)
     strike = float(parse_strike(short.symbol))
     min_dte = short.dte
-    premium_received = float(short.mid or 0.0) * 100.0  # per-contract premium (1 lot)
+    # Per-contract premium (1 lot). `short.mid or 0.0` does NOT catch a NaN mid
+    # (NaN is truthy), and `_eligible_snapshots`' `mid <= 0` filter also lets a
+    # NaN through (`NaN <= 0` is False). Coerce a non-finite mid to 0.0 so a NaN
+    # never reaches options_gate's BPR math (cs06; cr02 P2 follow-up). The gate
+    # also fails closed on a non-finite premium_received as defense in depth.
+    short_mid = _finite_mid(short.mid)
+    premium_received = short_mid * 100.0
 
     legs: list[OptionLeg | StockLeg]
     stock_leg: StockLeg | None
@@ -303,7 +329,7 @@ def build_multi_leg_proposal(
 
     # Net price (signed): a short call/put is a CREDIT (negative net_debit_credit).
     # mid * 100 * contracts, received => negative.
-    net_credit_per_contract = Decimal(str(short.mid or 0.0)) * Decimal(100)
+    net_credit_per_contract = Decimal(str(short_mid)) * Decimal(100)
     net_debit_credit = (-net_credit_per_contract * Decimal(contracts)).quantize(
         Decimal("0.01")
     )

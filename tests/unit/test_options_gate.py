@@ -252,6 +252,71 @@ def test_nan_nav_silences_not_fail_open(monkeypatch) -> None:
     assert res.reason == "nonfinite_market_input"
 
 
+def test_nan_total_bpr_silences_not_fail_open(monkeypatch) -> None:
+    # cs06 (cr02 follow-up): the cr02 guard only covered spot/nav. A NaN
+    # total_bpr reaches O6 (`if total_bpr + bpr > cfg.bpr_buffer_pct_nav * nav`),
+    # where `NaN + bpr` is NaN and `NaN > x` is always False -> the BPR-buffer
+    # check FAILS OPEN and ADMITS an under-validated structure. This is the same
+    # NaN-fail-open class cr02 fixed for spot/nav; total_bpr must FAIL CLOSED too.
+    # A CSP that is otherwise admissible (mirrors test_csp_admitted_*) isolates
+    # total_bpr as the only non-finite input.
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=20_000.0,
+            premium_received=250.0,
+            total_bpr=float("nan"),
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "nonfinite_market_input"
+
+
+def test_nan_options_buying_power_silences_not_fail_open(monkeypatch) -> None:
+    # cs06: a NaN options_buying_power flows into the CSP cash-collateral gate
+    # (`options_buying_power >= required`) and the at-size re-check; an
+    # unvalidated non-finite collateral input must FAIL CLOSED at entry rather
+    # than drive the collateral comparisons through NaN.
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=float("nan"),
+            premium_received=250.0,
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "nonfinite_market_input"
+
+
+def test_nan_premium_received_silences_not_fail_open(monkeypatch) -> None:
+    # cs06: recipes.py:225 builds premium_received as `float(short.mid or 0.0)
+    # * 100` — `or 0.0` does NOT catch a NaN mid (NaN is truthy), so a NaN
+    # premium_received reaches the gate and flows into the CSP BPR math
+    # (`strike*100*c - premium_received`), poisoning the O6 buffer comparison.
+    # A non-finite premium must FAIL CLOSED at entry.
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=20_000.0,
+            premium_received=float("nan"),
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "nonfinite_market_input"
+
+
 def test_gamma_cap_silences() -> None:
     big = NetGreeks(gamma=10.0)  # 10 * 150^2 = 225k > 0.05 * 1M = 50k
     res = options_gate(

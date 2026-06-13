@@ -496,7 +496,7 @@ def options_gate(
             "enable (this wave never sets it live)"
         )
 
-    # ---- Non-finite market-input guard (cr02 fail-closed). ----
+    # ---- Non-finite market-input guard (cr02 fail-closed; cs06 extension). ----
     # Every spot-/nav-scaled cap below is `value > cfg.x * nav` or
     # `abs(... * spot) > ...`. A NaN spot or nav makes the comparison always
     # False (`NaN > x` is False) — the canonical NaN-fail-open class — and a NaN
@@ -504,7 +504,27 @@ def options_gate(
     # equity gate already fails closed on non-finite inputs (gate.py:536); mirror
     # that here: a NaN/inf spot or nav silences deterministically (reject), never
     # admits and never aborts the tick.
-    if not math.isfinite(spot) or not math.isfinite(nav):
+    #
+    # cs06 (cr02 P2 follow-up): the same NaN-fail-open class also lives in the
+    # BPR/collateral inputs that cr02 left unguarded.
+    #   * total_bpr — O6 is `if total_bpr + bpr > cfg.bpr_buffer_pct_nav * nav`.
+    #     A NaN total_bpr makes the LHS NaN and `NaN > x` False => the BPR buffer
+    #     ADMITS (fail-open) an under-validated structure.
+    #   * options_buying_power — the CSP cash-collateral gate is
+    #     `options_buying_power >= required`; a NaN drives that comparison False.
+    #   * premium_received — feeds the CSP BPR math (`strike*100*c -
+    #     premium_received`), so a NaN premium poisons the same O6 buffer compare.
+    #     (recipes.py builds this as `float(short.mid or 0.0) * 100`; `or 0.0`
+    #     does NOT catch a NaN mid, so a NaN can reach the gate.)
+    # All three are caller-supplied money-state inputs we cannot validate; a
+    # non-finite value silences deterministically (reject), same posture as cr02.
+    if (
+        not math.isfinite(spot)
+        or not math.isfinite(nav)
+        or not math.isfinite(total_bpr)
+        or not math.isfinite(options_buying_power)
+        or not math.isfinite(premium_received)
+    ):
         return OptionsGateResult.silence(
             StructureBucket.NAKED,
             "nonfinite_market_input",
