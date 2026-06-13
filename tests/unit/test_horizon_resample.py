@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from hermes_quant.data.horizon_cache import resample_to_horizon
+from hermes_quant.data.horizon_cache import get_resampled_history, resample_to_horizon
 
 
 def _make_daily_df(n_days: int = 5 * 252, start: str = "2021-01-04") -> pd.DataFrame:
@@ -99,3 +99,54 @@ class TestResampleToHorizon:
         out = resample_to_horizon(empty, "1w")
         assert len(out) == 0
         assert list(out.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+class _LeakyProvider:
+    """A provider that IGNORES as_of and returns daily bars past the anchor —
+    simulating both the cache-hit path (cached frame outlives asof) and a
+    provider that doesn't honour the cutoff. get_resampled_history must clip
+    the result to asof itself (cs05: live no-lookahead leak)."""
+
+    name = "leaky"
+
+    def __init__(self, df: pd.DataFrame) -> None:
+        self._df = df
+
+    def fetch_bars(self, symbol, timeframe, start, end, *, as_of=None, **kw):  # noqa: ANN001
+        # Deliberately ignore as_of — return the full frame including future bars.
+        return self._df.copy()
+
+
+class TestGetResampledHistoryNoLookahead:
+    """cs05: get_resampled_history must not return bars after `asof`, on either
+    the cache-hit or partial-bucket path. The leak class is asof-honesty
+    (rail: asof = publication time always)."""
+
+    def test_no_resampled_bar_exceeds_asof_daily(self):
+        # Daily bars run well past the decision asof; the future bars must be clipped.
+        df = _make_daily_df(n_days=60, start="2026-01-05")  # ~Jan-Mar 2026
+        asof = pd.Timestamp("2026-02-02", tz="UTC")
+        out = get_resampled_history(
+            "ZLEAK", "1d", asof=asof, provider=_LeakyProvider(df)
+        )
+        assert len(out) > 0, "expected some bars at/under asof"
+        ts = pd.to_datetime(out["timestamp"], utc=True)
+        assert ts.max() <= asof, (
+            f"lookahead leak: max bar {ts.max()} > asof {asof} "
+            "(get_resampled_history did not clip future daily bars)"
+        )
+
+    def test_no_partial_future_weekly_bucket(self):
+        # asof mid-week (Wed) — a 1w resample must NOT emit a W-FRI bucket whose
+        # period-end (Fri) is after asof and which aggregates Thu/Fri future bars.
+        df = _make_daily_df(n_days=60, start="2026-01-05")
+        asof = pd.Timestamp("2026-02-04", tz="UTC")  # a Wednesday
+        out = get_resampled_history(
+            "ZLEAK", "1w", asof=asof, provider=_LeakyProvider(df)
+        )
+        assert len(out) > 0
+        ts = pd.to_datetime(out["timestamp"], utc=True)
+        assert ts.max() <= asof, (
+            f"lookahead leak: weekly bar labelled {ts.max()} > asof {asof} "
+            "(partial future bucket emitted as a completed bar)"
+        )

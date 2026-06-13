@@ -781,6 +781,34 @@ def quant_approve(args: dict, **_kwargs) -> str:
             default=str,
         )
 
+    # cs02 cap-silence parity: when the reactor's portfolio-cap clip SILENCED the
+    # fill (0-fill, no bus write, reactor_metadata.silenced=True), mirror the
+    # admissibility branch above — do NOT advance the proposal to `approved` and do
+    # NOT report success with the ORIGINAL requested size (that marks a cap-refused
+    # order as a successful approval and consumes the proposal so it cannot be
+    # re-approved when headroom frees). Keep it PENDING and report realized 0.0.
+    if _rmeta.get("silenced"):
+        return json.dumps(
+            {
+                "success": False,
+                "error": "portfolio_cap_silenced",
+                "proposal_id": proposal_id,
+                "state": "pending",  # NOT advanced — re-approvable when headroom frees
+                "silence_reason": _rmeta.get("silence_reason"),
+                "requested_fill_size_pct": _json_safe_float(fill_size_pct),
+                "realized_fill_size_pct": _json_safe_float(
+                    getattr(execution, "fill_size_pct", 0.0)
+                ),
+                "message": (
+                    "Portfolio-cap clip SILENCED this fill (no headroom / over a "
+                    "portfolio cap); no capital moved, nothing was written to the "
+                    "bus, and the proposal remains pending so it can be re-approved "
+                    "when headroom frees."
+                ),
+            },
+            default=str,
+        )
+
     # P1-B (shadow wiring): when HERMES_QUANT_ALPACA_SHADOW=1 and the fill we
     # just made went through the SYNTHETIC PaperReactor (reactor_name=="paper"),
     # ALSO submit the same proposal to Alpaca paper and log the divergence. This

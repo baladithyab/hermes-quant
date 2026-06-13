@@ -320,6 +320,73 @@ def test_approve_admissibility_rejected_short_stays_pending_and_honest(
     assert not exec_path.exists() or exec_path.read_text().strip() == ""
 
 
+def test_approve_cap_silenced_stays_pending_and_honest(
+    isolated_store, monkeypatch, tmp_path
+):
+    """cs02: when the reactor's portfolio-cap clip SILENCES a fill (0-fill, no bus
+    write, reactor_metadata.silenced=True), quant_approve must NOT report
+    success / advance the proposal to 'approved' with the original size — it must
+    surface the silence, keep the proposal PENDING (so the operator can re-approve
+    when headroom frees), and report realized 0.0. Mirrors the admissibility branch
+    (which already does this); the cap-silence path was missing the same treatment."""
+    _set_hitl_mode(monkeypatch, tmp_path)
+    _patch_default_store(monkeypatch, isolated_store)
+    exec_path = tmp_path / "executions.jsonl"
+    _patch_executions_path(monkeypatch, exec_path)
+
+    from hermes_quant.react.base import ExecutionRecord
+    import hermes_quant.react.dispatch as dispatch_module
+    import hermes_quant.tools as tools_module
+
+    proposal = isolated_store.propose(
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
+        advisor_result=_sample_advisor_result(kelly=0.10),
+    )
+
+    # A reactor whose cap clip fully silences the fire (the react/paper.py:488-501
+    # silence record): 0-fill, not appended to the bus, flagged silenced.
+    def _silenced_record(prop):
+        return ExecutionRecord(
+            proposal_id=prop.proposal_id,
+            signal_id=None,
+            asset=prop.symbol,
+            asset_class=prop.asset_class,
+            timeframe=prop.timeframe,
+            asof_decision="2026-06-13T00:00:00Z",
+            asof_execution="2026-06-13T00:00:00Z",
+            target_position_pct=0.10,
+            decision_price=100.0,
+            fill_price=100.0,
+            fill_size_pct=0.0,
+            reactor_name="paper",
+            human_in_the_loop=True,
+            reactor_metadata={"silenced": True, "silence_reason": "portfolio_cap_no_headroom"},
+        )
+
+    class _SilencingReactor:
+        name = "paper"
+
+        def execute(self, prop, **kwargs):
+            return _silenced_record(prop)
+
+    monkeypatch.setattr(dispatch_module, "select_reactor", lambda prop: _SilencingReactor())
+
+    out = tools_module.quant_approve(
+        {"proposal_id": proposal.proposal_id, "size_override_pct": 0.10}
+    )
+    parsed = json.loads(out)
+
+    # Honest response: NOT a success; the proposal stays pending; no original size.
+    assert parsed["success"] is False, f"cap-silence reported as success: {parsed}"
+    assert "silenc" in (parsed.get("error", "") + parsed.get("silence_reason", "")).lower()
+    assert parsed["state"] == "pending"
+    # The proposal was NOT consumed — operator can re-approve when headroom frees.
+    final = isolated_store.get(proposal.proposal_id)
+    assert final.state == "pending"
+
+
 # ---------------------------------------------------------------------------
 # 6: Approve already-approved -> state_mismatch
 # ---------------------------------------------------------------------------
