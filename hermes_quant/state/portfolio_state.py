@@ -364,15 +364,22 @@ class PortfolioState:
         # ADR-0091 Option E (default-OFF behind HERMES_QUANT_DELTA_NORMALIZER):
         # convert each absolute-target fill into its TRADED DELTA at fold time via
         # the ONE shared normalizer, so a re-affirmed unchanged target folds to a
-        # no-op instead of inflating (the AAPL-12x / BA-6x defect). The records are
-        # replayed in file order — the canonical per-bucket ordering the normalizer
-        # requires (executions.jsonl is append-ordered by asof_execution). Flag OFF
+        # no-op instead of inflating (the AAPL-12x / BA-6x defect). Flag OFF
         # ⇒ override is None ⇒ _replay_record reads the raw field, bit-for-bit legacy.
         _normalizer = None
         if os.environ.get("HERMES_QUANT_DELTA_NORMALIZER", "0") == "1":
             from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
 
             _normalizer = FillDeltaNormalizer()
+            # i0b no-lookahead/ordering guard: the carry-forward delta = target -
+            # running_net is ORDER-DEPENDENT, so the normalizer must see records in
+            # asof order, not raw file/append order. Stable-sort by asof_execution
+            # (stable ⇒ same-asof ties keep file order, so the per-bucket delta
+            # stream is deterministic and identical to a correctly-appended log).
+            # This runs ONLY on the normalizer path; flag OFF leaves `records` in raw
+            # file order, bit-for-bit legacy. The sort is global but the fold is
+            # per-bucket, so cross-bucket interleaving is unaffected.
+            records = sorted(records, key=lambda r: r.get("asof_execution") or "")
 
         for line_no, rec in enumerate(records, start=1):
             try:
