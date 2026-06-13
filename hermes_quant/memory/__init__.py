@@ -4,7 +4,7 @@ Wave 4 of the hermes-quant pipeline uplift.  Three layers, env-var gated; each
 flag's explicit =0 path stays bit-identical to pre-Wave-4 behavior:
 
   Layer 1  decisions.py   — append-only JSONL decision log
-  Layer 2  reflector.py   — deferred post-trade reflection (HERMES_QUANT_REFLECTION=1, default OFF)
+  Layer 2  reflector.py   — deferred post-trade reflection (HERMES_QUANT_REFLECTION, default ON; set =0 to opt out)
   Layer 3  retriever.py   — BM25 retriever + Oracle-Fallacy guard
                             (HERMES_QUANT_MEMORY_INJECT, default ON; set =0 to opt out)
 

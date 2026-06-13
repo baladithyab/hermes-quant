@@ -1,7 +1,7 @@
 """hermes_quant.memory.reflector — Layer 2: post-trade reflection (ADR-0042).
 
-Gated by env var HERMES_QUANT_REFLECTION=1. Default OFF — bit-identical
-pre-Wave-4 behavior when the env var is absent.
+Gated by env var HERMES_QUANT_REFLECTION. Default ON (set =0 to opt out) —
+bit-identical pre-Wave-4 behavior when the env var is set to 0.
 
 The Reflector produces a Reflection dataclass from a closed decision + exit
 record. It computes:

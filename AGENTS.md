@@ -69,7 +69,7 @@ hermes-quant/
 │   ├── analysts/                 # one analyst per file
 │   │   ├── classical_ta.py
 │   │   ├── microstructure.py
-│   │   └── kronos.py             # both KronosAnalyst and KairosAnalyst
+│   │   └── kronos.py             # KronosAnalyst (regime-timing; single class)
 │   ├── aggregators/
 │   │   ├── bma.py
 │   │   ├── deliberative.py
@@ -93,7 +93,7 @@ hermes-quant/
 │   ├── evaluation/
 │   │   ├── cv.py                 # PurgedWalkForward
 │   │   ├── lookahead.py          # shuffle_timestamps_test
-│   │   └── dsr.py                # DeFlated Sharpe (v0.2 placeholder)
+│   │   └── dsr.py                # Deflated Sharpe Ratio — implemented (v0.3 paper-book; v0.4 multi-comparison hook)
 │   ├── cli/
 │   │   ├── __init__.py           # setup_argparse, dispatch
 │   │   ├── status.py             # status, signals, doctor
