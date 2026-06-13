@@ -28,7 +28,9 @@ import pytest
 
 from hermes_quant.advisor import recommend
 from hermes_quant.analysts.classical_ta import ClassicalTAAnalyst
+from hermes_quant.analysts.fundamentals import FundamentalsAnalyst
 from hermes_quant.analysts.microstructure import MicrostructureLite
+from hermes_quant.analysts.overnight_drift import OvernightDriftAnalyst
 from hermes_quant.analysts.semantic import HermesSemanticAnalyst
 from hermes_quant.protocol import MarketContext
 
@@ -76,11 +78,22 @@ def _ctx_at(bars: pd.DataFrame, *, asof_idx: int) -> MarketContext:
 # ---------------------------------------------------------------------------
 
 
+# Every SHIPPED bar-consuming analyst (wired into advisor._build_default_analysts,
+# even if default-OFF behind a flag) must appear here — this is the AGENTS.md
+# release-blocker promise (§"No look-ahead bias": the gate runs against "every
+# shipped analyst"). FundamentalsAnalyst (ADR-0064) abstains None on synthetic
+# bars (cache miss) — covered: the test's both-None branch proves it doesn't peek
+# at out-of-window rows. OvernightDriftAnalyst (ADR-0089) consumes ctx.bars
+# open/close directly and is the discriminating case. HermesSemanticAnalyst is
+# packet-driven (not bar-temporal); its lookahead fence is Invariants 5/7 below,
+# so the bar-based fences here can't reach it and it is intentionally excluded.
 @pytest.mark.parametrize(
     "analyst_factory",
     [
         lambda: ClassicalTAAnalyst(),
         lambda: MicrostructureLite(),
+        lambda: FundamentalsAnalyst(),
+        lambda: OvernightDriftAnalyst(),
     ],
 )
 def test_analyst_view_at_t_independent_of_future_bars(analyst_factory):
@@ -283,11 +296,18 @@ def test_advisor_deterministic_under_as_of_replay():
 # without copy-paste.
 
 
+# Same shipped-analyst coverage promise as Invariant 1's parametrize list.
+# FundamentalsAnalyst abstains None on synthetic bars (score 0.0 — structural
+# assertions still exercise the harness); OvernightDriftAnalyst is the
+# discriminating bar-temporal case. HermesSemanticAnalyst is packet-driven and
+# intentionally excluded (its fence is Invariants 5/7).
 @pytest.mark.parametrize(
     "analyst_factory",
     [
         lambda: ClassicalTAAnalyst(),
         lambda: MicrostructureLite(),
+        lambda: FundamentalsAnalyst(),
+        lambda: OvernightDriftAnalyst(),
     ],
 )
 def test_shuffle_timestamps_invariant_via_evaluation_module(analyst_factory):
