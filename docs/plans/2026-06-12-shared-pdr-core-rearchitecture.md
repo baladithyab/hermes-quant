@@ -15,7 +15,7 @@ The assessment **reproduced** that the live book is currently untrustworthy: dua
 
 **Recommendation:** make the armed crons observe-only until Increment 0 lands. One-line, fully reversible, removes the money risk without slowing the rearchitecture. The operator runs the crons — this plan records the recommendation; it does not flip anything.
 
-**Precondition P1 — cheap and blocking, protects every approach:** extend the `conftest` autouse isolation to `executions.jsonl` / `QUANT_HOME` / `artifacts` (today it isolates `state.db` only). This is the guard that makes the fixture-leak class impossible during migration. Do this first, regardless of which increment follows.
+**Precondition P1 — cheap and blocking, protects every approach:** extend the `conftest` autouse isolation to `executions.jsonl` / `QUANT_HOME` / `artifacts` (today it isolates `state.db` + governance/evidence/kill-switch, but NOT `executions.jsonl`/`QUANT_HOME` — the real gap). This is the guard that makes the fixture-leak class impossible during migration. Do this first, regardless of which increment follows.
 
 ---
 

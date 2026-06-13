@@ -18,11 +18,13 @@ amends: ADR-0086
 
 # ADR-0091: Resolve the fill-size delta-vs-target accounting defect (carry-forward fold, not producer rewrite)
 
-> **RESOLUTION (2026-06-12) — Option C supersedes the Option-B draft below.** This ADR's
+> **RESOLUTION (2026-06-12) — Option E (the round-2 "Option C") supersedes the Option-B draft below.** This ADR's
 > first draft chose **Option B** (producer emits the delta + one-time log repair). A
 > 5-agent code-grounded adjudication (workflow `wf_61006ff6`, 2026-06-12) scored the options
 > against the four money-software principles and reversed that choice:
-> **Option C — versioned carry-forward fold — wins (34/40 vs B 20/40).**
+> **Option E — versioned carry-forward fold — wins (34/40 vs B 20/40).** (The round-2 review and
+> `~/wiki` call this "Option C"; renumbered E here to avoid collision with the rejected Option C
+> above — see the :195 note.)
 > - **Producers stay UNCHANGED** (they keep writing the absolute target they already know;
 >   `react/base.py:31` "paper=target" is now documented as intentional). This preserves the
 >   det-equity backend's true `filled_qty` (`deterministic_equity.py:385`) as a live-broker

@@ -13,7 +13,7 @@ This scope implements ADR-0091 **Option E** (carry-forward fold), NOT the supers
 
 ## 0.0 — Precondition (blocking, do first): conftest isolation (seed ra03)
 
-The `+$167K` fictional-P&L incident was a test fixture leaking into the live `state.db` via a default path + missing isolation. Today conftest isolates `state.db` only.
+The `+$167K` fictional-P&L incident was a test fixture leaking into the live `state.db` via a default path + missing isolation. Today conftest isolates `state.db` + governance/evidence/kill-switch, but NOT `executions.jsonl`/`QUANT_HOME` (the real gap).
 
 - Extend the autouse conftest fixture to also isolate `executions.jsonl`, `QUANT_HOME`, and `artifacts/`. Each test process gets a tmp `state_dir`; no test can reach live storage.
 - **Acceptance:** a test asserting that, inside a test, the resolved `executions.jsonl` / `state.db` / `QUANT_HOME` paths are all under the tmp dir — never `~/.hermes/quant/`.
