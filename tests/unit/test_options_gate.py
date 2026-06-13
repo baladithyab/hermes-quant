@@ -214,6 +214,44 @@ def test_net_delta_cap_silences() -> None:
     assert res.reason == "net_delta_cap"
 
 
+def test_nan_spot_silences_not_fail_open(monkeypatch) -> None:
+    # cr02: NaN spot must FAIL CLOSED (silence), not silently pass the gamma /
+    # net-delta caps. `NaN > threshold` is always False, so without an isfinite
+    # guard a NaN spot slips past every spot-scaled cap (the canonical
+    # NaN-fail-open class the equity gate already guards at gate.py:536).
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+    res = options_gate(
+        [
+            StockLeg(underlying="NVDA", qty=100, basis_per_share=100.0),
+            _short_call("NVDA260612C00160000", delta=0.25),
+        ],
+        **_base_kwargs(
+            held_shares=100, strike=160.0, basis_per_share=100.0, min_dte=30,
+            spot=float("nan"),
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "nonfinite_market_input"
+
+
+def test_nan_nav_silences_not_fail_open(monkeypatch) -> None:
+    # cr02: NaN nav must FAIL CLOSED — every cap is `... > cfg.x * nav`, so a
+    # NaN nav makes the RHS NaN and the comparison always False (fail-open).
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+    res = options_gate(
+        [
+            StockLeg(underlying="NVDA", qty=100, basis_per_share=100.0),
+            _short_call("NVDA260612C00160000", delta=0.25),
+        ],
+        **_base_kwargs(
+            held_shares=100, strike=160.0, basis_per_share=100.0, min_dte=30,
+            nav=float("nan"),
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "nonfinite_market_input"
+
+
 def test_gamma_cap_silences() -> None:
     big = NetGreeks(gamma=10.0)  # 10 * 150^2 = 225k > 0.05 * 1M = 50k
     res = options_gate(

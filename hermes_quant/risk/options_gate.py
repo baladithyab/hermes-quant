@@ -496,6 +496,20 @@ def options_gate(
             "enable (this wave never sets it live)"
         )
 
+    # ---- Non-finite market-input guard (cr02 fail-closed). ----
+    # Every spot-/nav-scaled cap below is `value > cfg.x * nav` or
+    # `abs(... * spot) > ...`. A NaN spot or nav makes the comparison always
+    # False (`NaN > x` is False) — the canonical NaN-fail-open class — and a NaN
+    # also propagates into _round_to_step() as an unhandled ValueError. The
+    # equity gate already fails closed on non-finite inputs (gate.py:536); mirror
+    # that here: a NaN/inf spot or nav silences deterministically (reject), never
+    # admits and never aborts the tick.
+    if not math.isfinite(spot) or not math.isfinite(nav):
+        return OptionsGateResult.silence(
+            StructureBucket.NAKED,
+            "nonfinite_market_input",
+        )
+
     # ---- O-classify (D7 composite-intent feeds the classifier sizing). ----
     # Provisional contract count for the share-coverage classification: use the
     # short-call ratio_qty sum as the structural contract count, before sizing.

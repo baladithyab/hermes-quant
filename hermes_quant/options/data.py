@@ -17,6 +17,7 @@ inert unless ``HERMES_QUANT_OPTIONS_LIVE_CHAIN=1`` AND credentials are present.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -276,6 +277,19 @@ def aggregate_net_greeks(
             if g.delta is None or g.gamma is None or g.theta is None or g.vega is None:
                 raise GreekComputationError(
                     f"option leg {leg.symbol} has incomplete greeks; fail-closed"
+                )
+            # cr02: a non-finite greek (NaN from an IV-overflow / ATM-DTE=0 GBS
+            # edge case, or inf) must fail closed exactly like a missing greek.
+            # The None-only check let NaN through into the net, where it slipped
+            # past every `NaN > cap` comparison downstream (NaN-fail-open).
+            if not (
+                math.isfinite(g.delta)
+                and math.isfinite(g.gamma)
+                and math.isfinite(g.theta)
+                and math.isfinite(g.vega)
+            ):
+                raise GreekComputationError(
+                    f"option leg {leg.symbol} has non-finite greeks; fail-closed"
                 )
             sgn = 1 if leg.side == "buy" else -1
             units = sgn * leg.ratio_qty * qty * _CONTRACT_MULTIPLIER
