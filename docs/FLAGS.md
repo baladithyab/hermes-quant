@@ -40,9 +40,9 @@ then bake it into the code default and delete the flag line.
 
 | Flag | Where set | Gates | Default in code | Promotion call |
 |---|---|---|---|---|
-| `HERMES_QUANT_SEMANTIC_ENABLED` | .env=1 | Catalyst/semantic analyst in the advisor pool | `"0"` | **PROMOTE** — core to the advisor; on for weeks. Flip default → `1`, keep an off-switch for one release. |
-| `HERMES_QUANT_REFLECTION` | .env=1, wrapper | Per-trade reflections → weekly retro | `"0"` | **PROMOTE** — feeds the learning loop; stable. |
-| `HERMES_QUANT_MEMORY_INJECT` | .env=1 | Inject memory lessons into LLM committee | `"0"` | **PROMOTE** (with `MEMORY_SPLIT` — see Tier C). |
+| `HERMES_QUANT_SEMANTIC_ENABLED` | .env=1 | Catalyst/semantic analyst in the advisor pool | `"1"` | **PROMOTED** (2026-06: code default flipped to `1` — advisor.py:379/1017, autonomous.py:555, perception/builder.py:176). Off-switch: set `=0`. |
+| `HERMES_QUANT_REFLECTION` | .env=1, wrapper | Per-trade reflections → weekly retro | `"1"` | **PROMOTED** (code default `1`; feeds the learning loop). Off-switch: set `=0`. |
+| `HERMES_QUANT_MEMORY_INJECT` | .env=1 | Inject memory lessons into LLM committee | `"1"` | **PROMOTED** (code default `1`; with `MEMORY_SPLIT` — see Tier C). Off-switch: set `=0`. |
 | `HERMES_QUANT_GRAPH_MINING` | .env=1 | Weekly catalyst-graph mining cron | `"0"` | **KEEP** — cheap, but it's a cron-cadence toggle, not a hot-path default. Low priority either way. |
 | `HERMES_QUANT_RESEARCH_LOOP` | .env=1 | Weekly research-loop cron | `"0"` | **KEEP** — same: cron-gated batch job, fine as a flag. |
 | `HERMES_QUANT_WEEKLY_RETRO` | .env=1 | Weekly strategy retro LLM pass | `"0"` | **PROMOTE** — part of the standing retro cadence. |
