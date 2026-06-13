@@ -51,6 +51,40 @@ def _bucket(rec: dict[str, Any]) -> _BucketKey:
     )
 
 
+def _absolute_size_of(rec: dict[str, Any]) -> float:
+    """The record's per-fill size in its own lane unit: shares if the
+    reactor_metadata.quantity lane is present, else the fill_size_pct
+    NAV-fraction. Mirrors the fold's ``pos_delta = leg_quantity if not None
+    else fill_size_pct`` lane selection."""
+    rmeta = rec.get("reactor_metadata") or {}
+    if isinstance(rmeta, dict):
+        q = rmeta.get("quantity")
+        if q is not None:
+            return float(q)
+    return float(rec.get("fill_size_pct", 0.0))
+
+
+def delta_from_net(rec: dict[str, Any], current_net: float) -> float:
+    """THE single carry-forward derivation, shared by both folds (the gate).
+
+    Given a fill record and the bucket's CURRENT net position (in the record's
+    own lane unit), return the traded delta to apply:
+      - absolute-target record  -> target - current_net (re-affirmation -> 0)
+      - true-delta-schema record -> the size field unchanged (already a delta;
+        current_net is ignored, no re-difference).
+
+    The rebuild fold (FillDeltaNormalizer, which carries an in-memory running net
+    per bucket) and the incremental fold (apply_execution, which reads current_net
+    from the persisted positions row) BOTH call this — so they cannot diverge on
+    how the delta is computed. That single-derivation property is the Option-E
+    no-two-views guarantee.
+    """
+    absolute = _absolute_size_of(rec)
+    if not is_absolute_target_record(rec):
+        return absolute  # already a delta — pass through, net irrelevant
+    return absolute - current_net
+
+
 class FillDeltaNormalizer:
     """Stream-ordered absolute-target → traded-delta transform.
 
@@ -92,19 +126,18 @@ class FillDeltaNormalizer:
         key = _bucket(rec)
         qty = self._quantity_of(rec)
         # Lane selection mirrors the existing fold: quantity wins when present.
-        if qty is not None:
-            lane, net_map, absolute = qty, self._net_qty, qty
-        else:
-            absolute = float(rec.get("fill_size_pct", 0.0))
-            lane, net_map = absolute, self._net_pct
+        net_map = self._net_qty if qty is not None else self._net_pct
+        absolute = qty if qty is not None else float(rec.get("fill_size_pct", 0.0))
 
         if not is_absolute_target_record(rec):
             # Already a traded delta — pass through untouched, do not re-difference.
             # (Do not advance running_net: the producer is reporting increments, so
             # a carry-forward derived from a partial stream would be wrong.)
-            return lane
+            return delta_from_net(rec, net_map.get(key, 0.0))
 
+        # Absolute-target: derive via the ONE shared derivation, then advance the
+        # in-memory running net to the target for the next record in this bucket.
         running = net_map.get(key, 0.0)
-        delta = absolute - running
+        delta = delta_from_net(rec, running)
         net_map[key] = absolute
         return delta

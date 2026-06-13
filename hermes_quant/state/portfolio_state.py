@@ -620,6 +620,25 @@ class PortfolioState:
                     old_qty = 0.0
                     old_avg = 0.0
 
+                # ADR-0091 Option E (i0a) — incremental path, default-OFF behind
+                # HERMES_QUANT_DELTA_NORMALIZER. The persisted old_qty IS this
+                # bucket's carried-forward net (in the record's lane unit), so the
+                # SAME shared derivation the rebuild fold uses — delta = target -
+                # net — applies here with net = old_qty. This makes the incremental
+                # and rebuild folds converge by construction (the i0a parity gate):
+                # a re-affirmed unchanged target yields pos_delta 0 (no-op in
+                # position AND cash). Flag OFF ⇒ pos_delta unchanged, bit-for-bit
+                # legacy. Re-feed the derived delta into BOTH the position fold and
+                # the cash basis (which tracks pos_delta / leg_quantity below).
+                if os.environ.get("HERMES_QUANT_DELTA_NORMALIZER", "0") == "1":
+                    from hermes_quant.state.fill_delta_normalizer import delta_from_net
+
+                    pos_delta = delta_from_net(record, old_qty)
+                    if leg_quantity is not None:
+                        leg_quantity = pos_delta
+                    else:
+                        fill_size_pct = pos_delta
+
                 new_qty, new_avg = _update_position(old_qty, old_avg, pos_delta, fill_price)
 
                 # ── upsert position ──────────────────────────────────────
