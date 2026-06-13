@@ -1,0 +1,66 @@
+{
+  "sub_questions": [
+    "What is the best-possible architecture for a money-software trading system factored as ONE host-agnostic deterministic CORE plus N deeply-integrated agent-host PLUGINS (adapters)?",
+    "Sub-Q1 CORE/ADAPTER BOUNDARY: For systems where heterogeneous producers (LLM subagents vs Python classes vs foundation-model /predict) feed one decision core, what is the proven contract-seam design (hexagonal/ports-and-adapters, strangler-fig migration), and what are the actual failure modes when the boundary leaks?",
+    "Sub-Q1b: How do mature multi-broker/multi-venue trading systems (nautilus_trader, lean/QuantConnect, vn.py, hummingbot) factor venue/host adapters from a shared core, and what did they get wrong first?",
+    "Sub-Q2 MONEY-STATE MODEL: event-sourced append-only ledger with a single fold vs materialized-state stores; hash-chained ledgers, dual-write/cross-store atomicity, single-writer invariants, reconstruct-vs-store tradeoffs in financial systems?",
+    "Sub-Q2b: What is current best practice for an auditable, replayable position+P&L ledger that multiple consumers (projection, settlement FIFO) read without divergence?",
+    "Sub-Q3 DETERMINISTIC-GATE-AS-FINAL-AUTHORITY: prior art for 'the model can silence but never amplify/override', structural (not prompt) enforcement of that polarity, and how agentic trading systems prevent committee/LLM runaway?",
+    "Sub-Q3b: Is monotonic-forward authority a recognized pattern, and where does it break?",
+    "Sub-Q4 CONTRACT EVOLUTION: schema versioning across independently-deployed plugins sharing a versioned core; carry-forward/interpretation-vs-mutation choice for append-only logs; backward/forward compatibility for two plugins on different release cadences?",
+    "Sub-Q4b: Monorepo-with-path-dep vs separately-published-and-pinned for the shared core?",
+    "Sub-Q5 MULTI-AGENT TRADING SOTA: what do TauricResearch/TradingAgents, virattt/ai-hedge-fund, HKUDS/Vibe-Trading, and 2025-2026 successors actually do for the perception->decision->reaction split, signal unification, and analysis/deterministic-risk separation?",
+    "Sub-Q5b: What has been shown NOT to work (LLM as final execution authority, free-text position sizing, RL-on-portfolio-value)?",
+    "DELIVERABLE: a decisive, evidence-cited architecture recommendation that either CONFIRMS the shared-core+two-shells design or proposes concrete improvements/alternatives, naming the specific contract-seam, state-model, gate-enforcement, and contract-evolution choices; flagging where ADR-0092 is right, under-specified, and where real systems suggest a different choice."
+  ],
+  "entities": [
+    {"name": "hermes-quant", "type": "system", "required_fields": ["host (Hermes agent)", "integration semantics (Python analyst classes, cron/daemon firing, MCP tools)"]},
+    {"name": "cowork-quant", "type": "system", "required_fields": ["host (Claude Cowork)", "integration semantics (in-session LLM subagent committee, scheduled /watch turns)"]},
+    {"name": "ADR-0092 shared-core+two-shells (Option D)", "type": "proposal", "required_fields": ["confirm-or-improve verdict", "where right", "where under-specified", "where contradicted"]},
+    {"name": "AnalystView contract", "type": "concept", "required_fields": ["host-blind seam", "modality-blind seam", "contract-seam design evaluation"]},
+    {"name": "nautilus_trader", "type": "reference-system", "required_fields": ["venue/host adapter factoring", "what they got wrong first"]},
+    {"name": "lean / QuantConnect", "type": "reference-system", "required_fields": ["venue/host adapter factoring", "what they got wrong first"]},
+    {"name": "vn.py", "type": "reference-system", "required_fields": ["venue/host adapter factoring", "what they got wrong first"]},
+    {"name": "hummingbot", "type": "reference-system", "required_fields": ["venue/host adapter factoring", "what they got wrong first"]},
+    {"name": "hexagonal / ports-and-adapters", "type": "pattern", "required_fields": ["contract-seam design", "boundary-leak failure modes"]},
+    {"name": "strangler-fig migration", "type": "pattern", "required_fields": ["applicability to shared-core extraction"]},
+    {"name": "event-sourced append-only ledger / single fold", "type": "pattern", "required_fields": ["vs materialized state", "hash-chaining", "single-writer invariant", "reconstruct-vs-store"]},
+    {"name": "dual-write / cross-store atomicity problem", "type": "concept", "required_fields": ["how avoided in money-state model"]},
+    {"name": "monotonic-forward authority / gate-as-final-authority", "type": "pattern", "required_fields": ["prior art", "structural enforcement", "where it breaks"]},
+    {"name": "schema versioning / carry-forward vs mutation for append-only logs", "type": "concept", "required_fields": ["backward/forward compat", "two plugins on different cadences"]},
+    {"name": "monorepo path-dep vs separately-published-and-pinned core", "type": "decision-axis", "required_fields": ["tradeoffs", "recommendation"]},
+    {"name": "TauricResearch/TradingAgents", "type": "reference-system", "required_fields": ["PDR split", "signal unification", "analysis/risk separation"]},
+    {"name": "virattt/ai-hedge-fund", "type": "reference-system", "required_fields": ["PDR split", "signal unification", "analysis/risk separation"]},
+    {"name": "HKUDS/Vibe-Trading", "type": "reference-system", "required_fields": ["PDR split", "signal unification", "analysis/risk separation"]},
+    {"name": "2025-2026 multi-agent trading successors", "type": "reference-system-group", "required_fields": ["what they do for PDR", "what NOT to do"]},
+    {"name": "anti-patterns (LLM as final execution authority, free-text position sizing, RL-on-portfolio-value)", "type": "negative-finding", "required_fields": ["evidence it does not work"]}
+  ],
+  "required_formats": [
+    "decisive architecture recommendation (committed verdict)",
+    "comparison of considered options/choices per decision axis",
+    "explicit flags: where ADR-0092 is right / under-specified / contradicted"
+  ],
+  "required_sections": [
+    "## Opinionated Synthesis (committed recommendation + ADR-0092 verdict)"
+  ],
+  "required_section_headings": [
+    "## 1. The Core/Adapter Boundary: Contract-Seam Design and How Mature Trading Systems Factor It",
+    "## 2. The Money-State Model: Append-Only Ledger vs Materialized State",
+    "## 3. Deterministic Gate as Final Authority: Evidence-Only LLMs and Monotonic Authority",
+    "## 4. Contract Evolution Across Independently-Deployed Plugins",
+    "## 5. Multi-Agent Trading Architecture SOTA and Documented Anti-Patterns",
+    "## 6. Verdict on ADR-0092: Confirm, Under-Specified, and Contradicted",
+    "## Opinionated Synthesis"
+  ],
+  "time_horizons": ["2024-2026 (real systems, papers, production practice)", "current best practice"],
+  "time_periods": [],
+  "scope_conditions": [
+    "money-software (a defect subtracts from a real bank account) — correctness is the dominant axis",
+    "two parallel agent-host plugins, not one system; neither to be abandoned",
+    "non-negotiable rails: silence-by-default, deterministic gate as FINAL authority, LLM as evidence-not-authority (may silence via 0.0 multiplier, never amplify/re-select), no-look-ahead (asof=publication time), new capability default-OFF behind flags + eval-gated",
+    "evidence must come from real systems, papers, and production practice (not invented)"
+  ],
+  "pipeline_tier": "full",
+  "response_format": "argumentative",
+  "citation_style": "wikilink"
+}

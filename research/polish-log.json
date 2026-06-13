@@ -1,0 +1,25 @@
+{
+  "vault_tag": "pdr-core-host-adapter-arch-e99014",
+  "run_mode": "single-threaded (subagent context: Task tool unavailable; orchestrator executed fetch/analysis/draft/critique/polish inline)",
+  "tier": "full",
+  "structural_audit": {
+    "required_headings_present_in_order": true,
+    "all_7_headings_matched": true,
+    "every_subquestion_answered": true,
+    "dialectic_tensions_engaged": ["TradingAgents-vs-charter (FIGHT-1)", "shared-shackle-vs-extraction (FIGHT-2)", "reconstruct-vs-materialize (FIGHT-3)", "vnpy-subscriber-vs-nautilus-chokepoint (TENSION-4)"]
+  },
+  "citation_audit": {
+    "style": "wikilink",
+    "distinct_notes_cited": 18,
+    "notes_uncited": 0,
+    "broken_wikilinks": 0
+  },
+  "hygiene_audit": {
+    "pipeline_reference_leaks": 0,
+    "yaml_frontmatter_in_report": false,
+    "scaffold_sections_in_report": false,
+    "filler_phrases": 0
+  },
+  "word_count": 5140,
+  "verdict": "CONFIRM ADR-0092 Option D with 5 named under-specification fixes + 1 structural sharpening (single synchronous gate chokepoint)"
+}

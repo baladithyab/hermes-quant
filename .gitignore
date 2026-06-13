@@ -21,3 +21,11 @@ logs/
 .vscode/
 .idea/
 build/
+
+# cowork-quant personal paper-trading state (ledger, config, dashboards) — never commit
+quant-state/
+
+# hyperresearch CLI tool scaffolding (created in-cwd by the research tool; not part of hermes-quant)
+/.hyperresearch/
+/CLAUDE.md
+/.claude/skills/hyperresearch/

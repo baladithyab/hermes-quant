@@ -9,6 +9,16 @@ supersedes: null
 
 # ADR-0092: Extract a shared host-agnostic PDR core; hermes-quant and cowork-quant become thin integration shells over it
 
+> **EXTERNAL RESEARCH CONFIRMATION (2026-06-13).** A full-tier hyperresearch pass (16-step pipeline,
+> code-grounded analysis of nautilus_trader / QuantConnect-Lean / vn.py / hummingbot + the 2025-2026
+> LLM-trading failure literature) **decisively CONFIRMS** this decision: the shared-core + thin-shells
+> factoring is "the dominant pattern across every mature multi-venue trading system surveyed," and the
+> strongest anti-shared-library argument concedes the case via its own *security-protocol exception*
+> (stable, catastrophic-if-wrong, thin, coupling-is-the-feature — exactly a money-core's profile). The
+> research sharpened the decision in six ways; see the addendum at the foot of this ADR and
+> `research/notes/final_report_pdr-core-host-adapter-arch-e99014.md`. None of the six contradicts the
+> core decision; they specify mechanisms ADR-0092 left open. Status remains `proposed`.
+
 > **This ADR ratifies an organizing decision and a migration direction; it builds nothing by itself.**
 > Every increment it implies is scoped default-OFF and eval-gated in the companion plan
 > (`docs/plans/2026-06-12-shared-pdr-core-rearchitecture.md`). With nothing yet extracted, both plugins
@@ -116,3 +126,16 @@ The core is built by promoting cowork-quant's `quantcore` spine (the clean ledge
 - **Operational-safety note (operator's call, recorded not actioned):** the assessment *reproduced* that the live book is currently untrustworthy (dual-ledger divergence live; 2-of-4 fire-paths bypass the cap; an armed `playbook-tick` cron is POSTing real paper orders through hand-rolled rails). Recommendation: make the armed crons observe-only until Increment 0 lands. One-line, reversible, removes money risk without slowing the rearchitecture. The operator runs the crons; this ADR records the recommendation and does not action it.
 - Findings should be filed as seeds (`.seeds/file_seed.py`), not GitHub issues, per repo convention.
 - Review date: re-evaluate this ADR's `proposed` status once ADR-0091 is decided and Increment 0 is scoped.
+
+## Addendum — 2026-06-13 external-research sharpenings (six, none contradict the decision)
+
+A full-tier hyperresearch pass confirmed Option D and specified six mechanisms ADR-0092 left open. These refine the companion design/plan; they do not change the decision. Full report + 18 cited source notes under `research/notes/`.
+
+1. **Contract TRIAD, not just `AnalystView`.** The host-blind seam is three contracts — `AnalystView` (in), `Proposal` (out), `Fill` (back) — guarded by a *no-host/infra-types fitness test* (the optivem driven-port leak test) so a third agent host can be added without touching core contracts. Lean (Order-in + execution-events-out) and nautilus (order-commands + execution-reports) both have the full triad; a single perception contract is half the factoring.
+2. **Gate polarity as ARITHMETIC, not prose.** Enforce `size = deterministic_max × clamp(committee_multiplier, 0, 1)`: the core computes the sized envelope from its own ledger-derived risk state; the committee emits only a confidence in `[0,1]` (or silence); the core multiplies. **The LLM never names or sees a size, so amplification is unrepresentable** — a pre-shield (safe-RL shielding literature) in one line. This closes the ai-hedge-fund residual leak ("pick qty ≤ max" in a prompt is still prompt-level). Strengthens, and is the structural form of, the charter's "evidence not authority."
+3. **Single SYNCHRONOUS gate chokepoint on every path** (nautilus `RiskEngine`-before-`ExecutionEngine`), fail-closed, with **completeness-of-coverage as an explicit invariant**. Reject vn.py's async risk-as-event-subscriber topology — that is the mechanism class behind hermes' confirmed 2-of-4-fire-paths cap-bypass (`ra02`/`cr01`). This is the external cross-validation of the cap-bypass findings: two independent investigations converged on the same defect.
+4. **Money-state: append-only immutable single fold as sole truth, + double-entry, + fixed-point.** Strongly consider **double-entry** (cash + per-instrument position accounts) so "money never appears from nowhere" is an invariant the fold asserts (TigerBeetle); adopt a **fixed-point/decimal money type** (nautilus — never floats); materialized projections ONLY as rebuildable caches behind a `projection == fold` property test, default-OFF until green — never a second writer (that re-opens the dual-ledger divergence). Names hermes' bug class precisely: the dual-write/dual-read problem (Confluent), structurally cured only by event-sourcing.
+5. **ADR-0091 Option C/E independently endorsed.** Read-time **upcasting** over an immutable log is canonical event-sourcing practice (Dudycz/Young); Option B's producer-emits-delta is the ES anti-pattern (write-time coupling into an immutable log) — exactly ADR-0091's own durable lesson. Ship an upcaster registry as part of the versioned core. *This validates the resolution already committed in ADR-0091.*
+6. **Package as MONOREPO-with-path-dependency**, each shell pinning a core version for rollback, breaking changes landed atomically across core + both shells — NOT separately-published-and-pinned. The "shared shackle" costs are multi-team/multi-repo costs largely absent for a single operator; the monorepo's atomic cross-cut change is the operation performed most when a money-contract evolves, and it *declines* the coordinated two-shell migration this ADR's "Negative" consequence feared. Keep the core MINIMAL (ledger + gate + contracts + fold) so it stays the security-protocol exception, not a utility SDK. Revisit only if a second author/org takes a shell.
+
+Empirical backbone for the rails (2025-2026): *Profit Mirage* (GPT-4o memorizes 85%+ of historical market QA; agents lose 55.68% Sharpe out-of-window) and *DeepFund / Time Travel is Cheating* (under leakage-free LIVE eval even DeepSeek-V3 / Claude-3.7-Sonnet net trading losses) — the evidence for no-look-ahead and LLM-as-evidence-not-authority. *MetaTrader / offline-policy-not-trustworthy* validates rejecting RL-on-portfolio-value (the charter's DO_NOT_BUILD).
