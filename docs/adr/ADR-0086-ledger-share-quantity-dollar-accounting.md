@@ -3,7 +3,17 @@ status: proposed
 date: 2026-06-02
 deciders: [codeseys]
 amends: ADR-0085
+amended_by: ADR-0091
 ---
+
+> **Amended-by ADR-0091 (2026-06-10):** this ADR's Phase-2 plan assumed positions are
+> NAV-fractions and did not address that both the `paper` and `deterministic-equity`
+> reactors write an *absolute target* into the per-fill size field while every consumer
+> reads it as a traded *delta* — inflating derived positions on re-affirmation (BA −0.2
+> ×6 → −0.8; AAPL 5% ×12 → 60%). ADR-0091 fixes the producers to emit the true traded
+> delta (so `executions.jsonl` stays a faithful transaction log) plus a one-time
+> backed-up log repair, and is a prerequisite-correctness fix the Phase-2 share migration
+> must build on. Phase-1 read-time MTM and the Phase-2 end-state target here are preserved.
 
 # ADR-0086: Migrate the paper ledger to share-quantity + dollar accounting with mark-to-market equity
 
