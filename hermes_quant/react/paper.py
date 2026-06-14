@@ -711,11 +711,21 @@ class PaperReactor:
         # duplicated logic.
         account_id = _resolve_account_id(proposal)
         positions = ps.get_positions(account_id)
-        pos_map: dict[str, float] = {}
-        for (_asset_class, symbol), position in positions.items():
+        # cs60: key pos_map on the CANONICAL (asset_class, symbol) position key,
+        # not the bare symbol. The same underlying can hold two distinct
+        # positions in different asset classes (e.g. an equity AAPL AND a
+        # us_option AAPL on the same name); a bare-symbol key would collapse them
+        # into one bucket and mis-sum the gross the cap clips against (it under-
+        # or over-counts a same-symbol cross-asset-class book). RiskPortfolioState
+        # only iterates positions.values() for gross/net, so the tuple key is a
+        # pure uniqueness device — for a single-asset-class book (the common
+        # case, no same-symbol collision) the gross/net sums are byte-identical
+        # whether keyed by bare symbol or (asset_class, symbol).
+        pos_map: dict[tuple[str, str], float] = {}
+        for key, position in positions.items():
             # Positions are stored as NAV-fraction quantities in v0.1 (ADR-0041).
-            # The cap seam reads them as target_position_pct by symbol.
-            pos_map[symbol] = position.quantity
+            # The cap seam reads them as target_position_pct.
+            pos_map[key] = position.quantity
 
         state = RiskPortfolioState(positions=pos_map)
         caps = PortfolioCaps.standard()
@@ -728,7 +738,10 @@ class PaperReactor:
         # symbol's contribution to gross exposure is abs(target). If this fill
         # lowers or preserves abs(existing), it frees or preserves headroom and
         # must not be clipped by remaining-headroom logic.
-        existing = pos_map.get(proposal.symbol, 0.0)
+        # cs60: look up THIS proposal's own existing position by its canonical
+        # (asset_class, symbol) key, so an equity de-risk compares against the
+        # equity line and not a same-symbol option line (and vice versa).
+        existing = pos_map.get((proposal.asset_class, proposal.symbol), 0.0)
         if abs(fill_size_pct) <= abs(existing) + 1e-9:
             return None, fill_size_pct, None
 

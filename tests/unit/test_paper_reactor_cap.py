@@ -316,6 +316,71 @@ class TestPaperReactorPortfolioCap:
         assert record.fill_size_pct == pytest.approx(0.30)
         assert not (record.reactor_metadata or {}).get("silenced")
 
+    def test_cap_does_not_collapse_same_symbol_cross_asset_class(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """cs60: the cap pos_map must key on (asset_class, symbol), not the bare
+        symbol, so two DISTINCT positions that share an underlying symbol but
+        differ in asset_class are accounted SEPARATELY.
+
+        Book: an equity AAPL at +0.40 NAV AND a us_option AAPL at +0.40 NAV.
+        These are two distinct canonical positions keyed
+        (equity, AAPL) and (us_option, AAPL).
+
+          * Correct accounting (separate buckets): gross = 0.80.
+            cash_headroom = (1.0 - 0.20) - 0.80 = 0.0. A new exposure-ADDING
+            GOOG +0.10 fire has NO headroom -> it is SILENCED.
+          * Buggy collapse (bare-symbol key): the second AAPL line overwrites
+            the first, so gross is mis-summed to 0.40, cash_headroom = 0.40, and
+            the GOOG fire FULL-PASSES at +0.10 — the cap UNDER-counts the gross
+            exposure of a same-symbol cross-asset-class book and admits a fire it
+            should have silenced.
+
+        net cap is not the binding constraint either way (prospective net in the
+        buggy case is 0.40 + 0.10 = 0.50 <= 1.0).
+        """
+
+        monkeypatch.setenv("HERMES_QUANT_PORTFOLIO_CAPS", "1")
+
+        executions_path = tmp_path / "executions.jsonl"
+        reactor = PaperReactor(executions_path=executions_path)
+        proposal = _make_proposal("GOOG")
+
+        import hermes_quant.state.portfolio_state as ps_mod
+        from hermes_quant.state.portfolio_state import PortfolioState as DBPortfolioState
+
+        ps_instance = DBPortfolioState(state_db_path=tmp_path / "state.db")
+
+        class DummyPos:
+            def __init__(self, quantity: float) -> None:
+                self.quantity = quantity
+
+        # Two distinct positions sharing the underlying "AAPL" symbol but in
+        # different asset classes. A bare-symbol pos_map collapses these into one
+        # bucket (the second overwrites the first); the canonical
+        # (asset_class, symbol) key keeps them separate.
+        ps_instance.get_positions = MagicMock(
+            return_value={
+                ("equity", "AAPL"): DummyPos(0.40),
+                ("us_option", "AAPL"): DummyPos(0.40),
+            }
+        )
+
+        with patch.object(ps_mod, "_singleton", ps_instance):
+            record = reactor.execute(proposal, fill_size_pct=0.10)
+
+        # Correct accounting: gross is 0.80, cash_headroom is 0.0 -> the new
+        # GOOG fire is silenced. Under the bare-symbol collapse it would
+        # full-pass at +0.10.
+        rmeta = record.reactor_metadata or {}
+        assert rmeta.get("silenced") is True, (
+            "same-symbol cross-asset-class gross was under-counted "
+            f"(record={record.fill_size_pct}, meta={rmeta})"
+        )
+        silence_reason = rmeta.get("silence_reason", "")
+        assert silence_reason.startswith("portfolio_cap_")
+        assert record.fill_size_pct == pytest.approx(0.0)
+
     def test_cap_adding_into_same_symbol_still_capped(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
