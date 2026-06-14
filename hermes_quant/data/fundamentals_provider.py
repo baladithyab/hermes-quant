@@ -59,10 +59,10 @@ a Q4 closing 31-Dec is filed ~mid-Feb). Filtering a backtest read on the
 period end (or even on the cache snapshot date) can therefore leak a
 fundamental into the past before it was actually reported.
 
-When ``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG`` is truthy (default OFF), the
-hot-path reads (`read_latest`, `read_sector_median_pe`) require, in addition
-to the existing ``as_of_date <= as_of`` snapshot filter, that the row's
-effective-knowable date satisfies::
+When ``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG`` is truthy (default ON; cs12 /
+no-lookahead), the hot-path reads (`read_latest`, `read_sector_median_pe`)
+require, in addition to the existing ``as_of_date <= as_of`` snapshot filter,
+that the row's effective-knowable date satisfies::
 
     effective_knowable = (report_date or period_end) + reporting_lag_days
     keep row iff effective_knowable <= as_of
@@ -76,8 +76,27 @@ report_date nor period_end fall back to the snapshot ``as_of_date`` (already
 a knowable date — it is when the datum entered the cache), so missing
 backfill never loosens visibility.
 
-The flag is read at call time; with it OFF the read path is byte-identical
-to the pre-B34 behavior.
+The flag is read at call time and is ON by default (cs12). An explicit
+falsey value (``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG=0`` / ``false`` /
+``no`` / ``off`` / empty) reverts the read path to the byte-identical
+pre-B34 ``as_of_date <= as_of`` behavior — the instant operator kill switch
+for this live-analyst-input change.
+
+Operator note — old/stale cache + default-ON
+---------------------------------------------
+Against an OLD-SCHEMA or STALE cache the default-ON filter is intentionally
+conservative to the point of going dark. Parquets that predate the B34
+``period_end`` / ``report_date`` columns (backfilled NaT), or a cache the
+prewarm cron has not yet repopulated, carry no point-in-time stamp, so every
+row falls back to ``as_of_date + reporting_lag_days``. A freshly-cached
+snapshot read at ~``as_of`` is then DROPPED (``as_of_date + 45d > as_of``) and
+``read_latest`` returns None. With the whole universe on that fallback the
+``FundamentalsAnalyst`` abstains across the board (full dark — silence-by-
+default, safety-conservative) until (i) the prewarm cron rewrites new-schema
+rows carrying a real ``period_end`` / ``report_date`` AND (ii) the 45d lag has
+elapsed for those rows. The byte-identical revert / instant kill switch is
+``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG=0`` (or ``false`` / ``no`` / ``off`` /
+empty), which restores the pre-B34 ``as_of_date <= as_of`` read path exactly.
 """
 
 from __future__ import annotations
@@ -98,8 +117,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache" / "fundamentals"
 
-# B34 reporting-lag-adjusted as_of. Default-OFF; read at call time so the
-# off-state read path is byte-identical to pre-B34 behavior.
+# B34 reporting-lag-adjusted as_of. Default-ON (cs12 / no-lookahead); read at
+# call time so the explicit-OFF revert path is byte-identical to pre-B34.
 REPORTING_LAG_ENV_FLAG = "HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG"
 # Conservative default for quarterly fundamentals: a 10-K/10-Q can land ~40d
 # (large accelerated filer) to ~75d after period end. 45d is a safe, jitter-
@@ -110,16 +129,27 @@ DEFAULT_REPORTING_LAG_DAYS: int = 45
 def _reporting_lag_flag_on() -> bool:
     """True iff the reporting-lag-adjusted as_of filter is enabled.
 
-    Canonical multi-value idiom (mirrors memory/meta_retro.py:_flag_on). Read
-    at call time so flipping the env var takes effect without re-import and the
-    OFF path stays byte-identical.
+    Default-ON (cs12 / no-lookahead): an ``as_of``-bounded read is by
+    definition a point-in-time read, and a fundamental is NOT knowable as of
+    its cache date — only after ``period_end`` (or ``report_date``) plus the
+    typical reporting lag. Filtering only on ``as_of_date <= as_of`` leaks a
+    Q4 datum (period_end 31-Dec, cached mid-Jan) into a backtest deciding in
+    January, ~45d before the 10-K is actually filed. The lag filter closes
+    that leak, so it is ON by default.
+
+    Reversibility: the operator can opt OUT with an explicit falsey value
+    (``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG=0`` / ``false`` / ``off`` / ...).
+    On that OFF path the read is byte-identical to pre-B34 behavior — the
+    instant kill switch required for a live analyst-input change.
+
+    Read at call time so flipping the env var takes effect without re-import.
     """
-    return os.environ.get(REPORTING_LAG_ENV_FLAG, "0") in (
-        "1",
-        "true",
-        "True",
-        "yes",
-        "on",
+    return os.environ.get(REPORTING_LAG_ENV_FLAG, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
     )
 
 # Per-ticker snapshot schema (column -> dtype)
@@ -297,7 +327,7 @@ class FundamentalsProvider:
         return self.sector_medians_dir / f"{_safe_component(sector)}.parquet"
 
     # ------------------------------------------------------------------
-    # B34: reporting-lag-adjusted as_of filter (default-OFF, no-lookahead)
+    # B34: reporting-lag-adjusted as_of filter (default-ON, no-lookahead)
     # ------------------------------------------------------------------
 
     def _apply_reporting_lag_filter(

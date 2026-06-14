@@ -52,6 +52,8 @@ def analyst(provider: FundamentalsProvider) -> FundamentalsAnalyst:
 def _row(
     *,
     fetched_at: pd.Timestamp,
+    report_date: pd.Timestamp | None = None,
+    period_end: pd.Timestamp | None = None,
     pe_trailing: float = 18.0,
     pe_forward: float = 17.0,
     debt_to_equity: float = 1.5,
@@ -68,10 +70,25 @@ def _row(
     quote_type: str = "EQUITY",
 ) -> dict[str, Any]:
     """Mirror of tests/data/test_fundamentals_provider.py::_row to keep
-    fixtures shape-compatible with the parquet cache layer."""
+    fixtures shape-compatible with the parquet cache layer.
+
+    cs12: every snapshot carries a PUBLIC point-in-time stamp. These tests'
+    ctx asof is 2026-05-15; the default ``period_end = 2025-12-31`` is a Q4
+    that was publicly filed well before asof (period_end + 45d reporting lag
+    = 2026-02-14 < 2026-05-15). Under the cs12 default-ON reporting-lag
+    filter the analyst's ``read_latest(ticker, as_of=asof)`` therefore ADMITS
+    this already-public quarter — exactly the live no-lookahead behavior:
+    a filed quarter is visible, a not-yet-filed one would be excluded. The
+    stamp keeps the filter ACTIVE (the tests do NOT pin the flag OFF)."""
     return {
         "as_of_date": fetched_at.normalize(),
         "fetched_at": fetched_at,
+        "report_date": report_date if report_date is not None else pd.NaT,
+        "period_end": (
+            period_end
+            if period_end is not None
+            else pd.Timestamp("2025-12-31", tz="UTC")
+        ),
         "source": "yfinance",
         "pe_trailing": pe_trailing,
         "pe_forward": pe_forward,

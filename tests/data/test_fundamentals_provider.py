@@ -125,8 +125,16 @@ def test_write_keeps_distinct_as_of_dates(
     assert snap["pe_trailing"] == pytest.approx(12.0)
 
 
-def test_read_latest_respects_as_of_filter(provider: FundamentalsProvider) -> None:
-    """as_of point-in-time semantics: rows with as_of_date > as_of are dropped."""
+def test_read_latest_respects_as_of_filter(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """as_of point-in-time semantics: rows with as_of_date > as_of are dropped.
+
+    Pins the reporting-lag filter OFF: this test asserts the LEGACY
+    ``as_of_date <= as_of`` predicate in isolation (rows carry NaT PIT
+    columns, so default-ON would tighten via the as_of_date+lag fallback).
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
     d1 = pd.Timestamp("2026-05-01T12:00:00", tz="UTC")
     d2 = pd.Timestamp("2026-05-15T12:00:00", tz="UTC")
     provider.write_snapshot("AAPL", _row(fetched_at=d1, pe_trailing=10.0))
@@ -278,6 +286,72 @@ def test_reporting_lag_default_constant_is_conservative() -> None:
     assert DEFAULT_REPORTING_LAG_DAYS == 45
 
 
+def test_reporting_lag_flag_default_is_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """cs12: the reporting-lag filter is ON by default (no env var set).
+
+    An ``as_of``-bounded read is a point-in-time read; default-ON closes the
+    fundamental-lookahead leak without requiring an operator opt-in.
+    """
+    from hermes_quant.data.fundamentals_provider import _reporting_lag_flag_on
+
+    monkeypatch.delenv(REPORTING_LAG_ENV_FLAG, raising=False)
+    assert _reporting_lag_flag_on() is True
+    # Explicit falsey values are the byte-identical OFF revert path.
+    for off in ("0", "false", "False", "no", "off", " OFF ", ""):
+        monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, off)
+        assert _reporting_lag_flag_on() is False, off
+    for on in ("1", "true", "yes", "on"):
+        monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, on)
+        assert _reporting_lag_flag_on() is True, on
+
+
+def test_cs12_default_on_excludes_fundamental_lookahead_leak(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs12 RED->GREEN: the exact lookahead scenario, with NO flag set.
+
+    A Q4 fundamental (period_end 2025-12-31) cached on 2026-01-14 is NOT
+    publicly filed until ~mid-Feb (period_end + 45d = 2026-02-14). A backtest
+    deciding at as_of 2026-01-15 must NOT see it. Pre-cs12 (flag OFF default)
+    the legacy ``as_of_date <= as_of`` predicate alone RETURNED the row — a
+    fundamental-lookahead leak. Default-ON excludes it until the lag horizon
+    passes, then admits it.
+    """
+    monkeypatch.delenv(REPORTING_LAG_ENV_FLAG, raising=False)  # rely on default
+    _write_reportlag_row(
+        provider,
+        as_of_date=pd.Timestamp("2026-01-14", tz="UTC"),  # cache day
+        period_end=pd.Timestamp("2025-12-31", tz="UTC"),  # Q4 fiscal end
+    )
+    # Backtest decides Jan-15: period_end+45d = Feb-14 > Jan-15 -> EXCLUDED.
+    assert provider.read_latest(
+        "AAPL", as_of=pd.Timestamp("2026-01-15", tz="UTC")
+    ) is None
+    # Past the filing horizon (Feb-14) the datum is legitimately visible.
+    snap = provider.read_latest("AAPL", as_of=pd.Timestamp("2026-02-20", tz="UTC"))
+    assert snap is not None
+    assert snap["pe_trailing"] == pytest.approx(18.0)
+
+
+def test_cs12_explicit_off_reverts_leak_byte_identical(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The OFF revert path is byte-identical to pre-cs12: the leak returns.
+
+    This is the documented kill switch — an operator who sets the flag falsey
+    gets exactly the legacy ``as_of_date <= as_of`` behavior (leak and all).
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    _write_reportlag_row(
+        provider,
+        as_of_date=pd.Timestamp("2026-01-14", tz="UTC"),
+        period_end=pd.Timestamp("2025-12-31", tz="UTC"),
+    )
+    snap = provider.read_latest("AAPL", as_of=pd.Timestamp("2026-01-15", tz="UTC"))
+    assert snap is not None  # legacy leak preserved on the explicit-OFF path
+    assert snap["pe_trailing"] == pytest.approx(18.0)
+
+
 def test_reporting_lag_columns_roundtrip(provider: FundamentalsProvider) -> None:
     """report_date / period_end are persisted and read back tz-aware."""
     pe = pd.Timestamp("2026-03-31", tz="UTC")
@@ -301,9 +375,11 @@ def test_reporting_lag_flag_off_is_byte_identical(
     """Flag OFF: a row knowable only LATER is still visible (pre-B34 behavior).
 
     period_end 2026-03-31 + 45d lag = 2026-05-15 is AFTER as_of 2026-04-10, but
-    with the flag OFF only the legacy ``as_of_date <= as_of`` predicate applies.
+    with the flag explicitly OFF only the legacy ``as_of_date <= as_of``
+    predicate applies. cs12 default-flipped the flag to ON, so OFF must now be
+    requested with an explicit falsey value (the byte-identical revert path).
     """
-    monkeypatch.delenv(REPORTING_LAG_ENV_FLAG, raising=False)
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
     _write_reportlag_row(
         provider,
         as_of_date=pd.Timestamp("2026-04-01", tz="UTC"),
@@ -402,7 +478,7 @@ def test_reporting_lag_never_admits_beyond_off_path(
         report_date=pd.Timestamp("2026-04-01", tz="UTC"),
     )
     as_of = pd.Timestamp("2026-04-10", tz="UTC")
-    monkeypatch.delenv(REPORTING_LAG_ENV_FLAG, raising=False)
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
     assert provider.read_latest("AAPL", as_of=as_of) is None  # OFF
     monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "1")
     assert provider.read_latest("AAPL", as_of=as_of) is None  # ON
