@@ -499,6 +499,16 @@ def tick(
     # this is a hard safety rail, not a sizing refinement, so it is always on).
     # reconstruct_portfolio_state() returns {symbol: target_pct} for non-zero
     # (open) positions only, so len() == current concurrent position count.
+    # cs16/ADR-0016: pass reactor_filter=None so this rail counts the WHOLE open
+    # equity book across EVERY reactor_name the live router can emit — paper,
+    # deterministic-equity (HERMES_QUANT_DETERMINISTIC_EQUITY=1), and alpaca_paper
+    # (HERMES_QUANT_ALPACA_PAPER=1). reconstruct_portfolio_state DEFAULTS to the
+    # paper-only slice (portfolio/state.py:40), which would UNDER-count the book
+    # (and let the rail open MORE than max_concurrent_positions) now that equity
+    # fills route to non-paper reactors. A safety rail must see the whole book.
+    # The per-symbol keying inside reconstruct_portfolio_state collapses a symbol
+    # written under two reactor names to ONE row at its latest target, so this
+    # cannot over-count a single logical position.
     # Fail-OPEN to 0 only if reconstruction itself errors (never block the tick
     # on a transient read failure), but log it so the gap is visible.
     open_positions_at_tick_start = 0
@@ -510,7 +520,7 @@ def tick(
         # default) so the rail honors the same home the rest of this module uses
         # — keeps it test-isolatable via the QUANT_HOME monkeypatch and correct
         # when the home is reconfigured.
-        _open = _recon(QUANT_HOME / "executions.jsonl").positions
+        _open = _recon(QUANT_HOME / "executions.jsonl", reactor_filter=None).positions
         open_symbols_at_tick_start = set(_open)
         open_positions_at_tick_start = len(_open)
     except Exception as _exc:  # noqa: BLE001 - never block tick on a read error
@@ -535,7 +545,10 @@ def tick(
             headroom_summary,
         )
 
-        portfolio_state = reconstruct_portfolio_state()
+        # cs16/ADR-0016: count the WHOLE open equity book (all reactor_names),
+        # not just the paper-only default slice — same rationale as the D9 rail
+        # above, so headroom is computed against the true book.
+        portfolio_state = reconstruct_portfolio_state(reactor_filter=None)
         portfolio_caps = PortfolioCaps()
         logger.info(
             "autonomous: portfolio-caps gate ENABLED. initial state: %s",
