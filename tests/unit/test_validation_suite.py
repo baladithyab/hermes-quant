@@ -199,6 +199,68 @@ def test_excess_all_finite_is_byte_identical():
     assert excess_ci.point == pytest.approx(expected_point)
 
 
+# --- cs46: non-finite bootstrap samples must not corrupt the promotion-gate CI
+def test_degenerate_series_yields_finite_ci_low_not_nan():
+    """cs46: a zero-variance (constant) return series makes _sharpe return ±inf
+    on EVERY stationary-bootstrap resample (a single repeated block is still
+    constant). np.nanpercentile drops NaN but KEEPS inf, and the tail
+    interpolation subtract(b, a) on inf yields NaN -> a NaN ci_low.
+
+    sharpe_95ci_lower is the promotion-gate threshold (react/live.py:38,
+    governance/promotion.py:274 require >= 1.0). ``NaN < 1.0`` is False in
+    Python, so a NaN lower bound silently PASSES a gate that must fail-closed.
+    After the fix the lower bound is FINITE and conservative (does not satisfy
+    the >= 1.0 gate)."""
+    r = np.full(42, 0.001)  # perfectly constant -> zero variance, +inf Sharpe
+    rep = validate_returns(r, bars_per_year=252, n_permutations=50, n_resamples=400, seed=42)
+    sharpe_ci = next(c for c in rep.bootstrap if c.statistic == "sharpe")
+    # The bug: ci_low/ci_high == NaN. The fix: a finite conservative bound.
+    assert np.isfinite(sharpe_ci.ci_low), "ci_low must be finite, not NaN (cs46)"
+    assert np.isfinite(sharpe_ci.ci_high), "ci_high must be finite, not NaN (cs46)"
+    # Fail-closed: the conservative lower bound does NOT clear the >=1.0 gate.
+    assert not (sharpe_ci.ci_low >= 1.0)
+    # And it round-trips through json.dumps(allow_nan=False) as a real number,
+    # not the None that a leaked NaN would render as.
+    rep_dict = rep.to_dict()
+    json.dumps(rep_dict, allow_nan=False)  # raises if any NaN/inf leaked
+    sharpe_d = next(b for b in rep_dict["bootstrap"] if b["statistic"] == "sharpe")
+    assert sharpe_d["ci_low"] is not None and np.isfinite(sharpe_d["ci_low"])
+
+
+def test_percentile_ci_filters_inf_samples():
+    """cs46 (unit): _percentile_ci must drop ±inf samples before the percentile
+    so an inf in the tail-interpolation window cannot poison ci_low/ci_high to
+    NaN. A bootstrap distribution mixing finite values with a few +inf samples
+    must yield the SAME finite CI as the all-finite subset."""
+    finite = np.linspace(-2.0, 3.0, 200)
+    contaminated = np.concatenate([finite, np.full(7, np.inf)])
+    lo_c, hi_c = validation_mod._percentile_ci(contaminated, 0.95)
+    lo_f, hi_f = validation_mod._percentile_ci(finite, 0.95)
+    assert np.isfinite(lo_c) and np.isfinite(hi_c)
+    assert lo_c == pytest.approx(lo_f)
+    assert hi_c == pytest.approx(hi_f)
+    # All-non-finite distribution -> conservative finite bound, never NaN.
+    all_inf = np.full(50, np.inf)
+    lo_z, hi_z = validation_mod._percentile_ci(all_inf, 0.95)
+    assert np.isfinite(lo_z) and np.isfinite(hi_z)
+    assert not (lo_z >= 1.0)  # fails-closed against the promotion gate
+
+
+def test_normal_variance_ci_unchanged_by_cs46_filter():
+    """A finite-variance series leaves every bootstrap sample finite, so the
+    finite mask is all-True and the percentile is byte-identical to the old
+    np.nanpercentile path. Asserts _percentile_ci == np.nanpercentile on a
+    fully-finite distribution."""
+    rng = np.random.default_rng(11)
+    samples = rng.standard_normal(5000) * 1.5 + 0.4  # all finite
+    lo, hi = validation_mod._percentile_ci(samples, 0.95)
+    # Equal to the old nanpercentile path to within floating-point (the only
+    # difference is which numpy percentile kernel runs; on all-finite input the
+    # finite mask is all-True so the statistic is the same percentile).
+    assert lo == pytest.approx(float(np.nanpercentile(samples, 2.5)))
+    assert hi == pytest.approx(float(np.nanpercentile(samples, 97.5)))
+
+
 # --- scipy-absent fallback ---------------------------------------------------
 def test_scipy_absent_falls_back_to_percentile(monkeypatch):
     """With scipy unavailable: percentile CI from the stationary bootstrap +

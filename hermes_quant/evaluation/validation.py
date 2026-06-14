@@ -368,10 +368,40 @@ def _stationary_bootstrap_indices(
 def _percentile_ci(
     samples: np.ndarray, confidence_level: float
 ) -> tuple[float, float]:
-    """Two-sided percentile CI from a bootstrap distribution."""
+    """Two-sided percentile CI from a bootstrap distribution.
+
+    cs46: filter NON-FINITE bootstrap samples (BOTH NaN and ±inf) before the
+    percentile, then percentile only the finite tail. ``np.nanpercentile``
+    drops NaN but KEEPS inf; a single inf in the tail-interpolation window
+    makes numpy's ``subtract(b, a)`` on inf yield NaN, corrupting ci_low /
+    ci_high to NaN. A degenerate / zero-variance resample (a stationary block
+    drawing a single repeated block -> constant series) makes ``_sharpe``
+    return ±inf, so this is reachable on a real low-variance OOS series.
+
+    A NaN lower bound is the worst failure mode for the promotion gate: the
+    gate is ``sharpe_95ci_lower < 1.0`` (governance/promotion.py:274;
+    react/live.py:38), and ``NaN < 1.0`` is ``False`` in Python — a NaN CI
+    silently PASSES a gate that should fail-closed. We therefore (a) drop the
+    non-finite samples, and (b) when NO finite samples remain (a fully
+    degenerate zero-variance distribution), return a CONSERVATIVE finite
+    ``0.0`` lower bound so the gate fails-closed rather than reading a NaN.
+
+    A finite-variance series leaves all samples finite -> the finite mask is
+    all-True and the result is byte-identical to the old percentile.
+    """
+    # Coerce to ndarray first: the production caller (_bootstrap_ci) passes an
+    # np.array, but a list/tuple caller would TypeError on the boolean mask
+    # below. np.nanpercentile used to coerce implicitly; preserve that contract.
+    samples = np.asarray(samples, dtype=float)
+    finite = samples[np.isfinite(samples)]
+    if finite.size == 0:
+        # Fully degenerate (every resample non-finite, e.g. zero-variance
+        # constant series -> ±inf Sharpe). The CI cannot be estimated; return
+        # a conservative finite bound that fails the >=1.0 promotion gate.
+        return 0.0, 0.0
     alpha = 1.0 - confidence_level
-    lo = float(np.nanpercentile(samples, 100.0 * (alpha / 2.0)))
-    hi = float(np.nanpercentile(samples, 100.0 * (1.0 - alpha / 2.0)))
+    lo = float(np.percentile(finite, 100.0 * (alpha / 2.0)))
+    hi = float(np.percentile(finite, 100.0 * (1.0 - alpha / 2.0)))
     return lo, hi
 
 
