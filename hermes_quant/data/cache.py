@@ -10,14 +10,13 @@ preferred for fidelity and speed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import os
 import re
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
 import pandas as pd
-
 
 DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache"
 
@@ -52,6 +51,78 @@ def _infer_step(timeframe: str, eligible: pd.DataFrame) -> pd.Timedelta | None:
             if step > pd.Timedelta(0):
                 return step
     return None
+
+
+def _positive_inter_bar_gaps(timestamps: pd.Series) -> pd.Series:
+    """Strictly-positive inter-bar deltas of a timestamp series (cs58 helper).
+
+    Shared by the HIT-path calendar bound and the MISS-path abstain flag bound
+    so the diff/positive-filter logic lives in one place. Returns an empty
+    Series when fewer than two ordered bars are available.
+    """
+    if len(timestamps) < 2:
+        return pd.Series([], dtype="timedelta64[ns]")
+    diffs = timestamps.diff().dropna()
+    return diffs[diffs > pd.Timedelta(0)]
+
+
+def _max_observed_gap(timestamps: pd.Series) -> pd.Timedelta | None:
+    """Largest strictly-positive inter-bar gap, or ``None`` when undefined (cs58).
+
+    A self-calibrating ceiling: the cache's own widest observed calendar gap
+    (weekend, overnight session) is the most a fresh right edge can legitimately
+    sit below the cutoff. Unlike :func:`_calendar_bound` this does NOT require
+    recurrence — a single observed weekend gap is enough to vouch for an
+    equally-sized right-edge gap.
+    """
+    diffs = _positive_inter_bar_gaps(timestamps)
+    if diffs.empty:
+        return None
+    return diffs.max()
+
+
+def _calendar_bound(canonical: pd.Timedelta, timestamps: pd.Series) -> pd.Timedelta:
+    """Self-calibrating right-edge bound for calendar-gapped markets (cs58).
+
+    cs43 set the right-edge staleness bound to ONE literal ``_infer_step``
+    (1d->1 day, 1h->1 hour) with zero trading-calendar awareness. Non-24/7
+    markets have legitimate calendar gaps at the right edge: a DAILY equity
+    cache's freshest real bar is Friday's close, but a backtest ``--end``
+    anchored Monday sits ~3 calendar days above Friday > the 1-day step, so the
+    HIT was wrongly rejected and the cache refetched on every run even though
+    the provider had nothing newer (markets closed Sat/Sun). Same for an
+    intraday cache across an overnight session gap.
+
+    The fix judges right-edge freshness by whether the newest bar advanced as
+    far as the CALENDAR/PROVIDER allows, not the canonical wall-clock step. We
+    learn the market's own rhythm from the cache: the largest inter-bar gap that
+    RECURS (appears at least twice) in the observed spacing is a legitimate
+    calendar gap (weekend, overnight) and widens the bound; a one-off giant gap
+    does NOT recur and is excluded, so the cs43 multi-month stale edge and the
+    cs50 single interior hole stay rejected. The canonical step is the floor (a
+    one-bar provider shortfall is always tolerated; a too-short cache with no
+    learnable rhythm degrades to the cs43 canonical bound).
+
+    This bound gates the HIT path (which must serve a multi-bar lookback window
+    contiguously), so it is deliberately CONSERVATIVE: it requires recurrence so
+    that a one-off interior hole cannot widen the contiguity tolerance. The
+    MISS-path abstain flag (an honesty signal, not a data-serving gate) uses the
+    looser :func:`_max_observed_gap` instead.
+    """
+    if len(timestamps) < 2:
+        return canonical
+    diffs = _positive_inter_bar_gaps(timestamps)
+    if diffs.empty:
+        return canonical
+    # Group near-equal gaps by whole seconds; a gap that recurs (>=2) is a
+    # calendar rhythm, not a one-off hole.
+    secs = diffs.dt.total_seconds().round().astype("int64")
+    counts = secs.value_counts()
+    recurring = counts[counts >= 2].index
+    if len(recurring) == 0:
+        return canonical
+    largest_recurring = pd.Timedelta(seconds=int(recurring.max()))
+    return max(canonical, largest_recurring)
 
 
 @dataclass(frozen=True)
@@ -256,13 +327,21 @@ def cached_fetch(
     if cutoff is not None and enough_bars:
         bound = max_staleness if max_staleness is not None else _infer_step(timeframe, eligible)
         if bound is not None:
+            # cs58: a literal one-step bound over-tightens for calendar-gapped
+            # markets (a Fri->Mon weekend, an overnight session gap) and
+            # refetches a fresh cache forever. Widen the bound to the cache's
+            # own RECURRING inter-bar gap so a legitimate calendar gap at the
+            # edge is fresh, while a one-off cs43 multi-month / cs50 interior
+            # hole (does not recur) stays rejected.
+            cal_bound = _calendar_bound(bound, eligible["timestamp"])
             newest_eligible = eligible["timestamp"].max()
-            fresh_right_edge = (cutoff - newest_eligible) <= bound
+            fresh_right_edge = (cutoff - newest_eligible) <= cal_bound
             served = eligible.tail(min(lookback_bars, len(eligible)))
             if len(served) >= 2:
                 max_gap = served["timestamp"].diff().dropna().max()
-                # One missing closed bar is tolerated; a multi-step hole is not.
-                contiguous = max_gap <= bound * 1.5
+                # One missing closed bar (or one recurring calendar gap) is
+                # tolerated; a one-off multi-step interior hole is not.
+                contiguous = max_gap <= cal_bound * 1.5
     if enough_bars and fresh_right_edge and contiguous:
         out = eligible.tail(min(lookback_bars, len(eligible))).reset_index(drop=True)
         return out, {
@@ -310,11 +389,25 @@ def cached_fetch(
     }
     # cs49: surface an honest right-edge staleness signal so the caller can
     # ABSTAIN rather than silently trust a stale window. cutoff=None -> no flag.
+    #
+    # cs58 Layer-2: the bare canonical one-step bound over-flags a fresh
+    # calendar-gapped cache. A 2-trading-week DAILY cache (Friday close) with a
+    # Monday cutoff sits 3 calendar days above its newest bar > the 1-day step,
+    # so the canonical bound wrongly emits ``right_edge_stale_days`` and the
+    # caller ABSTAINS on a demonstrably-fresh cache. The flag is an honesty
+    # signal (not a data-serving gate), so it may be looser than the HIT gate's
+    # recurrence-required ``_calendar_bound``: widen it to the cache's own
+    # largest observed inter-bar gap (a single observed weekend/overnight gap is
+    # enough to vouch for an equal-sized right-edge gap). A genuinely stale cache
+    # (cs49: dense hourly, newest months below the cutoff) has only a 1h largest
+    # observed gap, far below the multi-month edge gap -> it STILL flags.
     if cutoff is not None and not merged.empty:
         bound = max_staleness if max_staleness is not None else _infer_step(timeframe, merged)
         if bound is not None:
+            observed = _max_observed_gap(merged["timestamp"])
+            flag_bound = bound if observed is None else max(bound, observed)
             gap = cutoff - merged["timestamp"].max()
-            if gap > bound:
+            if gap > flag_bound:
                 meta["right_edge_stale_days"] = int(gap / pd.Timedelta(days=1))
     return out, meta
 

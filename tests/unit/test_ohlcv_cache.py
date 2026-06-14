@@ -24,6 +24,38 @@ def _bars(n=10, start="2024-01-01", *, seed=1):
     )
 
 
+def _bars_from_ts(ts, *, seed=1):
+    """OHLCV frame for an explicit (calendar-gapped) timestamp index."""
+    ts = pd.DatetimeIndex(ts)
+    n = len(ts)
+    rng = np.random.default_rng(seed)
+    close = 100 + np.cumsum(rng.normal(0, 0.1, n))
+    return pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": close - 0.1,
+            "high": close + 0.2,
+            "low": close - 0.2,
+            "close": close,
+            "volume": 1000.0,
+        }
+    )
+
+
+def _daily_business_bars(start, end):
+    """Mon-Fri daily bars (legitimate Fri->Mon weekend gaps at the right edge)."""
+    return _bars_from_ts(pd.bdate_range(start, end, tz="UTC"))
+
+
+def _intraday_rth_bars(start, end, *, open_h=14, close_h=20):
+    """1h Mon-Fri RTH-window bars with overnight AND weekend session gaps."""
+    ts = []
+    for day in pd.bdate_range(start, end, tz="UTC"):
+        for h in range(open_h, close_h + 1):
+            ts.append(day + pd.Timedelta(hours=h))
+    return _bars_from_ts(pd.DatetimeIndex(ts), seed=2)
+
+
 def test_safe_path_uses_provider_symbol_timeframe(tmp_path):
     cache = OhlcvCache("ccxt:kraken", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
     assert cache.csv_path.name == "BTC_USDT-1h.csv"
@@ -533,6 +565,346 @@ def test_cached_fetch_discontiguous_cutoff_none_still_hits(tmp_path):
     assert calls["n"] == 0
     assert meta["cache_hit"] is True
     assert "right_edge_stale_days" not in meta
+
+
+def test_cached_fetch_daily_weekend_anchor_hits_no_refetch_loop(tmp_path):
+    """cs58 (REGRESSION cs43): a fresh, contiguous DAILY equity cache whose
+    freshest real bar is FRIDAY's close, with a backtest --end anchored MONDAY,
+    sits ~3 calendar days above Friday. cs43's literal one-step (1 day) bound
+    REJECTED the HIT -> the cache refetched on EVERY run even though the provider
+    has nothing newer (markets closed Sat/Sun) = a refetch-forever loop on the
+    most common backtest case. The cache's OWN recurring weekend gap (3 days)
+    must self-calibrate the bound so the fresh cache HITs and never loops.
+    """
+    calls = {"n": 0}
+    # ~4 trading weeks of Mon-Fri daily bars; newest is Friday 2024-05-31.
+    bars = _daily_business_bars("2024-05-06", "2024-05-31")
+    cache = OhlcvCache("alpaca", "AAPL", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        calls["n"] += 1
+        return bars  # provider has nothing newer than Friday
+
+    cutoff = pd.Timestamp("2024-06-03T00:00:00Z")  # Monday --end anchor
+    kwargs = dict(
+        provider="alpaca",
+        symbol="AAPL",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    # Run three times: a correct fresh cache must HIT and never increment fetch.
+    for _ in range(3):
+        out, meta = cached_fetch(fetch, **kwargs)
+        assert meta["cache_hit"] is True
+    assert calls["n"] == 0  # no refetch-forever loop
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_intraday_session_gap_anchor_hits(tmp_path):
+    """cs58: an INTRADAY 1h RTH cache (14:00-20:00Z, Mon-Fri) has legitimate
+    overnight AND weekend session gaps. A backtest anchored at the next session's
+    open sits an overnight (or weekend) gap above the cache's freshest bar, which
+    cs43's literal 1-hour bound rejected -> refetch loop. The cache's recurring
+    session gap must self-calibrate the bound so it HITs.
+    """
+    calls = {"n": 0}
+    # 3 trading weeks: the cache has observed both overnight (18h) and weekend
+    # (Fri 20:00 -> Mon 14:00 = 66h) gaps multiple times.
+    bars = _intraday_rth_bars("2024-05-13", "2024-05-31")
+    cache = OhlcvCache("alpaca", "MSFT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        calls["n"] += 1
+        return bars
+
+    # Monday-open anchor: newest is prior Friday 20:00Z, a 66h weekend gap below.
+    cutoff = pd.Timestamp("2024-06-03T14:00:00Z")
+    kwargs = dict(
+        provider="alpaca",
+        symbol="MSFT",
+        timeframe="1h",
+        lookback_bars=20,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    for _ in range(3):
+        out, meta = cached_fetch(fetch, **kwargs)
+        assert meta["cache_hit"] is True
+    assert calls["n"] == 0
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_calendar_bound_still_rejects_cs43_multimonth(tmp_path):
+    """cs58 must NOT reopen the cs43 multi-month-stale hole. A DAILY Mon-Fri cache
+    ending months before the anchor has only a 3-day recurring weekend gap; the
+    multi-month edge gap is a ONE-OFF (does not recur) and is excluded from the
+    self-calibrated bound -> the HIT is still REJECTED and the provider refreshes.
+    """
+    calls = {"n": 0}
+    stale = _daily_business_bars("2024-01-01", "2024-01-31")  # ends ~2024-01-31
+
+    def fetch():
+        calls["n"] += 1
+        return _daily_business_bars("2024-05-01", "2024-05-31")  # fresh provider bars
+
+    cache = OhlcvCache("alpaca", "OLD", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(stale)
+
+    cutoff = pd.Timestamp("2024-06-03T00:00:00Z")  # ~4 months past the cache edge
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="OLD",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 1  # multi-month stale edge -> MISS/fetch (cs43 intact)
+    assert meta["cache_hit"] is False
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_calendar_bound_still_rejects_cs50_interior_hole(tmp_path):
+    """cs58 must NOT reopen the cs50 interior-hole hole. The lone giant interior
+    gap appears ONCE -> not recurring -> excluded from the self-calibrated bound,
+    so the contiguity check still rejects the discontiguous served tail.
+    """
+    calls = {"n": 0}
+    ancient = _bars(200, start="2024-01-01")  # contiguous hourly, ends ~2024-01-09
+    fresh1 = _bars(1, start="2024-06-01T00:00:00Z", seed=9)  # single bar AT cutoff
+    cache = OhlcvCache("ccxt", "HOLE", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(pd.concat([ancient, fresh1], ignore_index=True))
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(300, start="2024-05-20")
+
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="HOLE",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 1  # discontiguous interior hole -> MISS/fetch (cs50 intact)
+    assert meta["cache_hit"] is False
+
+
+def test_cached_fetch_calendar_bound_cutoff_none_byte_identical(tmp_path):
+    """cs58: cutoff=None (live caller) imposes NO calendar bound and is unchanged
+    from the prior behaviour (HITs, no staleness flag, most-recent tail).
+    """
+    calls = {"n": 0}
+    bars = _daily_business_bars("2024-05-06", "2024-05-31")
+    cache = OhlcvCache("alpaca", "AAPL", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        calls["n"] += 1
+        return bars
+
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="AAPL",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=None,
+    )
+    assert calls["n"] == 0
+    assert meta["cache_hit"] is True
+    assert "right_edge_stale_days" not in meta
+    full = cache.read()
+    assert out["timestamp"].iloc[-1] == full["timestamp"].iloc[-1]
+
+
+def test_cached_fetch_calendar_bound_short_cache_degrades_to_canonical(tmp_path):
+    """cs58: a cache too short to learn a recurring rhythm (only one occurrence of
+    a gap) degrades to the cs43 canonical one-step bound (no regression, no
+    spurious widening). A single Fri->Mon gap that appears once is NOT learned,
+    so a 3-day stale daily edge still rejects.
+    """
+    calls = {"n": 0}
+    # Only Fri + Mon: the single 3-day gap appears once -> not recurring.
+    bars = _bars_from_ts(pd.DatetimeIndex(["2024-05-24", "2024-05-31"]).tz_localize("UTC"))
+
+    def fetch():
+        calls["n"] += 1
+        return bars
+
+    cache = OhlcvCache("alpaca", "TINY", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+    # Anchor 3 days past the newest bar; with no learnable rhythm the canonical
+    # 1-day bound applies -> still MISS (matches cs43 conservative default).
+    cutoff = pd.Timestamp("2024-06-03T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="TINY",
+        timeframe="1d",
+        lookback_bars=2,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False  # canonical bound, no spurious widening
+
+
+def test_cached_fetch_daily_two_week_monday_no_refetch_loop_or_abstain(tmp_path):
+    """cs58 Layer-2 (MISS-path false-abstain): a fresh, contiguous 2-trading-week
+    DAILY cache (Friday close) has only ONE weekend (Fri->Mon) gap, so the gap
+    does NOT recur (>=2) and the HIT-path self-calibrated bound degrades to the
+    cs43 canonical 1-day step -> a Monday --end anchor (3 calendar days above
+    Friday) MISSes. That is acceptable per the conservative HIT default; the cs49
+    short-circuit already prevents cache churn (no append, mtime stable, served
+    deterministically). But the MISS-path staleness FLAG still uses the bare
+    canonical one-step bound, so it wrongly emits ``right_edge_stale_days=3`` and
+    the caller ABSTAINS on a demonstrably-fresh cache whose own largest observed
+    inter-bar gap (3-day weekend) already covers the 3-day edge gap.
+
+    RED today: across 3 runs the cache does not churn (append_calls==0) but
+    ``right_edge_stale_days`` is emitted every run -> false abstain.
+    GREEN after Layer 2: no churn AND no abstain flag (the flag bound widens to
+    the cache's largest observed gap), served tail deterministic across runs.
+    """
+    # 2 trading weeks Mon-Fri; newest is Friday 2024-05-24 (ONE weekend gap).
+    bars = _daily_business_bars("2024-05-13", "2024-05-24")
+    cache = OhlcvCache("alpaca", "AAPL", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        return bars  # provider has nothing newer than Friday (markets closed)
+
+    cutoff = pd.Timestamp("2024-05-27T00:00:00Z")  # Monday --end anchor
+    kwargs = dict(
+        provider="alpaca",
+        symbol="AAPL",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    # Spy on the real append + capture the cache mtime (mirror the cs49 churn test).
+    append_calls = {"n": 0}
+    orig_append = OhlcvCache.append
+
+    def spy_append(self, b):
+        append_calls["n"] += 1
+        return orig_append(self, b)
+
+    OhlcvCache.append = spy_append
+    cache_path = cache.path
+    mtime_before = cache_path.stat().st_mtime_ns if cache_path.exists() else None
+    metas = []
+    outs = []
+    try:
+        for _ in range(3):
+            out, meta = cached_fetch(fetch, **kwargs)
+            outs.append(out)
+            metas.append(meta)
+    finally:
+        OhlcvCache.append = orig_append
+    mtime_after = cache_path.stat().st_mtime_ns if cache_path.exists() else None
+    # No cache churn: the provider cannot advance the right edge (cs49 intact).
+    assert append_calls["n"] == 0
+    assert mtime_after == mtime_before
+    # Deterministic serve across runs (no loop-induced drift).
+    assert list(outs[0]["timestamp"]) == list(outs[1]["timestamp"])
+    assert list(outs[1]["timestamp"]) == list(outs[2]["timestamp"])
+    assert (outs[0]["timestamp"] <= cutoff).all()
+    # No false abstain on a demonstrably-fresh calendar-gapped cache: the
+    # largest observed gap (3-day weekend) covers the 3-day edge gap.
+    for meta in metas:
+        assert "right_edge_stale_days" not in meta
+
+
+def test_cached_fetch_miss_flag_still_fires_on_dense_stale_cache(tmp_path):
+    """cs58 Layer-2 anti-regression: the looser observed-gap flag bound must NOT
+    suppress the genuine cs49 abstain on a truly stale cache. A DENSE hourly
+    cache (largest observed inter-bar gap = 1h) ending ~139 days below the cutoff
+    still flags ``right_edge_stale_days`` because its own observed rhythm (1h)
+    does NOT cover the multi-month edge gap.
+    """
+    cache = OhlcvCache("ccxt", "DEAD", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(_bars(300, start="2024-01-01"))  # dense hourly, newest ~ 2024-01-13
+
+    def fetch():
+        return _bars(300, start="2024-01-01")  # provider capped: same stale window
+
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="DEAD",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False
+    # The genuine multi-month stale right edge is STILL surfaced (cs49 intact).
+    assert meta["right_edge_stale_days"] >= 139
+
+
+def test_cached_fetch_intraday_two_session_no_abstain(tmp_path):
+    """cs58 Layer-2: an INTRADAY 1h RTH cache spanning only 2 sessions has ONE
+    overnight gap (appears once -> not recurring -> HIT-path bound canonical 1h),
+    so a next-session-open cutoff MISSes. But the cache's largest observed gap
+    (the 18h overnight session gap) covers the equal-sized edge gap, so the MISS
+    path must NOT emit a false abstain flag, and cs49 short-circuit prevents churn.
+    """
+    # 2 weekday sessions: 2024-05-22 (Wed) and 2024-05-23 (Thu), 14:00-20:00Z each
+    # -> the cache observed exactly ONE 18h overnight gap (Wed 20:00 -> Thu 14:00).
+    bars = _intraday_rth_bars("2024-05-22", "2024-05-23")
+    cache = OhlcvCache("alpaca", "MSFT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        return bars  # nothing newer than Thu 20:00Z
+
+    # Anchor at the next weekday session open (Fri 2024-05-24 14:00Z): newest is
+    # Thu 20:00Z, an 18h overnight gap above == the cache's largest observed gap.
+    cutoff = pd.Timestamp("2024-05-24T14:00:00Z")
+    kwargs = dict(
+        provider="alpaca",
+        symbol="MSFT",
+        timeframe="1h",
+        lookback_bars=14,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    append_calls = {"n": 0}
+    orig_append = OhlcvCache.append
+
+    def spy_append(self, b):
+        append_calls["n"] += 1
+        return orig_append(self, b)
+
+    OhlcvCache.append = spy_append
+    try:
+        out, meta = cached_fetch(fetch, **kwargs)
+    finally:
+        OhlcvCache.append = orig_append
+    assert append_calls["n"] == 0  # no churn (cs49 intact)
+    assert "right_edge_stale_days" not in meta  # no false abstain
+    assert (out["timestamp"] <= cutoff).all()
 
 
 def test_normalize_drops_bad_rows_and_duplicates():
