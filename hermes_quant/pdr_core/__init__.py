@@ -37,10 +37,12 @@ from hermes_quant.pdr_core.aggregate import (
     core_aggregate,
 )
 from hermes_quant.pdr_core.contracts import (
+    OPTION_ASSET_CLASSES,
     POSITION_LADDER,
     AnalystView,
     Fill,
     Proposal,
+    is_option_asset_class,
 )
 from hermes_quant.pdr_core.gate_types import (
     CoreHaltState,
@@ -51,6 +53,7 @@ from hermes_quant.pdr_core.gate_types import (
 )
 
 __all__ = [
+    "OPTION_ASSET_CLASSES",
     "POSITION_LADDER",
     "AnalystView",
     "CoreAggregateContext",
@@ -63,4 +66,5 @@ __all__ = [
     "GateDecision",
     "Proposal",
     "core_aggregate",
+    "is_option_asset_class",
 ]

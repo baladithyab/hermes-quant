@@ -44,8 +44,42 @@ from typing import Any, Literal
 Direction = Literal[-1, 0, 1]
 """-1 = short, 0 = flat, +1 = long. (Mirrors protocol.Direction.)"""
 
-AssetClass = Literal["crypto", "equity", "etf", "fx", "option"]
-"""Asset class. (Mirrors protocol.AssetClass.)"""
+AssetClass = Literal["crypto", "equity", "etf", "fx", "option", "us_option"]
+"""Asset class. (Mirrors protocol.AssetClass.)
+
+``us_option`` is the token the live host money-state stamps on real US
+equity-option fills (``react.multileg`` -> ``state.portfolio_state``), where the
+×100 contract multiplier gates EXACTLY on the literal string ``"us_option"``.
+``option`` is the generic/legacy family token. BOTH are members so the contract
+vocabulary RECOGNIZES the host's live token: the seam that will own
+sizing+settlement (ADR-0092) must key the contract multiplier on the option
+FAMILY (:data:`OPTION_ASSET_CLASSES` / :func:`is_option_asset_class`), not on a
+single string — otherwise a ``Fill.asset_class == "us_option"`` settled by a core
+that only checks ``== "option"`` silently misses the ×100 (ac1). Adding the member
+is purely additive: every ``asset_class`` field is typed ``str`` (no Literal
+validation at construction), so the live money-state behavior is byte-identical.
+"""
+
+# The option FAMILY — the set of asset_class tokens that denote an options
+# contract and therefore carry the ×100 share-per-contract multiplier in
+# settlement. The host money-state (``state.portfolio_state``) gates the live
+# multiplier on the literal ``"us_option"``; the host-agnostic seam that will own
+# settlement (ADR-0092) MUST recognize the whole family so it never misses the
+# multiplier on a token the host already uses. ``"option"`` is the generic Literal
+# member; ``"us_option"`` is the live host stamp. Keep this in sync with the
+# option members of :data:`AssetClass`.
+OPTION_ASSET_CLASSES: frozenset[str] = frozenset({"option", "us_option"})
+"""The asset_class tokens that denote an options contract (carry the ×100 multiplier)."""
+
+
+def is_option_asset_class(asset_class: str | None) -> bool:
+    """True iff ``asset_class`` denotes an options contract (the ×100 family).
+
+    The host-agnostic settlement seam (ADR-0092) keys the contract multiplier on
+    THIS family recognizer — not on a single string — so a ``us_option`` fill (the
+    live host stamp) and a generic ``option`` fill are both recognized. Keying on a
+    bare ``== "option"`` would silently miss the ×100 on the live token (ac1)."""
+    return asset_class in OPTION_ASSET_CLASSES
 
 
 # ---------------------------------------------------------------------------
