@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, append_locked
+from hermes_quant.daemon.tick_lock import symbol_tick_lock
 
 from .admissibility_precondition import admissibility_reject_equity
 from .base import ExecutionRecord
@@ -26,6 +27,18 @@ from .base import ExecutionRecord
 logger = logging.getLogger(__name__)
 
 HARD_FILL_CEILING = 1.0
+
+
+def _resolve_account_id(proposal: Any) -> str:
+    """Resolve the account partition the SAME way execute()/_portfolio_cap_clip do.
+
+    reactor_metadata.account_id override, else the "paper-default" sentinel. Kept
+    as one helper so the tick-lock key and the state.db write agree on the account
+    (a mismatch would lock the wrong symbol triple).
+    """
+    rmeta = getattr(proposal, "reactor_metadata", None) or {}
+    account_id = rmeta.get("account_id") if isinstance(rmeta, dict) else None
+    return account_id or "paper-default"
 
 
 class FillSizeInvariantError(ValueError):
@@ -186,6 +199,104 @@ class PaperReactor:
         if admissibility_reject is not None:
             return admissibility_reject
 
+        # ADR-0078 / ra10: single-writer per-symbol TICK LOCK across the
+        # read-decide-fire-store window. The cap-read below RECONSTRUCTS the book,
+        # then we append to executions.jsonl and update state.db — a read-modify-
+        # write that two armed crons (autonomous + playbook) can interleave on the
+        # SAME symbol (the 880%-gross mechanism). The per-write flock on the bus
+        # and BEGIN IMMEDIATE on state.db each serialize ONE write but NOT the
+        # read-decide that precedes them, so they cannot close this. We hold an
+        # exclusive per-(account, asset_class, symbol) advisory lock from BEFORE
+        # the cap-read through the state.db update; different symbols use different
+        # lock files and never block each other.
+        #
+        # FAIL-OPEN-SAFE (a deadlocking lock is worse than the race):
+        #   * acquired           -> the whole sequence runs serialized under the lock.
+        #   * contended (timeout) -> another writer holds the symbol THIS tick; we
+        #                            SKIP it (silenced audit record, NOT appended,
+        #                            no double-fire, no block).
+        #   * fail-open          -> the lock file is unopenable / flock unsupported;
+        #                            we proceed exactly as today (race re-opens) with
+        #                            a WARNING. Never hang, never crash.
+        # DEFAULT-ON with a kill-switch: set HERMES_QUANT_TICK_LOCK=0 to bypass the
+        # lock entirely (byte-identical to the pre-ADR-0078 path).
+        account_id = _resolve_account_id(proposal)
+        if os.environ.get("HERMES_QUANT_TICK_LOCK", "1") != "1":
+            return self._execute_fired(
+                proposal,
+                fill_size_pct=fill_size_pct,
+                approver_user_id=approver_user_id,
+                play_tag=play_tag,
+                decision_price=decision_price,
+                signal_id=signal_id,
+                now=now,
+            )
+
+        with symbol_tick_lock(account_id, proposal.asset_class, proposal.symbol) as lock:
+            if not lock.acquired and lock.contended:
+                # Another writer holds this symbol this tick. SKIP (silence-by-
+                # default) — do NOT append, do NOT block, do NOT double-fire.
+                logger.warning(
+                    "paper-react: %s asset=%s SKIPPED — symbol tick-lock contended "
+                    "(%s); another writer is firing this symbol this tick",
+                    proposal.proposal_id,
+                    proposal.symbol,
+                    lock.reason,
+                )
+                return ExecutionRecord(
+                    proposal_id=proposal.proposal_id,
+                    signal_id=signal_id,
+                    asset=proposal.symbol,
+                    asset_class=proposal.asset_class,
+                    timeframe=proposal.timeframe,
+                    asof_decision=now,
+                    asof_execution=now,
+                    target_position_pct=fill_size_pct,
+                    decision_price=decision_price,
+                    fill_price=decision_price,
+                    fill_size_pct=0.0,
+                    reactor_name=self.name,
+                    human_in_the_loop=True,
+                    approver_user_id=approver_user_id,
+                    reactor_metadata={
+                        "paper": True,
+                        "silenced": True,
+                        "silence_reason": "tick_lock_contended",
+                        "tick_lock": lock.reason,
+                    },
+                    bar_ts=(proposal.advisor_result or {}).get("bar_ts"),
+                    play_tag=play_tag,
+                )
+            # acquired OR fail-open: run the fire sequence. On fail-open the lock
+            # is not held (degraded to today's behavior) but the tick proceeds.
+            return self._execute_fired(
+                proposal,
+                fill_size_pct=fill_size_pct,
+                approver_user_id=approver_user_id,
+                play_tag=play_tag,
+                decision_price=decision_price,
+                signal_id=signal_id,
+                now=now,
+            )
+
+    def _execute_fired(
+        self,
+        proposal: Any,
+        *,
+        fill_size_pct: float,
+        approver_user_id: str | None,
+        play_tag: str,
+        decision_price: float,
+        signal_id: str | None,
+        now: str,
+    ) -> ExecutionRecord:
+        """The read-decide-fire-store body of execute(), run under the tick lock.
+
+        Extracted verbatim from execute() (ADR-0078): the per-symbol tick lock
+        wraps THIS method so the cap-read (which reconstructs the book), the bus
+        append, and the state.db update are one serialized critical section per
+        symbol. Behavior is otherwise unchanged from the pre-lock inline body.
+        """
         # ADR-0087: portfolio-cap seam at the REACTION layer (DEFAULT-OFF).
         # When HERMES_QUANT_PORTFOLIO_CAPS=1, this precondition reads current
         # portfolio headroom and either SILENCES an over-cap fire (clipped to
