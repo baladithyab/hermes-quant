@@ -509,10 +509,21 @@ def tick(
     # The per-symbol keying inside reconstruct_portfolio_state collapses a symbol
     # written under two reactor names to ONE row at its latest target, so this
     # cannot over-count a single logical position.
-    # Fail-OPEN to 0 only if reconstruction itself errors (never block the tick
-    # on a transient read failure), but log it so the gap is visible.
+    # cs19/ADR-0016 §D9: fail-CLOSED on a read EXCEPTION. reconstruct_portfolio_state
+    # is ALREADY internally fail-soft — a missing bus (portfolio/state.py:108-109) and
+    # an OSError (:117-118) return an EMPTY PortfolioState WITHOUT raising, which is a
+    # legitimate "no open book" the SUCCESS path below admits against. So the bare
+    # `except` here catches only GENUINELY-UNEXPECTED faults (a corrupt reconstruct, a
+    # programming error, a non-OSError filesystem fault). In that population we are BLIND
+    # to the real exposure, and assuming the book is EMPTY (full headroom) is the most
+    # dangerous possible assumption for a HARD safety rail. The conservative direction is
+    # to treat the unreadable book as AT-CAP and SILENCE new-symbol opens this tick
+    # (recoverable next tick once the read succeeds), via the `rail_read_failed` sentinel
+    # wired into the D9 check below. NOTE: a SUCCESSFUL empty read keeps the old admit
+    # behavior — only the EXCEPTION path fails closed.
     open_positions_at_tick_start = 0
     open_symbols_at_tick_start: set[str] = set()
+    rail_read_failed = False
     try:
         from hermes_quant.portfolio.state import reconstruct_portfolio_state as _recon
 
@@ -524,8 +535,11 @@ def tick(
         open_symbols_at_tick_start = set(_open)
         open_positions_at_tick_start = len(_open)
     except Exception as _exc:  # noqa: BLE001 - never block tick on a read error
+        # cs19: fail-CLOSED for the HARD rail (was fail-open to count=0/empty-set).
+        rail_read_failed = True
         logger.warning(
-            "autonomous: could not count open positions for concurrent-cap rail: %s",
+            "autonomous: could not count open positions for concurrent-cap rail "
+            "(failing CLOSED — silencing NEW-symbol opens this tick): %s",
             _exc,
         )
 
@@ -649,18 +663,34 @@ def tick(
             max_concurrent = rails["max_concurrent_positions"]
             is_new_symbol = entry.symbol not in open_symbols_at_tick_start
             projected_concurrent = open_positions_at_tick_start + fires_this_tick
-            if is_new_symbol and projected_concurrent >= max_concurrent:
+            # cs19/ADR-0016 §D9: a read-EXCEPTION on the book count fails CLOSED —
+            # treat the unreadable book as AT-CAP for any NEW-looking symbol. A
+            # SUCCESSFUL read (empty or populated) leaves rail_read_failed False, so
+            # the `or` short-circuits to the normal count test and behavior is byte-
+            # identical. Existing-symbol management is unaffected: the `is_new_symbol`
+            # guard still exempts a fire on a held symbol (the rail only converts a
+            # would-be NEW open into a SILENCE; it never blocks a close/adjustment).
+            if is_new_symbol and (
+                rail_read_failed or projected_concurrent >= max_concurrent
+            ):
                 decision.gate = "SILENCE_CONCURRENT_CAP"
-                decision.details = {
-                    "reason": (
+                _cap_reason = (
+                    "concurrent-cap book read FAILED; failing CLOSED — silencing this "
+                    "NEW-symbol open this tick (recoverable next tick)"
+                    if rail_read_failed
+                    else (
                         f"max_concurrent_positions={max_concurrent} reached "
                         f"({open_positions_at_tick_start} open at tick start "
                         f"+ {fires_this_tick} fired this tick); this NEW-symbol "
                         "signal would have fired but the book is at the cap"
-                    ),
+                    )
+                )
+                decision.details = {
+                    "reason": _cap_reason,
                     "would_have_fired": True,
                     "original_gate": gate_result.decision.value,
                     "open_positions_at_tick_start": open_positions_at_tick_start,
+                    "rail_read_failed": rail_read_failed,
                 }
                 result.silences += 1
                 result.decisions.append(decision)
