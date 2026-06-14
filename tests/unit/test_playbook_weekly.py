@@ -414,3 +414,130 @@ def test_reshorted_asset_picks_held_sign_leg(mod):
     long_entry = mod.find_entry_record(execs, "AAPL", 100.0)
     assert long_entry is not None
     assert mod._rec_side(long_entry) == "buy"
+
+
+# ---- cs27/cs28: establishing-leg (multi-fill / re-open) ----
+#
+# Root question (cs27 P1 + cs28 P2 are ONE increment): WHICH execution record is
+# the entry of a multi-fill position? The loader keeps the LATEST target per asset
+# (portfolio_loader.py:245-255, no flip/partial guard on the absolute path) so the
+# held SIGN is sign(latest target_position_pct). But find_entry_record reads the
+# FIRST file-order match (oldest leg -> days_held source) while infer_play_tag reads
+# the reversed()/NEWEST match (play source) -> three readers anchor to three legs.
+#
+# The fix defines the OPEN BOUNDARY = the establishing leg = the first fill of the
+# CURRENT held sign AFTER the last flat (target==0) or flip (sign change). days_held
+# AND the play tag both anchor to THAT leg, so all readers agree with the loader's
+# held position. A flat fill is _live_exec_dict(target_position_pct=0.0) (derives
+# _rec_side==""). now_dt is pinned to 2026-06-14 UTC.
+
+
+def test_reopened_short_days_held_from_current_run(mod):
+    """cs27 (RED today, GREEN after): a short re-opened across a flat must read
+    days_held off the CURRENT run's opening leg (06-08, ~6d), NOT the long-dead
+    01-05 leg (~159d). The buggy find_entry_record returns the FIRST file-order sell
+    (01-05) -> 159-160d -> the armed 60d swing stop wrong-fires on a fresh re-open.
+    """
+    execs = [
+        _live_exec_dict(asset="BA", target_position_pct=-0.20,
+                        asof_execution="2026-01-05T00:00:00+00:00"),  # short opened
+        _live_exec_dict(asset="BA", target_position_pct=0.0,
+                        asof_execution="2026-03-01T00:00:00+00:00"),  # FLAT (closed)
+        _live_exec_dict(asset="BA", target_position_pct=-0.20,
+                        asof_execution="2026-06-08T00:00:00+00:00"),  # RE-OPENED (current)
+    ]
+    entry = mod.find_entry_record(execs, "BA", -100.0)
+    assert entry is not None
+    assert entry.get("asof_execution").startswith("2026-06-08")
+
+    now_dt = mod.datetime(2026, 6, 14, tzinfo=mod.UTC)
+    days_held = mod.days_between_iso(
+        entry.get("asof_execution") or entry.get("asof", ""), now_dt
+    )
+    # 2026-06-08T00:00 -> 2026-06-14T00:00 = 6 days (the buggy 01-05 leg -> 159).
+    assert days_held == 6
+    assert days_held <= 60
+
+
+def test_reopened_short_swing_stop_does_not_wrongfire(mod):
+    """cs27 (RED today, GREEN after): with days_held anchored to the establishing
+    leg the armed swing stop HOLDs a fresh re-opened (underwater) short. Cross-check
+    the weapon is real: the SAME stop CLOSES at the buggy 160d age."""
+    execs = [
+        _live_exec_dict(asset="BA", target_position_pct=-0.20,
+                        asof_execution="2026-01-05T00:00:00+00:00"),
+        _live_exec_dict(asset="BA", target_position_pct=0.0,
+                        asof_execution="2026-03-01T00:00:00+00:00"),
+        _live_exec_dict(asset="BA", target_position_pct=-0.20,
+                        asof_execution="2026-06-08T00:00:00+00:00"),
+    ]
+    entry = mod.find_entry_record(execs, "BA", -100.0)
+    now_dt = mod.datetime(2026, 6, 14, tzinfo=mod.UTC)
+    days_held = mod.days_between_iso(
+        entry.get("asof_execution") or entry.get("asof", ""), now_dt
+    )
+    d = mod.decide_swing(mod.SwingContext(
+        days_held=days_held, pnl_pct=-0.05, atr14_at_entry_pct=0.02,
+    ))
+    assert d.action == "HOLD"
+    # The stop is a real weapon — it fires at the (buggy) inflated age.
+    assert mod.decide_swing(mod.SwingContext(
+        days_held=160, pnl_pct=-0.05, atr14_at_entry_pct=0.02,
+    )).action == "CLOSE"
+
+
+def test_multifill_short_add_readers_agree_on_first_of_run(mod):
+    """cs28 (RED today, GREEN after): a same-sign add (no flat between) -> all readers
+    anchor to the FIRST add of the current run (02-01). days_held off 02-01; the play
+    tag off 02-01 ('leaps'). RED today: infer_play_tag's reversed() picks the 06-09
+    newest add -> 'swing'; find_entry_record picks 02-01 already (oldest) so the play
+    and the age legs DISAGREE."""
+    execs = [
+        _live_exec_dict(asset="AVGO", target_position_pct=-0.10, play_tag="leaps",
+                        asof_execution="2026-02-01T00:00:00+00:00"),  # opened short
+        _live_exec_dict(asset="AVGO", target_position_pct=-0.20, play_tag="swing",
+                        asof_execution="2026-06-09T00:00:00+00:00"),  # added (current)
+    ]
+    entry = mod.find_entry_record(execs, "AVGO", -100.0)
+    play = mod.infer_play_tag(execs, "AVGO", -100.0)
+    assert entry is not None
+    assert entry.get("asof_execution").startswith("2026-02-01")
+    assert play == "leaps"
+
+
+def test_single_fill_long_establishing_leg_byte_identical(mod):
+    """cs27/cs28 REGRESSION: a single-fill long is byte-identical pre/post fix. One
+    buy -> no flat, no flip -> the establishing leg IS that buy (== today's first
+    match). days_held reads asof_execution; play falls through to swing."""
+    execs = [_live_exec_dict(target_position_pct=0.20, play_tag="advisor",
+                             asof_execution="2026-06-08T13:31:05+00:00")]
+    assert mod.find_entry_record(execs, "AAPL", 100.0) == mod.find_entry_record(execs, "AAPL")
+    entry = mod.find_entry_record(execs, "AAPL", 100.0)
+    assert entry is not None
+    now_dt = mod.datetime(2026, 6, 18, tzinfo=mod.UTC)
+    days_held = mod.days_between_iso(
+        entry.get("asof_execution") or entry.get("asof", ""), now_dt
+    )
+    assert days_held == 9
+    assert mod.infer_play_tag(execs, "AAPL", 100.0) == "swing"
+
+
+def test_flip_then_short_establishing_is_post_flip_leg(mod):
+    """cs27/cs28 (flip-boundary compat): an asset long then flipped short. The held
+    SHORT's establishing leg is the post-flip sell (06-10); the held LONG's is the
+    pre-flip buy (05-01). A flip resets the run (like a flat)."""
+    execs = [
+        _live_exec_dict(asset="AAPL", target_position_pct=0.20,
+                        asof_execution="2026-05-01T00:00:00+00:00"),   # long opened (buy)
+        _live_exec_dict(asset="AAPL", target_position_pct=-0.20,
+                        asof_execution="2026-06-10T00:00:00+00:00"),   # flipped short (sell)
+    ]
+    short_entry = mod.find_entry_record(execs, "AAPL", -100.0)
+    assert short_entry is not None
+    assert mod._rec_side(short_entry) == "sell"
+    assert short_entry.get("asof_execution").startswith("2026-06-10")
+
+    long_entry = mod.find_entry_record(execs, "AAPL", 100.0)
+    assert long_entry is not None
+    assert mod._rec_side(long_entry) == "buy"
+    assert long_entry.get("asof_execution").startswith("2026-05-01")

@@ -261,14 +261,66 @@ def _rec_side(rec: dict) -> str:
     return ""
 
 
+# ---------- establishing-leg selection (cs27/cs28) ----------
+def _establishing_leg(executions: list[dict], asset: str, position_qty: float = 0.0) -> dict | None:
+    """Return the leg that ESTABLISHED the CURRENTLY-held position (None if absent).
+
+    cs27/cs28 root question: which execution is the entry of a multi-fill position?
+    The loader keeps the LATEST target per asset and folds re-opens/flips silently
+    (portfolio_loader.py:245-255 max asof_execution; the absolute-target path has NO
+    flip/partial guard, :225-233). So the held SIGN is sign(latest target). The
+    establishing leg is the FIRST fill of that held sign in the CURRENT run — the run
+    bounded behind by the last flat (target==0 -> _rec_side=="") or flip (the opposite
+    side). days_held and the play tag both anchor here so all readers AND the loader
+    agree on ONE leg per held position.
+
+    Walk the per-asset fills IN FILE ORDER (the list is already oldest-first; do NOT
+    re-sort — preserve the loader's tie/order semantics). Track a candidate (the first
+    desired_side fill of the current run) plus a "boundary seen since the candidate"
+    flag. A boundary (flat or flip) only SETS the flag — it does NOT erase the
+    candidate. When the NEXT desired_side fill arrives after a boundary it RE-OPENS the
+    run and becomes the new candidate. So the post-loop candidate is the first
+    desired_side fill after the LAST boundary that was actually followed by a same-sign
+    re-open; a TRAILING flip with no subsequent same-sign fill leaves the prior run's
+    opening leg intact (the position-flip case: querying the pre-flip sign still returns
+    that run's opener rather than None — keeps cs26 `test_reshorted_asset_picks_held_sign_leg`
+    green and is correct since run_weekly always queries the ACTUAL held sign).
+
+    SINGLE-FILL LONG stays byte-identical: one buy, qty>=0 -> desired_side='buy', no
+    flat/flip -> the single buy is both the first-ever match (old behavior) AND the
+    establishing leg. A same-sign ADD (e.g. AVGO -0.1 then -0.2, no flat between) keeps
+    the FIRST add of the run as the establishing leg — the exposure-honest anchor
+    (a routine size-up must not silently reset the holding clock; PROVE §4). A re-open
+    across a flat (BA -0.2, 0.0, -0.2) anchors on the post-flat re-open (PROVE §2).
+    """
+    desired_side = "sell" if position_qty < 0 else "buy"
+    candidate: dict | None = None
+    boundary_since_candidate = False
+    for rec in executions:
+        if rec.get("asset") != asset:
+            continue
+        side = _rec_side(rec)
+        if side == desired_side:
+            if candidate is None or boundary_since_candidate:
+                candidate = rec  # opens (or re-opens, post-boundary) the current run
+                boundary_since_candidate = False
+        else:
+            # Boundary: a flat (side=="") or a flip (opposite side) closes the run.
+            # Mark it; the NEXT desired_side fill re-opens the run. A trailing boundary
+            # with no subsequent same-sign fill leaves the prior run's opener intact.
+            boundary_since_candidate = True
+    return candidate
+
+
 # ---------- play_tag inference ----------
 def infer_play_tag(executions: list[dict], asset: str, position_qty: float = 0.0) -> str:
-    """Find the most-recent OPENING execution for `asset` and infer the play.
+    """Infer the play from the leg that ESTABLISHED the currently-held position.
 
-    The opening leg shares the HELD position's sign: a long (position_qty>=0)
-    opens with a 'buy', a short (position_qty<0) opens with a 'sell'. Match the
-    leg by direction so a short's opening leg is read (mirrors cs20 :228 `if qty
-    < 0`; flat/0 takes the long branch -> byte-identical to the pre-cs26 lookup).
+    The establishing leg (cs27/cs28: first fill of the held sign in the current run,
+    after the last flat/flip — see ``_establishing_leg``) is the leg that OPENED the
+    position held now. We classify off that leg so the play tag agrees with the leg
+    days_held is measured from (replacing the pre-cs28 reversed()/newest-leg scan that
+    let a same-sign add re-classify the play). flat/0 takes the long branch.
 
     Order of precedence:
       1. Explicit `play_tag` field on the execution (the 'advisor' sentinel — the
@@ -278,12 +330,8 @@ def infer_play_tag(executions: list[dict], asset: str, position_qty: float = 0.0
       3. Substring match on `signal_id`: 'leaps' or 'swing'
       4. Default: 'swing' (cautious — gets the swing exit rules)
     """
-    desired_side = "sell" if position_qty < 0 else "buy"
-    for rec in reversed(executions):
-        if rec.get("asset") != asset:
-            continue
-        if _rec_side(rec) != desired_side:  # opening leg (long->buy, short->sell)
-            continue
+    rec = _establishing_leg(executions, asset, position_qty)
+    if rec is not None:
         tag = rec.get("play_tag") or rec.get("recipe")
         if isinstance(tag, str) and tag and tag.lower() != "advisor":
             return tag.lower()
@@ -291,23 +339,22 @@ def infer_play_tag(executions: list[dict], asset: str, position_qty: float = 0.0
         for play in ("leaps", "swing", "covered_call", "csp", "wheel"):
             if play in sig:
                 return play
-        break
     return "swing"
 
 
 # ---------- entry context lookup ----------
 def find_entry_record(executions: list[dict], asset: str, position_qty: float = 0.0) -> dict | None:
-    """First opening leg (long->buy, short->sell) for asset (= entry). None if not found.
+    """Establishing (run-opening) leg for the held position (= entry). None if absent.
 
-    The opening leg shares the HELD position's sign: a long (position_qty>=0)
-    opens with a 'buy', a short (position_qty<0) with a 'sell'. flat/0 takes the
-    long branch -> byte-identical to the pre-cs26 buy-only lookup.
+    Returns the leg that ESTABLISHED the currently-held position: the first fill of
+    the held sign in the CURRENT run, after the last flat (target==0) or flip — see
+    ``_establishing_leg`` (cs27/cs28). days_held (run_weekly :535-536) reads age from
+    when the CURRENT run opened, not the first-ever file-order match (which inflated
+    age on a re-opened position and wrong-fired the armed 60d swing stop). A single
+    buy with no flat/flip -> the establishing leg IS that buy, so a single-fill long
+    is byte-identical to the pre-cs26 buy-only lookup.
     """
-    desired_side = "sell" if position_qty < 0 else "buy"
-    for rec in executions:
-        if rec.get("asset") == asset and _rec_side(rec) == desired_side:
-            return rec
-    return None
+    return _establishing_leg(executions, asset, position_qty)
 
 
 def days_between_iso(asof_iso: str, now_dt: datetime) -> int:
