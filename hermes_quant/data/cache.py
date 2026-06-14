@@ -20,6 +20,16 @@ import pandas as pd
 
 DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache"
 
+# cs63: one closed-session day. A market HOLIDAY is one extra closed session day
+# adjacent to a known calendar rhythm (a Monday holiday turns a Fri->Mon weekend
+# into Fri->Tue; an intraday Fri-close -> next-session-open weekend gap grows by a
+# full closed day). The right-edge bound tolerates the recurring rhythm PLUS this
+# allowance so a holiday-bordered cache stays fresh, while a one-off multi-month
+# (cs43) / interior (cs50) hole — which is many session days, not one — stays
+# rejected. ``max(canonical, _HOLIDAY_ALLOWANCE)`` so an intraday holiday (a full
+# closed day) and a daily holiday (one 1d step) are both covered.
+_HOLIDAY_ALLOWANCE = pd.Timedelta(days=1)
+
 # Timeframe → bar-step seconds. Used to infer the default right-edge staleness
 # bound (cs43): one timeframe step is the tightest gap a fresh cache can have
 # below the cutoff without indicating stale data.
@@ -82,7 +92,7 @@ def _max_observed_gap(timestamps: pd.Series) -> pd.Timedelta | None:
 
 
 def _calendar_bound(canonical: pd.Timedelta, timestamps: pd.Series) -> pd.Timedelta:
-    """Self-calibrating right-edge bound for calendar-gapped markets (cs58).
+    """Self-calibrating CONTIGUITY bound for calendar-gapped markets (cs58).
 
     cs43 set the right-edge staleness bound to ONE literal ``_infer_step``
     (1d->1 day, 1h->1 hour) with zero trading-calendar awareness. Non-24/7
@@ -93,21 +103,19 @@ def _calendar_bound(canonical: pd.Timedelta, timestamps: pd.Series) -> pd.Timede
     the provider had nothing newer (markets closed Sat/Sun). Same for an
     intraday cache across an overnight session gap.
 
-    The fix judges right-edge freshness by whether the newest bar advanced as
-    far as the CALENDAR/PROVIDER allows, not the canonical wall-clock step. We
-    learn the market's own rhythm from the cache: the largest inter-bar gap that
-    RECURS (appears at least twice) in the observed spacing is a legitimate
-    calendar gap (weekend, overnight) and widens the bound; a one-off giant gap
-    does NOT recur and is excluded, so the cs43 multi-month stale edge and the
-    cs50 single interior hole stay rejected. The canonical step is the floor (a
-    one-bar provider shortfall is always tolerated; a too-short cache with no
-    learnable rhythm degrades to the cs43 canonical bound).
+    We learn the market's own rhythm from the cache: the largest inter-bar gap
+    that RECURS (appears at least twice) in the observed spacing is a legitimate
+    calendar gap (weekend, overnight); a one-off giant gap does NOT recur and is
+    excluded, so the cs50 single interior hole stays rejected. The canonical step
+    is the floor (a one-bar provider shortfall is always tolerated; a too-short
+    cache with no learnable rhythm degrades to the cs43 canonical bound).
 
-    This bound gates the HIT path (which must serve a multi-bar lookback window
-    contiguously), so it is deliberately CONSERVATIVE: it requires recurrence so
-    that a one-off interior hole cannot widen the contiguity tolerance. The
-    MISS-path abstain flag (an honesty signal, not a data-serving gate) uses the
-    looser :func:`_max_observed_gap` instead.
+    cs63 SCOPE: this recurrence-based bound now gates ONLY the cs50 CONTIGUITY
+    check of the served lookback window — it must stay conservative so a one-off
+    interior hole cannot widen the contiguity tolerance. The right-EDGE freshness
+    gate uses the looser :func:`_edge_bound` (this bound + one closed session day)
+    so a non-recurring market HOLIDAY at the edge does not refetch forever; the
+    MISS-path abstain flag uses :func:`_flag_bound`.
     """
     if len(timestamps) < 2:
         return canonical
@@ -123,6 +131,51 @@ def _calendar_bound(canonical: pd.Timedelta, timestamps: pd.Series) -> pd.Timede
         return canonical
     largest_recurring = pd.Timedelta(seconds=int(recurring.max()))
     return max(canonical, largest_recurring)
+
+
+def _edge_bound(canonical: pd.Timedelta, timestamps: pd.Series) -> pd.Timedelta:
+    """Right-edge freshness bound that tolerates a non-recurring HOLIDAY (cs63).
+
+    cs58's :func:`_calendar_bound` learns only the cache's RECURRING inter-bar gap
+    (the 3-day Fri->Mon weekend, the overnight session gap). A market HOLIDAY
+    produces a rarer, longer trailing gap that a single backtest window observes
+    <2 times, so the >=2 recurrence gate never learns it: a fresh DAILY cache
+    ending Friday with an ``--end`` anchored the Tuesday after a Monday holiday
+    sits Fri->Tue = 4 calendar days > the learned 3-day weekend bound, so the
+    fresh fully-supplied cache MISSes + refetches on EVERY run (the refetch-forever
+    shape cs58 fixed for weekends), and likewise for a 2-session intraday holiday
+    gap.
+
+    A holiday is exactly ONE extra closed session day adjacent to a known calendar
+    rhythm, so the edge tolerance is the recurring rhythm PLUS one closed session
+    day (:data:`_HOLIDAY_ALLOWANCE`, floored to the canonical step). Crucially the
+    widening is derived from the RECURRING rhythm, NOT from the cache's largest
+    observed gap: an ancient one-off interior delisting hole (many session days)
+    does not inflate the edge tolerance, so the cs43 multi-month stale edge and an
+    ancient-interior-hole + smaller-stale-edge cache both stay rejected. The cs50
+    contiguity check keeps the tighter :func:`_calendar_bound` so a one-off interior
+    hole still fails contiguity even though the edge tolerance is widened.
+    """
+    cal = _calendar_bound(canonical, timestamps)
+    return max(canonical, cal + max(canonical, _HOLIDAY_ALLOWANCE))
+
+
+def _flag_bound(canonical: pd.Timedelta, timestamps: pd.Series) -> pd.Timedelta:
+    """MISS-path abstain-flag bound (cs58 Layer-2 + cs63).
+
+    The ``right_edge_stale_days`` flag is an HONESTY signal (not a data-serving
+    gate), so it may be looser than the HIT-path :func:`_edge_bound`. cs58 Layer-2
+    widened it to the cache's own largest observed inter-bar gap (a single observed
+    weekend/overnight gap is enough to vouch for an equal-sized right-edge gap). cs63
+    additionally tolerates one closed session day so a holiday-bordered cache that
+    happens to MISS for another reason does not false-abstain. A genuinely stale
+    cache (cs49: dense hourly, newest months below the cutoff) has only a tiny
+    observed gap, far below the multi-month edge gap -> it STILL flags.
+    """
+    observed = _max_observed_gap(timestamps)
+    if observed is None:
+        return canonical
+    return max(canonical, observed + max(canonical, _HOLIDAY_ALLOWANCE))
 
 
 @dataclass(frozen=True)
@@ -287,6 +340,21 @@ def cached_fetch(
     discontiguous served tail fails the HIT and falls through to MISS/fetch.
     ``cutoff=None`` imposes no contiguity check.
 
+    CALENDAR + HOLIDAY EDGE (cs58/cs63): cs43's literal one-step bound over-tightens
+    for non-24/7 markets and refetches a fresh cache forever across a weekend or an
+    overnight session gap. cs58 widened the edge bound to the cache's own RECURRING
+    inter-bar gap (the weekend/overnight rhythm). cs63 additionally tolerates one
+    closed session day: a market HOLIDAY is a rarer, longer trailing gap a single
+    backtest window observes <2 times (a Friday close before a Monday holiday, with
+    ``--end`` anchored the Tuesday after, is Fri->Tue = 4 calendar days > the learned
+    3-day weekend bound), so the recurrence-only bound never learns it and the fresh
+    cache refetched forever. The HIT-path EDGE gate uses ``_edge_bound`` (recurring
+    rhythm + one closed session day) while the cs50 CONTIGUITY check keeps the tighter
+    recurrence-only ``_calendar_bound``, so a non-recurring holiday at the EDGE stays
+    fresh but a one-off multi-month (cs43) / interior (cs50) hole — derived from the
+    recurring rhythm, NOT the largest observed gap, so an ancient interior delisting
+    hole never inflates the edge tolerance — stays rejected.
+
     MISS RIGHT-EDGE STALENESS (cs49): on a MISS the provider may ALSO be unable
     to supply bars up to ``cutoff`` (delisted symbol / provider lagging / short
     window). Two harms follow: (1) the served result keeps a stale right edge
@@ -329,19 +397,25 @@ def cached_fetch(
         if bound is not None:
             # cs58: a literal one-step bound over-tightens for calendar-gapped
             # markets (a Fri->Mon weekend, an overnight session gap) and
-            # refetches a fresh cache forever. Widen the bound to the cache's
-            # own RECURRING inter-bar gap so a legitimate calendar gap at the
-            # edge is fresh, while a one-off cs43 multi-month / cs50 interior
-            # hole (does not recur) stays rejected.
-            cal_bound = _calendar_bound(bound, eligible["timestamp"])
+            # refetches a fresh cache forever. The HIT path uses TWO bounds:
+            #   * cs63 edge bound: the cache's recurring rhythm PLUS one closed
+            #     session day, so a non-recurring market HOLIDAY at the edge
+            #     (Fri-close + Mon-holiday, Tuesday anchor) stays fresh and does
+            #     not refetch forever, while a one-off cs43 multi-month stale edge
+            #     (many session days) stays rejected;
+            #   * cs50 contiguity bound: the TIGHTER recurrence-only bound (NOT
+            #     holiday-widened) so a one-off multi-step interior hole still
+            #     fails contiguity even though the edge tolerance is widened.
+            edge_bound = _edge_bound(bound, eligible["timestamp"])
+            contig_bound = _calendar_bound(bound, eligible["timestamp"])
             newest_eligible = eligible["timestamp"].max()
-            fresh_right_edge = (cutoff - newest_eligible) <= cal_bound
+            fresh_right_edge = (cutoff - newest_eligible) <= edge_bound
             served = eligible.tail(min(lookback_bars, len(eligible)))
             if len(served) >= 2:
                 max_gap = served["timestamp"].diff().dropna().max()
                 # One missing closed bar (or one recurring calendar gap) is
                 # tolerated; a one-off multi-step interior hole is not.
-                contiguous = max_gap <= cal_bound * 1.5
+                contiguous = max_gap <= contig_bound * 1.5
     if enough_bars and fresh_right_edge and contiguous:
         out = eligible.tail(min(lookback_bars, len(eligible))).reset_index(drop=True)
         return out, {
@@ -390,22 +464,21 @@ def cached_fetch(
     # cs49: surface an honest right-edge staleness signal so the caller can
     # ABSTAIN rather than silently trust a stale window. cutoff=None -> no flag.
     #
-    # cs58 Layer-2: the bare canonical one-step bound over-flags a fresh
+    # cs58 Layer-2 + cs63: the bare canonical one-step bound over-flags a fresh
     # calendar-gapped cache. A 2-trading-week DAILY cache (Friday close) with a
     # Monday cutoff sits 3 calendar days above its newest bar > the 1-day step,
     # so the canonical bound wrongly emits ``right_edge_stale_days`` and the
     # caller ABSTAINS on a demonstrably-fresh cache. The flag is an honesty
     # signal (not a data-serving gate), so it may be looser than the HIT gate's
-    # recurrence-required ``_calendar_bound``: widen it to the cache's own
-    # largest observed inter-bar gap (a single observed weekend/overnight gap is
-    # enough to vouch for an equal-sized right-edge gap). A genuinely stale cache
-    # (cs49: dense hourly, newest months below the cutoff) has only a 1h largest
-    # observed gap, far below the multi-month edge gap -> it STILL flags.
+    # ``_edge_bound``: :func:`_flag_bound` widens it to the cache's own largest
+    # observed inter-bar gap (cs58 L2) plus one closed session day (cs63 holiday).
+    # A genuinely stale cache (cs49: dense hourly, newest months below the cutoff)
+    # has only a 1h largest observed gap, far below the multi-month edge gap -> it
+    # STILL flags.
     if cutoff is not None and not merged.empty:
         bound = max_staleness if max_staleness is not None else _infer_step(timeframe, merged)
         if bound is not None:
-            observed = _max_observed_gap(merged["timestamp"])
-            flag_bound = bound if observed is None else max(bound, observed)
+            flag_bound = _flag_bound(bound, merged["timestamp"])
             gap = cutoff - merged["timestamp"].max()
             if gap > flag_bound:
                 meta["right_edge_stale_days"] = int(gap / pd.Timedelta(days=1))

@@ -47,13 +47,31 @@ def _daily_business_bars(start, end):
     return _bars_from_ts(pd.bdate_range(start, end, tz="UTC"))
 
 
-def _intraday_rth_bars(start, end, *, open_h=14, close_h=20):
-    """1h Mon-Fri RTH-window bars with overnight AND weekend session gaps."""
+def _intraday_rth_bars(start, end, *, open_h=14, close_h=20, holidays=()):
+    """1h Mon-Fri RTH-window bars with overnight AND weekend session gaps.
+
+    ``holidays`` (date strings) are dropped so a closed-holiday session produces a
+    longer-than-overnight/weekend trailing gap (cs63).
+    """
+    skip = {pd.Timestamp(d, tz="UTC") for d in holidays}
     ts = []
     for day in pd.bdate_range(start, end, tz="UTC"):
+        if day in skip:
+            continue
         for h in range(open_h, close_h + 1):
             ts.append(day + pd.Timedelta(hours=h))
     return _bars_from_ts(pd.DatetimeIndex(ts), seed=2)
+
+
+def _daily_business_bars_with_holidays(start, end, holidays):
+    """Mon-Fri daily bars with the given ``holidays`` (date strings) removed.
+
+    A removed Monday/Friday holiday produces a 4-calendar-day trailing gap
+    (Fri->Tue or Thu->Mon) that exceeds the 3-day weekend rhythm (cs63).
+    """
+    days = pd.bdate_range(start, end, tz="UTC")
+    skip = {pd.Timestamp(d, tz="UTC") for d in holidays}
+    return _bars_from_ts(pd.DatetimeIndex([d for d in days if d not in skip]))
 
 
 def test_safe_path_uses_provider_symbol_timeframe(tmp_path):
@@ -905,6 +923,214 @@ def test_cached_fetch_intraday_two_session_no_abstain(tmp_path):
     assert append_calls["n"] == 0  # no churn (cs49 intact)
     assert "right_edge_stale_days" not in meta  # no false abstain
     assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_daily_monday_holiday_anchor_hits_no_refetch_loop(tmp_path):
+    """cs63 (residual cs58): cs58 learns only the cache's RECURRING inter-bar gap
+    (the 3-day Fri->Mon weekend, count>=2). A market HOLIDAY produces a rarer,
+    longer trailing gap: a fresh, contiguous DAILY equity cache whose freshest real
+    bar is FRIDAY's close, with a backtest --end anchored the TUESDAY after a Monday
+    holiday (Memorial Day), sits ~4 calendar days above Friday > the learned 3-day
+    weekend bound. A single holiday recurs <2x in a typical backtest window, so the
+    cs58 >=2 recurrence gate never learns the 4-day gap -> the fresh fully-supplied
+    cache MISSes + refetches on EVERY run (the refetch-forever shape cs58 fixed for
+    weekends). The edge bound must tolerate one closed session day adjacent to the
+    recurring weekend rhythm so the fresh holiday-bordered cache HITs and never loops.
+    """
+    calls = {"n": 0}
+    # 6 trading weeks of Mon-Fri daily bars, NO in-cache holiday; newest is Friday
+    # 2024-05-24 (the trading day before Memorial Day Monday 2024-05-27).
+    bars = _daily_business_bars("2024-04-15", "2024-05-24")
+    cache = OhlcvCache("alpaca", "AAPL", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        calls["n"] += 1
+        return bars  # provider has nothing newer than Friday (Mon is a holiday)
+
+    cutoff = pd.Timestamp("2024-05-28T00:00:00Z")  # Tuesday after Memorial Day Monday
+    kwargs = dict(
+        provider="alpaca",
+        symbol="AAPL",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    for _ in range(3):
+        out, meta = cached_fetch(fetch, **kwargs)
+        assert meta["cache_hit"] is True
+    assert calls["n"] == 0  # no refetch-forever loop on the holiday boundary
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_intraday_holiday_session_anchor_hits(tmp_path):
+    """cs63: an INTRADAY 1h RTH cache (14:00-20:00Z, Mon-Fri) anchored at the open
+    of the first session AFTER a Monday holiday. The newest bar is the prior
+    Friday's 20:00Z close; the next session open is the Tuesday after the holiday,
+    so the trailing edge gap is Fri 20:00 -> Tue 14:00 = 90h = a weekend (66h) plus a
+    full closed session DAY. cs58's recurring weekend rhythm alone (66h) does NOT
+    cover it -> refetch loop. The bound must tolerate one closed session day past the
+    recurring weekend so it HITs.
+    """
+    calls = {"n": 0}
+    # 3 trading weeks so the 66h weekend gap recurs (>=2); newest is Fri 2024-05-24.
+    bars = _intraday_rth_bars("2024-05-06", "2024-05-24")
+    cache = OhlcvCache("alpaca", "MSFT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        calls["n"] += 1
+        return bars
+
+    # Tuesday-after-holiday open anchor (Memorial Day Monday 2024-05-27 closed).
+    cutoff = pd.Timestamp("2024-05-28T14:00:00Z")
+    kwargs = dict(
+        provider="alpaca",
+        symbol="MSFT",
+        timeframe="1h",
+        lookback_bars=20,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    for _ in range(3):
+        out, meta = cached_fetch(fetch, **kwargs)
+        assert meta["cache_hit"] is True
+    assert calls["n"] == 0
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_holiday_bound_still_rejects_cs43_multimonth(tmp_path):
+    """cs63 anti-regression: the holiday-widened edge bound must NOT reopen the cs43
+    multi-month-stale hole. A DAILY Mon-Fri cache ending months before the anchor
+    has at most a 3-day recurring weekend gap; widening it by one closed session day
+    yields a 4-day bound, still far below a multi-month stale edge -> the HIT is
+    still REJECTED and the provider refreshes.
+    """
+    calls = {"n": 0}
+    stale = _daily_business_bars("2024-01-01", "2024-01-31")  # ends ~2024-01-31
+
+    def fetch():
+        calls["n"] += 1
+        return _daily_business_bars("2024-05-01", "2024-05-31")  # fresh provider bars
+
+    cache = OhlcvCache("alpaca", "OLD", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(stale)
+
+    cutoff = pd.Timestamp("2024-06-03T00:00:00Z")  # ~4 months past the cache edge
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="OLD",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 1  # multi-month stale edge -> MISS/fetch (cs43 intact)
+    assert meta["cache_hit"] is False
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_holiday_bound_still_rejects_cs50_interior_hole(tmp_path):
+    """cs63 anti-regression: widening the EDGE bound for a holiday must NOT widen the
+    cs50 contiguity tolerance. The contiguity check stays on the recurrence-based
+    bound (NOT the holiday-widened edge bound), so a single giant INTERIOR hole still
+    fails contiguity and the discontiguous served tail is rejected.
+    """
+    calls = {"n": 0}
+    ancient = _bars(200, start="2024-01-01")  # contiguous hourly, ends ~2024-01-09
+    fresh1 = _bars(1, start="2024-06-01T00:00:00Z", seed=9)  # single bar AT cutoff
+    cache = OhlcvCache("ccxt", "HOLE", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(pd.concat([ancient, fresh1], ignore_index=True))
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(300, start="2024-05-20")
+
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="HOLE",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 1  # discontiguous interior hole -> MISS/fetch (cs50 intact)
+    assert meta["cache_hit"] is False
+
+
+def test_cached_fetch_holiday_bound_rejects_ancient_interior_hole_plus_stale_edge(tmp_path):
+    """cs63 critical reconciliation (flagged by the cs58 prove): a cache containing
+    an ANCIENT one-off giant INTERIOR gap (a delisting hole) PLUS a stale right edge
+    must NOT wrongly HIT just because the interior hole is large. The holiday edge
+    bound is derived from the cache's RECURRING calendar rhythm + one closed session
+    day, NOT from the largest observed gap, so a one-off interior delisting hole does
+    not inflate the edge tolerance. With a stale edge SMALLER than the interior hole,
+    a max-observed-gap bound would wrongly tolerate it; the recurrence-based bound
+    correctly rejects it.
+    """
+    calls = {"n": 0}
+    seg1 = _daily_business_bars("2023-01-02", "2023-02-15")  # ~32 daily bars
+    seg2 = _daily_business_bars("2023-08-01", "2023-09-15")  # after a ~6-month hole
+    cache = OhlcvCache("alpaca", "DELISTED", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(pd.concat([seg1, seg2], ignore_index=True))
+
+    def fetch():
+        calls["n"] += 1
+        return _daily_business_bars("2023-10-15", "2023-11-15")  # fresh provider bars
+
+    # Stale edge ~2 months past seg2 (Sep 15) -> smaller than the 6-month interior hole.
+    cutoff = pd.Timestamp("2023-11-15T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="DELISTED",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 1  # interior hole must NOT widen the edge -> MISS/fetch
+    assert meta["cache_hit"] is False
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_holiday_bound_cutoff_none_byte_identical(tmp_path):
+    """cs63: cutoff=None (live caller) imposes NO edge/holiday bound and is unchanged
+    from the prior behaviour (HITs, no staleness flag, most-recent tail).
+    """
+    calls = {"n": 0}
+    bars = _daily_business_bars("2024-04-15", "2024-05-24")
+    cache = OhlcvCache("alpaca", "AAPL", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        calls["n"] += 1
+        return bars
+
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="AAPL",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=None,
+    )
+    assert calls["n"] == 0
+    assert meta["cache_hit"] is True
+    assert "right_edge_stale_days" not in meta
+    full = cache.read()
+    assert out["timestamp"].iloc[-1] == full["timestamp"].iloc[-1]
 
 
 def test_normalize_drops_bad_rows_and_duplicates():
