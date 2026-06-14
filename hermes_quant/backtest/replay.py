@@ -492,16 +492,65 @@ def replay(
     if n_observations >= 30:
         from hermes_quant.evaluation.dsr import deflated_sharpe
 
-        try:
-            dsr = deflated_sharpe(
-                observed_sharpe=sharpe,
-                n_trials=1,
-                n_observations=n_observations,
-                skew=float(strat_returns.skew()) if n_observations >= 3 else 0.0,
-                kurtosis=float(strat_returns.kurtosis() + 3.0) if n_observations >= 4 else 3.0,
+        skew = float(strat_returns.skew()) if n_observations >= 3 else 0.0
+        kurtosis = float(strat_returns.kurtosis() + 3.0) if n_observations >= 4 else 3.0
+
+        # cs56 (sibling of cs48 on the replay path): a zero-variance OOS
+        # strategy series (e.g. bit-identical per-bar returns from a flat-but-
+        # marked position, or a synthetic geometric-doubling instrument) makes
+        # `_sharpe` return ±inf (see _sharpe below: std==0, mean!=0 branch).
+        # dsr.deflated_sharpe then forms
+        # ``variance_term = 1 - skew*SR + (kurt-1)/4*SR**2``; for a constant
+        # series skew==0, so ``skew*inf == NaN`` -> variance_term is NaN, the
+        # ``variance_term <= 0`` guard (NaN<=0 == False) is bypassed, and
+        # ``Φ(sr_diff·sqrt(n-1)/sqrt(NaN))`` collapses to NaN WITHOUT raising —
+        # the try/except below only catches ValueError/ZeroDivisionError, so the
+        # NaN escapes into BacktestResult.deflated_sharpe and renders as ``null``
+        # in result.json, INDISTINGUISHABLE from the legitimate
+        # n_observations<30 low-power omission and silently erasing the
+        # false-discovery hedge from the operator's view of a degenerate
+        # backtest. Mirror cs48's validation.py guard EXACTLY: when any DSR input
+        # is non-finite the deflated Sharpe is not estimable; report a
+        # CONSERVATIVE finite 0.0 (zero probability the Sharpe is real — fails any
+        # ``dsr >= floor`` gate) plus a warning. A finite-variance series leaves
+        # every input finite, this guard never fires, and the result is
+        # byte-identical to the bare dsr call.
+        if not (
+            np.isfinite(sharpe) and np.isfinite(skew) and np.isfinite(kurtosis)
+        ):
+            dsr = 0.0
+            logger.warning(
+                "backtest: non-finite Sharpe/skew/kurtosis "
+                "(sharpe=%s, skew=%s, kurtosis=%s); degenerate (likely "
+                "zero-variance) OOS series. Reporting a conservative deflated "
+                "Sharpe of 0.0 (fails the DSR floor) rather than a NaN that "
+                "would render as null and masquerade as a low-power omission.",
+                sharpe,
+                skew,
+                kurtosis,
             )
-        except (ValueError, ZeroDivisionError):
-            dsr = float("nan")
+        else:
+            try:
+                dsr = deflated_sharpe(
+                    observed_sharpe=sharpe,
+                    n_trials=1,
+                    n_observations=n_observations,
+                    skew=skew,
+                    kurtosis=kurtosis,
+                )
+            except (ValueError, ZeroDivisionError):
+                dsr = float("nan")
+            else:
+                # Defensive belt: dsr.deflated_sharpe can in principle return a
+                # non-finite probability if a future input combination escapes
+                # its internal guards. Never let a NaN/inf DSR reach the
+                # artifact; collapse to the conservative 0.0.
+                if not np.isfinite(dsr):
+                    logger.warning(
+                        "backtest: non-finite deflated Sharpe result; reporting "
+                        "a conservative 0.0 (fails the DSR floor)."
+                    )
+                    dsr = 0.0
     else:
         dsr = float("nan")
 
