@@ -42,6 +42,7 @@ import pandas as pd
 from hermes_quant.calibrators import ColdStartCalibrator
 from hermes_quant.data.fundamentals_provider import FundamentalsProvider
 from hermes_quant.pdr_core import is_option_asset_class
+from hermes_quant.playbook.scorers import NON_EQUITY_QUOTE_TYPES
 from hermes_quant.protocol import (
     AnalystView,
     CalibratorNotReady,
@@ -232,7 +233,8 @@ class FundamentalsAnalyst:
           - no parquet file (cache miss; cron will populate)
           - parquet is empty
           - latest row is older than _STALENESS_DAYS_HARD_LIMIT days
-          - quote_type is 'ETF' (post-fetch ETF detection)
+          - quote_type is in NON_EQUITY_QUOTE_TYPES (post-fetch non-equity
+            detection: ETF / MUTUALFUND / INDEX / CURRENCY / CRYPTOCURRENCY)
         """
         try:
             snapshot = self.provider.read_latest(ticker, as_of=asof)
@@ -245,10 +247,18 @@ class FundamentalsAnalyst:
             return None
         if snapshot is None:
             return None
-        # ETF post-check (yfinance may label something an ETF that the
-        # heuristic gate above missed).
+        # Non-equity quote_type post-check (cs45/cs47). The symbol heuristics
+        # above only catch '/' (crypto) and '=X' (fx); a plain ticker with NO
+        # asset_class classifies 'equity' and the snapshot is fetched. The
+        # provider then writes ANY yfinance quoteType verbatim, so a MUTUALFUND
+        # / INDEX / CURRENCY / CRYPTOCURRENCY (or ETF) snapshot would otherwise
+        # be scored with equity-specific fundamentals (P/E, D/E, FCF, …) as if
+        # it were a stock — a category error feeding an ADR-0004 gate input.
+        # Abstain on the FULL canonical non-equity set, single-sourced from the
+        # provider-side scorers.NON_EQUITY_QUOTE_TYPES (the set scorers.py uses
+        # to skip equity-only earnings lookups) rather than a third inlined copy.
         qt = snapshot.get("quote_type")
-        if isinstance(qt, str) and qt.upper() == "ETF":
+        if isinstance(qt, str) and qt.upper() in NON_EQUITY_QUOTE_TYPES:
             return None
         if asof.tzinfo is None:
             asof = asof.tz_localize("UTC")

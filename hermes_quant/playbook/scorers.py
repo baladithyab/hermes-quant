@@ -34,6 +34,30 @@ from .profiles import PROFILES, PlayProfile
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
+# Canonical non-equity quote_type vocabulary (single source of truth)
+# --------------------------------------------------------------------------- #
+#
+# The yfinance ``quoteType`` strings that denote a NON-equity instrument, i.e. one
+# that has no earnings cycle and whose equity-specific fundamentals (P/E, D/E, FCF,
+# revenue YoY, …) are meaningless. The provider writes ANY ``info["quoteType"]``
+# verbatim into the snapshot (fundamentals_provider.py: ``str(info.get("quoteType")
+# or "")``), so every consumer that treats a snapshot as equity-shaped MUST gate on
+# this set, not on a single string.
+#
+# cs47: previously this set was inlined TWICE below (the earnings-lookup skip and
+# its legacy-calendar fallback) and a THIRD, narrower copy ('ETF' only) lived in
+# the FundamentalsAnalyst post-fetch gate — so a MUTUALFUND/INDEX/CURRENCY/
+# CRYPTOCURRENCY snapshot reached the analyst and was scored as a stock (an
+# ADR-0004 gate input). Hoisting to ONE frozenset, consumed by both sites here AND
+# by ``analysts.fundamentals`` (which imports THIS name), makes the abstain
+# vocabulary single-sourced and keeps the analyst's gate in lockstep with the
+# provider's own enumeration. Strings are upper-cased on write (line ~585), so
+# membership is case-exact against upper-case members.
+NON_EQUITY_QUOTE_TYPES: frozenset[str] = frozenset(
+    {"ETF", "MUTUALFUND", "INDEX", "CURRENCY", "CRYPTOCURRENCY"}
+)
+
+# --------------------------------------------------------------------------- #
 # Output dataclass
 # --------------------------------------------------------------------------- #
 
@@ -600,7 +624,7 @@ def compute_play_snapshot(symbol: str, asof: date | datetime | None = None) -> d
     # to avoid (a) HTTP 404 spam on stderr that yfinance can't be told to
     # silence and (b) wasted round-trips on hundreds of universe symbols.
     most_recent_past: datetime | None = None
-    if snap["quote_type"] in {"ETF", "MUTUALFUND", "INDEX", "CURRENCY", "CRYPTOCURRENCY"}:
+    if snap["quote_type"] in NON_EQUITY_QUOTE_TYPES:
         # Non-equity: leave days_since_earnings as None and let the
         # post-block default fill in the safe-large placeholder. No HTTP.
         pass
@@ -628,7 +652,7 @@ def compute_play_snapshot(symbol: str, asof: date | datetime | None = None) -> d
 
     if most_recent_past is not None:
         snap["days_since_earnings"] = (asof_dt - most_recent_past).days
-    elif snap["quote_type"] not in {"ETF", "MUTUALFUND", "INDEX", "CURRENCY", "CRYPTOCURRENCY"}:
+    elif snap["quote_type"] not in NON_EQUITY_QUOTE_TYPES:
         # Fall back to legacy calendar (next-earnings); flip sign sensibly.
         # Same stderr-suppression rationale as above.
         import contextlib as _ctxlib

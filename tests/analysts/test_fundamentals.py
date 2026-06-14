@@ -772,3 +772,92 @@ def test_charter_d8_no_training_invariant(
 def test_protocol_compliance(analyst: FundamentalsAnalyst) -> None:
     """`isinstance(FundamentalsAnalyst(), Analyst)` must be True (ADR-0002)."""
     assert isinstance(analyst, Analyst)
+
+
+# ---------------------------------------------------------------------------
+# 16 — non-equity quote_type abstain (cs47): the post-fetch quote_type gate
+#      abstained ONLY on 'ETF'. The provider writes ANY yfinance quoteType
+#      verbatim (fundamentals_provider.py:742 -> str(info.get("quoteType")
+#      or "")), so a cached snapshot whose quote_type is MUTUALFUND / INDEX /
+#      CURRENCY / CRYPTOCURRENCY (the rest of the canonical non-equity set that
+#      scorers.py already enumerates twice) reached the analyst when the symbol
+#      heuristics classified it 'equity' (no '/', no '=X', no asset_class).
+#      It was then SCORED with equity-specific fundamentals (P/E, D/E, FCF, …)
+#      as if it were a stock — a perception-layer category error feeding an
+#      ADR-0004 gate input. The fix STRICTLY WIDENS the abstain set to the full
+#      canonical non-equity quote_type vocabulary (defense-in-depth,
+#      silence-by-default); EQUITY stays byte-identical (still scored).
+# ---------------------------------------------------------------------------
+
+
+def _strong_long_row(fetched: pd.Timestamp, quote_type: str) -> dict[str, Any]:
+    """A snapshot that WOULD fire a strong 6-of-6 long view if scored as equity.
+
+    Mirrors test_equity_happy_path's subject so the ONLY thing that can stop a
+    view is the quote_type gate — proving the non-equity snapshot is otherwise
+    fully scoreable equity-shaped data."""
+    return _row(
+        fetched_at=fetched,
+        pe_trailing=18.0,
+        pe_forward=14.0,  # forward < trailing → improving
+        debt_to_equity=0.2,  # clean balance sheet
+        free_cash_flow=9.5e10,
+        fcf_yoy=0.25,  # FCF YoY +25% → buy
+        revenue_yoy=0.18,  # > 0.15 → buy
+        eps_trailing=7.0,
+        eps_forward=7.5,  # fwd / trail = 1.07 → +1
+        sector="Tech",
+        quote_type=quote_type,
+    )
+
+
+@pytest.mark.parametrize(
+    "quote_type", ["MUTUALFUND", "INDEX", "CURRENCY", "CRYPTOCURRENCY"]
+)
+def test_non_equity_quote_type_abstains_post_fetch(
+    provider: FundamentalsProvider,
+    analyst: FundamentalsAnalyst,
+    quote_type: str,
+) -> None:
+    """cs47 RED→GREEN: a cached non-equity quote_type must abstain post-fetch.
+
+    No asset_class is given on the ctx, so the universe heuristics classify the
+    plain ticker as 'equity' and the snapshot is fetched. Pre-fix the post-fetch
+    gate only matched 'ETF', so a MUTUALFUND/INDEX/CURRENCY/CRYPTOCURRENCY
+    snapshot was scored as a stock and produced a view. Post-fix the analyst
+    abstains (Protocol-clean None) for the whole non-equity set."""
+    asof = pd.Timestamp("2026-05-15T16:00:00", tz="UTC")
+    fetched = asof - pd.Timedelta(hours=18)
+    # Sector benchmark so pe_relative can fire (P/E=18 vs sector ~25 → cheap).
+    provider.write_snapshot("AAA", _row(fetched_at=fetched, pe_trailing=24.0, sector="Tech"))
+    provider.write_snapshot("BBB", _row(fetched_at=fetched, pe_trailing=26.0, sector="Tech"))
+    provider.refresh_sector_medians(["AAA", "BBB"])
+    # Subject: equity-shaped strong-long fundamentals but a non-equity quote_type.
+    provider.write_snapshot("FOO", _strong_long_row(fetched, quote_type=quote_type))
+
+    # ctx asset_class=None → '/'-less, '=X'-less ticker classifies 'equity'.
+    view = analyst.analyze(_ctx("FOO", asof, asset_class=None))
+    assert view is None, (
+        f"quote_type={quote_type!r} is non-equity; the analyst must abstain "
+        f"(Protocol-clean None), not score it as a stock — got {view!r}"
+    )
+
+
+def test_equity_quote_type_still_scored_byte_identical(
+    provider: FundamentalsProvider, analyst: FundamentalsAnalyst
+) -> None:
+    """cs47 invariant: an EQUITY quote_type snapshot still scores unchanged.
+
+    The widened abstain set must NOT darken legitimate equities — the same
+    strong-long row that test_equity_happy_path admits must still produce a
+    +1 view when quote_type='EQUITY'."""
+    asof = pd.Timestamp("2026-05-15T16:00:00", tz="UTC")
+    fetched = asof - pd.Timedelta(hours=18)
+    provider.write_snapshot("AAA", _row(fetched_at=fetched, pe_trailing=24.0, sector="Tech"))
+    provider.write_snapshot("BBB", _row(fetched_at=fetched, pe_trailing=26.0, sector="Tech"))
+    provider.refresh_sector_medians(["AAA", "BBB"])
+    provider.write_snapshot("FOO", _strong_long_row(fetched, quote_type="EQUITY"))
+
+    view = analyst.analyze(_ctx("FOO", asof, asset_class=None))
+    assert view is not None
+    assert view.direction == +1
