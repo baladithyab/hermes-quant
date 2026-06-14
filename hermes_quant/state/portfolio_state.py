@@ -247,13 +247,28 @@ CREATE TABLE IF NOT EXISTS executions_replayed (
 -- (proposal_id, asof_execution, "", "")) — bit-identical. Each multi-leg child
 -- claims its OWN (proposal_id, asof_execution, asset, asset_class); re-applying the
 -- same child is still a no-op (idempotency held per leg).
+--
+-- cs51 same-OCC extension: a multi-leg family can ROLL the SAME OCC contract —
+-- e.g. leg 0 sell-to-close + leg 1 buy-to-open resolve to ONE (asset, asset_class)
+-- pair. Those two legs then collide on the 4-column key, so the 2nd leg's
+-- INSERT OR IGNORE is silently dropped on the incremental fold while reconstruct_from
+-- (no dedup table) folds both — a bus/state divergence on equity_total (the
+-- gate-sized NAV). The key is extended with leg_index: the option children already
+-- carry reactor_metadata.leg_index (react/multileg.py:582; 0, 1, ...), so the two
+-- same-OCC legs claim distinct keys. leg_index is "" (sentinel) for any record
+-- WITHOUT a reactor_metadata.leg_index — that is EVERY legacy/single-leg equity row
+-- AND the single covered-call equity child (which carries no leg_index) — so those
+-- paths key (proposal_id, asof_execution, asset, asset_class, "") EXACTLY as the
+-- 4-column form did. A genuine re-apply of the SAME leg has the same leg_index ⇒
+-- still a no-op (idempotency held per leg).
 CREATE TABLE IF NOT EXISTS processed_fills (
     proposal_id    TEXT NOT NULL,
     asof_execution TEXT NOT NULL,
     asset          TEXT NOT NULL DEFAULT '',
     asset_class    TEXT NOT NULL DEFAULT '',
+    leg_index      TEXT NOT NULL DEFAULT '',
     applied_at     TEXT NOT NULL,
-    PRIMARY KEY (proposal_id, asof_execution, asset, asset_class)
+    PRIMARY KEY (proposal_id, asof_execution, asset, asset_class, leg_index)
 );
 """
 
@@ -390,30 +405,43 @@ class PortfolioState:
     @staticmethod
     def _migrate_processed_fills(conn: sqlite3.Connection) -> None:
         """Idempotent migration: bring a pre-existing processed_fills table up to the
-        4-column PRIMARY KEY (proposal_id, asof_execution, asset, asset_class) that the
-        ADR-0029 multi-leg per-leg idempotency key requires.
+        5-column PRIMARY KEY (proposal_id, asof_execution, asset, asset_class, leg_index)
+        that the multi-leg per-leg idempotency key requires (cs29 asset/asset_class +
+        cs51 leg_index).
 
-        A DB created before this wave has the old 2-column PK (proposal_id,
-        asof_execution). A bare ``ALTER TABLE ADD COLUMN`` adds the columns but
-        CANNOT change the PRIMARY KEY in SQLite — so the dedup key stays 2-column and
-        a multi-leg family (which shares proposal_id + asof_execution across its legs)
-        collides: the 2nd leg's ``INSERT OR IGNORE`` is treated as a duplicate and the
-        leg is SILENTLY DROPPED from state.db while still landing on executions.jsonl
-        — a bus/state divergence on the money path. So a full PK REBUILD is REQUIRED
-        (caught by the Wave-D adversarial review; the fresh-DB tests never hit the
-        legacy path). We rebuild only when the PK is not already the 4-column form, so
-        this stays idempotent and a no-op on fresh / already-migrated DBs.
+        A DB created before this wave has either the old 2-column PK (proposal_id,
+        asof_execution) or the cs44 4-column PK (+ asset, asset_class). A bare ``ALTER
+        TABLE ADD COLUMN`` adds the columns but CANNOT change the PRIMARY KEY in SQLite —
+        so the dedup key stays narrow and a multi-leg family (which shares proposal_id +
+        asof_execution across its legs) collides: the 2nd leg's ``INSERT OR IGNORE`` is
+        treated as a duplicate and the leg is SILENTLY DROPPED from state.db while still
+        landing on executions.jsonl — a bus/state divergence on the money path. The
+        4-column key still collides when two legs of ONE family resolve to the SAME
+        (asset, asset_class) — a same-OCC roll (cs51). So a full PK REBUILD is REQUIRED
+        (caught by adversarial review; the fresh-DB tests never hit the legacy path). We
+        rebuild only when the PK is not already the 5-column form, so this stays
+        idempotent and a no-op on fresh / already-migrated DBs.
         """
         # PK column names, in order, from PRAGMA (pk>0 marks key membership).
         info = list(conn.execute("PRAGMA table_info(processed_fills)"))
         if not info:
             return  # table not created yet (executescript creates it first; defensive)
         pk_cols = [row[1] for row in sorted((r for r in info if r[5]), key=lambda r: r[5])]
-        if pk_cols == ["proposal_id", "asof_execution", "asset", "asset_class"]:
-            return  # already on the 4-column PK — nothing to do
-        # Legacy table: rebuild with the 4-column PK, preserving every existing row
-        # (legacy rows get '' sentinels for the new key columns — the equity dedup key
-        # is unchanged for those, so historical idempotency is preserved exactly).
+        if pk_cols == [
+            "proposal_id",
+            "asof_execution",
+            "asset",
+            "asset_class",
+            "leg_index",
+        ]:
+            return  # already on the 5-column PK — nothing to do
+        # Legacy table (2-col, or cs44 4-col): rebuild with the 5-column PK, preserving
+        # every existing row. The SELECT projects only the prior key columns +
+        # applied_at, so the new leg_index column takes its NOT NULL DEFAULT '' for every
+        # migrated row — the same '' sentinel a non-multi-leg apply uses, so historical
+        # idempotency is preserved exactly (an omitted NOT NULL DEFAULT '' column is
+        # filled with the default on INSERT). asset/asset_class likewise default to '' for
+        # a 2-col legacy source that lacks them.
         conn.execute(
             """
             CREATE TABLE processed_fills_new (
@@ -421,8 +449,9 @@ class PortfolioState:
                 asof_execution TEXT NOT NULL,
                 asset          TEXT NOT NULL DEFAULT '',
                 asset_class    TEXT NOT NULL DEFAULT '',
+                leg_index      TEXT NOT NULL DEFAULT '',
                 applied_at     TEXT NOT NULL,
-                PRIMARY KEY (proposal_id, asof_execution, asset, asset_class)
+                PRIMARY KEY (proposal_id, asof_execution, asset, asset_class, leg_index)
             )
             """
         )
@@ -740,6 +769,17 @@ class PortfolioState:
             pos_delta = fill_size_pct  # NAV-fraction proxy (legacy path)
             dedup_asset = ""
             dedup_asset_class = ""
+        # cs51: a same-OCC roll resolves two legs of ONE family to the SAME
+        # (proposal_id, asof, asset, asset_class), so the 4-column key collides and the
+        # 2nd leg's INSERT OR IGNORE is silently dropped on the incremental fold (while
+        # reconstruct_from folds both). Disambiguate with the per-leg index the option
+        # children already carry (react/multileg.py:582). A MISSING leg_index maps to the
+        # "" sentinel — NOT the literal string "None" — so every legacy/single-leg row and
+        # the single covered-call equity child (which carries no leg_index) keys exactly
+        # as the 4-column form did (byte-identical, dedup_leg == ""). leg_index 0 and 1 on
+        # the same OCC then claim distinct keys, so both legs apply.
+        _leg_index = rmeta.get("leg_index") if isinstance(rmeta, dict) else None
+        dedup_leg = "" if _leg_index is None else str(_leg_index)
         # Contract multiplier (ADR-0088 F1 fix): a us_option fill_price is the
         # PER-CONTRACT premium, but a contract controls 100 shares, so the cash
         # and equity-valuation impact is premium × contracts × 100. An equity
@@ -796,9 +836,16 @@ class PortfolioState:
                 if proposal_id:
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO processed_fills "
-                        "(proposal_id, asof_execution, asset, asset_class, applied_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (proposal_id, asof, dedup_asset, dedup_asset_class, _utc_now_iso()),
+                        "(proposal_id, asof_execution, asset, asset_class, leg_index, applied_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            proposal_id,
+                            asof,
+                            dedup_asset,
+                            dedup_asset_class,
+                            dedup_leg,
+                            _utc_now_iso(),
+                        ),
                     )
                     if cur.rowcount == 0:
                         # Already applied — this is the duplicate-apply
@@ -806,11 +853,12 @@ class PortfolioState:
                         # return cleanly.
                         conn.execute("ROLLBACK")
                         logger.info(
-                            "apply_execution: idempotency hit on (%s, %s, %s, %s); skipping",
+                            "apply_execution: idempotency hit on (%s, %s, %s, %s, %s); skipping",
                             proposal_id,
                             asof,
                             dedup_asset,
                             dedup_asset_class,
+                            dedup_leg,
                         )
                         return
 
