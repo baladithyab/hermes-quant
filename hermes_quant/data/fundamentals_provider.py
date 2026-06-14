@@ -488,6 +488,21 @@ class FundamentalsProvider:
         df = self._apply_reporting_lag_filter(df, asof_ts)
         if df.empty:
             return None
+        # cs53: symmetric with read_latest:426 (cs42(a)). A sector-median row
+        # whose fetched_at is strictly AFTER as_of was fetched in the future
+        # relative to this point-in-time read — never legitimate at as_of. The
+        # day-normalized as_of_date can pass the ``as_of_date <= as_of`` snapshot
+        # filter for an intraday-future fetched_at (or a fabricated future
+        # timestamp), which yields a NEGATIVE age_days below; the staleness gate
+        # ``age_days > SECTOR_MEDIAN_STALE_HARD_DAYS`` is then False for any
+        # negative value and the future-fetched median is silently ACCEPTED. The
+        # pe_relative DENOMINATOR (sector median) must obey the same no-lookahead
+        # discipline as the read_latest NUMERATOR. Drop it. Pure PIT correctness;
+        # touches only the as_of-bounded path.
+        if as_of is not None:
+            df = df[df["fetched_at"] <= asof_ts]
+            if df.empty:
+                return None
         df = df.sort_values("fetched_at")
         latest = df.iloc[-1]
         age_days = (asof_ts - pd.Timestamp(latest["fetched_at"])).days

@@ -645,6 +645,87 @@ def test_cs41_refresh_then_read_now_default_on_goes_dark(
 
 
 # ---------------------------------------------------------------------------
+# cs53: read_sector_median_pe must drop a row whose fetched_at is strictly
+# AFTER as_of — the SYMMETRIC future-fetch guard read_latest got in cs42(a) but
+# read_sector_median_pe never did. as_of_date is day-normalized at write, so a
+# same-day intraday-future fetched_at (or a fabricated future timestamp)
+# silently passes the ``as_of_date <= as_of`` snapshot filter, then yields a
+# NEGATIVE age_days that defeats the ``age_days > SECTOR_MEDIAN_STALE_HARD_DAYS``
+# staleness gate (negative is never > 30) -> the future-fetched DENOMINATOR
+# (sector median) is accepted. cs41 insists the pe_relative denominator obey the
+# same no-lookahead discipline as the read_latest numerator.
+# ---------------------------------------------------------------------------
+
+
+def test_cs53_sector_median_future_fetched_at_excluded_at_as_of(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs53 RED->GREEN: a sector median fetched in the future relative to as_of is dropped.
+
+    Flag OFF isolates the fetched_at guard from the reporting-lag filter (else
+    the as_of_date+45d fallback would also drop the row, masking the bug). The
+    median's as_of_date = D 00:00 (normalized) passes ``as_of_date <= as_of`` at
+    as_of = D 00:00, but fetched_at = D+12h is strictly AFTER as_of -> it was
+    fetched in the FUTURE. age_days = (D - (D+12h)).days = -1, so the staleness
+    gate (age_days > 30) is False and pre-cs53 the future-fetched median is
+    RETURNED. After cs53 the fetched_at guard drops it -> None.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    d = pd.Timestamp("2026-05-01T00:00:00", tz="UTC")
+    _write_sector_median_row(
+        provider,
+        as_of_date=d,
+        fetched_at=d + pd.Timedelta(hours=12),
+        median_pe=22.0,
+    )
+    # RED: pre-cs53 returns 22.0 (negative age defeats the staleness gate);
+    # GREEN: future fetched_at dropped -> None.
+    assert provider.read_sector_median_pe("Tech", as_of=d) is None
+
+
+def test_cs53_sector_median_fetched_at_le_as_of_byte_identical(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs53 byte-identical: the guard only drops STRICTLY-future fetches.
+
+    fetched_at = D-1h is before the read as_of = D+1d, so a median legitimately
+    fetched before the point-in-time read is unchanged — still returned (and the
+    age_days < 30 staleness gate still passes).
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    d = pd.Timestamp("2026-05-01T00:00:00", tz="UTC")
+    _write_sector_median_row(
+        provider,
+        as_of_date=d,
+        fetched_at=d - pd.Timedelta(hours=1),
+        median_pe=22.0,
+    )
+    assert provider.read_sector_median_pe(
+        "Tech", as_of=d + pd.Timedelta(days=1)
+    ) == pytest.approx(22.0)
+
+
+def test_cs53_sector_median_no_as_of_latest_path_untouched(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs53 scope: the as_of=None live read is unaffected by the fetched_at guard.
+
+    The guard lives on the as_of-bounded path only (mirroring cs42(a) in
+    read_latest). With as_of=None the read defaults asof_ts to now(UTC); a median
+    fetched ~1h ago is the normal live case and is still returned.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    now = pd.Timestamp.now(tz="UTC")
+    _write_sector_median_row(
+        provider,
+        as_of_date=now.normalize(),
+        fetched_at=now - pd.Timedelta(hours=1),
+        median_pe=22.0,
+    )
+    assert provider.read_sector_median_pe("Tech") == pytest.approx(22.0)
+
+
+# ---------------------------------------------------------------------------
 # cs42(a): read_latest must drop a row whose fetched_at is strictly AFTER as_of.
 # as_of_date is day-normalized at write, so a same-day intraday-future fetched_at
 # (or a fabricated future timestamp) silently passes the ``as_of_date <= as_of``
