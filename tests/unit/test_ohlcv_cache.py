@@ -346,6 +346,195 @@ def test_cached_fetch_max_staleness_explicit_override(tmp_path):
     assert meta["cache_hit"] is True
 
 
+def test_cached_fetch_miss_flags_stale_right_edge(tmp_path):
+    """cs49: on a MISS where the provider ALSO cannot supply bars up to the
+    cutoff (delisted symbol / provider lagging / short window), the served
+    result keeps a stale right edge but emits NO staleness signal in meta, so
+    the promotion gate trusts it as fresh. The MISS path must re-apply the cs43
+    right-edge check to the MERGED window and surface ``right_edge_stale_days``
+    so the caller can ABSTAIN rather than silently trust the stale data.
+    """
+    cache = OhlcvCache("ccxt", "DEAD", "1h", root=tmp_path, prefer_parquet=False)
+    # Short warm cache below min_hit_bars -> guarantees a MISS by count.
+    cache.write(_bars(5, start="2024-01-01"))
+
+    def fetch():
+        # Provider is also lagging -> never reaches the cutoff (2024-06-01).
+        return _bars(300, start="2024-01-01")  # newest ~ 2024-01-13
+
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="DEAD",
+        timeframe="1h",
+        lookback_bars=100,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False
+    # The merged right edge is ~139 days below the cutoff: surface it.
+    assert meta["right_edge_stale_days"] >= 139
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_miss_caps_refetch_once_window_is_complete(tmp_path):
+    """cs49: a warm cache holding the provider's FULL stale window is
+    count-satisfied, so the cs43 right-edge gate rejects the HIT and falls to a
+    MISS. Today the MISS re-fetches the SAME stale window and re-appends it to
+    the cache on EVERY run -> a refetch-forever / cache-churn loop for any
+    symbol the provider cannot supply up to the cutoff. The fix: when the just
+    -fetched window does not ADVANCE the right edge, skip the cache append (no
+    churn) and serve the existing merged tail; still emit the abstain flag.
+    """
+    cache = OhlcvCache("ccxt", "DEAD", "1h", root=tmp_path, prefer_parquet=False)
+    # Warm cache already holds the provider's full STALE window (count-satisfied
+    # at-or-before the cutoff) but its right edge is far below the anchor.
+    cache.write(_bars(300, start="2024-01-01"))  # newest ~ 2024-01-13
+
+    def fetch():
+        return _bars(300, start="2024-01-01")  # provider capped: same stale window
+
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    kwargs = dict(
+        provider="ccxt",
+        symbol="DEAD",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    # Spy on the real append to lock in the no-churn property directly. Asserting
+    # only n_bars equality is a tautology here (OhlcvCache.append dedupes on
+    # timestamp, so n_bars stays constant even on the churning baseline). The
+    # actual fix is that append is NOT called when the fetch can't advance the
+    # right edge, and the cache file is NOT rewritten -> spy on both.
+    append_calls = {"n": 0}
+    orig_append = OhlcvCache.append
+
+    def spy_append(self, b):
+        append_calls["n"] += 1
+        return orig_append(self, b)
+
+    OhlcvCache.append = spy_append
+    cache_path = cache.path
+    mtime_before = cache_path.stat().st_mtime_ns if cache_path.exists() else None
+    try:
+        out1, m1 = cached_fetch(fetch, **kwargs)
+        out2, m2 = cached_fetch(fetch, **kwargs)
+    finally:
+        OhlcvCache.append = orig_append
+    mtime_after = cache_path.stat().st_mtime_ns if cache_path.exists() else None
+    # cs43 right-edge rejects the count-satisfied HIT -> both runs MISS.
+    assert m1["cache_hit"] is False
+    assert m2["cache_hit"] is False
+    # The fetch did not advance the right edge -> the cache must NOT churn:
+    # no append call and the cache file is never rewritten across both runs.
+    assert append_calls["n"] == 0
+    assert mtime_after == mtime_before
+    assert m1["cache"]["n_bars"] == m2["cache"]["n_bars"]
+    # Served output is deterministic run1 -> run2 (same stale tail).
+    assert list(out1["timestamp"]) == list(out2["timestamp"])
+    # The honest staleness signal is present so the caller can ABSTAIN.
+    assert m2["right_edge_stale_days"] >= 139
+
+
+def test_cached_fetch_hit_rejects_discontiguous_interior_hole(tmp_path):
+    """cs50: 200 ancient hourly bars + a SINGLE fresh bar AT the cutoff. The
+    count gate passes (201 eligible >= min_hit_bars) AND the cs43 right-edge
+    gate passes (newest_eligible == cutoff, gap 0), so the HIT serves the
+    lookback tail = ancient bars glued to the lone fresh bar across a ~143-day
+    INTERIOR hole as if one timeframe step. The backtest then computes returns
+    across the hole -> a spurious giant return at the seam. The served window
+    must be CONTIGUOUS or the HIT falls through to a MISS/fetch.
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "HOLE", "1h", root=tmp_path, prefer_parquet=False)
+    ancient = _bars(200, start="2024-01-01")  # ends ~ 2024-01-09
+    fresh1 = _bars(1, start="2024-06-01T00:00:00Z", seed=9)  # single bar AT cutoff
+    cache.write(pd.concat([ancient, fresh1], ignore_index=True))
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(300, start="2024-05-20")  # provider fills the contiguous window
+
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="HOLE",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 1  # discontiguous served tail -> MISS/fetch
+    assert meta["cache_hit"] is False
+
+
+def test_cached_fetch_hit_allows_contiguous_window(tmp_path):
+    """cs50: a fully contiguous fresh cache (no interior hole, newest == cutoff)
+    must STILL HIT. The contiguity check rejects multi-step interior holes, not
+    a sound dense window (no over-tightening).
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(_bars(200, start="2024-01-01"))  # contiguous hourly bars
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(200, start="2024-01-01")
+
+    # Anchor exactly on the newest cached bar: 199 hours past 2024-01-01.
+    cutoff = pd.Timestamp("2024-01-01T00:00:00Z") + pd.Timedelta(hours=199)
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 0
+    assert meta["cache_hit"] is True
+    assert len(out) == 10
+
+
+def test_cached_fetch_discontiguous_cutoff_none_still_hits(tmp_path):
+    """cs50: cutoff=None (live/up-to-now caller) imposes NO contiguity check.
+    A discontiguous cache still HITs and serves a plain tail with no staleness
+    flag -> byte-identical to the pre-cs49/cs50 behaviour.
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "HOLE", "1h", root=tmp_path, prefer_parquet=False)
+    ancient = _bars(200, start="2024-01-01")
+    fresh1 = _bars(1, start="2024-06-01T00:00:00Z", seed=9)
+    cache.write(pd.concat([ancient, fresh1], ignore_index=True))
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(200, start="2024-01-01")
+
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="HOLE",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=None,
+    )
+    assert calls["n"] == 0
+    assert meta["cache_hit"] is True
+    assert "right_edge_stale_days" not in meta
+
+
 def test_normalize_drops_bad_rows_and_duplicates():
     df = _bars(5)
     dup = df.iloc[[2]].copy()

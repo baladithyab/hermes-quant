@@ -203,6 +203,30 @@ def cached_fetch(
     to count-only (cs38 behaviour). A too-stale right edge fails the HIT and
     falls through to the MISS/fetch path so the provider supplies fresh bars.
     ``cutoff=None`` imposes no staleness bound.
+
+    CONTIGUITY (cs50): cs38+cs43 gate the COUNT and the right EDGE but not the
+    interior of the served window. A cache of 200 ancient bars plus a single
+    fresh bar AT the cutoff satisfies both gates (201 eligible; newest ==
+    cutoff) yet the served lookback tail glues ancient bars to the lone fresh
+    bar across a multi-month INTERIOR hole, and the backtest then computes a
+    spurious giant return across the seam. So when ``cutoff`` is set we also
+    require the SERVED lookback window to be contiguous: its max inter-bar gap
+    must be ``<= bound * 1.5`` (one missing closed bar tolerated; a multi-step
+    hole not). The bound scales with an explicit ``max_staleness``. A
+    discontiguous served tail fails the HIT and falls through to MISS/fetch.
+    ``cutoff=None`` imposes no contiguity check.
+
+    MISS RIGHT-EDGE STALENESS (cs49): on a MISS the provider may ALSO be unable
+    to supply bars up to ``cutoff`` (delisted symbol / provider lagging / short
+    window). Two harms follow: (1) the served result keeps a stale right edge
+    with NO signal, so the gate trusts it as fresh, and (2) re-fetching +
+    re-appending the same stale window on every run is a refetch-forever /
+    cache-churn loop. When ``cutoff`` is set we therefore: skip the cache append
+    when the just-fetched window does not ADVANCE the eligible right edge (no
+    churn; cs43's legitimate stale-cache + fresh-provider refresh still appends
+    + advances); and emit ``meta['right_edge_stale_days']`` when the merged
+    right edge remains beyond ``bound`` of the cutoff so the caller can ABSTAIN.
+    ``cutoff=None`` adds no flag and never skips the append.
     """
     cache = OhlcvCache(
         provider=provider,
@@ -220,12 +244,26 @@ def cached_fetch(
     # bound. cutoff=None imposes no bound (live caller); the bound is also a
     # no-op when it can't be derived (degrades to cs38 count-only).
     fresh_right_edge = True
+    # cs50: a count + right-edge satisfying HIT can still glue ancient bars to a
+    # single fresh bar across a multi-month INTERIOR hole (200 ancient bars + 1
+    # bar AT the cutoff -> 201 eligible, newest == cutoff). Serving that tail
+    # makes the backtest compute a spurious giant return across the seam.
+    # Require the SERVED lookback window to be contiguous (max inter-bar gap
+    # within the tail <= one step * tolerance) else fall through to MISS/fetch.
+    # cutoff=None imposes no contiguity check; no-op when the bound can't be
+    # derived (degrades to cs38/cs43 behaviour).
+    contiguous = True
     if cutoff is not None and enough_bars:
         bound = max_staleness if max_staleness is not None else _infer_step(timeframe, eligible)
         if bound is not None:
             newest_eligible = eligible["timestamp"].max()
             fresh_right_edge = (cutoff - newest_eligible) <= bound
-    if enough_bars and fresh_right_edge:
+            served = eligible.tail(min(lookback_bars, len(eligible)))
+            if len(served) >= 2:
+                max_gap = served["timestamp"].diff().dropna().max()
+                # One missing closed bar is tolerated; a multi-step hole is not.
+                contiguous = max_gap <= bound * 1.5
+    if enough_bars and fresh_right_edge and contiguous:
         out = eligible.tail(min(lookback_bars, len(eligible))).reset_index(drop=True)
         return out, {
             "cache_hit": True,
@@ -234,13 +272,35 @@ def cached_fetch(
             "min_hit_bars": min_hit_bars,
         }
 
+    # cs49: on a MISS, capture the pre-fetch eligible right edge so we can detect
+    # a provider that cannot advance it (delisted symbol / provider also lagging
+    # / short window). Re-fetching + re-appending the SAME stale window on every
+    # run is a refetch-forever / cache-churn loop, and the served result keeps a
+    # stale right edge with no signal the gate could ABSTAIN on.
+    pre_fetch_max = None
+    if cutoff is not None and not eligible.empty:
+        pre_fetch_max = eligible["timestamp"].max()
     fetched = normalize_bars(fetch_fn())
-    path = cache.append(fetched)
-    merged = cache.read()
+    fetched_advances = True
+    if pre_fetch_max is not None:
+        fetched_eligible = fetched[fetched["timestamp"] <= cutoff]
+        fetched_advances = (
+            not fetched_eligible.empty
+            and fetched_eligible["timestamp"].max() > pre_fetch_max
+        )
+    if fetched_advances:
+        # cs43's legitimate refresh fetch (stale cache + FRESH provider) lands here.
+        path = cache.append(fetched)
+        merged = cache.read()
+    else:
+        # Provider did not advance the right edge: skip the append (no churn) and
+        # serve the existing merged cache.
+        path = cache.path
+        merged = cached
     if cutoff is not None:
         merged = merged[merged["timestamp"] <= cutoff]
     out = merged.tail(min(lookback_bars, len(merged))).reset_index(drop=True)
-    return out, {
+    meta = {
         "cache_hit": False,
         "cache_path": str(path),
         "cache": cache.coverage(),
@@ -248,6 +308,15 @@ def cached_fetch(
         "requested_lookback_bars": lookback_bars,
         "min_hit_bars": min_hit_bars,
     }
+    # cs49: surface an honest right-edge staleness signal so the caller can
+    # ABSTAIN rather than silently trust a stale window. cutoff=None -> no flag.
+    if cutoff is not None and not merged.empty:
+        bound = max_staleness if max_staleness is not None else _infer_step(timeframe, merged)
+        if bound is not None:
+            gap = cutoff - merged["timestamp"].max()
+            if gap > bound:
+                meta["right_edge_stale_days"] = int(gap / pd.Timedelta(days=1))
+    return out, meta
 
 
 def normalize_bars(df: pd.DataFrame) -> pd.DataFrame:
