@@ -1160,6 +1160,33 @@ def recommend(
 
     result.risk_gate = _action_to_gate_dict(action, agg_signal)
 
+    # ---- Step 7.5: pdr_core SHADOW gate (ADR-0092 Inc-2, DEFAULT-OFF) ----
+    # SHADOW, NOT CUTOVER. The live `action` above and `result.risk_gate` are
+    # already final and UNCHANGED. When HERMES_QUANT_PDR_CORE_SHADOW=1 (read at
+    # call time, mirroring the FUNDAMENTALS/OVERNIGHT_DRIFT flags above) we
+    # ADDITIONALLY run the ported core gate over the SAME inputs, map its verdict
+    # onto an Action, compare field-by-field to the LIVE action, and LOG
+    # divergence — purely to validate the port before any cutover. The shadow
+    # NEVER assigns to `action` or `result.risk_gate`; it only reads them. Any
+    # raise is swallowed (best-effort) so a shadow failure can never reach the
+    # caller. Flag-OFF the branch is not entered, the adapter is not imported,
+    # and the core gate is not constructed — byte-identical to today.
+    if os.environ.get("HERMES_QUANT_PDR_CORE_SHADOW", "0") == "1":
+        try:
+            from hermes_quant.pdr_core_adapter import run_shadow_gate
+
+            run_shadow_gate(
+                agg_signal=agg_signal,
+                market=market,
+                portfolio=portfolio,
+                halt_state=halt_state,
+                live_action=action,
+                live_config=getattr(risk_gate, "config", None),
+                event_risk_enabled=os.environ.get("HERMES_QUANT_EVENT_RISK", "0") == "1",
+            )
+        except Exception as exc:  # noqa: BLE001 — shadow must never affect live
+            logger.warning("advisor: pdr_core shadow seam raised: %s", exc, exc_info=True)
+
     # ---- Step 8: lessons (optional) ----
     if include_lessons:
         try:
