@@ -249,6 +249,35 @@ class MultiLegPaperReactor:
             proposal, leg_fills, fill_size_pct=fill_size_pct, asof_execution=now
         )
 
+        # ── Step 6.5: portfolio gross-exposure cap (cs55; ADR-0087 parity). ─────
+        # DEFAULT-OFF behind HERMES_QUANT_PORTFOLIO_CAPS, like PaperReactor's
+        # _portfolio_cap_clip. The equity reactor caps single-symbol gross; the
+        # multi-leg path had NO aggregate gross-exposure clip, so a family could
+        # open even when PORTFOLIO_CAPS=1 and the book is already at the cap
+        # (cap-policy asymmetry). A multi-leg structure cannot be partially scaled
+        # (you cannot fill half a spread leg without breaking the structure), so an
+        # over-cap family is SILENCED (no-fill parent), mirroring the equity path's
+        # full-silence outcome. With the flag unset this is a bit-identical no-op:
+        # the family fills exactly as before (no import, no state read).
+        cap_silence = self._portfolio_cap_silence(
+            proposal,
+            leg_fills=leg_fills,
+            multi_leg_id=multi_leg_id,
+            client_order_id=client_order_id,
+            asof_decision=asof_decision,
+            asof_execution=now,
+            fill_size_pct=fill_size_pct,
+            approver_user_id=approver_user_id,
+            play_tag=play_tag,
+        )
+        if cap_silence is not None:
+            logger.info(
+                "multileg-react: %s SILENCED by portfolio gross cap "
+                "(PORTFOLIO_CAPS=1); nothing written",
+                multi_leg_id,
+            )
+            return cap_silence
+
         # ── Step 7: build records — Shape (B) (research §3.4). ──────────────────
         parent, children = self._build_records(
             proposal,
@@ -332,6 +361,186 @@ class MultiLegPaperReactor:
             if meta.get("multi_leg_id") == multi_leg_id and meta.get("role") == "parent":
                 return _dict_to_record(rec)
         return None
+
+    # ------------------------------------------------------------------
+    # Portfolio gross-exposure cap (cs55; ADR-0087 parity with PaperReactor)
+    # ------------------------------------------------------------------
+    def _portfolio_cap_silence(
+        self,
+        proposal: Any,
+        *,
+        leg_fills: list[LegFill],
+        multi_leg_id: str,
+        client_order_id: str,
+        asof_decision: str,
+        asof_execution: str,
+        fill_size_pct: float,
+        approver_user_id: str | None,
+        play_tag: str = "advisor",
+    ) -> ExecutionRecord | None:
+        """Aggregate gross-exposure cap for a multi-leg family (cs55).
+
+        DEFAULT-OFF behind ``HERMES_QUANT_PORTFOLIO_CAPS``. With the flag unset this
+        is a bit-identical no-op: returns ``None`` without importing the cap module
+        or reading state (the family fills exactly as before).
+
+        When the flag is ON, this mirrors ``PaperReactor._portfolio_cap_clip``'s
+        gross-exposure control, but for a multi-leg STRUCTURE rather than a single
+        equity symbol. A structure cannot be partially scaled (you cannot fill half
+        a spread leg without breaking the structure), so the only two outcomes are
+        FILL (the whole family fits within remaining gross headroom) or SILENCE (it
+        does not). On silence, returns an audit-only no-fill parent that is NOT
+        appended to the bus and does NOT update PortfolioState — the same shape the
+        broker-reject and admissibility-reject paths already produce.
+
+        Gross-exposure measure (single source of truth with the equity path): the
+        family's gross notional in USD is ``Σ |leg notional|`` over the filled legs
+        (option leg = |premium| × |contracts| × 100; equity leg = |shares| ×
+        |price|), converted to a NAV-fraction via the SAME ``_account_nav_usd()`` the
+        admissibility path uses, then clipped against the current book's gross via
+        ``clip_one_to_remaining_headroom`` (the very primitive PaperReactor calls).
+
+        NOTE (future hoist): when the in-flight ``react/paper.py`` cap lane (cr04/
+        cr05) has merged, the headroom-read + clip logic here and in
+        ``PaperReactor._portfolio_cap_clip`` should be hoisted to a shared helper
+        (single source of truth, mirrors the cs45/cs47 discipline). It is kept
+        self-contained in this module for now to avoid touching paper.py mid-flight.
+        """
+        if os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") != "1":
+            return None
+
+        # Flag-ON path only: lazy imports so the OFF path stays IO- and import-free.
+        from hermes_quant.risk.portfolio_normalize import (
+            PortfolioCaps,
+            clip_one_to_remaining_headroom,
+        )
+        from hermes_quant.risk.portfolio_normalize import (
+            PortfolioState as RiskPortfolioState,
+        )
+        from hermes_quant.state.portfolio_state import get_portfolio_state
+
+        nav = _account_nav_usd()
+        if nav is None or nav <= 0:
+            # Fail-closed: an unknown NAV means we cannot prove the family fits the
+            # gross cap, so we silence it (never open an uncapped family when the
+            # cap is armed). Mirrors the admissibility fail-closed posture.
+            return self._cap_silence_record(
+                proposal,
+                multi_leg_id=multi_leg_id,
+                client_order_id=client_order_id,
+                asof_decision=asof_decision,
+                asof_execution=asof_execution,
+                fill_size_pct=fill_size_pct,
+                approver_user_id=approver_user_id,
+                silence_reason="portfolio_cap_nav_unknown",
+                play_tag=play_tag,
+            )
+
+        family_gross_pct = _family_gross_notional_usd(leg_fills) / nav
+        if family_gross_pct <= 0.0:
+            # No measurable gross (degenerate / all-zero fill) — nothing to cap.
+            return None
+
+        # Reconstruct the current book's gross from PortfolioState, reading
+        # positions as NAV-fraction quantities (ADR-0041), exactly as
+        # PaperReactor._portfolio_cap_clip does.
+        try:
+            ps = get_portfolio_state()
+            positions = ps.get_positions("paper-default")
+            pos_map: dict[str, float] = {}
+            for (_asset_class, symbol), position in positions.items():
+                pos_map[symbol] = pos_map.get(symbol, 0.0) + position.quantity
+        except Exception as exc:  # noqa: BLE001 — fail-closed: unknown book => silence.
+            logger.warning(
+                "multileg-react: cap book read failed (fail-closed silence): %s", exc
+            )
+            return self._cap_silence_record(
+                proposal,
+                multi_leg_id=multi_leg_id,
+                client_order_id=client_order_id,
+                asof_decision=asof_decision,
+                asof_execution=asof_execution,
+                fill_size_pct=fill_size_pct,
+                approver_user_id=approver_user_id,
+                silence_reason="portfolio_cap_book_unknown",
+                play_tag=play_tag,
+            )
+
+        state = RiskPortfolioState(positions=pos_map)
+        caps = PortfolioCaps.standard()
+        # The family is a single new long-side gross demand. We clip it as one pick
+        # under a synthetic key so it does not collide with an existing symbol's
+        # de-risking semantics; net-cap is irrelevant here (gross is the control),
+        # so a positive sign is used uniformly.
+        clipped = clip_one_to_remaining_headroom(
+            asset=f"__mleg__{multi_leg_id}",
+            per_symbol_target_pct=family_gross_pct,
+            state=state,
+            caps=caps,
+        )
+
+        # A structure must fill WHOLE or not at all: anything short of a full-size
+        # fit (not fired, or scaled below 1.0) is silenced.
+        if not clipped.fired or clipped.scale_factor < 1.0 - 1e-9:
+            silence_reason = clipped.silence_reason or "gross_headroom"
+            return self._cap_silence_record(
+                proposal,
+                multi_leg_id=multi_leg_id,
+                client_order_id=client_order_id,
+                asof_decision=asof_decision,
+                asof_execution=asof_execution,
+                fill_size_pct=fill_size_pct,
+                approver_user_id=approver_user_id,
+                silence_reason=f"portfolio_cap_{silence_reason}",
+                play_tag=play_tag,
+            )
+        return None
+
+    def _cap_silence_record(
+        self,
+        proposal: Any,
+        *,
+        multi_leg_id: str,
+        client_order_id: str,
+        asof_decision: str,
+        asof_execution: str,
+        fill_size_pct: float,
+        approver_user_id: str | None,
+        silence_reason: str,
+        play_tag: str = "advisor",
+    ) -> ExecutionRecord:
+        """Audit-only silenced parent on a gross-cap breach. NOT appended to the bus
+        and does NOT update PortfolioState (mirror _write_nofill_parent / the equity
+        path's silence record): never fabricate a fill, leave no position-mutating
+        family on the bus for a capped family."""
+        return ExecutionRecord(
+            proposal_id=proposal.proposal_id,
+            signal_id=None,
+            asset=proposal.underlying,
+            asset_class="multi_leg",
+            timeframe="",
+            asof_decision=asof_decision,
+            asof_execution=asof_execution,
+            target_position_pct=fill_size_pct,
+            decision_price=float(proposal.net_debit_credit),
+            fill_price=0.0,
+            fill_size_pct=0.0,
+            reactor_name=self.name,
+            human_in_the_loop=True,
+            approver_user_id=approver_user_id,
+            reactor_metadata={
+                "multi_leg_id": multi_leg_id,
+                "strategy_kind": proposal.strategy_kind,
+                "client_order_id": client_order_id,
+                "silenced": True,
+                "silence_reason": silence_reason,
+                "no_fill": True,
+                "paper": True,
+                "role": "parent",
+            },
+            bar_ts=None,
+            play_tag=play_tag,
+        )
 
     # ------------------------------------------------------------------
     # Fill
@@ -797,6 +1006,25 @@ def _is_option(f: LegFill) -> bool:
         return True
     except OccParseError:
         return False
+
+
+_OPTION_CONTRACT_MULTIPLIER = 100.0  # one equity-option contract controls 100 shares
+
+
+def _family_gross_notional_usd(leg_fills: list[LegFill]) -> float:
+    """Gross notional (USD) of a filled multi-leg family = Σ |leg notional|.
+
+    Option leg: ``|premium| × |contracts| × 100`` (contracts = signed filled_qty).
+    Equity leg: ``|shares| × |price|`` (shares = signed filled_qty). The sum of the
+    absolute per-leg notionals is the family's contribution to gross exposure — the
+    same |notional|-summing semantics the equity path's gross cap enforces, applied
+    across the structure's legs. A zero/degenerate fill contributes 0.
+    """
+    gross = 0.0
+    for f in leg_fills:
+        mult = _OPTION_CONTRACT_MULTIPLIER if _is_option(f) else 1.0
+        gross += abs(f.filled_avg_price) * abs(f.filled_qty) * mult
+    return gross
 
 
 def _fillresult_to_legfill(fr: FillResult) -> LegFill:
