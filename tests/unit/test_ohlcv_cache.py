@@ -1294,6 +1294,181 @@ def test_cs66_served_window_behavior_byte_identical_cs38(tmp_path):
     assert (out["timestamp"] <= cutoff).all()
 
 
+# ---------------------------------------------------------------------------
+# cs70: .csv/.parquet dual-format SOURCE-OF-TRUTH divergence.
+#
+# OhlcvCache.path PREFERS the .parquet when prefer_parquet and it exists, and
+# read() reads the .parquet first (CSV only as a parquet-engine-absent fallback).
+# But write() can DEGRADE a re-fetch to .csv (parquet engine unavailable at write
+# time) WITHOUT invalidating a pre-existing stale .parquet for the same stem. So a
+# backtest replayed in an env where the parquet engine IS available silently
+# serves the OLD .parquet bars and DROPS the fresh CSV re-fetch -- environment
+# -dependent non-reproducibility (the same --end yields different bars depending
+# on which format the runtime can read). The OHLCV sibling of cs66 (PIT dedup),
+# but a DISTINCT root cause: a single stem must have a SINGLE source of truth.
+#
+# FIX SHAPE: write() / _write_storage() write to the preferred format and DELETE
+# the stale sibling-format file so only one format ever persists per stem; and
+# path()/read() prefer the NEWEST-mtime format when (a pre-fix on-disk cache
+# already has) BOTH present, so read() always returns the most-recently-written
+# bars regardless of which format the runtime can read. A single-format cache (the
+# common case) is byte-identical; cs66 fetched_at + served-window behaviour intact.
+# ---------------------------------------------------------------------------
+
+
+def _atomic_write_csv(cache, bars):
+    """Write the served 6-col frame to the .csv path, mirroring write()'s
+    parquet->CSV degrade branch (the exact bytes write() would emit on a minimal
+    install with no parquet engine). Bypasses write() so the test can leave a
+    stale sibling .parquet in place."""
+    from hermes_quant.data.cache import _atomic_write
+
+    _atomic_write(normalize_bars(bars), cache.csv_path)
+
+
+def test_cs70_csv_refetch_supersedes_stale_parquet(tmp_path):
+    """cs70 RED: a stale .parquet (close=100) lingers while a FRESH degraded-to
+    -CSV re-fetch (close=50) is written for the SAME stem. In a parquet-capable
+    env read() currently prefers the .parquet and serves the STALE 100, DROPPING
+    the fresh CSV re-fetch. After the fix read() returns the FRESH 50.
+    """
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=True)
+    # Step 1: write stale bars to .parquet (engine available here).
+    cache.write(_bar_at("2024-01-05", 100.0))
+    assert cache.parquet_path.exists()
+    # Step 2: a re-fetch that DEGRADED to CSV writes FRESH bars to .csv while the
+    # stale .parquet lingers (exactly what write()'s degrade branch leaves behind
+    # if it does not invalidate the sibling).
+    import os as _os
+
+    _atomic_write_csv(cache, _bar_at("2024-01-05", 50.0))
+    # Force the .csv mtime strictly newer than the .parquet DETERMINISTICALLY. A
+    # bare time.sleep() is not enough on coarse-granularity filesystems (WSL2 /
+    # drvfs under load can collapse two writes into the same mtime tick), which
+    # would flake this PIT-reproducibility test. os.utime makes the newest-mtime
+    # ordering exact regardless of filesystem clock resolution.
+    p_mtime = cache.parquet_path.stat().st_mtime
+    _os.utime(cache.csv_path, (p_mtime + 1.0, p_mtime + 1.0))
+    # Step 3: read() in a parquet-capable env must return the FRESH bars.
+    assert _close_at(cache, "2024-01-05") == 50.0
+
+
+def test_cs70_write_invalidates_stale_sibling_format(tmp_path):
+    """cs70: after the fix a successful write to the PREFERRED format invalidates
+    the stale sibling-format file, so only ONE format persists per stem (a single
+    source of truth). Here a legacy .csv exists; a fresh parquet write must leave
+    only the .parquet and remove the now-superseded .csv.
+    """
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=True)
+    _atomic_write_csv(cache, _bar_at("2024-01-05", 100.0))  # legacy .csv
+    assert cache.csv_path.exists()
+    cache.write(_bar_at("2024-01-05", 50.0))  # fresh parquet write
+    assert cache.parquet_path.exists()
+    assert not cache.csv_path.exists()  # stale sibling invalidated
+    assert _close_at(cache, "2024-01-05") == 50.0
+
+
+def test_cs70_append_through_csv_supersedes_stale_parquet(tmp_path):
+    """cs70: the PIT append path (cs66) round-trips through _read_storage /
+    _write_storage. A stale .parquet must not shadow a fresher CSV-degraded
+    storage file. After the fix an append reads the freshest format and writes a
+    single source of truth, so the cross-day PIT dedup operates on fresh data.
+    """
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=True)
+    # Seed a parquet via append (the cs66 storage path).
+    cache.append(_bar_at("2024-01-05", 100.0))
+    assert cache.parquet_path.exists()
+    import os as _os
+
+    # A degraded-to-CSV storage re-write lands a FRESH disjoint bar in .csv while
+    # the .parquet lingers (a different stem-state in the two formats).
+    storage = cache._read_storage()
+    fresh_row = storage.iloc[[0]].copy()
+    fresh_row["timestamp"] = pd.Timestamp("2024-01-06", tz="UTC")
+    fresh_row["close"] = 200.0
+    fresh = pd.concat([storage, fresh_row], ignore_index=True)
+    from hermes_quant.data.cache import _atomic_write
+
+    _atomic_write(fresh, cache.csv_path)
+    # Force the .csv mtime strictly newer than the .parquet DETERMINISTICALLY
+    # (coarse-granularity filesystems can collapse two writes into one mtime tick;
+    # see test_cs70_csv_refetch_supersedes_stale_parquet for rationale).
+    p_mtime = cache.parquet_path.stat().st_mtime
+    _os.utime(cache.csv_path, (p_mtime + 1.0, p_mtime + 1.0))
+    # read() must see the freshest format (the .csv with 2 bars), not the stale
+    # 1-bar .parquet.
+    out = cache.read()
+    assert len(out) == 2
+    assert _close_at(cache, "2024-01-06") == 200.0
+
+
+def test_cs70_write_degrade_to_csv_invalidates_stale_parquet(tmp_path, monkeypatch):
+    """cs70 (the production shape): a re-fetch whose parquet write FAILS (no
+    parquet engine on a minimal install) degrades to .csv THROUGH ``write``. The
+    pre-existing stale .parquet must be invalidated so a single source of truth
+    remains = the fresh CSV, and read() (even in a parquet-capable env, where an
+    unconditional .parquet preference would serve the stale bars) returns fresh.
+
+    This proves the fix does not depend on filesystem mtime resolution: a degraded
+    write and the stale parquet could share an mtime tick, but sibling
+    invalidation makes the result deterministic regardless.
+    """
+    import hermes_quant.data.cache as cache_mod
+
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=True)
+    cache.write(_bar_at("2024-01-05", 100.0))  # parquet engine works here
+    assert cache.parquet_path.exists() and not cache.csv_path.exists()
+
+    real_atomic_write = cache_mod._atomic_write
+
+    def flaky_atomic_write(df, target):
+        if target.suffix == ".parquet":
+            raise RuntimeError("no parquet engine (minimal install)")
+        return real_atomic_write(df, target)
+
+    monkeypatch.setattr(cache_mod, "_atomic_write", flaky_atomic_write)
+    written = cache.write(_bar_at("2024-01-05", 50.0))  # degrades to .csv
+    monkeypatch.undo()
+
+    assert written == cache.csv_path
+    # Single source of truth: the stale .parquet is invalidated.
+    assert cache.csv_path.exists()
+    assert not cache.parquet_path.exists()
+    # read() returns the FRESH bars regardless of which format the runtime prefers.
+    assert _close_at(cache, "2024-01-05") == 50.0
+    assert list(cache.read().columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_cs70_single_format_cache_byte_identical(tmp_path):
+    """cs70 anti-regression: a cache with only ONE format present (the common
+    case) is byte-identical -- no sibling to invalidate, no behaviour change.
+    """
+    # parquet-only
+    p = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=True)
+    p.write(_bars(10, start="2024-01-01"))
+    assert p.parquet_path.exists()
+    assert not p.csv_path.exists()
+    assert len(p.read()) == 10
+    # csv-only
+    c = OhlcvCache("ccxt", "ETH/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    c.write(_bars(10, start="2024-01-01"))
+    assert c.csv_path.exists()
+    assert not c.parquet_path.exists()
+    assert len(c.read()) == 10
+
+
+def test_cs70_legacy_single_format_does_not_crash(tmp_path):
+    """cs70: a legacy single-format cache (only a .csv, no .parquet) must read
+    without crashing and must not be invalidated by a read.
+    """
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=True)
+    _atomic_write_csv(cache, _bars(5, start="2024-01-01"))
+    assert not cache.parquet_path.exists()
+    out = cache.read()  # no crash, no parquet to prefer
+    assert len(out) == 5
+    assert cache.csv_path.exists()  # a read does not delete the only file
+
+
 def test_normalize_drops_bad_rows_and_duplicates():
     df = _bars(5)
     dup = df.iloc[[2]].copy()

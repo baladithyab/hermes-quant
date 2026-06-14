@@ -220,11 +220,55 @@ class OhlcvCache:
 
     @property
     def path(self) -> Path:
-        if self.prefer_parquet and self.parquet_path.exists():
+        """The single source-of-truth file for this stem (cs70).
+
+        cs70: ``write`` can DEGRADE a re-fetch to ``.csv`` (parquet engine
+        unavailable at write time) while a pre-existing stale ``.parquet`` for the
+        same stem lingers. Unconditionally preferring ``.parquet`` then serves the
+        OLD parquet bars and DROPS the fresh CSV re-fetch -> the same backtest
+        ``--end`` yields different bars depending on which format the runtime can
+        read (an environment-dependent PIT-reproducibility break). ``write`` /
+        ``_write_storage`` now invalidate the stale sibling so only ONE format
+        persists going forward, but a cache written by a pre-cs70 binary may
+        already carry BOTH formats on disk. When both exist we therefore prefer
+        the NEWEST-mtime file (the most-recently-written bars) rather than
+        unconditionally the preferred format, so ``read`` heals a pre-fix
+        dual-format cache too. With only one format present (the common case) the
+        choice is byte-identical to the prior behaviour.
+        """
+        p_exists = self.parquet_path.exists()
+        c_exists = self.csv_path.exists()
+        if p_exists and c_exists:
+            # Both present (legacy dual-format on disk): newest write wins; ties
+            # break to the preferred format for determinism.
+            p_mtime = self.parquet_path.stat().st_mtime
+            c_mtime = self.csv_path.stat().st_mtime
+            if p_mtime > c_mtime:
+                return self.parquet_path
+            if c_mtime > p_mtime:
+                return self.csv_path
+            return self.parquet_path if self.prefer_parquet else self.csv_path
+        if p_exists:
             return self.parquet_path
-        if self.csv_path.exists():
+        if c_exists:
             return self.csv_path
         return self.parquet_path if self.prefer_parquet else self.csv_path
+
+    def _invalidate_sibling(self, written: Path) -> None:
+        """Remove the not-written sibling-format file for this stem (cs70).
+
+        After a successful write to ``written`` (``.parquet`` or ``.csv``), delete
+        the OTHER format's file if it exists so a single stem keeps a SINGLE source
+        of truth. This is what stops a stale ``.parquet`` from shadowing a fresh
+        CSV-degraded re-fetch (and vice versa). Best-effort: a missing sibling is a
+        no-op and an unlink race never breaks the write (the just-written file is
+        already the authoritative copy).
+        """
+        sibling = self.csv_path if written == self.parquet_path else self.parquet_path
+        try:
+            sibling.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def read(self) -> pd.DataFrame:
         path = self.path
@@ -256,6 +300,10 @@ class OhlcvCache:
                 _atomic_write(df, target)
             else:
                 raise
+        # cs70: keep a SINGLE source of truth per stem. A degrade-to-CSV write (or
+        # a switch back to parquet on a later run) must invalidate the sibling-
+        # format file so a stale .parquet can never shadow a fresh CSV re-fetch.
+        self._invalidate_sibling(target)
         return target
 
     def _read_storage(self) -> pd.DataFrame:
@@ -335,6 +383,8 @@ class OhlcvCache:
                 _atomic_write(df, target)
             else:
                 raise
+        # cs70: single source of truth per stem (mirrors :meth:`write`).
+        self._invalidate_sibling(target)
         return target
 
     def append(self, bars: pd.DataFrame, *, fetched_at: pd.Timestamp | None = None) -> Path:
