@@ -262,8 +262,13 @@ def _rec_side(rec: dict) -> str:
 
 
 # ---------- play_tag inference ----------
-def infer_play_tag(executions: list[dict], asset: str) -> str:
+def infer_play_tag(executions: list[dict], asset: str, position_qty: float = 0.0) -> str:
     """Find the most-recent OPENING execution for `asset` and infer the play.
+
+    The opening leg shares the HELD position's sign: a long (position_qty>=0)
+    opens with a 'buy', a short (position_qty<0) opens with a 'sell'. Match the
+    leg by direction so a short's opening leg is read (mirrors cs20 :228 `if qty
+    < 0`; flat/0 takes the long branch -> byte-identical to the pre-cs26 lookup).
 
     Order of precedence:
       1. Explicit `play_tag` field on the execution (the 'advisor' sentinel — the
@@ -273,10 +278,11 @@ def infer_play_tag(executions: list[dict], asset: str) -> str:
       3. Substring match on `signal_id`: 'leaps' or 'swing'
       4. Default: 'swing' (cautious — gets the swing exit rules)
     """
+    desired_side = "sell" if position_qty < 0 else "buy"
     for rec in reversed(executions):
         if rec.get("asset") != asset:
             continue
-        if _rec_side(rec) != "buy":  # opening (long) leg
+        if _rec_side(rec) != desired_side:  # opening leg (long->buy, short->sell)
             continue
         tag = rec.get("play_tag") or rec.get("recipe")
         if isinstance(tag, str) and tag and tag.lower() != "advisor":
@@ -290,10 +296,16 @@ def infer_play_tag(executions: list[dict], asset: str) -> str:
 
 
 # ---------- entry context lookup ----------
-def find_entry_record(executions: list[dict], asset: str) -> dict | None:
-    """First buy execution for asset (= entry). None if not found."""
+def find_entry_record(executions: list[dict], asset: str, position_qty: float = 0.0) -> dict | None:
+    """First opening leg (long->buy, short->sell) for asset (= entry). None if not found.
+
+    The opening leg shares the HELD position's sign: a long (position_qty>=0)
+    opens with a 'buy', a short (position_qty<0) with a 'sell'. flat/0 takes the
+    long branch -> byte-identical to the pre-cs26 buy-only lookup.
+    """
+    desired_side = "sell" if position_qty < 0 else "buy"
     for rec in executions:
-        if rec.get("asset") == asset and _rec_side(rec) == "buy":
+        if rec.get("asset") == asset and _rec_side(rec) == desired_side:
             return rec
     return None
 
@@ -487,8 +499,8 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
             })
             continue
 
-        play = infer_play_tag(executions, asset)
-        entry = find_entry_record(executions, asset)
+        play = infer_play_tag(executions, asset, pos.qty)
+        entry = find_entry_record(executions, asset, pos.qty)
 
         if entry is None:
             # Phantom position — log error, hold.

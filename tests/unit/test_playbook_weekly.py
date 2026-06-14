@@ -306,3 +306,111 @@ def test_live_shape_explicit_play_tag_still_wins(mod):
     """cs17: a live record with a REAL play_tag (not the advisor sentinel) is honored."""
     execs = [_live_exec_dict(play_tag="leaps")]
     assert mod.infer_play_tag(execs, "AAPL") == "leaps"
+
+
+# ---------------------- cs26: sign-directed opening-leg lookup ----------------------
+#
+# The live book is short-dominated (cs14 emits Position.qty<0). A SHORT's OPENING
+# leg derives _rec_side=="sell" (cs17), but find_entry_record / infer_play_tag
+# hardcode =="buy" -> a held short returns None -> run_weekly logs action="ERROR"
+# and `continue`s, so the cs20 math + decide_swing/decide_leaps CLOSE path is
+# UNREACHABLE for any short. cs26 threads the held position's sign into both
+# helpers so the opening leg is matched by direction (long->buy, short->sell).
+# The LONG path stays byte-identical; legacy explicit-`side` records still match.
+
+
+def test_find_entry_record_short_unfound_without_sign(mod):
+    """Documents the bug AND the byte-identical default: a 2-arg lookup (default
+    position_qty=0.0 -> desired_side 'buy') never matches a short's sell opening
+    leg. Stays green pre- and post-fix (a long lookup must not match a short)."""
+    execs = [_live_exec_dict(target_position_pct=-0.20)]
+    assert mod.find_entry_record(execs, "AAPL") is None
+
+
+def test_find_entry_record_short_found_with_negative_qty(mod):
+    """KEYSTONE: passing the held SHORT sign finds the sell opening leg. RED today
+    (the unpatched 2-arg helper rejects a 3rd positional arg / drops the short)."""
+    execs = [_live_exec_dict(target_position_pct=-0.20)]
+    entry = mod.find_entry_record(execs, "AAPL", -100.0)
+    assert entry is not None
+    assert mod._rec_side(entry) == "sell"
+
+
+def test_infer_play_tag_short_with_negative_qty(mod):
+    """A short's opening leg (sell) is now read, so an explicit play_tag wins."""
+    execs = [_live_exec_dict(target_position_pct=-0.20, play_tag="leaps")]
+    assert mod.infer_play_tag(execs, "AAPL", -100.0) == "leaps"
+
+
+def test_infer_play_tag_short_advisor_falls_through(mod):
+    """The 'advisor' sentinel falls through to swing even though the short's sell
+    leg is now seen as the opening leg (it carries no playbook meaning)."""
+    execs = [_live_exec_dict(target_position_pct=-0.20, play_tag="advisor")]
+    assert mod.infer_play_tag(execs, "AAPL", -100.0) == "swing"
+
+
+def test_short_entry_reaches_cs20_close_path_end_to_end(mod):
+    """END-TO-END: the previously-unreachable short-exit chain. A held SHORT now
+    finds its entry -> days_held>0 via asof_execution -> the cs20 sign-aware
+    compute_pnl_drawdown yields an adverse drawdown -> decide_leaps CLOSES.
+
+    This is the logical join of run_weekly's :491->523->535->551 chain that was
+    dead behind the entry-is-None ERROR/continue for every short."""
+    execs = [_live_exec_dict(
+        target_position_pct=-0.20,
+        asof_execution="2026-06-08T13:31:05+00:00",
+    )]
+    entry = mod.find_entry_record(execs, "AAPL", -100.0)
+    assert entry is not None  # NOT the "no opening execution found" ERROR path
+
+    now_dt = mod.datetime(2026, 6, 18, tzinfo=mod.UTC)
+    days_held = mod.days_between_iso(
+        entry.get("asof_execution") or entry.get("asof", ""), now_dt
+    )
+    assert days_held == 9
+    assert days_held > 0
+
+    # Losing short: mark rose 200 -> 270 against it (+35% adverse).
+    pnl, dd = mod.compute_pnl_drawdown(200.0, 270.0, -100.0)
+    assert pnl == pytest.approx(-0.35)
+    assert dd == pytest.approx(0.35)
+    decision = mod.decide_leaps(mod.LeapsContext(
+        revenue_growth_yoy=0.20, debt_to_equity=0.5, drawdown_from_entry=dd,
+    ))
+    assert decision.action == "CLOSE"
+    assert "leaps_drawdown" in decision.reason
+
+
+def test_long_opening_leg_unchanged_with_positive_qty(mod):
+    """LONG REGRESSION: the 3-arg call with a positive qty is byte-identical to the
+    2-arg default for BOTH helpers (desired_side 'buy' either way)."""
+    execs = [_live_exec_dict(target_position_pct=0.20)]
+    assert mod.find_entry_record(execs, "AAPL", 100.0) == mod.find_entry_record(execs, "AAPL")
+    assert mod.find_entry_record(execs, "AAPL", 100.0) is not None
+    assert mod.infer_play_tag(execs, "AAPL", 100.0) == mod.infer_play_tag(execs, "AAPL")
+    assert mod.infer_play_tag(execs, "AAPL", 100.0) == "swing"
+
+
+def test_legacy_explicit_short_side_now_matches(mod):
+    """A legacy record with an explicit side='sell' is honored by _rec_side and now
+    matches as the short opening leg when the held sign is negative."""
+    execs = [{"asset": "X", "side": "sell", "play_tag": "leaps"}]
+    assert mod.find_entry_record(execs, "X", -50.0) is not None
+    assert mod.infer_play_tag(execs, "X", -50.0) == "leaps"
+
+
+def test_reshorted_asset_picks_held_sign_leg(mod):
+    """AMBIGUITY: an asset that was long then flipped short carries both a buy and a
+    sell leg. The opening leg is the one matching the CURRENT held sign — a held
+    short (-qty) picks the sell, a held long (+qty) picks the buy."""
+    execs = [
+        _live_exec_dict(target_position_pct=0.20),   # earlier long opening (buy)
+        _live_exec_dict(target_position_pct=-0.20),  # later short opening (sell)
+    ]
+    short_entry = mod.find_entry_record(execs, "AAPL", -100.0)
+    assert short_entry is not None
+    assert mod._rec_side(short_entry) == "sell"
+
+    long_entry = mod.find_entry_record(execs, "AAPL", 100.0)
+    assert long_entry is not None
+    assert mod._rec_side(long_entry) == "buy"
