@@ -219,6 +219,133 @@ def test_cached_fetch_cutoff_none_byte_identical(tmp_path):
     assert out["timestamp"].iloc[-1] == full["timestamp"].iloc[-1]
 
 
+def test_cached_fetch_hit_rejects_stale_right_edge(tmp_path):
+    """cs43: post-cs38 the HIT gate counts bars at-or-before the cutoff but does
+    NOT bound how far the newest at-or-before bar is from the cutoff. A cache
+    whose newest bar ends MONTHS before --end (yet has >=min_hit_bars below the
+    cutoff) currently HITs and serves stale right-edge data the promotion gate
+    then trusts. It must instead fall through to the MISS/fetch path so the
+    provider supplies fresh bars up to the anchor.
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    # 300 hourly bars from 2024-01-01: newest bar ~ 2024-01-13.
+    cache.write(_bars(300, start="2024-01-01"))
+
+    def fetch():
+        calls["n"] += 1
+        # Provider supplies fresh bars up to the anchor.
+        return _bars(300, start="2024-05-20")
+
+    # Anchor is ~147 days past the cache's newest bar (2024-01-13) but there are
+    # 300 bars at-or-before it -> count alone says HIT.
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    # The newest at-or-before bar is months below the anchor -> staleness gate
+    # rejects the HIT and falls through to a fetch.
+    assert calls["n"] == 1
+    assert meta["cache_hit"] is False
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_hit_allows_fresh_right_edge(tmp_path):
+    """cs43: a fresh cache whose newest at-or-before bar is within ~1 timeframe
+    step of the cutoff must STILL HIT (no over-tightening). The staleness bound
+    is for a multi-month gap, not a one-bar provider shortfall at the edge.
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    # 200 hourly bars from 2024-01-01: bar index 50 is 2024-01-03T02:00Z.
+    cache.write(_bars(200, start="2024-01-01"))
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(200, start="2024-01-01")
+
+    # Anchor one hour (one 1h step) past the newest eligible bar (index 50).
+    cutoff = pd.Timestamp("2024-01-03T03:00:00Z")  # 51 bars at-or-before
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 0  # newest eligible bar within one step -> HIT
+    assert meta["cache_hit"] is True
+    assert len(out) == 10
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_stale_gate_disabled_when_cutoff_none(tmp_path):
+    """cs43: cutoff=None (live/up-to-now caller) imposes no staleness bound, so a
+    cache whose newest bar is far from "now" still HITs -> byte-identical to the
+    pre-cs43 behaviour.
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    # Cache ends long ago; with cutoff=None there is no anchor to be stale against.
+    cache.write(_bars(50, start="2020-01-01"))
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(50, start="2020-01-01")
+
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=None,
+    )
+    assert calls["n"] == 0
+    assert meta["cache_hit"] is True
+    assert len(out) == 10
+
+
+def test_cached_fetch_max_staleness_explicit_override(tmp_path):
+    """cs43: an explicit max_staleness widens/narrows the bound. A generous
+    override lets an otherwise-stale cache HIT (operator opt-in).
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(_bars(300, start="2024-01-01"))  # newest ~ 2024-01-13
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(300, start="2024-05-20")
+
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+        max_staleness=pd.Timedelta(days=365),  # operator opts into a wide bound
+    )
+    assert calls["n"] == 0
+    assert meta["cache_hit"] is True
+
+
 def test_normalize_drops_bad_rows_and_duplicates():
     df = _bars(5)
     dup = df.iloc[[2]].copy()

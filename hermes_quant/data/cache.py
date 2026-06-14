@@ -21,6 +21,38 @@ import pandas as pd
 
 DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache"
 
+# Timeframe → bar-step seconds. Used to infer the default right-edge staleness
+# bound (cs43): one timeframe step is the tightest gap a fresh cache can have
+# below the cutoff without indicating stale data.
+_TF_SECONDS = {
+    "1m": 60,
+    "5m": 5 * 60,
+    "15m": 15 * 60,
+    "30m": 30 * 60,
+    "1h": 60 * 60,
+    "4h": 4 * 60 * 60,
+    "1d": 24 * 60 * 60,
+}
+
+
+def _infer_step(timeframe: str, eligible: pd.DataFrame) -> pd.Timedelta | None:
+    """Infer one bar-step as a Timedelta.
+
+    Prefers the declared ``timeframe`` (canonical, exact). Falls back to the
+    median spacing of the cached bars when the timeframe is unknown. Returns
+    ``None`` when neither is available (no bound can be derived).
+    """
+    secs = _TF_SECONDS.get(timeframe)
+    if secs is not None:
+        return pd.Timedelta(seconds=secs)
+    if len(eligible) >= 2:
+        diffs = eligible["timestamp"].diff().dropna()
+        if not diffs.empty:
+            step = diffs.median()
+            if step > pd.Timedelta(0):
+                return step
+    return None
+
 
 @dataclass(frozen=True)
 class OhlcvCache:
@@ -125,6 +157,7 @@ def cached_fetch(
     prefer_parquet: bool = True,
     min_hit_ratio: float = 0.95,
     cutoff: pd.Timestamp | None = None,
+    max_staleness: pd.Timedelta | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Read-through cache for provider fetches.
 
@@ -152,6 +185,24 @@ def cached_fetch(
 
     ``cutoff=None`` (a live/up-to-now caller) prunes nothing and is
     byte-identical to the prior behaviour.
+
+    RIGHT-EDGE STALENESS (cs43): cs38 made the HIT count only at-or-before bars
+    but never bounded how FAR the newest at-or-before bar sits below ``cutoff``.
+    A cache whose newest bar ends months before ``--end`` (yet still has
+    ``>=min_hit_bars`` below the cutoff) would HIT and serve stale right-edge
+    data the promotion gate then trusts. So when ``cutoff`` is set we
+    additionally require the newest eligible bar to be within ``max_staleness``
+    of the cutoff::
+
+        (cutoff - eligible["timestamp"].max()) <= max_staleness
+
+    ``max_staleness`` defaults to one timeframe step (inferred from
+    ``timeframe``, or the cached bars' median spacing if the timeframe is
+    unknown) — the tightest gap a fresh cache can have below the cutoff. When
+    the bound can't be derived (unknown timeframe, <2 bars), the gate degrades
+    to count-only (cs38 behaviour). A too-stale right edge fails the HIT and
+    falls through to the MISS/fetch path so the provider supplies fresh bars.
+    ``cutoff=None`` imposes no staleness bound.
     """
     cache = OhlcvCache(
         provider=provider,
@@ -163,7 +214,18 @@ def cached_fetch(
     cached = cache.read()
     min_hit_bars = max(1, int(lookback_bars * min_hit_ratio))
     eligible = cached if cutoff is None else cached[cached["timestamp"] <= cutoff]
-    if len(eligible) >= min_hit_bars:
+    enough_bars = len(eligible) >= min_hit_bars
+    # cs43: a count-satisfying cache can still have a multi-month gap below the
+    # cutoff. Reject the HIT when the newest eligible bar is staler than the
+    # bound. cutoff=None imposes no bound (live caller); the bound is also a
+    # no-op when it can't be derived (degrades to cs38 count-only).
+    fresh_right_edge = True
+    if cutoff is not None and enough_bars:
+        bound = max_staleness if max_staleness is not None else _infer_step(timeframe, eligible)
+        if bound is not None:
+            newest_eligible = eligible["timestamp"].max()
+            fresh_right_edge = (cutoff - newest_eligible) <= bound
+    if enough_bars and fresh_right_edge:
         out = eligible.tail(min(lookback_bars, len(eligible))).reset_index(drop=True)
         return out, {
             "cache_hit": True,
