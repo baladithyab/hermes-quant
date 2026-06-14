@@ -131,9 +131,26 @@ def reconstruct_portfolio(
             )
 
         if is_full_close:
-            # Fully closing position (clean path)
+            # Fully closing position (clean path).
+            #
+            # cs00 sign fix (2026-06-13): the realized P&L of a full close is
+            #   (exit_price - avg_entry) * exit_qty_in_the_direction_of_the_lot
+            # where the lot being closed has signed size -signed_qty (the close
+            # fill is opposite the position). For a LONG (old_qty > 0) the close
+            # fill is a sell (signed_qty < 0) so -signed_qty > 0 and the formula
+            # is (fill - avg_old) * (+qty) — profit when fill > entry. For a SHORT
+            # (old_qty < 0) the close fill is a buy (signed_qty > 0) so
+            # -signed_qty < 0 and the formula is (fill - avg_old) * (-qty) —
+            # profit when fill < entry (covered cheaper than shorted). The
+            # previous trailing `* (1 if old_qty > 0 else -1)` factor INVERTED the
+            # short branch (shorting @100 then covering @90 booked -100 instead of
+            # +100). Dropping it makes the short branch correct; the long branch is
+            # unchanged (the dropped factor was +1 for longs). realized_pnl_total
+            # is report-only / not-yet-gate-wired today (the lone live consumer,
+            # scripts/quant-playbook-weekly.py, reads pf.positions only), so this
+            # is a pure correctness fix to a human-facing number.
             avg_old = (old_cost / old_qty) if old_qty != 0 else 0.0
-            realized = (fill - avg_old) * (-signed_qty) * (1 if old_qty > 0 else -1)
+            realized = (fill - avg_old) * (-signed_qty)
             realized_pnl_total += realized
             positions_qty[asset] = 0.0
             positions_cost[asset] = 0.0

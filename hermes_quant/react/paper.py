@@ -30,15 +30,23 @@ HARD_FILL_CEILING = 1.0
 
 
 def _resolve_account_id(proposal: Any) -> str:
-    """Resolve the account partition the SAME way execute()/_portfolio_cap_clip do.
+    """Resolve the account partition for the tick-lock key, the cap-read, and the
+    state.db write — kept as ONE helper so they cannot disagree on the account.
 
-    reactor_metadata.account_id override, else the "paper-default" sentinel. Kept
-    as one helper so the tick-lock key and the state.db write agree on the account
-    (a mismatch would lock the wrong symbol triple).
+    v0.1 invariant (cs10, 2026-06-13): the paper reactor is SINGLE-ACCOUNT. The
+    canonical ``Proposal`` dataclass (proposals.py) has NO ``reactor_metadata``
+    field, and neither the ``StoredMultiLegProposal`` read-wrapper nor any current
+    producer sets one — so the partition is always the ``"paper-default"``
+    sentinel. The previous body read ``getattr(proposal, "reactor_metadata", ...)``
+    and claimed an account-override safety property the data model does not
+    provide: the getattr ALWAYS missed and the function ALWAYS returned
+    "paper-default". This is byte-identical to that behavior; it just removes the
+    dead override path and the false comment. When v0.2 introduces real named
+    accounts, this is the single seam to teach about the account field — and the
+    bus-append path at _execute_fired() injects the same "paper-default" sentinel,
+    so the two agree by construction.
     """
-    rmeta = getattr(proposal, "reactor_metadata", None) or {}
-    account_id = rmeta.get("account_id") if isinstance(rmeta, dict) else None
-    return account_id or "paper-default"
+    return "paper-default"
 
 
 class FillSizeInvariantError(ValueError):
@@ -551,12 +559,15 @@ class PaperReactor:
         from hermes_quant.state.portfolio_state import get_portfolio_state
 
         ps = get_portfolio_state()
-        # Resolve the account the SAME way the bus-append path does (see execute():
-        # reactor_metadata.account_id override, else the "paper-default" sentinel).
-        # Hardcoding "paper-default" would read the wrong book for any non-default
-        # account (Phase-8 review finding 2026-06-02).
-        rmeta = getattr(proposal, "reactor_metadata", None) or {}
-        account_id = (rmeta.get("account_id") if isinstance(rmeta, dict) else None) or "paper-default"
+        # Resolve the account through the SAME helper the tick-lock key and the
+        # bus-append path use, so the cap-read reconstructs the SAME book that gets
+        # written (cs10, 2026-06-13). v0.1 is single-account: this resolves to the
+        # "paper-default" sentinel. The previous inline getattr block read a
+        # reactor_metadata.account_id override the Proposal dataclass does not
+        # carry — it always missed and always returned "paper-default" — so this is
+        # byte-identical; it just routes through the one helper instead of dead
+        # duplicated logic.
+        account_id = _resolve_account_id(proposal)
         positions = ps.get_positions(account_id)
         pos_map: dict[str, float] = {}
         for (_asset_class, symbol), position in positions.items():

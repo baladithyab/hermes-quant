@@ -82,6 +82,41 @@ _DEFAULT_INITIAL_CASH = 100_000.0
 _CONTRACT_MULTIPLIER = 100.0
 
 
+# ---------------------------------------------------------------------------
+# ft1 (2026-06-13): delta-normalizer regime stamp.
+#
+# The normalizer fold (ADR-0091 Option E, default-OFF behind
+# HERMES_QUANT_DELTA_NORMALIZER) is consistent ONLY if the rebuild and the
+# incremental applies that touch a given state.db agree on whether they
+# folded raw absolute-targets (flag OFF, inflating) or carry-forward deltas
+# (flag ON, deflating). Flipping the flag ON against a populated state.db that
+# was built with the flag OFF differences NEW absolute targets against an
+# INFLATED running net => phantom sells. We stamp the regime that BUILT the db
+# in PRAGMA user_version (set inside reconstruct_from's BEGIN IMMEDIATE) and
+# HARD-REFUSE an incremental apply whose current flag regime disagrees with a
+# populated db's stamp — refuse + surface, never phantom-sell.
+#
+# Byte-identity rail: a legacy / flag-OFF db has user_version == 0
+# (NEVER_STAMPED == REGIME_OFF == 0), and the default flag regime is also 0, so
+# the guard NEVER fires on the default path. The only way to get a non-zero
+# stamp is to run reconstruct_from under flag ON — itself a flag-ON-only action.
+_NORMALIZER_FLAG = "HERMES_QUANT_DELTA_NORMALIZER"
+# user_version values: 0 doubles as "never stamped" AND "flag OFF" so a legacy
+# db (user_version defaults to 0) matches the default-OFF regime byte-for-bit.
+_REGIME_OFF = 0
+_REGIME_ON = 1
+
+
+def _current_normalizer_regime() -> int:
+    """The delta-normalizer regime implied by the CURRENT flag value.
+
+    1 (ON) when HERMES_QUANT_DELTA_NORMALIZER == "1", else 0 (OFF). Mirrors the
+    exact flag test the two folds use (reconstruct_from / _apply_execution_unsafe),
+    so the stamp and the folds key off the SAME predicate.
+    """
+    return _REGIME_ON if os.environ.get(_NORMALIZER_FLAG, "0") == "1" else _REGIME_OFF
+
+
 def _default_initial_cash() -> float:
     raw = os.environ.get(_INITIAL_CASH_ENV, "")
     try:
@@ -329,6 +364,59 @@ class PortfolioState:
         conn.execute("ALTER TABLE processed_fills_new RENAME TO processed_fills")
 
     # ------------------------------------------------------------------
+    # ft1: delta-normalizer regime stamp (read / check)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_user_version(conn: sqlite3.Connection) -> int:
+        row = conn.execute("PRAGMA user_version").fetchone()
+        # row may be a sqlite3.Row or a plain tuple depending on row_factory.
+        return int(row[0]) if row is not None else 0
+
+    def _db_is_populated(self, conn: sqlite3.Connection) -> bool:
+        """True if state.db carries any materialized position/cash row.
+
+        A fresh (or fully-flat) db carries no rows; the regime guard only fires
+        against a POPULATED db so a brand-new db can be folded under either flag
+        without a spurious refusal (the first fold under flag ON will stamp it).
+        """
+        for table in ("positions", "cash"):
+            row = conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()  # noqa: S608 — fixed table names
+            if row is not None:
+                return True
+        return False
+
+    def _check_regime_stamp(self) -> None:
+        """HARD-REFUSE an apply whose current flag regime disagrees with a populated
+        db's build regime stamp (ft1).
+
+        - Fresh / empty db (no position or cash rows): no refusal. The first fold
+          stamps the regime (apply stamps via _stamp_regime below; rebuild stamps
+          inside its transaction).
+        - Populated db whose stamped regime == current flag regime: no refusal.
+          A legacy db is stamped 0 and the default flag regime is 0 — byte-identical.
+        - Populated db whose stamped regime != current flag regime: RAISE. Flipping
+          HERMES_QUANT_DELTA_NORMALIZER against a db built under the other regime
+          would phantom-sell (inflated-net vs deflated-net basis mismatch); refuse
+          and surface rather than corrupt the money ledger.
+        """
+        current = _current_normalizer_regime()
+        with self._lock, self._conn() as conn:
+            if not self._db_is_populated(conn):
+                return
+            stamped = self._read_user_version(conn)
+            if stamped != current:
+                raise RuntimeError(
+                    "delta-normalizer regime mismatch: state.db was built under "
+                    f"regime {stamped} (0=OFF/legacy, 1=ON) but the current "
+                    f"{_NORMALIZER_FLAG} flag implies regime {current}. Folding new "
+                    "fills against a db built under the other regime would phantom-"
+                    "sell (the new absolute target would be differenced against an "
+                    "inflated/deflated net). Refusing to apply. Rebuild state.db "
+                    "with reconstruct_from() under the intended flag value first."
+                )
+
+    # ------------------------------------------------------------------
     # Full rebuild (idempotent)
     # ------------------------------------------------------------------
 
@@ -401,6 +489,13 @@ class PortfolioState:
             # Cross-model review I2: BEGIN IMMEDIATE for write-lock-on-start.
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # ft1: stamp the regime that BUILT this db so a later
+                # incremental apply can hard-refuse a flag-flip mismatch instead
+                # of phantom-selling. PRAGMA user_version takes a literal, not a
+                # bound param; the value is our own 0/1 constant (never user
+                # input). Flag OFF (default) stamps 0 == legacy never-stamped, so
+                # a flag-OFF rebuild leaves user_version byte-identical to today.
+                conn.execute(f"PRAGMA user_version = {int(_current_normalizer_regime())}")
                 # Clear derived tables (not halts!)
                 conn.execute("DELETE FROM positions")
                 conn.execute("DELETE FROM cash")
@@ -492,6 +587,11 @@ class PortfolioState:
             record: dict matching ExecutionRecord fields (as produced by
                     paper._record_to_dict).
         """
+        # ft1: BEFORE any fold, refuse a flag-flip regime mismatch against a
+        # populated db (would phantom-sell). Raised OUTSIDE the swallowing
+        # try/except below so the refusal is loud to the caller; the default
+        # flag-OFF path never trips it (legacy db stamp 0 == OFF regime 0).
+        self._check_regime_stamp()
         try:
             self._apply_execution_unsafe(record)
         except Exception as e:  # noqa: BLE001
@@ -588,6 +688,13 @@ class PortfolioState:
             # read-then-write race when two processes apply concurrently.
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # ft1: stamp the current regime on every incremental write so a
+                # flag-ON session marks the db (and a flag-OFF write re-affirms 0,
+                # a no-op on a legacy db => byte-identical). _check_regime_stamp()
+                # at the public entry already refused any populated-db mismatch
+                # before we got here, so this only ever (re)writes the AGREEING
+                # regime; it cannot silently overwrite a conflicting stamp.
+                conn.execute(f"PRAGMA user_version = {int(_current_normalizer_regime())}")
                 # Cross-model review C2: idempotency guard. If this
                 # (proposal_id, asof_execution) has already been applied,
                 # skip — INSERT into processed_fills will fail the UNIQUE,

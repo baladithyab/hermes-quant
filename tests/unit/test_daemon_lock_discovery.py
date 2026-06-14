@@ -153,6 +153,30 @@ class TestPortfolioReconstruction:
         # Realized PnL = 2000 (bought at 60k, sold at 62k)
         assert p.realized_pnl_total == pytest.approx(2_000.0)
 
+    def test_short_then_cover_realizes_positive_pnl(self, tmp_path):
+        """cs00 regression: shorting then covering CHEAPER must realize a POSITIVE
+        P&L. The v0.1.1 full-close formula carried a spurious trailing
+        `* (1 if old_qty > 0 else -1)` factor that INVERTED the short branch
+        (sell 10@100 then buy 10@90 booked -100 instead of +100). A short cover
+        is a full close (new_qty == 0), which the v0.1.1 gate permits, so this
+        stream reaches the fixed branch.
+        """
+        bus = tmp_path / "execs.jsonl"
+        # Sell 10 BTC at 100 (open short), then buy 10 BTC at 90 (cover cheaper).
+        emit_execution_record(self._exec("sell", 10.0, 100.0), path=bus)
+        emit_execution_record(self._exec("buy", 10.0, 90.0), path=bus)
+
+        p = reconstruct_portfolio(
+            "alpaca-paper",
+            "crypto",
+            initial_cash=100_000.0,
+            bus_path=bus,
+        )
+        # Position fully closed.
+        assert "BTC/USDT" not in p.positions
+        # Shorted at 100, covered at 90 => +100 realized profit (was -100 buggy).
+        assert p.realized_pnl_total == pytest.approx(100.0)
+
     def test_open_position_marked_to_market(self, tmp_path):
         bus = tmp_path / "execs.jsonl"
         emit_execution_record(self._exec("buy", 1.0, 60_000.0), path=bus)

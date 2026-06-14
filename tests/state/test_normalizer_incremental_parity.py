@@ -98,6 +98,63 @@ def test_incremental_matches_rebuild_flag_on(tmp_path, monkeypatch):
     assert inc[("equity", "BA")].quantity == pytest.approx(reb[("equity", "BA")].quantity, rel=1e-9)
 
 
+@pytest.mark.xfail(
+    reason=(
+        "ms1 (2026-06-13) DORMANT divergence: in a bucket that MIXES absolute-target "
+        "and true-delta records, FillDeltaNormalizer.delta_for() returns a true-delta "
+        "record's size WITHOUT advancing its in-memory running_net (rebuild), but "
+        "apply_execution DOES advance the persisted state.db qty by that delta and "
+        "then differences the NEXT absolute target against it (incremental). So the "
+        "two folds seed the next target-difference from different bases and diverge "
+        "(incremental 0.05 vs rebuild 0.07 for [abs 0.05, true-delta +0.02, abs 0.05]). "
+        "Dormant today: no producer emits schema_version='true-delta-v1' (every record "
+        "defaults schema_version=None == absolute-target), so the mixed stream cannot "
+        "occur in production. This test pins the desired parity (it WILL fail until the "
+        "advance rule is reconciled); flipping it to pass is the deferred fix's gate."
+    ),
+    strict=True,
+)
+def test_mixed_schema_bucket_incremental_vs_rebuild_parity(tmp_path, monkeypatch):
+    """RED (xfail): a single bucket mixing absolute-target + true-delta fills folds
+    to DIFFERENT final positions via the incremental vs rebuild paths.
+
+    The desired (asserted) invariant is parity. It currently FAILS because the
+    true-delta record advances the persisted net in the incremental fold but NOT the
+    normalizer's in-memory net in the rebuild fold — the ms1 divergence.
+    """
+    import json
+
+    monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
+
+    def _delta_rec(asset, size, *, pid, asof):
+        r = _rec(asset, size, pid=pid, asof=asof)
+        r["schema_version"] = "true-delta-v1"  # NOT absolute-target -> passthrough
+        return r
+
+    recs = [
+        _rec("AAPL", 0.05, pid="m0", asof="2026-06-06T10:00:00Z"),
+        _delta_rec("AAPL", 0.02, pid="m1", asof="2026-06-06T10:01:00Z"),
+        _rec("AAPL", 0.05, pid="m2", asof="2026-06-06T10:02:00Z"),
+    ]
+
+    # Incremental fold.
+    ps_inc = PortfolioState(state_db_path=tmp_path / "inc.db")
+    _apply_stream(ps_inc, recs)
+    inc = ps_inc.get_positions("paper-default")[("equity", "AAPL")].quantity
+
+    # Rebuild fold over the same stream.
+    bus = tmp_path / "executions.jsonl"
+    with open(bus, "w") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+    ps_reb = PortfolioState(state_db_path=tmp_path / "reb.db")
+    ps_reb.reconstruct_from(bus)
+    reb = ps_reb.get_positions("paper-default")[("equity", "AAPL")].quantity
+
+    # Desired invariant (currently violated => xfail): the two folds agree.
+    assert inc == pytest.approx(reb, rel=1e-9)
+
+
 def test_incremental_flag_off_is_legacy(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_QUANT_DELTA_NORMALIZER", raising=False)
     recs = [_rec("AAPL", 0.05, pid=f"p{i}", asof=f"2026-06-06T10:{i:02d}:00Z") for i in range(12)]
