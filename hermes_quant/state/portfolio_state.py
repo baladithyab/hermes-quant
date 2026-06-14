@@ -121,6 +121,64 @@ def _is_multileg_family_parent(asset_class: str) -> bool:
     return asset_class == _MULTILEG_PARENT_ASSET_CLASS
 
 
+def _resolve_account(rec: dict[str, Any]) -> str:
+    """Resolve the partition account for one persisted execution record (cs52).
+
+    Mirrors the cs24 daemon-loader resolution (daemon/portfolio_loader._record_account)
+    EXACTLY: top-level account_id if truthy, else reactor_metadata.account_id if truthy,
+    else the "paper-default" sentinel. This is the SAME seam the live producer uses —
+    the reactors inject a top-level account_id into the dict they hand apply_execution at
+    runtime (react/paper.py:438-441; react/alpaca_paper.py:432) BEFORE the persisted log
+    is written, but react/paper.py:_record_to_dict serializes account_id ONLY inside
+    reactor_metadata. So a record read back from executions.jsonl during a full rebuild
+    carries its account_id ONLY in reactor_metadata; reading just the top-level field
+    re-pools every alpaca-paper fill into paper-default and corrupts the per-account NAV
+    partition. A truthy top-level account_id resolves identically to the old
+    `.get(..., "paper-default")`, so a paper-default-only log is byte-identical.
+    """
+    acct = rec.get("account_id")
+    if acct:
+        return str(acct)
+    meta_acct = (rec.get("reactor_metadata") or {}).get("account_id")
+    if meta_acct:
+        return str(meta_acct)
+    return "paper-default"
+
+
+def _dedup_key(rec: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    """Build the cs51 5-column idempotency key for one execution record (cs57).
+
+    Returns (proposal_id, asof_execution, dedup_asset, dedup_asset_class, dedup_leg) —
+    the EXACT key the incremental fold writes into processed_fills
+    (_apply_execution_unsafe). reconstruct_from uses it to drop a true byte-duplicate
+    (the C2 append-before-apply crash-retry record) from its in-memory accumulator so the
+    rebuild fold agrees with the deduped incremental fold.
+
+    Mirrors the incremental key construction verbatim:
+      * dedup_asset / dedup_asset_class come from the true-unit (leg_quantity) path:
+        the real (asset, asset_class) when reactor_metadata.quantity is present, else the
+        "" / "" legacy sentinel — so a legacy single-leg equity row keys exactly as the
+        4-column form did.
+      * dedup_leg is the per-leg index the option children carry (react/multileg.py:582),
+        "" when absent (NOT the literal "None") — so the cs51 same-OCC legs (leg_index 0
+        and 1) claim DISTINCT keys and are NOT re-collapsed, while a true byte-duplicate
+        (same leg_index) collides and is dropped.
+    """
+    asof = rec.get("asof_execution") or _utc_now_iso()
+    proposal_id = rec.get("proposal_id") or ""
+    rmeta = rec.get("reactor_metadata") or {}
+    leg_quantity = rmeta.get("quantity") if isinstance(rmeta, dict) else None
+    if leg_quantity is not None:
+        dedup_asset = rec.get("asset", "")
+        dedup_asset_class = rec.get("asset_class", "equity")
+    else:
+        dedup_asset = ""
+        dedup_asset_class = ""
+    _leg_index = rmeta.get("leg_index") if isinstance(rmeta, dict) else None
+    dedup_leg = "" if _leg_index is None else str(_leg_index)
+    return (proposal_id, asof, dedup_asset, dedup_asset_class, dedup_leg)
+
+
 # ---------------------------------------------------------------------------
 # cs15 (ADR-0086 Phase 1, missed half): signed net-liquidation equity_total.
 #
@@ -573,14 +631,42 @@ class PortfolioState:
             # per-bucket, so cross-bucket interleaving is unaffected.
             records = sorted(records, key=lambda r: r.get("asof_execution") or "")
 
+        # cs57: the incremental fold dedups a true byte-duplicate (the C2
+        # append-before-apply crash-retry record) via INSERT OR IGNORE on processed_fills;
+        # reconstruct_from folds EVERY raw record with no dedup, so a duplicated line
+        # double-counts and the rebuild book DIVERGES from the deduped incremental book.
+        # Drop a record whose full cs51 5-col key was already folded in THIS rebuild pass,
+        # mirroring the incremental key (incl. leg_index ⇒ the cs51 same-OCC legs are NOT
+        # re-collapsed; only a genuine same-leg duplicate collides). Gated on a truthy
+        # proposal_id, exactly like the incremental dedup (`if proposal_id:`). A log with
+        # no duplicates leaves every key distinct ⇒ byte-identical to the legacy fold.
+        seen_keys: set[tuple[str, str, str, str, str]] = set()
+
         for line_no, rec in enumerate(records, start=1):
             try:
+                # cs57: dedup BEFORE folding. Skip the cs44 family-parent (no real key, it
+                # early-returns in _replay_record anyway) so it never enters seen_keys.
+                rec_asset_class = rec.get("asset_class", "equity")
+                if not _is_multileg_family_parent(rec_asset_class):
+                    proposal_id = rec.get("proposal_id") or ""
+                    if proposal_id:
+                        key = _dedup_key(rec)
+                        if key in seen_keys:
+                            # True byte-duplicate of an already-folded record: skip the
+                            # fold AND the executions_processed/accounts_seen bump, matching
+                            # the incremental rollback-books-nothing semantics. latest_asof
+                            # is unaffected (the dup shares the kept record's asof).
+                            continue
+                        seen_keys.add(key)
                 _override = _normalizer.delta_for(rec) if _normalizer is not None else None
                 _replay_record(
                     rec, positions, cash_map, last_ts, initial_cash, _override
                 )
                 result.executions_processed += 1
-                acct = rec.get("account_id", "paper-default")
+                # cs52: report the SAME resolved partition the fold booked into, so
+                # accounts_seen reflects alpaca-paper (account_id in reactor_metadata)
+                # rather than mis-reporting paper-default.
+                acct = _resolve_account(rec)
                 result.accounts_seen.add(acct)
             except Exception as e:  # noqa: BLE001
                 result.errors.append((line_no, str(e)))
@@ -732,7 +818,14 @@ class PortfolioState:
 
     def _apply_execution_unsafe(self, record: dict[str, Any]) -> None:
         """Inner implementation — may raise; caller wraps in try/except."""
-        acct = record.get("account_id", "paper-default")
+        # cs52: resolve the partition account via the same fallback as the rebuild fold
+        # (top-level account_id, else reactor_metadata.account_id, else "paper-default").
+        # The LIVE path is unaffected — the reactors pre-inject a top-level account_id
+        # before calling apply_execution (react/paper.py:438-441) — but this keeps the
+        # incremental fold in parity for a manual raw-log replay where account_id lives
+        # only in reactor_metadata. A truthy top-level account_id resolves identically ⇒
+        # byte-identical to the prior .get(...,"paper-default").
+        acct = _resolve_account(record)
         asset_class = record.get("asset_class", "equity")
         # cs44: skip the multi-leg family-PARENT audit record (asset_class=="multi_leg")
         # BEFORE any position/cash mutation — its children carry the real book; folding
@@ -1271,7 +1364,14 @@ def _replay_record(
             unit), replacing the raw absolute-target size field. None ⇒ legacy
             behavior (read the raw field), bit-for-bit unchanged.
     """
-    acct = rec.get("account_id", "paper-default")
+    # cs52: resolve the partition account the SAME way the live producer/state-write seam
+    # does — top-level account_id, else reactor_metadata.account_id, else "paper-default"
+    # (mirrors cs24/daemon _record_account). A persisted alpaca-paper fill carries its
+    # account_id ONLY in reactor_metadata (react/paper.py:_record_to_dict emits no
+    # top-level field), so the bare .get(...,"paper-default") re-pooled it into
+    # paper-default on rebuild. A truthy top-level account_id resolves identically ⇒
+    # paper-default-only log byte-identical.
+    acct = _resolve_account(rec)
     asset_class = rec.get("asset_class", "equity")
     # cs44: skip the multi-leg family-PARENT audit record (asset_class=="multi_leg")
     # BEFORE touching positions/cash_map/last_ts. reconstruct_from reads EVERY bus

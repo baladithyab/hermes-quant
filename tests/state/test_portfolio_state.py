@@ -247,9 +247,15 @@ class TestMultipleSymbols:
         self, ps: PortfolioState, executions_path: Path
     ):
         """Two distinct symbols produce two separate position rows."""
+        # Distinct fills carry distinct proposal_ids — a proposal targets ONE asset,
+        # so two symbols are two proposals. (Sharing the default "prop_test" would
+        # collide the cs51 idempotency key on the legacy NAV-fraction path, exactly
+        # as the incremental fold dedups them; the cs57 rebuild fold now matches that.)
         records = [
-            _make_record(asset="AAPL", fill_size_pct=0.03, fill_price=150.0),
-            _make_record(asset="MSFT", fill_size_pct=0.04, fill_price=300.0),
+            _make_record(asset="AAPL", fill_size_pct=0.03, fill_price=150.0,
+                         proposal_id="prop_aapl"),
+            _make_record(asset="MSFT", fill_size_pct=0.04, fill_price=300.0,
+                         proposal_id="prop_msft"),
         ]
         _write_jsonl(executions_path, records)
         ps.reconstruct_from(executions_path)
@@ -358,9 +364,12 @@ class TestMultipleSymbols:
 
     def test_multi_symbol_cash_sum(self, ps: PortfolioState, executions_path: Path):
         """Cash decremented by sum of all fill costs."""
+        # Distinct fills carry distinct proposal_ids (see test_two_symbols_separate_positions).
         records = [
-            _make_record(asset="AAPL", fill_size_pct=0.02, fill_price=100.0),
-            _make_record(asset="MSFT", fill_size_pct=0.03, fill_price=200.0),
+            _make_record(asset="AAPL", fill_size_pct=0.02, fill_price=100.0,
+                         proposal_id="prop_aapl"),
+            _make_record(asset="MSFT", fill_size_pct=0.03, fill_price=200.0,
+                         proposal_id="prop_msft"),
         ]
         _write_jsonl(executions_path, records)
         ps.reconstruct_from(executions_path)
@@ -405,12 +414,14 @@ class TestIdempotency:
         self, ps: PortfolioState, executions_path: Path
     ):
         """Full rebuild clears positions from a previous different state."""
-        # First write with AAPL + MSFT
+        # First write with AAPL + MSFT (distinct fills => distinct proposal_ids).
         _write_jsonl(
             executions_path,
             [
-                _make_record(asset="AAPL", fill_size_pct=0.05, fill_price=100.0),
-                _make_record(asset="MSFT", fill_size_pct=0.03, fill_price=200.0),
+                _make_record(asset="AAPL", fill_size_pct=0.05, fill_price=100.0,
+                             proposal_id="prop_aapl"),
+                _make_record(asset="MSFT", fill_size_pct=0.03, fill_price=200.0,
+                             proposal_id="prop_msft"),
             ],
         )
         ps.reconstruct_from(executions_path)
@@ -419,7 +430,8 @@ class TestIdempotency:
         # Now overwrite JSONL with only AAPL
         _write_jsonl(
             executions_path,
-            [_make_record(asset="AAPL", fill_size_pct=0.05, fill_price=100.0)],
+            [_make_record(asset="AAPL", fill_size_pct=0.05, fill_price=100.0,
+                          proposal_id="prop_aapl")],
         )
         ps.reconstruct_from(executions_path)
         positions = ps.get_positions("paper-default")
@@ -644,18 +656,22 @@ class TestMultipleAccounts:
         self, ps: PortfolioState, executions_path: Path
     ):
         """Two accounts have independent positions and cash."""
+        # Distinct fills (different account AND asset) carry distinct proposal_ids;
+        # the shared default would collide the cs51 legacy-path idempotency key.
         records = [
             _make_record(
                 account_id="paper-a",
                 asset="AAPL",
                 fill_size_pct=0.05,
                 fill_price=100.0,
+                proposal_id="prop_a",
             ),
             _make_record(
                 account_id="paper-b",
                 asset="MSFT",
                 fill_size_pct=0.10,
                 fill_price=200.0,
+                proposal_id="prop_b",
             ),
         ]
         _write_jsonl(executions_path, records)
@@ -955,10 +971,13 @@ class TestReconstructionResult:
         self, ps: PortfolioState, executions_path: Path
     ):
         """ReconstructionResult.accounts_seen contains all account_ids seen."""
+        # acc-a and acc-b are distinct fills (distinct proposal_ids); the third
+        # record is a true byte-duplicate of the first acc-a fill (same proposal_id),
+        # so the cs57 rebuild dedup folds it once — acc-a is still seen exactly once.
         records = [
-            _make_record(account_id="acc-a"),
-            _make_record(account_id="acc-b"),
-            _make_record(account_id="acc-a"),  # duplicate — counted once
+            _make_record(account_id="acc-a", proposal_id="prop_a"),
+            _make_record(account_id="acc-b", proposal_id="prop_b"),
+            _make_record(account_id="acc-a", proposal_id="prop_a"),  # duplicate
         ]
         _write_jsonl(executions_path, records)
         result = ps.reconstruct_from(executions_path)
@@ -967,8 +986,10 @@ class TestReconstructionResult:
     def test_executions_processed_count(
         self, ps: PortfolioState, executions_path: Path
     ):
-        """executions_processed matches number of valid records."""
-        records = [_make_record() for _ in range(5)]
+        """executions_processed matches number of valid DISTINCT records."""
+        # Distinct fills carry distinct proposal_ids; 5 byte-identical default records
+        # would be one fill under both the incremental and (post-cs57) rebuild folds.
+        records = [_make_record(proposal_id=f"prop_{i}") for i in range(5)]
         _write_jsonl(executions_path, records)
         result = ps.reconstruct_from(executions_path)
         assert result.executions_processed == 5
