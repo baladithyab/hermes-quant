@@ -28,8 +28,34 @@ from pathlib import Path
 
 from hermes_quant.risk.portfolio_normalize import PortfolioState
 
-
 _DEFAULT_EXECUTIONS_PATH = Path("~/.hermes/quant/executions.jsonl").expanduser()
+
+
+def _record_account(rec: dict) -> str:
+    """Resolve the account partition a bus record belongs to.
+
+    cs18: the executions.jsonl bus carries NO top-level ``account_id`` for the
+    live equity producers (verified on the live bus: 0/46 records). The account
+    lives inside ``reactor_metadata.account_id`` (react/paper.py emits no acct;
+    react/deterministic_equity.py + react/alpaca_paper.py both nest it there).
+
+    Resolution mirrors the cs14 weekly-exit loader EXACTLY
+    (daemon/portfolio_loader.py:103-110, operator-approved 4d5cc42):
+        top-level ``account_id``  ->  ``reactor_metadata.account_id``  ->
+        the ``"paper-default"`` sentinel.
+
+    So a "paper" fill (no account stamp) and a "deterministic-equity" fill (acct
+    "paper-default") both resolve to ``paper-default`` — the synthetic book the
+    autonomous fires actually hit — while an "alpaca_paper" fill resolves to the
+    separate ``alpaca-paper`` SHADOW book.
+    """
+    acct = rec.get("account_id")
+    if acct:
+        return str(acct)
+    meta_acct = (rec.get("reactor_metadata") or {}).get("account_id")
+    if meta_acct:
+        return str(meta_acct)
+    return "paper-default"
 
 
 def reconstruct_portfolio_state(
@@ -38,6 +64,7 @@ def reconstruct_portfolio_state(
     asof: str | None = None,
     drop_zeros: bool = True,
     reactor_filter: str | None = "paper",
+    account: str | None = None,
 ) -> PortfolioState:
     """Walk executions.jsonl and return a PortfolioState snapshot.
 
@@ -53,6 +80,15 @@ def reconstruct_portfolio_state(
         reactor_filter: only fills whose `reactor_name` matches contribute.
             Default "paper" — keeps live broker fills out of the paper-state
             view if/when both rails are running. Pass None to include all.
+        account: cs18 — if set (e.g. "paper-default"), only fills whose resolved
+            account partition (see `_record_account`) matches contribute. This
+            EXCLUDES the deliberately-separate ``alpaca-paper`` SHADOW book from a
+            ``paper-default`` reconstruction. Default None = include ALL accounts
+            (byte-identical to the pre-cs18 whole-book behavior — the asset-only
+            key collapses cross-account symbols and pools cross-account fractions,
+            which is the cs18 pooling bug when reactor_filter is also None). This
+            is ADDITIVE: it does NOT change the {symbol: float} return type; it
+            only narrows which records feed the existing asset-keyed collapse.
 
     Returns:
         PortfolioState with the snapshot's `positions` dict.
@@ -95,6 +131,12 @@ def reconstruct_portfolio_state(
         if reactor_filter is not None:
             if rec.get("reactor_name") != reactor_filter:
                 continue
+
+        # cs18: when an account partition is requested, drop records that resolve
+        # to a DIFFERENT account BEFORE the asset-only collapse, so a separate book
+        # (e.g. the alpaca-paper shadow) cannot pool into or mask this account.
+        if account is not None and _record_account(rec) != account:
+            continue
 
         asset = rec.get("asset")
         target = rec.get("target_position_pct")
