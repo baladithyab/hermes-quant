@@ -81,6 +81,45 @@ _DEFAULT_INITIAL_CASH = 100_000.0
 # layer dependency-light). ADR-0088 F1.
 _CONTRACT_MULTIPLIER = 100.0
 
+# ---------------------------------------------------------------------------
+# cs44: skip the multi-leg family-PARENT audit record in BOTH folds.
+#
+# react/multileg.py:_write_family appends ONE parent + one child-per-leg to
+# executions.jsonl. The CHILDREN carry the real positions and the FULL real cash
+# (option legs ×premium×contracts×100 via the leg_quantity true-unit path, equity
+# leg ×shares). The PARENT is a pure audit rollup: asset_class=="multi_leg",
+# reactor_metadata.role=="parent", NO reactor_metadata.quantity, fill_price==net_fill.
+# Folding it would (a) create a PHANTOM ("acct","multi_leg",underlying) position whose
+# quantity is the meaningless fill_size_pct NAV fraction, and (b) book a second cash
+# delta (-fill_size_pct*net_fill) ON TOP of the children's real cash — a money-state
+# DOUBLE-BOOK. state.db's equity_total is the gate-SIZED NAV (react/paper.py +
+# autonomous.py _account_nav_usd), so the phantom row + double cash corrupts a LIVE
+# risk-gate input.
+#
+# reconstruct_from() reads EVERY record in executions.jsonl (parents included), so the
+# rebuild fold is where the defect bites. The incremental fold (_reconcile_state feeds
+# only children today) gets the SAME skip for defense-in-depth: a manual replay or a
+# future caller could feed the parent dict to apply_execution directly.
+#
+# The skip discriminator is asset_class=="multi_leg": this value is parent-ONLY on the
+# bus — the multi-leg reactor's parent (multileg.py:531 fill, :667 no-fill) is the only
+# producer of an ExecutionRecord with this asset_class; every child uses "us_option" /
+# "equity". No real position class is "multi_leg" (positions.py / react/base.py impose
+# no such class; the proposals.py "multi_leg" use is on a Proposal store row, never a
+# bus ExecutionRecord). So the skip NEVER drops a child or a real position and an
+# equity/option-only book is byte-identical (the skip never fires).
+_MULTILEG_PARENT_ASSET_CLASS = "multi_leg"
+
+
+def _is_multileg_family_parent(asset_class: str) -> bool:
+    """True for the multi-leg family-PARENT audit record (cs44).
+
+    The parent is the ONLY bus ExecutionRecord with asset_class=="multi_leg"; its
+    children use "us_option"/"equity". Skipping it in both folds prevents a phantom
+    "multi_leg" position + a double-counted cash delta on top of the children.
+    """
+    return asset_class == _MULTILEG_PARENT_ASSET_CLASS
+
 
 # ---------------------------------------------------------------------------
 # cs15 (ADR-0086 Phase 1, missed half): signed net-liquidation equity_total.
@@ -666,6 +705,20 @@ class PortfolioState:
         """Inner implementation — may raise; caller wraps in try/except."""
         acct = record.get("account_id", "paper-default")
         asset_class = record.get("asset_class", "equity")
+        # cs44: skip the multi-leg family-PARENT audit record (asset_class=="multi_leg")
+        # BEFORE any position/cash mutation — its children carry the real book; folding
+        # the parent would phantom a "multi_leg" position + double-count cash. The early
+        # return touches no DB state (no processed_fills claim, no watermark bump), so a
+        # later child apply is unaffected. Fires ONLY on the parent marker ⇒ an
+        # equity/option-only record is byte-identical.
+        if _is_multileg_family_parent(asset_class):
+            logger.debug(
+                "apply_execution: skipping multi-leg family-parent rollup "
+                "(proposal_id=%s asset=%s) — children carry the position+cash",
+                record.get("proposal_id"),
+                record.get("asset"),
+            )
+            return
         symbol = record.get("asset", "")
         fill_size_pct = float(record.get("fill_size_pct", 0.0))
         fill_price = float(record.get("fill_price", 0.0))
@@ -1172,6 +1225,17 @@ def _replay_record(
     """
     acct = rec.get("account_id", "paper-default")
     asset_class = rec.get("asset_class", "equity")
+    # cs44: skip the multi-leg family-PARENT audit record (asset_class=="multi_leg")
+    # BEFORE touching positions/cash_map/last_ts. reconstruct_from reads EVERY bus
+    # record including the parent that _write_family appends; the children (us_option /
+    # equity, with reactor_metadata.quantity) carry the real positions + full cash. The
+    # parent has no quantity, so folding it phantoms a "multi_leg" position and books a
+    # second cash delta on top of the children (double-book). Skip fires ONLY on the
+    # parent marker ⇒ an equity/option-only rebuild is byte-identical (incl. last_ts,
+    # which the parent shares with its same-asof children, so the watermark is
+    # unchanged).
+    if _is_multileg_family_parent(asset_class):
+        return
     symbol = rec.get("asset", "")
     fill_size_pct = float(rec.get("fill_size_pct", 0.0))
     fill_price = float(rec.get("fill_price", 0.0))
