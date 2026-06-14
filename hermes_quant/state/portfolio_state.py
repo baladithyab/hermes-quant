@@ -673,7 +673,13 @@ class PortfolioState:
                 logger.warning("reconstruct_from: skipping record %d: %s", line_no, e)
 
         # ── 3. Write to state.db atomically ──────────────────────────────
-        latest_asof = _latest_asof(records)
+        # cs62: derive the watermark from the asofs we actually FOLDED (last_ts is mutated
+        # only by a successful _replay_record), NOT from the raw record list. A poisoned
+        # future-bound asof now raises in _replay_record and never enters last_ts, so it can
+        # no longer wedge the watermark past real time. For a clean log every record folds,
+        # so max(last_ts.values()) == _latest_asof(records) (byte-identical); an empty or
+        # all-errored log leaves last_ts {} ⇒ None, matching the prior no-write path.
+        latest_asof = max(last_ts.values()) if last_ts else None
 
         with self._lock, self._conn() as conn:
             # Cross-model review I2: BEGIN IMMEDIATE for write-lock-on-start.
@@ -887,24 +893,11 @@ class PortfolioState:
             if (leg_quantity is not None and asset_class == "us_option")
             else 1.0
         )
-        # Cross-model review C2 (Claude Opus): future-bound asof. A crafted
-        # asof of "9999-12-31..." would wedge the watermark and silently
-        # cause future delta-replays to skip every legitimate record.
-        # Reject anything more than 24h in the future of wall-clock-now.
-        now = datetime.now(UTC)
-        try:
-            asof_dt = datetime.fromisoformat(asof.replace("Z", "+00:00"))
-            if asof_dt.tzinfo is None:
-                asof_dt = asof_dt.replace(tzinfo=UTC)
-            if asof_dt > now and (asof_dt - now).total_seconds() > 86400:
-                raise ValueError(
-                    f"asof_execution {asof} is more than 24h in the future "
-                    f"of wall-clock {now.isoformat()}; refusing to apply"
-                )
-        except (TypeError, ValueError) as exc:
-            # Bad ISO format also lands here. We re-raise rather than
-            # silently using _utc_now_iso to avoid masking upstream bugs.
-            raise ValueError(f"unparseable or future-bound asof_execution: {asof!r}") from exc
+        # Cross-model review C2 (Claude Opus): future-bound / unparseable asof rejection.
+        # cs62: the SAME guard the rebuild fold (_replay_record) now applies, factored into
+        # ONE shared helper so the incremental and rebuild folds can never diverge on which
+        # records they drop. Byte-identical to the prior inline block.
+        _validate_asof(asof)
 
         initial_cash = _default_initial_cash()
         proposal_id = record.get("proposal_id") or ""
@@ -1285,6 +1278,40 @@ def _latest_asof(records: list[dict[str, Any]]) -> str | None:
     return max(asofs) if asofs else None
 
 
+def _validate_asof(asof: str) -> None:
+    """cs62: the SHARED no-lookahead/poison guard for asof_execution.
+
+    Cross-model review C2 (Claude Opus): a future-bound asof of "9999-12-31..." would
+    wedge the watermark and silently cause future delta-replays to skip every legitimate
+    record. A bad ISO format is equally poisonous. Reject anything more than 24h in the
+    future of wall-clock-now, or anything unparseable.
+
+    cs62: BOTH folds (the incremental _apply_execution_unsafe AND the rebuild
+    _replay_record) call this ONE implementation so reconstruct_from drops exactly the
+    records the live incremental book drops — the rebuild can no longer DIVERGE by folding a
+    poisoned record the live book correctly rejected, and a `--apply` can no longer corrupt
+    state.db / wedge the watermark. A clean (valid, non-future, parseable) asof returns None
+    and the caller proceeds bit-for-bit as before.
+
+    Raises:
+        ValueError: if asof is unparseable or more than 24h in the future.
+    """
+    now = datetime.now(UTC)
+    try:
+        asof_dt = datetime.fromisoformat(asof.replace("Z", "+00:00"))
+        if asof_dt.tzinfo is None:
+            asof_dt = asof_dt.replace(tzinfo=UTC)
+        if asof_dt > now and (asof_dt - now).total_seconds() > 86400:
+            raise ValueError(
+                f"asof_execution {asof} is more than 24h in the future "
+                f"of wall-clock {now.isoformat()}; refusing to apply"
+            )
+    except (TypeError, ValueError) as exc:
+        # Bad ISO format also lands here. We re-raise rather than
+        # silently using _utc_now_iso to avoid masking upstream bugs.
+        raise ValueError(f"unparseable or future-bound asof_execution: {asof!r}") from exc
+
+
 def _update_position(
     old_qty: float,
     old_avg: float,
@@ -1388,6 +1415,15 @@ def _replay_record(
     fill_size_pct = float(rec.get("fill_size_pct", 0.0))
     fill_price = float(rec.get("fill_price", 0.0))
     asof = rec.get("asof_execution") or _utc_now_iso()
+    # cs62: apply the SAME asof poison guard the incremental fold
+    # (_apply_execution_unsafe) applies, BEFORE any positions/cash/last_ts mutation. A
+    # future-bound or unparseable asof raises here; reconstruct_from's per-record
+    # try/except catches it, records the error, and skips the fold (and the
+    # executions_processed/accounts_seen bump) — exactly mirroring the incremental reject.
+    # Without this, the rebuild folded a poisoned record the live book correctly dropped
+    # (divergence), and a `--apply` corrupted state.db + wedged the watermark. A clean
+    # (valid, non-future, parseable) asof passes through untouched ⇒ byte-identical fold.
+    _validate_asof(asof)
 
     # ADR-0029 multi-leg: a child leg with an explicit signed contract/share count
     # tracks position quantity in that true unit (parity with apply_execution).
