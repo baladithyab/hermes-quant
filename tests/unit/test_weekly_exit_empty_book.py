@@ -112,17 +112,23 @@ def test_live_record_without_account_id_now_reconstructs(tmp_path: Path) -> None
     state-write seam does (reactor_metadata.account_id or the "paper-default"
     sentinel), so a record with no account_id now reconstructs a real position.
 
+    cs24 UPDATE: this record (reactor "paper", no account_id) resolves to the
+    "paper-default" partition. The loader is now account-EQUALITY (not the prior
+    set-OR over {account_id, "paper-default"}), so it reconstructs under a
+    PAPER-DEFAULT request — the account the weekly actually manages — NOT under an
+    "alpaca-paper" request (the separate SHADOW partition). The prior assertion
+    requested "alpaca-paper" and passed only because the set-OR pooled the
+    paper-default book into the alpaca request; that pooling was the cs24 bug.
+
     NAV-fraction fallback derivation (reactor_metadata is empty here, so no
     authoritative quantity): qty = target_position_pct * NAV / entry_price
     = 0.20 * 100_000 / 200 = 100.0 long shares, entry/mark = 200.0.
-
-    Regression guard: this used to assert pf.positions == {} (the broken empty
-    book). It now pins the CORRECT reconstruction.
     """
     d = _live_record_dict()
     bus = _write_bus(tmp_path, d)
 
-    pf = reconstruct_portfolio(ACCOUNT_ID, ASSET_CLASS, bus_path=bus)
+    # cs24: request the REAL managed book ("paper-default"), not the shadow.
+    pf = reconstruct_portfolio("paper-default", ASSET_CLASS, bus_path=bus)
 
     assert len(pf.positions) == 1
     assert "AAPL" in pf.positions
@@ -131,6 +137,11 @@ def test_live_record_without_account_id_now_reconstructs(tmp_path: Path) -> None
     assert pos.qty > 0  # long
     assert pos.avg_entry_price == pytest.approx(200.0)
     assert pos.mark_price == pytest.approx(200.0)
+
+    # cs24 anti-pooling guard: the SAME paper-default record must NOT pool into a
+    # request for the separate "alpaca-paper" SHADOW partition.
+    pf_shadow = reconstruct_portfolio("alpaca-paper", ASSET_CLASS, bus_path=bus)
+    assert pf_shadow.positions == {}
 
 
 def test_live_record_reconstructs_legacy_int1_still_needs_side_qty(tmp_path: Path) -> None:

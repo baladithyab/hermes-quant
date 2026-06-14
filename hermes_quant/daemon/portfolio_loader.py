@@ -109,13 +109,29 @@ def reconstruct_portfolio(
             return str(meta_acct)
         return "paper-default"
 
+    # cs24: account-EQUALITY, NOT a set-OR over {account_id, "paper-default"}.
+    #
+    # The prior `_record_account(r) in {account_id, "paper-default"}` was a set-OR
+    # that admitted the ENTIRE synthetic "paper-default" book (PaperReactor +
+    # DeterministicEquityReactor both resolve to "paper-default") into ANY requested
+    # account. Empirically, reconstruct_portfolio("alpaca-paper","equity") returned
+    # the paper-default fills POOLED with the lone real alpaca-paper position — so a
+    # request for the SHADOW book (react.alpaca_paper: a deliberately SEPARATE
+    # partition, default-OFF) silently absorbed the real synthetic managed book.
+    #
+    # This now matches the cs18 sibling reconstruction
+    # (portfolio.state.reconstruct_portfolio_state:138 — `_record_account(rec) !=
+    # account` skip) AND the strict legacy int-1 path above (:90 `== account_id`).
+    # The two reconstructions previously DISAGREED on account semantics (set-OR vs
+    # equality); they now agree. A paper-default request still gets the paper-default
+    # book; an alpaca-paper request gets ONLY the alpaca-paper shadow book — no pool.
     absolute_matching = [
         r
         for r in records
         if is_absolute_target_record(r)
         and r.get("reactor_name") in EQUITY_FILL_REACTORS
         and r.get("asset_class") == asset_class
-        and _record_account(r) in {account_id, "paper-default"}
+        and _record_account(r) == account_id
     ]
 
     cash = initial_cash

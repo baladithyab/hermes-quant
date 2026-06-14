@@ -423,10 +423,21 @@ def load_portfolio(executions_path: Path | None = None) -> tuple[Any, list[dict]
         return None, []
 
     raw = read_jsonl_tail(executions_path, n=100_000)
-    # We iterate over equity partitions (alpaca-paper). Crypto / others
-    # are out of scope for the ADR-0035 weekly rebalance.
+    # cs24: manage the "paper-default" equity partition — the REAL synthetic book the
+    # ADR-0035 playbook system trades (PaperReactor + DeterministicEquityReactor +
+    # the autonomous tick all write to "paper-default"; see react/deterministic_equity.py:79
+    # "shares the SAME book the autonomous tick + the legacy PaperReactor read/write").
+    # The prior "alpaca-paper" request was the SEPARATE Alpaca SHADOW partition
+    # (react/alpaca_paper.py:67, default-OFF behind HERMES_QUANT_ALPACA_PAPER=1) — NOT
+    # the book the weekly is meant to manage. That wrong-account request was masked by a
+    # loader set-OR (portfolio_loader.py: `in {account_id,"paper-default"}`) that pooled
+    # the paper-default book into the alpaca-paper request; with the loader tightened to
+    # account-EQUALITY (cs24), asking for "alpaca-paper" would now return ONLY the lone
+    # alpaca shadow position and STOP managing the real paper-default book — so the
+    # account request is corrected here in lockstep. Crypto / others are out of scope for
+    # the ADR-0035 weekly rebalance (equity-only).
     pf = reconstruct_portfolio(
-        account_id="alpaca-paper",
+        account_id="paper-default",
         asset_class="equity",
         bus_path=executions_path,
     )
