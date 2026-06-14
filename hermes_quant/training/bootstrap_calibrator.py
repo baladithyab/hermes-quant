@@ -172,7 +172,13 @@ def _walk_bars_for_symbol(
     horizon_bars: int,
     min_context_bars: int,
 ) -> dict[str, list[tuple[float, bool]]]:
-    """Walk forward through `bars`, run each analyst at each t, pair with t+H outcome.
+    """Walk forward through `bars`, run each analyst, pair with the t+H outcome.
+
+    The walk strides by ``horizon_bars`` so each emitted (raw, correct) pair
+    settles against a NON-overlapping forward window ([t, t+H], [t+H, t+2H], …).
+    This keeps the direction-correct outcomes i.i.d. across samples; striding by
+    1 (the pre-cs08 behavior) would overlap H-1 of H forward bars and inflate /
+    pseudo-replicate the calibration sample (see the loop comment).
 
     Returns {analyst_name: [(raw_conf, direction_correct), ...]}.
     """
@@ -186,7 +192,20 @@ def _walk_bars_for_symbol(
 
     # Walk t from min_context_bars to n-horizon_bars-1 (inclusive) so we
     # always have a future bar to settle against. Pre-slice once per t.
-    for t in range(min_context_bars, n - horizon_bars):
+    #
+    # cs08: stride by horizon_bars (NOT 1). Each sample settles against the
+    # forward window [t, t+horizon_bars]; stepping t by 1 would make sample t
+    # and t+1 share horizon_bars-1 of horizon_bars forward bars, so their
+    # direction_correct outcomes are heavily autocorrelated — NOT i.i.d.
+    # Overlapping windows pseudo-replicate the forward outcome, which (a)
+    # inflates the (raw, correct) pair count by ~horizon_bars so the
+    # min_samples / IsotonicCalibrator.n_min_samples gate passes on
+    # pseudo-evidence, and (b) over-confidently fits the calibration curve that
+    # SIZES every trade (risk/gate.py quarter_kelly). Striding by horizon_bars
+    # emits exactly one outcome per NON-overlapping H-bar block, restoring an
+    # i.i.d. forward-window sample. At horizon_bars=1 there is no overlap and
+    # this is byte-identical to the legacy stride-1 walk.
+    for t in range(min_context_bars, n - horizon_bars, horizon_bars):
         window = bars.iloc[: t + 1]
         asof_ts = pd.Timestamp(timestamps.iloc[t])
         if asof_ts.tzinfo is None:
@@ -263,7 +282,12 @@ def bootstrap_calibrator(
         days: lookback window for bar history (default ~1y).
         timeframe: bar timeframe; only "1d" is wired here. (Kept for API parity.)
         horizon_bars: forward-return window in bars used to settle each emitted
-            view. 4 ≈ 4 trading days for daily bars.
+            view. 4 ≈ 4 trading days for daily bars. ALSO the walk stride: the
+            replay emits one (raw, correct) pair per NON-overlapping H-bar block
+            so the calibration samples are i.i.d. forward-window outcomes (cs08).
+            Larger horizon_bars therefore yields ~1/H as many samples; size the
+            replay universe / lookback so the effective count still clears
+            min_samples.
         output_path: pickle target. Atomic write.
         min_samples: aggregated (raw, correct) pairs required to actually fit
             the IsotonicCalibrator. Below this, the function still returns the
