@@ -261,6 +261,74 @@ def test_normal_variance_ci_unchanged_by_cs46_filter():
     assert hi == pytest.approx(float(np.nanpercentile(samples, 97.5)))
 
 
+# --- cs48: a non-finite observed Sharpe must not propagate a NaN DSR ---------
+def test_degenerate_series_dsr_is_finite_conservative_not_nan():
+    """cs48 (sibling of cs46): a zero-variance OOS series with n >= 30 makes
+    _sharpe return +inf (positive mean) or -inf (negative mean). The DSR path
+    (dsr.deflated_sharpe) then computes
+    ``variance_term = 1 - skew*SR + (kurt-1)/4*SR**2``; with a constant series
+    skew==0, so ``skew*inf == nan`` -> variance_term is NaN, the
+    ``variance_term <= 0`` guard is NaN<=0 == False, and
+    ``Φ(sr_diff*sqrt(n-1)/sqrt(NaN))`` collapses to NaN. validation.py's
+    try/except only catches ValueError/ZeroDivisionError, so the NaN is NOT
+    caught and NO warning is emitted: the artifact reports deflated_sharpe NaN
+    (-> null in JSON) INDISTINGUISHABLE from the legitimate n<30 low-power
+    omission, silently erasing the false-discovery hedge.
+
+    After the fix the DSR is a FINITE, conservative value that fails any
+    ``dsr >= floor`` gate (mirrors cs46 returning a conservative finite bound),
+    and a warning records the degeneracy."""
+    r = np.full(42, 0.001)  # n>=30, zero variance -> +inf observed Sharpe
+    rep = validate_returns(r, bars_per_year=252, n_permutations=50, n_resamples=200, seed=42)
+    # The bug: deflated_sharpe is NaN. The fix: a finite conservative value.
+    assert np.isfinite(rep.deflated_sharpe), "deflated_sharpe must be finite, not NaN (cs48)"
+    # Conservative = does NOT clear a DSR floor (e.g. dsr_floor 0.5 / 0.95);
+    # a probability of 0.0 is the maximally-conservative "no confidence" value.
+    assert rep.deflated_sharpe == 0.0
+    # n>=30 so the legitimate low-power warning must NOT be the explanation;
+    # instead a DSR-degeneracy warning distinguishes this from a true omission.
+    assert not any("low statistical power" in w for w in rep.warnings)
+    assert any("deflated_sharpe" in w.lower() for w in rep.warnings)
+    # And the JSON artifact now carries a real number, not the null that a NaN
+    # would render as (which masquerades as the n<30 omission).
+    rep_dict = rep.to_dict()
+    json.dumps(rep_dict, allow_nan=False)  # raises if any NaN/inf leaked
+    assert rep_dict["deflated_sharpe"] == 0.0
+
+
+def test_degenerate_negative_mean_series_dsr_is_finite():
+    """cs48: the -inf branch (zero variance, NEGATIVE mean) must also yield a
+    finite conservative DSR, not NaN. A losing constant strategy should report
+    0.0 confidence, never a null that the gate cannot fail-close on."""
+    r = np.full(42, -0.002)  # n>=30, zero variance -> -inf observed Sharpe
+    rep = validate_returns(r, bars_per_year=252, n_permutations=50, n_resamples=200, seed=42)
+    assert np.isfinite(rep.deflated_sharpe)
+    assert rep.deflated_sharpe == 0.0
+
+
+def test_dsr_unchanged_for_finite_variance_series():
+    """cs48: a normal finite-variance series with n>=30 never triggers the
+    non-finite guard, so the DSR is byte-identical to the un-guarded
+    dsr.deflated_sharpe computed directly from the same observed Sharpe / skew /
+    kurtosis. The guard fires ONLY on the degenerate (non-finite) input."""
+    r = _noise(120, drift=0.001, seed=12)
+    rep = validate_returns(r, bars_per_year=252, n_permutations=50, n_resamples=200, seed=42)
+    # Recompute the expected DSR through the exact same inputs validate_returns
+    # feeds dsr.deflated_sharpe.
+    from hermes_quant.evaluation.dsr import deflated_sharpe
+
+    arr = validation_mod._to_array(r)
+    obs = validation_mod._sharpe(arr, bars_per_year=252)
+    skew = validation_mod._sample_skew(arr)
+    kurt = validation_mod._sample_kurtosis(arr)
+    expected = deflated_sharpe(
+        observed_sharpe=obs, n_trials=1, n_observations=arr.size, skew=skew, kurtosis=kurt
+    )
+    assert rep.deflated_sharpe == expected
+    assert np.isfinite(rep.deflated_sharpe)
+    assert 0.0 <= rep.deflated_sharpe <= 1.0
+
+
 # --- scipy-absent fallback ---------------------------------------------------
 def test_scipy_absent_falls_back_to_percentile(monkeypatch):
     """With scipy unavailable: percentile CI from the stationary bootstrap +

@@ -594,17 +594,59 @@ def validate_returns(
         # Sample skew / (non-excess) kurtosis via numpy (no scipy required).
         skew = _sample_skew(r)
         kurt = _sample_kurtosis(r)  # non-excess (normal == 3.0)
-        try:
-            deflated = deflated_sharpe(
-                observed_sharpe=observed_sharpe,
-                n_trials=1,
-                n_observations=n,
-                skew=skew,
-                kurtosis=kurt,
+
+        # cs48 (sibling of cs46): a zero-variance OOS series makes _sharpe
+        # return ±inf (see _sharpe above). dsr.deflated_sharpe then forms
+        # ``variance_term = 1 - skew*SR + (kurt-1)/4*SR**2``; for a constant
+        # series skew==0, so ``skew*inf == NaN`` -> variance_term is NaN, the
+        # ``variance_term <= 0`` guard (NaN<=0 == False) is bypassed, and
+        # ``Φ(sr_diff·sqrt(n-1)/sqrt(NaN))`` collapses to NaN WITHOUT raising —
+        # the try/except below only catches ValueError/ZeroDivisionError, so
+        # the NaN escapes and renders as ``null`` in validation.json,
+        # INDISTINGUISHABLE from the legitimate n<_MIN_OBS_FOR_DSR omission and
+        # silently erasing the false-discovery hedge. Mirror cs46's
+        # _percentile_ci guard: when any DSR input is non-finite the deflated
+        # Sharpe is not estimable; report a CONSERVATIVE finite 0.0 (zero
+        # probability the Sharpe is real — fails any ``dsr >= floor`` gate)
+        # plus a warning that distinguishes this from a low-power omission. A
+        # finite-variance series leaves every input finite, this guard never
+        # fires, and the result is byte-identical to the bare dsr call.
+        if not (
+            math.isfinite(observed_sharpe)
+            and math.isfinite(skew)
+            and math.isfinite(kurt)
+        ):
+            deflated = 0.0
+            warnings.append(
+                "deflated_sharpe: non-finite Sharpe/skew/kurtosis "
+                f"(observed_sharpe={observed_sharpe}, skew={skew}, kurtosis={kurt}); "
+                "degenerate (likely zero-variance) OOS series. Reporting a "
+                "conservative 0.0 (fails the DSR floor) rather than a NaN that "
+                "would render as null and masquerade as a low-power omission."
             )
-        except (ValueError, ZeroDivisionError):
-            deflated = float("nan")
-            warnings.append("deflated_sharpe: degenerate inputs; reported as NaN.")
+        else:
+            try:
+                deflated = deflated_sharpe(
+                    observed_sharpe=observed_sharpe,
+                    n_trials=1,
+                    n_observations=n,
+                    skew=skew,
+                    kurtosis=kurt,
+                )
+            except (ValueError, ZeroDivisionError):
+                deflated = float("nan")
+                warnings.append("deflated_sharpe: degenerate inputs; reported as NaN.")
+            else:
+                # Defensive: dsr.deflated_sharpe can in principle return a
+                # non-finite probability if a future input combination escapes
+                # its internal guards. Never let a NaN/inf DSR reach the
+                # artifact; collapse to the conservative 0.0.
+                if not math.isfinite(deflated):
+                    warnings.append(
+                        "deflated_sharpe: non-finite result; reporting a "
+                        "conservative 0.0 (fails the DSR floor)."
+                    )
+                    deflated = 0.0
 
     # ---- Monte-Carlo permutation tests (timing-skill null) ----
     # The permutation statistic is order-sensitive (_timing_pnl); plain
