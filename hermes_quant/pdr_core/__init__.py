@@ -31,6 +31,11 @@ paths imports ``pdr_core`` yet. It is the contract foundation for the extraction
 
 from __future__ import annotations
 
+from hermes_quant.pdr_core.aggregate import (
+    CoreAggregateContext,
+    CoreAggregatedSignal,
+    core_aggregate,
+)
 from hermes_quant.pdr_core.contracts import (
     POSITION_LADDER,
     AnalystView,
@@ -48,6 +53,8 @@ from hermes_quant.pdr_core.gate_types import (
 __all__ = [
     "POSITION_LADDER",
     "AnalystView",
+    "CoreAggregateContext",
+    "CoreAggregatedSignal",
     "CoreHaltState",
     "CoreMarketState",
     "CorePortfolio",
@@ -55,4 +62,5 @@ __all__ = [
     "Fill",
     "GateDecision",
     "Proposal",
+    "core_aggregate",
 ]
