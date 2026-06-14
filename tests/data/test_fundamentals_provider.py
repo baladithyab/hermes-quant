@@ -254,6 +254,81 @@ def test_refresh_skipped_when_within_ttl(
 
 
 # ---------------------------------------------------------------------------
+# cs67: refresh() must NOT treat a FUTURE fetched_at as "fresh". refresh()
+# computes age_h from read_latest(ticker) with as_of=None (the cold-refresh
+# path the cs42(a)/cs53 read guards do NOT cover — those are scoped to the
+# as_of-is-not-None point-in-time READ path). A cached row whose fetched_at is
+# in the future relative to the cron wall-clock (NTP/clock-skew regression,
+# container clock jump, a fabricated/corrupt parquet, or a backfill tool
+# stamping a future timestamp) makes age_h NEGATIVE, so ``age_h < ttl_hours``
+# is True and the ticker is returned 'skipped:fresh' PERMANENTLY — its
+# fundamentals silently go stale and are never re-fetched until wall-clock
+# advances past the future stamp. A future stamp answers NO to "is the cache
+# fresh enough to SKIP re-fetching" -> force-refresh (treat max-stale).
+# ---------------------------------------------------------------------------
+
+
+def test_cs67_refresh_future_fetched_at_force_refreshes_not_skipped(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs67 RED->GREEN: a future-stamped fetched_at is NOT 'skipped:fresh'.
+
+    A row stamped fetched_at = now + 2d yields age_h = -48.0, so the legacy
+    ``age_h < ttl_hours`` (-48 < 24) is True and refresh() returns
+    'skipped:fresh' — starved forever. After cs67 the future stamp is treated
+    max-stale, so the ticker is force-refreshed ('ok' here, since the fetch is
+    stubbed). The fetch is stubbed so this never touches the network.
+    """
+    pytest.importorskip(
+        "yfinance", reason="refresh requires yfinance; skip when missing"
+    )
+    future = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=2)
+    provider.write_snapshot("AAPL", _row(fetched_at=future, pe_trailing=18.0))
+
+    fetched: list[str] = []
+
+    def _fake_fetch(ticker: str, asof: pd.Timestamp) -> dict:
+        fetched.append(ticker)
+        return _row(fetched_at=asof, pe_trailing=20.0)
+
+    monkeypatch.setattr(provider, "_fetch_yfinance_snapshot", _fake_fetch)
+
+    out = provider.refresh(["AAPL"])
+    # RED: pre-cs67 the negative age_h defeats the staleness gate ->
+    # 'skipped:fresh' (never re-fetched). GREEN: force-refresh -> 'ok'.
+    assert out["AAPL"] == "ok"
+    assert fetched == ["AAPL"], "the future-stamped ticker must be re-fetched"
+
+
+def test_cs67_refresh_genuinely_fresh_past_stamp_still_skips_byte_identical(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs67 byte-identical: a genuinely-fresh PAST stamp still skips:fresh.
+
+    A row fetched 1h ago (age_h = +1, within the 24h ttl) is the normal
+    within-ttl case and must still be 'skipped:fresh' with NO fetch attempted —
+    the cs67 clamp only fires for a NEGATIVE age (future stamp).
+    """
+    pytest.importorskip(
+        "yfinance", reason="refresh requires yfinance; skip when missing"
+    )
+    fresh = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=1)
+    provider.write_snapshot("AAPL", _row(fetched_at=fresh, pe_trailing=18.0))
+
+    fetched: list[str] = []
+
+    def _fake_fetch(ticker: str, asof: pd.Timestamp) -> dict:
+        fetched.append(ticker)
+        return _row(fetched_at=asof, pe_trailing=20.0)
+
+    monkeypatch.setattr(provider, "_fetch_yfinance_snapshot", _fake_fetch)
+
+    out = provider.refresh(["AAPL"])
+    assert out["AAPL"] == "skipped:fresh"
+    assert fetched == [], "a genuinely-fresh past-stamped ticker must NOT be re-fetched"
+
+
+# ---------------------------------------------------------------------------
 # Atomic-write resilience
 # ---------------------------------------------------------------------------
 

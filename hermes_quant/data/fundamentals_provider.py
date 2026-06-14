@@ -682,7 +682,22 @@ class FundamentalsProvider:
                 latest = self.read_latest(ticker)
                 if latest is not None:
                     age_h = (now - pd.Timestamp(latest["fetched_at"])).total_seconds() / 3600.0
-                    if age_h < self.ttl_hours:
+                    # cs67: a FUTURE fetched_at (age_h < 0) must NOT count as
+                    # fresh. read_latest(as_of=None) returns the MAX-fetched_at
+                    # row; a row stamped in the future relative to the cron
+                    # wall-clock (NTP/clock-skew regression, container clock
+                    # jump, a fabricated/corrupt parquet, or a backfill tool
+                    # stamping a future timestamp) makes age_h negative, so the
+                    # legacy ``age_h < ttl_hours`` would skip:fresh FOREVER and
+                    # the ticker's fundamentals silently go stale and are never
+                    # re-fetched (until wall-clock passes that stamp). The
+                    # cs42(a)/cs53 future-fetch guards are scoped to the
+                    # as_of-is-not-None READ path; this cold REFRESH path
+                    # (as_of=None) had no guard. "Is the cache fresh enough to
+                    # SKIP re-fetching?" — a future stamp answers NO: treat it
+                    # max-stale and force-refresh. A genuinely-fresh past stamp
+                    # (0 <= age_h < ttl_hours) still skips:fresh, byte-identical.
+                    if 0 <= age_h < self.ttl_hours:
                         result[ticker] = "skipped:fresh"
                         continue
                 snapshot = self._fetch_yfinance_snapshot(ticker, now)
