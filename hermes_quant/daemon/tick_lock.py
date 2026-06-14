@@ -284,3 +284,32 @@ def symbol_tick_lock(
                 os.close(fd)
             except OSError:
                 pass
+
+
+@contextmanager
+def account_tick_lock(
+    account_id: str,
+    *,
+    timeout_s: float | None = None,
+) -> Iterator[TickLockResult]:
+    """Hold an exclusive per-ACCOUNT lock across the read-decide-fire-store window.
+
+    cr04 (2026-06-14): the per-SYMBOL :func:`symbol_tick_lock` serializes two crons
+    firing the SAME symbol, but a per-account gross-exposure cap is read against the
+    WHOLE-account book, so two DIFFERENT symbols racing both see the same pre-fire
+    headroom and both pass the cap (TOCTOU — ADR-0091 named this non-atomicity as why
+    Option B was rejected). This lock serializes ALL symbols on an account through the
+    cap-read so the second fire sees the first's consumed headroom.
+
+    It is a thin wrapper over :func:`symbol_tick_lock` with EMPTY asset_class/symbol:
+    ``_safe_component("")`` collapses both to ``"_"`` so the triple routes to a stable
+    per-account lock file (``<account>______.lock``) that is DISTINCT from every
+    ``(account, asset_class, symbol)`` symbol lock. Zero new flock code — it inherits
+    the exact fail-open-safe / non-blocking-timeout / release-in-``finally`` machinery.
+
+    Acquire order (NON-NEGOTIABLE): callers wrap this OUTSIDE the per-symbol lock
+    (account-outer / symbol-inner) so the acquire order is fixed and no deadlock cycle
+    is possible (the two locks are different files).
+    """
+    with symbol_tick_lock(account_id, "", "", timeout_s=timeout_s) as result:
+        yield result

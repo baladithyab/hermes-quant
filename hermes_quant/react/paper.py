@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, append_locked
-from hermes_quant.daemon.tick_lock import symbol_tick_lock
+from hermes_quant.daemon.tick_lock import account_tick_lock, symbol_tick_lock
 
 from .admissibility_precondition import admissibility_reject_equity
 from .base import ExecutionRecord
@@ -195,6 +195,35 @@ class PaperReactor:
         signal_id = self._extract_signal_id(proposal)
         now = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # cr05 (2026-06-14): REJECT a non-finite / zero / negative decision_price.
+        # _extract_decision_price() returns the 0.0 SENTINEL when no usable price is
+        # present (gated proposal approved-anyway / missing advisor field). A fill at
+        # price 0.0 is NOT a recoverable degradation — it silently corrupts the P&L
+        # ledger (zero-division in horizon-return math, a $0 cost basis). Fail closed:
+        # return a SILENCE record (fill_size_pct=0.0, NOT appended, no state.db write),
+        # the silence-by-default posture. This pre-empts BOTH the v0.1 passthrough and
+        # the v0.2 apply_slippage call so neither can ever build a fill_price=0.0 record.
+        # We return a record (not raise) because the live fire loop (autonomous.py:948)
+        # calls execute() with no try/except — a new raise would crash the tick.
+        if not math.isfinite(decision_price) or decision_price <= 0.0:
+            logger.warning(
+                "paper-react: %s asset=%s REJECTED — decision_price=%r is non-finite or "
+                "<= 0 (no usable price); refusing to book a corrupt zero-price fill",
+                proposal.proposal_id,
+                proposal.symbol,
+                decision_price,
+            )
+            return self._silence_record(
+                proposal,
+                fill_size_pct=fill_size_pct,
+                decision_price=decision_price,
+                signal_id=signal_id,
+                now=now,
+                approver_user_id=approver_user_id,
+                play_tag=play_tag,
+                silence_reason="zero_decision_price",
+            )
+
         # ADR-0077 / ADR-0079: pre-trade admissibility as a REACTION-layer PRECONDITION.
         # DEFAULT-OFF behind HERMES_QUANT_ADMISSIBILITY; with the flag absent this block is a
         # bit-for-bit no-op (the gate is never consulted and the fill proceeds exactly as today).
@@ -240,52 +269,95 @@ class PaperReactor:
                 now=now,
             )
 
-        with symbol_tick_lock(account_id, proposal.asset_class, proposal.symbol) as lock:
-            if not lock.acquired and lock.contended:
-                # Another writer holds this symbol this tick. SKIP (silence-by-
-                # default) — do NOT append, do NOT block, do NOT double-fire.
+        def _fire() -> ExecutionRecord:
+            """The per-SYMBOL tick-lock body. Extracted VERBATIM from the inline
+            ADR-0078 block so behavior under HERMES_QUANT_TICK_LOCK is unchanged.
+            cr04 wraps THIS closure in the optional per-account lock below."""
+            with symbol_tick_lock(account_id, proposal.asset_class, proposal.symbol) as lock:
+                if not lock.acquired and lock.contended:
+                    # Another writer holds this symbol this tick. SKIP (silence-by-
+                    # default) — do NOT append, do NOT block, do NOT double-fire.
+                    logger.warning(
+                        "paper-react: %s asset=%s SKIPPED — symbol tick-lock contended "
+                        "(%s); another writer is firing this symbol this tick",
+                        proposal.proposal_id,
+                        proposal.symbol,
+                        lock.reason,
+                    )
+                    return ExecutionRecord(
+                        proposal_id=proposal.proposal_id,
+                        signal_id=signal_id,
+                        asset=proposal.symbol,
+                        asset_class=proposal.asset_class,
+                        timeframe=proposal.timeframe,
+                        asof_decision=now,
+                        asof_execution=now,
+                        target_position_pct=fill_size_pct,
+                        decision_price=decision_price,
+                        fill_price=decision_price,
+                        fill_size_pct=0.0,
+                        reactor_name=self.name,
+                        human_in_the_loop=True,
+                        approver_user_id=approver_user_id,
+                        reactor_metadata={
+                            "paper": True,
+                            "silenced": True,
+                            "silence_reason": "tick_lock_contended",
+                            "tick_lock": lock.reason,
+                        },
+                        bar_ts=(proposal.advisor_result or {}).get("bar_ts"),
+                        play_tag=play_tag,
+                    )
+                # acquired OR fail-open: run the fire sequence. On fail-open the lock
+                # is not held (degraded to today's behavior) but the tick proceeds.
+                return self._execute_fired(
+                    proposal,
+                    fill_size_pct=fill_size_pct,
+                    approver_user_id=approver_user_id,
+                    play_tag=play_tag,
+                    decision_price=decision_price,
+                    signal_id=signal_id,
+                    now=now,
+                )
+
+        # cr04 (2026-06-14): DEFAULT-OFF per-ACCOUNT lock around the cross-symbol cap
+        # TOCTOU race. The per-symbol lock above serializes the SAME symbol, but the
+        # portfolio-cap seam reads the WHOLE-account book, so two DIFFERENT symbols
+        # racing both see the same pre-fire headroom and both pass the cap (ADR-0091
+        # named this non-atomicity). When HERMES_QUANT_ACCOUNT_LOCK=1, hold a per-
+        # account lock OUTSIDE the per-symbol lock (account-outer/symbol-inner =>
+        # fixed acquire order, no deadlock) spanning the cap-read through the state.db
+        # write so the loser sees the winner's consumed headroom. DEFAULT-OFF: with the
+        # flag absent this branch is never taken and execute() is byte-identical to the
+        # pre-cr04 path (the per-symbol _fire() runs directly). Contended -> SKIP via a
+        # silence record; acquired/fail-open -> _fire().
+        if os.environ.get("HERMES_QUANT_ACCOUNT_LOCK", "0") != "1":
+            return _fire()
+
+        with account_tick_lock(account_id) as acct_lock:
+            if not acct_lock.acquired and acct_lock.contended:
                 logger.warning(
-                    "paper-react: %s asset=%s SKIPPED — symbol tick-lock contended "
-                    "(%s); another writer is firing this symbol this tick",
+                    "paper-react: %s asset=%s SKIPPED — account tick-lock contended "
+                    "(%s); another writer is firing on this account this tick",
                     proposal.proposal_id,
                     proposal.symbol,
-                    lock.reason,
+                    acct_lock.reason,
                 )
-                return ExecutionRecord(
-                    proposal_id=proposal.proposal_id,
-                    signal_id=signal_id,
-                    asset=proposal.symbol,
-                    asset_class=proposal.asset_class,
-                    timeframe=proposal.timeframe,
-                    asof_decision=now,
-                    asof_execution=now,
-                    target_position_pct=fill_size_pct,
+                return self._silence_record(
+                    proposal,
+                    fill_size_pct=fill_size_pct,
                     decision_price=decision_price,
-                    fill_price=decision_price,
-                    fill_size_pct=0.0,
-                    reactor_name=self.name,
-                    human_in_the_loop=True,
+                    signal_id=signal_id,
+                    now=now,
                     approver_user_id=approver_user_id,
-                    reactor_metadata={
-                        "paper": True,
-                        "silenced": True,
-                        "silence_reason": "tick_lock_contended",
-                        "tick_lock": lock.reason,
-                    },
-                    bar_ts=(proposal.advisor_result or {}).get("bar_ts"),
                     play_tag=play_tag,
+                    silence_reason="account_lock_contended",
+                    extra_metadata={"account_lock": acct_lock.reason},
                 )
-            # acquired OR fail-open: run the fire sequence. On fail-open the lock
-            # is not held (degraded to today's behavior) but the tick proceeds.
-            return self._execute_fired(
-                proposal,
-                fill_size_pct=fill_size_pct,
-                approver_user_id=approver_user_id,
-                play_tag=play_tag,
-                decision_price=decision_price,
-                signal_id=signal_id,
-                now=now,
-            )
+            # acquired OR fail-open: run the per-symbol fire sequence under the
+            # account lock. On fail-open the account lock is not held (degraded to
+            # today's cross-symbol race) but the tick proceeds.
+            return _fire()
 
     def _execute_fired(
         self,
@@ -365,16 +437,35 @@ class PaperReactor:
                     is_late_session=is_late,
                 )
             except ValueError as exc:
-                # Bad input (e.g. decision_price <= 0) — degrade to passthrough
-                # rather than fail the fill. Surface in metadata for audit.
+                # cr05 (2026-06-14): FAIL CLOSED. The previous body DEGRADED to a
+                # passthrough fill (fill_price = decision_price) and APPENDED it —
+                # but apply_slippage only raises ValueError when decision_price is
+                # non-finite or <= 0 (slippage_model.py: "must be finite and > 0"),
+                # so the degrade booked a corrupt zero/garbage-price fill. The A1
+                # guard in execute() already rejects a non-finite/<= 0 decision_price
+                # upstream, so reaching here means a finite price > 0 that the model
+                # STILL rejected — we must NOT book it. Return a SILENCE record
+                # (NOT appended, no state.db write) instead of degrading. We return a
+                # record rather than re-raise so the no-try/except live fire loop
+                # (autonomous.py:948) is not crashed by a new raising path.
                 logger.warning(
-                    "paper-react: slippage_model rejected fill for %s: %s; "
-                    "degraded to passthrough",
+                    "paper-react: %s asset=%s REJECTED — slippage_model refused the "
+                    "fill (%s); failing closed (no degraded zero/garbage-price booking)",
                     proposal.proposal_id,
+                    proposal.symbol,
                     exc,
                 )
-                fill_price = decision_price
-                slippage_breakdown = {"error": str(exc)}
+                return self._silence_record(
+                    proposal,
+                    fill_size_pct=fill_size_pct,
+                    decision_price=decision_price,
+                    signal_id=signal_id,
+                    now=now,
+                    approver_user_id=approver_user_id,
+                    play_tag=play_tag,
+                    silence_reason="slippage_rejected",
+                    extra_metadata={"slippage_breakdown": {"error": str(exc)}},
+                )
         else:
             fill_price = decision_price  # legacy passthrough
 
@@ -471,6 +562,57 @@ class PaperReactor:
                 logger.warning("Wave4 reflection hook failed (non-blocking): %s", _re)
 
         return record
+
+    def _silence_record(
+        self,
+        proposal: Any,
+        *,
+        fill_size_pct: float,
+        decision_price: float,
+        signal_id: str | None,
+        now: str,
+        approver_user_id: str | None,
+        play_tag: str,
+        silence_reason: str,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> ExecutionRecord:
+        """Build an audit-only SILENCE ExecutionRecord (fill_size_pct=0.0, NOT appended).
+
+        Mirrors the tick-lock-contended (execute) and portfolio-cap (_portfolio_cap_clip)
+        silence shapes so every reactor refusal looks the same on the audit trail:
+        a returned ExecutionRecord that is NEVER written to executions.jsonl and NEVER
+        updates state.db. The caller returns it directly without appending.
+
+        cr05 (2026-06-14): the zero/negative/non-finite decision_price guard and the
+        slippage-rejection fail-closed branch both produce this record, so the refusal
+        is byte-identical regardless of which seam caught the bad price.
+        """
+        metadata: dict[str, Any] = {
+            "paper": True,
+            "silenced": True,
+            "silence_reason": silence_reason,
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        return ExecutionRecord(
+            proposal_id=proposal.proposal_id,
+            signal_id=signal_id,
+            asset=proposal.symbol,
+            asset_class=proposal.asset_class,
+            timeframe=proposal.timeframe,
+            asof_decision=now,
+            asof_execution=now,
+            target_position_pct=fill_size_pct,
+            decision_price=decision_price,
+            fill_price=decision_price,
+            fill_size_pct=0.0,
+            reactor_name=self.name,
+            human_in_the_loop=True,
+            approver_user_id=approver_user_id,
+            reactor_metadata=metadata,
+            bar_ts=(proposal.advisor_result or {}).get("bar_ts"),
+            play_tag=play_tag,
+        )
 
     def _admissibility_reject(
         self, proposal: Any, fill_size_pct: float, now: str, *, play_tag: str = "advisor"
