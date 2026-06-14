@@ -83,6 +83,42 @@ _CONTRACT_MULTIPLIER = 100.0
 
 
 # ---------------------------------------------------------------------------
+# cs15 (ADR-0086 Phase 1, missed half): signed net-liquidation equity_total.
+#
+# The cached equity_total folds open positions as cash + Σ qty_factor * avg * mult.
+# Historically qty_factor was abs(quantity), which treats a SHORT (negative qty)
+# as a positive asset. A short fill ALREADY booked its proceeds into cash, so
+# abs() adds the same notional a SECOND time with the wrong sign — inflating a
+# net-short book's equity_total by ~2×|notional|. Net-liquidation value uses the
+# SIGNED quantity: a long is an asset (+qty*price), a short is a liability whose
+# proceeds are in cash and whose close costs |qty|*price (so it contributes
+# -|qty|*price = signed_qty*price). Opening at the fill mark is then NAV-neutral.
+#
+# equity_total is the gate-SIZED NAV consumed by _account_nav_usd (admissibility
+# share-conversion sizing in react/paper.py + autonomous.py), so the corrected
+# value changes a LIVE sizing number for a book holding shorts. The correction is
+# therefore flag-gated default-OFF: flag OFF ⇒ abs(quantity) ⇒ bit-for-bit
+# current behavior on every book; flag ON ⇒ signed net-liq. The live flip of
+# HERMES_QUANT_SIGNED_EQUITY=1 is a separate eval-gated decision.
+_SIGNED_EQUITY_FLAG = "HERMES_QUANT_SIGNED_EQUITY"
+
+
+def _equity_qty_factor(quantity: float) -> float:
+    """Per-position quantity factor for the cached equity_total fold.
+
+    Signed (ADR-0086 net-liq) when HERMES_QUANT_SIGNED_EQUITY=1, else the legacy
+    abs(quantity). Called once per position in BOTH folds (rebuild + incremental)
+    so they stay in parity by construction. For a long (qty>0) the two regimes are
+    identical (abs(qty)==qty), so long books are byte-identical across the flag.
+    """
+    return (
+        quantity
+        if os.environ.get(_SIGNED_EQUITY_FLAG, "0") == "1"
+        else abs(quantity)
+    )
+
+
+# ---------------------------------------------------------------------------
 # ft1 (2026-06-13): delta-normalizer regime stamp.
 #
 # The normalizer fold (ADR-0091 Option E, default-OFF behind
@@ -532,11 +568,16 @@ class PortfolioState:
                 # Upsert cash
                 for acct, balance in cash_map.items():
                     ts = last_ts.get(acct, _utc_now_iso())
-                    # equity_total: cash + open position notionals. ADR-0088 F1:
-                    # value us_option positions at qty × avg × 100 (the contract
-                    # multiplier; key[1] is the position's asset_class), equity ×1.
+                    # equity_total: cash + open position notionals. The per-position
+                    # quantity factor is SIGNED net-liq (ADR-0086) when
+                    # HERMES_QUANT_SIGNED_EQUITY=1 (a short contributes a negative
+                    # liability term, not a phantom positive asset), else the legacy
+                    # abs() (flag-OFF byte-identity). ADR-0088 F1: value us_option
+                    # positions at factor × avg × 100 (the contract multiplier; key[1]
+                    # is the position's asset_class), equity ×1. The >= 1e-12 filter
+                    # is membership (keeps abs()), not the value term.
                     equity = balance + sum(
-                        abs(p["quantity"])
+                        _equity_qty_factor(p["quantity"])
                         * p["avg_entry_price"]
                         * (_CONTRACT_MULTIPLIER if a_cls == "us_option" else 1.0)
                         for (a, a_cls, _), p in positions.items()
@@ -805,18 +846,23 @@ class PortfolioState:
                 new_cash = cash_balance + delta_cash
 
                 # equity_total: recompute from all positions for this account
-                # (approximation: use avg_entry_price, not mark price). ADR-0088
-                # F1: value each position at qty × avg × its own contract
-                # multiplier (us_option ×100, equity ×1) so an option position is
-                # not undervalued 100×. asof_execution per-position asset_class
-                # drives the multiplier.
+                # (approximation: use avg_entry_price, not mark price). The per-
+                # position quantity factor is SIGNED net-liq (ADR-0086) when
+                # HERMES_QUANT_SIGNED_EQUITY=1 (a short is a negative liability term,
+                # not a phantom positive asset), else the legacy abs() (flag-OFF
+                # byte-identity). ADR-0088 F1: value each position at factor × avg ×
+                # its own contract multiplier (us_option ×100, equity ×1) so an option
+                # position is not undervalued 100×. The SQL ABS(quantity) >= 1e-12
+                # is membership (keeps abs()), not the value term. Both folds call the
+                # same _equity_qty_factor on the same signed qty, so a short-holding
+                # book yields identical equity from rebuild and incremental (parity).
                 all_pos = conn.execute(
                     "SELECT asset_class, quantity, avg_entry_price FROM positions "
                     "WHERE account_id=? AND ABS(quantity) >= 1e-12",
                     (acct,),
                 ).fetchall()
                 equity = new_cash + sum(
-                    abs(float(p["quantity"]))
+                    _equity_qty_factor(float(p["quantity"]))
                     * float(p["avg_entry_price"])
                     * (_CONTRACT_MULTIPLIER if p["asset_class"] == "us_option" else 1.0)
                     for p in all_pos
