@@ -353,17 +353,139 @@ def test_shuffle_timestamps_invariant_via_evaluation_module(analyst_factory):
         alpha=0.05,
         seed=42,
     )
-    # The result's `passed` flag is True when p_value > alpha (analyst's
-    # signal IS distinguishable from shuffled noise = uses temporal
-    # structure = no lookahead via bar-position-only).
-    # A FAILING analyst here would mean its score is consistently >=
-    # the real score even after timestamp shuffling — a strong indicator
-    # of timestamp-blind processing or position-based lookahead.
-    # We assert structural fields, not the pass/fail (which can be flaky
-    # on small n_shuffles); the canonical CI gate uses larger n_shuffles
-    # with a hard threshold.
+    # n_shuffles=8 + seed=42 is DETERMINISTIC — the prior "can be flaky on
+    # small n_shuffles" caveat was wrong (this RNG/shuffle is fully pinned),
+    # and asserting only the structural fields (0<=p<=1, len==8) made the gate
+    # VACUOUS: a constant timestamp-blind analyst yields p_value=1.0 and the
+    # right list length, so it passed both asserts WITHOUT being statistically
+    # tested for lookahead at all. We now assert the gate's actual verdict.
+
+    # Structural sanity (kept): the harness returned a well-formed result.
     assert 0.0 <= result.p_value <= 1.0
     assert len(result.shuffled_scores) == 8
+
+    # (1) The analyst MUST pass the lookahead verdict at this fixed seed: its
+    # real-timestamp score is statistically indistinguishable-from-or-better-than
+    # the shuffled null (p_value > alpha => not timestamp-shuffle-exploiting).
+    assert result.passed, (
+        f"{analyst.__class__.__name__} FAILED the shuffle-timestamps lookahead "
+        f"gate at seed=42: {result}"
+    )
+
+    # (2) NON-VACUITY FENCE — the keystone strengthening. The verdict above is
+    # only meaningful if the analyst's score actually RESPONDS to timestamp order
+    # when it emits a signal. A constant timestamp-blind analyst (identical
+    # confidence_raw on real vs every shuffle) is byte-identical across the whole
+    # shuffled distribution and trivially "passes" with p_value=1.0 — that is
+    # exactly the vacuous case this fence must reject. An honest abstain
+    # (real_score == 0.0, silence-by-default) is the one legitimate constant: it
+    # emits NO signal to be tested, so it is exempt. Note we do NOT require
+    # real_score > shuffled_mean: OvernightDrift's confidence is a |spread|
+    # MAGNITUDE that a shuffle can legitimately inflate (real may sit below the
+    # shuffled mean while still being timestamp-sensitive), so the fence is
+    # directional-agnostic — it only demands the score is not shuffle-invariant.
+    emitted_signal = result.real_score != 0.0
+    shuffle_invariant = all(s == result.real_score for s in result.shuffled_scores)
+    assert (not emitted_signal) or (not shuffle_invariant), (
+        f"{analyst.__class__.__name__} emitted a non-zero signal "
+        f"(real_score={result.real_score}) that is BYTE-IDENTICAL across all "
+        f"{result.n_shuffles} timestamp shuffles (shuffled_scores={result.shuffled_scores}). "
+        "Its confidence does not depend on temporal structure — the lookahead "
+        "gate is VACUOUS for it (timestamp-blind / bar-position-only processing). "
+        "An honest abstain (real_score == 0.0) is exempt; a real signal is not."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Invariant 4b — the lookahead gate above is NON-VACUOUS (canary). A constant,
+# timestamp-blind analyst (identical confidence_raw on real vs every shuffle)
+# satisfies the OLD structural-only asserts (0<=p<=1, len==8) and even
+# result.passed — yet it has ZERO temporal edge and MUST be rejected by the
+# strengthened non-vacuity fence in Invariant 4. This canary pins that the fence
+# actually bites, so the gate can never silently regress back to vacuous.
+# ---------------------------------------------------------------------------
+
+
+class _ConstantTimestampBlindAnalyst:
+    """Returns the SAME confidence_raw regardless of bar content/order — the
+    degenerate timestamp-blind case the lookahead gate must catch."""
+
+    name = "constant-timestamp-blind-canary"
+
+    def analyze(self, ctx):  # noqa: ARG002 — deliberately ignores all input
+        from hermes_quant.protocol import AnalystView
+
+        return AnalystView(
+            analyst=self.name,
+            direction=1,
+            magnitude=0.01,
+            confidence=0.5,
+            confidence_raw=0.5,
+            horizon="1d",
+            rationale="constant — ignores timestamps and bars entirely",
+            metadata={},
+        )
+
+
+def _shuffle_result_for(analyst):
+    """Run the SAME shuffle harness the Invariant-4 gate uses, for `analyst`.
+
+    Returns a LookaheadTestResult."""
+    from hermes_quant.evaluation import shuffle_timestamps_test
+
+    bars = _make_bars(100, trend=0.5, seed=42)
+
+    def score_fn(bars_df: pd.DataFrame) -> float:
+        ctx = MarketContext(
+            asset="TEST",
+            timeframe="1d",
+            asset_class="equity",
+            exchange=None,
+            bars=bars_df.reset_index(drop=True),
+            last_close=float(bars_df["close"].iloc[-1]),
+            last_volume=float(bars_df["volume"].iloc[-1]),
+            asof=bars_df["timestamp"].iloc[-1],
+            extras={},
+        )
+        view = analyst.analyze(ctx)
+        if view is None:
+            return 0.0
+        return float(view.confidence_raw)
+
+    return shuffle_timestamps_test(score_fn, bars, n_shuffles=8, alpha=0.05, seed=42)
+
+
+def test_shuffle_gate_old_structural_asserts_are_vacuous_for_constant_analyst():
+    """Documents the vacuity the strengthening fixes: a constant timestamp-blind
+    analyst satisfies the OLD structural-only assertions (and result.passed) —
+    proving those asserts alone did NOT statistically test it for lookahead."""
+    result = _shuffle_result_for(_ConstantTimestampBlindAnalyst())
+    # The old gate's entire body — all green for a no-edge analyst:
+    assert 0.0 <= result.p_value <= 1.0
+    assert len(result.shuffled_scores) == 8
+    assert result.passed  # p_value == 1.0 > alpha, so `assert result.passed` ALONE
+    # would not have caught it either — the non-vacuity fence is what bites.
+    assert result.real_score == 0.5
+    assert result.shuffled_mean == 0.5  # byte-identical: zero temporal edge
+
+
+def test_shuffle_gate_nonvacuity_fence_rejects_constant_analyst():
+    """The STRENGTHENED Invariant-4 fence MUST reject the constant timestamp-blind
+    analyst: it emits a non-zero signal (real_score=0.5) that is byte-identical
+    across every shuffle. If this test ever passes the fence, the gate has
+    regressed to vacuous."""
+    result = _shuffle_result_for(_ConstantTimestampBlindAnalyst())
+
+    emitted_signal = result.real_score != 0.0
+    shuffle_invariant = all(s == result.real_score for s in result.shuffled_scores)
+    fence_predicate = (not emitted_signal) or (not shuffle_invariant)
+
+    assert emitted_signal, "canary must emit a real (non-zero) signal to be a valid probe"
+    assert shuffle_invariant, "canary must be byte-identical across shuffles (timestamp-blind)"
+    assert not fence_predicate, (
+        "the non-vacuity fence should REJECT (predicate False for) the constant "
+        "timestamp-blind analyst — if it accepts, the lookahead gate is vacuous"
+    )
 
 
 # ---------------------------------------------------------------------------
