@@ -20,6 +20,20 @@ import pandas as pd
 
 DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache"
 
+# cs66: the SERVED OHLCV schema (what read() returns and what every downstream
+# consumer reads). Unchanged from the original cache.
+_SERVED_COLS = ["timestamp", "open", "high", "low", "close", "volume"]
+
+# cs66: the on-disk STORAGE schema adds a ``fetched_at`` wall-clock column so the
+# append-side dedup can distinguish a legitimate SAME-DAY intraday correction
+# (fetched_at on the same calendar day as the bar's timestamp -> wins) from a
+# CROSS-DAY backfill / vendor restatement (fetched_at on a LATER calendar day ->
+# must NOT overwrite the historical point-in-time bar). The OHLCV parquet is a
+# DERIVED, regenerable cache (not state.db), and read() strips this extra column
+# via ``out = out[required]`` in normalize_bars, so a storage file carrying
+# fetched_at is forward+backward compatible with the served 6-col read path.
+_STORAGE_COLS = ["timestamp", "open", "high", "low", "close", "volume", "fetched_at"]
+
 # cs63: one closed-session day. A market HOLIDAY is one extra closed session day
 # adjacent to a known calendar rhythm (a Monday holiday turns a Fri->Mon weekend
 # into Fri->Tue; an intraday Fri-close -> next-session-open weekend gap grows by a
@@ -244,12 +258,158 @@ class OhlcvCache:
                 raise
         return target
 
-    def append(self, bars: pd.DataFrame) -> Path:
-        existing = self.read()
-        incoming = normalize_bars(bars)
-        merged = pd.concat([existing, incoming], ignore_index=True)
-        merged = normalize_bars(merged)
-        return self.write(merged)
+    def _read_storage(self) -> pd.DataFrame:
+        """Read the RAW on-disk 7-col STORAGE frame (cs66), NOT the served frame.
+
+        Unlike :meth:`read` (which routes through ``normalize_bars`` and strips
+        any extra column via ``out = out[required]``), this preserves the
+        ``fetched_at`` column the append-side PIT dedup needs. It coerces the 6
+        OHLCV value columns + drops NaN-keyed rows inline (so it never depends on
+        normalize_bars stripping fetched_at), and BACKFILLS a sentinel
+        ``fetched_at`` for legacy rows that predate the cs66 storage schema.
+
+        MIGRATION (cs66): a pre-cs66 cache file has no fetched_at column. We
+        backfill it with the file mtime (UTC), which is by construction strictly
+        AFTER every cached bar's timestamp -> the dedup classifies legacy rows as
+        CROSS-DAY (historical / first-write), so a later re-fetch of a legacy
+        timestamp can never overwrite it. (No file -> empty frame.) This makes the
+        migration idempotent and crash-free: a fetched_at-less old parquet is
+        readable, never raises, and worst case the cache simply regenerates on the
+        next fetch.
+        """
+        path = self.path
+        if not path.exists():
+            return pd.DataFrame(columns=_STORAGE_COLS)
+        if path.suffix == ".parquet":
+            try:
+                df = pd.read_parquet(path)
+            except Exception:
+                # Mirror read()'s parquet->CSV degrade-on-corrupt-engine fallback.
+                if self.csv_path.exists():
+                    df = pd.read_csv(self.csv_path)
+                else:
+                    raise
+        else:
+            df = pd.read_csv(path)
+        if df is None or len(df) == 0:
+            return pd.DataFrame(columns=_STORAGE_COLS)
+        out = df.copy()
+        missing = [c for c in _SERVED_COLS if c not in out.columns]
+        if missing:
+            raise ValueError(f"OHLCV storage missing required columns: {missing}")
+        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+        # cs66 migration: backfill a sentinel fetched_at for legacy rows. The file
+        # mtime is strictly after every cached bar (the file was written no earlier
+        # than its newest bar), so legacy rows read as cross-day / historical and
+        # are immutable under re-fetch. now() is the fallback when no file/mtime.
+        sentinel = _file_mtime_utc(path)
+        if "fetched_at" not in out.columns:
+            out["fetched_at"] = sentinel
+        else:
+            out["fetched_at"] = pd.to_datetime(out["fetched_at"], utc=True, errors="coerce")
+            out["fetched_at"] = out["fetched_at"].fillna(sentinel)
+        out = out[_STORAGE_COLS]
+        out = out.dropna(subset=_SERVED_COLS)
+        return out.reset_index(drop=True)
+
+    def _write_storage(self, storage_df: pd.DataFrame) -> Path:
+        """Persist ALL 7 storage cols (incl fetched_at), mirroring :meth:`write`.
+
+        Does NOT route through ``normalize_bars`` (which would strip fetched_at).
+        Keeps :meth:`write`'s mkdir + parquet-target + atomic-write +
+        parquet->CSV degrade-on-exception fallback. Public ``write`` is left
+        UNCHANGED (it still persists the served 6-col frame); a subsequent
+        append's :meth:`_read_storage` backfills the sentinel for that
+        fetched_at-less file, exercising + validating the migration path.
+        """
+        self.directory.mkdir(parents=True, exist_ok=True)
+        df = storage_df[_STORAGE_COLS].copy()
+        target = self.parquet_path if self.prefer_parquet else self.csv_path
+        try:
+            _atomic_write(df, target)
+        except Exception:
+            if target.suffix == ".parquet":
+                target = self.csv_path
+                _atomic_write(df, target)
+            else:
+                raise
+        return target
+
+    def append(self, bars: pd.DataFrame, *, fetched_at: pd.Timestamp | None = None) -> Path:
+        """Append bars with a PIT-preserving interior value-rewrite guard (cs66).
+
+        The original 3-line append concatenated incoming AFTER existing and let
+        ``normalize_bars`` dedup on timestamp with keep="last", so a re-fetch
+        returning a REVISED value for a PAST timestamp (vendor restatement, split
+        / dividend re-adjustment, late print, differently-sized window) silently
+        OVERWROTE the cached historical bar -> a backtest replayed at the same
+        --end read a DIFFERENT historical price -> non-reproducible OOS metrics.
+        This is the OHLCV sibling of the fundamentals-side cs42(b)/cs53/cs59/cs61
+        point-in-time family.
+
+        The fix mirrors cs59's ``write_sector_median`` dedup, keyed on
+        ``timestamp`` (the PIT key, analog of fundamentals' ``as_of_date``): a
+        SAME-DAY correction (incoming fetched_at on the same calendar day as the
+        bar's timestamp) is the legitimate intraday revision and WINS; a CROSS-DAY
+        backfill (fetched_at on a LATER calendar day) does NOT overwrite the
+        already-stored historical bar. A first-write of a new timestamp is
+        byte-identical (the guard only fires on a re-write of an existing T).
+
+        ``fetched_at`` (default now, UTC) stamps the incoming bars; it is a test
+        seam so the same-day vs cross-day cases can be exercised deterministically
+        (production always passes now).
+
+        CRITICAL DIVERGENCE FROM cs59 (do NOT "simplify" this back) — cs59 ranks
+        rows ``[as_of_date, _same_day, fetched_at]`` then keep="last", i.e. within
+        a key it always keeps the LATEST fetched_at. That is correct on the
+        fundamentals side because a re-fetch's fetched_at is same-day with its own
+        as_of_date. On the OHLCV side a CROSS-DAY re-fetch of a 2024 bar carries a
+        2026 fetched_at — under plain keep="last" the LATER (cross-day) re-fetch
+        would win and re-introduce the exact overwrite this guards against. So we
+        split the fetched_at tie-break BY same-day class: among rows for one
+        timestamp, SAME-DAY rows keep the LATEST fetched_at (intraday correction
+        wins) and CROSS-DAY rows keep the EARLIEST fetched_at (the original
+        first-write historical bar wins), and a same-day row outranks any
+        cross-day row for the same timestamp.
+        """
+        if fetched_at is None:
+            fetched_at = pd.Timestamp.now(tz="UTC")
+        else:
+            fetched_at = pd.Timestamp(fetched_at)
+            if fetched_at.tzinfo is None:
+                fetched_at = fetched_at.tz_localize("UTC")
+
+        existing = self._read_storage()  # 7-col (legacy sentinel already backfilled)
+        incoming = normalize_bars(bars).copy()  # 6-col served-normalized
+        incoming["fetched_at"] = fetched_at
+        incoming = incoming[_STORAGE_COLS]
+
+        # Skip an empty (all-NA columns) existing frame from the concat: it adds
+        # nothing and tripped a pandas all-NA-concat FutureWarning. A first-write
+        # (empty cache) then flows through incoming alone.
+        frames = [f for f in (existing, incoming) if not f.empty]
+        merged = pd.concat(frames, ignore_index=True) if frames else incoming
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
+        merged["fetched_at"] = pd.to_datetime(merged["fetched_at"], utc=True)
+
+        # cs66 PIT-preserving dedup keyed on timestamp. A row is SAME-DAY when its
+        # fetched_at falls on (or before) the bar's own calendar day; otherwise it
+        # is a CROSS-DAY backfill. See the docstring for why the tie-break diverges
+        # from cs59 (cross-day rows must keep EARLIEST, not LATEST, fetched_at).
+        same_day = merged["fetched_at"].dt.normalize() <= merged["timestamp"].dt.normalize()
+        sd = merged[same_day]
+        cd = merged[~same_day]
+        # Same-day: intraday correction wins -> keep LATEST fetched_at.
+        sd = sd.sort_values("fetched_at").drop_duplicates(subset=["timestamp"], keep="last")
+        # Cross-day: original historical first-write wins -> keep EARLIEST fetched_at.
+        cd = cd.sort_values("fetched_at").drop_duplicates(subset=["timestamp"], keep="first")
+        # A same-day row outranks a cross-day row for the same timestamp.
+        combined = pd.concat([cd, sd], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["timestamp"], keep="last")
+        combined = combined.sort_values("timestamp").reset_index(drop=True)
+        return self._write_storage(combined)
 
     def coverage(self) -> dict:
         df = self.read()
@@ -505,6 +665,21 @@ def normalize_bars(df: pd.DataFrame) -> pd.DataFrame:
 
 def _empty_bars() -> pd.DataFrame:
     return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+
+def _file_mtime_utc(path: Path) -> pd.Timestamp:
+    """cs66 migration sentinel: the file's last-modified time as a UTC Timestamp.
+
+    Used to backfill ``fetched_at`` for legacy rows in a pre-cs66 cache file. A
+    file is written no earlier than its newest bar, so the mtime is by
+    construction strictly after every cached bar -> the dedup classifies legacy
+    rows as cross-day / historical and a re-fetch can never overwrite them. Falls
+    back to now() when the file is missing or its mtime can't be read.
+    """
+    try:
+        return pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC")
+    except (OSError, ValueError, OverflowError):
+        return pd.Timestamp.now(tz="UTC")
 
 
 def _safe_component(value: str) -> str:

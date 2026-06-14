@@ -1133,6 +1133,167 @@ def test_cached_fetch_holiday_bound_cutoff_none_byte_identical(tmp_path):
     assert out["timestamp"].iloc[-1] == full["timestamp"].iloc[-1]
 
 
+# ---------------------------------------------------------------------------
+# cs66: PIT-preserving interior value-rewrite guard on OhlcvCache.append.
+#
+# The OHLCV cache schema [timestamp,open,high,low,close,volume] has NO
+# fetched_at column, so ``normalize_bars`` deduped on timestamp with
+# keep="last" and ``append`` concatenated incoming AFTER existing -> a re-fetch
+# returning a REVISED value for a PAST timestamp (vendor restatement, split/div
+# re-adjustment, late print, differently-sized window) silently OVERWROTE the
+# cached historical bar. A backtest replayed at the same --end then read a
+# DIFFERENT historical price -> non-reproducible OOS metrics. This is the OHLCV
+# sibling of the fundamentals-side cs42(b)/cs53/cs59/cs61 PIT family; the fix
+# mirrors cs59's ``write_sector_median`` same-day-wins / cross-day-loses guard.
+# ---------------------------------------------------------------------------
+
+
+def _bar_at(ts, close, *, vol=1000.0):
+    """A single OHLCV bar at one timestamp with an explicit close (cs66)."""
+    t = pd.Timestamp(ts)
+    t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+    return pd.DataFrame(
+        {
+            "timestamp": [t],
+            "open": [float(close)],
+            "high": [float(close)],
+            "low": [float(close)],
+            "close": [float(close)],
+            "volume": [float(vol)],
+        }
+    )
+
+
+def _close_at(cache, ts):
+    out = cache.read()
+    t = pd.Timestamp(ts)
+    t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+    sub = out.loc[out["timestamp"] == t, "close"]
+    assert len(sub) == 1, f"expected exactly one bar at {ts}, got {len(sub)}"
+    return float(sub.iloc[0])
+
+
+def test_cs66_cross_day_refetch_does_not_overwrite_historical_bar(tmp_path):
+    """cs66 RED: a cached bar at T=2024-01-05 close=100, then a CROSS-DAY
+    re-fetch returning close=50 for the SAME T (the test clock is 2026, so the
+    re-fetch's fetched_at is a LATER calendar day than the 2024 bar date),
+    currently OVERWRITES the cached historical bar -> a replay reads 50.0.
+    After the fix the historical 100.0 is PRESERVED (cross-day backfill loses).
+    """
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.append(_bar_at("2024-01-05", 100.0))
+    cache.append(_bar_at("2024-01-05", 50.0))  # cross-day re-fetch (now >> 2024)
+    assert _close_at(cache, "2024-01-05") == 100.0
+
+
+def test_cs66_same_day_correction_still_wins(tmp_path):
+    """cs66: a SAME-DAY correction (a newer fetched_at on the SAME calendar day
+    as the bar's timestamp) is the legitimate intraday-revision case and STILL
+    wins, mirroring cs59's same-day-wins rule on the fundamentals side.
+    """
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    t = today + pd.Timedelta(hours=15)  # a bar timestamped today
+    cache.append(_bar_at(t, 100.0), fetched_at=today + pd.Timedelta(hours=9))
+    cache.append(_bar_at(t, 99.0), fetched_at=today + pd.Timedelta(hours=15, minutes=30))
+    assert _close_at(cache, t) == 99.0
+
+
+def test_cs66_first_write_of_disjoint_timestamps_byte_identical(tmp_path):
+    """cs66: a first-write of NEW disjoint timestamps preserves all values
+    byte-identical (the guard only ever fires on a re-write of an existing T).
+    """
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.append(_bar_at("2024-01-05", 100.0, vol=111.0))
+    cache.append(_bar_at("2024-01-06", 200.0, vol=222.0))  # disjoint T
+    cache.append(_bar_at("2024-01-07", 300.0, vol=333.0))  # disjoint T
+    out = cache.read()
+    assert len(out) == 3
+    assert _close_at(cache, "2024-01-05") == 100.0
+    assert _close_at(cache, "2024-01-06") == 200.0
+    assert _close_at(cache, "2024-01-07") == 300.0
+    # Every OHLCV value is byte-identical to the first write.
+    assert out.loc[out["timestamp"] == pd.Timestamp("2024-01-06", tz="UTC"), "volume"].iloc[0] == 222.0
+
+
+def test_cs66_served_columns_have_no_fetched_at_leak(tmp_path):
+    """cs66: the served read() frame stays the canonical 6 OHLCV columns after a
+    cross-day re-fetch sequence -- the internal fetched_at storage column must
+    NOT leak into the served frame any downstream consumer reads.
+    """
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.append(_bar_at("2024-01-05", 100.0))
+    cache.append(_bar_at("2024-01-05", 50.0))
+    cache.append(_bar_at("2024-01-06", 200.0))
+    assert list(cache.read().columns) == [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
+
+
+def test_cs66_legacy_fetched_at_less_file_appends_without_crash(tmp_path):
+    """cs66 migration: a LEGACY fetched_at-less 6-col cache (written by the old
+    ``write()`` path, or any pre-cs66 file) must not crash on append, must be
+    idempotent, must preserve its legacy rows, and a cross-day re-fetch of a
+    legacy timestamp must NOT overwrite it (the legacy sentinel fetched_at is
+    backfilled strictly after every cached bar so legacy rows are historical /
+    cross-day-protected).
+    """
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    # Write a legacy 6-col frame directly to disk, bypassing append (this is
+    # exactly what the unchanged public write() produces -- a fetched_at-less file).
+    cache.write(
+        pd.concat(
+            [_bar_at("2024-01-05", 100.0), _bar_at("2024-01-06", 200.0)],
+            ignore_index=True,
+        )
+    )
+    # Append a new disjoint-T bar twice -> no crash, idempotent, legacy rows survive.
+    cache.append(_bar_at("2024-01-07", 300.0))
+    cache.append(_bar_at("2024-01-07", 300.0))
+    out = cache.read()
+    assert len(out) == 3  # idempotent: no duplicate of 2024-01-07
+    assert _close_at(cache, "2024-01-05") == 100.0
+    assert _close_at(cache, "2024-01-06") == 200.0
+    assert _close_at(cache, "2024-01-07") == 300.0
+    # A cross-day re-fetch of a LEGACY timestamp does NOT overwrite the legacy bar.
+    cache.append(_bar_at("2024-01-05", 7.0))
+    assert _close_at(cache, "2024-01-05") == 100.0
+
+
+def test_cs66_served_window_behavior_byte_identical_cs38(tmp_path):
+    """cs66 anti-regression: this fix is about the STORED interior value, not the
+    SERVED WINDOW. Re-affirm a representative cs38 served-window test still
+    passes (no bar post-dates the cutoff on a HIT).
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(_bars(200, start="2024-01-01"))
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(200, start="2024-01-01")
+
+    cutoff = pd.Timestamp("2024-01-03T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 0
+    assert meta["cache_hit"] is True
+    assert (out["timestamp"] <= cutoff).all()
+
+
 def test_normalize_drops_bad_rows_and_duplicates():
     df = _bars(5)
     dup = df.iloc[[2]].copy()
