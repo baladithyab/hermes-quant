@@ -801,6 +801,202 @@ def test_cs53_sector_median_no_as_of_latest_path_untouched(
 
 
 # ---------------------------------------------------------------------------
+# cs68: read_sector_median_pe on the as_of=None LIVE path must NOT accept a
+# FUTURE-fetched median as fresh. cs53 added the fetched_at<=as_of future-fetch
+# guard but SCOPED it ``if as_of is not None`` (the point-in-time backtest read).
+# On the as_of=None LIVE read (asof_ts defaults to now — the path the LIVE
+# FundamentalsAnalyst uses for the pe_relative DENOMINATOR) that drop is SKIPPED,
+# so a median row stamped as_of_date=today / fetched_at=now+10d survives, yields
+# age_days = (now - (now+10d)).days = -10, and the staleness gate
+# ``age_days > SECTOR_MEDIAN_STALE_HARD_DAYS (30)`` is False for a NEGATIVE value
+# -> the future-fetched median is silently ACCEPTED as fresh instead of
+# abstaining. EXACTLY the path-scoping-gap class as cs67's refresh clamp. The fix
+# clamps a NEGATIVE age_days to max-stale (abstain) on the staleness gate, which
+# bites the as_of=None LIVE path while leaving the as_of!=None PIT path (cs53,
+# which already drops future fetched_at upstream so age_days is never negative)
+# byte-identical.
+# ---------------------------------------------------------------------------
+
+
+def test_cs68_sector_median_future_fetched_at_no_as_of_live_abstains(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs68 RED->GREEN: a future-fetched median is NOT accepted on the LIVE read.
+
+    Flag OFF isolates the staleness gate from the reporting-lag fallback. The
+    median's as_of_date = today (normalized) passes ``as_of_date <= now`` on the
+    as_of=None LIVE read, but fetched_at = now + 10d is in the FUTURE relative to
+    the asof_ts=now the LIVE path uses. age_days = (now - (now+10d)).days = -10,
+    so pre-cs68 the staleness gate (age_days > 30) is False for the negative
+    value and the future-fetched median (22.0) is RETURNED as fresh. After cs68
+    the negative age is clamped to max-stale -> the LIVE read abstains (None) so
+    the analyst's pe_relative DENOMINATOR goes dark instead of trusting a
+    future-stamped median (silence-by-default).
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    now = pd.Timestamp.now(tz="UTC")
+    _write_sector_median_row(
+        provider,
+        as_of_date=now.normalize(),
+        fetched_at=now + pd.Timedelta(days=10),
+        median_pe=22.0,
+    )
+    # RED: pre-cs68 returns 22.0 (negative age_days defeats the staleness gate on
+    # the as_of=None LIVE path); GREEN: future-fetched median abstains -> None.
+    assert provider.read_sector_median_pe("Tech") is None
+
+
+def test_cs68_sector_median_fresh_past_stamp_no_as_of_byte_identical(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs68 byte-identical: a genuinely-fresh PAST-stamped median still returns.
+
+    The clamp only fires for a NEGATIVE age (future stamp). A median fetched ~1h
+    ago (age_days = 0, well within the 30d hard-staleness) is the normal LIVE
+    case and is still returned — byte-identical to pre-cs68. A genuinely-fresh
+    past-stamped median and a fresh-constituent sector are BYTE-IDENTICAL.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    now = pd.Timestamp.now(tz="UTC")
+    _write_sector_median_row(
+        provider,
+        as_of_date=now.normalize(),
+        fetched_at=now - pd.Timedelta(hours=1),
+        median_pe=22.0,
+    )
+    assert provider.read_sector_median_pe("Tech") == pytest.approx(22.0)
+
+
+def test_cs68_pit_path_unaffected_by_negative_age_clamp(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs68 scope: the as_of!=None PIT path (cs53) is untouched by the clamp.
+
+    On the as_of!=None point-in-time read, cs53 already drops a future fetched_at
+    (fetched_at > as_of) BEFORE the staleness gate, so age_days is never negative
+    there and the new clamp is a no-op. A median fetched legitimately BEFORE the
+    point-in-time read still returns exactly as cs53 left it — proving the cs68
+    clamp does not regress the PIT path.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    d = pd.Timestamp("2026-05-01T00:00:00", tz="UTC")
+    _write_sector_median_row(
+        provider,
+        as_of_date=d,
+        fetched_at=d - pd.Timedelta(hours=1),
+        median_pe=22.0,
+    )
+    # PIT read after the fetch: cs53 keeps it, age_days >= 0, gate passes -> 22.0.
+    assert provider.read_sector_median_pe(
+        "Tech", as_of=d + pd.Timedelta(days=1)
+    ) == pytest.approx(22.0)
+
+
+# ---------------------------------------------------------------------------
+# cs69: refresh_sector_medians must NOT stamp a TODAY median built from STALE
+# constituents. The median is built from read_latest(ticker, as_of=None) per
+# constituent and the median row is written with as_of_date=now.normalize() /
+# fetched_at=now — with NO check that the constituent snapshots are themselves
+# fresh. Two constituents whose only snapshots are months stale still produce a
+# median row stamped TODAY, which then sails through read_sector_median_pe's 30d
+# hard-staleness gate (which measures the MEDIAN-ROW fetched_at, NOT constituent
+# age), so the analyst treats a months-stale DENOMINATOR as fresh. The fix skips
+# constituents whose read_latest fetched_at age exceeds SECTOR_MEDIAN_STALE_HARD_
+# DAYS (or is in the future) before taking the median; if all constituents in a
+# sector are stale, no median row is written (silence-by-default).
+# ---------------------------------------------------------------------------
+
+
+def test_cs69_refresh_skips_stale_constituents(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs69 RED->GREEN: a sector built ENTIRELY from stale constituents writes no median.
+
+    Two constituents whose only snapshots are ~150d stale must NOT produce a
+    TODAY-stamped median. Pre-cs69 refresh_sector_medians takes the median of the
+    stale pe values, stamps the row fetched_at=now, and read_sector_median_pe's
+    30d gate (which measures the MEDIAN-ROW fetched_at) accepts it -> 20.0 (a
+    months-stale denominator treated as fresh). After cs69 both stale
+    constituents are skipped, no median row is written, and the LIVE read
+    abstains (None).
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    now = pd.Timestamp.now(tz="UTC")
+    stale = now - pd.Timedelta(days=150)
+    provider.write_snapshot("AAA", _row(fetched_at=stale, pe_trailing=10.0, sector="Tech"))
+    provider.write_snapshot("BBB", _row(fetched_at=stale, pe_trailing=30.0, sector="Tech"))
+    out = provider.refresh_sector_medians(["AAA", "BBB"])
+    # RED: pre-cs69 out has Tech (median 20.0); GREEN: stale constituents skipped.
+    assert "Tech" not in out
+    # No median row was written, so the LIVE read abstains.
+    assert provider.read_sector_median_pe("Tech") is None
+
+
+def test_cs69_refresh_drops_only_stale_keeps_fresh_constituents(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs69: a stale constituent is excluded from the median; fresh ones remain.
+
+    AAA (fresh, pe 10) + BBB (stale, pe 30) + CCC (fresh, pe 20): pre-cs69 the
+    median is (10,20,30)->20.0 (the stale BBB poisons it). After cs69 BBB is
+    skipped and the median is over the two FRESH constituents (10,20)->15.0,
+    correctly stamped TODAY (the median IS genuinely fresh now).
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    now = pd.Timestamp.now(tz="UTC")
+    stale = now - pd.Timedelta(days=150)
+    provider.write_snapshot("AAA", _row(fetched_at=now, pe_trailing=10.0, sector="Tech"))
+    provider.write_snapshot("BBB", _row(fetched_at=stale, pe_trailing=30.0, sector="Tech"))
+    provider.write_snapshot("CCC", _row(fetched_at=now, pe_trailing=20.0, sector="Tech"))
+    out = provider.refresh_sector_medians(["AAA", "BBB", "CCC"])
+    assert out["Tech"]["n"] == 2, "only the two fresh constituents contribute"
+    assert out["Tech"]["median_pe"] == pytest.approx(15.0)
+    assert provider.read_sector_median_pe("Tech") == pytest.approx(15.0)
+
+
+def test_cs69_refresh_skips_future_fetched_constituent(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs69: a FUTURE-fetched constituent is also excluded (symmetric with stale).
+
+    read_latest(as_of=None) returns the MAX-fetched_at row; a constituent stamped
+    in the future relative to the cron wall-clock (clock skew, fabricated parquet)
+    yields a NEGATIVE age. That is just as untrustworthy as a stale one and must
+    be skipped, mirroring the cs67/cs68 future-stamp discipline. Here AAA is
+    future-stamped and BBB is fresh -> only BBB contributes.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    now = pd.Timestamp.now(tz="UTC")
+    future = now + pd.Timedelta(days=10)
+    provider.write_snapshot("AAA", _row(fetched_at=future, pe_trailing=99.0, sector="Tech"))
+    provider.write_snapshot("BBB", _row(fetched_at=now, pe_trailing=18.0, sector="Tech"))
+    out = provider.refresh_sector_medians(["AAA", "BBB"])
+    assert out["Tech"]["n"] == 1, "the future-stamped constituent is skipped"
+    assert out["Tech"]["median_pe"] == pytest.approx(18.0)
+
+
+def test_cs69_refresh_all_fresh_byte_identical(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs69 byte-identical: an all-fresh-constituent sector is unchanged.
+
+    When every constituent is fresh (fetched_at within the 30d bound) the median
+    and the written row are byte-identical to pre-cs69 — the freshness skip only
+    fires on a stale/future constituent. A fresh-constituent sector and a
+    genuinely-fresh past-stamped median are BYTE-IDENTICAL.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    now = pd.Timestamp.now(tz="UTC")
+    provider.write_snapshot("AAA", _row(fetched_at=now, pe_trailing=10.0, sector="Tech"))
+    provider.write_snapshot("BBB", _row(fetched_at=now, pe_trailing=20.0, sector="Tech"))
+    provider.write_snapshot("CCC", _row(fetched_at=now, pe_trailing=30.0, sector="Tech"))
+    out = provider.refresh_sector_medians(["AAA", "BBB", "CCC"])
+    assert out["Tech"]["n"] == 3
+    assert out["Tech"]["median_pe"] == pytest.approx(20.0)
+    assert provider.read_sector_median_pe("Tech") == pytest.approx(20.0)
+
+
+# ---------------------------------------------------------------------------
 # cs59: write_sector_median dedupe must PRESERVE the historical point-in-time
 # median — the WRITE-side symmetry of cs42(b) (which hardened write_snapshot).
 # The sector median is the pe_relative DENOMINATOR; a past-as-of read

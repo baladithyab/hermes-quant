@@ -540,7 +540,21 @@ class FundamentalsProvider:
         df = df.sort_values("fetched_at")
         latest = df.iloc[-1]
         age_days = (asof_ts - pd.Timestamp(latest["fetched_at"])).days
-        if age_days > self.SECTOR_MEDIAN_STALE_HARD_DAYS:
+        # cs68: a NEGATIVE age_days means the surviving median row was fetched in
+        # the FUTURE relative to asof_ts. cs53 drops a future fetched_at on the
+        # as_of-is-not-None POINT-IN-TIME path (so age_days is never negative
+        # there — the clause below is a no-op on that path), but that guard is
+        # scoped ``if as_of is not None``. On the as_of=None LIVE path (asof_ts
+        # defaults to now — the path the LIVE FundamentalsAnalyst uses for the
+        # pe_relative DENOMINATOR) the future-fetch drop is SKIPPED, so a median
+        # stamped as_of_date=today / fetched_at=now+10d survives, yields
+        # age_days < 0, and the bare ``age_days > HARD_DAYS`` gate is False for a
+        # negative value -> the future-fetched median is silently ACCEPTED as
+        # fresh. Clamp it: a negative age is treated as max-stale -> abstain.
+        # Symmetric with the cs67 refresh clamp (``if 0 <= age_h < ttl``) and the
+        # silence-by-default charter (a not-yet-knowable median must go dark, not
+        # be trusted). The as_of!=None PIT path (cs53) is byte-identical.
+        if age_days < 0 or age_days > self.SECTOR_MEDIAN_STALE_HARD_DAYS:
             return None
         val = _coerce_float(latest.get("median_pe_trailing"))
         if np.isnan(val) or val <= 0:
@@ -725,6 +739,32 @@ class FundamentalsProvider:
         for ticker in universe:
             snap = self.read_latest(ticker)
             if snap is None:
+                continue
+            # cs69: read_latest(as_of=None) returns the MAX-fetched_at constituent
+            # snapshot, but with NO freshness check. A constituent whose only
+            # snapshot is months stale (the prewarm cron stopped covering it, a
+            # delisting, a gap) would still contribute its stale pe to the median,
+            # and the median ROW is then stamped fetched_at=now below — so it
+            # sails through read_sector_median_pe's 30d HARD-staleness gate (that
+            # gate measures the MEDIAN-ROW fetched_at, NOT constituent age), and
+            # the analyst trusts a months-stale DENOMINATOR as fresh. Skip a
+            # constituent whose snapshot fetched_at age exceeds the same
+            # SECTOR_MEDIAN_STALE_HARD_DAYS bound the read gate uses, OR is in the
+            # FUTURE (negative age — clock-skew / fabricated parquet, symmetric
+            # with the cs67 refresh clamp and the cs68 read clamp). Reusing the
+            # 30d sector bound keeps the median's effective freshness consistent
+            # with the gate it must later pass; an all-fresh sector never trips
+            # the skip and is byte-identical. read_latest semantics are unchanged
+            # (the cs42(a) as_of=None latest path is untouched) — we only inspect
+            # the returned snapshot's fetched_at here.
+            fetched_at = snap.get("fetched_at")
+            if fetched_at is None or pd.isna(fetched_at):
+                continue
+            constituent_age_days = (now - pd.Timestamp(fetched_at)).days
+            if (
+                constituent_age_days < 0
+                or constituent_age_days > self.SECTOR_MEDIAN_STALE_HARD_DAYS
+            ):
                 continue
             pe = _coerce_float(snap.get("pe_trailing"))
             sector = snap.get("sector")
