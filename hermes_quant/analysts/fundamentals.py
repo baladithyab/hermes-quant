@@ -117,7 +117,39 @@ class FundamentalsAnalyst:
 
     # Composite gates
     _MIN_SURVIVING_SUBSIGNALS = 3
-    _STALENESS_DAYS_HARD_LIMIT = 7  # per-signal abstain if older
+
+    # Staleness gates (ADR-0064 §D5; cs40).
+    #
+    # Two distinct freshness concerns, two distinct gates:
+    #
+    #   (1) DATUM staleness — is the underlying fundamental too OLD to be
+    #       relevant? Fundamentals are quarterly, so a datum is measured
+    #       against its fiscal-period basis (report_date preferred, else
+    #       period_end), NOT against when the cron happened to cache it. A
+    #       quarterly datum is legitimately ~1 quarter old between filings,
+    #       and stays the freshest-available datum until the next quarter is
+    #       filed (one quarter ≈ 91d) plus the reporting lag (~45d) before
+    #       that next quarter is even knowable. The cadence-aware hard limit
+    #       (~2 quarters) admits the freshest-available quarter in every
+    #       legitimate case while still rejecting a snapshot older than ~half
+    #       a fiscal year. This replaces the old 7d fetched_at gate on the
+    #       datum-recency axis: post-cs12 the provider's reporting-lag filter
+    #       already guarantees a returned row was PUBLIC by as_of, so keying
+    #       datum-recency off fetched_at (a 7d cron-cadence value) wrongly
+    #       darkened the analyst on any backtest cache not re-snapshotted
+    #       daily — the lag (visible at period_end+45d) and the 7d
+    #       fetched_at gate (fetched_at ~30d+ old by then) cancelled.
+    #
+    #   (2) CRON-LIVENESS — only the FALLBACK when a row carries NO fiscal
+    #       basis (old-schema / pre-B34 parquets backfilled with NaT). There
+    #       the original §D5 7d fetched_at gate stands: if the cron stopped
+    #       writing fresh rows for >7d the cache is going stale, abstain.
+    #       This preserves the original live behavior for basis-less rows and
+    #       loosens nothing for them.
+    _STALENESS_DATUM_DAYS_HARD_LIMIT = 190  # ~2 quarters; datum-recency axis
+    _STALENESS_FETCHED_AT_DAYS_HARD_LIMIT = 7  # cron-liveness fallback (no basis)
+    # Back-compat alias (some callers/tests reference the original name).
+    _STALENESS_DAYS_HARD_LIMIT = _STALENESS_FETCHED_AT_DAYS_HARD_LIMIT
 
     def __init__(
         self,
@@ -210,19 +242,63 @@ class FundamentalsAnalyst:
         qt = snapshot.get("quote_type")
         if isinstance(qt, str) and qt.upper() == "ETF":
             return None
-        # Per-row hard staleness (ADR-0064 §D5).
+        if asof.tzinfo is None:
+            asof = asof.tz_localize("UTC")
+        # Per-row hard staleness (ADR-0064 §D5; cs40).
+        #
+        # Prefer the DATUM's fiscal-period basis (report_date, else
+        # period_end) and apply the cadence-aware quarterly limit. The
+        # provider's reporting-lag filter has already proven the row was
+        # PUBLIC by as_of, so the only remaining question is whether the
+        # datum is too OLD to be relevant — a quarterly question, not a
+        # 7-day cron-cadence one. Only when the row carries NEITHER a
+        # report_date NOR a period_end (old-schema / pre-B34 parquets) do we
+        # fall back to the original 7d fetched_at cron-liveness gate.
+        basis = self._datum_basis(snapshot)
+        if basis is not None:
+            datum_age_days = (asof - basis).days
+            if datum_age_days > self._STALENESS_DATUM_DAYS_HARD_LIMIT:
+                return None
+            return snapshot
+        # Fallback: no fiscal basis — cron-liveness gate on fetched_at.
         try:
             fetched_at = pd.Timestamp(snapshot["fetched_at"])
         except (KeyError, ValueError, TypeError):
             return None
         if fetched_at.tzinfo is None:
             fetched_at = fetched_at.tz_localize("UTC")
-        if asof.tzinfo is None:
-            asof = asof.tz_localize("UTC")
         age_days = (asof - fetched_at).days
-        if age_days > self._STALENESS_DAYS_HARD_LIMIT:
+        if age_days > self._STALENESS_FETCHED_AT_DAYS_HARD_LIMIT:
             return None
         return snapshot
+
+    @staticmethod
+    def _datum_basis(snapshot: pd.Series) -> pd.Timestamp | None:
+        """Return the datum's fiscal-period basis (UTC), or None.
+
+        report_date preferred (when the filing was published), else
+        period_end (the fiscal period the datum describes). Returns None
+        when both are absent / NaT — the basis-less fallback path. Mirrors
+        the provider's _apply_reporting_lag_filter precedence (report_date
+        → period_end) so the staleness axis is consistent with the
+        knowability axis.
+        """
+        for col in ("report_date", "period_end"):
+            if col not in snapshot.index:
+                continue
+            raw = snapshot.get(col)
+            if raw is None:
+                continue
+            try:
+                ts = pd.Timestamp(raw)
+            except (ValueError, TypeError):
+                continue
+            if ts is pd.NaT or pd.isna(ts):
+                continue
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            return ts
+        return None
 
     # ------------------------------------------------------------------
     # Sub-signal scorers (one per row in §D6 calibration table)

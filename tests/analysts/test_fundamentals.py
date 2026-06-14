@@ -355,19 +355,128 @@ def test_cache_miss_returns_none_no_error(
 
 
 # ---------------------------------------------------------------------------
-# 9 — staleness (>7d hard limit) abstains
+# 9 — staleness: a GENUINELY-stale datum (period basis > cadence limit) abstains
 # ---------------------------------------------------------------------------
 
 
 def test_cache_staleness_hard_limit_abstains(
     provider: FundamentalsProvider, analyst: FundamentalsAnalyst
 ) -> None:
+    """cs40: staleness keys off the datum's fiscal basis, not fetched_at.
+
+    A row whose period_end is older than the cadence-aware limit (> ~1
+    quarter + reporting lag) is genuinely stale fundamentals and abstains —
+    regardless of when it was cached. Here period_end = 2024-06-30 vs asof
+    2026-05-15 (~685d) is far past any quarterly cadence, so abstain.
+    """
     asof = pd.Timestamp("2026-05-15T16:00:00", tz="UTC")
-    too_old = asof - pd.Timedelta(days=8)
-    provider.write_snapshot("AAPL", _row(fetched_at=too_old, sector="Tech"))
+    fetched = asof - pd.Timedelta(hours=2)  # cron just ran -> fetched_at fresh
+    old_period = pd.Timestamp("2024-06-30", tz="UTC")  # ~685d ago, genuinely stale
+    # A full bullish slate WITH a sector benchmark: every gate EXCEPT staleness
+    # would admit a view, so abstention here pins the genuinely-stale rejection.
+    provider.write_snapshot(
+        "AAA", _row(fetched_at=fetched, period_end=old_period, pe_trailing=30.0, sector="Tech")
+    )
+    provider.write_snapshot(
+        "BBB", _row(fetched_at=fetched, period_end=old_period, pe_trailing=30.0, sector="Tech")
+    )
+    provider.refresh_sector_medians(["AAA", "BBB"])
+    provider.write_snapshot(
+        "AAPL",
+        _row(
+            fetched_at=fetched,
+            period_end=old_period,
+            pe_trailing=18.0,
+            pe_forward=14.0,
+            debt_to_equity=0.2,
+            fcf_yoy=0.25,
+            revenue_yoy=0.18,
+            eps_trailing=7.0,
+            eps_forward=7.5,
+            sector="Tech",
+        ),
+    )
     view = analyst.analyze(_ctx("AAPL", asof))
     assert view is None
     # Hard-staleness is a structural abstain, not an exception path.
+    assert analyst.health()["error_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 9b — cs40 RED: lag-admitted row with OLD fetched_at must NOT be darkened
+# ---------------------------------------------------------------------------
+
+
+def test_cs40_lag_admitted_old_fetched_at_still_emits(
+    provider: FundamentalsProvider, analyst: FundamentalsAnalyst
+) -> None:
+    """cs40 regression: the no-lookahead backtest replay path.
+
+    A Q4 datum (period_end 2025-12-31, knowable 2026-02-14 under the 45d
+    reporting lag) cached ONCE near period_end (fetched_at 2025-12-31), then
+    replayed at asof 2026-03-01 (> knowable). The provider lag filter ADMITS
+    it (genuinely public). Pre-cs40 the analyst's 7d *fetched_at* staleness
+    gate rejected it (fetched_at ~60d old) -> the analyst went DARK on every
+    sparse backtest cache. Post-cs40 staleness keys off the datum's fiscal
+    period basis, so a recently-public quarter is ADMITTED.
+    """
+    period_end = pd.Timestamp("2025-12-31", tz="UTC")
+    fetched_at = pd.Timestamp("2025-12-31T20:00:00", tz="UTC")  # cached once
+    asof = pd.Timestamp("2026-03-01T16:00:00", tz="UTC")  # > knowable 2026-02-14
+
+    # sector benchmark (cheap relative P/E so pe_relative can also fire)
+    provider.write_snapshot(
+        "AAA", _row(fetched_at=fetched_at, period_end=period_end, pe_trailing=30.0, sector="Tech")
+    )
+    provider.write_snapshot(
+        "BBB", _row(fetched_at=fetched_at, period_end=period_end, pe_trailing=30.0, sector="Tech")
+    )
+    provider.refresh_sector_medians(["AAA", "BBB"])
+    provider.write_snapshot(
+        "AAPL",
+        _row(
+            fetched_at=fetched_at,
+            period_end=period_end,
+            pe_trailing=18.0,
+            pe_forward=14.0,
+            debt_to_equity=0.2,
+            fcf_yoy=0.25,
+            revenue_yoy=0.18,
+            eps_trailing=7.0,
+            eps_forward=7.5,
+            sector="Tech",
+        ),
+    )
+    # Sanity: the provider lag filter genuinely admits this row (it is public).
+    assert provider.read_latest("AAPL", as_of=asof) is not None
+    view = analyst.analyze(_ctx("AAPL", asof))
+    assert view is not None, "cs40: lag-admitted public quarter must NOT be darkened by fetched_at age"
+    assert view.direction == +1
+    assert analyst.health()["error_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 9c — cs40: live/no-period-basis row keeps the fetched_at cron-liveness gate
+# ---------------------------------------------------------------------------
+
+
+def test_cs40_no_period_basis_keeps_fetched_at_liveness_gate(
+    provider: FundamentalsProvider, analyst: FundamentalsAnalyst
+) -> None:
+    """cs40 safety: rows with NO fiscal basis (old-schema / pre-B34 caches)
+    still use the fetched_at cron-liveness gate, so a dead cron that stopped
+    writing > the fetched_at limit ago still darkens the analyst. This keeps
+    the original D5 operational-liveness behavior on the fallback path and
+    does not loosen anything for rows that never carried a period basis."""
+    asof = pd.Timestamp("2026-05-15T16:00:00", tz="UTC")
+    # No report_date AND no period_end -> fall back to fetched_at age gate.
+    stale_fetch = asof - pd.Timedelta(days=8)
+    provider.write_snapshot(
+        "AAPL",
+        _row(fetched_at=stale_fetch, report_date=pd.NaT, period_end=pd.NaT, sector="Tech"),
+    )
+    view = analyst.analyze(_ctx("AAPL", asof))
+    assert view is None
     assert analyst.health()["error_count"] == 0
 
 
