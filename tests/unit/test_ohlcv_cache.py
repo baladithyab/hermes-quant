@@ -124,6 +124,101 @@ def test_cached_fetch_hit_tolerates_exchange_shortfall(tmp_path):
     assert len(out) == 95
 
 
+def test_cached_fetch_hit_prunes_to_cutoff_no_lookahead(tmp_path):
+    """cs38: a warm cache populated to a LATER date must not serve bars that
+    post-date the backtest cutoff on a HIT.
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    # Cache covers 2024-01-01 .. (200 hourly bars -> well past Jan 3).
+    cache.write(_bars(200, start="2024-01-01"))
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(200, start="2024-01-01")
+
+    cutoff = pd.Timestamp("2024-01-03T00:00:00Z")  # 49 bars at-or-before
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 0  # enough at-or-before bars -> still a HIT
+    assert meta["cache_hit"] is True
+    assert len(out) == 10
+    # No bar in the result may post-date the cutoff (the leak).
+    assert (out["timestamp"] <= cutoff).all()
+    assert out["timestamp"].iloc[-1] <= cutoff
+
+
+def test_cached_fetch_hit_gate_counts_only_at_or_before_cutoff(tmp_path):
+    """cs38: a cache full of FUTURE bars must not falsely satisfy the hit
+    threshold. With too few at-or-before bars, fall through to a MISS/fetch
+    rather than serving future bars.
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    # 100 bars total, but only 3 fall at-or-before the cutoff.
+    cache.write(_bars(100, start="2024-01-01"))
+
+    def fetch():
+        calls["n"] += 1
+        # Provider supplies the past window the backtest actually needs.
+        return _bars(20, start="2023-12-20")
+
+    cutoff = pd.Timestamp("2024-01-01T02:00:00Z")  # only bars 0,1,2 are <= cutoff
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        lookback_bars=20,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    # 3 at-or-before bars < min_hit_bars(=19) -> MISS, fetch invoked.
+    assert calls["n"] == 1
+    assert meta["cache_hit"] is False
+    # Result still respects the cutoff after the fetch+merge.
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_cutoff_none_byte_identical(tmp_path):
+    """cs38: cutoff=None (live/up-to-now caller) prunes nothing -> identical to
+    the prior behaviour (returns the most-recent lookback_bars).
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("ccxt", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(_bars(20, start="2024-01-01"))
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(20, start="2024-01-01")
+
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=None,
+    )
+    assert calls["n"] == 0
+    assert meta["cache_hit"] is True
+    assert len(out) == 10
+    # Most-recent 10 bars (tail), unchanged from pre-cs38 behaviour.
+    full = cache.read()
+    assert out["timestamp"].iloc[-1] == full["timestamp"].iloc[-1]
+
+
 def test_normalize_drops_bad_rows_and_duplicates():
     df = _bars(5)
     dup = df.iloc[[2]].copy()

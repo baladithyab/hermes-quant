@@ -1718,6 +1718,11 @@ def _fetch_bars_via_provider(
         timeframe=timeframe,
         lookback_bars=lookback,
         cache_root=root if root is not None else _Path.home() / ".hermes" / "quant" / "cache",
+        # NO-LOOKAHEAD (cs38): the cache file accumulates bars up to each prior
+        # fetch's wall-clock; without this anchor a warm HIT would serve bars
+        # that post-date a backtest --end. as_of is derived from --end above
+        # (None => live/up-to-now caller => no prune, byte-identical).
+        cutoff=as_of,
     )
     print(
         "backtest: OHLCV cache "

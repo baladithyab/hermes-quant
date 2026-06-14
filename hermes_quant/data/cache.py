@@ -124,6 +124,7 @@ def cached_fetch(
     cache_root: Path = DEFAULT_CACHE_ROOT,
     prefer_parquet: bool = True,
     min_hit_ratio: float = 0.95,
+    cutoff: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Read-through cache for provider fetches.
 
@@ -136,6 +137,21 @@ def cached_fetch(
     It must return a normalized-ish OHLCV DataFrame; this function normalizes,
     appends/dedupes, and returns the last lookback_bars rows (or all cached rows
     if the provider never supplies that many).
+
+    NO-LOOKAHEAD (cs38): ``cutoff`` is the as_of/end anchor of the caller
+    (a backtest derives it from ``--end``). The cache file accumulates bars up
+    to each prior fetch's wall-clock, so a warm cache populated to a LATER date
+    must never serve bars that post-date the current backtest anchor. When
+    ``cutoff`` is set:
+
+    * the cache-HIT path prunes the returned bars to ``timestamp <= cutoff``;
+    * the HIT is gated on having enough bars AT-OR-BEFORE the cutoff
+      (``len(cached[timestamp <= cutoff]) >= min_hit_bars``), not just enough
+      bars total — otherwise a cache full of future bars would falsely satisfy
+      the hit threshold and then return too few past bars.
+
+    ``cutoff=None`` (a live/up-to-now caller) prunes nothing and is
+    byte-identical to the prior behaviour.
     """
     cache = OhlcvCache(
         provider=provider,
@@ -146,8 +162,9 @@ def cached_fetch(
     )
     cached = cache.read()
     min_hit_bars = max(1, int(lookback_bars * min_hit_ratio))
-    if len(cached) >= min_hit_bars:
-        out = cached.tail(min(lookback_bars, len(cached))).reset_index(drop=True)
+    eligible = cached if cutoff is None else cached[cached["timestamp"] <= cutoff]
+    if len(eligible) >= min_hit_bars:
+        out = eligible.tail(min(lookback_bars, len(eligible))).reset_index(drop=True)
         return out, {
             "cache_hit": True,
             "cache": cache.coverage(),
@@ -158,6 +175,8 @@ def cached_fetch(
     fetched = normalize_bars(fetch_fn())
     path = cache.append(fetched)
     merged = cache.read()
+    if cutoff is not None:
+        merged = merged[merged["timestamp"] <= cutoff]
     out = merged.tail(min(lookback_bars, len(merged))).reset_index(drop=True)
     return out, {
         "cache_hit": False,
