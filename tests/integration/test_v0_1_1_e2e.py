@@ -1,14 +1,20 @@
 """Integration tests for the v0.1.1 vertical slice.
 
 Tests that exercise the whole pipeline end-to-end with synthetic data:
-  - Daemon-style tick loop emits signals to the bus
-  - Heartbeat emitter writes to the bus
-  - Halt registry blocks emissions when active
+  - Halt registry persists across simulated daemon restart
   - Multi-process flock concurrency holds up under daemon + freqtrade-style
     concurrent writers
 
 These tests are still unit-y (no real network, no real broker), but
 exercise the full module wiring beyond what the per-module unit tests cover.
+
+NOTE (vestigial-daemon-spine deletion): the original tick-loop + heartbeat
+end-to-end emission tests lived here. The documented daemon → signals.jsonl →
+freqtrade spine they exercised is vestigial — the live spine is cron scripts
+that call advisor.recommend + reactors directly — so `daemon/tick_loop.py` and
+`daemon/heartbeat.py` were removed and those two test classes with them. The
+flock-concurrency + halt-persistence + freqtrade-strategy-import coverage below
+exercises the KEPT signal_bus / halt_state utilities and stays.
 """
 
 from __future__ import annotations
@@ -16,215 +22,11 @@ from __future__ import annotations
 import json
 import multiprocessing
 import sys
-import time
 from pathlib import Path
-from unittest.mock import MagicMock
 
-import numpy as np
 import pandas as pd
-import pytest
 
-from hermes_quant.aggregators.bma import BMAAggregator
 from hermes_quant.daemon.halt_state import HaltStateSQLite
-from hermes_quant.daemon.heartbeat import HeartbeatEmitter
-from hermes_quant.daemon.signal_bus import (
-    read_jsonl_tail,
-)
-from hermes_quant.daemon.tick_loop import (
-    AssetTask,
-    TickLoopState,
-    run_one_tick,
-)
-from hermes_quant.protocol import (
-    AnalystView,
-    Portfolio,
-)
-from hermes_quant.risk.gate import DefaultRiskGate, RiskConfig
-
-
-def _make_bars(n: int = 100, base: float = 60_000.0):
-    """Synthetic crypto-like bars."""
-    rng = np.random.default_rng(42)
-    ts = pd.date_range("2026-05-13T00:00:00", periods=n, freq="1h")
-    closes = base * np.cumprod(1 + 0.001 + rng.normal(0, 0.005, n))
-    return pd.DataFrame(
-        {
-            "timestamp": ts,
-            "open": closes,
-            "high": closes * 1.005,
-            "low": closes * 0.995,
-            "close": closes,
-            "volume": [1000.0] * n,
-        }
-    )
-
-
-def _mock_provider(bars):
-    p = MagicMock()
-    p.name = "mock"
-    p.fetch_bars.return_value = bars
-    return p
-
-
-def _mock_analyst(direction: int, name: str, conf: float = 0.7):
-    a = MagicMock()
-    a.name = name
-    a.analyze.return_value = AnalystView(
-        analyst=name,
-        direction=direction,
-        magnitude=0.02,
-        confidence=conf,
-        confidence_raw=conf + 0.2,
-        horizon="4h",
-    )
-    return a
-
-
-def _empty_portfolio_for(equity: float = 100_000.0):
-    def _f(account_id, asset_class):
-        return Portfolio(
-            account_id=account_id,
-            asset_class=asset_class,
-            asof=pd.Timestamp.utcnow(),
-            positions={},
-            cash=equity,
-            equity_total=equity,
-            realized_pnl_total=0.0,
-            realized_fees_total=0.0,
-            peak_equity=equity,
-            daily_open_equity=equity,
-        )
-
-    return _f
-
-
-# ---------------------------------------------------------------------------
-# End-to-end: tick → bus emission
-# ---------------------------------------------------------------------------
-
-
-class TestE2ETickEmits:
-    def test_full_tick_emits_signal_to_bus(self, tmp_path):
-        bus = tmp_path / "signals.jsonl"
-        halt_db = tmp_path / "halts.db"
-        halt_mirror = tmp_path / "halt.json"
-
-        bars = _make_bars(100)
-        provider = _mock_provider(bars)
-        analysts = [_mock_analyst(1, "a"), _mock_analyst(1, "b")]
-        agg = BMAAggregator(require_ensemble=False)
-        gate = DefaultRiskGate(
-            RiskConfig(
-                cost_multiple=0.5,
-                min_trade_size=0.0,
-                cooldown_after_loss_minutes=0,
-                max_position_pct=0.20,
-            )
-        )
-        halt_state = HaltStateSQLite(halt_db, halt_mirror)
-
-        state = TickLoopState()
-        n = run_one_tick(
-            tasks=[AssetTask("BTC/USDT", "crypto", "1h", exchange="binance", horizon="4h")],
-            data_providers=[provider],
-            analysts=analysts,
-            aggregator=agg,
-            risk_gate=gate,
-            halt_state=halt_state,
-            portfolio_for=_empty_portfolio_for(),
-            state=state,
-            bus_path=bus,
-        )
-        assert n >= 1
-
-        # Verify the bus has a well-formed record
-        records = read_jsonl_tail(bus, n=10)
-        signals = [r for r in records if r.get("type") != "heartbeat"]
-        assert len(signals) >= 1
-        sig = signals[-1]
-        # ADR-0008 schema, bumped to v2 by ADR-0068 (split bar_ts replay anchor
-        # from asof_decision wall-clock; `asof` retains its v1 meaning == bar_ts).
-        assert sig["schema_version"] == 2
-        assert sig["asset"] == "BTC/USDT"
-        assert "id" in sig
-        assert "asof" in sig
-        # ADR-0068 explicit aliases must be present on a v2 record.
-        assert "bar_ts" in sig, "ADR-0068 bar_ts missing from v2 bus record"
-        assert "asof_decision" in sig, "ADR-0068 asof_decision missing from v2 bus record"
-        assert sig["direction"] in (-1, 1)
-        assert "target_position_pct" in sig
-        assert "components" in sig
-        # Phase-8 P0-A.1: decision_price MUST be on the bus record so the
-        # freqtrade strategy + settlement loop can compute realized_return
-        # correctly. A `decision_price=fill_price` artifact would make the
-        # entire calibration loop train on noise.
-        assert "decision_price" in sig, (
-            "decision_price missing from bus record — Phase-8 P0-A.1 regression"
-        )
-        assert sig["decision_price"] > 0
-        # Decision price comes from MarketContext.last_close (the most
-        # recent bar close at signal.asof), so it should equal the test
-        # bars' last close
-        assert abs(sig["decision_price"] - float(bars["close"].iloc[-1])) < 1e-6
-
-    def test_halt_blocks_emission(self, tmp_path):
-        bus = tmp_path / "signals.jsonl"
-        halt_state = HaltStateSQLite(tmp_path / "halts.db", tmp_path / "halt.json")
-
-        # Pre-halt the asset
-        halt_state.add_halt("default", "crypto", "BTC/USDT", reason="test")
-
-        bars = _make_bars(100)
-        provider = _mock_provider(bars)
-        analysts = [_mock_analyst(1, "a")]
-        agg = BMAAggregator(require_ensemble=False)
-        gate = DefaultRiskGate(RiskConfig(cost_multiple=0.5, min_trade_size=0.0))
-        state = TickLoopState()
-
-        n = run_one_tick(
-            tasks=[AssetTask("BTC/USDT", "crypto", "1h")],
-            data_providers=[provider],
-            analysts=analysts,
-            aggregator=agg,
-            risk_gate=gate,
-            halt_state=halt_state,
-            portfolio_for=_empty_portfolio_for(),
-            state=state,
-            bus_path=bus,
-        )
-        assert n == 0
-
-
-# ---------------------------------------------------------------------------
-# Heartbeat emitter writes to bus
-# ---------------------------------------------------------------------------
-
-
-class TestHeartbeatToBus:
-    @pytest.mark.timeout(10)
-    def test_heartbeat_writes_distinguishable_records(self, tmp_path):
-        bus = tmp_path / "signals.jsonl"
-        emitter = HeartbeatEmitter(
-            get_state=lambda: {
-                "last_tick_at": pd.Timestamp.utcnow(),
-                "active_assets": ["BTC/USDT"],
-            },
-            interval_seconds=0.05,
-            bus_path=bus,
-        )
-        emitter.start()
-        time.sleep(0.2)
-        emitter.stop(timeout=2.0)
-
-        records = read_jsonl_tail(bus, n=50)
-        heartbeats = [r for r in records if r.get("type") == "heartbeat"]
-        assert len(heartbeats) >= 2
-
-        # Heartbeats are JSON-distinguishable from regular signals
-        for hb in heartbeats:
-            assert "daemon_pid" in hb
-            assert "uptime_seconds" in hb
-
 
 # ---------------------------------------------------------------------------
 # Multi-process flock under daemon + freqtrade concurrent writers

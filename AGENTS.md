@@ -5,10 +5,13 @@ coding agent working on this repository.
 
 ## Project posture
 
-hermes-quant is **money-software**. It runs a daemon that ultimately decides
-where to put real capital. Defects don't just print bad output — they
-subtract from the user's bank account. Every code change should be reviewed
-through that lens.
+hermes-quant is **money-software**. It runs a set of scheduled cron tasks
+(ops/scripts/quant-*-tick.py + quant-daily-interim.py) that call
+advisor.recommend + the react reactors directly to decide where to put real
+capital. (The original long-lived daemon → signals.jsonl → freqtrade spine was
+vestigial and was removed; the daemon/ package now hosts only
+shared utilities.) Defects don't just print bad output — they subtract from
+the user's bank account. Every code change should be reviewed through that lens.
 
 Three discipline principles, in priority order:
 
@@ -82,10 +85,16 @@ hermes-quant/
 │   │   ├── ccxt_provider.py
 │   │   ├── alphavantage_provider.py
 │   │   └── fundamentals_provider.py
-│   ├── daemon/
-│   │   ├── main.py               # hermes-quant-daemon entry point
-│   │   ├── tick_loop.py
-│   │   └── settlement_loop.py
+│   ├── daemon/                   # shared utilities only — the long-lived
+│   │   │                         # main.py/tick_loop.py signal loop was
+│   │   │                         # vestigial and removed. The live
+│   │   │                         # spine is the ops/scripts/quant-*-tick.py
+│   │   │                         # crons calling advisor.recommend + reactors.
+│   │   ├── signal_bus.py         # append-only JSONL bus (flock-protected)
+│   │   ├── halt_state.py         # durable halt registry (kill-switch authority)
+│   │   ├── settlement_loop.py    # join_exit_fills = kill-switch realized-PnL basis
+│   │   ├── discovery.py          # entry-point discovery for analysts/aggregators
+│   │   └── portfolio_loader.py   # reconstruct_portfolio from the execution log
 │   ├── consumers/
 │   │   └── freqtrade/
 │   │       ├── quant_consumer_strategy.py    # drop into freqtrade user_data/strategies/

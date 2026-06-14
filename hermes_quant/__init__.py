@@ -4,7 +4,12 @@ Distributed as a Hermes Agent plugin. See README.md and docs/adr/ for the
 architecture. AGENTS.md has the development guide.
 
 Plugin entry: register(ctx) — wires tools, slash command, CLI subcommands.
-Daemon entry: hermes_quant.daemon.main:main — the long-lived signal loop.
+
+The live spine is cron scripts (ops/scripts/quant-*-tick.py,
+quant-daily-interim.py) that call advisor.recommend + the react reactors
+directly. The long-lived `hermes_quant.daemon.main` signal loop was vestigial
+and was removed; the daemon/ package now hosts only the shared
+utilities (signal_bus, halt_state, settlement_loop, discovery, portfolio_loader).
 """
 
 from __future__ import annotations

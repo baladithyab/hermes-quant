@@ -1,10 +1,15 @@
-"""Tests for daemon/lock.py + daemon/discovery.py + daemon/portfolio_loader.py."""
+"""Tests for daemon/discovery.py + daemon/portfolio_loader.py.
+
+Vestigial-daemon-spine deletion: this file originally also covered
+``daemon/lock.py`` (TestDaemonLock — the singleton daemon flock). That lock
+only protected the long-lived daemon entry point (``daemon/main.py``), which
+was vestigial; the live spine is cron scripts that call advisor.recommend +
+reactors directly. ``daemon/lock.py`` and ``daemon/main.py`` were removed, and
+TestDaemonLock with them. The discovery + portfolio-reconstruction coverage
+(both KEPT utilities) stays.
+"""
 
 from __future__ import annotations
-
-import multiprocessing
-import os
-import time
 
 import pandas as pd
 import pytest
@@ -17,65 +22,8 @@ from hermes_quant.daemon.discovery import (
     instantiate_analysts,
     instantiate_data_provider,
 )
-from hermes_quant.daemon.lock import DaemonLock
 from hermes_quant.daemon.portfolio_loader import reconstruct_portfolio
 from hermes_quant.daemon.signal_bus import emit_execution_record
-from hermes_quant.protocol import DaemonAlreadyRunning
-
-# ---------------------------------------------------------------------------
-# DaemonLock
-# ---------------------------------------------------------------------------
-
-
-class TestDaemonLock:
-    def test_acquire_and_release(self, tmp_path):
-        lock = DaemonLock(account_id="test", lock_dir=tmp_path)
-        lock.acquire()
-        assert lock.lock_path.exists()
-        # File contains our PID
-        content = lock.lock_path.read_text().strip()
-        pid_str = content.split()[0]
-        assert int(pid_str) == os.getpid()
-        lock.release()
-
-    def test_context_manager(self, tmp_path):
-        with DaemonLock(account_id="test", lock_dir=tmp_path) as lock:
-            assert lock.lock_path.exists()
-        # Released on exit (we can't easily verify the flock state, but no exception)
-
-    def test_open_without_o_trunc_p1_alpha(self, tmp_path):
-        """Per synthesis-v2 §P1-α: open WITHOUT O_TRUNC then flock then truncate.
-
-        We verify by writing a sentinel byte to the lock file BEFORE acquiring;
-        if the implementation used O_TRUNC at open, the sentinel would be
-        gone after the failed-acquire call. (We can't easily test the win path
-        because that DOES truncate by design, so we check the lose path.)
-        """
-        lock_path = tmp_path / "daemon-test.lock"
-        lock_path.write_text("99999 sentinel\n")  # bogus PID
-
-        # Hold the lock from a child process
-        def hold_lock():
-            lock = DaemonLock(account_id="test", lock_dir=tmp_path)
-            lock.acquire()
-            time.sleep(2)
-
-        proc = multiprocessing.Process(target=hold_lock)
-        proc.start()
-        time.sleep(0.5)
-
-        # Now try to acquire from this process; should fail
-        lock = DaemonLock(account_id="test", lock_dir=tmp_path)
-        with pytest.raises(DaemonAlreadyRunning):
-            lock.acquire()
-
-        # The sentinel-replacement done by the child is whatever the child wrote —
-        # we don't enforce the exact content here, but we DO verify that the
-        # file is non-empty (the lock acquisition succeeded for the child;
-        # it would be empty if O_TRUNC had been used and the lock then failed)
-        proc.terminate()
-        proc.join()
-
 
 # ---------------------------------------------------------------------------
 # Discovery

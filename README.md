@@ -44,7 +44,7 @@
 A trading framework where multiple independent analysts emit views, an aggregator combines them, and a risk gate decides whether to act. Built around three principles:
 
 1. **Multi-analyst by design.** Pluggable analyst modules that emit a uniform `AnalystView` (direction, magnitude, confidence, horizon). v0.1.0 ships classical TA, microstructure-lite, [Kronos foundation model](https://github.com/shiyu-coder/Kronos), and the Kairos BTC fine-tune. Add your own.
-2. **Sidecar architecture.** A long-running daemon emits signals on a JSONL bus. [freqtrade](https://www.freqtrade.io/) (v0.1) or NautilusTrader (v0.2) reads the bus and executes. We don't reinvent order management; we focus on signal intelligence.
+2. **Scheduled-tick architecture.** The live spine is scheduled cron ticks that call `advisor.recommend` and the paper reactors directly (the original long-lived `daemon/main.py` signal-bus → freqtrade sidecar was vestigial and was removed; the shared `daemon/` utilities — `signal_bus`, `halt_state`, `settlement_loop`, `discovery`, `portfolio_loader` — remain). We don't reinvent order management; we focus on signal intelligence.
 3. **Silence by default.** Aggregator emits zero on disagreement; risk gate enforces hard rules the aggregator can't bypass; circuit breakers flatten on drawdown. Designed to lose money slowly, not catastrophically.
 
 ## What this is NOT (yet)
