@@ -34,8 +34,21 @@ import pandas as pd
 
 from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, read_jsonl_tail
 from hermes_quant.protocol import Portfolio, Position
+from hermes_quant.react.base import is_absolute_target_record
 
 logger = logging.getLogger(__name__)
+
+# cs14 Option B (ADR-0091 Option E / docs/design/2026-06-13-cs14-weekly-exit-reader-fork.md):
+# the LIVE producer (react.paper.PaperReactor -> _record_to_dict) emits a record shape
+# the legacy int-1 `side`/`qty` branch below CANNOT read — it carries
+# schema_version=None (or the "absolute-target-v1" sentinel), a signed NAV-fraction
+# `target_position_pct`, `reactor_name`, `fill_price`, `asof_execution`, and NO
+# top-level qty/side/account_id. The absolute-target reconstruction block (added below)
+# consumes that real shape via LATEST-TARGET semantics (mirroring
+# portfolio.state.reconstruct_portfolio_state) so the weekly-exit reader reconstructs a
+# real book. Only equity-fill reactors are admitted; crypto/other partitions are NOT
+# silently absorbed (they must use the legacy int-1 path or a future per-class seam).
+EQUITY_FILL_REACTORS = frozenset({"paper", "deterministic-equity", "alpaca_paper"})
 
 
 def reconstruct_portfolio(
@@ -67,13 +80,42 @@ def reconstruct_portfolio(
     mark_prices = mark_prices or {}
 
     records = read_jsonl_tail(bus_path, n=n_records)
-    # Filter to scope
+    # Filter to scope — LEGACY int-1 path (hand-rolled side/qty records; the crypto
+    # settlement shape). Unchanged: schema_version == 1 is the int sentinel, which is
+    # disjoint from the absolute-target shape (None / "absolute-target-v1") by
+    # construction, so the two lists never overlap.
     matching = [
         r
         for r in records
         if r.get("account_id") == account_id
         and r.get("asset_class") == asset_class
         and r.get("schema_version") == 1
+    ]
+
+    # cs14: ABSOLUTE-TARGET path — the real live producer shape. A record is admitted
+    # iff it is an absolute-target record (schema_version None or the sentinel),
+    # its reactor_name is an equity-fill reactor, its asset_class matches scope, AND
+    # the account resolves to the requested partition the SAME way the live
+    # producer/state-write seam does: top-level account_id (legacy-injected) OR
+    # reactor_metadata.account_id OR the "paper-default" sentinel (react.paper:438-441).
+    # We do NOT silently admit crypto/other partitions — reactor_name must be in the
+    # equity-fill set.
+    def _record_account(r: dict) -> str:
+        acct = r.get("account_id")
+        if acct:
+            return str(acct)
+        meta_acct = (r.get("reactor_metadata") or {}).get("account_id")
+        if meta_acct:
+            return str(meta_acct)
+        return "paper-default"
+
+    absolute_matching = [
+        r
+        for r in records
+        if is_absolute_target_record(r)
+        and r.get("reactor_name") in EQUITY_FILL_REACTORS
+        and r.get("asset_class") == asset_class
+        and _record_account(r) in {account_id, "paper-default"}
     ]
 
     cash = initial_cash
@@ -179,6 +221,95 @@ def reconstruct_portfolio(
             unrealized_pnl=unrealized,
             realized_fees=0.0,
         )
+
+    # ------------------------------------------------------------------------
+    # cs14 ABSOLUTE-TARGET reconstruction (LATEST-TARGET, never delta-summed).
+    #
+    # The real live producer emits one absolute signed NAV-fraction target per
+    # symbol per fill; later fills SUPERSEDE earlier ones (they do NOT cancel /
+    # net out — that is the dual-ledger inflation ADR-0091 forbids). So we keep
+    # the single record with the MAX asof_execution per symbol (mirroring
+    # portfolio.state.reconstruct_portfolio_state:108-113) and derive ONE Position
+    # from it. A latest target of 0.0 means the symbol is closed -> dropped.
+    #
+    # Derivation of share qty/avg_entry from a NAV fraction:
+    #   * reactor_metadata.quantity, when present, is the AUTHORITATIVE signed
+    #     absolute filled share count (the det-equity / live-broker reconciliation
+    #     anchor per react/base.py:50-52) — used verbatim.
+    #   * otherwise qty = target_position_pct * NAV / entry_price, where NAV is the
+    #     loader's `initial_cash` (the daemon passes the account NAV here; in tests
+    #     it is the 100_000 default). entry_price = fill_price (slipped) or, absent
+    #     that, decision_price.
+    # The Position's cost-basis cash leg is folded into `cash` (cash -= qty*entry)
+    # so equity_total = cash + sum(qty*mark) stays coherent with the legacy legs.
+    abs_latest: dict[str, dict] = {}
+    for rec in absolute_matching:
+        asset = rec.get("asset")
+        if asset is None:
+            continue
+        ts = rec.get("asof_execution") or rec.get("asof")
+        if ts is None:
+            continue
+        prior = abs_latest.get(asset)
+        if prior is None or ts >= (prior.get("asof_execution") or prior.get("asof") or ""):
+            abs_latest[asset] = rec
+
+    for asset, rec in abs_latest.items():
+        try:
+            target_pct = float(rec.get("target_position_pct"))
+        except (TypeError, ValueError):
+            logger.warning("absolute-target record missing target_position_pct: %s", rec)
+            continue
+        if abs(target_pct) < 1e-12:
+            # Latest target is flat -> the position is closed. Drop it.
+            continue
+
+        # Entry price: slipped fill_price preferred, else decision_price.
+        try:
+            entry_price = float(rec.get("fill_price"))
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        if entry_price <= 0.0:
+            try:
+                entry_price = float(rec.get("decision_price"))
+            except (TypeError, ValueError):
+                entry_price = 0.0
+        if entry_price <= 0.0:
+            logger.warning(
+                "absolute-target record for %s has no usable entry price; skipped: %s",
+                asset,
+                rec,
+            )
+            continue
+
+        meta = rec.get("reactor_metadata") or {}
+        qty: float
+        meta_qty = meta.get("quantity")
+        if meta_qty is not None:
+            # Authoritative signed absolute backend share count (det-equity / live).
+            try:
+                qty = float(meta_qty)
+            except (TypeError, ValueError):
+                qty = (target_pct * initial_cash) / entry_price
+        else:
+            # NAV-fraction fallback: shares = (fraction-of-NAV * NAV) / price.
+            qty = (target_pct * initial_cash) / entry_price
+
+        if abs(qty) < 1e-12:
+            continue
+
+        mark = mark_prices.get(asset, entry_price)
+        unrealized = (mark - entry_price) * qty
+        positions[asset] = Position(
+            asset=asset,
+            qty=qty,
+            avg_entry_price=entry_price,
+            mark_price=mark,
+            unrealized_pnl=unrealized,
+            realized_fees=0.0,
+        )
+        # Fold the absolute leg's cost basis into cash so equity stays coherent.
+        cash -= qty * entry_price
 
     equity_total = cash + sum(p.qty * p.mark_price for p in positions.values())
     peak_equity = max(peak_equity, equity_total)

@@ -154,3 +154,74 @@ def test_infer_play_tag_no_match(mod):
     """Asset never in executions -> default swing."""
     execs = [{"asset": "AAPL", "side": "buy", "play_tag": "leaps"}]
     assert mod.infer_play_tag(execs, "MSFT") == "swing"
+
+
+# ---------------------- cs17: live-record shape (no side/asof) ----------------------
+
+def _live_exec_dict(
+    asset: str = "AAPL",
+    target_position_pct: float = 0.20,
+    play_tag: str = "advisor",
+    asof_execution: str = "2026-06-08T13:31:05+00:00",
+) -> dict:
+    """A record in the REAL live-producer shape: signed target_position_pct, no
+    `side`, no `asof` (uses asof_execution), play_tag at the producer default."""
+    return {
+        "asset": asset,
+        "asset_class": "equity",
+        "target_position_pct": target_position_pct,
+        "fill_size_pct": target_position_pct,
+        "fill_price": 200.0,
+        "decision_price": 200.0,
+        "asof_execution": asof_execution,
+        "reactor_name": "paper",
+        "play_tag": play_tag,
+    }
+
+
+def test_rec_side_derives_buy_from_positive_target(mod):
+    """cs17: a long target_position_pct (no `side` key) derives 'buy'."""
+    assert mod._rec_side(_live_exec_dict(target_position_pct=0.20)) == "buy"
+
+
+def test_rec_side_derives_sell_from_negative_target(mod):
+    """cs17: a short target_position_pct derives 'sell'."""
+    assert mod._rec_side(_live_exec_dict(target_position_pct=-0.20)) == "sell"
+
+
+def test_rec_side_honors_explicit_legacy_side(mod):
+    """cs17: a legacy record with an explicit `side` is honored verbatim."""
+    assert mod._rec_side({"asset": "X", "side": "buy"}) == "buy"
+    assert mod._rec_side({"asset": "X", "side": "sell"}) == "sell"
+
+
+def test_live_shape_infer_play_tag_advisor_falls_through(mod):
+    """cs17: a live record (no side, play_tag='advisor' sentinel) is treated as an
+    opening leg AND the 'advisor' sentinel falls through to the swing default
+    (it carries no playbook meaning)."""
+    execs = [_live_exec_dict(play_tag="advisor")]
+    assert mod.infer_play_tag(execs, "AAPL") == "swing"
+
+
+def test_live_shape_find_entry_and_days_held(mod):
+    """cs17: the live shape (no `side`, no `asof`) is found as the entry record, and
+    days_held reads asof_execution (>0, not the ERROR/HOLD no-entry path)."""
+    execs = [_live_exec_dict(asof_execution="2026-06-08T13:31:05+00:00")]
+    entry = mod.find_entry_record(execs, "AAPL")
+    assert entry is not None  # NOT the "no opening execution found" early-return
+
+    now_dt = mod.datetime(2026, 6, 18, tzinfo=mod.UTC)
+    days_held = mod.days_between_iso(
+        entry.get("asof_execution") or entry.get("asof", ""), now_dt
+    )
+    # 2026-06-08T13:31:05 -> 2026-06-18T00:00 = 9 full calendar days. The key
+    # assertion is that asof_execution was READ (days_held > 0, not the 0/ERROR
+    # path that an empty asof would produce).
+    assert days_held == 9
+    assert days_held > 0
+
+
+def test_live_shape_explicit_play_tag_still_wins(mod):
+    """cs17: a live record with a REAL play_tag (not the advisor sentinel) is honored."""
+    execs = [_live_exec_dict(play_tag="leaps")]
+    assert mod.infer_play_tag(execs, "AAPL") == "leaps"

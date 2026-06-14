@@ -200,12 +200,41 @@ def decide_leaps(ctx: LeapsContext) -> ExitDecision:
     return ExitDecision("HOLD", "leaps_hold")
 
 
+# ---------- record-side derivation (cs17) ----------
+def _rec_side(rec: dict) -> str:
+    """Derive the buy/sell side of an execution record.
+
+    The LIVE producer (react.paper._record_to_dict) emits NO ``side`` key — it
+    carries a signed ``target_position_pct`` (and ``fill_size_pct``) instead. The
+    legacy hand-rolled / settlement records carry an explicit ``side``. Honor an
+    explicit non-empty ``side`` verbatim; otherwise derive it from the sign of the
+    signed NAV fraction (a long target is a 'buy', a short target a 'sell').
+    """
+    side = rec.get("side")
+    if isinstance(side, str) and side:
+        return side
+    frac = rec.get("target_position_pct")
+    if frac is None:
+        frac = rec.get("fill_size_pct")
+    try:
+        f = float(frac)
+    except (TypeError, ValueError):
+        return ""
+    if f > 0:
+        return "buy"
+    if f < 0:
+        return "sell"
+    return ""
+
+
 # ---------- play_tag inference ----------
 def infer_play_tag(executions: list[dict], asset: str) -> str:
     """Find the most-recent OPENING execution for `asset` and infer the play.
 
     Order of precedence:
-      1. Explicit `play_tag` field on the execution
+      1. Explicit `play_tag` field on the execution (the 'advisor' sentinel — the
+         producer default for unlabeled fires — falls through, since it carries no
+         playbook meaning)
       2. Explicit `recipe` field
       3. Substring match on `signal_id`: 'leaps' or 'swing'
       4. Default: 'swing' (cautious — gets the swing exit rules)
@@ -213,10 +242,10 @@ def infer_play_tag(executions: list[dict], asset: str) -> str:
     for rec in reversed(executions):
         if rec.get("asset") != asset:
             continue
-        if rec.get("side") != "buy":  # opening (long) leg
+        if _rec_side(rec) != "buy":  # opening (long) leg
             continue
         tag = rec.get("play_tag") or rec.get("recipe")
-        if isinstance(tag, str) and tag:
+        if isinstance(tag, str) and tag and tag.lower() != "advisor":
             return tag.lower()
         sig = (rec.get("signal_id") or "").lower()
         for play in ("leaps", "swing", "covered_call", "csp", "wheel"):
@@ -230,7 +259,7 @@ def infer_play_tag(executions: list[dict], asset: str) -> str:
 def find_entry_record(executions: list[dict], asset: str) -> dict | None:
     """First buy execution for asset (= entry). None if not found."""
     for rec in executions:
-        if rec.get("asset") == asset and rec.get("side") == "buy":
+        if rec.get("asset") == asset and _rec_side(rec) == "buy":
             return rec
     return None
 
@@ -457,7 +486,9 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
             })
             continue
 
-        days_held = days_between_iso(entry.get("asof", ""), now_dt)
+        days_held = days_between_iso(
+            entry.get("asof_execution") or entry.get("asof", ""), now_dt
+        )
         avg_entry = float(pos.avg_entry_price)
         mark, atr_pct = fetch_mark_atr(asset)
         if mark is None:

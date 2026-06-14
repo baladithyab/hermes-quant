@@ -106,60 +106,70 @@ def test_live_record_dict_has_divergent_shape() -> None:
     assert d.get("target_position_pct") == 0.20  # the fraction the loader ignores
 
 
-def test_live_record_account_id_absent_drops_at_filter(tmp_path: Path) -> None:
-    """HOLE-0: the real record lacks an account_id key, so the loader's
-    ``r.get("account_id") == account_id`` filter (portfolio_loader.py:74) drops it
-    (None != "alpaca-paper"). pf.positions is empty.
+def test_live_record_without_account_id_now_reconstructs(tmp_path: Path) -> None:
+    """cs14 FIX (was HOLE-0): the real record lacks a top-level account_id key, but
+    the absolute-target path resolves the account the SAME way the producer's
+    state-write seam does (reactor_metadata.account_id or the "paper-default"
+    sentinel), so a record with no account_id now reconstructs a real position.
 
-    PASSES today — characterization of the current broken behavior.
+    NAV-fraction fallback derivation (reactor_metadata is empty here, so no
+    authoritative quantity): qty = target_position_pct * NAV / entry_price
+    = 0.20 * 100_000 / 200 = 100.0 long shares, entry/mark = 200.0.
+
+    Regression guard: this used to assert pf.positions == {} (the broken empty
+    book). It now pins the CORRECT reconstruction.
     """
     d = _live_record_dict()
     bus = _write_bus(tmp_path, d)
 
     pf = reconstruct_portfolio(ACCOUNT_ID, ASSET_CLASS, bus_path=bus)
 
-    assert pf.positions == {}
+    assert len(pf.positions) == 1
+    assert "AAPL" in pf.positions
+    pos = pf.positions["AAPL"]
+    assert pos.qty == pytest.approx(100.0)  # 0.20 * 100_000 / 200
+    assert pos.qty > 0  # long
+    assert pos.avg_entry_price == pytest.approx(200.0)
+    assert pos.mark_price == pytest.approx(200.0)
 
 
-def test_live_record_shape_drops_at_schema_and_qty(tmp_path: Path) -> None:
-    """HOLE-1 + HOLE-2: inject account_id to isolate past HOLE-0, then show the
-    record STILL drops out.
+def test_live_record_reconstructs_legacy_int1_still_needs_side_qty(tmp_path: Path) -> None:
+    """cs14 FIX (was HOLE-1 + HOLE-2): the live shape (schema_version None) is an
+    absolute-target record and now reconstructs a position. But the LEGACY int-1
+    path is byte-identical — a record stamped schema_version=1 with NO side/qty is
+    still genuinely malformed and is skipped (it is NOT an absolute-target record,
+    so the new path never sees it, and the legacy loop KeyErrors and continues).
 
-    * schema_version is None != int 1 -> dropped at the filter (portfolio_loader.py:76).
-    * even if we then also set schema_version=1, the loop reads rec["side"]/
-      float(rec["qty"]) (portfolio_loader.py:91-92), KeyErrors, and ``continue``s.
-
-    PASSES today — characterization of the current broken behavior.
+    This pins BOTH halves: the new absolute-target reconstruction (HOLE-1 fixed)
+    AND the retained legacy int-1 strictness (a hand-rolled int-1 record without
+    side/qty is malformed -> empty book; HOLE-2 legacy-strict regression guard).
     """
     d = _live_record_dict()
-    d["account_id"] = ACCOUNT_ID  # isolate past HOLE-0
+    d["account_id"] = ACCOUNT_ID  # legacy-injected account_id is also honored
     bus = _write_bus(tmp_path, d)
 
     pf = reconstruct_portfolio(ACCOUNT_ID, ASSET_CLASS, bus_path=bus)
-    assert pf.positions == {}  # HOLE-1: schema_version None != 1 -> filtered out
+    # HOLE-1 fixed: live shape (schema_version None) now reconstructs.
+    assert len(pf.positions) == 1
+    assert "AAPL" in pf.positions
 
-    # Sub-assert HOLE-2: pass the schema filter, the loop still cannot read the record.
+    # Legacy int-1 strictness retained: stamp schema_version=1 (an int, NOT the
+    # absolute-target sentinel) so the new path skips it; the legacy loop then
+    # KeyErrors on the absent side/qty and the book is empty.
     d["schema_version"] = 1
     bus2 = _write_bus(tmp_path, d)
     pf2 = reconstruct_portfolio(ACCOUNT_ID, ASSET_CLASS, bus_path=bus2)
-    assert pf2.positions == {}  # HOLE-2: rec["side"]/rec["qty"] KeyError -> skipped
+    assert pf2.positions == {}  # legacy int-1 without side/qty is malformed -> skipped
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "cs14: a live-producer ExecutionRecord must reconstruct to 1 position; the "
-        "fix lands in a later operator-approved increment. When it lands, this test "
-        "XPASSes and strict-xfail FAILS, forcing removal of this marker."
-    ),
-)
 def test_green_live_record_reconstructs_one_position(tmp_path: Path) -> None:
-    """The CORRECT behavior the deferred fix must deliver.
+    """cs14 GREEN: a live-producer ExecutionRecord reconstructs exactly one position.
 
-    Feed the SAME real producer record (with account_id injected so HOLE-0 is not
-    the blocker under study) and expect the loader to reconstruct exactly one
-    AAPL position. Fails today (-> recorded XFAIL, suite stays green); the later
-    fix flips it to a real PASS.
+    Feed the SAME real producer record (ExecutionRecord -> _record_to_dict, with
+    account_id injected) and the loader's absolute-target path reconstructs exactly
+    one AAPL position. This was a strict-xfail tripwire under the RED proof; the
+    cs14 Option-B loader fix flipped it to a real PASS and the @pytest.mark.xfail
+    marker was removed (strict-xfail would FAIL on XPASS otherwise).
     """
     d = _live_record_dict()
     d["account_id"] = ACCOUNT_ID
