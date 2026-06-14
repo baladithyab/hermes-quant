@@ -101,7 +101,6 @@ empty), which restores the pre-B34 ``as_of_date <= as_of`` read path exactly.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import tempfile
@@ -417,6 +416,16 @@ class FundamentalsProvider:
             df = self._apply_reporting_lag_filter(df, asof_ts)
             if df.empty:
                 return None
+            # cs42(a): a row whose fetched_at is strictly AFTER as_of was fetched
+            # in the future relative to this point-in-time read — never
+            # legitimate at as_of. The day-normalized as_of_date can pass the
+            # ``as_of_date <= as_of`` snapshot filter for an intraday-future
+            # fetched_at (or a fabricated future timestamp), which would yield a
+            # negative age that defeats the downstream staleness gate. Drop it.
+            # Pure PIT correctness; touches only the as_of-bounded path.
+            df = df[df["fetched_at"] <= asof_ts]
+            if df.empty:
+                return None
 
         # Latest by fetched_at.
         df = df.sort_values("fetched_at")
@@ -467,6 +476,18 @@ class FundamentalsProvider:
         df = df[df["as_of_date"] <= asof_ts]
         if df.empty:
             return None
+        # cs41: ANDed reporting-lag-adjusted as_of, symmetric with read_latest
+        # (no-op when the flag is OFF). The pe_relative DENOMINATOR (sector
+        # median) must obey the same no-lookahead lag as the NUMERATOR
+        # (read_latest); else a backtest sector median embeds not-yet-public
+        # constituent fundamentals. The sector-median schema has no
+        # report_date / period_end, so the filter falls back to
+        # ``as_of_date + reporting_lag_days`` — conservative-tightening,
+        # consistent with the old/stale-cache go-dark behavior. Flag OFF reverts
+        # to the byte-identical pre-cs41 ``as_of_date <= as_of`` read.
+        df = self._apply_reporting_lag_filter(df, asof_ts)
+        if df.empty:
+            return None
         df = df.sort_values("fetched_at")
         latest = df.iloc[-1]
         age_days = (asof_ts - pd.Timestamp(latest["fetched_at"])).days
@@ -509,9 +530,18 @@ class FundamentalsProvider:
 
         merged = pd.concat([existing, new_df], ignore_index=True)
         merged = self._normalize_snapshot_frame(merged)
-        # Dedupe on as_of_date keep latest fetched_at
-        merged = merged.sort_values(["as_of_date", "fetched_at"])
+        # cs42(b): point-in-time-preserving dedupe. A SAME-DAY correction (a
+        # newer fetched_at on the SAME calendar day as the row's as_of_date) is
+        # the legitimate intraday-revision case and still wins. A CROSS-DAY
+        # backfill (fetched_at on a LATER calendar day than as_of_date) must NOT
+        # overwrite a row already recorded same-day-correct for that as_of_date,
+        # else a re-fetch silently rewrites a historical point-in-time value.
+        # Among rows sharing an as_of_date, rank same-day rows above cross-day
+        # ones, then by fetched_at, and keep="last" -> the PIT-correct row.
+        merged["_same_day"] = merged["fetched_at"].dt.normalize() <= merged["as_of_date"]
+        merged = merged.sort_values(["as_of_date", "_same_day", "fetched_at"])
         merged = merged.drop_duplicates(subset=["as_of_date"], keep="last")
+        merged = merged.drop(columns=["_same_day"])
         merged = merged.sort_values("fetched_at").reset_index(drop=True)
         _atomic_write_parquet(merged, path)
         return path

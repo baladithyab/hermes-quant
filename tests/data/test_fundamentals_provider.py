@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -156,7 +155,18 @@ def test_sector_median_missing_returns_none(provider: FundamentalsProvider) -> N
     assert provider.read_sector_median_pe("unknown") is None
 
 
-def test_refresh_sector_medians_aggregates(provider: FundamentalsProvider) -> None:
+def test_refresh_sector_medians_aggregates(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # cs41: this asserts the cold-path AGGREGATION (median arithmetic) via an
+    # as_of=None live read (as_of defaults to now). A just-written median has
+    # as_of_date=now.normalize(), so default-ON cs41 (now.normalize()+45d > now)
+    # would go dark — that go-dark is asserted separately in
+    # test_cs41_refresh_then_read_now_default_on_goes_dark. Pin the flag OFF here
+    # so the aggregation value is observable (the as_of=None live path is not a
+    # point-in-time backtest read; mirrors the cs12 pin at
+    # test_read_latest_respects_as_of_filter).
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
     now = pd.Timestamp.now(tz="UTC")
     provider.write_snapshot("AAA", _row(fetched_at=now, pe_trailing=10.0, sector="Tech"))
     provider.write_snapshot("BBB", _row(fetched_at=now, pe_trailing=20.0, sector="Tech"))
@@ -169,8 +179,13 @@ def test_refresh_sector_medians_aggregates(provider: FundamentalsProvider) -> No
     assert median == pytest.approx(20.0)
 
 
-def test_sector_median_skips_invalid_pe(provider: FundamentalsProvider) -> None:
+def test_sector_median_skips_invalid_pe(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Negative / zero / >1000 P/E should not contribute to the median."""
+    # cs41: flag OFF — see test_refresh_sector_medians_aggregates rationale (this
+    # asserts the cold-path aggregation via an as_of=None live read).
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
     now = pd.Timestamp.now(tz="UTC")
     provider.write_snapshot("AAA", _row(fetched_at=now, pe_trailing=10.0, sector="Tech"))
     provider.write_snapshot("BBB", _row(fetched_at=now, pe_trailing=-5.0, sector="Tech"))
@@ -516,3 +531,225 @@ def test_reporting_lag_no_op_without_as_of(
     snap = provider.read_latest("AAPL")  # no as_of -> latest row regardless of lag
     assert snap is not None
     assert snap["pe_trailing"] == pytest.approx(18.0)
+
+
+# ---------------------------------------------------------------------------
+# cs41: read_sector_median_pe reporting-lag symmetry with read_latest.
+# The pe_relative DENOMINATOR (sector median) must obey the same no-lookahead
+# lag as the NUMERATOR (read_latest). Previously read_sector_median_pe filtered
+# only ``as_of_date <= as_of`` and never applied _apply_reporting_lag_filter, so
+# a backtest sector median could embed not-yet-public constituent fundamentals.
+# ---------------------------------------------------------------------------
+
+
+def _write_sector_median_row(
+    p: FundamentalsProvider,
+    *,
+    sector: str = "Tech",
+    as_of_date: pd.Timestamp,
+    fetched_at: pd.Timestamp | None = None,
+    median_pe: float = 20.0,
+    n: int = 5,
+) -> None:
+    """Write one sector-median snapshot with an explicit as_of_date / fetched_at."""
+    p.write_sector_median(
+        sector,
+        {
+            "as_of_date": as_of_date,
+            "fetched_at": fetched_at if fetched_at is not None else as_of_date,
+            "sector": sector,
+            "median_pe_trailing": median_pe,
+            "n_constituents": n,
+        },
+    )
+
+
+def test_cs41_sector_median_applies_reporting_lag_symmetric(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs41 RED->GREEN (default-ON): the sector median obeys the reporting lag.
+
+    A median dated only ~10d before the read as_of (within the 45d not-yet-public
+    window) must NOT be visible — its constituents' fundamentals were not all
+    public yet. Pre-cs41 read_sector_median_pe filtered only ``as_of_date <=
+    as_of`` and RETURNED it (lookahead). After cs41 the as_of_date+45d fallback
+    drops it. A median dated >=45d before as_of (but freshly re-snapshotted so it
+    passes the 30d hard-staleness) is correctly ADMITTED.
+    """
+    monkeypatch.delenv(REPORTING_LAG_ENV_FLAG, raising=False)  # rely on default-ON
+    as_of = pd.Timestamp("2026-05-01", tz="UTC")
+    # Within-lag-window median: as_of_date 10d before read -> as_of_date+45d > as_of.
+    _write_sector_median_row(
+        provider,
+        as_of_date=as_of - pd.Timedelta(days=10),
+        fetched_at=as_of - pd.Timedelta(days=10) + pd.Timedelta(hours=12),
+        median_pe=22.0,
+    )
+    # RED: pre-cs41 returns 22.0; GREEN after cs41: None (lag drops it).
+    assert provider.read_sector_median_pe("Tech", as_of=as_of) is None
+
+    # Admit case: a fresh re-snapshot stamped at an OLD as_of_date (>=45d before
+    # as_of) but fetched only ~5d ago (age < 30d hard-staleness passes; the
+    # as_of_date+45d <= as_of lag passes too) -> median IS returned.
+    p2 = FundamentalsProvider(cache_root=provider.cache_root / "admit")
+    _write_sector_median_row(
+        p2,
+        as_of_date=as_of - pd.Timedelta(days=45),
+        fetched_at=as_of - pd.Timedelta(days=5),
+        median_pe=19.0,
+    )
+    assert p2.read_sector_median_pe("Tech", as_of=as_of) == pytest.approx(19.0)
+
+
+def test_cs41_sector_median_flag_off_byte_identical(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs41 byte-identical revert: flag OFF returns the within-window median.
+
+    The exact near-today median the default-ON path drops is RETURNED with the
+    flag explicitly OFF — the pre-cs41 ``as_of_date <= as_of`` read path is
+    preserved exactly (the cs12 kill switch covers this read too).
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    as_of = pd.Timestamp("2026-05-01", tz="UTC")
+    _write_sector_median_row(
+        provider,
+        as_of_date=as_of - pd.Timedelta(days=10),
+        fetched_at=as_of - pd.Timedelta(days=10) + pd.Timedelta(hours=12),
+        median_pe=22.0,
+    )
+    assert provider.read_sector_median_pe("Tech", as_of=as_of) == pytest.approx(22.0)
+
+
+def test_cs41_refresh_then_read_now_default_on_goes_dark(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs41 documents the default-ON change for the as_of=None / now read.
+
+    A just-refreshed sector median (as_of_date = now.normalize()) read at the
+    implicit as_of=now is DROPPED under default-ON (now.normalize()+45d > now ->
+    conservative go-dark) and RETURNED under the flag OFF revert. This documents
+    why the existing as_of=None aggregation tests must pin the flag OFF.
+    """
+    provider.write_snapshot("AAA", _row(fetched_at=pd.Timestamp.now(tz="UTC"), pe_trailing=10.0, sector="Tech"))
+    provider.write_snapshot("BBB", _row(fetched_at=pd.Timestamp.now(tz="UTC"), pe_trailing=20.0, sector="Tech"))
+    provider.write_snapshot("CCC", _row(fetched_at=pd.Timestamp.now(tz="UTC"), pe_trailing=30.0, sector="Tech"))
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    provider.refresh_sector_medians(["AAA", "BBB", "CCC"])  # write under OFF; read path is what matters
+    # Default-ON: as_of=now read goes dark (now.normalize()+45d > now).
+    monkeypatch.delenv(REPORTING_LAG_ENV_FLAG, raising=False)
+    assert provider.read_sector_median_pe("Tech") is None
+    # Flag OFF revert: the median is returned.
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    assert provider.read_sector_median_pe("Tech") == pytest.approx(20.0)
+
+
+# ---------------------------------------------------------------------------
+# cs42(a): read_latest must drop a row whose fetched_at is strictly AFTER as_of.
+# as_of_date is day-normalized at write, so a same-day intraday-future fetched_at
+# (or a fabricated future timestamp) silently passes the ``as_of_date <= as_of``
+# snapshot filter and yields a negative age that defeats the staleness gate.
+# ---------------------------------------------------------------------------
+
+
+def test_cs42_future_fetched_at_excluded_at_as_of(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs42(a) RED->GREEN: a row fetched in the future relative to as_of is dropped.
+
+    Flag OFF isolates the fetched_at guard from the reporting-lag filter (else
+    the lag would also drop the row). as_of_date = D 00:00 (normalized) passes
+    ``as_of_date <= as_of`` at as_of = D 00:00, but fetched_at = D+12h is
+    strictly after as_of -> the row was fetched in the FUTURE. Pre-cs42 it was
+    returned (negative age); after cs42 it is None.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    d = pd.Timestamp("2026-05-01T00:00:00", tz="UTC")
+    provider.write_snapshot(
+        "AAPL", _row(fetched_at=d + pd.Timedelta(hours=12), as_of_date=d, pe_trailing=18.0)
+    )
+    # RED: pre-cs42 returns the row; GREEN: future fetched_at dropped -> None.
+    assert provider.read_latest("AAPL", as_of=d) is None
+
+
+def test_cs42_fetched_at_le_as_of_byte_identical(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs42(a) byte-identical: the guard only drops STRICTLY-future fetches.
+
+    fetched_at = D-1h is before the read as_of = D+1d, so the normal live case
+    (a row fetched before the point-in-time read) is unchanged — still returned.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    d = pd.Timestamp("2026-05-01T00:00:00", tz="UTC")
+    provider.write_snapshot(
+        "AAPL", _row(fetched_at=d - pd.Timedelta(hours=1), as_of_date=d, pe_trailing=18.0)
+    )
+    snap = provider.read_latest("AAPL", as_of=d + pd.Timedelta(days=1))
+    assert snap is not None
+    assert snap["pe_trailing"] == pytest.approx(18.0)
+
+
+def test_cs42_no_as_of_latest_path_untouched(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs42(a) scope: the as_of=None latest-read path is unaffected by the guard.
+
+    refresh / refresh_sector_medians read with as_of=None; the fetched_at guard
+    lives inside ``if as_of is not None`` so a future-fetched row is still
+    returned by the latest path.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    d = pd.Timestamp("2026-05-01T00:00:00", tz="UTC")
+    provider.write_snapshot(
+        "AAPL", _row(fetched_at=d + pd.Timedelta(hours=12), as_of_date=d, pe_trailing=18.0)
+    )
+    snap = provider.read_latest("AAPL")  # no as_of -> latest path
+    assert snap is not None
+    assert snap["pe_trailing"] == pytest.approx(18.0)
+
+
+# ---------------------------------------------------------------------------
+# cs42(b): write_snapshot dedupe must PRESERVE the historical point-in-time
+# value. A cross-day backfill (fetched_at on a later calendar day than the
+# row's as_of_date) must NOT overwrite a row already recorded same-day-correct
+# for that as_of_date — else a re-fetch rewrites a historical PIT read.
+# ---------------------------------------------------------------------------
+
+
+def test_cs42_backfill_does_not_rewrite_historical_pit(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs42(b) RED->GREEN: a cross-day backfill does not rewrite a historical PIT row.
+
+    Original PIT snapshot: as_of_date 2026-05-01, fetched_at 2026-05-01T12:00,
+    pe 10.0 (recorded same-day -> point-in-time-correct). A backfill re-fetch
+    carrying the SAME old as_of_date but TODAY's fetched_at (2026-06-13T12:00,
+    cross-day) with pe 99.0 must NOT win. Pre-cs42 the blind keep-latest-
+    fetched_at dedupe returned 99.0 (history rewritten); after cs42 the same-day
+    PIT row (10.0) is preserved.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    pit_date = pd.Timestamp("2026-05-01T00:00:00", tz="UTC")
+    provider.write_snapshot(
+        "AAPL",
+        _row(fetched_at=pit_date + pd.Timedelta(hours=12), as_of_date=pit_date, pe_trailing=10.0),
+    )
+    # Cross-day backfill of the SAME old as_of_date with a much later fetched_at.
+    provider.write_snapshot(
+        "AAPL",
+        _row(
+            fetched_at=pd.Timestamp("2026-06-13T12:00:00", tz="UTC"),
+            as_of_date=pit_date,
+            pe_trailing=99.0,
+        ),
+    )
+    # RED: pre-cs42 returns 99.0; GREEN: the historical PIT value (10.0) survives.
+    snap = provider.read_latest("AAPL", as_of=pd.Timestamp("2026-05-01T23:59:00", tz="UTC"))
+    assert snap is not None
+    assert snap["pe_trailing"] == pytest.approx(10.0)
+    # Exactly one row for that as_of_date, carrying the original PIT pe.
+    df = pd.read_parquet(provider.ticker_path("AAPL"))
+    same_date = df[df["as_of_date"] == pit_date]
+    assert len(same_date) == 1
+    assert same_date.iloc[0]["pe_trailing"] == pytest.approx(10.0)
