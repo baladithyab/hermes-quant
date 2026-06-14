@@ -593,6 +593,26 @@ def recommend_multi_horizon(
         if len(bars) == 0:
             continue
 
+        # cs54 no-lookahead: drop the still-forming trailing bar on the NATIVE
+        # provider timeframe path, mirroring single-horizon recommend()
+        # (advisor.py: ADR-0069 / a643). The `bars[bar_ts <= cutoff]` filter
+        # above is a period-OPEN-label filter — for a '1d' horizon read mid-
+        # session it KEEPS today's still-forming daily bar (ts today 00:00 <=
+        # asof), whose close is the latest intraday tick, not a settled close.
+        # Feeding that into every analyst's MarketContext.last_close is a
+        # charter-invariant (NO-LOOKAHEAD) violation. The resampled horizons
+        # (1w/1M/1Q) are already clipped at their period-END inside
+        # get_resampled_history (cs05); calling drop_still_forming_bar on a
+        # resampled frame is a safe no-op (those timeframes are unbounded here
+        # and pass through). A fully-closed-bar history is byte-identical — the
+        # drop removes only a still-forming trailing bar.
+        from hermes_quant.data.bar_alignment import drop_still_forming_bar
+
+        bars, _bar_alignment_info = drop_still_forming_bar(bars, h, asset_class)
+        if _bar_alignment_info["still_forming_dropped"] and len(bars) == 0:
+            # Silence-by-default: the only bar was still-forming → no views
+            continue
+
         last_bar_ts = pd.Timestamp(bars["timestamp"].iloc[-1])
         if last_bar_ts.tzinfo is None:
             last_bar_ts_utc = last_bar_ts.tz_localize("UTC")
