@@ -726,6 +726,108 @@ def test_cs53_sector_median_no_as_of_latest_path_untouched(
 
 
 # ---------------------------------------------------------------------------
+# cs59: write_sector_median dedupe must PRESERVE the historical point-in-time
+# median — the WRITE-side symmetry of cs42(b) (which hardened write_snapshot).
+# The sector median is the pe_relative DENOMINATOR; a past-as-of read
+# (read_sector_median_pe, cs53 fetched_at<=as_of) must return the SAME value
+# across re-fetches, else a backtest replayed after refresh_sector_medians runs
+# again sees a mutated denominator. Pre-cs59 write_sector_median did a blind
+# keep-latest-fetched_at dedupe (no _same_day guard), so a cross-day backfill of
+# an already-written as_of_date overwrote the historical PIT row.
+# ---------------------------------------------------------------------------
+
+
+def test_cs59_sector_median_backfill_does_not_rewrite_historical_pit(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs59 RED->GREEN: a cross-day sector-median backfill preserves the historical PIT.
+
+    Original PIT snapshot: as_of_date 2026-05-01, fetched_at 2026-05-01 - 1h
+    (knowable at the read as_of), median 20.0. A point-in-time read at
+    as_of = 2026-05-01 + 1h returns 20.0. A backfill re-fetch carrying the SAME
+    old as_of_date but a CROSS-DAY-later fetched_at (2026-05-03) with median 99.0
+    must NOT win. Pre-cs59 the blind keep-latest-fetched_at dedupe overwrote the
+    row with 99.0, and the cs53 fetched_at<=as_of read guard then dropped the
+    future-fetched survivor -> the same past-as-of read flips 20.0 -> None
+    (history destroyed). After cs59 the same-day-correct PIT row (20.0) survives
+    and the past-as-of read is stable across the re-fetch.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    pit = pd.Timestamp("2026-05-01T00:00:00", tz="UTC")
+    read_at = pit + pd.Timedelta(hours=1)
+    _write_sector_median_row(
+        provider,
+        as_of_date=pit,
+        fetched_at=pit - pd.Timedelta(hours=1),
+        median_pe=20.0,
+    )
+    before = provider.read_sector_median_pe("Tech", as_of=read_at)
+    assert before == pytest.approx(20.0)
+
+    # Cross-day backfill of the SAME old as_of_date with a much later fetched_at.
+    _write_sector_median_row(
+        provider,
+        as_of_date=pit,
+        fetched_at=pit + pd.Timedelta(days=2),
+        median_pe=99.0,
+    )
+    # RED: pre-cs59 the historical row is overwritten (99.0) -> the cs53 read
+    # guard drops the future-fetched survivor -> past-as-of read becomes None.
+    # GREEN: the same-day PIT median (20.0) survives -> the read is stable.
+    after = provider.read_sector_median_pe("Tech", as_of=read_at)
+    assert after == pytest.approx(20.0)
+
+    # Exactly one row for that as_of_date, carrying the original PIT median.
+    df = pd.read_parquet(provider.sector_median_path("Tech"))
+    same_date = df[df["as_of_date"] == pit]
+    assert len(same_date) == 1
+    assert same_date.iloc[0]["median_pe_trailing"] == pytest.approx(20.0)
+
+
+def test_cs59_sector_median_same_day_correction_still_wins(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs59 scope: a SAME-DAY correction (later fetched_at, same calendar day) wins.
+
+    The cs59 guard only protects cross-day backfills; a legitimate intraday
+    revision (a newer fetched_at on the same UTC calendar day as the as_of_date)
+    is still the authoritative value, exactly as cs42(b) preserves on the
+    per-ticker write side.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    pit = pd.Timestamp("2026-05-01T00:00:00", tz="UTC")
+    _write_sector_median_row(
+        provider, as_of_date=pit, fetched_at=pit + pd.Timedelta(hours=2), median_pe=20.0
+    )
+    _write_sector_median_row(
+        provider, as_of_date=pit, fetched_at=pit + pd.Timedelta(hours=10), median_pe=21.0
+    )
+    df = pd.read_parquet(provider.sector_median_path("Tech"))
+    same_date = df[df["as_of_date"] == pit]
+    assert len(same_date) == 1
+    assert same_date.iloc[0]["median_pe_trailing"] == pytest.approx(21.0)
+
+
+def test_cs59_sector_median_first_write_byte_identical(
+    provider: FundamentalsProvider,
+) -> None:
+    """cs59 scope: a first-write of a NEW as_of_date is byte-identical.
+
+    The guard only fires on a re-write of an existing as_of_date. A single write
+    (even a cross-day fetched_at) lands as one clean row with the temporary
+    _same_day ranking column dropped — no schema leak.
+    """
+    pit = pd.Timestamp("2026-05-01T00:00:00", tz="UTC")
+    _write_sector_median_row(
+        provider, as_of_date=pit, fetched_at=pit + pd.Timedelta(days=2), median_pe=33.0
+    )
+    df = pd.read_parquet(provider.sector_median_path("Tech"))
+    assert len(df) == 1
+    assert df.iloc[0]["median_pe_trailing"] == pytest.approx(33.0)
+    assert "_same_day" not in df.columns
+
+
+# ---------------------------------------------------------------------------
 # cs42(a): read_latest must drop a row whose fetched_at is strictly AFTER as_of.
 # as_of_date is day-normalized at write, so a same-day intraday-future fetched_at
 # (or a fabricated future timestamp) silently passes the ``as_of_date <= as_of``

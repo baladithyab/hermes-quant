@@ -577,8 +577,24 @@ class FundamentalsProvider:
 
         merged = pd.concat([existing, new_df], ignore_index=True)
         merged = self._normalize_sector_median_frame(merged)
-        merged = merged.sort_values(["as_of_date", "fetched_at"])
+        # cs59: point-in-time-preserving dedupe, mirroring write_snapshot's
+        # cs42(b) guard. The sector median is the pe_relative DENOMINATOR; a
+        # past-as-of read (read_sector_median_pe) must return the SAME value
+        # across re-fetches, else a backtest replayed after a refresh sees a
+        # mutated denominator — the same PIT-integrity class cs42(b) closed on
+        # the per-ticker write side. A SAME-DAY correction (a newer fetched_at on
+        # the SAME calendar day as the row's as_of_date) is the legitimate
+        # intraday-revision case and still wins. A CROSS-DAY backfill (fetched_at
+        # on a LATER calendar day than as_of_date) must NOT overwrite a row
+        # already recorded same-day-correct for that as_of_date, else a re-fetch
+        # silently rewrites a historical point-in-time median. Among rows sharing
+        # an as_of_date, rank same-day rows above cross-day ones, then by
+        # fetched_at, and keep="last" -> the PIT-correct row. A first-write of a
+        # new as_of_date is byte-identical (the guard only fires on a re-write).
+        merged["_same_day"] = merged["fetched_at"].dt.normalize() <= merged["as_of_date"]
+        merged = merged.sort_values(["as_of_date", "_same_day", "fetched_at"])
         merged = merged.drop_duplicates(subset=["as_of_date"], keep="last")
+        merged = merged.drop(columns=["_same_day"])
         merged = merged.sort_values("fetched_at").reset_index(drop=True)
         _atomic_write_parquet(merged, path)
         return path
