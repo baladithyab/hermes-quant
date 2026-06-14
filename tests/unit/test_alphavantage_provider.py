@@ -260,6 +260,90 @@ def test_as_of_tz_naive_input_handled():
 
 
 # ---------------------------------------------------------------------------
+# No-lookahead end-prune (cs11) — AV ignores start/end on the wire, so when a
+# caller omits as_of (e.g. fetch_with_chain) the requested `end` must still cap
+# the returned bars. Without the prune the full ~100-bar window up to wall-clock
+# today leaks past the backtest anchor.
+# ---------------------------------------------------------------------------
+
+
+def test_end_prune_drops_future_bars_when_as_of_absent():
+    """RED before fix: end in the past + as_of=None returns the 05-29 bar
+    (which post-dates `end`). After: bars are pruned to timestamp <= end."""
+    p = _provider(SAMPLE_DAILY)
+    # `end` = 2026-05-28 (US/Eastern 05-28 -> 05-28 04:00 UTC after localize).
+    # The 05-29 bar (05-29 04:00 UTC) post-dates `end` and must be dropped.
+    end = pd.Timestamp("2026-05-28T23:00:00Z")
+    bars = p.fetch_bars(
+        "IBM", "1d", pd.Timestamp("2026-01-01"), end, as_of=None
+    )
+    assert bars["timestamp"].max() <= pd.Timestamp("2026-05-28T23:00:00")
+    # 05-27 (04:00 UTC) and 05-28 (04:00 UTC) survive; 05-29 dropped.
+    assert len(bars) == 2
+
+
+def test_chain_path_prunes_to_end_without_as_of():
+    """The leak path: fetch_with_chain calls fetch_bars WITHOUT as_of. The
+    requested `end` must still cap the AV bars (RED before fix: 05-29 leaks)."""
+    yf = MagicMock()
+    yf.name = "yfinance"
+    yf.fetch_bars.side_effect = [
+        RateLimitError("throttled"),
+        RateLimitError("throttled"),
+        RateLimitError("throttled"),
+    ]
+    av = _provider(SAMPLE_DAILY)
+    out = fetch_with_chain(
+        [yf, av],
+        "IBM",
+        "1d",
+        pd.Timestamp("2026-01-01"),
+        pd.Timestamp("2026-05-28T23:00:00Z"),  # past `end`
+        max_retries=2,
+    )
+    # 05-29 bar (after end) is pruned by AV's end-cutoff even though the chain
+    # never forwarded as_of.
+    assert out["timestamp"].max() <= pd.Timestamp("2026-05-28T23:00:00")
+    assert len(out) == 2
+
+
+def test_as_of_wins_when_tighter_than_end():
+    """as_of (05-27) is earlier than end (06-01) -> as_of is the cutoff. The
+    end-prune only ADDS protection; it never weakens a tighter as_of."""
+    p = _provider(SAMPLE_DAILY)
+    as_of = pd.Timestamp("2026-05-27T23:00:00Z")
+    bars = p.fetch_bars(
+        "IBM", "1d", pd.Timestamp("2026-01-01"), pd.Timestamp("2026-06-01"), as_of=as_of
+    )
+    # Only the 05-27 bar (04:00 UTC) is <= as_of; 05-28 and 05-29 dropped.
+    # The post-filter runs AFTER validate_bars, so the <2-bar min is not re-
+    # enforced — 1 surviving bar is the expected (tighter-of) result.
+    assert bars["timestamp"].max() <= pd.Timestamp("2026-05-27T23:00:00")
+    assert len(bars) == 1
+
+
+def test_end_wins_when_tighter_than_as_of():
+    """end (05-27) is earlier than as_of (06-01) -> end is the cutoff (min)."""
+    p = _provider(SAMPLE_DAILY)
+    bars = p.fetch_bars(
+        "IBM",
+        "1d",
+        pd.Timestamp("2026-01-01"),
+        pd.Timestamp("2026-05-27T23:00:00Z"),  # tighter than as_of
+        as_of=pd.Timestamp("2026-06-01T00:00:00Z"),
+    )
+    assert bars["timestamp"].max() <= pd.Timestamp("2026-05-27T23:00:00")
+
+
+def test_end_none_with_as_of_none_returns_full_window():
+    """end=None AND as_of=None is the only no-upper-prune case (genuine
+    up-to-now request). All ~100 free-tier bars come through."""
+    p = _provider(SAMPLE_DAILY)
+    bars = p.fetch_bars("IBM", "1d", pd.Timestamp("2026-01-01"), None, as_of=None)
+    assert len(bars) == 3  # all SAMPLE_DAILY bars, no prune
+
+
+# ---------------------------------------------------------------------------
 # Data quality
 # ---------------------------------------------------------------------------
 
