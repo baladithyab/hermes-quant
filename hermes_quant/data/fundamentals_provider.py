@@ -220,6 +220,40 @@ def _atomic_write_parquet(df: pd.DataFrame, target: Path) -> None:
             tmp.unlink()
 
 
+def _quarantine_corrupt_parquet(path: Path) -> Path:
+    """Rename a corrupt/unreadable parquet to a timestamped ``.corrupt`` sidecar.
+
+    cs61 (money-software, fail-CLOSED): when ``pd.read_parquet`` RAISES on an
+    existing cache file (transient/torn/genuinely-corrupt read) the write paths
+    used to reset ``existing`` to an EMPTY frame and ``_atomic_write_parquet``
+    the single new row over the file — irrecoverably destroying the ENTIRE
+    historical point-in-time series for that ticker / sector (same write-side
+    PIT-history-mutation class as cs42(b) / cs59, but triggered by a READ ERROR
+    rather than a re-fetch, and a SILENT fail-open data-loss).
+
+    Quarantine instead: MOVE the corrupt bytes aside (so the history is
+    recoverable for a human / a repair job) BEFORE the caller starts fresh, and
+    return the sidecar path so the caller can LOUDLY warn. Preserves forward
+    progress (the new row is still written) AND recoverability, vs. a bare
+    ``raise`` that would also block the cron.
+
+    The sidecar name carries a UTC timestamp + a uniqueness counter so repeated
+    corrupt reads of the same path never clobber an earlier quarantine. On the
+    (unlikely) event the rename itself fails the corrupt bytes are left in place
+    and the original exception path is preserved — we never silently delete.
+    """
+    stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%S")
+    base = path.with_suffix(path.suffix + f".{stamp}.corrupt")
+    sidecar = base
+    counter = 0
+    # Never clobber an earlier quarantine of the same path within the same second.
+    while sidecar.exists():
+        counter += 1
+        sidecar = path.with_suffix(path.suffix + f".{stamp}-{counter}.corrupt")
+    path.replace(sidecar)
+    return sidecar
+
+
 def _coerce_float(x: Any) -> float:
     """Coerce yfinance value to float; NaN if missing/unparseable."""
     if x is None:
@@ -534,9 +568,20 @@ class FundamentalsProvider:
             try:
                 existing = pd.read_parquet(path)
             except Exception as exc:  # noqa: BLE001
+                # cs61 (money-software, fail-CLOSED): do NOT silently overwrite a
+                # corrupt/unreadable cache with the single new row — that would
+                # irrecoverably destroy the ticker's entire historical
+                # point-in-time series (same write-side PIT-history-mutation
+                # class as cs42(b) / cs59, here triggered by a READ ERROR).
+                # QUARANTINE the corrupt bytes to a recoverable .corrupt sidecar,
+                # LOUDLY warn, then start fresh so forward progress is preserved.
+                sidecar = _quarantine_corrupt_parquet(path)
                 logger.warning(
-                    "fundamentals: corrupt parquet for %s, overwriting: %s",
+                    "fundamentals: corrupt parquet for %s, QUARANTINED to %s "
+                    "(history preserved for recovery, NOT overwritten); "
+                    "starting fresh: %s",
                     ticker,
+                    sidecar.name,
                     exc,
                 )
                 existing = pd.DataFrame(columns=list(_SNAPSHOT_COLUMNS.keys()))
@@ -570,7 +615,22 @@ class FundamentalsProvider:
         if path.exists():
             try:
                 existing = pd.read_parquet(path)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                # cs61 (money-software, fail-CLOSED): symmetric with
+                # write_snapshot. A corrupt-read here used to silently overwrite
+                # the entire historical sector-median series (the pe_relative
+                # DENOMINATOR) with the single new row — and without even a
+                # warning. QUARANTINE the corrupt bytes to a recoverable .corrupt
+                # sidecar, LOUDLY warn, then start fresh.
+                sidecar = _quarantine_corrupt_parquet(path)
+                logger.warning(
+                    "fundamentals: corrupt sector_median parquet for %s, "
+                    "QUARANTINED to %s (history preserved for recovery, NOT "
+                    "overwritten); starting fresh: %s",
+                    sector,
+                    sidecar.name,
+                    exc,
+                )
                 existing = pd.DataFrame(columns=list(_SECTOR_MEDIAN_COLUMNS.keys()))
         else:
             existing = pd.DataFrame(columns=list(_SECTOR_MEDIAN_COLUMNS.keys()))

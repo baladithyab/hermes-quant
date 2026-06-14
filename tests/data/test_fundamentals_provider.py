@@ -936,3 +936,166 @@ def test_cs42_backfill_does_not_rewrite_historical_pit(
     same_date = df[df["as_of_date"] == pit_date]
     assert len(same_date) == 1
     assert same_date.iloc[0]["pe_trailing"] == pytest.approx(10.0)
+
+
+# ---------------------------------------------------------------------------
+# cs61: corrupt-parquet read-error branch must QUARANTINE the existing file
+# (recoverable .corrupt sidecar + loud warning) instead of silently truncating
+# the entire historical point-in-time series to the single new row. Same
+# write-side PIT-history-mutation class as cs42(b) / cs59, but triggered by a
+# READ ERROR (transient / torn / genuinely-corrupt read) rather than a
+# re-fetch, and a SILENT fail-open data-loss. The fix is fail-CLOSED: never
+# silently destroy history.
+# ---------------------------------------------------------------------------
+
+
+def _corrupt(path: Path) -> None:
+    """Overwrite a parquet file with bytes that make pd.read_parquet raise."""
+    path.write_bytes(b"PAR1\x00\x00not-a-valid-parquet-footer")
+
+
+def test_cs61_write_snapshot_corrupt_parquet_quarantines_not_truncates(
+    provider: FundamentalsProvider, caplog: pytest.LogCaptureFixture
+) -> None:
+    """cs61 RED->GREEN (per-ticker): a corrupt read quarantines, never truncates.
+
+    RED (pre-cs61): the read-error branch reset ``existing`` to an EMPTY frame
+    and atomic-wrote the single new row over the file — the ENTIRE historical
+    PIT series (3 distinct as_of_dates here) was irrecoverably destroyed, with
+    only a logger.warning. GREEN: the corrupt bytes are MOVED to a recoverable
+    ``.corrupt`` sidecar BEFORE starting fresh, a loud warning fires, and the
+    write still makes forward progress (the new row lands).
+    """
+    base = pd.Timestamp("2026-01-01T12:00:00", tz="UTC")
+    for i in range(3):  # 3 historical PIT snapshots, distinct as_of_dates
+        provider.write_snapshot(
+            "AAPL", _row(fetched_at=base + pd.Timedelta(days=31 * i), pe_trailing=10.0 + i)
+        )
+    path = provider.ticker_path("AAPL")
+    assert len(pd.read_parquet(path)) == 3
+
+    # Simulate a torn/corrupt read, then append a new snapshot. The on-disk
+    # bytes at read-failure time are the corrupt bytes; the quarantine must
+    # preserve EXACTLY those bytes (so a human / repair job can recover whatever
+    # of the history is salvageable), not silently delete them.
+    _corrupt(path)
+    corrupt_bytes = path.read_bytes()
+    with caplog.at_level("WARNING"):
+        provider.write_snapshot(
+            "AAPL", _row(fetched_at=base + pd.Timedelta(days=200), pe_trailing=99.0)
+        )
+
+    # The corrupt bytes were QUARANTINED (recoverable), not deleted.
+    sidecars = [p for p in path.parent.iterdir() if p.name.endswith(".corrupt")]
+    assert len(sidecars) == 1, "exactly one quarantine sidecar expected"
+    assert sidecars[0].read_bytes() == corrupt_bytes, "corrupt file must be recoverable"
+    # A LOUD warning fired (fail-loud, not silent).
+    assert any(
+        "QUARANTINED" in r.getMessage() and "AAPL" in r.getMessage()
+        for r in caplog.records
+    )
+    # Forward progress: the new row landed (history of the corrupt file is in the
+    # sidecar, not silently merged — that is the documented quarantine tradeoff).
+    live = pd.read_parquet(path)
+    assert len(live) == 1
+    assert live.iloc[0]["pe_trailing"] == pytest.approx(99.0)
+
+
+def test_cs61_write_snapshot_normal_read_is_byte_identical(
+    provider: FundamentalsProvider,
+) -> None:
+    """cs61 byte-identical: a READABLE existing parquet appends + preserves history.
+
+    The quarantine branch only fires when ``pd.read_parquet`` RAISES. A normal
+    (non-corrupt) read is unchanged: the new row is appended, all prior PIT rows
+    survive, and NO ``.corrupt`` sidecar is created.
+    """
+    base = pd.Timestamp("2026-01-01T12:00:00", tz="UTC")
+    for i in range(3):
+        provider.write_snapshot(
+            "AAPL", _row(fetched_at=base + pd.Timedelta(days=31 * i), pe_trailing=10.0 + i)
+        )
+    provider.write_snapshot(
+        "AAPL", _row(fetched_at=base + pd.Timedelta(days=200), pe_trailing=12.0)
+    )
+    path = provider.ticker_path("AAPL")
+    df = pd.read_parquet(path)
+    assert len(df) == 4, "all 3 historical rows + the new one survive"
+    assert [p for p in path.parent.iterdir() if p.name.endswith(".corrupt")] == []
+
+
+def test_cs61_write_sector_median_corrupt_parquet_quarantines_not_truncates(
+    provider: FundamentalsProvider, caplog: pytest.LogCaptureFixture
+) -> None:
+    """cs61 RED->GREEN (sector median): symmetric with write_snapshot.
+
+    The sector median is the pe_relative DENOMINATOR. Pre-cs61 a corrupt read
+    here silently overwrote the entire historical median series with the single
+    new row — and without even a warning (the branch had a bare ``except`` with
+    no log). GREEN: quarantine the corrupt bytes to a recoverable sidecar and
+    fire a loud warning.
+    """
+    base = pd.Timestamp("2026-01-01", tz="UTC")
+    for i in range(3):
+        _write_sector_median_row(
+            provider, as_of_date=base + pd.Timedelta(days=31 * i), median_pe=18.0 + i
+        )
+    path = provider.sector_median_path("Tech")
+    assert len(pd.read_parquet(path)) == 3
+
+    _corrupt(path)
+    corrupt_bytes = path.read_bytes()
+    with caplog.at_level("WARNING"):
+        _write_sector_median_row(
+            provider, as_of_date=base + pd.Timedelta(days=200), median_pe=22.0
+        )
+
+    sidecars = [p for p in path.parent.iterdir() if p.name.endswith(".corrupt")]
+    assert len(sidecars) == 1
+    assert sidecars[0].read_bytes() == corrupt_bytes, "corrupt median file recoverable"
+    assert any(
+        "QUARANTINED" in r.getMessage() and "Tech" in r.getMessage()
+        for r in caplog.records
+    )
+    live = pd.read_parquet(path)
+    assert len(live) == 1
+    assert live.iloc[0]["median_pe_trailing"] == pytest.approx(22.0)
+
+
+def test_cs61_write_sector_median_normal_read_is_byte_identical(
+    provider: FundamentalsProvider,
+) -> None:
+    """cs61 byte-identical: a readable sector-median parquet appends + preserves."""
+    base = pd.Timestamp("2026-01-01", tz="UTC")
+    for i in range(3):
+        _write_sector_median_row(
+            provider, as_of_date=base + pd.Timedelta(days=31 * i), median_pe=18.0 + i
+        )
+    _write_sector_median_row(
+        provider, as_of_date=base + pd.Timedelta(days=200), median_pe=21.0
+    )
+    path = provider.sector_median_path("Tech")
+    assert len(pd.read_parquet(path)) == 4
+    assert [p for p in path.parent.iterdir() if p.name.endswith(".corrupt")] == []
+
+
+def test_cs61_repeated_corrupt_reads_do_not_clobber_prior_quarantine(
+    provider: FundamentalsProvider,
+) -> None:
+    """cs61: two corrupt reads of the same path produce two distinct sidecars.
+
+    The sidecar name carries a uniqueness counter so a second quarantine within
+    the same second never overwrites the first — both corrupt generations stay
+    recoverable.
+    """
+    base = pd.Timestamp("2026-01-01T12:00:00", tz="UTC")
+    provider.write_snapshot("AAPL", _row(fetched_at=base, pe_trailing=10.0))
+    path = provider.ticker_path("AAPL")
+
+    _corrupt(path)
+    provider.write_snapshot("AAPL", _row(fetched_at=base + pd.Timedelta(days=1), pe_trailing=11.0))
+    _corrupt(path)
+    provider.write_snapshot("AAPL", _row(fetched_at=base + pd.Timedelta(days=2), pe_trailing=12.0))
+
+    sidecars = [p for p in path.parent.iterdir() if p.name.endswith(".corrupt")]
+    assert len(sidecars) == 2, "each corrupt read gets its own recoverable sidecar"
