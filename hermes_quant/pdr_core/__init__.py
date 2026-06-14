@@ -37,10 +37,22 @@ from hermes_quant.pdr_core.contracts import (
     Fill,
     Proposal,
 )
+from hermes_quant.pdr_core.gate_types import (
+    CoreHaltState,
+    CoreMarketState,
+    CorePortfolio,
+    CoreSignal,
+    GateDecision,
+)
 
 __all__ = [
     "POSITION_LADDER",
     "AnalystView",
+    "CoreHaltState",
+    "CoreMarketState",
+    "CorePortfolio",
+    "CoreSignal",
     "Fill",
+    "GateDecision",
     "Proposal",
 ]
