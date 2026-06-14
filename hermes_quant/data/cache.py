@@ -20,6 +20,13 @@ import pandas as pd
 
 DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache"
 
+# cs72: the filesystem-safe character class for a cache path component. A char
+# OUTSIDE this class is percent-escaped per UTF-8 byte (see ``_safe_component``)
+# rather than collapsed to "_", so the sanitizer is INJECTIVE: distinct
+# identities (e.g. "BTC/USDT" vs "BTC:USDT" vs a literal "BTC_USDT") can never
+# map to the same cache stem and silently merge into one cross-contaminated file.
+_SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
 # cs66: the SERVED OHLCV schema (what read() returns and what every downstream
 # consumer reads). Unchanged from the original cache.
 _SERVED_COLS = ["timestamp", "open", "high", "low", "close", "volume"]
@@ -645,19 +652,33 @@ def cached_fetch(
         pre_fetch_max = eligible["timestamp"].max()
     fetched = normalize_bars(fetch_fn())
     fetched_advances = True
+    # cs71: cs49 alone skips the append whenever the fetch does not advance the
+    # RIGHT EDGE. But a fetch that BACKFILLS an INTERIOR hole below the cutoff
+    # (genuinely-new timestamps, none past the existing edge) also fails that
+    # edge-only test -> the backfill was DISCARDED and never persisted, so the
+    # cs50 contiguity HIT gate kept rejecting the still-discontiguous cache and
+    # fetch_fn was called on every replay (a cs49 x cs50 refetch-forever loop).
+    # Append on ANY genuinely-new timestamp (edge OR interior); STILL skip a pure
+    # no-new-data re-serve (the cs49 churn case: the provider re-serves only
+    # timestamps already cached) so the right-edge-stale honesty signal is kept.
+    fetched_has_new = False
     if pre_fetch_max is not None:
         fetched_eligible = fetched[fetched["timestamp"] <= cutoff]
         fetched_advances = (
             not fetched_eligible.empty
             and fetched_eligible["timestamp"].max() > pre_fetch_max
         )
-    if fetched_advances:
+        fetched_has_new = not fetched_eligible[
+            ~fetched_eligible["timestamp"].isin(cached["timestamp"])
+        ].empty
+    if fetched_advances or fetched_has_new:
         # cs43's legitimate refresh fetch (stale cache + FRESH provider) lands here.
         path = cache.append(fetched)
         merged = cache.read()
     else:
-        # Provider did not advance the right edge: skip the append (no churn) and
-        # serve the existing merged cache.
+        # cs71: the fetch added NO genuinely-new timestamp (a pure no-new-data
+        # re-serve of already-cached bars). Skip the append (no churn) and serve
+        # the existing merged cache.
         path = cache.path
         merged = cached
     if cutoff is not None:
@@ -733,9 +754,38 @@ def _file_mtime_utc(path: Path) -> pd.Timestamp:
 
 
 def _safe_component(value: str) -> str:
-    value = value.strip().replace("/", "_")
-    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
-    return value.strip("._") or "unknown"
+    """Map a path component to a filesystem-safe, INJECTIVE stem fragment (cs72).
+
+    The original collapsed every char outside ``[A-Za-z0-9_.-]`` to ``_``, so
+    distinct identities silently shared one cache file:
+    ``_safe_component("BTC/USDT") == _safe_component("BTC:USDT") == "BTC_USDT"``
+    -> two ccxt instruments differing only by separator MERGED into one stem and
+    served blended / wrong OHLCV bars (cross-contamination + PIT hazard).
+
+    Each unsafe char is now percent-escaped per UTF-8 byte (``"/"`` -> ``"%2F"``,
+    ``":"`` -> ``"%3A"``). ``"%"`` is itself outside the safe class, so it escapes
+    to ``"%25"`` first — that keeps the encoding reversible and therefore
+    injective: no two distinct inputs can produce the same output. A component
+    already inside the safe class (the common case: ``"AAPL"``, ``"1h"``,
+    ``"yfinance"``, a literal ``"BTC_USDT"``) is returned BYTE-IDENTICAL, so
+    existing all-safe caches keep their stems and are not orphaned. Only
+    identities containing an unsafe char change stem (e.g. ``BTC/USDT-1h`` ->
+    ``BTC%2FUSDT-1h``); the OHLCV cache is a DERIVED, regenerable file, so such a
+    stem regenerates cleanly on next fetch with no PIT loss.
+    """
+    value = value.strip()
+    # Empty / whitespace-only -> the legacy "unknown" sentinel. "." and ".."
+    # are path-traversal directory refs (all-safe chars, so they would survive
+    # encoding unchanged); map them to the sentinel too, as the original
+    # ``strip("._")`` did, so a degenerate component can never escape the cache
+    # root. No real provider/symbol/timeframe is literally "." or "..".
+    if not value or value in {".", ".."}:
+        return "unknown"
+
+    def _escape(match: re.Match[str]) -> str:
+        return "".join(f"%{byte:02X}" for byte in match.group(0).encode("utf-8"))
+
+    return _SAFE_COMPONENT_RE.sub(_escape, value)
 
 
 def _atomic_write(df: pd.DataFrame, target: Path) -> None:

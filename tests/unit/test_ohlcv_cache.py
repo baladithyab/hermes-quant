@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from hermes_quant.data.cache import OhlcvCache, cached_fetch, normalize_bars
+from hermes_quant.data.cache import (
+    OhlcvCache,
+    _safe_component,
+    cached_fetch,
+    normalize_bars,
+)
 
 
 def _bars(n=10, start="2024-01-01", *, seed=1):
@@ -75,9 +80,13 @@ def _daily_business_bars_with_holidays(start, end, holidays):
 
 
 def test_safe_path_uses_provider_symbol_timeframe(tmp_path):
+    # cs72: _safe_component is now INJECTIVE. Identities containing chars outside
+    # [A-Za-z0-9_.-] percent-escape the offending byte rather than collapsing it
+    # to "_", so "BTC/USDT" and "BTC:USDT" (and a literal "BTC_USDT") can never
+    # share a cache stem. "/" -> "%2F", ":" -> "%3A".
     cache = OhlcvCache("ccxt:kraken", "BTC/USDT", "1h", root=tmp_path, prefer_parquet=False)
-    assert cache.csv_path.name == "BTC_USDT-1h.csv"
-    assert "ccxt_kraken" in str(cache.csv_path)
+    assert cache.csv_path.name == "BTC%2FUSDT-1h.csv"
+    assert "ccxt%3Akraken" in str(cache.csv_path)
 
 
 def test_write_and_read_round_trip_csv(tmp_path):
@@ -1490,3 +1499,171 @@ def test_coverage_empty_then_populated(tmp_path):
     assert cov["n_bars"] == 3
     assert cov["start"] is not None
     assert cov["end"] is not None
+
+
+# ---------------------------------------------------------------------------
+# cs71: a MISS that BACKFILLS an INTERIOR hole below the cutoff (new bars, but
+# none past the existing right edge) sets the cs49 fetched_advances churn-skip
+# to False -> the interior backfill is DISCARDED and never persisted. The cs50
+# HIT contiguity gate then keeps rejecting the still-discontiguous cache, so
+# fetch_fn is called on EVERY replay (refetch-forever). A cs49 x cs50
+# interaction bug. The fix: also append when the fetch contains ANY new bar the
+# cache lacked (edge OR interior), while STILL skipping a pure no-new-data
+# re-serve (the cs49 churn case the provider re-serves only cached timestamps).
+# ---------------------------------------------------------------------------
+
+
+def _daily_bars_from(closes_by_date):
+    """Daily OHLCV frame from a {date_str: close} mapping (cs71)."""
+    return pd.concat(
+        [_bar_at(d, c) for d, c in closes_by_date.items()], ignore_index=True
+    )
+
+
+def test_cached_fetch_miss_persists_interior_backfill_and_heals(tmp_path):
+    """cs71 RED->GREEN: a cache with an INTERIOR hole + a fetch that backfills it
+    (no bar past the existing right edge). Today the cs49 fetched_advances guard
+    is False (the fetched window does not advance the edge) so the append is
+    SKIPPED -> the interior backfill is discarded, the served window stays
+    discontiguous, and the cs50 HIT gate rejects every replay -> fetch called 3x
+    (refetch-forever). After the fix the backfill is persisted on the first MISS,
+    healing the hole, so replays 2 and 3 are HITs (1 fetch total, contiguous).
+    """
+    calls = {"n": 0}
+    cache = OhlcvCache("yfinance", "SPY", "1d", root=tmp_path, prefer_parquet=False)
+    # Cache holds 2026-01-01, -02, and a fresh edge bar at -10: a multi-day
+    # INTERIOR hole (03..09) below the cutoff.
+    cache.write(_daily_bars_from({"2026-01-01": 100, "2026-01-02": 101, "2026-01-10": 110}))
+    cutoff = pd.Timestamp("2026-01-10", tz="UTC")
+
+    def fetch():
+        calls["n"] += 1
+        # Interior backfill 03..09 ONLY (none past the existing edge day 10).
+        days = pd.date_range("2026-01-03", "2026-01-09", freq="1d", tz="UTC")
+        return pd.DataFrame(
+            {
+                "timestamp": days,
+                "open": 102.0,
+                "high": 102.0,
+                "low": 102.0,
+                "close": 102.0,
+                "volume": 1000.0,
+            }
+        )
+
+    # lookback_bars=10 so the healed 10-bar contiguous window satisfies the count
+    # gate (min_hit_bars = int(10 * 0.95) = 9); the point under test is that the
+    # interior backfill is PERSISTED so the cs50 contiguity HIT gate stops
+    # rejecting, not the count gate.
+    kwargs = dict(
+        provider="yfinance",
+        symbol="SPY",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    out1, m1 = cached_fetch(fetch, **kwargs)
+    out2, m2 = cached_fetch(fetch, **kwargs)
+    out3, m3 = cached_fetch(fetch, **kwargs)
+
+    # One fetch heals the hole; the next two replays are HITs (no refetch loop).
+    assert calls["n"] == 1
+    assert m1["cache_hit"] is False  # the healing MISS
+    assert m2["cache_hit"] is True
+    assert m3["cache_hit"] is True
+    # The interior backfill is PERSISTED: the cache is now the contiguous 01..10.
+    persisted = cache.read()["timestamp"].dt.strftime("%Y-%m-%d").tolist()
+    assert persisted == [f"2026-01-{d:02d}" for d in range(1, 11)]
+    # The served window is contiguous (max inter-bar gap == one day).
+    assert out3["timestamp"].diff().dropna().max() == pd.Timedelta(days=1)
+
+
+def test_cached_fetch_miss_no_new_data_still_skips_append(tmp_path):
+    """cs71 must NOT reopen the cs49 refetch-forever fix. A warm cache that holds
+    the provider's FULL stale window, with the provider re-serving the SAME bars
+    (zero new timestamps), is a pure no-new-data re-serve: fetched_has_new must be
+    False so the append is still SKIPPED (no churn) and the honest abstain flag is
+    still emitted. Spies the real append + the cache file mtime across 2 replays.
+    """
+    cache = OhlcvCache("ccxt", "DEAD", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(_bars(300, start="2024-01-01"))  # provider's full stale window
+
+    def fetch():
+        return _bars(300, start="2024-01-01")  # re-serves the SAME 300 bars
+
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    kwargs = dict(
+        provider="ccxt",
+        symbol="DEAD",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    append_calls = {"n": 0}
+    orig_append = OhlcvCache.append
+
+    def spy_append(self, b):
+        append_calls["n"] += 1
+        return orig_append(self, b)
+
+    OhlcvCache.append = spy_append
+    cache_path = cache.path
+    mtime_before = cache_path.stat().st_mtime_ns if cache_path.exists() else None
+    try:
+        _out1, m1 = cached_fetch(fetch, **kwargs)
+        _out2, m2 = cached_fetch(fetch, **kwargs)
+    finally:
+        OhlcvCache.append = orig_append
+    mtime_after = cache_path.stat().st_mtime_ns if cache_path.exists() else None
+
+    assert m1["cache_hit"] is False
+    assert m2["cache_hit"] is False
+    # No new timestamp in the fetch -> no append, no cache rewrite (cs49 intact).
+    assert append_calls["n"] == 0
+    assert mtime_after == mtime_before
+    # The honest staleness signal still fires so the caller can ABSTAIN.
+    assert m2["right_edge_stale_days"] >= 139
+
+
+# ---------------------------------------------------------------------------
+# cs72: _safe_component collapsed every non-[A-Za-z0-9_.-] char to "_", so
+# DISTINCT identities shared one cache stem ("BTC/USDT" == "BTC:USDT" ==
+# "BTC_USDT" -> "BTC_USDT"). In production the provider is "ccxt:<exchange>" and
+# the symbol a ccxt BASE/QUOTE pair, so two instruments differing only by
+# separator silently MERGED into one cache file -> blended/wrong OHLCV bars
+# served with no signal (cross-contamination + PIT hazard). The fix makes the
+# sanitizer INJECTIVE via percent-escaping while keeping already-safe components
+# byte-identical (existing all-safe caches are not orphaned).
+# ---------------------------------------------------------------------------
+
+
+def test_safe_component_is_injective_across_separators(tmp_path):
+    """cs72 RED->GREEN: the three distinct identities map to DISTINCT stems and
+    only the literal all-safe "BTC_USDT" stays unchanged. RED today: all three
+    collapse to "BTC_USDT".
+    """
+    slash = _safe_component("BTC/USDT")
+    colon = _safe_component("BTC:USDT")
+    underscore = _safe_component("BTC_USDT")
+    # The already-safe literal is byte-identical.
+    assert underscore == "BTC_USDT"
+    # The three are pairwise distinct (no cross-contamination).
+    assert slash != colon
+    assert slash != underscore
+    assert colon != underscore
+    assert len({slash, colon, underscore}) == 3
+
+
+def test_safe_component_safe_values_byte_identical():
+    """cs72: a component already inside [A-Za-z0-9_.-] is returned byte-identical
+    (no stem change -> existing all-safe caches are NOT orphaned). Empty / all
+    -whitespace degrade to the legacy "unknown" sentinel.
+    """
+    for v in ["AAPL", "1h", "yfinance", "BTC_USDT", "SPY", "ccxt", "a.b-c_d"]:
+        assert _safe_component(v) == v
+    assert _safe_component("") == "unknown"
+    assert _safe_component("  ") == "unknown"
