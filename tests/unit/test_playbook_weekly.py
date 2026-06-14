@@ -541,3 +541,197 @@ def test_flip_then_short_establishing_is_post_flip_leg(mod):
     assert long_entry is not None
     assert mod._rec_side(long_entry) == "buy"
     assert long_entry.get("asof_execution").startswith("2026-05-01")
+
+
+# ---------------------- cs29: ATR-14_at_entry (ADR-0035 §98) ----------------------
+#
+# ADR-0035 §98: take-profit fires when `pnl_pct > 3 × ATR-14_at_entry`. The field
+# SwingContext.atr14_at_entry_pct encodes "at entry", but fetch_mark_atr historically
+# computed CURRENT ATR (a 60d window ENDING TODAY). For a position whose volatility
+# shifted since entry, current-ATR yields the WRONG take-profit threshold. These tests
+# pin (a) the pure window->atr_pct helper, (b) the entry_date wiring on fetch_mark_atr
+# with the legacy no-arg path byte-unchanged, and (c) graceful fallback with NO
+# fabrication (a missing/short/unparseable entry window degrades to the recent ATR).
+
+import pandas as pd  # noqa: E402
+
+
+def _bars(n: int, *, hi_lo_range: float, close: float = 200.0):
+    """Build an n-bar OHLC frame with a fixed High-Low range per bar (controls ATR)
+    and a flat Close. ATR-14 (Wilder simplification used by the script) = mean of the
+    last-14 (High-Low) true ranges, so atr_pct = hi_lo_range / close for n>=14."""
+    return pd.DataFrame(
+        {
+            "High": [close + hi_lo_range / 2.0] * n,
+            "Low": [close - hi_lo_range / 2.0] * n,
+            "Close": [close] * n,
+        }
+    )
+
+
+def test_atr_pct_from_bars_low_vs_high_differ(mod):
+    """cs29 core: feeding the WRONG window yields the WRONG 3xATR TP threshold.
+    A low-vol window and a high-vol window produce different (and ordered) atr_pct."""
+    low = mod._atr_pct_from_bars(_bars(20, hi_lo_range=2.0, close=200.0))   # 0.01
+    high = mod._atr_pct_from_bars(_bars(20, hi_lo_range=8.0, close=200.0))  # 0.04
+    assert low is not None and high is not None
+    assert low != high
+    assert low < high
+    assert abs(low - 0.01) < 1e-9
+    assert abs(high - 0.04) < 1e-9
+
+
+def test_atr_pct_from_bars_guards(mod):
+    """cs29: None for empty / <15-bar / non-positive close frames (no fabrication)."""
+    assert mod._atr_pct_from_bars(pd.DataFrame({"High": [], "Low": [], "Close": []})) is None
+    assert mod._atr_pct_from_bars(_bars(14, hi_lo_range=2.0)) is None  # <15 bars
+    assert mod._atr_pct_from_bars(_bars(20, hi_lo_range=2.0, close=0.0)) is None
+    assert mod._atr_pct_from_bars(None) is None
+
+
+class _FakeTicker:
+    """A yfinance.Ticker stand-in. history(period=...) returns the RECENT (today-
+    ending) frame; history(start=,end=) returns the ENTRY-window frame — distinguished
+    by which kwargs are present, mirroring the two real call shapes."""
+
+    def __init__(self, symbol, *, recent, entry):
+        self.symbol = symbol
+        self._recent = recent
+        self._entry = entry
+
+    def history(self, *, period=None, start=None, end=None, interval="1d", auto_adjust=False):
+        if start is not None or end is not None:
+            return self._entry
+        return self._recent
+
+
+class _FakeYF:
+    def __init__(self, *, recent, entry):
+        self._recent = recent
+        self._entry = entry
+
+    def Ticker(self, symbol):  # noqa: N802 — mirrors yfinance's real capitalized API
+        return _FakeTicker(symbol, recent=self._recent, entry=self._entry)
+
+
+def _install_fake_yf(monkeypatch, *, recent, entry):
+    import sys
+    monkeypatch.setitem(sys.modules, "yfinance", _FakeYF(recent=recent, entry=entry))
+
+
+def test_fetch_mark_atr_legacy_no_arg_uses_recent(mod, monkeypatch):
+    """cs29: the no-arg call is byte-unchanged — it returns the RECENT (today-ending)
+    ATR. recent=HIGH vol, entry-window=LOW vol; with no entry_date we get HIGH."""
+    recent = _bars(60, hi_lo_range=8.0, close=200.0)   # 0.04
+    entry = _bars(20, hi_lo_range=2.0, close=200.0)     # 0.01
+    _install_fake_yf(monkeypatch, recent=recent, entry=entry)
+    mark, atr = mod.fetch_mark_atr("AAPL")
+    assert mark == 200.0
+    assert atr is not None and abs(atr - 0.04) < 1e-9
+
+
+def test_fetch_mark_atr_entry_date_uses_entry_window(mod, monkeypatch):
+    """cs29 the bug: with entry_date set we anchor the ATR to the ENTRY window (LOW),
+    NOT today's (HIGH). atr_entry != atr_recent; the mark stays the recent mark."""
+    recent = _bars(60, hi_lo_range=8.0, close=200.0)   # 0.04
+    entry = _bars(20, hi_lo_range=2.0, close=200.0)     # 0.01
+    _install_fake_yf(monkeypatch, recent=recent, entry=entry)
+    mark_recent, atr_recent = mod.fetch_mark_atr("AAPL")
+    mark_entry, atr_entry = mod.fetch_mark_atr("AAPL", entry_date="2026-01-05T00:00:00+00:00")
+    assert atr_entry is not None and abs(atr_entry - 0.01) < 1e-9
+    assert atr_entry != atr_recent
+    assert mark_entry == mark_recent == 200.0
+
+
+def test_fetch_mark_atr_falls_back_when_entry_window_empty(mod, monkeypatch):
+    """cs29 fallback (NO fabrication): an entry window that is empty/<15 bars falls
+    back to the RECENT atr rather than inventing a number or returning None-atr."""
+    recent = _bars(60, hi_lo_range=8.0, close=200.0)   # 0.04
+    _install_fake_yf(monkeypatch, recent=recent, entry=_bars(5, hi_lo_range=2.0))  # too short
+    _, atr = mod.fetch_mark_atr("AAPL", entry_date="2010-01-05T00:00:00+00:00")
+    assert atr is not None and abs(atr - 0.04) < 1e-9  # recent fallback
+
+    _install_fake_yf(monkeypatch, recent=recent,
+                     entry=pd.DataFrame({"High": [], "Low": [], "Close": []}))
+    _, atr2 = mod.fetch_mark_atr("AAPL", entry_date="2010-01-05T00:00:00+00:00")
+    assert atr2 is not None and abs(atr2 - 0.04) < 1e-9
+
+
+def test_fetch_mark_atr_unparseable_entry_date_uses_recent(mod, monkeypatch):
+    """cs29: an unparseable entry_date never raises — it degrades to the recent atr."""
+    recent = _bars(60, hi_lo_range=8.0, close=200.0)   # 0.04
+    entry = _bars(20, hi_lo_range=2.0, close=200.0)     # 0.01
+    _install_fake_yf(monkeypatch, recent=recent, entry=entry)
+    _, atr = mod.fetch_mark_atr("AAPL", entry_date="not-a-date")
+    assert atr is not None and abs(atr - 0.04) < 1e-9
+
+
+def test_fetch_mark_atr_entry_date_none_byte_identical_to_no_arg(mod, monkeypatch):
+    """cs29: entry_date=None is byte-identical to the no-arg call (legacy invariance)."""
+    recent = _bars(60, hi_lo_range=8.0, close=200.0)
+    entry = _bars(20, hi_lo_range=2.0, close=200.0)
+    _install_fake_yf(monkeypatch, recent=recent, entry=entry)
+    assert mod.fetch_mark_atr("AAPL", entry_date=None) == mod.fetch_mark_atr("AAPL")
+
+
+def test_fetch_mark_atr_stable_vol_single_fill_long_unchanged(mod, monkeypatch):
+    """cs29 regression: when vol is stable (entry window vol == recent window vol),
+    the entry-anchored atr equals the recent atr — a single-fill long whose entry is
+    ~now sees a take-profit threshold that is ~unchanged from the legacy behavior."""
+    recent = _bars(60, hi_lo_range=6.0, close=200.0)   # 0.03
+    entry = _bars(20, hi_lo_range=6.0, close=200.0)     # 0.03 (same vol regime)
+    _install_fake_yf(monkeypatch, recent=recent, entry=entry)
+    _, atr_recent = mod.fetch_mark_atr("AAPL")
+    _, atr_entry = mod.fetch_mark_atr("AAPL", entry_date="2026-06-12T00:00:00+00:00")
+    assert atr_entry == atr_recent
+
+
+def test_parse_entry_date_robust(mod):
+    """cs29: _parse_entry_date Z-normalizes, returns a date on success, None (never
+    raises) on junk/None/non-str."""
+    import datetime as _dt
+    assert mod._parse_entry_date("2026-01-05T00:00:00Z") == _dt.date(2026, 1, 5)
+    assert mod._parse_entry_date("2026-01-05T00:00:00+00:00") == _dt.date(2026, 1, 5)
+    assert mod._parse_entry_date("not-a-date") is None
+    assert mod._parse_entry_date(None) is None
+    assert mod._parse_entry_date(1234567890) is None
+
+
+# ---------------------- cs30: days_between_iso iso-guard ----------------------
+#
+# days_between_iso wraps `asof_iso.replace("Z","+00:00")` then fromisoformat ONLY in
+# `except ValueError`. A non-str asof (numeric/None/Timestamp) makes .replace raise
+# AttributeError, or fromisoformat raise TypeError — NEITHER is caught today, so the
+# exception propagates out of the per-asset loop (run_weekly has no per-asset
+# try/except) into main()'s catch-all -> weekly_uncaught_exception, return 1: NO
+# decisions for the WHOLE run. The fix widens the guard to also catch TypeError/
+# AttributeError so one bad asof degrades to days_held=0 for that single position.
+
+def test_days_between_iso_numeric_asof_does_not_raise(mod):
+    """cs30: a numeric asof (today raises AttributeError on .replace) -> 0, no raise."""
+    now_dt = mod.datetime(2026, 6, 14, tzinfo=mod.UTC)
+    assert mod.days_between_iso(1234567890, now_dt) == 0
+
+
+def test_days_between_iso_none_asof_does_not_raise(mod):
+    """cs30: a None asof -> 0, no raise (today AttributeError on None.replace)."""
+    now_dt = mod.datetime(2026, 6, 14, tzinfo=mod.UTC)
+    assert mod.days_between_iso(None, now_dt) == 0
+
+
+def test_days_between_iso_timestamp_asof_does_not_raise(mod):
+    """cs30: a pandas/datetime Timestamp asof -> 0, no raise (today TypeError/
+    AttributeError path)."""
+    now_dt = mod.datetime(2026, 6, 14, tzinfo=mod.UTC)
+    ts = pd.Timestamp("2026-06-08T00:00:00+00:00")
+    assert mod.days_between_iso(ts, now_dt) == 0
+    # A bare datetime instance also has no .replace(str,str) -> guarded to 0.
+    assert mod.days_between_iso(mod.datetime(2026, 6, 8, tzinfo=mod.UTC), now_dt) == 0
+
+
+def test_days_between_iso_str_happy_path_byte_identical(mod):
+    """cs30: the str-ISO happy path is byte-identical — '2026-06-08' to '2026-06-14'
+    is still 6 calendar days (the guard widening must not touch the success path)."""
+    now_dt = mod.datetime(2026, 6, 14, tzinfo=mod.UTC)
+    assert mod.days_between_iso("2026-06-08T00:00:00+00:00", now_dt) == 6
+    assert mod.days_between_iso("2026-06-08T00:00:00Z", now_dt) == 6

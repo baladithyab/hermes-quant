@@ -44,7 +44,7 @@ import os
 import sys
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -70,6 +70,10 @@ UTC = timezone.utc
 # ---------- exit thresholds (ADR-0035) ----------
 SWING_MAX_DAYS_LOSING = 60
 SWING_TP_ATR_MULT = 3.0
+# cs29 (ADR-0035 §98): the 3xATR take-profit threshold must use ATR-14 AT ENTRY,
+# not today's ATR. We fetch a daily-bar window ending at the entry date; ~40
+# calendar days reliably nets >=15 trading bars (the _atr_pct_from_bars minimum).
+ENTRY_ATR_LOOKBACK_DAYS = 40
 LEAPS_MIN_REV_GROWTH = 0.05
 LEAPS_MAX_DEBT_TO_EQUITY = 2.0
 LEAPS_MAX_DRAWDOWN = 0.25
@@ -364,7 +368,13 @@ def days_between_iso(asof_iso: str, now_dt: datetime) -> int:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC)
-    except ValueError:
+    except (ValueError, TypeError, AttributeError):
+        # cs30: a non-str asof (numeric / None / Timestamp / datetime) makes
+        # .replace raise AttributeError or fromisoformat raise TypeError. Without
+        # this widening the exception escapes the per-asset loop (no per-asset
+        # try/except) into main()'s catch-all -> weekly_uncaught_exception,
+        # return 1, killing the WHOLE weekly run. Degrade to days_held=0 for the
+        # one bad position instead. The str-ISO success path is byte-unchanged.
         return 0
     return max(0, (now_dt - dt).days)
 
@@ -424,11 +434,56 @@ def load_portfolio(executions_path: Path | None = None) -> tuple[Any, list[dict]
 
 
 # ---------- mark price + ATR + fundamentals (best-effort) ----------
-def fetch_mark_atr(symbol: str) -> tuple[float | None, float | None]:
-    """Return (mark_price, atr14_pct_at_recent_close) via yfinance.
+def _atr_pct_from_bars(h: Any) -> float | None:
+    """ATR-14 as a fraction of the last-bar close, from a daily-bar OHLC frame.
 
-    Returns (None, None) on any fetch failure — the caller should HOLD on
-    missing data rather than risk a bad-decision close.
+    Pure (no I/O). Returns None for an empty / <15-bar frame or a non-positive
+    last-bar close (so the caller can fall back rather than fabricate). Uses the
+    same Wilder simplification the legacy fetch used — mean of the last-14
+    (High-Low) true-range bars — over the bar window AS GIVEN. Feeding the wrong
+    window (today's vs. the entry's) yields the wrong threshold; that is the cs29
+    bug this helper makes testable.
+    """
+    try:
+        if h is None or h.empty or len(h) < 15:
+            return None
+        close = float(h["Close"].iloc[-1])
+        tr = (h["High"] - h["Low"]).abs()
+        atr = float(tr.tail(14).mean())
+        return atr / close if close > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _parse_entry_date(entry_date: Any) -> date | None:
+    """Parse an ISO asof string to a date. Never raises — returns None on junk,
+    None, or a non-str input (so the at-entry ATR lookup degrades gracefully)."""
+    if not isinstance(entry_date, str) or not entry_date:
+        return None
+    try:
+        s = entry_date.replace("Z", "+00:00")
+        return datetime.fromisoformat(s).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def fetch_mark_atr(symbol: str, *, entry_date: str | None = None) -> tuple[float | None, float | None]:
+    """Return (mark_price, atr14_pct) via yfinance.
+
+    The mark is ALWAYS the recent (today-ending) close. The ATR fraction is:
+      * entry_date is None  -> ATR-14 at the recent close (legacy behavior,
+        byte-identical to the pre-cs29 no-arg path).
+      * entry_date given     -> ADR-0035 §98 ATR-14 AT ENTRY: a daily-bar window
+        ending at/just-before the entry date, divided by the entry-date close.
+        Anchoring the denominator to the FIXED entry-date close also removes the
+        cs20 short moving-mark drift (the take-profit threshold no longer drifts
+        with the live mark).
+
+    Graceful fallback (NO fabrication): if entry_date is unparseable, or the
+    entry-window fetch returns an empty/<15-bar frame (e.g. the entry predates
+    available history), we fall back to the recent ATR rather than invent a
+    number or return a None ATR. Returns (None, None) on any total fetch failure
+    — the caller HOLDs on missing data.
     """
     try:
         import yfinance as yf  # type: ignore
@@ -441,11 +496,21 @@ def fetch_mark_atr(symbol: str) -> tuple[float | None, float | None]:
         if h is None or h.empty or len(h) < 15:
             return None, None
         close = float(h["Close"].iloc[-1])
-        # ATR-14 (Wilder simplification: rolling mean of true range)
-        tr = (h["High"] - h["Low"]).abs()
-        atr = float(tr.tail(14).mean())
-        atr_pct = atr / close if close > 0 else None
-        return close, atr_pct
+        recent_atr_pct = _atr_pct_from_bars(h)
+        if entry_date is None:
+            return close, recent_atr_pct
+        ed = _parse_entry_date(entry_date)
+        if ed is None:
+            return close, recent_atr_pct  # unparseable -> recent fallback
+        # Fetch a window ending at the entry date. end is EXCLUSIVE in yfinance,
+        # so +1 day includes the entry bar itself.
+        start = (ed - timedelta(days=ENTRY_ATR_LOOKBACK_DAYS)).isoformat()
+        end = (ed + timedelta(days=1)).isoformat()
+        he = t.history(start=start, end=end, interval="1d", auto_adjust=False)
+        entry_atr_pct = _atr_pct_from_bars(he)
+        if entry_atr_pct is None:
+            return close, recent_atr_pct  # short/empty window -> recent fallback
+        return close, entry_atr_pct
     except Exception:  # noqa: BLE001
         return None, None
 
@@ -579,13 +644,19 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
             })
             continue
 
-        days_held = days_between_iso(
-            entry.get("asof_execution") or entry.get("asof", ""), now_dt
-        )
+        # cs29: read the establishing-leg entry date ONCE; reuse it for both the
+        # holding clock and the ATR-14-AT-ENTRY anchor (ADR-0035 §98).
+        entry_asof = entry.get("asof_execution") or entry.get("asof", "")
+        days_held = days_between_iso(entry_asof, now_dt)
         avg_entry = float(pos.avg_entry_price)
-        mark, atr_pct = fetch_mark_atr(asset)
+        mark, atr_pct = fetch_mark_atr(asset, entry_date=entry_asof)
         if mark is None:
             mark = float(pos.mark_price)
+        # Operator visibility: 'entry' when the at-entry anchor was honored,
+        # 'recent_fallback' when the entry date was missing/unparseable (the ATR
+        # may then reflect the recent window or the entry window's graceful
+        # fallback — either way the entry anchor could not be guaranteed).
+        atr_basis = "entry" if _parse_entry_date(entry_asof) is not None else "recent_fallback"
         # cs20: sign-aware P&L/drawdown. The live book is short-dominated
         # (cs14 emits Position.qty<0); a long-only formula falsely marks a
         # losing short as profitable (LEAPS -25% / 60d-loss stop never fire)
@@ -600,6 +671,7 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
             "mark": mark,
             "pnl_pct": pnl_pct,
             "atr14_pct": atr_pct,
+            "atr_basis": atr_basis,
             "drawdown_from_entry": drawdown,
         }
 
