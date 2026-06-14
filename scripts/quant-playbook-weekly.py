@@ -265,6 +265,43 @@ def _rec_side(rec: dict) -> str:
     return ""
 
 
+def _held_nav_fraction(executions: list[dict], asset: str) -> float:
+    """Return the currently-held absolute NAV-fraction target for ``asset`` (0.0 absent).
+
+    cs21: the armed close must fire ``fill_size_pct = -held`` (NOT 0.0) so it FLATTENS
+    the LIVE default-regime ``state.db`` delta fold, where ``new_qty = old_qty +
+    fill_size_pct`` (portfolio_state.py:1124; the flag ``HERMES_QUANT_DELTA_NORMALIZER``
+    is unset == regime 0 == raw-delta fold). A ``_fire_equity_close`` Proposal carries
+    NO ``reactor_metadata.quantity`` so the fill takes the NAV-fraction lane
+    (``pos_delta = fill_size_pct``, portfolio_state.py:687) — the delta-fold path. With
+    ``-held``: a held SHORT (-0.20) folds +0.20 -> 0 (buy-to-cover); a held LONG (+0.30)
+    folds -0.30 -> 0 (sell). ``fill_size_pct=0.0`` would be a SILENT NO-OP on that ledger
+    (proven: _update_position(-0.20,...,0.0) -> -0.20, unchanged) — the close would not
+    flatten the live book.
+
+    The held NAV-fraction == the LATEST ``target_position_pct`` for the asset — the SAME
+    abs_latest record the loader keys QTY/sign off (portfolio_loader.py:316-326). We scan
+    the raw ``executions`` list for the asset's MAX-``asof_execution`` (fall back to
+    ``asof``) record and return its ``target_position_pct``. Mirror the loader's tie/order
+    (``ts >= prior`` keeps the LAST of an equal-timestamp run). Returns 0.0 on a missing /
+    unparseable target or no matching record (the close then no-ops, which is safe).
+    """
+    best_rec: dict | None = None
+    best_ts = ""
+    for rec in executions:
+        if rec.get("asset") != asset:
+            continue
+        ts = rec.get("asof_execution") or rec.get("asof") or ""
+        if best_rec is None or ts >= best_ts:
+            best_rec, best_ts = rec, ts
+    if best_rec is None:
+        return 0.0
+    try:
+        return float(best_rec.get("target_position_pct"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # ---------- establishing-leg selection (cs27/cs28) ----------
 def _establishing_leg(executions: list[dict], asset: str, position_qty: float = 0.0) -> dict | None:
     """Return the leg that ESTABLISHED the CURRENTLY-held position (None if absent).
@@ -742,7 +779,13 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
         # high-level helper if available; otherwise we record a CLOSE_FAILED
         # journal entry rather than crashing the cron.
         try:
-            placed = _fire_equity_close(asset, qty=float(pos.qty), reason=decision.reason)
+            # cs21: the close size is the NEGATIVE of the held NAV-fraction (the traded
+            # delta that flattens the default-regime state.db fold), recovered from the
+            # latest-target record — the SAME abs_latest record the loader reads.
+            held = _held_nav_fraction(executions, asset)
+            placed = _fire_equity_close(
+                asset, qty=float(pos.qty), target_position_pct=held, reason=decision.reason
+            )
             if placed.get("ok"):
                 summary["closes_fired"] += 1
                 rec["execution_id"] = placed.get("execution_id")
@@ -763,32 +806,99 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
     return summary
 
 
-def _fire_equity_close(symbol: str, *, qty: float, reason: str) -> dict[str, Any]:
-    """Place a market sell to flatten an equity position.
+def _fire_equity_close(
+    symbol: str, *, qty: float, target_position_pct: float, reason: str
+) -> dict[str, Any]:
+    """Flatten an equity position through the PaperReactor — fire ``-held`` to cover/sell.
 
-    Reuses hermes_quant.reactor.PaperReactor when available. The ADR-0029
-    multi-leg reactor is the eventual home; for now we go through the same
-    Alpaca paper path the daily tick uses.
+    cs21: the close DIRECTION is the opposite of the held sign — a held SHORT
+    (``qty < 0``) is closed by a BUY-to-cover, a held LONG (``qty > 0``) by a SELL.
+    The OLD body hardcoded ``side="sell"`` for ANY position, so an armed close of a
+    short would DEEPEN the short rather than cover it.
+
+    We fire through the canonical ``hermes_quant.react.paper.PaperReactor`` (the OLD
+    body imported the non-existent ``hermes_quant.reactor`` module — a guaranteed
+    ModuleNotFoundError -> CLOSE_FAILED on every armed close). The reactor consumes a
+    ``Proposal`` object (NOT a dict) and a KEYWORD-ONLY ``fill_size_pct``:
+    ``execute(proposal, *, fill_size_pct, ...)`` (react/paper.py).
+
+    CLOSE SIZE — ``fill_size_pct = -target_position_pct`` (the NEGATIVE of the held
+    NAV-fraction), NOT 0.0
+    -----------------------------------------------------------------------------------
+    A ``_fire_equity_close`` Proposal carries no ``reactor_metadata.quantity``, so the
+    fill takes the NAV-fraction lane and folds into the LIVE state.db as a raw DELTA in
+    the default regime (``new_qty = old_qty + fill_size_pct``, portfolio_state.py:1124;
+    ``HERMES_QUANT_DELTA_NORMALIZER`` is unset == regime 0). Firing ``-held`` flattens it
+    and the SIGN is automatically correct: short (held<0) -> +delta (buy-to-cover); long
+    (held>0) -> -delta (sell). ``|-held| <= 1.0`` so the |fill_size|<=1.0 ceiling holds.
+    ``fill_size_pct=0.0`` would be a SILENT NO-OP on this ledger — the short/long would
+    survive the "close" (proven: _update_position(-0.20,...,0.0) -> -0.20, unchanged).
+
+    DUAL-LEDGER DIVERGENCE / HAZARD (do NOT silently elide — concurrent-critique Finding A)
+    ----------------------------------------------------------------------------------------
+    There is NO single value that flattens BOTH ledgers the schema folds against:
+      * ``0.0`` flattens the ``reconstruct_portfolio`` LATEST-TARGET loader (and the
+        normalizer-ON state.db, where ``delta_from_net = 0 - held = -held``), because a
+        non-zero latest target reconstructs as a NEW position of that size/sign rather
+        than a flat (portfolio_loader.py:335-336 drops only ``|target| < 1e-12``).
+      * ``-held`` flattens the DEFAULT-regime state.db raw-delta fold — the live money
+        ledger TODAY (the flag is unset; the close fires a -held delta that cancels the
+        carried net). This is the path PaperReactor.execute writes (react/paper.py:442).
+    Finding A argues the close target must be 0.0 (correct for the loader/normalizer-ON
+    paths). The scoped cs21 directive is authoritative: fire ``-held`` to flatten the
+    LIVE default-regime state.db. The full reconciliation (normalizer-ON makes BOTH need
+    0.0, or a close-specific override) is OUT OF cs21 SCOPE and is documented, not
+    code-resolved. The det-equity reactor twin is irrelevant here (it carries
+    reactor_metadata.quantity -> shares lane; ``_fire_equity_close`` uses PaperReactor).
+
+    The whole body stays inside try/except so an armed cron records a CLOSE_FAILED
+    journal entry on any failure (ImportError, etc.) rather than crashing the run.
     """
     try:
-        from hermes_quant.reactor import PaperReactor  # type: ignore
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"PaperReactor import failed: {exc}"}
+        import secrets
 
-    try:
-        reactor = PaperReactor()  # type: ignore[call-arg]
-        # Best-effort call — if the API differs, surface the error clearly.
-        if hasattr(reactor, "close_position"):
-            res = reactor.close_position(symbol=symbol, qty=qty, reason=reason)  # type: ignore[attr-defined]
-        elif hasattr(reactor, "execute"):
-            res = reactor.execute(  # type: ignore[attr-defined]
-                {"symbol": symbol, "side": "sell", "qty": qty, "reason": reason}
-            )
-        else:
-            return {"ok": False, "error": "PaperReactor lacks close_position/execute"}
-        if isinstance(res, dict):
-            return {"ok": True, "execution_id": res.get("execution_id"), "raw": res}
-        return {"ok": True, "execution_id": getattr(res, "execution_id", None)}
+        from hermes_quant.proposals import Proposal
+        from hermes_quant.react.paper import PaperReactor
+
+        # Close direction = OPPOSITE the held sign: short (qty<0) -> BUY to cover;
+        # long (qty>0) -> SELL. Flat (qty==0) takes the long/sell branch (a no-op
+        # close-to-flat; harmless). Kept for the audit/pairing field; the SIZE sign
+        # (close_size below) carries the direction into the actual fold.
+        side = "buy" if qty < 0 else "sell"
+
+        # Close DELTA = -held NAV-fraction (the traded delta that flattens the
+        # default-regime state.db fold). short held -0.20 -> +0.20 (cover); long held
+        # +0.30 -> -0.30 (sell). 0.0 (no held target) -> a harmless no-op close.
+        close_size = -float(target_position_pct)
+
+        # Mint a proposal_id in the ADR-0015 §D3 shape (prop_<ISO_seconds>_<symbol>_<rand6>)
+        # without coupling to proposals.py private helpers; built from the script's own
+        # UTC-ISO-seconds clock so the close is self-contained + auditable.
+        iso_seconds = utcnow_iso()
+        iso_compact = iso_seconds.replace("-", "").replace(":", "").rstrip("Z")
+        safe_symbol = "".join(c if c.isalnum() else "_" for c in symbol)[:16]
+        proposal_id = f"prop_{iso_compact}_{safe_symbol}_{secrets.token_hex(3)}"
+
+        prop = Proposal(
+            proposal_id=proposal_id,
+            state="approved",
+            symbol=symbol,
+            asset_class="equity",
+            timeframe="1d",
+            created_at=iso_seconds,
+            expires_at=iso_seconds,
+            advisor_result={
+                "decision_price": 0.0,  # best-effort; PaperReactor tolerates 0.0
+                "as_of": iso_seconds,
+                "close_side": side,
+                "reason": reason,
+            },
+        )
+        # fill_size_pct = -held = the close DELTA that flattens the live state.db fold
+        # (KEYWORD-ONLY). NOT 0.0 (which would be a silent no-op on the default regime).
+        rec = PaperReactor().execute(prop, fill_size_pct=close_size, play_tag="playbook")
+        # ExecutionRecord carries .proposal_id (NOT .execution_id).
+        return {"ok": True, "execution_id": getattr(rec, "proposal_id", None), "side": side}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 

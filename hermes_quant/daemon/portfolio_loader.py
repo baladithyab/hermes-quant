@@ -51,6 +51,61 @@ logger = logging.getLogger(__name__)
 EQUITY_FILL_REACTORS = frozenset({"paper", "deterministic-equity", "alpaca_paper"})
 
 
+def _abs_record_sign(rec: dict) -> int:
+    """Sign of an absolute-target record's signed NAV fraction: +1 long, -1 short,
+    0 flat (|target| < 1e-12 -> a run boundary). Mirrors the weekly readers."""
+    try:
+        f = float(rec.get("target_position_pct"))
+    except (TypeError, ValueError):
+        return 0
+    if f > 1e-12:
+        return 1
+    if f < -1e-12:
+        return -1
+    return 0
+
+
+def _abs_opening_leg(
+    records: list[dict], asset: str, held_sign: int
+) -> dict | None:
+    """Return the leg that ESTABLISHED the currently-held absolute-target position.
+
+    cs22: the loader analogue of the weekly's ``_establishing_leg`` (cs27/cs28). The
+    absolute-target fold keeps QTY/sign from the LATEST target per symbol, but the cost
+    BASIS (``Position.avg_entry_price``) must anchor on the OPENING leg of the current
+    run — the FIRST same-held-sign fill after the last flat/flip — not the latest add.
+    A same-sign ADD (open then size-up) must NOT silently re-anchor the basis.
+
+    Walk the per-asset records IN FILE ORDER (the list is already oldest-first; do NOT
+    re-sort — preserve the loader's tie/order semantics). Track a candidate (the first
+    held-sign fill of the current run) plus a "boundary seen since the candidate" flag.
+    A boundary (flat target==0, or a flip to the opposite sign) only SETS the flag — it
+    does not erase the candidate; the NEXT held-sign fill after a boundary RE-OPENS the
+    run and becomes the new candidate. So the post-loop candidate is the first held-sign
+    fill after the LAST boundary that was followed by a same-sign re-open.
+
+    Single-fill positions are byte-identical: one held-sign fill, no boundary -> that
+    single fill IS the opening leg (= the abs_latest record), so the derived basis is
+    unchanged.
+    """
+    candidate: dict | None = None
+    boundary_since_candidate = False
+    for rec in records:
+        if rec.get("asset") != asset:
+            continue
+        sign = _abs_record_sign(rec)
+        if sign == held_sign:
+            if candidate is None or boundary_since_candidate:
+                candidate = rec  # opens (or re-opens, post-boundary) the current run
+                boundary_since_candidate = False
+        else:
+            # Boundary: a flat (sign==0) or a flip (opposite sign) closes the run.
+            # Mark it; the next held-sign fill re-opens. A trailing boundary with no
+            # subsequent same-sign fill leaves the prior run's opener intact.
+            boundary_since_candidate = True
+    return candidate
+
+
 def reconstruct_portfolio(
     account_id: str,
     asset_class: str,
@@ -280,21 +335,31 @@ def reconstruct_portfolio(
             # Latest target is flat -> the position is closed. Drop it.
             continue
 
-        # Entry price: slipped fill_price preferred, else decision_price.
+        # cs22: the cost BASIS anchors on the OPENING (establishing) leg of the current
+        # run — the first same-held-sign fill after the last flat/flip — NOT the latest
+        # add. QTY/sign stay latest-target (`rec` = abs_latest[asset]); only the entry
+        # price comes from the opening leg. A same-sign size-up must not silently
+        # re-anchor the basis the weekly's sign-aware pnl_pct/drawdown reads against.
+        # Single-fill: the opening leg IS this latest record -> byte-identical.
+        held_sign = 1 if target_pct > 0 else -1
+        basis_rec = _abs_opening_leg(absolute_matching, asset, held_sign) or rec
+
+        # Entry price: slipped fill_price preferred, else decision_price — read from the
+        # OPENING leg (same ladder as before; only the source record changed).
         try:
-            entry_price = float(rec.get("fill_price"))
+            entry_price = float(basis_rec.get("fill_price"))
         except (TypeError, ValueError):
             entry_price = 0.0
         if entry_price <= 0.0:
             try:
-                entry_price = float(rec.get("decision_price"))
+                entry_price = float(basis_rec.get("decision_price"))
             except (TypeError, ValueError):
                 entry_price = 0.0
         if entry_price <= 0.0:
             logger.warning(
                 "absolute-target record for %s has no usable entry price; skipped: %s",
                 asset,
-                rec,
+                basis_rec,
             )
             continue
 
