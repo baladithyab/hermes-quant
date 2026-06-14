@@ -178,9 +178,40 @@ def _clean_floats(obj):
 
 
 def _to_array(returns) -> np.ndarray:
-    """Coerce a pd.Series | np.ndarray | sequence to a 1-D float ndarray."""
+    """Coerce a pd.Series | np.ndarray | sequence to a 1-D float ndarray.
+
+    Drops non-finite ELEMENTS (compresses the array). Correct for the
+    per-series, order-only statistics (Sharpe, DSR, timing permutation) where
+    a dropped bar carries no cross-series pairing. For the PAIRED excess
+    computation use :func:`_paired_finite` instead — independent per-series
+    compression here would shift the two series relative to one another and
+    pair bars from different dates (cs39).
+    """
     arr = np.asarray(getattr(returns, "values", returns), dtype=float).ravel()
     return arr[np.isfinite(arr)]
+
+
+def _paired_finite(a, b) -> tuple[np.ndarray, np.ndarray]:
+    """Coerce two return series and align them on a SHARED finite mask.
+
+    Truncates both to the common length, then keeps only the positions where
+    BOTH series are finite (``isfinite(a) & isfinite(b)`` elementwise). A
+    non-finite element in EITHER series drops that bar from BOTH, so the i-th
+    kept element of ``a`` always pairs the SAME-DATE i-th kept element of
+    ``b`` (cs39). Independently compressing each series (the old ``_to_array``
+    path) shifts them relative to one another when a NaN sits at different
+    indices, silently pairing bars from different dates in the excess subtract.
+
+    When both series are fully finite the mask is all-True and the result is
+    byte-identical to a naive positional ``a[:m] - b[:m]``.
+    """
+    arr_a = np.asarray(getattr(a, "values", a), dtype=float).ravel()
+    arr_b = np.asarray(getattr(b, "values", b), dtype=float).ravel()
+    m = min(arr_a.size, arr_b.size)
+    arr_a = arr_a[:m]
+    arr_b = arr_b[:m]
+    mask = np.isfinite(arr_a) & np.isfinite(arr_b)
+    return arr_a[mask], arr_b[mask]
 
 
 def _sharpe(returns: np.ndarray, *, bars_per_year: float) -> float:
@@ -567,12 +598,17 @@ def validate_returns(
     )
 
     # ---- Excess-return series (optional) ----
+    # cs39: pair strat/bh on a SHARED finite mask BEFORE subtracting so every
+    # excess element pairs SAME-DATE strat/bh bars. We re-coerce strat_returns
+    # here (rather than reuse the independently-compressed `r`) because a
+    # non-finite in EITHER series must drop that bar from BOTH; the per-series
+    # `r` above is still correct for the strat-only Sharpe/DSR/timing stats.
     excess = None
     if bh_returns is not None:
-        bh = _to_array(bh_returns)
-        m = min(r.size, bh.size)
+        r_paired, bh_paired = _paired_finite(strat_returns, bh_returns)
+        m = r_paired.size
         if m >= 2:
-            excess = r[:m] - bh[:m]
+            excess = r_paired - bh_paired
             obs, p, pmean, pstd = _permutation_pvalue(
                 excess, _timing_pnl, n_permutations=n_permutations, rng=perm_rng
             )

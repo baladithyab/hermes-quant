@@ -147,6 +147,58 @@ def test_excess_return_stats_present_with_bh():
     assert "excess_return" in boot_stats
 
 
+def test_excess_pairs_same_date_bars_under_misaligned_nan():
+    """cs39: a non-finite in ONE series at an index the OTHER series lacks must
+    drop that bar from BOTH (joint mask) so excess pairs SAME-DATE strat/bh
+    bars. The old code compressed each series independently then subtracted
+    positionally — pairing strat[i] with the wrong (shifted) bh bar.
+
+    strat = [.01, .02, .03, .04, .05]
+    bh    = [.01, NaN, .02, .03, .04]
+    The NaN is at index 1 of bh only. Correct same-date pairing drops index 1
+    from BOTH -> excess = [.01-.01, .03-.02, .04-.03, .05-.04] = [0, .01, .01, .01].
+    The buggy independent-compress yields bh_compressed[1:] shifted left, so
+    excess collapses to [0, 0, 0, 0] (strategy looks like it never outperforms).
+    The excess_return bootstrap point is the compounded total return of the
+    PAIRED excess series; assert it matches the same-date-aligned hand value.
+    """
+    strat = np.array([0.01, 0.02, 0.03, 0.04, 0.05])
+    bh = np.array([0.01, np.nan, 0.02, 0.03, 0.04])
+
+    # Hand-computed SAME-DATE-aligned excess (joint mask drops index 1 from both).
+    expected_excess = np.array([0.0, 0.01, 0.01, 0.01])
+    expected_point = float(np.prod(1.0 + expected_excess) - 1.0)
+
+    rep = validate_returns(
+        strat,
+        bars_per_year=252,
+        bh_returns=bh,
+        n_permutations=50,
+        n_resamples=50,
+        seed=42,
+    )
+    excess_ci = next(c for c in rep.bootstrap if c.statistic == "excess_return")
+    # The buggy positional-subtract collapses excess to all-zeros -> point == 0.0;
+    # the same-date pairing yields a strictly positive compounded excess.
+    assert excess_ci.point == pytest.approx(expected_point)
+    assert excess_ci.point > 0.0
+
+
+def test_excess_all_finite_is_byte_identical():
+    """The all-finite common case must be unchanged by the cs39 joint-mask fix
+    (joint mask == all True), so the excess_return point equals the naive
+    positional subtract of the two fully-finite series."""
+    r = _noise(120, drift=0.001, seed=4)
+    bh = _noise(120, drift=0.0002, seed=9)
+    m = min(r.size, bh.size)
+    expected_point = float(np.prod(1.0 + (r[:m] - bh[:m])) - 1.0)
+    rep = validate_returns(
+        r, bars_per_year=252, bh_returns=bh, n_permutations=50, n_resamples=50, seed=42
+    )
+    excess_ci = next(c for c in rep.bootstrap if c.statistic == "excess_return")
+    assert excess_ci.point == pytest.approx(expected_point)
+
+
 # --- scipy-absent fallback ---------------------------------------------------
 def test_scipy_absent_falls_back_to_percentile(monkeypatch):
     """With scipy unavailable: percentile CI from the stationary bootstrap +
