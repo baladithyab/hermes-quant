@@ -200,6 +200,40 @@ def decide_leaps(ctx: LeapsContext) -> ExitDecision:
     return ExitDecision("HOLD", "leaps_hold")
 
 
+# ---------- sign-aware P&L / drawdown (cs20) ----------
+def compute_pnl_drawdown(avg_entry: float, mark: float, qty: float) -> tuple[float, float]:
+    """Return (pnl_pct, drawdown_from_entry) honoring the position sign.
+
+    The live book is short-dominated (cs14 emits Position.qty<0 for the -0.2 NAV
+    targets), so a long-only P&L is actively wrong on it. Both metrics drive the
+    downstream exit rules:
+      * pnl_pct  -> swing >60d loss-stop (pnl_pct<0) and the 3*ATR take-profit
+      * drawdown -> the LEAPS -25% close
+
+    For a LONG (qty >= 0) we keep the original formula byte-identical:
+        pnl_pct  = (mark - avg_entry) / avg_entry
+        drawdown = max(0, (avg_entry - mark) / avg_entry)   # adverse = price fell
+
+    For a SHORT (qty < 0) a position profits as the mark falls below entry, so we
+    flip both: the short's unrealized profit rises when mark < avg_entry (matching
+    portfolio_loader.unrealized = (mark-avg_entry)*qty, which is >0 for qty<0 when
+    mark<avg_entry), and the adverse drawdown is the mark rising above entry:
+        pnl_pct  = (avg_entry - mark) / avg_entry
+        drawdown = max(0, (mark - avg_entry) / avg_entry)   # adverse = price rose
+
+    A non-positive avg_entry (bad data) yields (0.0, 0.0) -> the rules HOLD.
+    """
+    if avg_entry <= 0:
+        return 0.0, 0.0
+    if qty < 0:  # short
+        pnl_pct = (avg_entry - mark) / avg_entry
+        drawdown = max(0.0, (mark - avg_entry) / avg_entry)
+    else:  # long (or flat — treated as long; byte-identical to the original)
+        pnl_pct = (mark - avg_entry) / avg_entry
+        drawdown = max(0.0, (avg_entry - mark) / avg_entry)
+    return pnl_pct, drawdown
+
+
 # ---------- record-side derivation (cs17) ----------
 def _rec_side(rec: dict) -> str:
     """Derive the buy/sell side of an execution record.
@@ -493,8 +527,12 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
         mark, atr_pct = fetch_mark_atr(asset)
         if mark is None:
             mark = float(pos.mark_price)
-        pnl_pct = (mark - avg_entry) / avg_entry if avg_entry > 0 else 0.0
-        drawdown = max(0.0, (avg_entry - mark) / avg_entry) if avg_entry > 0 else 0.0
+        # cs20: sign-aware P&L/drawdown. The live book is short-dominated
+        # (cs14 emits Position.qty<0); a long-only formula falsely marks a
+        # losing short as profitable (LEAPS -25% / 60d-loss stop never fire)
+        # and a winning short as losing (60d stop wrong-fires). For a long the
+        # values are byte-identical to the pre-cs20 formula.
+        pnl_pct, drawdown = compute_pnl_drawdown(avg_entry, mark, float(pos.qty))
 
         decision: ExitDecision
         details: dict[str, Any] = {

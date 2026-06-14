@@ -132,6 +132,87 @@ def test_leaps_missing_fundamentals_does_not_close(mod):
     assert d.action == "HOLD"
 
 
+# ---------------------- cs20: sign-aware P&L / drawdown ----------------------
+
+def test_pnl_drawdown_long_byte_identical(mod):
+    """REGRESSION GUARD: a long (qty>=0) keeps the EXACT pre-cs20 formula.
+
+    pnl_pct = (mark-avg_entry)/avg_entry ; drawdown = max(0,(avg_entry-mark)/avg_entry).
+    """
+    avg_entry, mark = 200.0, 250.0
+    pnl, dd = mod.compute_pnl_drawdown(avg_entry, mark, qty=100.0)
+    assert pnl == pytest.approx((mark - avg_entry) / avg_entry)  # +0.25
+    assert dd == pytest.approx(max(0.0, (avg_entry - mark) / avg_entry))  # 0.0
+    # losing long: price fell below entry
+    pnl2, dd2 = mod.compute_pnl_drawdown(200.0, 150.0, qty=100.0)
+    assert pnl2 == pytest.approx(-0.25)
+    assert dd2 == pytest.approx(0.25)
+
+
+def test_pnl_drawdown_long_flat_qty_treated_as_long(mod):
+    """qty==0 (degenerate) takes the long branch — byte-identical to original."""
+    pnl, dd = mod.compute_pnl_drawdown(200.0, 250.0, qty=0.0)
+    assert pnl == pytest.approx(0.25)
+    assert dd == pytest.approx(0.0)
+
+
+def test_pnl_drawdown_short_losing_flips_to_loss_and_drawdown(mod):
+    """A LOSING short (mark>avg_entry, price rose against it) must show pnl<0 AND a
+    positive drawdown so the LEAPS -25% close and the >60d loss-stop CAN fire.
+
+    Under the buggy long-only formula this short showed pnl=+0.25, dd=0.0 — the
+    -25% LEAPS close and the loss-stop never fired on a real losing short.
+    """
+    pnl, dd = mod.compute_pnl_drawdown(avg_entry=200.0, mark=250.0, qty=-100.0)
+    assert pnl == pytest.approx(-0.25)  # NOT +0.25
+    assert dd == pytest.approx(0.25)    # NOT 0.0 -> LEAPS -25% fires
+
+
+def test_pnl_drawdown_short_winning_flips_to_profit(mod):
+    """A WINNING short (mark<avg_entry, price fell) must show pnl>0 so the >60d
+    loss-stop does NOT wrong-fire on a winner, and drawdown stays 0."""
+    pnl, dd = mod.compute_pnl_drawdown(avg_entry=200.0, mark=150.0, qty=-100.0)
+    assert pnl == pytest.approx(0.25)  # NOT -0.25 (which would wrong-fire the stop)
+    assert dd == pytest.approx(0.0)
+
+
+def test_pnl_drawdown_zero_avg_entry_holds(mod):
+    """Non-positive avg_entry (bad data) yields (0,0) for both signs -> rules HOLD."""
+    assert mod.compute_pnl_drawdown(0.0, 100.0, qty=100.0) == (0.0, 0.0)
+    assert mod.compute_pnl_drawdown(0.0, 100.0, qty=-100.0) == (0.0, 0.0)
+
+
+def test_short_losing_drives_leaps_drawdown_close(mod):
+    """End-to-end through the decision layer: a losing short's flipped drawdown
+    crosses the LEAPS -25% threshold and decide_leaps CLOSES."""
+    _, dd = mod.compute_pnl_drawdown(avg_entry=200.0, mark=270.0, qty=-100.0)  # +35% adverse
+    d = mod.decide_leaps(mod.LeapsContext(
+        revenue_growth_yoy=0.20, debt_to_equity=0.5, drawdown_from_entry=dd,
+    ))
+    assert d.action == "CLOSE"
+    assert "leaps_drawdown" in d.reason
+
+
+def test_short_winner_take_profit_fires_under_flipped_pnl(mod):
+    """A short that has profited (mark fell) crosses the 3*ATR take-profit under the
+    flipped pnl_pct, so decide_swing CLOSES on the TP branch (a short hitting +3*ATR
+    profit should take profit)."""
+    pnl, _ = mod.compute_pnl_drawdown(avg_entry=200.0, mark=180.0, qty=-100.0)  # +10% profit
+    d = mod.decide_swing(mod.SwingContext(days_held=15, pnl_pct=pnl, atr14_at_entry_pct=0.02))
+    # 3*0.02 = 0.06 ; pnl=+0.10 > 0.06
+    assert d.action == "CLOSE"
+    assert "swing_tp" in d.reason
+
+
+def test_short_loser_60d_stop_fires_under_flipped_pnl(mod):
+    """An old (>60d) losing short shows pnl<0 under the flip, so the >60d loss-stop
+    CLOSES (it never could under the buggy +pnl)."""
+    pnl, _ = mod.compute_pnl_drawdown(avg_entry=200.0, mark=240.0, qty=-100.0)  # -20% loss
+    d = mod.decide_swing(mod.SwingContext(days_held=70, pnl_pct=pnl, atr14_at_entry_pct=0.02))
+    assert d.action == "CLOSE"
+    assert "swing_stop" in d.reason
+
+
 # ---------------------- play_tag inference ----------------------
 
 def test_infer_play_tag_explicit(mod):
