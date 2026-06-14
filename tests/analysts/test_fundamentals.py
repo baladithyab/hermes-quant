@@ -302,6 +302,60 @@ def test_fx_abstain_returns_none(analyst: FundamentalsAnalyst) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 6b — option FAMILY abstain (cs45): both the generic 'option' token AND the
+#      live 'us_option' stamp (react.multileg.py:569) must abstain. An OCC-21
+#      option symbol has no '/' and does not end '=X', so a bare `== "option"`
+#      check let 'us_option' fall through the symbol heuristics → 'equity' →
+#      analyze() fetched/scored fundamentals for a contract symbol as a stock
+#      (the ac1 contract-layer divergence, here in the analyst). The recognizer
+#      keys on the option FAMILY (pdr_core.is_option_asset_class) so both tokens
+#      abstain. LATENT today (options route the multi-leg recipe path, not the
+#      equity advisor analyst loop), live the instant an option MarketContext
+#      reaches the analyst pool. FundamentalsAnalyst is an ADR-0004 gate input.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("opt_class", ["option", "us_option"])
+def test_option_family_abstain_returns_none(
+    provider: FundamentalsProvider,
+    analyst: FundamentalsAnalyst,
+    opt_class: str,
+) -> None:
+    """cs45 RED→GREEN: an option MarketContext abstains (Protocol-clean None).
+
+    Pre-fix, 'us_option' (the live stamp) classified 'equity' and analyze()
+    proceeded to read the provider for the OCC-21 contract symbol as a stock.
+    The OCC-21 symbol below has no '/' and no '=X', so the symbol heuristics
+    alone would route it to 'equity' — the abstain MUST come from the
+    asset_class option-family gate, not the heuristics.
+    """
+    asof = pd.Timestamp("2026-05-15T16:00:00", tz="UTC")
+    occ_symbol = "AAPL  260116C00150000"  # OCC-21: no '/', no '=X'
+
+    # Classifier-level invariant: option family → 'unknown' (abstain).
+    assert (
+        FundamentalsAnalyst._classify_symbol_universe(occ_symbol, opt_class)
+        == "unknown"
+    )
+    # The non-option classes stay byte-identical (no collateral change).
+    assert FundamentalsAnalyst._classify_symbol_universe("AAPL", "equity") == "equity"
+    assert FundamentalsAnalyst._classify_symbol_universe("SPY", "etf") == "etf"
+    assert (
+        FundamentalsAnalyst._classify_symbol_universe("BTC/USDT", "crypto") == "crypto"
+    )
+    assert FundamentalsAnalyst._classify_symbol_universe("EURUSD=X", "fx") == "fx"
+
+    # End-to-end abstain, and the provider is never touched (sentinel: no
+    # parquet ever materializes — same proof shape as the crypto abstain).
+    view = analyst.analyze(_ctx(occ_symbol, asof, asset_class=opt_class))
+    assert view is None
+    yf_dir = provider.yfinance_dir
+    assert not yf_dir.exists() or not any(yf_dir.iterdir()), (
+        "option abstain must not trigger a provider read/write"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 7 — cache hit: fresh snapshot
 # ---------------------------------------------------------------------------
 

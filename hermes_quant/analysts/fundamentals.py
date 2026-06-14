@@ -41,6 +41,7 @@ import pandas as pd
 
 from hermes_quant.calibrators import ColdStartCalibrator
 from hermes_quant.data.fundamentals_provider import FundamentalsProvider
+from hermes_quant.pdr_core import is_option_asset_class
 from hermes_quant.protocol import (
     AnalystView,
     CalibratorNotReady,
@@ -189,7 +190,7 @@ class FundamentalsAnalyst:
           1. Empty / non-string asset → 'unknown'.
           2. asset_class explicitly given:
              - 'equity' / 'etf' / 'crypto' / 'fx' → trust upstream.
-             - 'option'                          → 'unknown' (deferred).
+             - option FAMILY ('option' / 'us_option') → 'unknown' (deferred).
           3. '/' in asset                          → 'crypto'.
           4. asset endswith '=X'                   → 'fx'.
           5. else                                  → 'equity'.
@@ -200,10 +201,17 @@ class FundamentalsAnalyst:
         if not isinstance(asset, str) or not asset.strip():
             return "unknown"
         if asset_class is not None:
+            # Option FAMILY first: the live host stamps 'us_option' (react.multileg),
+            # 'option' is the generic/legacy token. Recognize the FAMILY via
+            # pdr_core.is_option_asset_class — a bare `== "option"` would miss the
+            # live 'us_option' stamp and fall through to the symbol heuristics, which
+            # classify an OCC-21 option symbol (no '/', no '=X') as 'equity' and let
+            # analyze() fetch/score fundamentals for a contract symbol as a stock
+            # (ac1's contract-layer divergence, here in the analyst).
+            if is_option_asset_class(asset_class):
+                return "unknown"
             if asset_class in ("equity", "etf", "crypto", "fx"):
                 return asset_class  # type: ignore[return-value]
-            if asset_class == "option":
-                return "unknown"
             # Unknown asset_class string → fall through to heuristics.
         if "/" in asset:
             return "crypto"
