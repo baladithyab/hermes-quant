@@ -43,9 +43,44 @@ from hermes_quant.react.base import is_absolute_target_record
 _BucketKey = tuple[str, str, str]
 
 
+def _resolve_account(rec: dict[str, Any]) -> str:
+    """Resolve the partition account for one record (cs64) — IDENTICAL to the cs52
+    ``portfolio_state._resolve_account`` (and the cs24 daemon loader): top-level
+    ``account_id`` if truthy, else ``reactor_metadata.account_id`` if truthy, else the
+    ``"paper-default"`` sentinel.
+
+    Inlined here (not imported from portfolio_state) deliberately: this module is the
+    SINGLE shared normalizer and must not couple its import to the heavy portfolio_state
+    module. Keep this body byte-for-byte in step with portfolio_state._resolve_account.
+
+    Why it matters (cs64): the running-net carry-forward MUST partition on the same grain
+    the BOOKING fold uses, or the two folds diverge. The persisted log serializes
+    ``account_id`` ONLY inside ``reactor_metadata`` (react/paper.py:_record_to_dict,
+    alpaca_paper.py:413) — the top-level ``account_id`` is injected at runtime onto the
+    in-memory dict handed to apply_execution (react/paper.py:530, alpaca_paper.py:432)
+    but is NOT written to the log. So on a full rebuild an alpaca-paper fill carries its
+    account ONLY in reactor_metadata. Reading just the bare top-level field collapses every
+    reactor_metadata-only account onto ``paper-default`` and re-pools the running net, while
+    the incremental fold (apply_execution -> ``acct = portfolio_state._resolve_account`` ->
+    reads ``old_qty WHERE account_id=acct``) keeps the per-account net. The carry-forward
+    delta ``target - net`` then differs between folds whenever >1 named account shares a
+    symbol — corrupting the gate-sized NAV. A truthy top-level account_id resolves
+    identically to the old ``.get(..., "paper-default")``, so a single-account log is
+    byte-identical (and the normalizer is itself default-OFF behind
+    HERMES_QUANT_DELTA_NORMALIZER, so _bucket is unreachable when the flag is off).
+    """
+    acct = rec.get("account_id")
+    if acct:
+        return str(acct)
+    meta_acct = (rec.get("reactor_metadata") or {}).get("account_id")
+    if meta_acct:
+        return str(meta_acct)
+    return "paper-default"
+
+
 def _bucket(rec: dict[str, Any]) -> _BucketKey:
     return (
-        rec.get("account_id", "paper-default"),
+        _resolve_account(rec),
         rec.get("asset_class", "equity"),
         rec.get("asset", ""),
     )

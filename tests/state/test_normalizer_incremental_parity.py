@@ -155,6 +155,61 @@ def test_mixed_schema_bucket_incremental_vs_rebuild_parity(tmp_path, monkeypatch
     assert inc == pytest.approx(reb, rel=1e-9)
 
 
+def test_multi_account_metadata_only_rebuild_matches_incremental_cs64(tmp_path, monkeypatch):
+    """cs64 RED->GREEN: a multi-account book where account_id lives ONLY in
+    reactor_metadata (the PERSISTED log shape — _record_to_dict / alpaca_paper.py:413
+    do NOT write a top-level account_id) folds to the SAME positions via the incremental
+    and rebuild paths.
+
+    Before the fix the rebuild normalizer keyed its running-net on the BARE top-level
+    account_id, collapsing every alpaca-paper fill onto paper-default; a re-affirmed
+    alpaca-paper target was then differenced against paper-default's net (delta 0 ->
+    alpaca-paper booked flat -> position dropped), while the incremental fold kept the
+    per-account net (alpaca-paper == 0.05). The gate-sized NAV diverged. The fix routes
+    _bucket through the same cs52 account resolution the booking fold uses.
+    """
+    import json
+
+    monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
+
+    def _meta_rec(asset, target, *, pid, asof, meta_acct, price=100.0):
+        r = _rec(asset, target, pid=pid, asof=asof, price=price)
+        # PERSISTED shape: drop the top-level account_id, carry it only in metadata.
+        del r["account_id"]
+        r["reactor_metadata"] = {"account_id": meta_acct}
+        return r
+
+    recs = [
+        _meta_rec("AAPL", 0.05, pid="pd0", asof="2026-06-06T10:00:00Z", meta_acct="paper-default"),
+        _meta_rec("AAPL", 0.05, pid="ap0", asof="2026-06-06T10:01:00Z", meta_acct="alpaca-paper"),
+        _meta_rec("AAPL", 0.05, pid="ap1", asof="2026-06-06T10:02:00Z", meta_acct="alpaca-paper"),
+    ]
+
+    # Incremental fold.
+    ps_inc = PortfolioState(state_db_path=tmp_path / "inc.db")
+    _apply_stream(ps_inc, recs)
+    inc_ap = ps_inc.get_positions("alpaca-paper").get(("equity", "AAPL"))
+    inc_pd = ps_inc.get_positions("paper-default").get(("equity", "AAPL"))
+
+    # Rebuild fold over the persisted log.
+    bus = tmp_path / "executions.jsonl"
+    with open(bus, "w") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+    ps_reb = PortfolioState(state_db_path=tmp_path / "reb.db")
+    ps_reb.reconstruct_from(bus)
+    reb_ap = ps_reb.get_positions("alpaca-paper").get(("equity", "AAPL"))
+    reb_pd = ps_reb.get_positions("paper-default").get(("equity", "AAPL"))
+
+    # Both accounts independently hold the single intended 0.05 (NOT collapsed/dropped).
+    assert inc_ap is not None and reb_ap is not None, "alpaca-paper must hold AAPL in both folds"
+    assert inc_ap.quantity == pytest.approx(0.05, rel=1e-9)
+    assert inc_pd.quantity == pytest.approx(0.05, rel=1e-9)
+    # The parity gate: incremental == rebuild for every shared-symbol account.
+    assert inc_ap.quantity == pytest.approx(reb_ap.quantity, rel=1e-9)
+    assert inc_pd.quantity == pytest.approx(reb_pd.quantity, rel=1e-9)
+
+
 def test_incremental_flag_off_is_legacy(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_QUANT_DELTA_NORMALIZER", raising=False)
     recs = [_rec("AAPL", 0.05, pid=f"p{i}", asof=f"2026-06-06T10:{i:02d}:00Z") for i in range(12)]

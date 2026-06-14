@@ -94,3 +94,71 @@ def test_absolute_target_schema_version_explicit_same_as_none():
     n = FillDeltaNormalizer()
     assert n.delta_for(_r(fill_size_pct=0.05, schema_version=SCHEMA_ABSOLUTE_TARGET)) == 0.05
     assert abs(n.delta_for(_r(fill_size_pct=0.05, schema_version=SCHEMA_ABSOLUTE_TARGET))) < 1e-12
+
+
+def _meta_acct_rec(asset="AAPL", meta_acct="alpaca-paper", ac="equity", *, fill_size_pct):
+    """A PERSISTED-shape record: account_id lives ONLY in reactor_metadata, never
+    top-level — exactly what react/paper.py:_record_to_dict + alpaca_paper.py:413
+    serialize to executions.jsonl. The top-level account_id is injected onto the
+    in-memory dict at runtime (alpaca_paper.py:432) but is NOT written to the log, so a
+    full rebuild reads this shape."""
+    return {
+        "asset_class": ac,
+        "asset": asset,
+        "asof_execution": "2026-06-13T00:00:00Z",
+        "schema_version": None,
+        "fill_size_pct": fill_size_pct,
+        "reactor_metadata": {"account_id": meta_acct},
+    }
+
+
+def test_bucket_resolves_account_from_reactor_metadata_cs64():
+    """cs64: the running-net bucket must resolve the account the SAME way the booking
+    fold does (cs52 _resolve_account: top-level account_id, else reactor_metadata
+    .account_id, else paper-default). The persisted log carries an alpaca-paper fill's
+    account ONLY in reactor_metadata, so a bare top-level read would collapse it onto
+    paper-default and re-pool the carry-forward net.
+
+    RED before the fix: _bucket returned 'paper-default' for an alpaca-paper-in-metadata
+    record, so a paper-default + alpaca-paper book sharing a symbol re-differenced the
+    alpaca-paper target against paper-default's net (rebuild fold) — diverging from the
+    per-account incremental fold.
+    """
+    from hermes_quant.state.fill_delta_normalizer import _bucket, _resolve_account
+    from hermes_quant.state.portfolio_state import _resolve_account as ps_resolve_account
+
+    rec = _meta_acct_rec(meta_acct="alpaca-paper", fill_size_pct=0.05)
+    assert _bucket(rec) == ("alpaca-paper", "equity", "AAPL")
+    # The normalizer's account resolution must be byte-identical to the cs52 booking
+    # fold's resolution — that identity is the whole no-divergence guarantee.
+    assert _resolve_account(rec) == ps_resolve_account(rec) == "alpaca-paper"
+
+
+def test_metadata_only_accounts_are_independent_buckets_cs64():
+    """cs64: two accounts (paper-default + alpaca-paper) sharing ONE symbol, each
+    carrying its account only in reactor_metadata, must NOT share a running-net bucket.
+    A re-affirm on alpaca-paper folds to delta 0 against its OWN 0.05 net, not against a
+    re-pooled paper-default + alpaca-paper net."""
+    n = FillDeltaNormalizer()
+    # paper-default opens AAPL 0.05
+    assert n.delta_for(_meta_acct_rec(meta_acct="paper-default", fill_size_pct=0.05)) == 0.05
+    # alpaca-paper opens the SAME symbol — its own bucket starts at net 0, so delta 0.05
+    # (NOT 0.05 - 0.05 == 0, which is what the collapsed bucket produced pre-fix).
+    assert n.delta_for(_meta_acct_rec(meta_acct="alpaca-paper", fill_size_pct=0.05)) == 0.05
+    # alpaca-paper re-affirms -> delta 0 against its own 0.05 net.
+    assert abs(n.delta_for(_meta_acct_rec(meta_acct="alpaca-paper", fill_size_pct=0.05))) < 1e-12
+
+
+def test_top_level_account_id_resolves_identically_byte_identical_cs64():
+    """cs64 safety: a truthy top-level account_id resolves exactly as the old
+    .get('account_id','paper-default') did, so a single-account / live-injected log is
+    byte-identical (the resolution only CHANGES behavior for the reactor_metadata-only
+    persisted shape)."""
+    from hermes_quant.state.fill_delta_normalizer import _bucket
+
+    rec = _r(asset="AAPL", acct="paper-default", fill_size_pct=0.05)
+    assert _bucket(rec) == ("paper-default", "equity", "AAPL")
+    # Top-level wins over a conflicting reactor_metadata account (runtime-injected shape).
+    rec2 = dict(rec)
+    rec2["reactor_metadata"] = {"account_id": "alpaca-paper"}
+    assert _bucket(rec2) == ("paper-default", "equity", "AAPL")
