@@ -264,6 +264,102 @@ def test_self_oversized_family_silenced_on_empty_book(
 
 
 # --------------------------------------------------------------------------- #
+# cs65 — the multileg cap pos_map must key on the canonical (asset_class, symbol)
+# key, NOT the bare symbol. A book with an equity AND a us_option on the SAME
+# underlying must contribute BOTH |quantities| to gross. Pre-fix the bare-symbol
+# pos_map SUMS the two signed quantities into one bucket — a long equity + short
+# option net toward zero magnitude, under-counting the book's true gross and
+# leaving phantom headroom that wrongly admits an over-cap family.
+# --------------------------------------------------------------------------- #
+def _cross_asset_class_collision_state_db(
+    tmp_path, monkeypatch, *, equity_qty: float, option_qty: float
+):
+    """A book carrying TWO distinct canonical positions on the SAME underlying
+    (SPY): ("equity", "SPY") and ("us_option", "SPY"). Their TRUE gross is
+    abs(equity_qty) + abs(option_qty); the buggy bare-symbol collapse sums the
+    signed quantities into one bucket and computes abs(equity_qty + option_qty)."""
+    db = tmp_path / "state.db"
+    ps = PortfolioState(state_db_path=db)
+
+    class DummyPos:
+        def __init__(self, quantity: float) -> None:
+            self.quantity = quantity
+
+    real_get_positions = ps.get_positions
+
+    def _get_positions(account_id):
+        out = dict(real_get_positions(account_id))
+        out[("equity", "SPY")] = DummyPos(equity_qty)
+        out[("us_option", "SPY")] = DummyPos(option_qty)
+        return out
+
+    ps.get_positions = _get_positions  # type: ignore[method-assign]
+
+    import hermes_quant.state.portfolio_state as ps_mod
+
+    monkeypatch.setattr(ps_mod, "_singleton", ps, raising=False)
+    return ps
+
+
+def test_cross_asset_class_same_symbol_gross_not_collapsed(
+    enabled, tmp_path, monkeypatch
+) -> None:
+    """RED (pre-fix): equity SPY +1.95 and us_option SPY -1.95. The bare-symbol
+    pos_map collapses both into pos_map["SPY"] = 1.95 + (-1.95) = 0.0, so the book
+    reads as ~0% gross with ample headroom and a new CSP family fills UNCLIPPED.
+
+    GREEN (post-fix): keyed on the canonical (asset_class, symbol), the true gross
+    is |1.95| + |1.95| = 3.90 (>> the 200% cap), no remaining headroom, and the
+    family is silenced — exactly as a 390%-gross book should behave."""
+    monkeypatch.setenv("HERMES_QUANT_PORTFOLIO_CAPS", "1")
+    ps = _cross_asset_class_collision_state_db(
+        tmp_path, monkeypatch, equity_qty=1.95, option_qty=-1.95
+    )
+    bus = tmp_path / "executions.jsonl"
+    reactor = MultiLegPaperReactor(executions_path=bus)
+
+    parent = reactor.execute(_csp(), fill_size_pct=0.05)
+
+    meta = parent.reactor_metadata or {}
+    silenced = meta.get("no_fill") is True or meta.get("silenced") is True
+    assert silenced, (
+        "cs65: an equity + same-underlying us_option book (true gross 390%) was "
+        "NOT silenced — the bare-symbol pos_map collapsed the two opposing-sign "
+        "positions to ~0 gross, leaving phantom headroom"
+    )
+    assert parent.fill_size_pct == pytest.approx(0.0)
+    assert "portfolio_cap_" in str(meta.get("silence_reason", ""))
+    assert _read_family(bus) == []
+    assert ("us_option", "NVDA260626P00130000") not in ps.get_positions(
+        "paper-default"
+    )
+
+
+def test_single_asset_class_book_byte_identical(
+    enabled, tmp_path, monkeypatch
+) -> None:
+    """A single-asset-class book (no same-symbol cross-asset-class collision) must
+    behave identically before and after the cs65 fix: a 50%-gross equity-only book
+    leaves ample headroom and the CSP family fills."""
+    monkeypatch.setenv("HERMES_QUANT_PORTFOLIO_CAPS", "1")
+    ps = _near_cap_state_db(tmp_path, monkeypatch, gross_fraction=0.50)
+    bus = tmp_path / "executions.jsonl"
+    reactor = MultiLegPaperReactor(executions_path=bus)
+
+    parent = reactor.execute(_csp(), fill_size_pct=0.05)
+
+    meta = parent.reactor_metadata or {}
+    assert not meta.get("no_fill")
+    assert not meta.get("silenced")
+    assert (
+        ps.get_positions("paper-default")[
+            ("us_option", "NVDA260626P00130000")
+        ].quantity
+        == -1
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Flag ON but cap NOT breached by an empty book — the common case, no regression.
 # --------------------------------------------------------------------------- #
 def test_flag_on_empty_book_fills(enabled, tmp_path, monkeypatch) -> None:

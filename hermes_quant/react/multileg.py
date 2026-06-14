@@ -444,12 +444,26 @@ class MultiLegPaperReactor:
         # Reconstruct the current book's gross from PortfolioState, reading
         # positions as NAV-fraction quantities (ADR-0041), exactly as
         # PaperReactor._portfolio_cap_clip does.
+        #
+        # cs65: key the cap pos_map on the FULL canonical position key
+        # (asset_class, symbol), NOT the bare symbol. get_positions returns a
+        # dict keyed on (asset_class, symbol) — the canonical state.db PK — and
+        # the same underlying can carry TWO distinct positions (an equity AND a
+        # us_option on the same ticker). Collapsing both into one bare-symbol
+        # bucket SUMS their signed quantities before RiskPortfolioState takes
+        # abs() for gross, so a long equity + short option (or vice versa) net to
+        # a smaller (even zero) magnitude and under-count the book's true gross —
+        # phantom headroom that wrongly admits an over-cap family. Keying on the
+        # canonical key keeps the two positions distinct so each contributes its
+        # own |quantity| to gross_exposure_pct. (RiskPortfolioState.positions is
+        # a flat dict[str, float] whose keys are opaque — gross sums abs over
+        # .values() — so a per-canonical-key string is sufficient and correct.)
         try:
             ps = get_portfolio_state()
             positions = ps.get_positions("paper-default")
             pos_map: dict[str, float] = {}
-            for (_asset_class, symbol), position in positions.items():
-                pos_map[symbol] = pos_map.get(symbol, 0.0) + position.quantity
+            for (asset_class, symbol), position in positions.items():
+                pos_map[f"{asset_class}\x1f{symbol}"] = position.quantity
         except Exception as exc:  # noqa: BLE001 — fail-closed: unknown book => silence.
             logger.warning(
                 "multileg-react: cap book read failed (fail-closed silence): %s", exc
