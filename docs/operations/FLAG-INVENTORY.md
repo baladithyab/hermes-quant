@@ -33,15 +33,15 @@
 | `HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG` | `1` | `hermes_quant/data/fundamentals_provider.py:146` |
 | `HERMES_QUANT_GRAPH_MINING` | `0` | `hermes_quant/catalyst/graph_mining.py:157` |
 | `HERMES_QUANT_GROUNDING_ENFORCE` | `0` | `hermes_quant/grounding/enforcement.py:156` |
-| `HERMES_QUANT_HOME` | `` | `hermes_quant/daemon/tick_lock.py:112` |
+| `HERMES_QUANT_HOME` | `` | `hermes_quant/daemon/tick_lock.py:117` |
 | `HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD` | `0.85` | `hermes_quant/research/hypothesis_novelty.py:40` |
 | `HERMES_QUANT_IC_DEDUP_AT_INGEST` | `` | `hermes_quant/factors/alpha_zoo.py:333` |
 | `HERMES_QUANT_IC_DEDUP_THRESHOLD` | `0.99` | `hermes_quant/factors/ic_dedup.py:44` |
 | `HERMES_QUANT_INSIDER_ENABLED` | `0` | `hermes_quant/evidence/adapters/form4.py:82` |
 | `HERMES_QUANT_JOURNAL_PATH` | `` | `hermes_quant/journal/writer.py:32` |
 | `HERMES_QUANT_KNOWLEDGE_CUTOFF` | `` | `hermes_quant/eval/stockbench.py:47` |
-| `HERMES_QUANT_LLM_BUDGET` | `0` | `hermes_quant/agents/llm_budget.py:175` |
-| `HERMES_QUANT_LLM_BUDGET_DIR` | `` | `hermes_quant/agents/llm_budget.py:184` |
+| `HERMES_QUANT_LLM_BUDGET` | `0` | `hermes_quant/agents/llm_budget.py:176` |
+| `HERMES_QUANT_LLM_BUDGET_DIR` | `` | `hermes_quant/agents/llm_budget.py:185` |
 | `HERMES_QUANT_MCP_READS_ENABLED` | `0` | `hermes_quant/data/mcp_bridge.py:194` |
 | `HERMES_QUANT_MEMORY_INJECT` | `1` | `hermes_quant/aggregators/llm_committee.py:312` |
 | `HERMES_QUANT_MEMORY_SPLIT` | `0` | `hermes_quant/aggregators/llm_committee.py:333` |
@@ -72,7 +72,7 @@
 | `HERMES_QUANT_STACKING` | `0` | `hermes_quant/aggregators/bma.py:277` |
 | `HERMES_QUANT_STRUCTURE_SELECT` | `0` | `hermes_quant/options/structure_select.py:111` |
 | `HERMES_QUANT_TICK_LOCK` | `1` | `hermes_quant/react/paper.py:261` |
-| `HERMES_QUANT_TICK_LOCK_TIMEOUT_S` | `` | `hermes_quant/daemon/tick_lock.py:87` |
+| `HERMES_QUANT_TICK_LOCK_TIMEOUT_S` | `` | `hermes_quant/daemon/tick_lock.py:88` |
 | `HERMES_QUANT_TRADER_LLM` | `0` | `hermes_quant/agents/trader.py:504` |
 | `HERMES_QUANT_TREND_VELOCITY` | `0` | `hermes_quant/catalyst/synthesize.py:199` |
 | `HERMES_QUANT_WATCHLIST_CAP_TRIM` | `0` | `hermes_quant/playbook/watchlist_evolution.py:167` |

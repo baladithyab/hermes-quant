@@ -253,16 +253,26 @@ def _current_normalizer_regime() -> int:
 
 def _default_initial_cash() -> float:
     raw = os.environ.get(_INITIAL_CASH_ENV, "")
+    if not raw:
+        return _DEFAULT_INITIAL_CASH
     try:
-        return float(raw) if raw else _DEFAULT_INITIAL_CASH
-    except ValueError:
+        val = float(raw)
+    except (TypeError, ValueError):
+        val = float("nan")
+    # ar10: reject non-finite / <=0. This is the NAV source for every _account_nav_usd;
+    # a non-finite NAV (a `1e400` operator typo silently overflows to inf — NO ValueError)
+    # otherwise CRASHES the tick via math.floor(inf) in the admissibility path, or BYPASSES
+    # the multileg gross cap (gross/inf == 0.0 -> "nothing to cap"). Fail CLOSED to the
+    # documented default + warn. Byte-identical for any finite positive configured value.
+    if not math.isfinite(val) or val <= 0:
         logger.warning(
-            "%s is not a valid float (%r); using default %.2f",
+            "%s is not a finite positive float (%r); using default %.2f",
             _INITIAL_CASH_ENV,
             raw,
             _DEFAULT_INITIAL_CASH,
         )
         return _DEFAULT_INITIAL_CASH
+    return val
 
 
 # ---------------------------------------------------------------------------

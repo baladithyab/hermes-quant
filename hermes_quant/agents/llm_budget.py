@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 from dataclasses import dataclass, field
@@ -442,10 +443,18 @@ def _env_float(name: str) -> float | None:
     if raw is None or raw.strip() == "":
         return None
     try:
-        return float(raw)
+        val = float(raw)
     except ValueError:
         logger.warning("LLMBudgetGuard: ignoring non-numeric %s=%r", name, raw)
         return None
+    # ar10: a NaN ceiling makes `projected > ceiling` always False -> the cost gate
+    # NEVER trips (fail-OPEN). Treat non-finite as 'not set' (None) so the gate keeps
+    # its default behavior rather than silently disabling. (`inf` would also never trip,
+    # but inf is a plausible intentional 'unlimited'; NaN is always a config error.)
+    if not math.isfinite(val):
+        logger.warning("LLMBudgetGuard: ignoring non-finite %s=%r", name, raw)
+        return None
+    return val
 
 
 def _env_int(name: str) -> int | None:

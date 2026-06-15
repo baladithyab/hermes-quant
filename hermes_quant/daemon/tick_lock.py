@@ -64,6 +64,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import logging
+import math
 import os
 import re
 import time
@@ -91,7 +92,11 @@ def _default_timeout_s() -> float:
         val = float(raw)
     except (TypeError, ValueError):
         return DEFAULT_TIMEOUT_S
-    return val if val >= 0.0 else DEFAULT_TIMEOUT_S
+    # ar10: reject non-finite. `inf` (a `1e400` typo) otherwise makes
+    # deadline = monotonic() + inf, so the poll loop's `monotonic() >= deadline`
+    # is never True and a contended lock spin-polls FOREVER instead of returning
+    # contended=True after the short timeout. Fall back to the finite default.
+    return val if (math.isfinite(val) and val >= 0.0) else DEFAULT_TIMEOUT_S
 
 # Poll interval while waiting on a contended lock. Small enough to be responsive,
 # large enough not to busy-spin the CPU.
