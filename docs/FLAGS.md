@@ -1,6 +1,24 @@
 # Hermes-Quant Feature Flags — Inventory & Promotion Plan
 
-> Generated 2026-06-05 from a ground-truth scan of `os.environ.get(...)` reads +
+> **Authoritative flag SoT = [`docs/operations/FLAG-INVENTORY.md`](operations/FLAG-INVENTORY.md)**
+> (GENERATED — `python ops/scripts/quant-flag-inventory.py --write`; a `--check` test gate
+> in `tests/ops/test_flag_inventory_drift.py` fails the build on drift). That generated table
+> is the single source of truth for *every* `HERMES_QUANT_*` flag READ in `hermes_quant/`
+> and its CODE default. **THIS file (FLAGS.md) is a human-curated decision/promotion sheet**
+> for the capability subset — it carries the *judgement* (keep / promote / retire / stays-config)
+> the generated table cannot. When the two disagree on whether a flag EXISTS or its DEFAULT,
+> FLAG-INVENTORY.md wins; fix this sheet, don't fork it.
+>
+> Scope note: FLAG-INVENTORY.md scans `hermes_quant/` only and lists flags that supply a
+> literal/`None` default, so it omits (a) **cron-script-side** flags read in `ops/scripts/*.py`
+> — e.g. `HERMES_QUANT_AUTONOMOUS` / `_AUTONOMOUS_ARMED` (read in `quant-hourly-tick.py`); and
+> (b) flags read WITHOUT an inline default (`environ.get("X") == "1"` membership/path style)
+> — e.g. `PORTFOLIO_CAPS`, `DISSENT_CAP`, `BROKER_BACKEND`, `REGIME_HMM`, `IC_DEDUP_AT_INGEST`,
+> the `*_DIR`/`HOME` path flags. Those are still real flags; they just live outside the
+> generated table's capture and are tracked here. (Expanding the scanner to capture the
+> no-default reads is filed as a follow-up — it is NOT a doc-drift bug.)
+>
+> Originally generated 2026-06-05 from a ground-truth scan of `os.environ.get(...)` reads +
 > flag-constant definitions in `hermes_quant/` (excluding the stale `build/` mirror),
 > cross-referenced against what is currently set in `~/.hermes/.env` and exported in
 > the `~/.hermes/scripts/quant-*-armed.sh` cron wrappers.
@@ -45,8 +63,8 @@ then bake it into the code default and delete the flag line.
 | `HERMES_QUANT_MEMORY_INJECT` | .env=1 | Inject memory lessons into LLM committee | `"1"` | **PROMOTED** (code default `1`; with `MEMORY_SPLIT` — see Tier C). Off-switch: set `=0`. |
 | `HERMES_QUANT_GRAPH_MINING` | .env=1 | Weekly catalyst-graph mining cron | `"0"` | **KEEP** — cheap, but it's a cron-cadence toggle, not a hot-path default. Low priority either way. |
 | `HERMES_QUANT_RESEARCH_LOOP` | .env=1 | Weekly research-loop cron | `"0"` | **KEEP** — same: cron-gated batch job, fine as a flag. |
-| `HERMES_QUANT_WEEKLY_RETRO` | .env=1 | Weekly strategy retro LLM pass | `"0"` | **PROMOTE** — part of the standing retro cadence. |
-| `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | wrapper=v0.2 | Realistic paper fill slippage (`v0.1` passthrough vs `v0.2` model) | `"v0.1"` | **PROMOTE default → `v0.2`** — v0.2 is strictly more honest; passthrough understates cost. This is the clearest promote on the list. |
+| `HERMES_QUANT_WEEKLY_RETRO` | .env=1 | Weekly strategy retro LLM pass | `"1"` | **PROMOTED** (ra09 2026-06-15: code default is now `1` per FLAG-INVENTORY.md — `llm_committee.py:350`). Off-switch: set `=0`. |
+| `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | wrapper=v0.2 | Realistic paper fill slippage (`v0.1` passthrough vs `v0.2` model) | `"v0.2"` | **PROMOTED default → `v0.2`** (ra09 2026-06-15: code default is now `v0.2` per FLAG-INVENTORY.md — `deterministic_equity.py:432`; v0.2 is strictly more honest, passthrough understated cost). |
 | `HERMES_QUANT_PORTFOLIO_CAPS` | wrapper=1 | The 200/100/20 gross/net/cash clip band-aid | (presence) | **RETIRE-ON-PATH** — superseded by BP enforcement (DeterministicEquityReactor + Alpaca). Keep until the deterministic-equity + Alpaca cutover both prove out, then DELETE. It was always a stand-in for broker BP rejection. |
 | `HERMES_QUANT_DETERMINISTIC_EQUITY` | .env=1, wrapper=1 | Route synthetic equity through the BP-enforcing reactor | `"0"` | **NEW (2026-06-05) — bake-then-promote.** Just flipped. After ~1 week of clean ticks, promote default → `1` and retire `PORTFOLIO_CAPS` on this path. |
 | `HERMES_QUANT_ALPACA_SHADOW` | .env=1 | Record Alpaca-vs-synthetic fill divergence (record-only) | (presence) | **TRANSIENT** — a proving-window instrument, not a permanent feature. Turn OFF once the Alpaca cutover completes; do not promote. |
@@ -95,12 +113,14 @@ adopted → **retire**, or (b) a real feature awaiting a decision → **trial th
 > prior ~2 weeks), so the "experiments that never graduated" premise does not hold here.
 > The flags split cleanly into two buckets, NEITHER of which is "delete":
 >
-> **KEEP (16) — already SET in deploy env/wrappers OR a genuine config/safety/cost/test knob (mis-tiered as C):**
+> **KEEP (15) — already SET in deploy env/wrappers OR a genuine config/safety/cost/test knob (mis-tiered as C):**
 > `CONVERGENCE`, `CALIBRATOR_AUTO_REFIT`, `HORIZONS`, `CATALYST_ONBOARDING`, `SATURATION`,
 > `ADMISSIBILITY` (all SET in env/wrappers — live config, not Tier-C); plus the legitimate
-> knobs `TRADER_LLM`, `RESEARCH_DEBATE_ROUNDS`, `WATERMARK_ENABLED`, `PREWARM_WORKERS`,
+> knobs `TRADER_LLM`, `RESEARCH_DEBATE_ROUNDS`, `PREWARM_WORKERS`,
 > `LOAD_TEST` (test/CI-only, 0 src files), `PLAYS_OPEN`, `RESEARCH_RISK_TIER_BLOCK`,
 > `MCP_READS_ENABLED`, `HYPOTHESIS_NOVELTY_THRESHOLD` (config/safety/cost — Tier B by nature).
+> _(ra09 2026-06-15: `WATERMARK_ENABLED` was dropped from this KEEP list — it has been
+> REMOVED from `hermes_quant/` entirely and no longer appears in FLAG-INVENTORY.md. Count 16→15.)_
 >
 > **PROMOTE-CANDIDATE (16–18) — real default-OFF features that change the decision/risk
 > core and need a backtest/replay EVAL before default-on (the flag-ablation harness gates these):**
@@ -137,10 +157,12 @@ adopted → **retire**, or (b) a real feature awaiting a decision → **trial th
 
 ## Recommended next actions (in order)
 
-1. **Promote the proven hot-path defaults** (one PR): flip code defaults for
-   `PAPER_SLIPPAGE_MODEL`→`v0.2`, `SEMANTIC_ENABLED`→`1`, `REFLECTION`→`1`,
-   `MEMORY_INJECT`→`1`, `WEEKLY_RETRO`→`1`. Keep a single-release off-switch each, then
-   delete the `.env`/wrapper lines. Removes 5 lines of config drift.
+1. **Promote the proven hot-path defaults** — DONE in code (ra09 2026-06-15, verified vs
+   FLAG-INVENTORY.md): `PAPER_SLIPPAGE_MODEL`=`v0.2`, `SEMANTIC_ENABLED`=`1`, `REFLECTION`=`1`,
+   `MEMORY_INJECT`=`1`, `WEEKLY_RETRO`=`1` are now the code defaults (each retains a single
+   off-switch via `=0`/`=v0.1`). Remaining cleanup: delete the now-redundant `.env`/wrapper
+   lines that re-assert these (removes 5 lines of config drift). The code-default flip itself
+   is closed.
 2. **Bake DETERMINISTIC_EQUITY** after ~1 week of clean autonomous ticks → default `1`,
    then **delete PORTFOLIO_CAPS** from the wrapper (BP enforcement replaces it).
 3. **Triage Tier C** — DONE (2026-06-06, two-reviewer audit): **RETIRE set is empty.** Every
