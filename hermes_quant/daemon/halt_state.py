@@ -165,32 +165,49 @@ class HaltStateSQLite:
         until = halted_until.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if halted_until is not None else None
 
         with self._lock, self._conn() as conn:
-            # Reject if active halt exists at this exact scope
-            row = conn.execute(
-                "SELECT halt_epoch FROM halts "
-                "WHERE account_id=? AND asset_class=? AND asset=? "
-                "AND cleared_at IS NULL",
-                scope,
-            ).fetchone()
-            if row is not None:
-                raise ValueError(
-                    f"active halt already exists at scope {scope} "
-                    f"(epoch {row['halt_epoch']}); resume first or use different scope"
+            # ar04: BEGIN IMMEDIATE acquires the SQLite write lock at transaction
+            # start, eliminating the cross-PROCESS check-then-insert race (the
+            # process-local RLock above only serializes threads). Mirrors the
+            # established pattern at state/portfolio_state.py:910. Without it, two
+            # concurrent add_halt() at the same scope both pass the active-halt
+            # SELECT and the loser's INSERT raises a raw sqlite3.IntegrityError on
+            # the UNIQUE PK — which is NOT a ValueError, so it escapes the CLI's
+            # `except ValueError` and crashes emergency-stop BEFORE the bus signal.
+            # With it, the 5s busy_timeout serializes the loser, which then sees the
+            # winner's committed row and hits the ValueError guard below.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Reject if active halt exists at this exact scope
+                row = conn.execute(
+                    "SELECT halt_epoch FROM halts "
+                    "WHERE account_id=? AND asset_class=? AND asset=? "
+                    "AND cleared_at IS NULL",
+                    scope,
+                ).fetchone()
+                if row is not None:
+                    raise ValueError(
+                        f"active halt already exists at scope {scope} "
+                        f"(epoch {row['halt_epoch']}); resume first or use different scope"
+                    )
+
+                # Compute next epoch (max + 1, default 1)
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(halt_epoch), 0) AS max_e FROM halts "
+                    "WHERE account_id=? AND asset_class=? AND asset=?",
+                    scope,
+                ).fetchone()
+                next_epoch = (row["max_e"] or 0) + 1
+
+                conn.execute(
+                    "INSERT INTO halts (account_id, asset_class, asset, reason, "
+                    "halted_at, halted_until, halt_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (*scope, reason, now, until, next_epoch),
                 )
-
-            # Compute next epoch (max + 1, default 1)
-            row = conn.execute(
-                "SELECT COALESCE(MAX(halt_epoch), 0) AS max_e FROM halts "
-                "WHERE account_id=? AND asset_class=? AND asset=?",
-                scope,
-            ).fetchone()
-            next_epoch = (row["max_e"] or 0) + 1
-
-            conn.execute(
-                "INSERT INTO halts (account_id, asset_class, asset, reason, "
-                "halted_at, halted_until, halt_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (*scope, reason, now, until, next_epoch),
-            )
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            else:
+                conn.execute("COMMIT")
 
         record = HaltRecord(
             account_id=scope[0],

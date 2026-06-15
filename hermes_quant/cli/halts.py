@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sqlite3
 import sys
 
 import pandas as pd
@@ -77,6 +78,13 @@ def cmd_halt(args: argparse.Namespace) -> int:
         return 0
     except ValueError as e:
         print(f"halt failed: {e}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as e:
+        # ar04: a concurrent writer won the add_halt BEGIN IMMEDIATE race — the
+        # raw sqlite error is not a ValueError. For an explicit `halt` command
+        # (not emergency-stop) this is a genuine failure to install THIS halt, so
+        # report it non-zero — but with a clear contention message, not a crash.
+        print(f"halt failed (write contended by a concurrent halt): {e}", file=sys.stderr)
         return 1
 
 
@@ -151,6 +159,15 @@ def cmd_emergency_stop(args: argparse.Namespace) -> int:
         # Existing halt blocks add_halt; that's fine for emergency-stop —
         # it means a halt is already active. Continue with bus signal + broker.
         print(f"halt already active (continuing): {e}", file=sys.stderr)
+    except sqlite3.Error as e:
+        # ar04: a concurrent emergency-stop (or any writer) may win the BEGIN
+        # IMMEDIATE race and leave this process a sqlite contention loser
+        # (IntegrityError on the UNIQUE PK, or OperationalError on busy-timeout).
+        # That is NOT a ValueError, so it would otherwise crash us BEFORE the
+        # Step-2 bus signal and defeat the HALT-FIRST ordering. Treat it as
+        # "a halt is being installed by a concurrent operator" and CONTINUE —
+        # the winner's durable halt is committed; we still emit our bus signal.
+        print(f"halt write contended (continuing — a concurrent halt won): {e}", file=sys.stderr)
 
     # Step 2: halt signal on bus
     halt_signal = {
