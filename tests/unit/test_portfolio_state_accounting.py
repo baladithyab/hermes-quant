@@ -263,9 +263,12 @@ def test_marked_equity_zero_avg_entry_price_skipped(tmp_path) -> None:
     # Even with a mark, this position is skipped
     result = ps.get_marked_equity("paper-default", {"ZERO": 100.0})
 
-    # Position exists but contributes zero unrealized (skipped)
+    # Position exists but contributes zero unrealized (skipped at the avg guard)
     assert result.total_unrealized == 0.0
-    assert result.n_positions == 1
+    # cs32: n_positions now counts only CONSIDERED rows (avg_entry_price > 0). The sole
+    # bad-avg row is skipped before n_considered increments, so the considered count is
+    # 0 (was len(positions)==1 before the cs32 denominator fix).
+    assert result.n_positions == 0
     assert result.n_marked == 0  # skipped before marking
     assert result.equity_basis == "entry"
 
@@ -487,6 +490,198 @@ def test_equity_total_long_byte_identical_across_flag(tmp_path, monkeypatch):
     # A long debits cash by the notional then adds it back as an asset -> NAV-neutral
     # at entry in BOTH regimes (cash 99_980 + 0.2*100 = 100_000).
     assert eq_off == 100_000.0, f"long equity_total {eq_off} unexpected (NAV-neutral at entry)"
+
+
+# ---------------------------------------------------------------------------
+# cs3x: get_marked_equity read-time MTM correctness (unit basis + guards + keying).
+#
+# get_marked_equity (the read-side MTM report consumed by cli/status.py) hardcoded
+# the NAV-FRACTION basis for EVERY position, ignored asset_class for both the unit
+# and the mark lookup, did not guard a NaN/non-positive mark (which poisons the
+# whole-account marked_equity to NaN), and counted avg<=0 skipped rows in the
+# equity_basis denominator. Each defect below has a RED proof (fails pre-fix) and
+# the legacy NAV-fraction / symbol-only paths are locked byte-identical.
+# ---------------------------------------------------------------------------
+
+
+def _opt_marked_rec(asset, asset_class, qty, price, prop):
+    """Seed a true-unit (reactor_metadata.quantity) position for marked-equity tests.
+
+    Mirrors test_option_cash_uses_contract_multiplier_x100's _rec helper: an option
+    leg carries SIGNED real contracts (us_option) or shares (equity) in
+    reactor_metadata.quantity, persisted in the true unit rather than a NAV fraction.
+    """
+    return {
+        "account_id": "t",
+        "asset": asset,
+        "asset_class": asset_class,
+        "fill_price": price,
+        "fill_size_pct": 0.0,
+        "asof_execution": "2026-06-05T12:00:00Z",
+        "proposal_id": prop,
+        "reactor_metadata": {"quantity": qty},
+    }
+
+
+def test_marked_equity_us_option_uses_contract_basis(tmp_path):
+    """cs31/cs33 RED: a us_option position is tracked in REAL CONTRACTS, so its MTM
+    must be contracts * _CONTRACT_MULTIPLIER * (mark - avg), NOT the NAV-fraction
+    basis. 1 contract avg 2.00 mark 3.00 -> +100.0 (1*100*(3-2)), not the +50000
+    the NAV-fraction formula (1*nav_ref*(3/2-1)) produced (a 500x overstatement)."""
+    from hermes_quant.state.portfolio_state import _CONTRACT_MULTIPLIER
+
+    ps = PortfolioState(state_db_path=tmp_path / "s.db")
+    ps.apply_execution(
+        _opt_marked_rec("AAPL260101C00150000", "us_option", 1.0, 2.00, "opt1")
+    )
+    result = ps.get_marked_equity("t", {"AAPL260101C00150000": 3.00})
+
+    expected = 1.0 * _CONTRACT_MULTIPLIER * (3.00 - 2.00)  # = +100.0
+    assert abs(result.total_unrealized - expected) < 1e-9, (
+        f"us_option MTM {result.total_unrealized} != {expected} "
+        "(cs31: must use the contract basis, not the NAV-fraction formula)"
+    )
+    assert result.n_marked == 1
+    assert result.equity_basis == "mark"
+
+
+def test_marked_equity_nan_mark_skipped_account_finite(tmp_path):
+    """cs34a RED: a NaN mark must NOT poison the whole-account marked_equity to NaN.
+    Two equity legs marks {GOOD:55, BAD:nan} -> the bad leg is skipped (not marked),
+    marked_equity stays finite, n_marked == 1."""
+    import math
+
+    ps = PortfolioState(state_db_path=tmp_path / "s.db")
+    ps.apply_execution(
+        _opt_marked_rec("GOOD", "equity", 10.0, 50.0, "good")
+    )
+    ps.apply_execution(
+        _opt_marked_rec("BAD", "equity", 10.0, 50.0, "bad")
+    )
+    result = ps.get_marked_equity("t", {"GOOD": 55.0, "BAD": float("nan")})
+
+    assert math.isfinite(result.marked_equity), (
+        f"marked_equity {result.marked_equity} not finite (cs34: NaN mark must be skipped)"
+    )
+    assert math.isfinite(result.total_unrealized)
+    assert result.n_marked == 1, "cs34: a NaN mark must not be counted as marked"
+
+
+def test_marked_equity_nonpositive_mark_skipped(tmp_path):
+    """cs34b RED: a 0 or negative mark is nonsense and must be skipped (not booked).
+    mark=0 today books qty*nav_ref*(0/avg-1) = -qty*nav_ref of phantom loss."""
+    ps = PortfolioState(state_db_path=tmp_path / "s.db")
+    ps.apply_execution(
+        _opt_marked_rec("Z", "equity", 1.0, 50.0, "z")
+    )
+    # mark == 0 -> skip
+    r0 = ps.get_marked_equity("t", {"Z": 0.0})
+    assert r0.total_unrealized == 0.0, (
+        f"mark=0 leg booked {r0.total_unrealized} (cs34: non-positive mark must be skipped)"
+    )
+    assert r0.n_marked == 0
+    assert r0.equity_basis == "entry"
+
+    # mark < 0 -> skip
+    rneg = ps.get_marked_equity("t", {"Z": -5.0})
+    assert rneg.total_unrealized == 0.0, (
+        f"mark<0 leg booked {rneg.total_unrealized} (cs34: negative mark must be skipped)"
+    )
+    assert rneg.n_marked == 0
+
+
+def test_marked_equity_same_underlying_distinct_marks(tmp_path):
+    """cs35 RED: an equity AAPL and a us_option AAPL persist under distinct PKs
+    (asset_class differs). The mark lookup must key on (asset_class, symbol) so the
+    option is marked at its premium and the equity at its share price — not both at
+    the same symbol-only mark."""
+    from hermes_quant.state.portfolio_state import _CONTRACT_MULTIPLIER
+
+    ps = PortfolioState(state_db_path=tmp_path / "s.db")
+    ps.apply_execution(
+        _opt_marked_rec("AAPL", "equity", 10.0, 100.0, "aapl_eq")
+    )
+    ps.apply_execution(
+        _opt_marked_rec("AAPL", "us_option", 1.0, 2.00, "aapl_opt")
+    )
+
+    marks = {("equity", "AAPL"): 110.0, ("us_option", "AAPL"): 3.00}
+    result = ps.get_marked_equity("t", marks)
+
+    nav = result.cost_basis_equity
+    eq_leg = 10.0 * nav * (110.0 / 100.0 - 1.0)  # equity NAV-fraction basis
+    opt_leg = 1.0 * _CONTRACT_MULTIPLIER * (3.00 - 2.00)  # +100.0 contract basis
+    assert abs(result.total_unrealized - (eq_leg + opt_leg)) < 1e-6, (
+        f"distinct-mark total {result.total_unrealized} != {eq_leg + opt_leg} "
+        "(cs35: composite (asset_class,symbol) keying)"
+    )
+    assert result.n_marked == 2
+
+
+def test_marked_equity_symbol_only_dict_unchanged(tmp_path):
+    """cs35 BYTE-IDENTITY: a plain symbol-keyed marks dict (the existing contract)
+    must still mark via the symbol-only fallback. Locks the all-equity book to the
+    UNCHANGED NAV-fraction formula."""
+    ps = PortfolioState(state_db_path=tmp_path / "s.db")
+    ps.apply_execution(
+        _exec_rec(asset="AAPL", fill_size_pct=0.2, fill_price=100.0, proposal_id="aapl")
+    )
+    result = ps.get_marked_equity("paper-default", {"AAPL": 110.0})
+
+    nav = result.cost_basis_equity
+    expected = 0.2 * nav * (110.0 / 100.0 - 1.0)  # the UNCHANGED :1187 formula
+    assert abs(result.total_unrealized - expected) < 1e-9, (
+        f"symbol-only fallback {result.total_unrealized} != {expected} "
+        "(cs35: a symbol-keyed dict must still mark)"
+    )
+    assert result.n_marked == 1
+    assert result.equity_basis == "mark"
+
+
+def test_marked_equity_one_bad_avg_reads_mark(tmp_path):
+    """cs32 RED: a book with one valid (marked) leg + one avg<=0 leg (skipped at the
+    avg guard) must report equity_basis == 'mark' (every CONSIDERED leg is marked),
+    not 'mixed'. The bad-avg row must not inflate the basis denominator."""
+    ps = PortfolioState(state_db_path=tmp_path / "s.db")
+    ps.apply_execution(
+        _exec_rec(asset="GOOD", fill_size_pct=0.2, fill_price=50.0, proposal_id="good")
+    )
+    ps.apply_execution(
+        _exec_rec(asset="BAD", fill_size_pct=0.2, fill_price=0.0, proposal_id="bad")
+    )
+    result = ps.get_marked_equity("paper-default", {"GOOD": 55.0})
+
+    assert result.equity_basis == "mark", (
+        f"equity_basis {result.equity_basis!r} != 'mark' "
+        "(cs32: the avg<=0 skipped row must not count toward the basis denominator)"
+    )
+    assert result.n_positions == 1, "cs32: n_positions counts only considered rows"
+    assert result.n_marked == 1
+
+
+def test_marked_equity_legacy_navfraction_unchanged(tmp_path):
+    """cs31 BYTE-IDENTITY: an all-equity NAV-fraction book fully marked is unchanged
+    by the unit branch (asset_class != 'us_option' uses the legacy formula). Locks
+    a mixed long/short book to the UNCHANGED :1187 formula."""
+    ps = PortfolioState(state_db_path=tmp_path / "s.db")
+    ps.apply_execution(
+        _exec_rec(asset="A", fill_size_pct=0.2, fill_price=50.0, proposal_id="a")
+    )
+    ps.apply_execution(
+        _exec_rec(asset="B", fill_size_pct=-0.3, fill_price=80.0, proposal_id="b")
+    )
+    marks = {"A": 55.0, "B": 72.0}
+    result = ps.get_marked_equity("paper-default", marks)
+
+    nav = result.cost_basis_equity
+    expected = 0.2 * nav * (55.0 / 50.0 - 1.0) + (-0.3) * nav * (72.0 / 80.0 - 1.0)
+    assert abs(result.total_unrealized - expected) < 1e-9, (
+        f"legacy NAV-fraction book {result.total_unrealized} != {expected} "
+        "(cs31: all-equity book must be byte-identical)"
+    )
+    assert result.equity_basis == "mark"
+    assert result.n_positions == 2
+    assert result.n_marked == 2
 
 
 def test_equity_total_us_option_short_signed_navneutral(tmp_path, monkeypatch):

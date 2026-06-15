@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -1135,7 +1136,7 @@ class PortfolioState:
     def get_marked_equity(
         self,
         account_id: str,
-        mark_prices: dict[str, float],
+        mark_prices: dict[str | tuple[str, str], float],
         *,
         nav_ref: float | None = None,
     ) -> MarkedEquity:
@@ -1146,19 +1147,31 @@ class PortfolioState:
 
         Args:
             account_id: Account identifier.
-            mark_prices: dict mapping symbol → current mark price. Positions
-                without an entry in this dict fall back to avg_entry_price.
-            nav_ref: NAV reference against which position weights are sized.
-                Defaults to cash.equity_total (cost-basis equity) or
+            mark_prices: dict mapping the position's mark key → current mark price.
+                The key may be the bare ``symbol`` (legacy contract) OR the composite
+                ``(asset_class, symbol)`` tuple — the composite key is tried first and
+                the bare symbol is the fallback, so an equity and a us_option on the
+                SAME underlying (distinct PK rows) can carry distinct marks (cs35).
+                Positions without an entry fall back to avg_entry_price (no P&L).
+            nav_ref: NAV reference against which NAV-fraction position weights are
+                sized. Defaults to cash.equity_total (cost-basis equity) or
                 _default_initial_cash() if no cash record exists yet.
 
         Returns:
             MarkedEquity with marked_equity = cost_basis_equity + total_unrealized.
+            n_positions counts only CONSIDERED rows (avg_entry_price > 0); rows
+            skipped at the avg guard do not inflate the equity_basis denominator
+            (cs32).
 
         Notes:
-            Position.quantity is a SIGNED NAV-FRACTION (e.g., -0.2 = 20% short).
-            unrealized_i = quantity_i * nav_ref * (mark_i / entry_i - 1).
-            Shorts profit when mark < entry (quantity is negative, ratio < 1).
+            For a NAV-FRACTION equity row Position.quantity is a SIGNED weight (e.g.,
+            -0.2 = 20% short) and unrealized_i = quantity_i * nav_ref *
+            (mark_i / entry_i - 1) — shorts profit when mark < entry. A us_option row
+            persists Position.quantity in REAL CONTRACTS, so it is marked on the
+            per-contract premium basis: contracts_i * _CONTRACT_MULTIPLIER *
+            (mark_i - entry_i) — i.e. ×100 shares per contract (cs31). A mark that is
+            None, non-finite, or non-positive is skipped (not marked) so a single bad
+            mark cannot poison the whole-account marked_equity (cs34).
         """
         cash = self.get_cash(account_id)
         cost_basis_equity = cash.equity_total if cash else _default_initial_cash()
@@ -1174,24 +1187,51 @@ class PortfolioState:
         positions = self.get_positions(account_id)
         total_unrealized = 0.0
         n_marked = 0
+        # cs32: count only positions actually CONSIDERED (avg_entry_price > 0). A row
+        # skipped at the avg guard below must not inflate the equity_basis denominator
+        # — otherwise a book whose every valid leg is marked reads 'mixed', and a book
+        # with a sole bad-avg row can never read 'mark'.
+        n_considered = 0
 
         for pos in positions.values():
-            # Guard: skip positions with invalid avg_entry_price
+            # Guard: skip positions with invalid avg_entry_price (division by zero).
+            # NOT considered, NOT marked.
             if pos.avg_entry_price <= 0:
                 continue
+            n_considered += 1
 
-            mark = mark_prices.get(pos.symbol)
-            if mark is not None:
-                n_marked += 1
-                # Signed MTM: quantity carries sign, shorts profit when mark < entry
+            # cs35: an equity and a us_option on the SAME underlying persist under
+            # distinct PK rows (asset_class differs). Key the mark lookup on the
+            # composite (asset_class, symbol) first, falling back to the bare symbol so
+            # a legacy symbol-keyed marks dict still resolves byte-identically.
+            mark = mark_prices.get((pos.asset_class, pos.symbol))
+            if mark is None:
+                mark = mark_prices.get(pos.symbol)
+            if mark is None:
+                # No mark → fall back to avg_entry_price → zero unrealized contribution.
+                continue
+            # cs34: a None mark is already handled above; a non-finite (NaN/inf) or
+            # non-positive mark is nonsense — booking it would either poison the whole
+            # account marked_equity to NaN or book a phantom -quantity*nav_ref loss.
+            # Skip it WITHOUT incrementing n_marked (it falls back to entry).
+            if not math.isfinite(mark) or mark <= 0:
+                continue
+            n_marked += 1
+            # cs31: a us_option row's quantity is REAL CONTRACTS (the true-unit fold),
+            # so its MTM is contracts × _CONTRACT_MULTIPLIER × (mark - entry) — the
+            # per-contract premium basis (mirrors the equity_total write fold's ×100).
+            # Every other class is the legacy NAV-fraction signed weight (UNCHANGED):
+            # quantity carries sign, shorts profit when mark < entry.
+            if pos.asset_class == "us_option":
+                unrealized_i = pos.quantity * _CONTRACT_MULTIPLIER * (mark - pos.avg_entry_price)
+            else:
                 unrealized_i = pos.quantity * nav_ref * (mark / pos.avg_entry_price - 1.0)
-                total_unrealized += unrealized_i
-            # else: no mark → fall back to avg_entry_price → zero unrealized contribution
+            total_unrealized += unrealized_i
 
         marked_equity = cost_basis_equity + total_unrealized
 
-        # Determine equity_basis flag
-        n_positions = len(positions)
+        # Determine equity_basis flag (cs32: denominator = considered rows, not raw len)
+        n_positions = n_considered
         if n_positions == 0:
             equity_basis = "entry"  # no positions → no marks needed
         elif n_marked == n_positions:
