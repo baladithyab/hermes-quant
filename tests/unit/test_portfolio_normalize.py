@@ -331,3 +331,49 @@ def test_normalize_targets_deterministic() -> None:
     r1 = normalize_targets(targets, state, caps)
     r2 = normalize_targets(targets, state, caps)
     assert r1 == r2
+
+
+# ---------------------------------------------------------------------------
+# ar03 — a NON-FINITE existing book must fail CLOSED (silence all new picks),
+# not silently no-op the cap. (Archaeology wave-2: a NaN target_position_pct in
+# the book made `g_room <= 0` evaluate False — every NaN comparison is False —
+# so the breach guard was a silent no-op and every new pick fired at full size.)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_targets_nan_book_fails_closed() -> None:
+    """A NaN in the existing book silences ALL new picks (was: fired at full size)."""
+    state = PortfolioState(positions={"XYZ": float("nan"), "AAPL": 0.10})
+    assert not math.isfinite(state.gross_exposure_pct)
+    out = normalize_targets([("AAPL", 0.10), ("MSFT", 0.10)], state, PortfolioCaps())
+    assert all(not nt.fired for nt in out), "NaN book must silence every new pick"
+    assert all(nt.portfolio_target_pct == 0.0 for nt in out)
+    assert all("nonfinite" in (nt.silence_reason or "") for nt in out), [
+        nt.silence_reason for nt in out
+    ]
+
+
+def test_normalize_targets_priority_rank_nan_book_fails_closed() -> None:
+    """The priority_rank policy must also fail closed on a NaN book."""
+    state = PortfolioState(positions={"XYZ": float("nan")})
+    caps = PortfolioCaps(normalization="priority_rank")
+    out = normalize_targets([("AAPL", 0.20), ("MSFT", 0.20), ("TSLA", 0.20)], state, caps)
+    assert all(not nt.fired for nt in out), "priority_rank NaN book must silence every pick"
+
+
+def test_clip_one_nan_book_fails_closed() -> None:
+    """The greedy single-fire path must fail closed on a NaN book."""
+    state = PortfolioState(positions={"XYZ": float("nan")})
+    nt = clip_one_to_remaining_headroom("AAPL", 0.10, state, PortfolioCaps())
+    assert nt.fired is False
+    assert nt.portfolio_target_pct == 0.0
+    assert "nonfinite" in (nt.silence_reason or "")
+
+
+def test_finite_book_is_byte_identical_after_guard() -> None:
+    """A finite book is unaffected by the guard — a normal in-headroom pick still fires."""
+    state = PortfolioState(positions={"AAPL": 0.10})
+    nt = clip_one_to_remaining_headroom("MSFT", 0.10, state, PortfolioCaps())
+    assert nt.fired is True
+    out = normalize_targets([("MSFT", 0.10)], state, PortfolioCaps())
+    assert out[0].fired is True

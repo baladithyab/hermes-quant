@@ -24,6 +24,7 @@ Forward compatibility:
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from hermes_quant.risk.portfolio_normalize import PortfolioState
@@ -150,9 +151,15 @@ def reconstruct_portfolio_state(
         prior = latest_per_symbol.get(asset)
         if prior is None or ts >= prior[0]:
             try:
-                latest_per_symbol[asset] = (ts, float(target))
+                t_val = float(target)
             except (TypeError, ValueError):
                 continue
+            # ar03: drop a non-finite target (a bareword NaN/Infinity in the bus
+            # would otherwise poison gross_exposure_pct and silently defeat the
+            # downstream portfolio-cap breach test). Fail-closed at the source.
+            if not math.isfinite(t_val):
+                continue
+            latest_per_symbol[asset] = (ts, t_val)
 
     positions: dict[str, float] = {}
     for asset, (_ts, t) in latest_per_symbol.items():

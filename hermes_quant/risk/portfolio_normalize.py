@@ -31,6 +31,7 @@ them. That's the rebalancer's job (ADR-0035 wave-4).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from hermes_quant.pdr_core.portfolio_snapshot import CorePortfolioSnapshot
@@ -131,6 +132,25 @@ class PortfolioState(CorePortfolioSnapshot):
 # ---------------------------------------------------------------------------
 
 
+def _book_is_finite(state: PortfolioState) -> bool:
+    """ar03: every breach test in this module is a `<= 0` comparison, and EVERY
+    comparison against a NaN is False — so a single non-finite position in the
+    existing book would make the cap-breach guards silently no-op and let every
+    new pick fire at full size (a NaN-into-a-cap fail-OPEN, strictly worse than the
+    over-leverage the module was written to catch). The cap layer therefore must
+    fail CLOSED on a non-finite book, mirroring the gate.py `_is_finite_number`
+    discipline. (An Inf book already fails closed via `g_room = max_gross - inf =
+    -inf <= 0`; this guard is the NaN backstop + makes the intent explicit.)"""
+    return math.isfinite(state.gross_exposure_pct) and math.isfinite(state.net_exposure_pct)
+
+
+def _nonfinite_reason(state: PortfolioState) -> str:
+    return (
+        f"nonfinite_book gross={state.gross_exposure_pct} net={state.net_exposure_pct} "
+        "— a non-finite position defeats the cap breach test; failing CLOSED"
+    )
+
+
 def _headroom(state: PortfolioState, caps: PortfolioCaps) -> tuple[float, float, float]:
     """Return (gross_headroom, net_headroom_signed, cash_headroom).
 
@@ -217,6 +237,22 @@ def normalize_targets(
     out: list[NormalizedTarget] = []
     if not per_symbol_targets:
         return out
+
+    # ar03: a non-finite existing book defeats every `<= 0` breach test below
+    # (NaN comparisons are all False) — fail CLOSED before sizing anything.
+    if not _book_is_finite(state):
+        reason = _nonfinite_reason(state)
+        return [
+            NormalizedTarget(
+                asset=asset,
+                per_symbol_target_pct=t,
+                portfolio_target_pct=0.0,
+                scale_factor=0.0,
+                fired=False,
+                silence_reason=reason,
+            )
+            for asset, t in per_symbol_targets
+        ]
 
     g_room, n_room, c_room = _headroom(state, caps)
 
@@ -412,6 +448,18 @@ def clip_one_to_remaining_headroom(
             scale_factor=0.0,
             fired=False,
             silence_reason="zero_target",
+        )
+
+    # ar03: fail CLOSED on a non-finite existing book (a NaN defeats the `<= 0`
+    # breach test below — every NaN comparison is False).
+    if not _book_is_finite(state):
+        return NormalizedTarget(
+            asset=asset,
+            per_symbol_target_pct=per_symbol_target_pct,
+            portfolio_target_pct=0.0,
+            scale_factor=0.0,
+            fired=False,
+            silence_reason=_nonfinite_reason(state),
         )
 
     g_room, n_room, c_room = _headroom(state, caps)
