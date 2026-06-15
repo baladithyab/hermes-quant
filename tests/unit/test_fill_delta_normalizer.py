@@ -18,6 +18,10 @@ The transform, per bucket, over the asof-ordered stream:
 
 from __future__ import annotations
 
+import math
+
+import pytest
+
 from hermes_quant.react.base import SCHEMA_ABSOLUTE_TARGET
 from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
 
@@ -162,3 +166,81 @@ def test_top_level_account_id_resolves_identically_byte_identical_cs64():
     rec2 = dict(rec)
     rec2["reactor_metadata"] = {"account_id": "alpaca-paper"}
     assert _bucket(rec2) == ("paper-default", "equity", "AAPL")
+
+
+# ── cs84: guard the raw-dict float() coercion so a poisoned size never folds into the
+# gate-sized state.db NAV (fl1/cs82 guard Fill.__post_init__, but the production fold
+# reads RAW dicts at portfolio_state.py:662/979 and never constructs a Fill). ──────────
+
+
+def test_cs84_nan_fill_size_pct_does_not_poison_running_net_forever():
+    """RED before the fix: delta_for({'fill_size_pct': NaN}) returned NaN AND poisoned
+    the bucket's running_net so the NEXT valid 0.05 fill ALSO returned NaN forever (the
+    exact carry-forward poisoning fl1 cited). GREEN: the NaN record abstains (delta 0.0,
+    running_net NOT advanced) and the next valid fill is unaffected."""
+    n = FillDeltaNormalizer()
+    d_nan = n.delta_for(_r(fill_size_pct=float("nan")))
+    assert d_nan == 0.0 and not math.isnan(d_nan), "poisoned NaN record must abstain to 0"
+    # The NEXT valid fill in the SAME bucket must be a clean open (0.05), NOT NaN —
+    # i.e. running_net was never poisoned by the abstained record.
+    d_next = n.delta_for(_r(fill_size_pct=0.05))
+    assert d_next == 0.05, f"running_net poisoned: next valid fill returned {d_next!r}"
+
+
+def test_cs84_inf_fill_size_pct_abstains():
+    n = FillDeltaNormalizer()
+    assert n.delta_for(_r(fill_size_pct=float("inf"))) == 0.0
+    assert n.delta_for(_r(fill_size_pct=0.05)) == 0.05  # bucket recovered
+
+
+def test_cs84_bool_fill_size_pct_is_not_a_100pct_nav_target():
+    """RED before the fix: delta_for({'fill_size_pct': True}) == 1.0 — a bool read as a
+    100% NAV target (bool subclasses int, so True slips past isfinite). GREEN: abstain."""
+    n = FillDeltaNormalizer()
+    assert n.delta_for(_r(fill_size_pct=True)) == 0.0
+    assert n.delta_for(_r(fill_size_pct=False)) == 0.0
+    # And the bucket is unpoisoned: a real subsequent fill opens cleanly.
+    assert n.delta_for(_r(fill_size_pct=0.05)) == 0.05
+
+
+def test_cs84_bool_quantity_is_not_a_1_contract_target():
+    """RED before the fix: reactor_metadata.quantity=True yielded a 1.0-contract delta
+    (cs82 numeric verdict). GREEN: the quantity lane abstains on the bool too."""
+    n = FillDeltaNormalizer()
+    assert n.delta_for(_r(asset="AAPL", quantity=True)) == 0.0
+    assert n.delta_for(_r(asset="AAPL", quantity=50.0)) == 50.0  # bucket clean afterwards
+
+
+def test_cs84_string_fill_size_pct_not_silently_coerced():
+    """RED before the fix: delta_for({'fill_size_pct': '0.05'}) silently coerced to 0.05.
+    GREEN: a non-numeric raw value abstains (no silent string->float into the NAV)."""
+    n = FillDeltaNormalizer()
+    assert n.delta_for(_r(fill_size_pct="0.05")) == 0.0
+    assert n.delta_for(_r(fill_size_pct=0.05)) == 0.05  # real value still folds
+
+
+def test_cs84_incremental_delta_from_net_fails_closed_on_poison():
+    """The incremental fold (portfolio_state.py:979) calls the module-level delta_from_net
+    on a RAW dict. A poisoned size there must fail CLOSED (raise) — NOT silently fold NaN
+    or a bool-1.0 into the persisted position. The rebuild loop's delta_for abstains; the
+    incremental caller surfaces the raise (it is not a sustained in-memory stream)."""
+    from hermes_quant.state.fill_delta_normalizer import _PoisonedSizeError, delta_from_net
+
+    for bad in (float("nan"), float("inf"), True, "0.05"):
+        with pytest.raises(_PoisonedSizeError):
+            delta_from_net(_r(fill_size_pct=bad), 0.0)
+
+
+def test_cs84_valid_numeric_stream_is_byte_identical():
+    """The ONLY valid production case (real numeric absolute targets) must be untouched by
+    the guard — re-affirm folds to 0, genuine change to the increment, flip to the signed
+    delta. Byte-identical to the pre-guard behavior."""
+    n = FillDeltaNormalizer()
+    assert n.delta_for(_r(fill_size_pct=0.05)) == 0.05
+    assert abs(n.delta_for(_r(fill_size_pct=0.05))) < 1e-12   # re-affirm -> 0
+    assert abs(n.delta_for(_r(fill_size_pct=0.07)) - 0.02) < 1e-12  # +2% ADD
+    assert abs(n.delta_for(_r(fill_size_pct=-0.05)) - (-0.12)) < 1e-12  # flip 7%->-5% = -12%
+    # quantity lane likewise unaffected
+    m = FillDeltaNormalizer()
+    assert m.delta_for(_r(asset="MSFT", quantity=33.33)) == 33.33
+    assert abs(m.delta_for(_r(asset="MSFT", quantity=33.33))) < 1e-12

@@ -35,12 +35,61 @@ module's scope. Within a single unit regime the carry-forward is exact.
 
 from __future__ import annotations
 
+import logging
+import math
+from numbers import Real
 from typing import Any
 
 from hermes_quant.react.base import is_absolute_target_record
 
+logger = logging.getLogger(__name__)
+
 # Bucket key: the same grain the state.db fold and the settlement FIFO use.
 _BucketKey = tuple[str, str, str]
+
+
+class _PoisonedSizeError(ValueError):
+    """A raw size field is non-finite / bool / non-numeric and would poison the
+    carry-forward running_net. Raised by the dict-boundary coercion so the fold
+    fails CLOSED on that one record (silence-by-default: abstain, do NOT fold a
+    poisoned value into running_net)."""
+
+
+def _coerce_size(value: Any, field: str) -> float:
+    """cs84: the SINGLE guarded float() coercion at the raw-dict boundary, mirroring
+    the fl1/cs82 ``Fill.__post_init__`` guard (pdr_core.contracts) — but applied HERE,
+    where the production fold actually reads values. fl1/cs82 protect in-memory ``Fill``
+    construction via ``__post_init__``; the normalizer's production fold
+    (portfolio_state.py:662 rebuild + :979 incremental, under HERMES_QUANT_DELTA_NORMALIZER)
+    consumes RAW executions.jsonl dicts and NEVER constructs a ``Fill``, so that guard
+    never runs on this path. Without this, a NaN ``fill_size_pct`` poisons ``running_net``
+    so every later valid fill in that bucket also returns NaN (the exact poisoning fl1
+    cited), a ``bool`` target reads as a 100% NAV target (``True`` -> 1.0), and a string
+    silently coerces — all into the gate-sized state.db NAV.
+
+    Guard order matches cs82: reject ``bool`` FIRST (in Python ``bool`` subclasses
+    ``int``, so ``True``/``False`` are finite and slip through ``isfinite``), then reject
+    non-``Real`` (string/None/list) BEFORE float() can coerce them, then reject non-finite
+    (NaN/inf). Any failure raises ``_PoisonedSizeError`` so the caller abstains on that
+    record rather than folding the poison forward.
+    """
+    if isinstance(value, bool):
+        raise _PoisonedSizeError(
+            f"{field}={value!r} is a bool, not a real number (a bool slips through "
+            "the isfinite checks and reads as a 100% NAV target -> poisons running_net)."
+        )
+    if not isinstance(value, Real):
+        raise _PoisonedSizeError(
+            f"{field}={value!r} is non-numeric ({type(value).__name__}); refusing to "
+            "float()-coerce a raw size into the carry-forward running_net."
+        )
+    out = float(value)
+    if not math.isfinite(out):
+        raise _PoisonedSizeError(
+            f"{field}={value!r} is non-finite (NaN/inf); a poisoned target would make "
+            "every later fill in this bucket return NaN -> corrupts the state.db NAV."
+        )
+    return out
 
 
 def _resolve_account(rec: dict[str, Any]) -> str:
@@ -95,8 +144,8 @@ def _absolute_size_of(rec: dict[str, Any]) -> float:
     if isinstance(rmeta, dict):
         q = rmeta.get("quantity")
         if q is not None:
-            return float(q)
-    return float(rec.get("fill_size_pct", 0.0))
+            return _coerce_size(q, "reactor_metadata.quantity")
+    return _coerce_size(rec.get("fill_size_pct", 0.0), "fill_size_pct")
 
 
 def delta_from_net(rec: dict[str, Any], current_net: float) -> float:
@@ -146,7 +195,7 @@ class FillDeltaNormalizer:
         if isinstance(rmeta, dict):
             q = rmeta.get("quantity")
             if q is not None:
-                return float(q)
+                return _coerce_size(q, "reactor_metadata.quantity")
         return None
 
     def delta_for(self, rec: dict[str, Any]) -> float:
@@ -162,10 +211,27 @@ class FillDeltaNormalizer:
         difference (the ms1 mixed-schema parity fix).
         """
         key = _bucket(rec)
-        qty = self._quantity_of(rec)
-        # Lane selection mirrors the existing fold: quantity wins when present.
-        net_map = self._net_qty if qty is not None else self._net_pct
-        absolute = qty if qty is not None else float(rec.get("fill_size_pct", 0.0))
+        try:
+            qty = self._quantity_of(rec)
+            # Lane selection mirrors the existing fold: quantity wins when present.
+            net_map = self._net_qty if qty is not None else self._net_pct
+            absolute = (
+                qty if qty is not None
+                else _coerce_size(rec.get("fill_size_pct", 0.0), "fill_size_pct")
+            )
+        except _PoisonedSizeError as exc:
+            # cs84: ABSTAIN on a poisoned raw size (NaN/inf/bool/non-numeric) — skip this
+            # ONE record, return a 0.0 delta (a no-op in every downstream fold), and do
+            # NOT advance running_net (so the next VALID fill in this bucket is unaffected;
+            # without this a single NaN poisoned the carry-forward forever). Silence-by-
+            # default for the valid stream; fail-CLOSED + loud on the bad record so it
+            # never folds into the gate-sized state.db NAV.
+            logger.warning(
+                "FillDeltaNormalizer: abstaining on poisoned record in bucket %s: %s",
+                key,
+                exc,
+            )
+            return 0.0
 
         if not is_absolute_target_record(rec):
             # Already a traded delta — pass it through untouched (do NOT re-difference
