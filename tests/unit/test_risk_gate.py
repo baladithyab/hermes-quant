@@ -643,3 +643,247 @@ class TestStats:
         g = DefaultRiskGate()
         g.gate(_signal(direction=0), _market(), _portfolio(), halt_state)
         assert g.stats()["n_silenced_flat"] == 1
+
+
+# ---------------------------------------------------------------------------
+# cs01: durable HWM drawdown / session-anchored daily-loss circuit breakers
+#
+# The loader collapses peak_equity / daily_open_equity to the inception baseline
+# (initial_cash), so a profitable-from-inception account that suffers a large
+# peak-to-trough fall reports drawdown_pct / daily_loss_pct == 0 (FAIL-OPEN: the
+# breaker silently does not fire). When a DrawdownBaselineStore is injected, the
+# gate recomputes both fractions against the DURABLE high-water-mark peak +
+# session-anchored daily-open and the breaker trips correctly.
+# ---------------------------------------------------------------------------
+
+
+_CS01_ASOF = pd.Timestamp("2026-05-13T12:00:00Z")
+
+
+def _collapsed_portfolio(
+    *,
+    equity: float,
+    asof: pd.Timestamp | None = None,
+    account_id: str = "alpaca-paper",
+    asset_class: str = "crypto",
+) -> Portfolio:
+    """Portfolio whose loader collapsed peak/daily_open to the inception baseline.
+
+    peak_equity == daily_open_equity == equity_total ⇒ reported drawdown_pct == 0
+    and daily_loss_pct == 0 (this is exactly the FAIL-OPEN state the loader
+    produces for a profitable-from-inception account whose current equity is its
+    within-call max). The durable store carries the real HWM / session-open.
+    """
+    if asof is None:
+        asof = _CS01_ASOF
+    return Portfolio(
+        account_id=account_id,
+        asset_class=asset_class,
+        asof=asof,
+        positions={},
+        cash=equity,
+        equity_total=equity,
+        realized_pnl_total=0.0,
+        realized_fees_total=0.0,
+        peak_equity=equity,  # loader collapsed to within-call max
+        daily_open_equity=equity,  # loader collapsed to inception
+    )
+
+
+@pytest.fixture()
+def baseline_store(tmp_path: Path):
+    from hermes_quant.risk.baseline_store import DrawdownBaselineStore
+
+    return DrawdownBaselineStore(
+        db_path=tmp_path / "state.db",
+        mirror_path=tmp_path / "drawdown_baselines.json",
+    )
+
+
+class TestCs01DurableDrawdown:
+    def test_profitable_then_drawdown_fails_open_without_store(self, halt_state):
+        """RED: today (no store) a profitable-from-inception account that fell 20%
+        peak-to-trough does NOT trip Rule 1 — the inception-collapsed baseline
+        reports drawdown 0."""
+        g = DefaultRiskGate()  # no baseline_store → byte-identical to today
+        port = _collapsed_portfolio(equity=104_000.0)
+        assert port.drawdown_pct == 0.0  # the bug: reported drawdown is 0
+        action = g.gate(_signal(direction=0), _market(), port, halt_state)
+        # No drawdown breaker fires (the flat signal silences instead).
+        assert action is None
+        assert g.stats()["n_silenced_drawdown"] == 0
+
+    def test_profitable_then_drawdown_trips_with_store(self, halt_state, baseline_store):
+        """GREEN: with the durable store, the same 20% peak-to-trough fall trips
+        Rule 1 (drawdown vs durable HWM peak = 130k → 0.20 > 0.15)."""
+        # Build the durable HWM history: inception 100k → peak 130k.
+        asof = pd.Timestamp("2026-05-13T12:00:00Z")
+        baseline_store.reconcile("alpaca-paper", "crypto", 100_000.0, asof, "UTC")
+        baseline_store.reconcile("alpaca-paper", "crypto", 130_000.0, asof, "UTC")
+
+        g = DefaultRiskGate(baseline_store=baseline_store)
+        port = _collapsed_portfolio(equity=104_000.0, asof=asof)
+        action = g.gate(_signal(), _market(), port, halt_state)
+        assert action is not None
+        assert action.target_position_pct == 0.0
+        assert action.halt is True
+        assert action.halt_until is None  # drawdown breaker = durable halt
+        assert "drawdown" in action.reason
+        assert "0.2000" in action.reason
+        assert g.stats()["n_silenced_drawdown"] == 1
+
+    def test_session_daily_loss_fails_open_without_store(self, halt_state):
+        """RED: today the session-anchored daily loss is invisible — the
+        inception-collapsed daily_open reports daily_loss 0."""
+        g = DefaultRiskGate()
+        port = _collapsed_portfolio(equity=117_000.0)
+        assert port.daily_loss_pct == 0.0
+        action = g.gate(_signal(direction=0), _market(), port, halt_state)
+        assert action is None
+        assert g.stats()["n_silenced_daily_loss"] == 0
+
+    def test_session_daily_loss_trips_with_store(self, halt_state, baseline_store):
+        """GREEN: with the durable store, a 125k session-open falling to 117k same
+        session trips Rule 2 (daily-loss 0.064 > 0.05) with a session-bounded
+        halt_until == _next_session_open(tz, asof)."""
+        from hermes_quant.risk.gate import _next_session_open
+
+        t_open = pd.Timestamp("2026-05-13T09:30:00Z")
+        t_now = pd.Timestamp("2026-05-13T15:00:00Z")  # same UTC day → same session
+        baseline_store.reconcile("alpaca-paper", "crypto", 125_000.0, t_open, "UTC")
+
+        g = DefaultRiskGate(baseline_store=baseline_store)
+        port = _collapsed_portfolio(equity=117_000.0, asof=t_now)
+        action = g.gate(_signal(), _market(), port, halt_state)
+        assert action is not None
+        assert action.target_position_pct == 0.0
+        assert action.halt is True
+        assert action.halt_until == _next_session_open("UTC", t_now)
+        assert "daily_loss" in action.reason
+        assert g.stats()["n_silenced_daily_loss"] == 1
+
+    def test_fresh_account_byte_identical_no_spurious_trip(self, halt_state, baseline_store):
+        """A fresh account (peak == open == now) must be byte-identical to today:
+        the store-backed gate's action equals the no-store gate's action
+        field-for-field (no spurious trip)."""
+        asof = pd.Timestamp("2026-05-13T12:00:00Z")
+        port = _collapsed_portfolio(equity=100_000.0, asof=asof)
+
+        cfg = RiskConfig(cost_multiple=0.5, min_trade_size=0.0, max_position_pct=0.20)
+        market = _market(volatility=0.02, commission=0.00005, spread=0.00005, slippage=0.00005)
+        signal = _signal(direction=1, magnitude=0.10, confidence=0.90)
+
+        g_no_store = DefaultRiskGate(cfg)
+        g_store = DefaultRiskGate(cfg, baseline_store=baseline_store)
+
+        a_no_store = g_no_store.gate(signal, market, _collapsed_portfolio(equity=100_000.0, asof=asof), halt_state)
+        a_store = g_store.gate(signal, market, port, halt_state)
+
+        # Neither trips the breaker; both emit the SAME action.
+        assert a_no_store is not None
+        assert a_store is not None
+        assert a_store.target_position_pct == a_no_store.target_position_pct
+        assert a_store.halt == a_no_store.halt is False
+        assert a_store.reason == a_no_store.reason
+        assert g_store.stats()["n_silenced_drawdown"] == 0
+        assert g_store.stats()["n_silenced_daily_loss"] == 0
+
+    def test_fresh_account_seeds_store_no_trip(self, halt_state, baseline_store):
+        """First-ever observation (no prior row): store seeds peak=open=equity →
+        drawdown 0 / daily-loss 0 → no trip."""
+        asof = pd.Timestamp("2026-05-13T12:00:00Z")
+        g = DefaultRiskGate(baseline_store=baseline_store)
+        port = _collapsed_portfolio(equity=100_000.0, asof=asof)
+        action = g.gate(_signal(direction=0), _market(), port, halt_state)
+        # Flat signal silences; crucially the breaker did NOT fire.
+        assert action is None
+        assert g.stats()["n_silenced_drawdown"] == 0
+        assert g.stats()["n_silenced_daily_loss"] == 0
+
+    def test_store_read_failure_fails_closed(self, halt_state):
+        """A baseline_store.reconcile that RAISES must not crash gate() and must
+        recompute a baseline AT-LEAST-AS-STRICT as the portfolio's reported
+        values (fail-CLOSED: never weaker). A state that should trip still trips."""
+
+        class _ExplodingStore:
+            def reconcile(self, **kwargs):
+                raise RuntimeError("durable store unreadable")
+
+        g = DefaultRiskGate(baseline_store=_ExplodingStore())
+        # Portfolio whose OWN reported drawdown already exceeds the threshold:
+        # the fail-closed fallback uses portfolio.peak_equity / daily_open_equity,
+        # so the breaker still trips (never weaker than today).
+        port = _portfolio(drawdown=0.20)
+        action = g.gate(_signal(), _market(), port, halt_state)
+        assert action is not None  # did NOT raise
+        assert action.halt is True
+        assert "drawdown" in action.reason
+        assert g.stats()["n_silenced_drawdown"] == 1
+
+    def test_store_read_failure_benign_state_still_passes(self, halt_state):
+        """Fail-closed fallback must not spuriously trip a genuinely benign
+        account (drawdown 0): a store raise falls back to the portfolio's own
+        (zero) baseline, so a flat signal silences normally — no breaker."""
+
+        class _ExplodingStore:
+            def reconcile(self, **kwargs):
+                raise RuntimeError("boom")
+
+        g = DefaultRiskGate(baseline_store=_ExplodingStore())
+        action = g.gate(_signal(direction=0), _market(), _portfolio(drawdown=0.0), halt_state)
+        assert action is None
+        assert g.stats()["n_silenced_drawdown"] == 0
+        assert g.stats()["n_silenced_daily_loss"] == 0
+
+    def test_store_path_non_finite_equity_fails_closed_breaker(self, halt_state, baseline_store):
+        """Non-finite equity through the store path FAILS CLOSED, byte-identical
+        to the no-store path: _pct_from_baseline mirrors protocol.py's
+        NaN-fail-CLOSED 1.0 sentinel (drawdown_pct/daily_loss_pct == 1.0), so
+        Rule-1 trips (flatten + halt). It does NOT silently allow a trade. This
+        matches the property path: a real Portfolio with NaN equity_total reports
+        drawdown_pct == 1.0 too — the store path is a strict mirror."""
+        asof = pd.Timestamp("2026-05-13T12:00:00Z")
+        port = Portfolio(
+            account_id="alpaca-paper",
+            asset_class="crypto",
+            asof=asof,
+            positions={},
+            cash=float("nan"),
+            equity_total=float("nan"),
+            realized_pnl_total=0.0,
+            realized_fees_total=0.0,
+            peak_equity=float("nan"),
+            daily_open_equity=float("nan"),
+        )
+        # The property path itself reports the 1.0 fail-closed sentinel (NOT 0):
+        assert port.drawdown_pct == 1.0
+        assert port.daily_loss_pct == 1.0
+
+        # No-store path: Rule-1 trips on the 1.0 sentinel.
+        g_no_store = DefaultRiskGate()
+        a_no_store = g_no_store.gate(_signal(), _market(), port, halt_state)
+        # Store path: identical fail-closed outcome (flatten + durable halt).
+        g_store = DefaultRiskGate(baseline_store=baseline_store)
+        a_store = g_store.gate(_signal(), _market(), port, halt_state)
+
+        for a in (a_no_store, a_store):
+            assert a is not None
+            assert a.target_position_pct == 0.0
+            assert a.halt is True
+            assert "drawdown" in a.reason  # fail-CLOSED: breaker trips, no trade
+        # Byte-identical reason across both paths.
+        assert a_store.reason == a_no_store.reason
+        assert g_store.stats()["n_silenced_drawdown"] == 1
+
+    def test_direction_invariant_recomputed_ge_reported(self, baseline_store):
+        """Direction invariant: recomputed drawdown_pct >= portfolio.drawdown_pct
+        (the durable baseline can only trip EARLIER / equally)."""
+        asof = pd.Timestamp("2026-05-13T12:00:00Z")
+        baseline_store.reconcile("alpaca-paper", "crypto", 100_000.0, asof, "UTC")
+        baseline_store.reconcile("alpaca-paper", "crypto", 130_000.0, asof, "UTC")
+        g = DefaultRiskGate(baseline_store=baseline_store)
+        port = _collapsed_portfolio(equity=104_000.0, asof=asof)
+        dd, dl = g._durable_breaker_pcts(port, _market())
+        assert dd >= port.drawdown_pct
+        assert dl >= port.daily_loss_pct
+        assert dd == pytest.approx(0.20, abs=1e-9)

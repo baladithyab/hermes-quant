@@ -411,6 +411,7 @@ class DefaultRiskGate:
         config: RiskConfig | None = None,
         *,
         evidence_store: Any = None,
+        baseline_store: Any = None,
     ):
         """
         Args:
@@ -423,9 +424,27 @@ class DefaultRiskGate:
                 tainted by data the gate could not have seen at `signal.asof`.
                 When None (default), the lookahead check is skipped — preserves
                 backward compatibility with existing tests.
+            baseline_store: Optional DrawdownBaselineStore-like object (must
+                expose `.reconcile(account_id, asset_class, equity_total, asof,
+                tz) -> Baseline(peak_equity, daily_open_equity)`). cs01 fix:
+                when provided, the gate reconciles the DURABLE high-water-mark
+                peak and the session-anchored daily-open BEFORE the Rule-1
+                (drawdown) / Rule-2 (daily-loss) circuit breakers, and recomputes
+                drawdown_pct / daily_loss_pct against those durable baselines
+                instead of the loader's inception-collapsed peak_equity /
+                daily_open_equity (which fail-OPEN on a profitable-from-inception
+                account that suffers a large peak-to-trough fall). The durable
+                baselines are conservative-by-construction (HWM never decreases;
+                daily-open re-anchors only at the session boundary), so the
+                breaker can only trip EARLIER / equally — always the safe
+                direction. When None (default), behavior is BYTE-IDENTICAL to
+                today (reads portfolio.drawdown_pct / portfolio.daily_loss_pct
+                directly) — mirrors the evidence_store=None no-op seam so live
+                wiring is a separate operator-gated step.
         """
         self.config = config or RiskConfig()
         self.evidence_store = evidence_store
+        self.baseline_store = baseline_store
         self._cooldowns: dict[tuple[str, str, str], _AssetCooldownState] = {}
         # Action stats for observability
         self._n_actions = 0
@@ -478,6 +497,82 @@ class DefaultRiskGate:
         self._audit_rejection(signal, reason)
         return None
 
+    @staticmethod
+    def _pct_from_baseline(base: Any, equity: Any) -> float:
+        """Recompute a drawdown/daily-loss fraction from a durable baseline.
+
+        Replicates the EXACT formula in protocol.py drawdown_pct (:308-318) /
+        daily_loss_pct (:320-328), including the `base<=0` and non-finite
+        NaN-fail-CLOSED guards, so the recomputed value behaves identically to
+        the property the gate would otherwise read — only the DENOMINATOR is the
+        durable baseline (HWM peak / session-open) rather than the loader's
+        inception-collapsed value. Returns a sentinel >= any plausible threshold
+        (1.0) on a non-finite numerator/denominator so Rule-1/Rule-2 trip on
+        unknowable state (fail-CLOSED), matching the property exactly.
+        """
+        try:
+            b = float(base)
+            eq = float(equity)
+        except (TypeError, ValueError):
+            return 1.0
+        if not (math.isfinite(b) and math.isfinite(eq)) or b <= 0:
+            return 0.0 if (math.isfinite(b) and b <= 0) else 1.0
+        return max(0.0, (b - eq) / b)
+
+    def _durable_breaker_pcts(
+        self,
+        portfolio: Portfolio,
+        market: MarketState,
+    ) -> tuple[float, float]:
+        """cs01 fix: drawdown_pct / daily_loss_pct against DURABLE baselines.
+
+        Reconciles the durable high-water-mark peak + session-anchored daily-open
+        via the injected baseline_store, then recomputes the two circuit-breaker
+        fractions against those baselines. The store call is wrapped fail-CLOSED:
+        any failure falls back to a baseline AT-LEAST-AS-STRICT as today
+        (max(portfolio.peak_equity, equity) for peak; portfolio.daily_open_equity
+        for the session anchor) and a warning, and NEVER raises out of gate().
+
+        Direction invariant: durable peak >= portfolio.peak_equity and durable
+        daily_open >= portfolio.daily_open_equity whenever the loader collapsed
+        them to inception, so the recomputed fractions are >= the portfolio's
+        reported values — the breaker can only trip EARLIER / equally.
+        """
+        equity = portfolio.equity_total
+        try:
+            baseline = self.baseline_store.reconcile(
+                account_id=portfolio.account_id,
+                asset_class=portfolio.asset_class,
+                equity_total=equity,
+                asof=portfolio.asof,
+                tz=market.tz,
+            )
+            peak = baseline.peak_equity
+            daily_open = baseline.daily_open_equity
+        except Exception as e:  # noqa: BLE001 - store failure must fail CLOSED, never raise
+            logger.warning(
+                "baseline_store.reconcile raised (%s) — failing CLOSED to "
+                "at-least-as-strict portfolio baselines",
+                e,
+            )
+            # Fail-CLOSED: never weaker than today. peak >= reported peak (so
+            # recomputed drawdown >= portfolio.drawdown_pct); daily_open = the
+            # portfolio's own session anchor (so recomputed daily_loss >=
+            # portfolio.daily_loss_pct). A non-finite peak/equity still routes to
+            # _flatten_nonfinite_portfolio via the _is_finite_number guard.
+            try:
+                rep_peak = float(portfolio.peak_equity)
+                eq_f = float(equity)
+                peak = max(rep_peak, eq_f) if (
+                    math.isfinite(rep_peak) and math.isfinite(eq_f)
+                ) else portfolio.peak_equity
+            except (TypeError, ValueError):
+                peak = portfolio.peak_equity
+            daily_open = portfolio.daily_open_equity
+        drawdown_pct = self._pct_from_baseline(peak, equity)
+        daily_loss_pct = self._pct_from_baseline(daily_open, equity)
+        return drawdown_pct, daily_loss_pct
+
     def _flatten_nonfinite_portfolio(
         self,
         signal: AggregatedSignal,
@@ -528,9 +623,24 @@ class DefaultRiskGate:
                         reason=f"lookahead_tainted_{result.violations[0].evidence_id}",
                     )
 
+        # cs01 fix: the Rule-1 (drawdown) / Rule-2 (daily-loss) denominators.
+        # When a durable baseline_store is injected, recompute drawdown_pct /
+        # daily_loss_pct against the DURABLE high-water-mark peak + session-
+        # anchored daily-open instead of portfolio.peak_equity /
+        # portfolio.daily_open_equity (which the loader collapses to the
+        # inception baseline → a profitable-from-inception account that suffers a
+        # large peak-to-trough fall fails OPEN). The durable baselines are
+        # conservative-by-construction so the breaker only trips EARLIER /
+        # equally. When baseline_store is None (default) this is BYTE-IDENTICAL
+        # to today — reads the portfolio properties directly. The store path is
+        # fail-CLOSED (never raises out of gate()); the recomputed values still
+        # run the same _is_finite_number → _flatten_nonfinite_portfolio guard.
         try:
-            drawdown_pct = portfolio.drawdown_pct
-            daily_loss_pct = portfolio.daily_loss_pct
+            if self.baseline_store is not None:
+                drawdown_pct, daily_loss_pct = self._durable_breaker_pcts(portfolio, market)
+            else:
+                drawdown_pct = portfolio.drawdown_pct
+                daily_loss_pct = portfolio.daily_loss_pct
         except Exception:  # noqa: BLE001 - unknowable account state fails closed
             return self._flatten_nonfinite_portfolio(signal, portfolio)
         if not _is_finite_number(drawdown_pct) or not _is_finite_number(daily_loss_pct):
