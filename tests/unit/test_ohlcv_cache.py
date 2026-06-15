@@ -1667,3 +1667,266 @@ def test_safe_component_safe_values_byte_identical():
         assert _safe_component(v) == v
     assert _safe_component("") == "unknown"
     assert _safe_component("  ") == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# cs73: MISS-path INTERIOR discontiguity (no flag). cs49 flags a stale right
+# EDGE on the MISS path; cs50 gates INTERIOR contiguity on the HIT path ONLY.
+# Neither covers a MISS that serves a window with a genuinely-UNFILLABLE
+# interior hole: the provider ADVANCES the right edge (cs71's append runs) but
+# CANNOT backfill a delisted stretch / provider short-window / exchange-downtime
+# gap, so the served lookback tail glues bars across the hole and a backtest
+# computes a spurious seam return with NO signal the caller could ABSTAIN on.
+# cs49's right_edge_stale_days flags a stale EDGE; there was no analogous
+# INTERIOR-discontiguity flag on the MISS path. The fix emits
+# ``meta['interior_gap_days']`` + ``meta['served_window_discontiguous']`` using
+# the SAME cs50 contiguity bound, symmetric with cs49. A FILLABLE hole is still
+# HEALED by cs71 (no flag once contiguous); a contiguous window / cutoff=None is
+# byte-identical (flag absent). The fix does NOT refetch (the edge advanced, so
+# cs71's append already ran -- the cs71 boundary).
+# ---------------------------------------------------------------------------
+
+
+def test_cached_fetch_miss_flags_unfillable_interior_hole(tmp_path):
+    """cs73 RED->GREEN: a cache contiguous 01..05 then an UNFILLABLE interior hole
+    (06..14) then edge bars 15,16; a MISS whose provider ADVANCES the edge (adds
+    day 17 == cutoff) but CANNOT backfill 06..14. The served lookback tail glues
+    01..05 to 15,16,17 across the ~10-day interior hole. The right edge is FRESH
+    (advanced to the cutoff) so cs49's right_edge_stale_days correctly does NOT
+    fire -- yet the served window is internally discontiguous with NO signal.
+
+    RED today: no interior flag, caller silently trusts a discontiguous window.
+    GREEN: ``meta['interior_gap_days']`` + ``meta['served_window_discontiguous']``
+    surface the hole so the caller can ABSTAIN.
+    """
+    cache = OhlcvCache("yfinance", "DELISTED", "1d", root=tmp_path, prefer_parquet=False)
+    seg1 = {f"2026-01-{d:02d}": 100 + d for d in range(1, 6)}  # 01..05 contiguous
+    seg2 = {f"2026-01-{d:02d}": 100 + d for d in (15, 16)}  # edge after a 06..14 hole
+    cache.write(_daily_bars_from({**seg1, **seg2}))
+    cutoff = pd.Timestamp("2026-01-17", tz="UTC")
+
+    calls = {"n": 0}
+
+    def fetch():
+        calls["n"] += 1
+        # Provider ADVANCES the edge (day 17) but cannot fill 06..14 (delisted).
+        return _daily_bars_from({"2026-01-17": 117})
+
+    out, meta = cached_fetch(
+        fetch,
+        provider="yfinance",
+        symbol="DELISTED",
+        timeframe="1d",
+        lookback_bars=8,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False
+    # The served window glues 05 -> 15 across the unfillable interior hole.
+    served = out["timestamp"].dt.strftime("%Y-%m-%d").tolist()
+    assert served == ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04",
+                      "2026-01-05", "2026-01-15", "2026-01-16", "2026-01-17"]
+    # The interior-discontiguity honesty flag is present (~10-day hole).
+    assert meta["served_window_discontiguous"] is True
+    assert meta["interior_gap_days"] >= 9
+    # The right EDGE advanced to the cutoff -> cs49's edge flag must NOT fire.
+    assert "right_edge_stale_days" not in meta
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_miss_no_interior_flag_when_hole_is_fillable_cs71(tmp_path):
+    """cs73 boundary vs cs71: a FILLABLE interior hole must be HEALED by cs71 (the
+    backfill is appended -> the served window becomes contiguous) and therefore
+    carry NO interior flag. cs73 flags ONLY a hole that REMAINS after the
+    append+dedup. RED-trap: a naive cs73 that flagged on the PRE-append window
+    would false-flag here even though cs71 healed the hole.
+    """
+    cache = OhlcvCache("yfinance", "SPY", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(_daily_bars_from({"2026-01-01": 100, "2026-01-02": 101, "2026-01-10": 110}))
+    cutoff = pd.Timestamp("2026-01-10", tz="UTC")
+
+    calls = {"n": 0}
+
+    def fetch():
+        calls["n"] += 1
+        # cs71 fillable backfill: interior 03..09 (none past the existing edge).
+        days = pd.date_range("2026-01-03", "2026-01-09", freq="1d", tz="UTC")
+        return pd.DataFrame(
+            {
+                "timestamp": days,
+                "open": 102.0,
+                "high": 102.0,
+                "low": 102.0,
+                "close": 102.0,
+                "volume": 1000.0,
+            }
+        )
+
+    out, meta = cached_fetch(
+        fetch,
+        provider="yfinance",
+        symbol="SPY",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False  # the healing MISS
+    # cs71 healed the hole -> the served window is contiguous (01..10) -> no flag.
+    served = out["timestamp"].dt.strftime("%Y-%m-%d").tolist()
+    assert served == [f"2026-01-{d:02d}" for d in range(1, 11)]
+    assert "interior_gap_days" not in meta
+    assert "served_window_discontiguous" not in meta
+
+
+def test_cached_fetch_miss_no_interior_flag_on_contiguous_window(tmp_path):
+    """cs73 anti-regression: a CONTIGUOUS served MISS window (a dense hourly cache,
+    provider lagging) carries NO interior flag even though cs49's edge flag fires.
+    A legitimate calendar gap inside the window would not flag either (the bound is
+    the cs50 recurrence-aware ``_calendar_bound``).
+    """
+    cache = OhlcvCache("ccxt", "DEAD", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(_bars(5, start="2024-01-01"))  # short warm cache -> MISS by count
+
+    def fetch():
+        return _bars(300, start="2024-01-01")  # dense contiguous, provider lagging
+
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="DEAD",
+        timeframe="1h",
+        lookback_bars=100,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False
+    # Contiguous served window -> no interior flag.
+    assert "interior_gap_days" not in meta
+    assert "served_window_discontiguous" not in meta
+    # cs49 right-edge staleness still fires (the edge is months below the cutoff).
+    assert meta["right_edge_stale_days"] >= 139
+
+
+def test_cached_fetch_miss_interior_flag_respects_calendar_gap(tmp_path):
+    """cs73: a legitimate RECURRING calendar gap (a Fri->Mon weekend) inside the
+    served MISS window must NOT false-flag as a discontiguity. A daily Mon-Fri
+    cache served on a MISS has recurring 3-day weekend gaps; the cs50
+    ``_calendar_bound`` learns the rhythm so the served window is treated as
+    contiguous (no interior flag).
+    """
+    cache = OhlcvCache("alpaca", "DEAD", "1d", root=tmp_path, prefer_parquet=False)
+    # 6 weeks of Mon-Fri daily bars (recurring 3-day weekend gaps); short of count.
+    cache.write(_daily_business_bars("2024-01-01", "2024-01-05"))  # one short week
+
+    def fetch():
+        # Provider supplies a longer Mon-Fri window (recurring weekend gaps), but
+        # its right edge stays months below the cutoff -> MISS persists.
+        return _daily_business_bars("2024-01-01", "2024-02-16")
+
+    cutoff = pd.Timestamp("2024-06-03T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="DEAD",
+        timeframe="1d",
+        lookback_bars=20,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False
+    # Recurring weekend gaps are NOT a discontiguity -> no interior flag.
+    assert "interior_gap_days" not in meta
+    assert "served_window_discontiguous" not in meta
+
+
+def test_cached_fetch_miss_interior_flag_short_tail_single_weekend_no_false_flag(
+    tmp_path,
+):
+    """cs73 calendar-symmetry (mirror cs50): a SHORT served MISS tail that straddles
+    exactly ONE weekend (e.g. ``lookback_bars=3`` -> [Thu, Fri, Mon]) must NOT
+    false-flag as discontiguous.
+
+    The recurrence gate in ``_calendar_bound`` requires a calendar gap to appear
+    >=2 times. A 3-bar served tail contains the Fri->Mon weekend gap only ONCE, so
+    learning the contiguity bound from the served tail ``out`` alone degrades to the
+    canonical 1-day floor and (3-day weekend > 1d*1.5) FALSE-FLAGS a legitimate
+    single-weekend window — a false-abstain, the exact symmetric failure cs58 fixed
+    for the EDGE flag. The fix learns the bound from the BROAD served-source set
+    ``merged`` (the MISS analogue of the cs50 HIT gate's ``eligible``), which carries
+    the recurring rhythm, so the weekend gap is tolerated. The cs50 HIT path serves
+    the identical [Thu, Fri, Mon] shape cleanly; this asserts the MISS path is
+    symmetric.
+
+    RED (pre-fix, bound learned from ``out``): ``served_window_discontiguous`` is
+    wrongly True with ``interior_gap_days == 3``. GREEN (bound from ``merged``): the
+    flag is absent.
+    """
+    cache = OhlcvCache("alpaca", "WKND", "1d", root=tmp_path, prefer_parquet=False)
+    # Two full Mon-Fri weeks already cached (the broad merged set will carry >=2
+    # recurring weekend gaps); short of the requested edge so a MISS is forced.
+    cache.write(_daily_business_bars("2026-01-05", "2026-01-16"))
+
+    def fetch():
+        # Provider ADVANCES the right edge to the next Monday (a fresh weekend gap)
+        # but supplies no genuinely-new interior bars -> the served lookback tail of
+        # 3 bars is [Thu, Fri, Mon], a legitimate single-weekend window.
+        return _daily_business_bars("2026-01-05", "2026-01-19")
+
+    cutoff = pd.Timestamp("2026-01-19T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="WKND",
+        timeframe="1d",
+        lookback_bars=3,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False
+    # Served tail straddles exactly one weekend: [Thu, Fri, Mon].
+    days = list(out["timestamp"].dt.day_name())
+    assert days == ["Thursday", "Friday", "Monday"], days
+    # A single legitimate weekend gap is NOT an interior discontiguity.
+    assert "interior_gap_days" not in meta
+    assert "served_window_discontiguous" not in meta
+    # The edge advanced to the cutoff Monday -> the cs49 edge flag must not fire.
+    assert "right_edge_stale_days" not in meta
+
+
+def test_cached_fetch_miss_interior_flag_cutoff_none_byte_identical(tmp_path):
+    """cs73: cutoff=None (live caller) imposes NO interior-discontiguity flag, even
+    when the served window has an interior hole -> byte-identical to the prior
+    behaviour (no flag).
+    """
+    cache = OhlcvCache("yfinance", "X", "1d", root=tmp_path, prefer_parquet=False)
+    # Short warm cache (2 bars) << lookback so the count gate forces a MISS/fetch.
+    cache.write(_daily_bars_from({"2026-01-01": 101, "2026-01-02": 102}))
+
+    def fetch():
+        # Provider supplies a window with an interior hole (03..14 missing): the
+        # merged served tail is 01,02 then 15,16,17 -> internally discontiguous.
+        return _daily_bars_from(
+            {"2026-01-15": 115, "2026-01-16": 116, "2026-01-17": 117}
+        )
+
+    out, meta = cached_fetch(
+        fetch,
+        provider="yfinance",
+        symbol="X",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=None,
+    )
+    assert meta["cache_hit"] is False
+    # cutoff=None -> the interior flag is never computed (byte-identical).
+    assert "interior_gap_days" not in meta
+    assert "served_window_discontiguous" not in meta

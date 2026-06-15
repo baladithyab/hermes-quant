@@ -583,6 +583,23 @@ def cached_fetch(
     + advances); and emit ``meta['right_edge_stale_days']`` when the merged
     right edge remains beyond ``bound`` of the cutoff so the caller can ABSTAIN.
     ``cutoff=None`` adds no flag and never skips the append.
+
+    MISS INTERIOR DISCONTIGUITY (cs73): cs49 flags a stale right EDGE on the MISS
+    path; cs50 gates INTERIOR contiguity on the HIT path only. Neither covers the
+    case where a MISS serves a window with an unfillable INTERIOR hole: the
+    provider ADVANCES the right edge (cs71's append runs) but a genuinely
+    UNFILLABLE interior hole (delisting stretch, provider short-window,
+    exchange-downtime gap the provider will never return) REMAINS after the
+    append+dedup, so the served lookback tail glues bars across the hole and a
+    backtest computes a spurious seam return with no signal. When ``cutoff`` is
+    set we therefore emit ``meta['interior_gap_days']`` +
+    ``meta['served_window_discontiguous']`` when the SERVED window's max inter-bar
+    gap exceeds the SAME cs50 contiguity bound, so the caller can ABSTAIN —
+    symmetric with ``right_edge_stale_days``. We do NOT refetch (the edge advanced;
+    refetching cannot heal an unfillable hole — the cs71 boundary). A FILLABLE hole
+    is still healed by cs71 (the backfill is appended -> the served window is
+    contiguous -> no flag). A contiguous served window is byte-identical (flag
+    absent); ``cutoff=None`` adds no flag.
     """
     cache = OhlcvCache(
         provider=provider,
@@ -713,6 +730,46 @@ def cached_fetch(
             gap = cutoff - merged["timestamp"].max()
             if gap > flag_bound:
                 meta["right_edge_stale_days"] = int(gap / pd.Timedelta(days=1))
+    # cs73: surface an honest INTERIOR-discontiguity signal on the MISS path,
+    # symmetric with the cs49 right_edge_stale_days EDGE signal above. cs50 gates
+    # the served window's interior contiguity on the HIT path only; the MISS-path
+    # serve (``out = merged.tail(...)``) had no analogous check. When the provider
+    # ADVANCES the right edge (the cs71 append ran) but a genuinely-UNFILLABLE
+    # interior hole REMAINS after the append+dedup (a delisted stretch, a provider
+    # short-window, an exchange-downtime gap the provider will never return), the
+    # served lookback tail GLUES bars across the hole with no signal -> a backtest
+    # computes a spurious seam return across the hole. We do NOT refetch (the edge
+    # advanced, so cs71's append already ran; refetching would not heal an
+    # unfillable hole -> the cs71 boundary). Instead we emit a FLAG so the caller
+    # can ABSTAIN, mirroring cs49's posture (a flag, not a refusal-to-serve).
+    #
+    # The bound is the SAME cs50 ``contig_bound`` (recurrence-only
+    # :func:`_calendar_bound`, scaled by 1.5) the HIT-path contiguity gate uses, so
+    # a legitimate calendar gap (a weekend / overnight session) inside the served
+    # window does NOT false-flag, while a multi-step unfillable hole does. A
+    # FILLABLE hole is still HEALED by cs71 (the backfill is appended -> the served
+    # window is contiguous -> no flag fires here). A contiguous served window is
+    # byte-identical (the flag is absent); cutoff=None adds no flag.
+    #
+    # cs73 calendar-symmetry (mirror cs50 exactly): the contiguity bound is learned
+    # from the BROAD served-source set ``merged`` (the MISS analogue of the cs50 HIT
+    # gate's ``eligible``), NOT from the short served tail ``out``. The recurrence
+    # gate in :func:`_calendar_bound` requires a calendar gap to appear >=2 times; a
+    # short served tail that straddles exactly ONE weekend contains the Fri->Mon gap
+    # only once, so learning the bound from ``out`` would degrade to the canonical
+    # one-step floor and FALSE-FLAG a legitimate single-weekend window as
+    # discontiguous (a false-abstain — the exact symmetric failure cs58 fixed for
+    # the EDGE flag). Learning from ``merged`` (which carries the recurring rhythm)
+    # keeps the weekend gap tolerated while the max-gap measurement stays on the
+    # EXACT served window ``out`` the backtest receives.
+    if cutoff is not None and len(out) >= 2:
+        bound = max_staleness if max_staleness is not None else _infer_step(timeframe, merged)
+        if bound is not None:
+            contig_bound = _calendar_bound(bound, merged["timestamp"])
+            max_gap = out["timestamp"].diff().dropna().max()
+            if max_gap is not pd.NaT and max_gap > contig_bound * 1.5:
+                meta["interior_gap_days"] = int(max_gap / pd.Timedelta(days=1))
+                meta["served_window_discontiguous"] = True
     return out, meta
 
 
