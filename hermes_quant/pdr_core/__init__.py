@@ -51,6 +51,7 @@ from hermes_quant.pdr_core.gate_types import (
     CoreSignal,
     GateDecision,
 )
+from hermes_quant.pdr_core.portfolio_snapshot import CorePortfolioSnapshot
 
 __all__ = [
     "OPTION_ASSET_CLASSES",
@@ -61,6 +62,7 @@ __all__ = [
     "CoreHaltState",
     "CoreMarketState",
     "CorePortfolio",
+    "CorePortfolioSnapshot",
     "CoreSignal",
     "Fill",
     "GateDecision",

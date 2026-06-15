@@ -31,7 +31,9 @@ them. That's the rebalancer's job (ADR-0035 wave-4).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+from hermes_quant.pdr_core.portfolio_snapshot import CorePortfolioSnapshot
 
 # ---------------------------------------------------------------------------
 # Config + state
@@ -98,7 +100,7 @@ class PortfolioCaps:
 
 
 @dataclass(frozen=True)
-class PortfolioState:
+class PortfolioState(CorePortfolioSnapshot):
     """Read-only snapshot of current portfolio used by Stage-2 normalization.
 
     `positions` maps symbol -> signed target_position_pct of NAV (the LATEST
@@ -108,21 +110,20 @@ class PortfolioState:
     `cash_pct` is implied: 1 - sum(abs(positions)). May be negative if the
     book is over-leveraged (which is exactly the case ADR-0071 was written to
     catch). Stage-2 fails closed in that case (silences all new picks).
+
+    ra06 (ADR-0092): this is now a THIN SUBCLASS of the canonical host-agnostic
+    :class:`hermes_quant.pdr_core.portfolio_snapshot.CorePortfolioSnapshot`. The
+    single ``positions`` field and the three derived reads
+    (``gross_exposure_pct`` / ``net_exposure_pct`` / ``cash_pct``) are INHERITED
+    unchanged, so every existing consumer is byte-identical — including the frozen
+    field binding and the in-place-mutable inner dict the autonomous tick relies on
+    (``autonomous.py:880``). The host-named subclass is kept (rather than a bare
+    alias) so ``type(x).__name__`` / ``repr`` stay ``PortfolioState`` and the
+    hermes-specific PaperReactor/executions.jsonl semantics stay documented here,
+    while ``isinstance(x, CorePortfolioSnapshot)`` becomes the migration handle for
+    the eventual consumer-migration sequence. Parity is proven in
+    ``tests/pdr_core/test_portfolio_snapshot_parity.py``.
     """
-
-    positions: dict[str, float] = field(default_factory=dict)
-
-    @property
-    def gross_exposure_pct(self) -> float:
-        return sum(abs(p) for p in self.positions.values())
-
-    @property
-    def net_exposure_pct(self) -> float:
-        return sum(self.positions.values())
-
-    @property
-    def cash_pct(self) -> float:
-        return 1.0 - self.gross_exposure_pct
 
 
 # ---------------------------------------------------------------------------
