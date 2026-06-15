@@ -169,6 +169,14 @@ def _collect_metrics(asof: datetime) -> dict[str, Any]:
     calibrator_drift_max = 0.0
     weekly_retro_ready = False
     sharpe_ci_lower = 0.0
+    # sharpe_95ci_lower gates on `<` (a FLOOR), so it must reflect the CURRENT
+    # (latest in-window) snapshot, not the window's single best moment. Reducing
+    # with max() is the PERMISSIVE direction — one momentarily-good snapshot would
+    # admit promotion even after every later snapshot degraded below the floor (a
+    # latent fail-OPEN). We therefore keep the LATEST in-window value, tracked by
+    # the snapshot's asof. (drawdown / calibrator_drift gate on `>` so their max()
+    # reducers below stay correctly conservative and unchanged.)
+    sharpe_ci_latest_asof: datetime | None = None
     rolling_30d_max_drawdown_pct = 0.0
 
     for evt in audit_log.read():
@@ -211,9 +219,15 @@ def _collect_metrics(asof: datetime) -> dict[str, Any]:
             sharpe_ci = evt.payload.get("sharpe_95ci_lower")
             if sharpe_ci is not None:
                 try:
-                    sharpe_ci_lower = max(sharpe_ci_lower, float(sharpe_ci))
+                    val = float(sharpe_ci)
                 except (TypeError, ValueError):
                     pass
+                else:
+                    # Keep the LATEST in-window snapshot (by asof), not the max —
+                    # a FLOOR gate must see the current value, not the best historical.
+                    if sharpe_ci_latest_asof is None or evt_asof >= sharpe_ci_latest_asof:
+                        sharpe_ci_lower = val
+                        sharpe_ci_latest_asof = evt_asof
 
             dd = evt.payload.get("rolling_30d_max_drawdown_pct")
             if dd is not None:

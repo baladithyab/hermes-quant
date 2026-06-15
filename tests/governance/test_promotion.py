@@ -153,6 +153,73 @@ def test_promotion_gate_passes_when_all_thresholds_pass(audit_path: Path) -> Non
     assert decision.weekly_retro_promotion_readiness is True
 
 
+def test_promotion_gate_blocks_when_sharpe_ci_degrades_within_window(
+    audit_path: Path,
+) -> None:
+    """A degrading sharpe_95ci_lower window must BLOCK (archaeology finding):
+    the gate is `metrics['sharpe_95ci_lower'] < min` so the reducer must reflect the
+    CURRENT (latest) snapshot, not the window's single best moment. A run that was
+    once healthy (1.5) but has since degraded below the 1.0 floor (0.2 then 0.1) must
+    NOT be promotable. A max() reducer would pick 1.5 and wrongly pass — the fail-open."""
+    for i in range(100):
+        audit_log.append(
+            GovernanceEvent(
+                kind="fill",
+                asof=NOW - timedelta(days=15),
+                source="paper_reactor",
+                payload={"broker": "paper", "realized_pnl": 1.0},
+            )
+        )
+    # Three in-window snapshots, sharpe degrading 1.5 -> 0.2 -> 0.1 (latest is worst).
+    for days_ago, sharpe in ((5, 1.5), (3, 0.2), (1, 0.1)):
+        audit_log.append(
+            GovernanceEvent(
+                kind="promotion_event",
+                asof=NOW - timedelta(days=days_ago),
+                source="weekly_retro",
+                payload={
+                    "calibrator_drift": 0.01,
+                    "sharpe_95ci_lower": sharpe,
+                    "rolling_30d_max_drawdown_pct": 0.005,
+                    "weekly_retro_promotion_readiness": True,
+                },
+            )
+        )
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is False, (
+        "a sharpe_95ci_lower that degraded to 0.1 (< 1.0 floor) must block promotion; "
+        "a max() reducer would pick the stale 1.5 and fail OPEN"
+    )
+    assert any("sharpe_95ci_lower" in r for r in decision.blocked_by), decision.blocked_by
+
+
+def test_promotion_gate_sharpe_uses_latest_not_max_when_improving(
+    audit_path: Path,
+) -> None:
+    """Symmetric guard: when the LATEST snapshot is healthy (improved 0.2 -> 1.5),
+    the latest-reducer must use 1.5 and PASS the sharpe leg — confirming the fix uses
+    the most-recent snapshot, not min() (which would wrongly pick 0.2 and block)."""
+    _seed_passing_run(NOW, n_outcomes=100)  # includes a 1.25 snapshot at day-1
+    # An EARLIER, worse snapshot that must NOT drag the latest down.
+    audit_log.append(
+        GovernanceEvent(
+            kind="promotion_event",
+            asof=NOW - timedelta(days=10),
+            source="weekly_retro",
+            payload={
+                "calibrator_drift": 0.01,
+                "sharpe_95ci_lower": 0.2,
+                "rolling_30d_max_drawdown_pct": 0.005,
+                "weekly_retro_promotion_readiness": True,
+            },
+        )
+    )
+    decision = promotion.evaluate(NOW)
+    # The latest in-window sharpe snapshot is 1.25 (day-1) >= 1.0 -> the sharpe leg
+    # must NOT be a blocker (the stale 0.2 at day-10 must not block).
+    assert not any("sharpe_95ci_lower" in r for r in decision.blocked_by), decision.blocked_by
+
+
 def test_promotion_gate_emits_audit_event(audit_path: Path) -> None:
     _seed_passing_run(NOW, n_outcomes=100)
 
