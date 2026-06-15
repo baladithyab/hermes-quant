@@ -281,3 +281,60 @@ def test_architectural_single_carry_forward_symbol():
     assert "fill_delta_normalizer" in sl_src, (
         "settlement_loop must import the ONE shared normalizer, not reimplement it"
     )
+
+
+def test_architectural_both_folds_route_through_shared_symbol_behaviorally(tmp_path, monkeypatch):
+    """rt04: BEHAVIORAL proof (not a textual import-check) that BOTH state.db folds route
+    their carry-forward THROUGH the one shared ``delta_from_net``, not merely import it.
+
+    A dead-import + an inline ``target - net`` reimplementation at a fold site would pass the
+    textual test above but FAIL this one. We replace the module-level ``delta_from_net`` with a
+    counting wrapper (it still returns the real delta, so the fold result is unchanged) and assert
+    the wrapper is invoked when we drive (1) the rebuild fold and (2) the incremental fold. If a
+    fold computed the delta inline it would never call the shared symbol and the counter would stay
+    at 0 — catching exactly the divergence the parity keystone backstops, but at the routing layer.
+
+    delta_for delegates to the module-level delta_from_net (fill_delta_normalizer.py:265,274) and
+    the incremental fold imports + calls it directly (portfolio_state.py:977,979), so patching the
+    module symbol is observable through both."""
+    monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
+
+    from hermes_quant.state import fill_delta_normalizer as fdn
+
+    real = fdn.delta_from_net
+    calls = {"n": 0}
+
+    def _counting_delta_from_net(rec, current_net):
+        calls["n"] += 1
+        return real(rec, current_net)
+
+    monkeypatch.setattr(fdn, "delta_from_net", _counting_delta_from_net)
+
+    recs = _incident_stream()
+    bus = tmp_path / "executions.jsonl"
+    _write(bus, recs)
+
+    # (1) REBUILD fold routes through the shared symbol (via FillDeltaNormalizer.delta_for).
+    calls["n"] = 0
+    ps_reb = PortfolioState(state_db_path=tmp_path / "reb.db")
+    ps_reb.reconstruct_from(bus)
+    assert calls["n"] > 0, (
+        "the REBUILD fold did not route through the shared delta_from_net — it must not "
+        "reimplement target - net inline (rt04 behavioral invariant)"
+    )
+    # Sanity: the result is still the corrected single net (the wrapper returns the real value).
+    assert ps_reb.get_positions("paper-default")[("equity", "AAPL")].quantity == pytest.approx(
+        _AAPL_TARGET, rel=1e-9
+    )
+
+    # (2) INCREMENTAL fold routes through the SAME shared symbol.
+    calls["n"] = 0
+    ps_inc = PortfolioState(state_db_path=tmp_path / "inc.db")
+    for r in recs:
+        ps_inc.apply_execution(r)
+    assert calls["n"] > 0, (
+        "the INCREMENTAL fold did not route through the shared delta_from_net (rt04 invariant)"
+    )
+    assert ps_inc.get_positions("paper-default")[("equity", "BA")].quantity == pytest.approx(
+        _BA_TARGET, rel=1e-9
+    )
