@@ -49,7 +49,17 @@ def _proposal(*, symbol: str = "AAPL", decision_price: float = 200.0) -> Proposa
 
 
 @pytest.fixture()
-def reactor(tmp_path: Path) -> PaperReactor:
+def reactor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PaperReactor:
+    # Tick-lock isolation: this fixture fires a REAL PaperReactor against the
+    # default AAPL/equity proposal. The per-symbol tick lock (paper.py:261, DEFAULT-ON)
+    # resolves its lock dir from HERMES_QUANT_HOME else the LIVE ~/.hermes/quant
+    # (tick_lock.py:108-112), and the conftest QUANT_HOME isolation patches only
+    # module globals, not the env — so under CONCURRENT execution all AAPL/equity
+    # fires contend on the shared live lock and silence to 0 bus lines (the fill
+    # assertions then fail IndexError/0==1). Bypass the lock (byte-identical to
+    # pre-ADR-0078) + point HERMES_QUANT_HOME at a per-test dir (belt-and-suspenders).
+    monkeypatch.setenv("HERMES_QUANT_TICK_LOCK", "0")
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(tmp_path / "qh"))
     return PaperReactor(executions_path=tmp_path / "executions.jsonl")
 
 
@@ -135,14 +145,30 @@ def test_autonomous_react_stamps_autonomous(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_QUANT_ADMISSIBILITY", raising=False)
     bus = tmp_path / "executions.jsonl"
 
-    # _react does `from hermes_quant.react import PaperReactor` inside the function body,
-    # so patch the symbol on hermes_quant.react.
+    # inc2: _react now routes through `react.dispatch.select_reactor(proposal)`
+    # instead of hardcoding PaperReactor(). With both routing flags OFF (the test
+    # default here) select_reactor returns a PaperReactor — patch the name where
+    # dispatch resolves it (`from .paper import PaperReactor` binds it into the
+    # dispatch module namespace, so the package-level export is NOT what runs).
     import hermes_quant.autonomous as autonomous_mod
-    import hermes_quant.react as react_mod
+    import hermes_quant.react.dispatch as dispatch_mod
     from hermes_quant.watchlist import WatchlistEntry
 
+    monkeypatch.delenv("HERMES_QUANT_ALPACA_PAPER", raising=False)
+    monkeypatch.delenv("HERMES_QUANT_DETERMINISTIC_EQUITY", raising=False)
+    # TICK-LOCK ISOLATION (test-only): this test fires a REAL PaperReactor for an
+    # AAPL/equity proposal, which acquires the DEFAULT-ON per-symbol tick lock
+    # (paper.py:261). tick_lock._quant_home() (tick_lock.py:112) resolves the lock
+    # dir from HERMES_QUANT_HOME else the LIVE ~/.hermes/quant, and the conftest
+    # isolation fixture patches only module globals (not the env), so the lock
+    # otherwise resolves to the shared live locks/paper-default__equity__AAPL.lock.
+    # Under concurrent execution a sibling holding that lock SILENCES this fire
+    # (0 fills) and flakes the len(lines)==1 assertion. Bypass the lock (byte-
+    # identical to the pre-ADR-0078 path) + point HOME at a per-test tmp dir.
+    monkeypatch.setenv("HERMES_QUANT_TICK_LOCK", "0")
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(tmp_path / "qh"))
     monkeypatch.setattr(
-        react_mod, "PaperReactor", lambda *a, **k: PaperReactor(executions_path=bus)
+        dispatch_mod, "PaperReactor", lambda *a, **k: PaperReactor(executions_path=bus)
     )
 
     entry = WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d")

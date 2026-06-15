@@ -929,29 +929,39 @@ def _react(
     *,
     paper_zero_costs: bool = False,
 ) -> str:
-    """Fire the PaperReactor for an autonomous decision and return the
+    """Fire the routed reactor for an autonomous decision and return the
     synthesized proposal_id (used as the execution_id surfaced in tick output).
 
-    We construct a minimal Proposal-shaped object on the fly so we can
-    reuse PaperReactor without forcing it to depend on the proposal store.
-    The execution lands in executions.jsonl per ADR-0015 §D6.
+    We construct a minimal Proposal-shaped object on the fly so we can route it
+    through the ONE dispatch chokepoint (``react.dispatch.select_reactor``) the
+    HITL/CLI approve seam already uses — instead of HARDCODING ``PaperReactor()``
+    here as a second, duplicate reactor-choice site (ra02 / the 2026-06-02
+    41.6x-gross mechanism class). The execution lands in executions.jsonl per
+    ADR-0015 §D6.
+
+    Byte-identical by default: ``select_reactor`` returns ``PaperReactor`` for an
+    equity proposal when BOTH routing flags are OFF (``HERMES_QUANT_ALPACA_PAPER``
+    / ``HERMES_QUANT_DETERMINISTIC_EQUITY`` unset — the production default), which
+    is the exact type this seam constructed before. With a routing flag ON the
+    autonomous fire (correctly) inherits the SAME routed reactor the HITL path uses.
+    The synthesized proposal is ``proposal_kind == "equity"`` (the dataclass
+    default), so ``select_reactor`` never routes it to the multi-leg reactor.
 
     Fail-closed guard (paper-mode-only cost-gate override):
-      `paper_zero_costs=True` REQUIRES that the active reactor is named
-      'paper'. If a non-paper reactor were ever wired in here while the
-      flag is set, raise ValueError before any execution side-effect.
-      Live behavior must be unaffected by this flag — silence-by-default.
+      `paper_zero_costs=True` REQUIRES that the routed reactor is named
+      'paper'. ``select_reactor`` CAN return a non-paper reactor (alpaca_paper /
+      deterministic-equity) when a routing flag is ON, so this guard is now MORE
+      load-bearing: if a non-paper reactor were routed here while the flag is set,
+      raise ValueError BEFORE any execution side-effect. Live behavior must be
+      unaffected by this flag — silence-by-default.
     """
     from hermes_quant.proposals import Proposal, _make_proposal_id, _utc_now
-    from hermes_quant.react import PaperReactor
+    from hermes_quant.react.dispatch import select_reactor
 
-    reactor = PaperReactor()
-    if paper_zero_costs and getattr(reactor, "name", None) != "paper":
-        raise ValueError("paper_zero_costs is set but reactor is not paper")
-
-    # Synthesize a Proposal stand-in. We DO NOT register it in the
-    # proposal store — autonomous fires bypass HITL's pending state.
-    # The execution is the audit trail.
+    # Synthesize a Proposal stand-in FIRST so it can be routed. We DO NOT register
+    # it in the proposal store — autonomous fires bypass HITL's pending state; the
+    # execution is the audit trail. Synthesis is side-effect-free, so building it
+    # before the guard does not move the guard's "before any side-effect" position.
     pid = _make_proposal_id(entry.symbol, _utc_now())
     proposal = Proposal(
         proposal_id=pid,
@@ -965,6 +975,13 @@ def _react(
         approver_user_id="autonomous",
         advisor_result=advisor_result,
     )
+
+    # Route through the ONE dispatch chokepoint (the landed ADR-0029 §2.5 seam)
+    # instead of hardcoding PaperReactor(). Flags-OFF -> PaperReactor (byte-
+    # identical); flag-ON -> the same routed reactor the HITL path inherits.
+    reactor = select_reactor(proposal)
+    if paper_zero_costs and getattr(reactor, "name", None) != "paper":
+        raise ValueError("paper_zero_costs is set but reactor is not paper")
 
     reactor.execute(
         proposal,

@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import pytest
 
-import hermes_quant.react as react_pkg
 from hermes_quant.autonomous import _react
 from hermes_quant.watchlist import WatchlistEntry
 
@@ -68,16 +67,27 @@ def _advisor_result() -> dict:
 
 
 def _patch_reactor(monkeypatch: pytest.MonkeyPatch, name: str) -> _StubReactor:
-    """Force `_react`'s lazy `from hermes_quant.react import PaperReactor`
-    to construct a stub reactor with the given .name."""
+    """Force `_react`'s `select_reactor(proposal)` call to return a stub reactor
+    with the given .name.
+
+    inc2: `_react` now routes through `react.dispatch.select_reactor(proposal)`
+    (the ONE dispatch chokepoint) instead of hardcoding `PaperReactor()`. The
+    paper_zero_costs guard runs on select_reactor's OUTPUT, so we inject the stub
+    by patching the `select_reactor` name that `_react` imports — `_react` does
+    `from hermes_quant.react.dispatch import select_reactor` inside the function
+    body, so the name is resolved from the `hermes_quant.react.dispatch` module
+    at call time; patch it there. This pins the guard predicate (what's under
+    test) independent of which concrete reactor select_reactor would pick."""
     holder: dict[str, _StubReactor] = {}
 
-    def _factory(*args, **kwargs):  # noqa: ANN002, ANN003
+    def _select(_proposal):  # noqa: ANN001, ANN202
         r = _StubReactor(name)
         holder["reactor"] = r
         return r
 
-    monkeypatch.setattr(react_pkg, "PaperReactor", _factory)
+    import hermes_quant.react.dispatch as dispatch_mod
+
+    monkeypatch.setattr(dispatch_mod, "select_reactor", _select)
     return holder  # type: ignore[return-value]
 
 
