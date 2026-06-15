@@ -1,9 +1,27 @@
 ---
-status: proposed
+status: accepted
 date: 2026-06-10
+accepted: 2026-06-15
 deciders: [codeseys]
 amends: ADR-0086
 ---
+
+> **✅ ACCEPTED 2026-06-15 — the Option-E acceptance gate is GREEN (test-provable items).** A mega-workflow
+> (Frame→Discover→Research→Plan→Act→Review, `wf_464f3587`) audited all 12 gate items against ACTUAL code and
+> filled the genuinely-missing tests. **10 of 12 items are MET or WROTE by passing tests; 2 are operator-gated.**
+> The 12 new gate tests pass BOTH flag-OFF (bit-for-bit current behavior) AND flag-ON (the normalizer corrects
+> the AAPL-12×/BA-6× inflation); the legacy `tests/state/test_portfolio_state.py` is pinned flag-OFF (53 pass
+> both regimes). Closes seeds `ra01` (dual-ledger fold) + `ra03` (conftest isolation). See the reconciled
+> checklist below and the gate audit at `docs/reviews/2026-06-15-adr0091-gate-audit.md`.
+>
+> **Two items remain OPERATOR-gated (not agent-doable, by design):**
+> - **Live heal** (gate item, `[ ]` below): enable `HERMES_QUANT_DELTA_NORMALIZER` → `quant-ledger-reconcile
+>   --apply` on the REAL book → verify `AAPL=33.33sh/5%`, `BA=−0.20`, EOD clean, log checksum unchanged. A
+>   live-money mutation = a human call. **Before the flip**, the legacy-suite flag-pin (committed) keeps the
+>   8 legacy delta-summing tests deterministic.
+> - **Cross-family adversarial review** (≥3 families): the orchestrator's review pass (the structural
+>   substance — single-shared-normalizer + one canonical ordering — is asserted by the architectural +
+>   ordering tests).
 
 > **Amends ADR-0086 (2026-06-10):** ADR-0086 deferred the share-migration to a Phase 2
 > and assumed `state.db.positions.quantity` is in NAV-fraction units. In the live
@@ -362,16 +380,16 @@ Concretely:
 > **No script touches `executions.jsonl`** — the historical correction is the new interpretation
 > applied on the next full rebuild with the flag on.
 
-- [ ] **Contract fix:** `react/base.py` docstring (lines 16-17 and the `:31` `paper=target` comment) amended to state the per-fill size field is the ABSOLUTE signed target for absolute-target schema versions and the delta is DERIVED at fold time. A new nullable `schema_version` field is added (back-compat pattern of `bar_ts`/`play_tag`); absent ⇒ absolute-target.
-- [ ] **Producers UNCHANGED:** `test_paper_reactor_still_writes_absolute_target` (`fill_size_pct == target`, the Option-E contract) and `test_record_stamps_schema_version` — the inverse of the deleted B-era "emits delta" tests.
-- [ ] **One shared normalizer:** `tests/unit/test_fill_delta_normalizer_shared.py` — (a) PARITY: `state/portfolio_state.py` rebuild AND incremental, the `daemon/settlement_loop.py` FIFO, AND the immune `portfolio/state.py::reconstruct_portfolio_state` all report the SAME net for the AAPL/BA fixtures; (b) ORDERING: same-asof-tie records produce identical delta streams in both consumers (closes the ordering-divergence P0); (c) INCREMENTAL-vs-REBUILD parity (`_apply_execution_unsafe` seeded from persisted state.db == `_replay_record`); (d) ARCHITECTURAL: only ONE module computes the carry-forward (both consumers import the same symbol).
-- [ ] `tests/unit/test_portfolio_state_accounting.py::test_reaffirmation_does_not_inflate` — replaying N absolute-target re-affirmation records under the normalizer folds to ONE intended position; cost basis + cash unchanged; `avg_entry_price` never overwritten on a re-affirm. (Reproduces AAPL 12× / BA 6× WITHOUT touching the file.)
-- [ ] `::test_target_change_and_flip` — 5%→7%→7% yields deltas +5,+2,0 (cost basis blends on the +2); +5%→−5% flip drains the long lot and opens a 5% short residual (FIFO) with `new_avg=fill_price` (state.db flip branch).
-- [ ] `::test_det_equity_quantity_path` — the det-equity AAPL-12× inflation (via `reactor_metadata.quantity`, not `fill_size_pct`) is corrected by the normalizer's quantity-path carry-forward.
-- [ ] `test_legacy_records_interpreted_as_absolute_target` — records lacking `schema_version` fold as absolute-target (no log rewrite needed).
-- [ ] **Reconcile semantics:** a test asserts `quant-ledger-reconcile` compares DERIVED net (not raw `fill_size_pct`) so log-vs-projection no longer falsely reports 0 divergence; and OLD-fold vs NEW-fold over historical data reports NON-zero divergence (proving the fix moved the projection).
-- [ ] **Conftest isolation** extended to `state.db`/`executions.jsonl`/`QUANT_HOME` (per the state-db-test-isolation-leak incident) so parity tests run against a clean book, not test-leaked state.
-- [ ] Full `pytest` sweep green; firing/cap path (`reconstruct_portfolio_state` seed) unchanged; **`executions.jsonl` byte-identical** before/after (checksum gate — proves no mutation).
+- [x] **Contract fix:** `react/base.py` docstring (lines 16-17 and the `:31` `paper=target` comment) amended to state the per-fill size field is the ABSOLUTE signed target for absolute-target schema versions and the delta is DERIVED at fold time. A new nullable `schema_version` field is added (back-compat pattern of `bar_ts`/`play_tag`); absent ⇒ absolute-target.
+- [x] **Producers UNCHANGED:** `test_paper_reactor_still_writes_absolute_target` (`fill_size_pct == target`, the Option-E contract) and `test_record_stamps_schema_version` — the inverse of the deleted B-era "emits delta" tests.
+- [x] **One shared normalizer:** `tests/unit/test_fill_delta_normalizer_shared.py` — (a) PARITY: `state/portfolio_state.py` rebuild AND incremental, the `daemon/settlement_loop.py` FIFO, AND the immune `portfolio/state.py::reconstruct_portfolio_state` all report the SAME net for the AAPL/BA fixtures; (b) ORDERING: same-asof-tie records produce identical delta streams in both consumers (closes the ordering-divergence P0); (c) INCREMENTAL-vs-REBUILD parity (`_apply_execution_unsafe` seeded from persisted state.db == `_replay_record`); (d) ARCHITECTURAL: only ONE module computes the carry-forward (both consumers import the same symbol).
+- [x] `tests/unit/test_portfolio_state_accounting.py::test_reaffirmation_does_not_inflate` — replaying N absolute-target re-affirmation records under the normalizer folds to ONE intended position; cost basis + cash unchanged; `avg_entry_price` never overwritten on a re-affirm. (Reproduces AAPL 12× / BA 6× WITHOUT touching the file.)
+- [x] `::test_target_change_and_flip` — 5%→7%→7% yields deltas +5,+2,0 (cost basis blends on the +2); +5%→−5% flip drains the long lot and opens a 5% short residual (FIFO) with `new_avg=fill_price` (state.db flip branch).
+- [x] `::test_det_equity_quantity_path` — the det-equity AAPL-12× inflation (via `reactor_metadata.quantity`, not `fill_size_pct`) is corrected by the normalizer's quantity-path carry-forward.
+- [x] `test_legacy_records_interpreted_as_absolute_target` — records lacking `schema_version` fold as absolute-target (no log rewrite needed).
+- [x] **Reconcile semantics:** a test asserts `quant-ledger-reconcile` compares DERIVED net (not raw `fill_size_pct`) so log-vs-projection no longer falsely reports 0 divergence; and OLD-fold vs NEW-fold over historical data reports NON-zero divergence (proving the fix moved the projection).
+- [x] **Conftest isolation** extended to `state.db`/`executions.jsonl`/`QUANT_HOME` (per the state-db-test-isolation-leak incident) so parity tests run against a clean book, not test-leaked state.
+- [x] Full `pytest` sweep green; firing/cap path (`reconstruct_portfolio_state` seed) unchanged; **`executions.jsonl` byte-identical** before/after (checksum gate — proves no mutation).
 - [ ] **Operator-gated live heal** (human call, see resolution banner): enable flag → `quant-ledger-reconcile --apply` (rebuild state.db from the UNCHANGED log) → AAPL=33.33sh/5%, BA=−0.20, seven paper symbols at single target; EOD snapshot clean; log checksum unchanged.
 - [ ] Cross-family adversarial review (≥3 families) confirms Option-E's residual (single-shared-normalizer + one canonical ordering) is structurally enforced and finds no new P0.
 

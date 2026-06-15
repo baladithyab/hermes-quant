@@ -84,6 +84,25 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             fh.write(json.dumps(rec) + "\n")
 
 
+@pytest.fixture(autouse=True)
+def _legacy_delta_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin HERMES_QUANT_DELTA_NORMALIZER=0 for this legacy delta-semantics suite.
+
+    ADR-0091 Option E (the carry-forward normalizer) reinterprets the per-fill
+    size field as an ABSOLUTE target at fold time when the flag is ON. The tests
+    in this file predate that and hand-feed DELTA-shaped records (e.g. +0.10 then
+    -0.05 expecting net 0.05), asserting the OLD summing semantics. They are
+    correct under the production default (flag OFF) and must NOT be run under an
+    ambient flag-ON regime, where the normalizer would (correctly) re-interpret
+    their deltas as absolute targets and the legacy assertions would fail.
+
+    This autouse default is OVERRIDDEN by the one test that explicitly opts into
+    the normalizer (TestMultipleSymbols::...flag-on..., which calls
+    monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1") after this fixture).
+    """
+    monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "0")
+
+
 @pytest.fixture()
 def ps(tmp_path: Path) -> PortfolioState:
     """Fresh PortfolioState backed by isolated tmp_path DB."""
