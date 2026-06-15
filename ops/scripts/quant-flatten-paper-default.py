@@ -1,9 +1,32 @@
 #!/usr/bin/env python3
 """Operator flatten of the paper-default advisor/autonomous book.
 
-Closes every OPEN position in the `reactor_filter='paper'` view (the view the
-ADR-0087 portfolio cap and the autonomous tick actually read) by emitting a
-proper CLOSE fill per symbol:
+Closes every OPEN position in the CANONICAL post-cs16 paper-default view (the
+view the ADR-0087 portfolio cap and the autonomous tick actually read) by
+emitting a proper CLOSE fill per symbol:
+
+cs25: this view is `reactor_filter=None, account="paper-default"`, NOT the
+narrower `reactor_filter='paper'` slice this script used before. cs16 (commit
+2f1a280) widened the autonomous D9 safety rail + the portfolio-caps gate to
+`reconstruct_portfolio_state(reactor_filter=None)` so they count the WHOLE
+open equity book across EVERY reactor_name the live router can emit — `paper`,
+`deterministic-equity` (HERMES_QUANT_DETERMINISTIC_EQUITY=1), and `alpaca_paper`
+(HERMES_QUANT_ALPACA_PAPER=1). The default `reactor_filter='paper'` slice this
+script READ (autonomous.py:505-508 calls it "the paper-only slice ... which
+would UNDER-count the book") leaves any det-equity/alpaca_paper position OPEN
+while the post-cs16 cap STILL counts it in gross/net — so the headroom-recovery
+tool freed NO headroom and reported a FALSE "flat" that disagreed with the live
+rail. We now enumerate through the SAME canonical seam the cap reads.
+
+cs18 account scope: we pass `account="paper-default"` so the deliberately
+SEPARATE `alpaca-paper` SHADOW book (account_id nested in reactor_metadata) is
+EXCLUDED from the synthetic flatten. det-equity resolves to paper-default and
+is correctly flattened by a synthetic close; an alpaca-paper position is a REAL
+broker position whose close must route through the broker, NOT a synthetic
+executions.jsonl append (which would desync the broker from the bus). The cap's
+own `reactor_filter=None` (no account scope) pools alpaca-paper into gross — but
+that is the cs18 partition-disagreement the cap layer owns; this flatten tool
+must only synthetically close the book it can synthetically close.
 
   * target_position_pct = 0.0   -> reconstruct_portfolio_state keys on this;
                                    a close MUST set it to 0 or the position
@@ -42,6 +65,38 @@ import json  # noqa: E402
 BUS = os.path.expanduser("~/.hermes/quant/executions.jsonl")
 FIRE = "--fire" in sys.argv
 
+# cs25: the canonical paper-default account partition (matches the cs18
+# account-scoped reconstruction the per-fill cap-clip + state.db use).
+PAPER_DEFAULT_ACCOUNT = "paper-default"
+
+
+def canonical_open_positions(bus_path: str) -> dict[str, float]:
+    """Enumerate the OPEN paper-default positions through the SAME seam the
+    post-cs16 autonomous safety rail + portfolio-caps gate read (cs25).
+
+    Calls reconstruct_portfolio_state with:
+      * reactor_filter=None — count the WHOLE open equity book across EVERY
+        reactor_name (paper + deterministic-equity + alpaca_paper), exactly as
+        autonomous.py:534/:565 do post-cs16. The default reactor_filter='paper'
+        UNDER-counts (autonomous.py:505-508), leaving det-equity/alpaca opens
+        un-flattened while the cap still counts them.
+      * account="paper-default" — cs18: scope to the synthetic paper-default
+        book (PaperReactor + DeterministicEquityReactor) and EXCLUDE the
+        deliberately-separate alpaca-paper SHADOW book, whose real broker
+        positions must be closed via the broker, not a synthetic bus append.
+
+    Returns the {symbol: target_position_pct} dict for non-zero (open)
+    positions — the SAME shape the prior reconstruct_portfolio_state(BUS) call
+    returned, so the close-emission loop is unchanged.
+    """
+    return dict(
+        reconstruct_portfolio_state(
+            bus_path,
+            reactor_filter=None,
+            account=PAPER_DEFAULT_ACCOUNT,
+        ).positions
+    )
+
 # Per-symbol originating play_tag, read from the bus earlier. Anything not
 # listed defaults to "advisor". (AAL/BA/CBOE/CDNS were autonomous; the shorts
 # AVGO/CRM/META/ORCL and ASTS were advisor.)
@@ -74,10 +129,13 @@ def latest_bus_prices() -> dict[str, float]:
 
 
 def main() -> int:
-    ps = reconstruct_portfolio_state(BUS)  # reactor_filter='paper' (cap view)
-    open_pos = dict(ps.positions)
+    # cs25: enumerate through the canonical post-cs16 seam (reactor_filter=None,
+    # account="paper-default") so we flatten EVERY position the autonomous rail +
+    # caps gate count — not just the narrow 'paper' slice that left det-equity /
+    # alpaca opens behind and reported a false "flat".
+    open_pos = canonical_open_positions(BUS)
     if not open_pos:
-        print("Book already flat (paper view). Nothing to do.")
+        print("Book already flat (canonical paper-default view). Nothing to do.")
         return 0
 
     marks = latest_bus_prices()
@@ -153,11 +211,13 @@ def main() -> int:
     print(f"reconstruct_from: processed={res.executions_processed} "
           f"accounts={sorted(res.accounts_seen)} errors={len(res.errors)}")
 
-    # Verify flat in the cap view
-    ps2 = reconstruct_portfolio_state(BUS)
-    g2 = sum(abs(v) for v in ps2.positions.values())
-    print(f"\nPOST-FLATTEN cap view: {len(ps2.positions)} open | gross: {g2:.4f}")
-    for s, v in sorted(ps2.positions.items()):
+    # Verify flat in the SAME canonical view we enumerated from (cs25): a
+    # paper-only verify here would report a false "flat" the instant a
+    # det-equity position remained open, exactly the divergence this fix closes.
+    post = canonical_open_positions(BUS)
+    g2 = sum(abs(v) for v in post.values())
+    print(f"\nPOST-FLATTEN canonical paper-default view: {len(post)} open | gross: {g2:.4f}")
+    for s, v in sorted(post.items()):
         print(f"  {s:<6} {v:+.4f}")
     return 0
 
