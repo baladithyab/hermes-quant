@@ -631,17 +631,30 @@ def cached_fetch(
         if bound is not None:
             # cs58: a literal one-step bound over-tightens for calendar-gapped
             # markets (a Fri->Mon weekend, an overnight session gap) and
-            # refetches a fresh cache forever. The HIT path uses TWO bounds:
-            #   * cs63 edge bound: the cache's recurring rhythm PLUS one closed
-            #     session day, so a non-recurring market HOLIDAY at the edge
+            # refetches a fresh cache forever. The HIT path EDGE + CONTIGUITY
+            # checks both use the cs63 _edge_bound (the cache's recurring rhythm
+            # PLUS one closed session day):
+            #   * cs63 edge bound: a non-recurring market HOLIDAY at the edge
             #     (Fri-close + Mon-holiday, Tuesday anchor) stays fresh and does
             #     not refetch forever, while a one-off cs43 multi-month stale edge
             #     (many session days) stays rejected;
-            #   * cs50 contiguity bound: the TIGHTER recurrence-only bound (NOT
-            #     holiday-widened) so a one-off multi-step interior hole still
-            #     fails contiguity even though the edge tolerance is widened.
+            #   * cs74 contiguity bound: cs58 first gated contiguity on the TIGHTER
+            #     recurrence-only _calendar_bound, but that degrades to the 1-step
+            #     floor for a SHORT cache straddling exactly ONE weekend / overnight
+            #     session (the gap occurs once, never recurs >=2x): a demonstrably
+            #     FRESH such cache (cutoff==newest, edge_bound passes) was wrongly
+            #     contiguity-rejected and refetched forever. cs74 reuses _edge_bound
+            #     here too so ONE non-recurring legitimate session gap in a short
+            #     cache is tolerated. The widening is derived from the RECURRING
+            #     rhythm + one closed session day (NOT the largest observed gap), so
+            #     a cs50 multi-step interior hole (MANY session-days wide, far above
+            #     edge_bound * 1.5) STILL fails contiguity -> cs50 is not reopened.
+            #     The MISS-path cs73 interior flag below deliberately keeps the
+            #     tighter recurrence-only _calendar_bound (an honesty signal, not a
+            #     data-serving gate) and is untouched.
+            # cs74: edge and contiguity now share the same holiday-tolerant bound.
             edge_bound = _edge_bound(bound, eligible["timestamp"])
-            contig_bound = _calendar_bound(bound, eligible["timestamp"])
+            contig_bound = edge_bound
             newest_eligible = eligible["timestamp"].max()
             fresh_right_edge = (cutoff - newest_eligible) <= edge_bound
             served = eligible.tail(min(lookback_bars, len(eligible)))

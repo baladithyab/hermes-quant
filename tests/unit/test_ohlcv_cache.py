@@ -1930,3 +1930,197 @@ def test_cached_fetch_miss_interior_flag_cutoff_none_byte_identical(tmp_path):
     # cutoff=None -> the interior flag is never computed (byte-identical).
     assert "interior_gap_days" not in meta
     assert "served_window_discontiguous" not in meta
+
+
+# cs74: the HIT-path cs50 CONTIGUITY bound used the RECURRENCE-ONLY
+# ``_calendar_bound`` (a gap must appear >=2x to be learned). For a SHORT cache
+# whose entire eligible set straddles exactly ONE legitimate weekend (or one
+# overnight session gap), that gap occurs only ONCE -> _calendar_bound degrades to
+# the canonical 1-step floor, so the served tail's max_gap (the single weekend /
+# overnight) exceeds contig_bound*1.5 and the HIT is wrongly rejected EVEN THOUGH
+# the right edge is perfectly fresh (cutoff==newest, passed by the looser
+# ``_edge_bound``). The MISS path re-serves the identical bars (cs49/cs71 skip the
+# append) BUT fetch_fn is called on every replay = refetch-forever (the calls==0
+# contract). The fix mirrors cs63 onto the HIT contiguity gate: contig_bound now
+# uses ``_edge_bound`` (recurring rhythm + one closed session day) so ONE
+# non-recurring session gap in a short cache passes, while a cs50 multi-step
+# interior hole (many session-days wide) still fails contiguity.
+
+
+def test_cached_fetch_daily_one_weekend_fresh_edge_hits_no_refetch_loop(tmp_path):
+    """cs74 (REGRESSION cs58): a SHORT, fresh, contiguous DAILY cache that straddles
+    exactly ONE weekend (Mon..Fri..Mon..Fri = 10 bdays) with an --end anchored AT the
+    newest Friday (FRESH edge, cutoff==newest) was HIT-rejected because the single
+    Fri->Mon weekend gap appears only ONCE -> the recurrence-only contig_bound degrades
+    to the 1-day floor and the 3-day weekend in the served tail fails contiguity. The
+    fresh edge passes ``_edge_bound`` so the cache then refetched on EVERY run (calls=3)
+    even though the provider has nothing newer = a refetch-forever loop on a demonstrably
+    fresh short cache. The fix gives the contiguity bound the cs63 one-closed-session-day
+    allowance so the single weekend is tolerated and the cache HITs.
+
+    RED today: hits=[F,F,F], calls=3. GREEN after: HITs each run, calls==0.
+    """
+    calls = {"n": 0}
+    # 10 Mon-Fri daily bars, ONE weekend (Fri 2024-05-10 -> Mon 2024-05-13).
+    bars = _daily_business_bars("2024-05-06", "2024-05-17")
+    cache = OhlcvCache("alpaca", "AAPL", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        calls["n"] += 1
+        return bars  # provider has nothing newer than the newest Friday
+
+    cutoff = bars["timestamp"].max()  # FRESH edge: cutoff == newest bar (Fri)
+    kwargs = dict(
+        provider="alpaca",
+        symbol="AAPL",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    for _ in range(3):
+        out, meta = cached_fetch(fetch, **kwargs)
+        assert meta["cache_hit"] is True
+    assert calls["n"] == 0  # no refetch-forever loop
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_intraday_one_overnight_fresh_edge_hits_no_refetch_loop(tmp_path):
+    """cs74: a SHORT, fresh INTRADAY 1h cache spanning exactly TWO RTH sessions (one
+    18h overnight gap) with --end anchored AT the newest bar (FRESH edge) was wrongly
+    HIT-rejected — the single overnight gap appears once so contig_bound degrades to
+    the 1h floor and the 18h gap fails contiguity, then refetched every run. The cs63
+    holiday allowance applied to the contiguity bound tolerates the single overnight.
+
+    RED today: hits=[F,F,F], calls=3. GREEN after: HITs each run, calls==0.
+    """
+    calls = {"n": 0}
+    # Two RTH sessions (14:00-20:00Z) -> 7 bars each = 14 bars, ONE 18h overnight gap.
+    bars = _intraday_rth_bars("2024-05-22", "2024-05-23")
+    assert len(bars) == 14
+    cache = OhlcvCache("alpaca", "MSFT", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        calls["n"] += 1
+        return bars
+
+    cutoff = bars["timestamp"].max()  # FRESH edge
+    kwargs = dict(
+        provider="alpaca",
+        symbol="MSFT",
+        timeframe="1h",
+        lookback_bars=14,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    for _ in range(3):
+        out, meta = cached_fetch(fetch, **kwargs)
+        assert meta["cache_hit"] is True
+    assert calls["n"] == 0
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_cs74_edge_bound_still_rejects_cs50_interior_hole(tmp_path):
+    """cs74 must NOT reopen the cs50 interior-hole rejection. Even with the contiguity
+    bound widened to ``_edge_bound`` (recurring rhythm + one closed session day, ~1d1h
+    for a 1h cache), a single multi-month INTERIOR hole (200 contiguous hourly bars
+    glued to one fresh bar AT the cutoff, ~143 days wide) is MANY session-days, far
+    above ``_edge_bound * 1.5`` (~37.5h) -> still fails contiguity -> MISS/fetch.
+    """
+    calls = {"n": 0}
+    ancient = _bars(200, start="2024-01-01")  # contiguous hourly
+    fresh1 = _bars(1, start="2024-06-01T00:00:00Z", seed=9)  # single bar AT cutoff
+    cache = OhlcvCache("ccxt", "HOLE", "1h", root=tmp_path, prefer_parquet=False)
+    cache.write(pd.concat([ancient, fresh1], ignore_index=True))
+
+    def fetch():
+        calls["n"] += 1
+        return _bars(300, start="2024-05-20")
+
+    cutoff = pd.Timestamp("2024-06-01T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="ccxt",
+        symbol="HOLE",
+        timeframe="1h",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 1  # discontiguous interior hole -> MISS/fetch (cs50 intact)
+    assert meta["cache_hit"] is False
+
+
+def test_cached_fetch_cs74_edge_bound_still_rejects_cs43_multimonth(tmp_path):
+    """cs74 must NOT reopen the cs43 multi-month-stale rejection. A DAILY Mon-Fri cache
+    ending months before the anchor fails on the EDGE gate (``fresh_right_edge`` False
+    via ``_edge_bound``), which is independent of the contiguity bound the cs74 fix
+    touches -> the HIT is still REJECTED and the fresh provider refreshes.
+    """
+    calls = {"n": 0}
+    stale = _daily_business_bars("2024-01-01", "2024-01-31")  # ends ~2024-01-31
+
+    def fetch():
+        calls["n"] += 1
+        return _daily_business_bars("2024-05-01", "2024-05-31")  # fresh provider bars
+
+    cache = OhlcvCache("alpaca", "OLD", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(stale)
+
+    cutoff = pd.Timestamp("2024-06-03T00:00:00Z")  # ~4 months past the cache edge
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="OLD",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert calls["n"] == 1  # multi-month stale edge -> MISS/fetch (cs43 intact)
+    assert meta["cache_hit"] is False
+    assert (out["timestamp"] <= cutoff).all()
+
+
+def test_cached_fetch_cs74_multiweek_recurring_weekend_byte_identical(tmp_path):
+    """cs74: a 4-week DAILY cache whose Fri->Mon weekend gap RECURS (>=2x) was ALREADY
+    contiguous under the recurrence-only ``_calendar_bound`` (3d learned -> 3d <= 4.5d).
+    Widening the contiguity bound to ``_edge_bound`` (4d) only LOOSENS the test, so the
+    HIT decision cannot flip -> the outcome is byte-identical: HITs every run, calls==0,
+    and the served tail is stable run-to-run (no loop-induced drift).
+    """
+    calls = {"n": 0}
+    bars = _daily_business_bars("2024-05-06", "2024-05-31")  # 4 trading weeks
+    cache = OhlcvCache("alpaca", "AAPL", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(bars)
+
+    def fetch():
+        calls["n"] += 1
+        return bars
+
+    cutoff = bars["timestamp"].max()  # FRESH edge
+    kwargs = dict(
+        provider="alpaca",
+        symbol="AAPL",
+        timeframe="1d",
+        lookback_bars=10,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    outs = []
+    for _ in range(3):
+        out, meta = cached_fetch(fetch, **kwargs)
+        assert meta["cache_hit"] is True
+        outs.append(out)
+    assert calls["n"] == 0
+    # Served tail byte-identical run-to-run (no refetch-forever drift).
+    assert list(outs[0]["timestamp"]) == list(outs[1]["timestamp"])
+    assert list(outs[1]["timestamp"]) == list(outs[2]["timestamp"])
+    assert (outs[0]["timestamp"] <= cutoff).all()
