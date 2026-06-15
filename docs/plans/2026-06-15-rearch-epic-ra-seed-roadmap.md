@@ -24,16 +24,22 @@ architecture decision for the operator/deciders, NOT a code task the agent makes
 
 ## ra* seed → increment map
 
-| Seed | P | What it is | ADR-0092 increment | Gate / blocker | Status |
+| Seed | P | What it is | ADR-0092 increment | Gate / blocker | Status (updated 2026-06-15) |
 |---|---|---|---|---|---|
-| `ra00` | 1 | EPIC: extract the shared pdr-core | the whole plan (Inc 0–6) | ADR-0091 resolution → Inc 0 | epic root; tracks the 6 increments |
-| `ra01` | 1 | Dual-ledger divergence (cumulative-delta vs latest-target reconstructors) | **Increment 0** (one canonical `Ledger.portfolio()` fold) | ADR-0091 (the deciding authority on the fold) | blocked on ADR-0091; **mitigated** this session — see below |
-| `ra02` | 1 | 2 of 4 fire-paths bypass the cap/reaction seam (`autonomous` hardcodes `PaperReactor`; `playbook-tick` POSTs raw) | **Increment 2** (point all fire-paths at the core selector) | Inc 0 first | blocked on Inc 0; **2 cap-asymmetry instances closed** this session (cs55, cs60) |
-| `ra05` | 2 | Three competing signal contracts; analysts honor only the untyped one | **Increment 1** (freeze contracts, port `AnalystView`) | Inc 0 first | blocked on Inc 0; **contract type-hardening done** this session (av1/cs82/cs83) |
-| `ra06` | 2 | Three classes named `PortfolioState` with different shapes | **Increment 2** (retire hermes's 3 dup `PortfolioState`; point at the core's one reader) | Inc 0 (core `PortfolioState`) | blocked on Inc 0 |
-| `ra07` | 2 | Orphaned `governance.promotion.evaluate()` (paper→live gate, zero live callers) | **Increment 4** (orchestration spine wires the promotion gate) | Inc 0–2 | blocked; re-confirmed orphaned (no live caller) by the convergence review |
-| `ra08` | 2 | Entire LLM committee layer orphaned (built, fires on no live path) | **Increment 4** (spine decides committee wiring) + ADR-0062 (`8db9`) | Inc 4 + the five-gate LLM-production criteria | blocked; shadow-mode default-OFF (`HERMES_QUANT_DELIBERATIVE`) |
-| `ra09` | 2 | No single source of truth for "what is ON in production"; 3 disagreeing flag inventories | **Increment 4** (deploy lineage) + the FLAG-INVENTORY reconcile | Inc 4 | blocked; partially served by `docs/FLAGS.md` + the 2026-06-14 operator action packet |
+| `ra00` | 1 | EPIC: extract the shared pdr-core | the whole plan (Inc 0–6) | sequenced | **OPEN — epic root.** Inc 0 DONE (ADR-0091 accepted); Inc 1 substantially landed (pdr_core contracts+gate+kelly+aggregate ported, 436 parity tests green); Inc 2 shadow-gate landed. Tracks the remaining cutover increments. |
+| `ra01` | 1 | Dual-ledger divergence (cumulative-delta vs latest-target reconstructors) | **Increment 0** (one canonical fold) | — | **✅ CLOSED 2026-06-15.** ADR-0091 Option E ACCEPTED; the one shared FillDeltaNormalizer feeds all four folds; 4-fold parity gate green. |
+| `ra02` | 1 | 2 of 4 fire-paths bypass the cap/reaction seam (`autonomous` hardcodes `PaperReactor`; `playbook-tick` POSTs raw) | **Increment 2** (point all fire-paths at the core selector) | Inc 0 (DONE) → the cutover | **OPEN — Increment 2.** Core gate runs as a default-OFF SHADOW (b34afa0, observes core-vs-live parity); the cap-bypass CUTOVER (route all fire-paths through the one seam) is the remaining behavioral step. cs55/cs60/cap2 closed the live cap-correctness holes this session. |
+| `ra05` | 2 | Three competing signal contracts | **Increment 1** (freeze contracts) | parity-tested + eval-gated increment | **DEFERRED-WITH-GATE 2026-06-15.** LIVENESS-TRACED (wps0a9wcl): premise PARTLY REFUTED — analysts DO emit the typed `protocol.AnalystView`; the "three" are 1-live + 1-future-core + 1-serialization-view. pdr_core.contracts TRIAD frozen (av1/cs82/cs83). Collapsing them touches the pdr_core seam + protocol money types = its own parity-tested increment; wiring EvidenceRecord is behavioral not additive. Gate: that increment. |
+| `ra06` | 2 | Three classes named `PortfolioState` | **Increment 2** (retire the dups; point at the core's one reader) | the state-core increment | **OPEN — Increment 2.** Same risk-class as ra05 (touches money types under a parity grid). Now-2 live `PortfolioState` (risk/portfolio_normalize + state/portfolio_state) + the protocol view. Sequenced behind the Inc-2 cutover. |
+| `ra07` | 2 | Orphaned `governance.promotion.evaluate()` (paper→live gate, zero live callers) | **Increment 4** | blocked on B48/B01-LIVE | **DEFERRED-WITH-GATE 2026-06-15.** LIVENESS-TRACED (wps0a9wcl): DECISION = neither wire nor quarantine; leave STAGED. Zero non-test callers verified. Gate: a LIVE reactor (B48/`243d`) lands → then the spine wires the promotion gate. |
+| `ra08` | 2 | LLM committee layer (built, default-OFF shadow) | **Increment 4** + ADR-0062 five-gate (`8db9` DONE) | the five-gate eval PASS | **DEFERRED-WITH-GATE 2026-06-15.** LIVENESS-TRACED (wps0a9wcl): NOT dead — a default-OFF shadow-only eval-gated rollout, reachable from the enabled playbook-tick when the flag flips. The five-gate criteria are now documented (ADR-0062 amendment, `8db9`). Gate: an eval PASS + operator flag flip. |
+| `ra09` | 2 | No single source of truth for "what is ON in production" | **Increment 4** (deploy lineage) | Inc 4 | **OPEN — Increment 4.** Partially served by `docs/FLAGS.md` + the 2026-06-14 action packet + the `9048` CRON/DEPLOY destale this session. The single deploy-lineage SoT is the Inc-4 deliverable. |
+
+> **Increment 0 is COMPLETE (2026-06-15).** ADR-0091 Option E is accepted, the canonical fold is
+> proven across all four folds, and ra01 is closed. The epic's remaining open items (ra00 root,
+> ra02 + ra06 the Inc-2 cutover, ra09 the Inc-4 deploy SoT) are genuine behavioral cutovers that
+> change live routing/state under a parity grid — sequenced, not stalled. The traced-and-dispositioned
+> items (ra05, ra07, ra08) are deferred-with-gate, each with a named, re-verified unblock condition.
 
 ---
 
