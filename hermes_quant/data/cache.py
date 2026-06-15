@@ -649,9 +649,11 @@ def cached_fetch(
             #     rhythm + one closed session day (NOT the largest observed gap), so
             #     a cs50 multi-step interior hole (MANY session-days wide, far above
             #     edge_bound * 1.5) STILL fails contiguity -> cs50 is not reopened.
-            #     The MISS-path cs73 interior flag below deliberately keeps the
-            #     tighter recurrence-only _calendar_bound (an honesty signal, not a
-            #     data-serving gate) and is untouched.
+            #     cs76 later brought the MISS-path cs73 interior flag below to this
+            #     SAME holiday-tolerant _edge_bound (the symmetric MISS-side twin of
+            #     this HIT-gate switch): it stays an honesty signal (not a
+            #     data-serving gate) but no longer false-flags a short single-weekend
+            #     merged set as discontiguous.
             # cs74: edge and contiguity now share the same holiday-tolerant bound.
             edge_bound = _edge_bound(bound, eligible["timestamp"])
             contig_bound = edge_bound
@@ -775,10 +777,28 @@ def cached_fetch(
     # the EDGE flag). Learning from ``merged`` (which carries the recurring rhythm)
     # keeps the weekend gap tolerated while the max-gap measurement stays on the
     # EXACT served window ``out`` the backtest receives.
+    #
+    # cs76 (the MISS-path twin of cs74): cs73 learning from ``merged`` only dodges the
+    # false-flag when ``merged`` ITSELF carries the weekend gap >=2x. For a SHORT cache
+    # whose ENTIRE merged set straddles exactly ONE weekend (or one overnight session),
+    # the gap appears ONCE even in ``merged`` -> the recurrence-only
+    # :func:`_calendar_bound` degrades to the canonical one-step floor and a 3d weekend
+    # (or an ~18h overnight) exceeds bound*1.5 -> the flag fires on a window that is
+    # CONTIGUOUS-modulo-weekends, so the caller may wrongly ABSTAIN on a legitimate
+    # short cache. cs74 fixed the SYMMETRIC HIT GATE (:line ``contig_bound = edge_bound``
+    # above) but its HIT-path-only scope left this MISS flag with the bug. We mirror
+    # cs74 EXACTLY: use the holiday-tolerant :func:`_edge_bound` (recurring rhythm + one
+    # closed session day) so ONE legitimate session gap in a short merged set is
+    # tolerated, while a genuinely-unfillable multi-step interior hole (MANY session-
+    # days wide, far above edge_bound*1.5) STILL flags (cs73's original case intact).
+    # The flag is an HONESTY signal (not a data-serving gate), so a bound at least as
+    # loose as the HIT gate's is correct here. A long recurring-weekend cache was
+    # already non-flagging under _calendar_bound (3d learned) and _edge_bound only
+    # LOOSENS it -> byte-identical.
     if cutoff is not None and len(out) >= 2:
         bound = max_staleness if max_staleness is not None else _infer_step(timeframe, merged)
         if bound is not None:
-            contig_bound = _calendar_bound(bound, merged["timestamp"])
+            contig_bound = _edge_bound(bound, merged["timestamp"])
             max_gap = out["timestamp"].diff().dropna().max()
             if max_gap is not pd.NaT and max_gap > contig_bound * 1.5:
                 meta["interior_gap_days"] = int(max_gap / pd.Timedelta(days=1))

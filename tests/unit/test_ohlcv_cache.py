@@ -1900,6 +1900,173 @@ def test_cached_fetch_miss_interior_flag_short_tail_single_weekend_no_false_flag
     assert "right_edge_stale_days" not in meta
 
 
+# cs76: the MISS-path twin of cs74. cs73 moved the interior-flag contiguity bound
+# learning-source from the short served tail ``out`` to the BROAD ``merged`` set to
+# dodge a false-flag — but that only works when ``merged`` ITSELF contains the
+# weekend gap >=2x (the recurrence gate in ``_calendar_bound``). For a SHORT cache
+# whose ENTIRE merged set straddles exactly ONE weekend (or one overnight session),
+# the gap appears ONCE even in ``merged`` -> ``_calendar_bound`` degrades to the
+# 1-step floor -> a 3d weekend > bound*1.5 -> ``served_window_discontiguous`` fires
+# on a window that is CONTIGUOUS-modulo-weekends -> the caller may wrongly ABSTAIN
+# on a legitimate short cache. cs74 fixed the symmetric HIT-GATE by switching its
+# contig_bound from ``_calendar_bound`` to the holiday-tolerant ``_edge_bound``;
+# cs74's HIT-path-only scope left the MISS flag with the bug. The fix mirrors cs74
+# EXACTLY: switch the MISS-path flag bound to ``_edge_bound``.
+
+
+def test_cached_fetch_miss_interior_flag_single_weekend_merged_no_false_flag(tmp_path):
+    """cs76 RED->GREEN (MISS-side twin of cs74): a SHORT MISS whose ENTIRE merged set
+    straddles exactly ONE weekend must NOT false-flag interior discontiguity.
+
+    The cache holds Thu+Fri only (short of the lookback -> MISS by count). The
+    provider supplies Thu,Fri,Mon and ADVANCES the right edge to Monday == cutoff
+    (FRESH edge, so cs49's right_edge_stale_days correctly does NOT fire). The merged
+    set is exactly [Thu, Fri, Mon] -> the single Fri->Mon weekend gap appears ONCE,
+    so the cs73 recurrence-only ``_calendar_bound`` degrades to the canonical 1-day
+    floor and (3d weekend > 1d*1.5) FALSE-FLAGS this contiguous-modulo-weekends
+    window. The cs76 fix learns the flag bound from the holiday-tolerant ``_edge_bound``
+    (recurring rhythm + one closed session day), so a single legitimate weekend gap is
+    tolerated (3d <= 3d) and no flag fires.
+
+    RED today: ``served_window_discontiguous`` is wrongly True with
+    ``interior_gap_days == 3``. GREEN after: both flags absent.
+    """
+    cache = OhlcvCache("alpaca", "WK1", "1d", root=tmp_path, prefer_parquet=False)
+    # Thu+Fri only (2 bars), short of lookback=3 -> MISS by count.
+    cache.write(_bars_from_ts(["2026-01-08", "2026-01-09"]))
+    cutoff = pd.Timestamp("2026-01-12", tz="UTC")  # Monday == provider edge
+
+    calls = {"n": 0}
+
+    def fetch():
+        calls["n"] += 1
+        # Provider ADVANCES the edge to Monday; merged = [Thu, Fri, Mon] straddles
+        # exactly ONE weekend -> the gap appears ONCE even in merged (the cs76 trigger).
+        return _bars_from_ts(["2026-01-08", "2026-01-09", "2026-01-12"])
+
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="WK1",
+        timeframe="1d",
+        lookback_bars=3,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False
+    # The served window is the whole single-weekend merged set: [Thu, Fri, Mon].
+    days = list(out["timestamp"].dt.day_name())
+    assert days == ["Thursday", "Friday", "Monday"], days
+    # A single legitimate weekend gap is NOT an interior discontiguity (cs76 fix).
+    assert "interior_gap_days" not in meta
+    assert "served_window_discontiguous" not in meta
+    # The edge advanced to the cutoff Monday -> the cs49 edge flag must not fire.
+    assert "right_edge_stale_days" not in meta
+
+
+def test_cached_fetch_miss_interior_flag_intraday_single_overnight_no_false_flag(
+    tmp_path,
+):
+    """cs76 (intraday variant): a SHORT INTRADAY MISS whose ENTIRE merged set spans
+    exactly TWO sessions (ONE overnight gap) must NOT false-flag. The single overnight
+    gap appears once even in merged, so the recurrence-only ``_calendar_bound`` degrades
+    to the 1h floor and the ~18h overnight > 1h*1.5 wrongly flags; the ``_edge_bound``
+    one-closed-session-day allowance tolerates the single overnight.
+    """
+    cache = OhlcvCache("alpaca", "OVN", "1h", root=tmp_path, prefer_parquet=False)
+    # Day-1 RTH session only (7 bars), short of the requested lookback -> MISS.
+    cache.write(_intraday_rth_bars("2024-05-22", "2024-05-22"))
+
+    def fetch():
+        # Provider ADVANCES the edge into day-2's session; merged spans exactly TWO
+        # sessions -> the single overnight gap appears ONCE in merged.
+        return _intraday_rth_bars("2024-05-22", "2024-05-23")
+
+    bars2 = _intraday_rth_bars("2024-05-22", "2024-05-23")
+    cutoff = bars2["timestamp"].max()  # FRESH edge: cutoff == newest bar (day-2 close)
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="OVN",
+        timeframe="1h",
+        lookback_bars=14,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False
+    # A single legitimate overnight session gap is NOT an interior discontiguity.
+    assert "interior_gap_days" not in meta
+    assert "served_window_discontiguous" not in meta
+    assert "right_edge_stale_days" not in meta
+
+
+def test_cached_fetch_cs76_miss_flag_still_flags_unfillable_hole(tmp_path):
+    """cs76 must NOT silence the cs73 genuinely-unfillable interior hole. Widening the
+    MISS-flag bound to ``_edge_bound`` only adds ONE closed session day of tolerance; a
+    multi-step unfillable hole (delisting stretch ~10 session-days wide) is far above
+    ``_edge_bound * 1.5`` -> ``served_window_discontiguous`` STILL fires. This is the
+    exact cs73 original case; the cs76 fix must leave it flagged.
+    """
+    cache = OhlcvCache("yfinance", "DELISTED2", "1d", root=tmp_path, prefer_parquet=False)
+    seg1 = {f"2026-01-{d:02d}": 100 + d for d in range(1, 6)}  # 01..05 contiguous
+    seg2 = {f"2026-01-{d:02d}": 100 + d for d in (15, 16)}  # edge after a 06..14 hole
+    cache.write(_daily_bars_from({**seg1, **seg2}))
+    cutoff = pd.Timestamp("2026-01-17", tz="UTC")
+
+    def fetch():
+        return _daily_bars_from({"2026-01-17": 117})  # advances edge, cannot fill hole
+
+    out, meta = cached_fetch(
+        fetch,
+        provider="yfinance",
+        symbol="DELISTED2",
+        timeframe="1d",
+        lookback_bars=8,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False
+    # The genuinely-unfillable ~10-day interior hole STILL flags (cs73 intact).
+    assert meta["served_window_discontiguous"] is True
+    assert meta["interior_gap_days"] >= 9
+
+
+def test_cached_fetch_cs76_multiweek_recurring_weekend_miss_byte_identical(tmp_path):
+    """cs76 anti-regression: a long MISS window whose Fri->Mon weekend RECURS (>=2x in
+    merged) was ALREADY non-flagging under the recurrence-only ``_calendar_bound`` (3d
+    learned -> 3d <= 4.5d). Widening to ``_edge_bound`` (4d) only LOOSENS the bound, so
+    the flag decision cannot flip -> the outcome is byte-identical (no interior flag),
+    while cs49's right-edge flag still fires (the provider stays months below cutoff).
+    """
+    cache = OhlcvCache("alpaca", "DEAD2", "1d", root=tmp_path, prefer_parquet=False)
+    cache.write(_daily_business_bars("2024-01-01", "2024-01-05"))  # one short week
+
+    def fetch():
+        # Multi-week Mon-Fri window (recurring weekends), right edge months below cutoff.
+        return _daily_business_bars("2024-01-01", "2024-02-16")
+
+    cutoff = pd.Timestamp("2024-06-03T00:00:00Z")
+    out, meta = cached_fetch(
+        fetch,
+        provider="alpaca",
+        symbol="DEAD2",
+        timeframe="1d",
+        lookback_bars=20,
+        cache_root=tmp_path,
+        prefer_parquet=False,
+        cutoff=cutoff,
+    )
+    assert meta["cache_hit"] is False
+    # Recurring weekends -> no interior flag (byte-identical to cs73).
+    assert "interior_gap_days" not in meta
+    assert "served_window_discontiguous" not in meta
+    # The right edge stays months below cutoff -> cs49 edge flag still fires.
+    assert meta["right_edge_stale_days"] >= 100
+
+
 def test_cached_fetch_miss_interior_flag_cutoff_none_byte_identical(tmp_path):
     """cs73: cutoff=None (live caller) imposes NO interior-discontiguity flag, even
     when the served window has an interior hole -> byte-identical to the prior
