@@ -46,7 +46,13 @@ Verdicts per `quant-*.py`:
 
 Current state (2026-05-30): **3 SAME · 9 DRIFT · 7 REPO_ONLY_NEW · 4 DEPLOYED_ONLY**.
 
-## Reconciliation procedure (the only safe deploy)
+## Reconciliation procedure (the only safe deploy) {#reconciliation-procedure}
+
+> **Anchor note (seed `9048`):** other docs reference this section as "DEPLOY-SYNC §49" — that
+> "§49" is a **line-number artifact** (this heading sits at line 49), not a section number; this
+> doc has no numbered sections (it uses `M0x` labels). The canonical reference is **DEPLOY-SYNC
+> "Reconciliation procedure" step N** (the four numbered steps below). Treat any "§49 step N" you
+> see elsewhere as "Reconciliation-procedure step N".
 
 For each non-`SAME` script, in this order:
 

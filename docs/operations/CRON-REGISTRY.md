@@ -67,11 +67,21 @@ pins thread `:1509261038879637524`. **PT** is the schedule's literal clock numbe
 | **19** | **quant-weekly-retro** *(NEW — not yet registered; W2 / ADR-0081)* | `30 13 * * 0` | 16:30 ET, Sun | `quant-weekly-retro.py` | local | ✓ | `HERMES_QUANT_WEEKLY_RETRO` **default-OFF** (flag-OFF = silent no-op) | Weekly CVRF pattern-mining retro: distill winners-vs-losers (by realized alpha) into bounded/decaying beliefs; emits `weekly_retro_promotion_readiness` (closes O3) | exits 0 silent unless a belief is distilled/expired, budget-cap flips, or readiness toggles (flag-OFF = empty stdout) |
 | **20** | **quant-monthly-meta-retro** *(NEW — not yet registered; W3 / ADR-0080 / ADR-0081 §3)* | `0 14 1 * *` | 09:00 ET, 1st of month (after the trailing weekly retros) | `quant-monthly-meta-retro.py` | local | ✓ | `HERMES_QUANT_MONTHLY_META_RETRO` **default-OFF** (flag-OFF = byte-identical no-op) | Monthly meta-retro (T3): aggregate W2 weekly belief digests + `research_debate` audit rows (O7) + promotion records → repeating-lesson trends, persona-calibration **telemetry** (NOT applied), and novelty/dedup-gated **candidate** hypotheses registered `status="open"` (closes O8); applies the deterministic weekly→monthly belief promote/expire. PROPOSE-ONLY; zero auto-promotion. | exits 0 silent unless a candidate is proposed or a belief is promoted/expired (flag-OFF = empty stdout) |
 | **21** | **research-loop-weekly** *(NEW — not yet registered; W6 / ADR-0080 §D80.6)* | `0 8 * * 1` | 11:00 ET, Mon (after the W3 meta-retro has seeded candidates) | `quant-research-loop.py` | discord:#hq | ✓ | `HERMES_QUANT_RESEARCH_LOOP` **default-OFF** (flag-OFF = byte-identical no-op) | Weekly W6 driving cron: drain W3 `open` candidate hypotheses → deterministic OOS backtest + lookahead sentinel → (clean+validated only) PromotionGate. PRODUCES reproducible Run-Cards + review-only PromotionRecords. **PROPOSER ONLY — zero auto-promotion to live; the operator promotes (ADR-0052).** | exits 0 silent unless a candidate ran / promotion recommended / contamination fired / error / halt aborted (flag-OFF = empty stdout) |
+| **22** | **catalyst-graph-mine-weekly** *(NEW — not yet registered; B10 / seed `afa4`)* | `0 6 * * 0` | 09:00 ET, Sun | `quant-catalyst-graph-mine.py` | local | ✓ | `HERMES_QUANT_GRAPH_MINING` **default-OFF** (flag-OFF = no mining) | Weekly learned-graph mining: join the propagation-log corpus → propose catalyst-relation edges. **PROPOSES-ONLY — never auto-edits seed YAML.** | exits 0 silent until the propagation-log corpus reaches `MIN_SAMPLE=20`/edge, then emits proposed edges |
 
-**Counts.** 16 quant crons are **live in `jobs.json`** (rows 1–16, all `enabled`). 14 of those are
-`no_agent=True` watchdogs; 3 are `no_agent=False` LLM advisor briefs (#5, #11, #13). Rows **17–18 are
-built and the repo scripts exist, but they are NOT yet deployed and NOT yet registered** — registering
-them is the pending action in §2/§3.
+**Counts (reconciled 2026-06-14, seed `9048`).** **16 quant crons were confirmed live in `jobs.json`**
+at the 2026-05-30 snapshot (rows 1–16, all `enabled`; 14 `no_agent=True` watchdogs + 3 `no_agent=False`
+LLM advisor briefs #5/#11/#13). Rows **17–22 are NEW: the repo scripts exist, but they are NOT yet
+deployed and NOT yet registered** — they are the six owed crons (catalyst-profitability, calibrator-drift,
+weekly-retro, monthly-meta-retro, research-loop, catalyst-graph-mine). **Once all six are deployed (§3) +
+registered (§2), the managed total is 16 + 6 = 22 `quant-*` crons.**
+
+> **Live-count caveat — this doc cannot read `~/.hermes/cron/jobs.json` itself.** The "16 live" is the
+> 2026-05-30 read; the "22" is the arithmetic target after the six owed registrations. The **authoritative
+> live count is whatever `cronjob action='list'` / `hermes cron list` reports on the host** — re-reconcile
+> this number against that output on the next operator pass (the operator runs the enablement commands in
+> `docs/operations/2026-06-14-operator-action-packet.md`; this agent has no `cronjob` tool). Do **not** treat
+> "22" as a confirmed live count until the six registrations are verified on the host.
 
 > **ADR-0052 promotion crons** (`promotion-cron.py`) are operator/CI-run and are **not** in the host
 > `jobs.json`; they are out of scope for this trading-cron registry.
@@ -246,7 +256,12 @@ cronjob action='run' job_id='catalyst-profitability-weekly'
 cronjob action='run' job_id='calibrator-drift-weekly'
 ```
 
-Expected post-registration count: **16 live + 2 new = 18 `quant-*` trading crons** managed for the system.
+Expected post-registration count: **16 live + 6 new (rows 17–22) = 22 `quant-*` trading crons** managed
+for the system (the §2.1/§2.2 commands shown here are for the first two; the other four — weekly-retro,
+monthly-meta-retro, research-loop, catalyst-graph-mine — follow the identical `no_agent=true` pattern with
+the schedules in the row table above and the SELFEVOLVE-ENABLEMENT.md create blocks). **CRON-REGISTRY is
+the single source of truth for cron schedules** — if a SELFEVOLVE / FEATURE doc shows a different schedule
+for the same cron name, this table wins; reconcile the other doc to it.
 If a name is missing from `cronjob action='list'`, the most likely cause is the
 deploy step (§3) was skipped and the first tick errored. **Never guess job IDs — always `list` first**
 before `remove`/`pause`/`update`.

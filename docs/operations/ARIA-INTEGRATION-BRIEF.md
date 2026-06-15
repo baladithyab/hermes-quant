@@ -27,7 +27,7 @@ paper — NEVER originate from an LLM/MCP tool call; they flow only through prop
 1. **Deploy the REPO_ONLY_NEW scripts** (16 built this drive, none yet live) to ~/.hermes/scripts/ via
    `cp` (safe — nothing to clobber), then `python ops/deploy/quant-deploy-audit.py` and confirm each
    shows SAME before registering its cron.
-2. **Reconcile the 8 DRIFT scripts** — THREE-WAY reconcile per DEPLOY-SYNC.md §49, NEVER a blind cp.
+2. **Reconcile the 8 DRIFT scripts** — THREE-WAY reconcile per DEPLOY-SYNC.md "Reconciliation procedure", NEVER a blind cp.
    CRITICAL: the deployed playbook-weekly.py / playbook-quarterly.py carry the Wave-1d equity-halt-filter
    safety fix that is NOT in repo — preserve it. playbook-tick/hourly-tick/universe-scan have richer
    deployed emit formatters — preserve them. Merge the repo's PerceptionFrame/B04/ADR-0075/corrupt-row

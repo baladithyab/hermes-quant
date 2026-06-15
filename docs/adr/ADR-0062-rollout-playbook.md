@@ -175,3 +175,77 @@ documentation honest.
 | `docs/adr/ADR-0062-rollout-playbook.md`           | **NEW** — this ADR                                 |
 | `tests/docs/test_rollout_consistency.py`          | **NEW** — eight lightweight consistency checks     |
 | `docs/adr/README.md`                              | **EXTENDED** — index entry for ADR-0062            |
+
+---
+
+## Amendment — 2026-06-15: the five-gate LLM-production-default criteria (seed `8db9`, B41-g)
+
+**Status of amendment:** Accepted (governance close-out). **Scope:** documentation only — this
+amendment records the criteria a default-flip MUST clear; it flips **no** flag and changes **no**
+running behavior, so it is compatible with the ADR-freeze (seed `d9d8`) if active. Every flag named
+below remains **default-OFF**; flipping any of them is an operator decision gated on the criteria here.
+
+### Why this amends §1–§2
+
+The original ADR-0062 gated each per-stage default-flip on **dwell time (24h/24h/48h/7d) + a ±10%
+KPI-drift eyeball** (§2, §4). That is a *time-and-observation* heuristic — necessary (it is gate 5
+below) but **not sufficient**: it never asks whether turning the stage ON actually *improves the
+decision*. The B41 research (`docs/research/2026-06-01-r-llm-production-default.md` §7) established
+the load-bearing gap: **all four LLM stages already clear "default-OFF / byte-identical" and the
+silence-by-default half, but none clears the OOS-beats-fallback gate** — because that gate did not
+exist. As of 2026-06-15 it does (see "Now-merged instruments"), so the implicit drift heuristic is
+replaced by the explicit five-gate criteria.
+
+### The five gates (ALL must hold simultaneously, in order; none is "the LLM produced plausible output")
+
+A stage's default flips OFF→ON only when it clears all five:
+
+1. **Determinism / byte-identical rail.** Flag OFF ⇒ path byte-identical to today. Flag ON ⇒ the
+   *decision* the gate sees is reproducible from the audit log (`prompt_hash` + parsed dump), not
+   the prose. (Already true for all four stages.)
+2. **Cost ceiling.** A per-decision USD/token budget with a zero-call local kill-switch, surviving
+   restart, enforced *before* the call; child-cost-counts-against-parent for the research debate;
+   fall back to the $0/no-network v0.1 path on exhaustion. **Merged:** `hermes_quant/agents/llm_budget.py`
+   (seed `ed7c`/B41-a).
+3. **OOS eval gate — the LLM stage beats its own heuristic fallback out-of-sample.** Not in-sample,
+   not one window, not prose quality: the stage's decision-relevant metric across ≥2 regimes incl. a
+   drawdown regime, contamination-guard clean (the W7 red-team eval-gate template). **Merged:**
+   `hermes_quant/eval/llm_beats_fallback_gate.py` (approval-quality for RiskCommittee, proposal-quality
+   for Trader) + `hermes_quant/eval/debate_dissent_gate.py` (dissent-quality for ResearchDebate) — seed
+   `20b6`/B41-b. **This is the keystone gate and the one the original §1 omitted.**
+4. **HITL / gate-still-final invariant intact.** The deterministic risk gate (ADR-0004), the discrete
+   sizing ladder, the 3-of-5 committee quorum (ADR-0043), and per-order human confirmation remain
+   downstream of and authoritative over every LLM stage. The LLM is evidence — never the ballot, never
+   the executor. (Architecturally enforced; re-verify per stage at flip time.)
+5. **Silence-by-default proven live.** The fallback probe (ADR-0060) passes for the stage AND a live
+   observation window shows the fallback firing rate is low and bounded. **This subsumes the original
+   dwell-time + KPI-drift step** — dwell time is how long you observe gate 5, not a gate by itself.
+
+### Per-stage default-flip checklist (supersedes the implicit §2 order for the FLIP decision)
+
+The §2 activation *order* (HMM → Reflector → RiskCommittee → Trader, lowest blast-radius first) stands.
+What changes is the *admission test* at each step — replace "dwelled 24h, KPIs within ±10%" with:
+
+| Stage | Flag | G1 byte-id | G2 cost ceiling | G3 OOS-beats-fallback | G4 gate-final | G5 silence-live | Flip when |
+|---|---|---|---|---|---|---|---|
+| Reflector v0.2 | `HERMES_QUANT_REFLECTOR_LLM` | ✅ | ✅ (`llm_budget`) | **N/A-shape** — write-only, no decision metric; use a faithfulness/no-leakage check instead (§5.1) | ✅ off-path | needs a clean observation week | G1+G2+G4 hold + faithfulness check + 1 clean week |
+| RiskCommittee v0.2 | `HERMES_QUANT_RISK_COMMITTEE_LLM` | ✅ | ✅ | **instrument exists** (`llm_beats_fallback_gate`, approval-quality axis) — must be RUN and PASS on the fixed corpus | ✅ 3-of-5 quorum preserved | run the probe | all five PASS (G3 = approval-quality beats deterministic-voted approval OOS) |
+| TraderNode v0.2 | `HERMES_QUANT_TRADER_LLM` | ✅ | ✅ | **instrument exists** (proposal-quality axis); close the numeric-override gap first (§5.3) | ✅ deterministic helpers override numerics | run the probe | all five PASS |
+| ResearchDebate | `HERMES_QUANT_RESEARCH_DEBATE` | ✅ | ✅ (child-cost rollup) | **instrument exists** (`debate_dissent_gate`, dissent-quality) | ✅ off the execution path | run the probe | all five PASS; most expensive — flip last |
+
+"Instrument exists" means the eval axis is built and merged; the **gate is cleared only by running it
+on the fixed corpus and getting a PASS** — building the axis ≠ passing it. No stage has a recorded PASS
+yet, so **every LLM default remains OFF** pending the operator running the eval + observation.
+
+### Now-merged instruments (provenance)
+
+- Gate 2: `hermes_quant/agents/llm_budget.py` — `ed7c` (B41-a), closed.
+- Gate 3: `hermes_quant/eval/llm_beats_fallback_gate.py`, `hermes_quant/eval/debate_dissent_gate.py` — `20b6` (B41-b), closed.
+- Gate 5: `docs/adr/ADR-0060-fallback-probe.md` (fallback probe).
+- Gate 4: `docs/adr/ADR-0004-risk-gate.md` (deterministic gate, final authority), ADR-0043 (committee quorum).
+
+### Consequence for the consistency test
+
+`tests/docs/test_rollout_consistency.py` continues to check ROLLOUT.md ↔ code flag parity. This
+amendment adds no new flag (the four are unchanged), so the existing checks remain green. The
+five-gate criteria are a *governance* layer over the same flags, not new env vars.
