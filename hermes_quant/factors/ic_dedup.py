@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,8 +41,38 @@ logger = logging.getLogger(__name__)
 # only possible value; operators on different alpha-density regimes may want
 # a tighter 0.95 or looser 0.999 threshold).
 # ---------------------------------------------------------------------------
-_DEFAULT_THRESHOLD = float(
-    os.environ.get("HERMES_QUANT_IC_DEDUP_THRESHOLD", "0.99")
+_IC_DEDUP_ENV = "HERMES_QUANT_IC_DEDUP_THRESHOLD"
+_IC_DEDUP_DEFAULT = 0.99
+
+
+def _finite_threshold(raw: str, default: float, name: str) -> float:
+    """Parse an operator-supplied threshold, falling back to ``default`` on any
+    non-numeric OR non-finite value (ar12, mirrors autonomous.py / llm_budget idiom).
+
+    A bare ``float(...)`` catches only ValueError, so ``"1e400"`` (a realistic typo
+    that overflows to ``inf`` without raising), ``"inf"``, and ``"nan"`` all slip
+    through. With the gate logic ``passes = max_corr < thr``, ``thr=inf`` makes the
+    comparison ALWAYS True — every candidate factor is admitted and the Correlation
+    Red Sea (F4) this gate exists to prevent floods the library; ``nan`` makes it
+    always False and silently bricks the gate. Reject non-finite -> documented default.
+    """
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("ic_dedup: ignoring non-numeric %s=%r; using default %s", name, raw, default)
+        return default
+    if not math.isfinite(val):
+        logger.warning("ic_dedup: ignoring non-finite %s=%r; using default %s", name, raw, default)
+        return default
+    return val
+
+
+# NB: the env default is a quoted literal ("0.99") — not str(_IC_DEDUP_DEFAULT) — so the
+# flag-inventory scanner (ops/scripts/quant-flag-inventory.py, _VIA_CONST regex) still detects
+# this read; a computed default silently drops the flag from FLAG-INVENTORY.md (the operator
+# source-of-truth). _IC_DEDUP_DEFAULT mirrors the literal and is the post-parse fallback value.
+_DEFAULT_THRESHOLD = _finite_threshold(
+    os.environ.get(_IC_DEDUP_ENV, "0.99"), _IC_DEDUP_DEFAULT, _IC_DEDUP_ENV
 )
 
 

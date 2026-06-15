@@ -386,10 +386,19 @@ class TestCriticalFindingPlaybookHourlyBypassSeam:
         assert "place_paper_market_order" in src, (
             "playbook fire helper changed — re-audit the cap inheritance path"
         )
-        assert "PaperReactor" not in src, (
-            "playbook NOW references PaperReactor — if it routes fills through the "
-            "seam, ADR-0087 cap inheritance may now hold; update this test to "
-            "exercise the real playbook fire path through execute()"
+        # ar11: assert the playbook does not USE the reactor seam — check for an actual
+        # IMPORT or INSTANTIATION, not a raw "PaperReactor" substring. A bare substring
+        # scan false-matched a units-explanation DOC COMMENT (quant-playbook-tick.py:318
+        # mentions "PaperReactor persists fill_size_pct ...", added by cap2/202274b), which
+        # is documentation, not a code path. The invariant is about the fire MECHANISM: you
+        # cannot call a reactor's .execute() without first importing it (from hermes_quant.
+        # react) or instantiating it (PaperReactor(...)) — both asserted below — so a bare
+        # mention in prose is harmless. Detecting the actual import/instantiation rather than
+        # text also avoids re-introducing the same comment-false-match for a future reader.
+        assert "import PaperReactor" not in src and "PaperReactor(" not in src, (
+            "playbook NOW imports/instantiates PaperReactor — if it routes fills through "
+            "the seam, ADR-0087 cap inheritance may now hold; update this test to exercise "
+            "the real playbook fire path through execute()"
         )
         assert "select_reactor" not in src
         assert "from hermes_quant.react" not in src

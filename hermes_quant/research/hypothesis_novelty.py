@@ -24,20 +24,52 @@ Configuration
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 import re
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Default threshold — configurable via env var (mirrors ic_dedup's idiom; do NOT
 # hardcode 0.85 as the only possible value).
 # ---------------------------------------------------------------------------
+_NOVELTY_ENV = "HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD"
+_NOVELTY_DEFAULT = 0.85
 
 
 def _default_threshold() -> float:
     """Resolve the default threshold at call time so tests that monkey-patch the
-    env var are respected (mirrors audit_log._audit_path resolve-each-call idiom)."""
-    return float(os.environ.get("HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD", "0.85"))
+    env var are respected (mirrors audit_log._audit_path resolve-each-call idiom).
+
+    ar12: reject non-finite (mirrors ic_dedup._finite_threshold). A bare ``float(...)``
+    catches only ValueError, so ``"1e400"`` (overflows to ``inf`` without raising),
+    ``"inf"``, and ``"nan"`` slip through. With ``passes = max_sim < thr``, ``thr=inf``
+    makes every claim read as "novel" (defeats the dedup — re-propose near-duplicate
+    hypotheses forever); ``nan`` makes nothing ever novel. Fall back to the default.
+    """
+    # Env default is a quoted literal ("0.85") — not str(_NOVELTY_DEFAULT) — so the
+    # flag-inventory scanner (_VIA_CONST regex) keeps detecting this read; a computed
+    # default silently drops the flag from FLAG-INVENTORY.md. _NOVELTY_DEFAULT mirrors
+    # the literal and is the post-parse fallback value.
+    raw = os.environ.get(_NOVELTY_ENV, "0.85")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "hypothesis_novelty: ignoring non-numeric %s=%r; using default %s",
+            _NOVELTY_ENV, raw, _NOVELTY_DEFAULT,
+        )
+        return _NOVELTY_DEFAULT
+    if not math.isfinite(val):
+        logger.warning(
+            "hypothesis_novelty: ignoring non-finite %s=%r; using default %s",
+            _NOVELTY_ENV, raw, _NOVELTY_DEFAULT,
+        )
+        return _NOVELTY_DEFAULT
+    return val
 
 
 # Backwards-compatible module-level constant (snapshot at import; the live default
