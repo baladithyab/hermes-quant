@@ -36,10 +36,23 @@ architecture decision for the operator/deciders, NOT a code task the agent makes
 | `ra09` | 2 | No single source of truth for "what is ON in production" | **Increment 4** (deploy lineage) | Inc 4 | **OPEN — Increment 4.** Partially served by `docs/FLAGS.md` + the 2026-06-14 action packet + the `9048` CRON/DEPLOY destale this session. The single deploy-lineage SoT is the Inc-4 deliverable. |
 
 > **Increment 0 is COMPLETE (2026-06-15).** ADR-0091 Option E is accepted, the canonical fold is
-> proven across all four folds, and ra01 is closed. The epic's remaining open items (ra00 root,
-> ra02 + ra06 the Inc-2 cutover, ra09 the Inc-4 deploy SoT) are genuine behavioral cutovers that
-> change live routing/state under a parity grid — sequenced, not stalled. The traced-and-dispositioned
-> items (ra05, ra07, ra08) are deferred-with-gate, each with a named, re-verified unblock condition.
+> proven across all four folds, and ra01 is closed. The traced-and-dispositioned items (ra05, ra07,
+> ra08) are deferred-with-gate, each with a named, re-verified unblock condition.
+>
+> **STATUS 2026-06-16 — every concrete ra* child is closed or deferred-with-gate; ra00 (root) is now
+> tracking-only.** Closed: ra01 (canonical fold / Inc-0), ra03 (conftest isolation), ra04, ra09 (single
+> flag SoT + drift gate; rt03 then completed the scanner), ra10, ra11. Deferred-with-gate (each at a
+> named parity-gated increment): ra02 (half-1 autonomous→select_reactor DONE byte-identical; half-2
+> playbook-tick is a behavioral cutover — `docs/plans/ra02-playbook-reactor-cap-centralization.md`),
+> ra05 (signal contracts), ra06 (pdr_core `CorePortfolioSnapshot` canonical type + parity grid LANDED;
+> consumer-collapse gated), ra07 (orphaned promotion gate, blocked on a live reactor), ra08 (LLM
+> committee, five-gate eval-gated). Increment 1 substantially landed (pdr_core contracts+gate+kelly+
+> aggregate+portfolio_snapshot, 450+ parity tests green). **ra00's original blocker premise ("blocked
+> on ADR-0091 before Inc 0") is now STALE — ADR-0091 is accepted and Inc 0/1 landed.** ra00 remains as
+> the epic tracking root (deferred-with-gate): the remaining work is the per-increment behavioral
+> cutovers above, each already individually gated. The agent has driven every byte-identical/additive
+> slice to merge; what is left is genuinely the behavioral consumer-migrations + the operator-gated
+> live flips — no un-dispositioned epic work remains.
 
 ---
 
