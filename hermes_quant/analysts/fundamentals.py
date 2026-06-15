@@ -275,7 +275,20 @@ class FundamentalsAnalyst:
         basis = self._datum_basis(snapshot)
         if basis is not None:
             datum_age_days = (asof - basis).days
-            if datum_age_days > self._STALENESS_DATUM_DAYS_HARD_LIMIT:
+            # cs77: bound the datum age BELOW as well as above. A future-dated
+            # fiscal basis (corrupt / hand-built / vendor mis-stamped
+            # report_date / period_end > asof) makes datum_age_days NEGATIVE,
+            # and the old upper-only `> HARD_LIMIT` clause read `negative > 190`
+            # as False -> the gate was BYPASSED and a not-yet-knowable datum was
+            # scored as a current one (same fail-OPEN-on-future-timestamp class
+            # as cs42a/cs53/cs67/cs68/cs69/cs75). The NaN-safe bounded membership
+            # test mirrors cs75 (`if not (0 <= age_days <= HARD)`) and cs67
+            # (`0 <= age_h < ttl`): a future basis -> negative -> abstain; a
+            # NaT/missing-derived nan age fails the test -> abstain. The
+            # inclusive `<=` preserves the old strictly-greater upper boundary,
+            # so a genuinely-current datum (age in [0, HARD_LIMIT]) is admitted
+            # byte-identically.
+            if not (0 <= datum_age_days <= self._STALENESS_DATUM_DAYS_HARD_LIMIT):
                 return None
             return snapshot
         # Fallback: no fiscal basis — cron-liveness gate on fetched_at.

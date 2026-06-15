@@ -535,6 +535,119 @@ def test_cs40_no_period_basis_keeps_fetched_at_liveness_gate(
 
 
 # ---------------------------------------------------------------------------
+# 9d — cs77 RED: a FUTURE-dated datum basis (period_end/report_date > asof)
+#      must ABSTAIN — the datum-age gate had no lower bound, so a negative
+#      datum_age_days (basis in the future) silently passed `> HARD_LIMIT`
+#      and a not-yet-knowable fundamental was scored as a current datum.
+# ---------------------------------------------------------------------------
+
+
+def test_cs77_future_basis_datum_abstains(
+    provider: FundamentalsProvider,
+    analyst: FundamentalsAnalyst,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cs77: a fundamentals datum with a FUTURE fiscal basis is not knowable.
+
+    A corrupt / hand-built / mis-stamped ``period_end`` dated AFTER ``asof``
+    makes ``datum_age_days = (asof - basis).days`` NEGATIVE. The old upper-only
+    clause ``if datum_age_days > _STALENESS_DATUM_DAYS_HARD_LIMIT`` then reads
+    ``-121 > 190`` (False) and the gate is BYPASSED — a not-yet-knowable datum
+    is scored as a current one. Same fail-OPEN-on-future-timestamp class as
+    cs42a/cs53/cs67/cs68/cs69/cs75.
+
+    The provider's cs12 reporting-lag filter is the OTHER guard (it would drop
+    a future basis: effective_knowable = basis + 45d > asof), but it is
+    flag-gated. With ``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG=0`` the filter is
+    a no-op and the future-basis row reaches the analyst's datum-age gate — the
+    sole guard on that path. The analyst's own gate must independently abstain.
+    """
+    monkeypatch.setenv("HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG", "0")
+    asof = pd.Timestamp("2026-03-01T16:00:00", tz="UTC")
+    fetched = asof - pd.Timedelta(hours=2)  # fresh -> fetched_at fallback never darkens
+    future_period = pd.Timestamp("2026-06-30", tz="UTC")  # basis > asof, age = -121d
+
+    # Full bullish slate + sector benchmark: every gate EXCEPT the datum-age
+    # lower bound would admit a view, so abstention pins the future-basis reject.
+    provider.write_snapshot(
+        "AAA", _row(fetched_at=fetched, period_end=future_period, pe_trailing=30.0, sector="Tech")
+    )
+    provider.write_snapshot(
+        "BBB", _row(fetched_at=fetched, period_end=future_period, pe_trailing=30.0, sector="Tech")
+    )
+    provider.refresh_sector_medians(["AAA", "BBB"])
+    provider.write_snapshot(
+        "AAPL",
+        _row(
+            fetched_at=fetched,
+            period_end=future_period,
+            pe_trailing=18.0,
+            pe_forward=14.0,
+            debt_to_equity=0.2,
+            fcf_yoy=0.25,
+            revenue_yoy=0.18,
+            eps_trailing=7.0,
+            eps_forward=7.5,
+            sector="Tech",
+        ),
+    )
+    # Sanity: flag OFF -> lag filter is a no-op -> the future-basis row survives
+    # the read and routes to the analyst datum-age gate (the only remaining guard).
+    assert provider.read_latest("AAPL", as_of=asof) is not None
+    view = analyst.analyze(_ctx("AAPL", asof))
+    assert view is None, "cs77: a future-dated (not-yet-knowable) datum must abstain"
+    # Future-basis abstain is a structural drop, not an exception path.
+    assert analyst.health()["error_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 9e — cs77 companion: a genuinely-CURRENT datum (age in [0, HARD]) still emits
+#      — the bounded membership test is byte-identical on the in-range path.
+# ---------------------------------------------------------------------------
+
+
+def test_cs77_current_datum_still_emits(
+    provider: FundamentalsProvider,
+    analyst: FundamentalsAnalyst,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cs77 byte-identical guard: a current datum (period_end 60d before asof,
+    age in [0, 190]) is admitted exactly as before. Same flag-OFF isolation
+    and same slate as the RED test, differing only in the fiscal basis."""
+    monkeypatch.setenv("HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG", "0")
+    asof = pd.Timestamp("2026-03-01T16:00:00", tz="UTC")
+    fetched = asof - pd.Timedelta(hours=2)
+    current_period = asof - pd.Timedelta(days=60)  # age 60, in [0, 190]
+
+    provider.write_snapshot(
+        "AAA", _row(fetched_at=fetched, period_end=current_period, pe_trailing=30.0, sector="Tech")
+    )
+    provider.write_snapshot(
+        "BBB", _row(fetched_at=fetched, period_end=current_period, pe_trailing=30.0, sector="Tech")
+    )
+    provider.refresh_sector_medians(["AAA", "BBB"])
+    provider.write_snapshot(
+        "AAPL",
+        _row(
+            fetched_at=fetched,
+            period_end=current_period,
+            pe_trailing=18.0,
+            pe_forward=14.0,
+            debt_to_equity=0.2,
+            fcf_yoy=0.25,
+            revenue_yoy=0.18,
+            eps_trailing=7.0,
+            eps_forward=7.5,
+            sector="Tech",
+        ),
+    )
+    view = analyst.analyze(_ctx("AAPL", asof))
+    assert view is not None, "cs77: a current in-range datum must still emit"
+    assert view.direction == +1
+    assert analyst.health()["error_count"] == 0
+
+
+# ---------------------------------------------------------------------------
 # 10 — provider read raises FileNotFoundError (or other) → handled cleanly
 # ---------------------------------------------------------------------------
 
