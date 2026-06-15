@@ -2,6 +2,12 @@
 
 - **Status:** canonical. This is the single source of truth for every trading-system cron.
 - **Last reconciled:** 2026-05-30 (against live `~/.hermes/cron/jobs.json`, 33 jobs total, 16 `quant-*`).
+- **⚠️ COUNT STALE (2026-06-14, seed `9048`):** the `16 quant-*` count below is the 2026-05-30
+  snapshot. Live count is now **~22 `quant-*`** (the original 16 + 6 ARIA-registered + the
+  graph-mine row). The per-row table below is still the canonical registration mechanism/runbook;
+  only the aggregate count + "owed cron" deltas are stale. Re-reconcile against live `jobs.json`
+  on the next operator pass; current enablement commands are in
+  `docs/operations/2026-06-14-operator-action-packet.md`.
 - **Grounded in:** `docs/research/2026-05-30-r-hermes-cronjob-mechanism.md` (the `cronjob` API) and
   `docs/research/2026-05-30-r-cron-and-flag-inventory.md` (the registry/flag reconciliation).
 

@@ -1,5 +1,14 @@
 # GO-LIVE CHECKLIST — hermes-quant Monday market-open runbook
 
+> **⚠️ SUPERSEDED-IN-PART (2026-06-14, seed `9048`):** the deploy-drift assessment captured below
+> (`{REPO_ONLY_NEW:16, DRIFT:8, SAME:4}`, exit 1, dated 2026-05-30/06-01) is a **historical
+> snapshot**, not the current state. As of seed `9048` the deploy audit is reconciled to
+> **`{SAME:32}` exit-0** and the daily-interim has migrated to ADR-0079. The B1 "Deploy-sync is
+> DIRTY" blocker and the owed-B04-reconcile line below are **RESOLVED**. The cron count is now
+> ~22 `quant-*` live (16 + the 6 ARIA-registered + the graph-mine row), not 16. For the current
+> operator command set (flips/crons/deploy-sync) use **`docs/operations/2026-06-14-operator-action-packet.md`**.
+> This file is retained as the 2026-06-01 historical runbook.
+
 - **Status:** operator runbook for the Monday 2026-06-01 US equity open (09:30 ET / 06:30 PT).
 - **Audience:** the human operator (Codeseys) + the Hermes gateway agent. The subagent that wrote
   this **cannot** flip `.env` flags (tool-guarded), register crons (no `cronjob` tool), edit
