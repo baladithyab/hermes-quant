@@ -1,5 +1,8 @@
 # Operator Action Packet — 2026-06-14 (supersedes 2026-06-13)
 
+> **⚠️ SUPERSEDED-IN-PART (2026-06-16):** 71ef/8b01/afa4 below were RUN by the operator and reconciled CLOSED on 2026-06-16 (verified live `jobs.json` enabled=True + scripts byte-identical). For the CURRENT remaining 12 open items use **`docs/operations/2026-06-16-final-backlog-handoff.md`** (this packet is retained as history).
+
+
 **Why this exists:** after this session's 38+ code merges, the only backlog items an autonomous
 agent **cannot** resolve itself are **operator-gated enablement** items — live `~/.hermes/.env`
 flips and Hermes `cron.db` (`~/.hermes/cron/jobs.json`) registrations — which are operator actions
