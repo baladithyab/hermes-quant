@@ -354,6 +354,82 @@ def test_analyst_view_accepts_valid_int_direction_and_float_fields() -> None:
         assert av.confidence_raw == 0.5
 
 
+# ---------------------------------------------------------------------------
+# Gate 3b (cs82) — Proposal.target_position_pct and Fill.fill_price/fill_size_pct
+# reject bool, the sibling of av1's AnalystView hole. In Python ``bool``
+# subclasses ``int`` (``False == 0.0`` snaps to ladder rung 0.0; ``True`` is
+# finite & > 0), so a bool slips through ``_on_ladder`` / the isfinite/>0
+# checks and lands in the SIZED DECISION and the cash basis / running_net.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [True, False])
+def test_proposal_rejects_bool_target_position_pct(bad: bool) -> None:
+    """A bool ``target_position_pct`` must be rejected even though ``False``
+    snaps to ladder rung ``0.0`` and ``True`` to ``1.0`` under ``_on_ladder``."""
+    from hermes_quant.pdr_core.contracts import Proposal
+
+    with pytest.raises(ValueError):
+        Proposal(
+            symbol="AAPL",
+            asset_class="equity",
+            target_position_pct=bad,  # type: ignore[arg-type]
+            gate_reason="x",
+            asof="2026-06-12T15:00:01+00:00",
+        )
+
+
+@pytest.mark.parametrize("field_name", ["fill_price", "fill_size_pct"])
+@pytest.mark.parametrize("bad", [True, False])
+def test_fill_rejects_bool_price_and_size(field_name: str, bad: bool) -> None:
+    """A bool ``fill_price``/``fill_size_pct`` must be rejected even though
+    ``True`` is finite & > 0 and ``False`` is finite — a bool ``fill_price``
+    (``$1.00``) corrupts the cash basis and a bool ``fill_size_pct`` poisons the
+    carry-forward running_net target."""
+    from hermes_quant.pdr_core.contracts import Fill
+
+    kwargs = dict(
+        proposal_id="prop_123",
+        asset="AAPL",
+        asset_class="equity",
+        fill_price=212.34,
+        fill_size_pct=0.10,
+        asof_execution="2026-06-12T15:00:02+00:00",
+    )
+    kwargs[field_name] = bad  # type: ignore[assignment]
+    with pytest.raises(ValueError):
+        Fill(**kwargs)  # type: ignore[arg-type]
+
+
+def test_proposal_and_fill_accept_valid_floats_byte_identical() -> None:
+    """The non-triggering path stays byte-identical: genuine float
+    target/price/size construct and round-trip unchanged (the guard rejects only
+    the bool TYPE, never a real number — incl. the genuine int 0 / 0.0 rung)."""
+    from hermes_quant.pdr_core.contracts import Fill, Proposal
+
+    for size in (0.0, 0.05, -0.05, 0.10, -0.10, 0.15, -0.15, 0.20, -0.20):
+        prop = Proposal(
+            symbol="AAPL",
+            asset_class="equity",
+            target_position_pct=size,
+            gate_reason="ok",
+            asof="t",
+        )
+        assert prop.target_position_pct == size
+        assert type(prop.target_position_pct) is not bool
+
+    fill = Fill(
+        proposal_id="prop_123",
+        asset="AAPL",
+        asset_class="equity",
+        fill_price=212.34,
+        fill_size_pct=0.0,  # genuine float zero target is fine (not bool False)
+        asof_execution="t",
+    )
+    assert fill.fill_price == 212.34
+    assert fill.fill_size_pct == 0.0
+
+
 def test_triad_round_trip_smoke() -> None:
     """Construct each member with realistic args (no exception) — guards the
     happy path so a future over-eager validator can't silently break it."""

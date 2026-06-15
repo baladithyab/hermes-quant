@@ -223,6 +223,19 @@ class Proposal:
     asof: Any  # decision timestamp (ISO str or pandas.Timestamp)
 
     def __post_init__(self) -> None:
+        # cs82: reject ``bool`` explicitly, BEFORE the ladder check. In Python
+        # ``bool`` subclasses ``int`` (``False == 0.0``, ``True == 1.0``), so a
+        # bool ``target_position_pct`` silently passes ``_on_ladder`` —
+        # ``False`` snaps to rung ``0.0`` (a flat verdict) and would slip into
+        # the SIZED DECISION the shell executes against, typed as a float. Mirror
+        # av1's AnalystView guard: reject the bool type at the boundary so the
+        # core stays the trustworthy seam.
+        if isinstance(self.target_position_pct, bool):
+            raise ValueError(
+                "Proposal.target_position_pct must be a real number on the "
+                f"discrete ladder, got bool {self.target_position_pct!r} "
+                "(a bool snaps to a ladder rung and corrupts the sized decision)."
+            )
         if not _on_ladder(self.target_position_pct):
             raise ValueError(
                 "Proposal.target_position_pct must be on the discrete ladder "
@@ -271,12 +284,20 @@ class Fill:
     metadata: Mapping[str, Any] | None = field(default=None)
 
     def __post_init__(self) -> None:
-        # fl1: Fill is the reaction feedback the carry-forward fold trusts; a
-        # non-finite fill_size_pct poisons FillDeltaNormalizer.running_net for the
-        # whole (account,asset_class,asset) bucket (target - NaN = NaN forever), and
-        # a non-positive fill_price zeroes/sign-flips the cash basis. Reject at the
-        # contract boundary so the core stays the trustworthy seam (parity with the
-        # finiteness validation AnalystView/Proposal already enforce).
+        # cs82: reject ``bool`` explicitly, BEFORE the finiteness/>0 checks. In
+        # Python ``bool`` subclasses ``int`` (``True`` is finite & > 0, ``False``
+        # is finite), so a bool ``fill_price``/``fill_size_pct`` silently passes
+        # the fl1 isfinite/>0 guards below — a bool ``fill_price`` (``True`` ->
+        # ``$1.00``) lands in the cash basis and a bool ``fill_size_pct`` lands
+        # in FillDeltaNormalizer.running_net as an absolute target. Mirror av1's
+        # AnalystView guard: reject the bool type at the boundary first.
+        for _name in ("fill_price", "fill_size_pct"):
+            if isinstance(getattr(self, _name), bool):
+                raise ValueError(
+                    f"Fill.{_name} must be a real number, got bool "
+                    f"{getattr(self, _name)!r} (a bool slips through the "
+                    "isfinite/>0 checks and corrupts the cash basis / running_net)."
+                )
         if not math.isfinite(self.fill_size_pct):
             raise ValueError(
                 f"Fill.fill_size_pct must be finite, got {self.fill_size_pct!r} "
