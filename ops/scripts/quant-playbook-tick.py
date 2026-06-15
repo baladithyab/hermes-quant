@@ -80,6 +80,12 @@ PER_FIRE_NOTIONAL_FLOOR_USD = 100.0
 GAP_ATR_MULTIPLIER = 1.5
 EARNINGS_LOCKOUT_DAYS = 5  # silence if days_until_earnings < 5
 PLAYBOOK_AGGREGATE_CAP_ENV = "HERMES_QUANT_PLAYBOOK_AGGREGATE_CAP"
+# Canonical paper-account partition in state.db (matches the live producer's
+# default sentinel — react/paper.py + state/portfolio_state.py both default to
+# "paper-default" when no top-level/reactor account_id is present). The playbook
+# fires land on this same Alpaca paper account, so the aggregate cap reads the
+# real open book from this partition.
+PAPER_ACCOUNT_ID = "paper-default"
 
 # ---------- utilities ----------
 def utcnow_iso() -> str:
@@ -298,6 +304,58 @@ def read_alpaca_account_equity() -> float | None:
     return equity
 
 
+def read_real_open_positions_gross_usd(equity_usd: float) -> float | None:
+    """Return the canonical open book's gross exposure in USD, or None on failure.
+
+    Used only when HERMES_QUANT_PLAYBOOK_AGGREGATE_CAP=1. The aggregate cap
+    ceiling is denominated in USD (account equity × gross_headroom). The
+    consumed side must be seeded with the REAL open positions' gross exposure
+    in the SAME USD unit — otherwise the cap counts only this tick's own fires
+    and admits fires that breach the gross ceiling against the true book (cap2).
+
+    UNIT (verified against the canonical money-state code):
+        Position.quantity is a SIGNED NAV-FRACTION, NOT a share count. The
+        PaperReactor persists fill_size_pct (a signed fraction of NAV) straight
+        into the position's quantity field (state.portfolio_state §3; react/
+        paper.py:69 with reactor_metadata.quantity ABSENT for an equity fill —
+        the playbook fires equity only, EQUITY_PLAYS). The canonical ADR-0071
+        gross cap measures the existing book as Σ |Position.quantity| (react/
+        multileg.py:461-466 feeds bare quantity into RiskPortfolioState whose
+        gross_exposure_pct = Σ|p|; risk.portfolio_normalize:116-117) and
+        compares it against caps.max_gross_exposure_pct — a NAV-fraction.
+
+        So the book's gross NAV-fraction is Σ |quantity|, and its USD gross
+        (matching this cap's USD ceiling = equity × gross_headroom) is
+        equity_usd × Σ |quantity|. Multiplying quantity by avg_entry_price (a
+        per-share price) would mix a NAV-fraction with a price — a unit error
+        that under-counts by orders of magnitude and re-introduces cap2.
+
+    Args:
+        equity_usd: the SAME validated, finite-positive account equity the cap
+            ceiling is denominated against (build_aggregate_tick_budget passes
+            the already-checked equity), so the consumed side and the ceiling
+            share one NAV reference.
+
+    Returns:
+        0.0 for an empty/absent book (BYTE-IDENTICAL to the prior consumed=0
+        behavior — equity × 0 = 0). The positive gross USD when positions are
+        open. None is a fail-closed input on ANY error (unreadable state.db,
+        schema drift) or a non-finite/negative result: callers silence would-be
+        fires rather than assuming an empty book.
+    """
+    try:
+        from hermes_quant.state.portfolio_state import get_portfolio_state
+
+        positions = get_portfolio_state().get_positions(PAPER_ACCOUNT_ID)
+        gross_nav_fraction = sum(abs(float(pos.quantity)) for pos in positions.values())
+        gross = equity_usd * gross_nav_fraction
+    except Exception:
+        return None
+    if not math.isfinite(gross) or gross < 0:
+        return None
+    return gross
+
+
 class AggregateTickBudget:
     """Tick-local notional accumulator for playbook/hourly direct Alpaca fires.
 
@@ -430,7 +488,23 @@ def build_aggregate_tick_budget() -> AggregateTickBudget | None:
             failure_reason=f"aggregate_ceiling_non_finite_or_non_positive:{ceiling!r}",
         )
 
-    return AggregateTickBudget(ceiling_usd=ceiling)
+    # cap2: seed consumed_usd from the REAL open book so the gross ceiling is
+    # enforced against the true exposure, not just this tick's own fires. The
+    # ceiling is USD (equity × gross_headroom); the consumed side is the same-unit
+    # USD gross of the open positions = equity × Σ|quantity| (quantity is a
+    # NAV-fraction — see read_real_open_positions_gross_usd). We pass the SAME
+    # validated finite-positive `equity` the ceiling uses so both share one NAV
+    # reference. An empty/absent book yields 0.0 → byte-identical to the prior
+    # consumed=0 behavior. A None (unreadable book) is a fail-closed input:
+    # silence every fire rather than under-count.
+    real_consumed = read_real_open_positions_gross_usd(equity)
+    if real_consumed is None:
+        return AggregateTickBudget(
+            ceiling_usd=None,
+            failure_reason="open_book_unavailable_or_non_finite",
+        )
+
+    return AggregateTickBudget(ceiling_usd=ceiling, consumed_usd=real_consumed)
 
 
 # ---------- snapshot + silence rules ----------
