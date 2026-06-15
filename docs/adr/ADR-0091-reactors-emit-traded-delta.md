@@ -65,11 +65,14 @@ amends: ADR-0086
 >   independent carry-forwards, C drifts back into the rejected two-views failure. This is a
 >   hard architectural gate, captured in the revised Acceptance Gate below.
 >
-> **Status stays `proposed`:** the *decision* (C over B) is resolved; *acceptance* awaits the
-> revised gate (tests green + cross-family review + operator-gated live heal). Implementation
-> is Increment 0 of the ADR-0092 rearchitecture (`docs/plans/2026-06-12-shared-pdr-core-rearchitecture.md`).
+> **Status (HISTORICAL, 2026-06-12):** at resolution the *decision* (C over B) was resolved while
+> *acceptance* awaited the revised gate. **→ SUPERSEDED 2026-06-15: status is now `accepted` (see the
+> frontmatter + the ACCEPTED banner at the top).** The test-provable gate is green (10/12 items); only
+> the live `--apply` heal + the cross-family review remain operator-gated. Implementation is Increment 0
+> of the ADR-0092 rearchitecture (`docs/plans/2026-06-12-shared-pdr-core-rearchitecture.md`).
 > The Option A/B analysis below is preserved as decision history. Resolution detail:
-> `docs/reviews/2026-06-12-adr0091-resolution/verdict.md`.
+> `docs/reviews/2026-06-12-adr0091-resolution/verdict.md`; acceptance audit:
+> `docs/reviews/2026-06-15-adr0091-gate-audit.md`.
 
 ## Context and Problem Statement
 
