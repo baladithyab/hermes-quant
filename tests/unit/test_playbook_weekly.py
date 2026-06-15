@@ -735,3 +735,228 @@ def test_days_between_iso_str_happy_path_byte_identical(mod):
     now_dt = mod.datetime(2026, 6, 14, tzinfo=mod.UTC)
     assert mod.days_between_iso("2026-06-08T00:00:00+00:00", now_dt) == 6
     assert mod.days_between_iso("2026-06-08T00:00:00Z", now_dt) == 6
+
+
+# ---------------------- cs36: weekly close plumbs a real decision_price ----------------------
+#
+# cr05 (LANDED) made PaperReactor REJECT a proposal whose decision_price is 0/missing
+# (it returns a SILENCE record, fill_size_pct=0.0, NOT appended, no state.db write).
+# _fire_equity_close hardcoded advisor_result["decision_price"] = 0.0, so EVERY armed
+# weekly close now silently no-fills: the reactor silences it and the position survives.
+# The daily/single close path plumbs the mark (advisor.py:1222 final["decision_price"]=
+# float(ctx.last_close)); the weekly close must mirror that — pass the same recent close
+# (`mark`) it already computes for the exit rules into the fire so the close executes at
+# a real, finite, >0 price (and so cr05 does NOT reject it).
+
+class _CaptureReactor:
+    """Stand-in PaperReactor that records the proposal + fill_size it was called with."""
+    last_proposal = None
+    last_fill_size_pct = None
+    last_play_tag = None
+
+    def execute(self, proposal, *, fill_size_pct, play_tag=None, **_kw):
+        type(self).last_proposal = proposal
+        type(self).last_fill_size_pct = fill_size_pct
+        type(self).last_play_tag = play_tag
+        from types import SimpleNamespace
+        return SimpleNamespace(proposal_id=proposal.proposal_id)
+
+
+def _install_capture_reactor(mod, monkeypatch):
+    """Patch the reactor + Proposal that _fire_equity_close imports locally so we can
+    inspect the proposal it builds without firing a real fill."""
+    import hermes_quant.react.paper as paper_mod
+    from hermes_quant.proposals import Proposal  # noqa: F401  (kept real — body builds it)
+    _CaptureReactor.last_proposal = None
+    _CaptureReactor.last_fill_size_pct = None
+    monkeypatch.setattr(paper_mod, "PaperReactor", _CaptureReactor)
+
+
+def test_fire_equity_close_plumbs_nonzero_decision_price(mod, monkeypatch):
+    """cs36 RED->GREEN: an armed weekly close must carry a FINITE, >0 decision_price
+    (the mark) into the proposal so cr05 does NOT reject it. The pre-fix body hardcoded
+    decision_price=0.0 — which cr05 silences (no-fill)."""
+    _install_capture_reactor(mod, monkeypatch)
+    placed = mod._fire_equity_close(
+        "AAPL", qty=-100.0, target_position_pct=-0.20, reason="swing_tp", decision_price=187.5
+    )
+    assert placed.get("ok") is True
+    prop = _CaptureReactor.last_proposal
+    assert prop is not None
+    dp = (prop.advisor_result or {}).get("decision_price")
+    # Must be a real, finite, > 0 price — NOT the cr05-rejected 0.0 sentinel.
+    assert dp == pytest.approx(187.5)
+    assert dp > 0.0
+
+
+def test_fire_equity_close_decision_price_passes_cr05_guard(mod, monkeypatch):
+    """cs36 end-to-end with the REAL PaperReactor: an armed close fired with the mark as
+    decision_price is NOT silenced (it books a position-moving fill), whereas the pre-fix
+    0.0 sentinel was rejected. Caps OFF, tick-lock ON, isolated state.db/bus."""
+    monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.1")
+    monkeypatch.setenv("HERMES_QUANT_REFLECTION", "0")
+    monkeypatch.setenv("HERMES_QUANT_TICK_LOCK", "1")
+    monkeypatch.delenv("HERMES_QUANT_PORTFOLIO_CAPS", raising=False)
+    monkeypatch.delenv("HERMES_QUANT_ADMISSIBILITY", raising=False)
+
+    import tempfile
+
+    from hermes_quant.state import portfolio_state as ps_mod
+    tmpdir = Path(tempfile.mkdtemp())
+    ps_mod.DEFAULT_STATE_DB = tmpdir / "state.db"
+    with ps_mod._singleton_lock:
+        ps_mod._singleton = None
+    bus = tmpdir / "executions.jsonl"
+
+    # Route the module's PaperReactor() through an isolated executions path.
+    import hermes_quant.react.paper as paper_mod
+    real_reactor_cls = paper_mod.PaperReactor
+
+    class _IsolatedReactor(real_reactor_cls):
+        def __init__(self, *a, **kw):
+            kw.setdefault("executions_path", bus)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(paper_mod, "PaperReactor", _IsolatedReactor)
+
+    placed = mod._fire_equity_close(
+        "AAPL", qty=-100.0, target_position_pct=-0.20, reason="swing_tp", decision_price=187.5
+    )
+    assert placed.get("ok") is True
+    # The reactor did NOT silence it: a real position-moving record landed on the bus.
+    lines = [ln for ln in bus.read_text().splitlines() if ln.strip()] if bus.exists() else []
+    assert len(lines) == 1, f"expected one booked close fill, got {lines}"
+    import json
+    row = json.loads(lines[0])
+    assert (row.get("reactor_metadata") or {}).get("silenced") is not True
+    assert float(row["decision_price"]) == pytest.approx(187.5)
+
+
+def test_run_weekly_armed_close_fires_at_mark_not_zero(mod, monkeypatch):
+    """cs36 integration: run_weekly's armed CLOSE branch must pass the computed `mark`
+    (not 0.0) as the close decision_price. We capture the value _fire_equity_close
+    receives through run_weekly's own call site."""
+    captured = {}
+
+    def _fake_fire(symbol, *, qty, target_position_pct, reason, decision_price):
+        captured["decision_price"] = decision_price
+        captured["symbol"] = symbol
+        return {"ok": True, "execution_id": "x"}
+
+    # Force a CLOSE decision deterministically: a >60d losing swing.
+    monkeypatch.setattr(mod, "_fire_equity_close", _fake_fire)
+    monkeypatch.setattr(mod, "fetch_mark_atr", lambda *a, **k: (123.45, 0.02))
+    monkeypatch.setattr(mod, "read_active_halts", lambda: [])
+    monkeypatch.setattr(mod, "fired_this_week", lambda *a, **k: False)
+    monkeypatch.setattr(mod, "infer_play_tag", lambda *a, **k: "swing")
+    monkeypatch.setattr(mod, "append_journal", lambda *a, **k: None)
+
+    from types import SimpleNamespace
+    entry_rec = {"asof_execution": "2026-01-01T00:00:00+00:00", "target_position_pct": -0.20}
+    monkeypatch.setattr(mod, "find_entry_record", lambda *a, **k: entry_rec)
+    monkeypatch.setattr(mod, "_held_nav_fraction", lambda *a, **k: -0.20)
+
+    pos = SimpleNamespace(asset="AAPL", qty=-100.0, avg_entry_price=100.0, mark_price=200.0)
+    pf = SimpleNamespace(positions={"AAPL": pos})
+    monkeypatch.setattr(mod, "load_portfolio", lambda *a, **k: (pf, [entry_rec]))
+
+    summary = mod.run_weekly(armed=True)
+    assert summary["closes_fired"] == 1
+    # The mark (123.45) — NOT 0.0 — must have been threaded into the fire.
+    assert captured["decision_price"] == pytest.approx(123.45)
+    assert captured["decision_price"] > 0.0
+
+
+# ---------------------- cs37: options-leg detection by structure, not len ----------------------
+#
+# The weekly path detected an options leg via `len(asset) > 6` (an OCC-21 symbol is
+# ~19-21 chars). That silently HOLDs ANY equity ticker longer than 6 chars — a 7+ char
+# ticker / class-share / ADR symbol — treating it as an option and SKIPPING the equity
+# close. We detect an option by its OCC structure (a space-padded wire form OR a
+# parseable OCC-21 symbol), NOT raw string length. A clean <=6-char equity ticker and a
+# real OCC option are byte-identical to the old behavior.
+
+def test_is_option_symbol_long_equity_ticker_not_option(mod):
+    """cs37 RED->GREEN: a 7+ char equity ticker is NOT an option (the len>6 bug HELD it
+    as one and skipped the close)."""
+    assert mod._is_option_symbol("LONGTICKER") is False   # 10 chars, plain equity
+    assert mod._is_option_symbol("ABCDEFG") is False        # 7 chars
+    assert mod._is_option_symbol("GOOGL") is False          # 5 chars (always was ok)
+    assert mod._is_option_symbol("AAPL") is False
+
+
+def test_is_option_symbol_occ_detected(mod):
+    """cs37: a real OCC-21 option (compact or space-padded wire form) IS an option."""
+    assert mod._is_option_symbol("NVDA260526C00145000") is True   # compact OCC, 19 chars
+    assert mod._is_option_symbol("AAPL  240621C00200000") is True  # space-padded wire form
+
+
+def test_run_weekly_long_equity_ticker_is_closed_not_held_as_option(mod, monkeypatch):
+    """cs37 integration: a 7+ char equity ticker reaches the exit-rule path and CLOSEs
+    (>60d losing swing), instead of being mis-bucketed to options_skipped/TODO_ADR0029.
+    Pre-fix, len('LONGTICKR')==9 > 6 routed it straight to options_skipped."""
+    journals = []
+    monkeypatch.setattr(mod, "read_active_halts", lambda: [])
+    monkeypatch.setattr(mod, "fetch_mark_atr", lambda *a, **k: (50.0, 0.02))
+    monkeypatch.setattr(mod, "infer_play_tag", lambda *a, **k: "swing")
+    monkeypatch.setattr(mod, "fired_this_week", lambda *a, **k: False)
+    monkeypatch.setattr(mod, "append_journal", lambda rec: journals.append(rec))
+
+    entry_rec = {"asof_execution": "2026-01-01T00:00:00+00:00", "target_position_pct": 0.20}
+    monkeypatch.setattr(mod, "find_entry_record", lambda *a, **k: entry_rec)
+
+    from types import SimpleNamespace
+    # LONG losing >60d: avg 100, mark 50 (-50%), held since Jan -> swing stop CLOSE.
+    pos = SimpleNamespace(asset="LONGTICKR", qty=100.0, avg_entry_price=100.0, mark_price=50.0)
+    pf = SimpleNamespace(positions={"LONGTICKR": pos})
+    monkeypatch.setattr(mod, "load_portfolio", lambda *a, **k: (pf, [entry_rec]))
+
+    summary = mod.run_weekly(armed=False)  # dry-run: no real fire, just the decision
+    assert summary["options_skipped"] == 0, "7+ char equity ticker wrongly bucketed as option"
+    actions = [j.get("action") for j in journals if j.get("symbol") == "LONGTICKR"]
+    assert "DRY_RUN_CLOSE" in actions, f"expected a swing close, got {actions}"
+    assert "TODO_ADR0029" not in actions
+
+
+def test_run_weekly_real_occ_option_still_skipped(mod, monkeypatch):
+    """cs37 regression: a real OCC-21 option leg is STILL bucketed to options_skipped /
+    TODO_ADR0029 (byte-identical to the old len>6 behavior for true options)."""
+    journals = []
+    monkeypatch.setattr(mod, "read_active_halts", lambda: [])
+    monkeypatch.setattr(mod, "append_journal", lambda rec: journals.append(rec))
+
+    from types import SimpleNamespace
+    occ = "NVDA260526C00145000"
+    pos = SimpleNamespace(asset=occ, qty=1.0, avg_entry_price=1.0, mark_price=1.0)
+    pf = SimpleNamespace(positions={occ: pos})
+    monkeypatch.setattr(mod, "load_portfolio", lambda *a, **k: (pf, []))
+
+    summary = mod.run_weekly(armed=False)
+    assert summary["options_skipped"] == 1
+    actions = [j.get("action") for j in journals if j.get("symbol") == occ]
+    assert actions == ["TODO_ADR0029"]
+
+
+def test_run_weekly_clean_equity_ticker_byte_identical(mod, monkeypatch):
+    """cs37 regression: a clean <=6-char equity ticker is NOT bucketed as an option —
+    it reaches the exit-rule path exactly as before the fix."""
+    journals = []
+    monkeypatch.setattr(mod, "read_active_halts", lambda: [])
+    monkeypatch.setattr(mod, "fetch_mark_atr", lambda *a, **k: (100.0, 0.02))
+    monkeypatch.setattr(mod, "infer_play_tag", lambda *a, **k: "swing")
+    monkeypatch.setattr(mod, "append_journal", lambda rec: journals.append(rec))
+
+    entry_rec = {"asof_execution": "2026-06-10T00:00:00+00:00", "target_position_pct": 0.20}
+    monkeypatch.setattr(mod, "find_entry_record", lambda *a, **k: entry_rec)
+
+    from types import SimpleNamespace
+    # Recent long, modest gain -> HOLD (not a close, not an option-skip).
+    pos = SimpleNamespace(asset="GOOGL", qty=100.0, avg_entry_price=100.0, mark_price=101.0)
+    pf = SimpleNamespace(positions={"GOOGL": pos})
+    monkeypatch.setattr(mod, "load_portfolio", lambda *a, **k: (pf, [entry_rec]))
+
+    summary = mod.run_weekly(armed=False)
+    assert summary["options_skipped"] == 0
+    actions = [j.get("action") for j in journals if j.get("symbol") == "GOOGL"]
+    assert "HOLD" in actions
+    assert "TODO_ADR0029" not in actions

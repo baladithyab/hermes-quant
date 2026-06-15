@@ -238,6 +238,44 @@ def compute_pnl_drawdown(avg_entry: float, mark: float, qty: float) -> tuple[flo
     return pnl_pct, drawdown
 
 
+# ---------- options-leg detection (cs37) ----------
+def _is_option_symbol(asset: str) -> bool:
+    """True iff ``asset`` is an options leg (OCC structure), NOT raw string length.
+
+    cs37: the old test was ``len(asset) > 6`` — an OCC-21 symbol is ~19-21 chars, so
+    that ACCIDENTALLY caught real options BUT also silently HELD any equity ticker
+    longer than 6 chars (a 7+ char ticker, a class-share / ADR symbol) as an "option",
+    skipping the equity close entirely. We detect an option by its OCC SHAPE instead:
+
+      * the space-padded 21-char wire form (root left-justified to 6, then a space),
+        which a plain equity ticker never carries; OR
+      * a string that parses as a well-formed OCC-21 symbol (root + YYMMDD + C/P +
+        8-digit strike). ``hermes_quant.options.occ.parse_occ`` is the canonical,
+        pure (no-I/O) recognizer.
+
+    A clean equity ticker — ``GOOGL`` (5), ``LONGTICKER`` (10), ``BRK.B`` (5),
+    ``GOOGL.X`` (7) — is NOT an option: it has no internal space and does not parse as
+    OCC-21. A real OCC option (compact ``NVDA260526C00145000`` or the space-padded wire
+    form) IS. Falls back to the legacy len>6 heuristic ONLY if the options module is
+    unavailable (defensive; the package is always importable in the live env).
+    """
+    if not isinstance(asset, str):
+        return False
+    if " " in asset:
+        return True  # space-padded OCC wire form; a plain ticker never has a space
+    try:
+        from hermes_quant.options.occ import OccParseError, parse_occ
+    except Exception:  # noqa: BLE001 — defensive only; options pkg is normally present
+        return len(asset) > 6
+    try:
+        parse_occ(asset)
+        return True
+    except OccParseError:
+        return False
+    except Exception:  # noqa: BLE001 — any other parse failure -> treat as non-option
+        return False
+
+
 # ---------- record-side derivation (cs17) ----------
 def _rec_side(rec: dict) -> str:
     """Derive the buy/sell side of an execution record.
@@ -643,9 +681,11 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
     for asset, pos in pf.positions.items():
         summary["scanned"] += 1
 
-        # Detect option-leg shape: "AAPL  240621C00200000" or anything
-        # that isn't a clean equity ticker. ADR-0029 punt.
-        if " " in asset or len(asset) > 6:
+        # Detect option-leg shape by OCC STRUCTURE (cs37), not raw string length:
+        # "AAPL  240621C00200000" (wire form) or a parseable OCC-21 symbol. A 7+ char
+        # equity ticker / class-share / ADR is NOT an option and must reach the exit
+        # rules below — the old `len(asset) > 6` test silently HELD it. ADR-0029 punt.
+        if _is_option_symbol(asset):
             summary["options_skipped"] += 1
             append_journal({
                 "event": "decision",
@@ -783,8 +823,18 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
             # delta that flattens the default-regime state.db fold), recovered from the
             # latest-target record — the SAME abs_latest record the loader reads.
             held = _held_nav_fraction(executions, asset)
+            # cs36: plumb a REAL close decision_price (the recent close / mark) into the
+            # fire. cr05 (LANDED) made PaperReactor REJECT a zero/missing decision_price
+            # (silence record, no fill) — the old hardcoded 0.0 made EVERY armed weekly
+            # close silently no-fill. `mark` is the same recent-close the exit rules used
+            # above (fetch_mark_atr -> pos.mark_price fallback), mirroring the daily path
+            # (advisor.py: final["decision_price"] = float(ctx.last_close)).
             placed = _fire_equity_close(
-                asset, qty=float(pos.qty), target_position_pct=held, reason=decision.reason
+                asset,
+                qty=float(pos.qty),
+                target_position_pct=held,
+                reason=decision.reason,
+                decision_price=mark,
             )
             if placed.get("ok"):
                 summary["closes_fired"] += 1
@@ -807,7 +857,7 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
 
 
 def _fire_equity_close(
-    symbol: str, *, qty: float, target_position_pct: float, reason: str
+    symbol: str, *, qty: float, target_position_pct: float, reason: str, decision_price: float
 ) -> dict[str, Any]:
     """Flatten an equity position through the PaperReactor — fire ``-held`` to cover/sell.
 
@@ -821,6 +871,20 @@ def _fire_equity_close(
     ModuleNotFoundError -> CLOSE_FAILED on every armed close). The reactor consumes a
     ``Proposal`` object (NOT a dict) and a KEYWORD-ONLY ``fill_size_pct``:
     ``execute(proposal, *, fill_size_pct, ...)`` (react/paper.py).
+
+    DECISION_PRICE — pass the real close/mark, NOT the 0.0 sentinel (cs36)
+    -----------------------------------------------------------------------------------
+    cr05 (LANDED 2026-06-14) made PaperReactor REJECT a non-finite / <= 0
+    ``decision_price`` UPSTREAM (react/paper.py:208): it returns a SILENCE record
+    (``fill_size_pct=0.0``, NOT appended, no state.db write, ``silence_reason=
+    'zero_decision_price'``). The OLD body hardcoded ``advisor_result['decision_price']
+    = 0.0`` ("PaperReactor tolerates 0.0") — which is no longer true: post-cr05 EVERY
+    armed weekly close is silenced and the position SURVIVES (a silent no-fill). We now
+    plumb the caller-supplied ``decision_price`` (the recent close / mark — the SAME
+    value the exit rules used, and the SAME source the daily path uses: advisor.py
+    ``final['decision_price'] = float(ctx.last_close)``). If it is non-finite / <= 0 we
+    fail CLOSED (return ``ok=False``) rather than fire a price cr05 would reject anyway,
+    so the cron records a CLOSE_FAILED journal entry instead of a silent no-op.
 
     CLOSE SIZE — ``fill_size_pct = -target_position_pct`` (the NEGATIVE of the held
     NAV-fraction), NOT 0.0
@@ -855,10 +919,18 @@ def _fire_equity_close(
     journal entry on any failure (ImportError, etc.) rather than crashing the run.
     """
     try:
+        import math
         import secrets
 
         from hermes_quant.proposals import Proposal
         from hermes_quant.react.paper import PaperReactor
+
+        # cs36: fail CLOSED on a bad close price. cr05 would reject a non-finite / <= 0
+        # decision_price (silence record, no fill); surface it as CLOSE_FAILED instead
+        # of a silent no-op so an armed cron logs the failure.
+        dp = float(decision_price)
+        if not math.isfinite(dp) or dp <= 0.0:
+            return {"ok": False, "error": f"bad decision_price={decision_price!r} (non-finite or <= 0)"}
 
         # Close direction = OPPOSITE the held sign: short (qty<0) -> BUY to cover;
         # long (qty>0) -> SELL. Flat (qty==0) takes the long/sell branch (a no-op
@@ -888,7 +960,7 @@ def _fire_equity_close(
             created_at=iso_seconds,
             expires_at=iso_seconds,
             advisor_result={
-                "decision_price": 0.0,  # best-effort; PaperReactor tolerates 0.0
+                "decision_price": dp,  # cs36: the real close/mark; cr05 rejects 0.0
                 "as_of": iso_seconds,
                 "close_side": side,
                 "reason": reason,
