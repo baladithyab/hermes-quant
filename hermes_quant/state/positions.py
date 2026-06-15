@@ -31,12 +31,28 @@ class Position:
     symbol:
         Ticker, e.g. "AAPL" or "BTC/USDT".
     quantity:
-        Signed shares/units: positive = long, negative = short.
+        Signed shares/units: positive = long, negative = short. The UNIT
+        depends on ``unit_kind`` (see below).
     avg_entry_price:
         Weighted-average cost basis per unit (v0.1: weighted-average,
         not FIFO — see ADR-0041 §D7).
     last_update_at:
         ISO 8601 UTC of the last fill that touched this position.
+    unit_kind:
+        Which unit ``quantity`` is expressed in (ar13/ar14 units fix):
+
+          * ``"nav_fraction"`` (default, legacy / single-leg equity):
+            ``quantity`` is a SIGNED fraction of NAV (e.g. 0.05 = 5% long).
+            Its gross-exposure contribution IS ``abs(quantity)``.
+          * ``"true_unit"`` (ADR-0086/0088, leg_quantity path):
+            ``quantity`` is SIGNED CONTRACTS/SHARES. Its gross-exposure
+            contribution is ``abs(quantity × avg_entry_price × multiplier)
+            / NAV``, NOT ``abs(quantity)``.
+
+        Consumers that treat ``quantity`` as a gross-exposure NAV-fraction
+        (the portfolio-cap seam) MUST branch on this. Defaults to
+        ``"nav_fraction"`` so dataclasses built without the field (older
+        callers, test doubles) keep the legacy interpretation.
     """
 
     account_id: str
@@ -45,6 +61,7 @@ class Position:
     quantity: float
     avg_entry_price: float
     last_update_at: str
+    unit_kind: str = "nav_fraction"
 
     @property
     def is_long(self) -> bool:

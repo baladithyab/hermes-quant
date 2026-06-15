@@ -698,7 +698,10 @@ class PaperReactor:
         from hermes_quant.risk.portfolio_normalize import (
             PortfolioState as RiskPortfolioState,
         )
-        from hermes_quant.state.portfolio_state import get_portfolio_state
+        from hermes_quant.state.portfolio_state import (
+            get_portfolio_state,
+            position_gross_fraction,
+        )
 
         ps = get_portfolio_state()
         # Resolve the account through the SAME helper the tick-lock key and the
@@ -720,20 +723,32 @@ class PaperReactor:
         # only iterates positions.values() for gross/net, so the tuple key is a
         # pure uniqueness device — for a single-asset-class book (the common
         # case, no same-symbol collision) the gross/net sums are byte-identical
-        # whether keyed by bare symbol or (asset_class, symbol).
+        # whether keyed by bare symbol or (asset_class, symbol). The de-risk guard
+        # below ALSO indexes pos_map by this tuple key, so it must stay a tuple.
+        #
+        # ar13 units fix: Position.quantity is UNIT-AMBIGUOUS. Legacy / single-leg
+        # equity stores it as a signed NAV-fraction (ADR-0041), but the ADR-0086/
+        # 0088 true-unit path (reactor_metadata.quantity) stores SIGNED SHARES/
+        # CONTRACTS. The cap seam below feeds RiskPortfolioState a
+        # key -> signed-NAV-fraction map and sums abs(.) for gross exposure, so a
+        # raw true-unit quantity (e.g. 100 shares) would be read as a 10000%
+        # NAV-fraction — defeating the de-risk guard (fail-OPEN) and inflating
+        # gross ~100x (fail-CLOSED). position_gross_fraction normalizes each line
+        # to a NAV-fraction using the SAME net-liq valuation (qty × avg_price ×
+        # multiplier / NAV) the equity_total fold uses; an nav_fraction (legacy)
+        # line and any marker-less object are returned verbatim → byte-identical.
+        nav = _account_nav_usd()
         pos_map: dict[tuple[str, str], float] = {}
         for key, position in positions.items():
-            # Positions are stored as NAV-fraction quantities in v0.1 (ADR-0041).
-            # The cap seam reads them as target_position_pct.
-            pos_map[key] = position.quantity
+            pos_map[key] = position_gross_fraction(position, nav=nav)
 
         state = RiskPortfolioState(positions=pos_map)
         caps = PortfolioCaps.standard()
 
         # De-risking guard (P1 trade-correctness fix).
         #
-        # Positions are stored as the latest signed target_position_pct per
-        # symbol (ADR-0041 / portfolio_normalize.PortfolioState semantics), and
+        # pos_map[symbol] is now each symbol's signed gross-exposure NAV-fraction
+        # (true-unit lines converted above; legacy lines verbatim), and
         # fill_size_pct here is the new signed target for proposal.symbol. A
         # symbol's contribution to gross exposure is abs(target). If this fill
         # lowers or preserves abs(existing), it frees or preserves headroom and

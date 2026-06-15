@@ -148,14 +148,24 @@ def test_restate_does_not_mutate_state_db(restate_mod, tmp_path):
     def _dump():
         conn = sqlite3.connect(db)
         try:
-            return sorted(conn.execute("SELECT * FROM positions").fetchall())
+            # Explicit data columns (not SELECT *): restate is a read-only data
+            # guarantee, and PortfolioState's idempotent schema migration may
+            # additively introduce columns (e.g. unit_kind, ar13/ar14 units fix).
+            # Comparing the position DATA proves restate mutated no row VALUES
+            # without coupling the assertion to the table's column count.
+            return sorted(
+                conn.execute(
+                    "SELECT account_id, asset_class, symbol, quantity, "
+                    "avg_entry_price, last_update_at FROM positions"
+                ).fetchall()
+            )
         finally:
             conn.close()
 
     before = _dump()
     restate_mod.restate_book(db, "paper-default", snapshot, oracle)
     after = _dump()
-    assert before == after  # read-only guarantee
+    assert before == after  # read-only guarantee (position data unchanged)
 
 
 def test_restate_json_shape(restate_mod, tmp_path):

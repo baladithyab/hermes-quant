@@ -279,6 +279,21 @@ def _default_initial_cash() -> float:
 # SQLite schema
 # ---------------------------------------------------------------------------
 
+# Position.quantity unit kinds. A position is one of:
+#   "nav_fraction" — legacy / single-leg equity path: quantity is a SIGNED
+#                    fraction of NAV (e.g. 0.05 = 5% long). avg_entry_price is
+#                    the per-share fill price. This is the v0.1 ADR-0041 proxy.
+#   "true_unit"    — ADR-0086/0088 path (reactor_metadata.quantity present):
+#                    quantity is SIGNED CONTRACTS/SHARES. Gross-exposure
+#                    contribution = abs(quantity × avg_entry_price × multiplier)
+#                    / NAV, NOT abs(quantity).
+# The marker is set from the SAME discriminator the apply/replay paths use to
+# decide the quantity unit (leg_quantity present ⇒ true_unit), so it is exact,
+# not a magnitude heuristic. Legacy rows (and DBs created before this column)
+# default to "nav_fraction" — bit-identical to the pre-marker behavior.
+_UNIT_KIND_NAV_FRACTION = "nav_fraction"
+_UNIT_KIND_TRUE_UNIT = "true_unit"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS positions (
     account_id       TEXT NOT NULL,
@@ -287,6 +302,7 @@ CREATE TABLE IF NOT EXISTS positions (
     quantity         REAL NOT NULL,
     avg_entry_price  REAL NOT NULL,
     last_update_at   TEXT NOT NULL,
+    unit_kind        TEXT NOT NULL DEFAULT 'nav_fraction',
     PRIMARY KEY (account_id, asset_class, symbol)
 ) WITHOUT ROWID;
 
@@ -470,6 +486,7 @@ class PortfolioState:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
             self._migrate_processed_fills(conn)
+            self._migrate_positions_unit_kind(conn)
 
     @staticmethod
     def _migrate_processed_fills(conn: sqlite3.Connection) -> None:
@@ -535,6 +552,31 @@ class PortfolioState:
         )
         conn.execute("DROP TABLE processed_fills")
         conn.execute("ALTER TABLE processed_fills_new RENAME TO processed_fills")
+
+    @staticmethod
+    def _migrate_positions_unit_kind(conn: sqlite3.Connection) -> None:
+        """Idempotent migration: add the ``unit_kind`` column to a pre-existing
+        positions table (ar13/ar14 units fix).
+
+        A state.db created before this wave has a positions table WITHOUT the
+        ``unit_kind`` column. SQLite ``ALTER TABLE ADD COLUMN`` with a NOT NULL
+        DEFAULT backfills every existing row with that default, so legacy rows
+        become ``'nav_fraction'`` — exactly the unit they were always stored in
+        (the marker only changes the cap seam's interpretation of TRUE-UNIT
+        rows, which legacy DBs do not have). No PK change, so a plain
+        ADD COLUMN suffices (unlike processed_fills). Idempotent: a no-op once
+        the column exists (fresh DBs already get it from _SCHEMA).
+        """
+        info = list(conn.execute("PRAGMA table_info(positions)"))
+        if not info:
+            return  # table not created yet (defensive; executescript creates it first)
+        cols = {row[1] for row in info}
+        if "unit_kind" in cols:
+            return  # already present (fresh DB or already migrated)
+        conn.execute(
+            f"ALTER TABLE positions ADD COLUMN unit_kind TEXT NOT NULL "
+            f"DEFAULT '{_UNIT_KIND_NAV_FRACTION}'"
+        )
 
     # ------------------------------------------------------------------
     # ft1: delta-normalizer regime stamp (read / check)
@@ -725,8 +767,8 @@ class PortfolioState:
                         """
                         INSERT OR REPLACE INTO positions
                             (account_id, asset_class, symbol, quantity,
-                             avg_entry_price, last_update_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                             avg_entry_price, last_update_at, unit_kind)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             acct,
@@ -735,6 +777,7 @@ class PortfolioState:
                             qty,
                             pos["avg_entry_price"],
                             pos["last_update_at"],
+                            pos.get("unit_kind", _UNIT_KIND_NAV_FRACTION),
                         ),
                     )
                     result.positions_written += 1
@@ -878,10 +921,12 @@ class PortfolioState:
             pos_delta = float(leg_quantity)  # signed contracts/shares
             dedup_asset = symbol
             dedup_asset_class = asset_class
+            unit_kind = _UNIT_KIND_TRUE_UNIT  # ar13/ar14: quantity is true units
         else:
             pos_delta = fill_size_pct  # NAV-fraction proxy (legacy path)
             dedup_asset = ""
             dedup_asset_class = ""
+            unit_kind = _UNIT_KIND_NAV_FRACTION  # ar13/ar14: quantity is a NAV-fraction
         # cs51: a same-OCC roll resolves two legs of ONE family to the SAME
         # (proposal_id, asof, asset, asset_class), so the 4-column key collides and the
         # 2nd leg's INSERT OR IGNORE is silently dropped on the incremental fold (while
@@ -1011,10 +1056,10 @@ class PortfolioState:
                         """
                         INSERT OR REPLACE INTO positions
                             (account_id, asset_class, symbol, quantity,
-                             avg_entry_price, last_update_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                             avg_entry_price, last_update_at, unit_kind)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (acct, asset_class, symbol, new_qty, new_avg, asof),
+                        (acct, asset_class, symbol, new_qty, new_avg, asof, unit_kind),
                     )
 
                 # ── load / bootstrap cash ────────────────────────────────
@@ -1110,7 +1155,7 @@ class PortfolioState:
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT account_id, asset_class, symbol, quantity, "
-                "avg_entry_price, last_update_at "
+                "avg_entry_price, last_update_at, unit_kind "
                 "FROM positions "
                 "WHERE account_id=? AND ABS(quantity) >= 1e-12",
                 (account_id,),
@@ -1124,6 +1169,7 @@ class PortfolioState:
                 quantity=float(row["quantity"]),
                 avg_entry_price=float(row["avg_entry_price"]),
                 last_update_at=row["last_update_at"],
+                unit_kind=(row["unit_kind"] or _UNIT_KIND_NAV_FRACTION),
             )
             for row in rows
         }
@@ -1292,6 +1338,69 @@ def get_portfolio_state(db_path: Path | None = None) -> PortfolioState:
         if _singleton is None:
             _singleton = PortfolioState(db_path)
         return _singleton
+
+
+# ---------------------------------------------------------------------------
+# Gross-exposure NAV-fraction conversion (ar13/ar14 units fix)
+# ---------------------------------------------------------------------------
+
+
+def position_gross_fraction(position: Any, *, nav: float | None) -> float:
+    """Signed gross-exposure NAV-fraction contribution of one ``position``.
+
+    The portfolio-cap seam (``risk.portfolio_normalize``) reads a
+    ``symbol -> signed NAV-fraction`` map and sums ``abs(.)`` for gross
+    exposure. ``Position.quantity`` is NOT always a NAV-fraction (ar13/ar14):
+
+      * ``unit_kind == "nav_fraction"`` (legacy / single-leg equity, AND any
+        object that does not expose ``unit_kind`` — older callers, test
+        doubles): ``quantity`` already IS the signed NAV-fraction. Returned
+        verbatim → byte-identical to the pre-fix path.
+      * ``unit_kind == "true_unit"`` (ADR-0086/0088 leg_quantity path):
+        ``quantity`` is signed CONTRACTS/SHARES. The NAV-fraction is
+        ``quantity × avg_entry_price × multiplier / nav`` (us_option ×100,
+        else ×1) — the SAME valuation the ``equity_total`` net-liq fold uses.
+
+    Fail-closed on a true-unit position when NAV or price is unusable: returns
+    the raw ``quantity`` (the pre-fix value) rather than fabricating a fraction.
+    A true-unit position whose magnitude collapses to a fraction is the
+    pathological case the cap would over-count, but with no usable NAV there is
+    no safe conversion, so we preserve the prior behavior rather than silently
+    zeroing the contribution (which would HIDE the position from the gross cap).
+
+    Args:
+        position: anything exposing ``quantity`` (required) and, for the
+            true-unit branch, ``avg_entry_price``, ``asset_class``, and
+            ``unit_kind``. Missing ``unit_kind`` ⇒ treated as nav_fraction.
+        nav: account NAV (USD) for the true-unit conversion. ``None`` or
+            non-positive falls back to the raw quantity (fail-closed).
+
+    Returns:
+        Signed NAV-fraction (sign preserved from ``quantity``).
+    """
+    quantity = float(getattr(position, "quantity", 0.0))
+    unit_kind = getattr(position, "unit_kind", _UNIT_KIND_NAV_FRACTION)
+    if unit_kind != _UNIT_KIND_TRUE_UNIT:
+        # Legacy NAV-fraction (or marker-less object): quantity IS the fraction.
+        return quantity
+
+    avg_entry_price = float(getattr(position, "avg_entry_price", 0.0))
+    asset_class = getattr(position, "asset_class", "equity")
+    multiplier = _CONTRACT_MULTIPLIER if asset_class == "us_option" else 1.0
+
+    if (
+        nav is None
+        or not math.isfinite(nav)
+        or nav <= 0.0
+        or not math.isfinite(avg_entry_price)
+        or avg_entry_price <= 0.0
+        or not math.isfinite(quantity)
+    ):
+        # No safe conversion — fail closed by preserving the raw (pre-fix)
+        # quantity. Do NOT zero it (that would hide the line from the gross cap).
+        return quantity
+
+    return (quantity * avg_entry_price * multiplier) / nav
 
 
 # ---------------------------------------------------------------------------
@@ -1512,6 +1621,12 @@ def _replay_record(
         "quantity": new_qty,
         "avg_entry_price": new_avg,
         "last_update_at": asof,
+        # ar13/ar14: record the unit the running quantity is in. The latest
+        # fill's path determines it (leg_quantity present ⇒ true_unit), parity
+        # with apply_execution. Legacy equity stays "nav_fraction" (unchanged).
+        "unit_kind": (
+            _UNIT_KIND_TRUE_UNIT if leg_quantity is not None else _UNIT_KIND_NAV_FRACTION
+        ),
     }
 
     # Update cash: long fill decreases cash, short fill increases cash.
