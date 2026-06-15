@@ -299,7 +299,23 @@ class FundamentalsAnalyst:
         if fetched_at.tzinfo is None:
             fetched_at = fetched_at.tz_localize("UTC")
         age_days = (asof - fetched_at).days
-        if age_days > self._STALENESS_FETCHED_AT_DAYS_HARD_LIMIT:
+        # cs78: bound the fetched_at age BELOW as well as above — the symmetric
+        # completion of cs77 on the basis-LESS cron-liveness fallback path. The
+        # old upper-only clause ``if age_days > _STALENESS_FETCHED_AT_DAYS_HARD_LIMIT``
+        # fails OPEN on exactly the two timestamps cs42a/cs53/cs67/cs68/cs75/cs77
+        # all guard against: (a) a FUTURE fetched_at makes age_days NEGATIVE and
+        # ``-10 > 7`` reads False -> gate bypassed -> a not-yet-knowable fetch is
+        # scored as fresh; (b) a NaT/missing-derived ``nan`` age and ``nan > 7``
+        # reads False -> gate bypassed -> an unknowable fetch-time row scored as
+        # fresh. The NaN-safe bounded membership test mirrors cs77 (`if not (0 <=
+        # age_days <= HARD)`) and cs75: a future fetched_at -> negative -> abstain;
+        # a nan age -> abstain. The inclusive `<=` preserves the old strictly-
+        # greater upper boundary, so a genuinely-fresh fetched_at (age in [0, 7])
+        # is admitted byte-identically. Defense-in-depth: cs42a already drops a
+        # future/NaT fetched_at upstream on the as_of-bounded read, so this is the
+        # last unbounded sibling gate, closing the future-timestamp/staleness
+        # family across both freshness axes (datum + cron-liveness).
+        if not (0 <= age_days <= self._STALENESS_FETCHED_AT_DAYS_HARD_LIMIT):
             return None
         return snapshot
 

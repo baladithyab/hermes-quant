@@ -648,6 +648,120 @@ def test_cs77_current_datum_still_emits(
 
 
 # ---------------------------------------------------------------------------
+# 9f — cs78 RED: the basis-LESS cron-liveness fallback (no report_date AND no
+#      period_end) had an upper-only fetched_at gate, so a FUTURE fetched_at
+#      (negative age) or a NaT/missing fetched_at (nan age) silently passed
+#      ``age_days > _STALENESS_FETCHED_AT_DAYS_HARD_LIMIT`` (`-10 > 7` False,
+#      `nan > 7` False) and a not-yet-/un-knowable fetch-time row was scored
+#      as fresh — the symmetric sibling of the cs77 datum-axis fail-open.
+#
+#      cs78 is defense-in-depth: the analyst's live read passes as_of=ctx.asof
+#      (non-None), where the provider's cs42a drops a future/NaT fetched_at on
+#      the as_of-bounded read (`df[df["fetched_at"] <= asof_ts]`), so this gate
+#      is not independently live-reachable. These tests exercise the analyst's
+#      own gate directly via _fetch_fundamentals with a hand-built basis-less
+#      Series (the cron-liveness fallback path) to pin the LAST unbounded
+#      sibling gate — closing the future-timestamp/staleness family on the
+#      cron-liveness axis as cs77 did on the datum axis.
+# ---------------------------------------------------------------------------
+
+
+def _basis_less_row(*, fetched_at: pd.Timestamp) -> pd.Series:
+    """A snapshot with NO fiscal basis (report_date AND period_end NaT), so
+    _datum_basis returns None and _fetch_fundamentals routes to the fetched_at
+    cron-liveness fallback gate. Equity quote_type so the cs45/cs47 non-equity
+    post-check does not pre-empt the staleness gate under audit."""
+    return pd.Series(
+        {
+            "report_date": pd.NaT,
+            "period_end": pd.NaT,
+            "fetched_at": fetched_at,
+            "quote_type": "EQUITY",
+            "pe_trailing": 18.0,
+            "sector": "Technology",
+        }
+    )
+
+
+def test_cs78_future_fetched_at_basis_less_abstains(
+    analyst: FundamentalsAnalyst,
+) -> None:
+    """cs78 RED: a basis-less row with a FUTURE fetched_at must abstain.
+
+    asof - fetched_at is NEGATIVE (here -10d). The old upper-only clause
+    ``age_days > 7`` reads ``-10 > 7`` (False) -> gate BYPASSED -> the row is
+    returned as fresh (fail-OPEN, same class as cs42a/cs53/cs67/cs68/cs75/cs77).
+    Post-cs78 the bounded membership test ``not (0 <= age_days <= 7)`` rejects a
+    negative age -> _fetch_fundamentals returns None.
+    """
+    asof = pd.Timestamp("2026-03-01T16:00:00", tz="UTC")
+    future_fetch = asof + pd.Timedelta(days=10)  # age = -10d
+    snap = _basis_less_row(fetched_at=future_fetch)
+
+    # Sanity: this row genuinely has no fiscal basis -> the fallback path runs.
+    assert FundamentalsAnalyst._datum_basis(snap) is None
+
+    # Drive the analyst gate directly: provider.read_latest returns the
+    # basis-less Series verbatim; cs42a is bypassed here precisely so the
+    # analyst's own (last) gate is the one under test.
+    analyst.provider.read_latest = lambda *_a, **_k: snap  # type: ignore[assignment]
+    result = analyst._fetch_fundamentals("AAPL", asof)
+    assert result is None, (
+        "cs78: a basis-less row with a FUTURE fetched_at (negative age) must "
+        "abstain — it was fetched in the future and is not yet knowable"
+    )
+
+
+def test_cs78_nat_fetched_at_basis_less_abstains(
+    analyst: FundamentalsAnalyst,
+) -> None:
+    """cs78 RED: a basis-less row with a NaT/missing fetched_at must abstain.
+
+    ``(asof - NaT).days`` is ``nan``; the old clause ``nan > 7`` is False ->
+    gate BYPASSED -> an unknowable-fetch-time row scored as fresh (fail-OPEN).
+    Post-cs78 ``not (0 <= nan <= 7)`` is True (nan comparisons are False) ->
+    abstain. NaT survives the fetched_at parse (pd.Timestamp(NaT) -> NaT, and
+    NaT.tz_localize('UTC') -> NaT, no raise), so it reaches the age gate rather
+    than the KeyError/ValueError/TypeError fallback.
+    """
+    asof = pd.Timestamp("2026-03-01T16:00:00", tz="UTC")
+    snap = _basis_less_row(fetched_at=pd.NaT)
+    assert FundamentalsAnalyst._datum_basis(snap) is None
+
+    analyst.provider.read_latest = lambda *_a, **_k: snap  # type: ignore[assignment]
+    result = analyst._fetch_fundamentals("AAPL", asof)
+    assert result is None, (
+        "cs78: a basis-less row with a NaT fetched_at (nan age) must abstain — "
+        "an unknowable fetch time cannot satisfy the cron-liveness gate"
+    )
+
+
+def test_cs78_fresh_basis_less_still_admitted(
+    analyst: FundamentalsAnalyst,
+) -> None:
+    """cs78 byte-identical guard: a basis-less row with a genuinely-fresh
+    fetched_at (age in [0, 7]) is admitted EXACTLY as before. The inclusive
+    ``<=`` preserves the old strictly-greater upper boundary, and a stale
+    (> 7d) fetched_at still darkens — so cs78 only ADDS the lower bound and
+    does not loosen the cron-liveness gate cs40 9c pins."""
+    asof = pd.Timestamp("2026-03-01T16:00:00", tz="UTC")
+
+    fresh = _basis_less_row(fetched_at=asof - pd.Timedelta(days=3))  # age 3, in [0,7]
+    analyst.provider.read_latest = lambda *_a, **_k: fresh  # type: ignore[assignment]
+    assert analyst._fetch_fundamentals("AAPL", asof) is not None, (
+        "cs78: a fresh basis-less row (age in [0, 7]) must still be admitted"
+    )
+
+    # Upper bound preserved: a > 7d basis-less fetched_at still abstains.
+    stale = _basis_less_row(fetched_at=asof - pd.Timedelta(days=8))  # age 8, > 7
+    analyst.provider.read_latest = lambda *_a, **_k: stale  # type: ignore[assignment]
+    assert analyst._fetch_fundamentals("AAPL", asof) is None, (
+        "cs78: a stale basis-less row (age > 7) must still abstain (upper "
+        "bound unchanged)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 10 — provider read raises FileNotFoundError (or other) → handled cleanly
 # ---------------------------------------------------------------------------
 
