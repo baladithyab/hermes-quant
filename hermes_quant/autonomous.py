@@ -268,13 +268,19 @@ def compute_cumulative_realized_pnl_pct(
     to `kill_switch_pct`.
 
     Returns a SIGNED fraction: negative = net loss (e.g. -0.12 = down 12% of NAV
-    on realized round-trips). Returns 0.0 on any error or empty book — the rail
-    fails OPEN (does not trip) on a read failure, because tripping the kill-switch
-    on a transient parse error would halt a healthy system. The trip decision in
-    the tick treats 0.0 as "no breach"; a genuinely catastrophic book will still
-    parse and trip. Unrealized (still-open) positions are NOT counted — the
-    kill-switch reacts to LOCKED-IN losses, consistent with "closed-position"
-    semantics in the post-mortem.
+    on realized round-trips). Unrealized (still-open) positions are NOT counted —
+    the kill-switch reacts to LOCKED-IN losses ("closed-position" semantics).
+
+    ar02 — degraded-rail handling (was a fail-OPEN). On a SUCCESSFUL compute we
+    persist the value to a last-known sidecar. On a compute error (e.g. the FIFO
+    matcher faulting mid-book, or a corrupt bus) we do NOT return 0.0 ("no breach")
+    — that silently disarmed this SECONDARY rail when a catastrophic book also
+    happened to fail to parse. Instead we return the LAST-KNOWN value (conservative:
+    a losing book that briefly can't parse stays tripped) and emit a
+    state_reconstruction_failed audit event so an operator sees the rail went blind.
+    Cold start (no last-known) still returns 0.0 — we cannot fabricate a loss, and
+    the deterministic gate (ADR-0004, independent + fail-CLOSED) remains the final
+    authority. An empty/absent book legitimately returns 0.0 (no realized P&L yet).
     """
     try:
         from hermes_quant.daemon.settlement_loop import join_exit_fills
@@ -304,10 +310,76 @@ def compute_cumulative_realized_pnl_pct(
         if nav is None or nav <= 0 or not math.isfinite(nav):
             return 0.0
         frac = realized_pnl_usd / nav
-        return frac if math.isfinite(frac) else 0.0
-    except Exception as exc:  # noqa: BLE001 - fail-OPEN: never trip on read error
+        if not math.isfinite(frac):
+            return 0.0
+        _persist_last_known_cum_pnl(frac)
+        return frac
+    except Exception as exc:  # noqa: BLE001 - degraded rail: carry last-known forward, never silently re-arm
         logger.warning("autonomous: cumulative-PnL computation failed: %s", exc)
-        return 0.0
+        last_known = _read_last_known_cum_pnl()
+        _emit_killswitch_degraded_audit(exc, last_known)
+        return last_known if last_known is not None else 0.0
+
+
+_LAST_KNOWN_CUM_PNL_PATH = QUANT_HOME / "autonomous_cum_pnl_last_known.json"
+
+
+def _persist_last_known_cum_pnl(frac: float) -> None:
+    """Persist the most recent SUCCESSFUL cumulative realized-P&L fraction so a later
+    compute error can carry it forward instead of fail-opening to 0.0 (ar02). Atomic;
+    best-effort (a persist failure must never break the healthy compute path)."""
+    path = QUANT_HOME / _LAST_KNOWN_CUM_PNL_PATH.name
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "cum_pnl_pct": float(frac),
+            "asof": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, sort_keys=True))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - persistence is best-effort, never break the rail
+        logger.warning("autonomous: failed to persist last-known cum-PnL: %s", exc)
+
+
+def _read_last_known_cum_pnl() -> float | None:
+    """Return the last successfully-computed cumulative realized-P&L fraction, or None
+    if no sidecar exists / it is unreadable (cold start)."""
+    path = QUANT_HOME / _LAST_KNOWN_CUM_PNL_PATH.name
+    if not path.exists():
+        return None
+    try:
+        val = float(json.loads(path.read_text(encoding="utf-8")).get("cum_pnl_pct"))
+        return val if math.isfinite(val) else None
+    except Exception:  # noqa: BLE001 - a corrupt sidecar is treated as cold start
+        return None
+
+
+def _emit_killswitch_degraded_audit(exc: Exception, last_known: float | None) -> None:
+    """Emit an operator-visible audit event when the secondary kill-switch rail goes blind
+    (ar02). Best-effort — an audit-append failure must never break the compute path."""
+    try:
+        from hermes_quant.governance import audit_log
+        from hermes_quant.governance.audit_log import GovernanceEvent
+
+        audit_log.append(
+            GovernanceEvent(
+                kind="state_reconstruction_failed",
+                asof=datetime.now(tz=UTC),
+                source="autonomous_kill_switch",
+                payload={
+                    "rail": "cumulative_realized_pnl_pct",
+                    "error": str(exc)[:300],
+                    "carried_last_known_cum_pnl_pct": last_known,
+                    "degraded": True,
+                },
+            )
+        )
+    except Exception as audit_exc:  # noqa: BLE001 - audit is best-effort
+        logger.warning("autonomous: failed to emit kill-switch degraded audit: %s", audit_exc)
 
 
 # ---------------------------------------------------------------------------
