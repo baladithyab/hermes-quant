@@ -133,7 +133,8 @@ def test_short_close_buys_to_cover(mod, spy):
     """A held SHORT (target -0.20) closes with a BUY (cover) firing +0.20 (= -held)."""
     held = -0.20
     placed = mod._fire_equity_close(
-        "AVGO", qty=-100.0, target_position_pct=held, reason="leaps_drawdown"
+        "AVGO", qty=-100.0, target_position_pct=held, reason="leaps_drawdown",
+        decision_price=200.0,
     )
 
     assert placed["ok"] is True, placed
@@ -155,7 +156,8 @@ def test_short_close_buys_to_cover(mod, spy):
 def test_long_close_sells(mod, spy):
     """A held LONG (target +0.30) closes with a SELL firing -0.30 (= -held)."""
     placed = mod._fire_equity_close(
-        "AAPL", qty=100.0, target_position_pct=0.30, reason="swing_tp"
+        "AAPL", qty=100.0, target_position_pct=0.30, reason="swing_tp",
+        decision_price=200.0,
     )
 
     assert placed["ok"] is True, placed
@@ -174,7 +176,8 @@ def test_execute_called_as_valid_proposal_plus_keyword(mod, spy):
     """The invocation must be a Proposal positionally + keyword fill_size_pct —
     a valid call (no TypeError, no ModuleNotFoundError, no positional dict)."""
     placed = mod._fire_equity_close(
-        "NVDA", qty=-50.0, target_position_pct=-0.15, reason="leaps_drawdown"
+        "NVDA", qty=-50.0, target_position_pct=-0.15, reason="leaps_drawdown",
+        decision_price=200.0,
     )
     assert placed["ok"] is True, placed
     assert "error" not in placed
@@ -190,7 +193,8 @@ def test_state_is_approved_and_kind_equity(mod, spy):
     """The minted Proposal routes to the equity PaperReactor (kind 'equity')
     and is built in the approved state."""
     mod._fire_equity_close(
-        "MSFT", qty=100.0, target_position_pct=0.10, reason="swing_tp"
+        "MSFT", qty=100.0, target_position_pct=0.10, reason="swing_tp",
+        decision_price=200.0,
     )
     prop = spy.calls[0]["proposal"]
     assert prop.proposal_kind == "equity"
@@ -308,6 +312,7 @@ def test_close_delta_flattens_default_regime_state_db(
             qty=(open_pct * 1000.0),  # signed proxy share count; sign = held sign
             target_position_pct=held,
             reason="leaps_drawdown",
+            decision_price=200.0,
         )
         assert placed["ok"] is True, placed
         # short held<0 -> buy-to-cover; long held>0 -> sell.
