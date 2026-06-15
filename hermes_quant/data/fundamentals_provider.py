@@ -554,7 +554,22 @@ class FundamentalsProvider:
         # Symmetric with the cs67 refresh clamp (``if 0 <= age_h < ttl``) and the
         # silence-by-default charter (a not-yet-knowable median must go dark, not
         # be trusted). The as_of!=None PIT path (cs53) is byte-identical.
-        if age_days < 0 or age_days > self.SECTOR_MEDIAN_STALE_HARD_DAYS:
+        #
+        # cs75: the bare disjunct ``age_days < 0 or age_days > HARD`` is NaN-UNSAFE.
+        # When the surviving latest row has fetched_at = NaT (a corrupt / torn /
+        # hand-built parquet, an old-schema migration, or a backfill omitting the
+        # stamp), ``(asof_ts - pd.Timestamp(NaT)).days`` is float('nan'); ``nan < 0``
+        # and ``nan > HARD`` are BOTH False, so the 30d HARD gate is BYPASSED and a
+        # median with NO knowable fetch time is silently ACCEPTED as fresh ->
+        # fail-OPEN (the gap bit only the as_of=None LIVE path: cs53 above drops a
+        # NaT row upstream on the PIT path). Use a bounded NaN-SAFE membership test
+        # mirroring cs67's ``0 <= age_h < ttl`` and cs69's ``pd.isna(fetched_at)``
+        # skip: a nan / NaT-derived age fails ``0 <= age_days <= HARD`` -> abstain.
+        # The inclusive upper bound ``<= HARD`` preserves the old strictly-greater
+        # ``> HARD`` boundary (age_days == HARD still accepted); a genuinely-fresh
+        # past-stamped median (age_days in [0, HARD]) and the cs68 negative-age
+        # abstain stay byte-identical.
+        if not (0 <= age_days <= self.SECTOR_MEDIAN_STALE_HARD_DAYS):
             return None
         val = _coerce_float(latest.get("median_pe_trailing"))
         if np.isnan(val) or val <= 0:

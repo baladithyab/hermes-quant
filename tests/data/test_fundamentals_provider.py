@@ -892,6 +892,47 @@ def test_cs68_pit_path_unaffected_by_negative_age_clamp(
     ) == pytest.approx(22.0)
 
 
+def test_cs75_sector_median_nat_fetched_at_no_as_of_live_abstains(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cs75 RED->GREEN: a NaT-fetched_at median is NOT accepted on the LIVE read.
+
+    cs75 is the NaN-completeness gap in the cs68 clamp. When the surviving latest
+    sector-median row has fetched_at = NaT (a corrupt / torn / hand-built parquet,
+    an old-schema migration, or a backfill that omits the stamp), the cs68 clamp
+    ``age_days = (asof_ts - pd.Timestamp(NaT)).days`` is float('nan'). The bare
+    cs68 disjunct ``age_days < 0 or age_days > HARD`` evaluates ``nan < 0`` ->
+    False and ``nan > 30`` -> False, so BOTH disjuncts are False and the 30d HARD
+    gate is BYPASSED: the median (the pe_relative DENOMINATOR) is silently
+    ACCEPTED as fresh despite NO knowable fetch time -> fail-OPEN. After cs75 the
+    bounded NaN-safe test ``not (0 <= age_days <= HARD)`` is True for nan (a NaT
+    fetch time is not a knowable age in [0, 30]) so the LIVE read abstains (None),
+    mirroring the NaN-safe cs67 refresh clamp (``if 0 <= age_h < ttl``) and the
+    cs69 ``pd.isna(fetched_at): continue`` skip. Silence-by-default: a not-yet-
+    knowable median must go dark, never be trusted as fresh.
+
+    The as_of!=None PIT path is a no-op here: cs53 (:536-539) already drops a NaT
+    row upstream (``NaT <= asof_ts`` is False -> empty frame -> early None), so
+    the new bounded clamp never even runs on that path. The second assertion
+    guards against any PIT regression.
+    """
+    monkeypatch.setenv(REPORTING_LAG_ENV_FLAG, "0")
+    now = pd.Timestamp.now(tz="UTC")
+    _write_sector_median_row(
+        provider,
+        as_of_date=now.normalize(),
+        fetched_at=pd.NaT,
+        median_pe=22.0,
+    )
+    # RED: pre-cs75 the LIVE read returns 22.0 (age_days = (now - NaT).days = nan
+    # defeats BOTH disjuncts of the cs68 clamp -> fail-OPEN); GREEN: the bounded
+    # NaN-safe test abstains -> None.
+    assert provider.read_sector_median_pe("Tech") is None
+    # PIT no-op: cs53 drops the NaT row upstream (NaT <= asof_ts is False) so the
+    # clamp never runs; None here both pre- and post-cs75 (PIT byte-identical).
+    assert provider.read_sector_median_pe("Tech", as_of=now) is None
+
+
 # ---------------------------------------------------------------------------
 # cs69: refresh_sector_medians must NOT stamp a TODAY median built from STALE
 # constituents. The median is built from read_latest(ticker, as_of=None) per
