@@ -56,7 +56,7 @@
 | `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1298` |
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:206` |
-| `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:623` |
+| `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:643` |
 | `HERMES_QUANT_PREWARM_WORKERS` | `` | `hermes_quant/playbook/scorers.py:781` |
 | `HERMES_QUANT_REFLECTION` | `1` | `hermes_quant/react/deterministic_equity.py:604` |
 | `HERMES_QUANT_REFLECTOR_LLM` | `0` | `hermes_quant/memory/reflector.py:554` |

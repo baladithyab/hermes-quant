@@ -513,7 +513,27 @@ def tick(
     # honored an already-tripped file and never computed live P&L (deep-review
     # 2026-06-07). On a DRY RUN we DETECT-but-do-not-WRITE (report would_trip in
     # the returned state; never persist the trip file on the dry path).
-    _ks_threshold = float(_read_safety_rails().get("kill_switch_pct", 0.10))
+    # ar08: kill_switch_pct comes from operator-editable ~/.hermes/config.yaml. A
+    # malformed value (NaN/inf/<=0) must NOT silently DISABLE the ADR-0016 §D9
+    # always-on rail — `nan > 0` is False, so the pre-fix `_ks_threshold > 0` guard
+    # short-circuited and a catastrophic realized loss would not trip, with no trace.
+    # Fail CLOSED: fall back to the documented 0.10 floor AND warn, so an operator can
+    # tell a neutered config from a healthy account. Byte-identical for any finite
+    # positive threshold (the only legal shape). Mirrors the finite-guard posture the
+    # SAME function applies to its P&L basis (autonomous.py:306/310/313) + gate.py.
+    try:
+        _ks_raw = float(_read_safety_rails().get("kill_switch_pct", 0.10))
+    except (TypeError, ValueError):
+        _ks_raw = float("nan")
+    if not math.isfinite(_ks_raw) or _ks_raw <= 0:
+        logger.warning(
+            "autonomous: invalid kill_switch_pct=%r (non-finite or <=0) — falling back "
+            "to the ADR-0016 0.10 floor; the kill-switch rail stays ARMED",
+            _ks_raw,
+        )
+        _ks_threshold = 0.10
+    else:
+        _ks_threshold = _ks_raw
     _cum_pnl = compute_cumulative_realized_pnl_pct()
     if _ks_threshold > 0 and _cum_pnl <= -abs(_ks_threshold):
         reason = (
