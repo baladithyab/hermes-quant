@@ -80,12 +80,37 @@ def _read_pdr_mode() -> str:
     return mode if mode in {"advise", "hitl", "autonomous"} else "advise"
 
 
+def _finite_threshold(raw: Any, default: float, name: str) -> float:
+    """ar09 (ar08 family): coerce an operator-YAML money threshold to a finite POSITIVE float,
+    falling back to the documented default + a warning on a NaN/inf/<=0/non-numeric value.
+
+    A non-finite threshold silently NEUTERS a `<`/`<=`/`>` money gate (every comparison against NaN
+    is False), so it must fail CLOSED to the conservative default rather than propagate. Byte-identical
+    for any finite positive configured value (the only legal shape)."""
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        val = float("nan")
+    if not math.isfinite(val) or val <= 0:
+        logger.warning(
+            "autonomous: invalid %s=%r (non-finite or <=0) — falling back to default %r; "
+            "the gate stays ARMED",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return val
+
+
 def _read_silence_bias_config() -> GateConfig:
     cfg = _read_config()
     raw = ((cfg.get("quant") or {}).get("autonomous") or {}).get("silence_bias") or {}
     return GateConfig(
-        min_confidence=float(raw.get("min_confidence", 0.65)),
-        min_urgency=float(raw.get("min_urgency", 0.5)),
+        # ar09: finite-guard the operator-YAML thresholds (a NaN min_confidence/min_urgency
+        # would make `metric < threshold` False -> a should-be-SILENCED signal FIRES).
+        min_confidence=_finite_threshold(raw.get("min_confidence", 0.65), 0.65, "min_confidence"),
+        min_urgency=_finite_threshold(raw.get("min_urgency", 0.5), 0.5, "min_urgency"),
         min_analysts_emitted=int(raw.get("min_analysts_emitted", 2)),
         max_recent_rejections=int(raw.get("max_recent_rejections", 3)),
         salience_window_hours=int(raw.get("salience_window_hours", 168)),
@@ -117,7 +142,11 @@ def _read_safety_rails() -> dict:
         #   stopless_mode: "size_down" (cap to the threshold, keep trading) or
         #     "silence" (refuse the trade entirely).
         "require_stop_loss": bool(auto.get("require_stop_loss", False)),
-        "stopless_max_size_pct": float(auto.get("stopless_max_size_pct", 0.05)),
+        # ar09: finite-guard the backstop limit (a NaN/<=0 would make `abs(kelly) > limit`
+        # False -> a full-size stopless position passes UNCAPPED, silently disabling the backstop).
+        "stopless_max_size_pct": _finite_threshold(
+            auto.get("stopless_max_size_pct", 0.05), 0.05, "stopless_max_size_pct"
+        ),
         "stopless_mode": str(auto.get("stopless_mode", "size_down")),
     }
 
