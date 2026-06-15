@@ -98,29 +98,27 @@ def test_incremental_matches_rebuild_flag_on(tmp_path, monkeypatch):
     assert inc[("equity", "BA")].quantity == pytest.approx(reb[("equity", "BA")].quantity, rel=1e-9)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "ms1 (2026-06-13) DORMANT divergence: in a bucket that MIXES absolute-target "
-        "and true-delta records, FillDeltaNormalizer.delta_for() returns a true-delta "
-        "record's size WITHOUT advancing its in-memory running_net (rebuild), but "
-        "apply_execution DOES advance the persisted state.db qty by that delta and "
-        "then differences the NEXT absolute target against it (incremental). So the "
-        "two folds seed the next target-difference from different bases and diverge "
-        "(incremental 0.05 vs rebuild 0.07 for [abs 0.05, true-delta +0.02, abs 0.05]). "
-        "Dormant today: no producer emits schema_version='true-delta-v1' (every record "
-        "defaults schema_version=None == absolute-target), so the mixed stream cannot "
-        "occur in production. This test pins the desired parity (it WILL fail until the "
-        "advance rule is reconciled); flipping it to pass is the deferred fix's gate."
-    ),
-    strict=True,
-)
 def test_mixed_schema_bucket_incremental_vs_rebuild_parity(tmp_path, monkeypatch):
-    """RED (xfail): a single bucket mixing absolute-target + true-delta fills folds
-    to DIFFERENT final positions via the incremental vs rebuild paths.
+    """ms1 RED->GREEN: a single bucket MIXING absolute-target + true-delta fills must
+    fold to the SAME final position via the incremental and rebuild paths.
 
-    The desired (asserted) invariant is parity. It currently FAILS because the
-    true-delta record advances the persisted net in the incremental fold but NOT the
-    normalizer's in-memory net in the rebuild fold — the ms1 divergence.
+    The ms1 divergence (now fixed): FillDeltaNormalizer.delta_for() returned a
+    true-delta record's size WITHOUT advancing its in-memory running_net (rebuild),
+    but apply_execution DID advance the persisted state.db qty by that delta and then
+    differenced the NEXT absolute target against it (incremental). So the two folds
+    seeded the next target-difference from different bases and diverged.
+
+    Stream [abs 0.05, true-delta +0.02, abs 0.05]:
+      - incremental: 0.05 -> +0.02 = 0.07 -> (target 0.05 - net 0.07 = -0.02) -> 0.05
+      - rebuild (pre-fix): 0.05 -> +0.02 = 0.07 -> (target 0.05 - STALE net 0.05 =
+        0.0) -> 0.07   [DIVERGENCE: incremental 0.05 vs rebuild 0.07]
+      - rebuild (post-fix): the true-delta advances net_map to 0.07 too, so the second
+        target differences against 0.07 -> -0.02 -> 0.05   [PARITY]
+
+    Dormant today: no producer emits schema_version='true-delta-v1' (every record
+    defaults schema_version=None == absolute-target), so the mixed stream cannot occur
+    in production. This test is the architectural-parity gate the internal state.db
+    split verdict demanded.
     """
     import json
 
@@ -151,8 +149,34 @@ def test_mixed_schema_bucket_incremental_vs_rebuild_parity(tmp_path, monkeypatch
     ps_reb.reconstruct_from(bus)
     reb = ps_reb.get_positions("paper-default")[("equity", "AAPL")].quantity
 
-    # Desired invariant (currently violated => xfail): the two folds agree.
+    # The parity gate: the two folds agree, both on the single intended 0.05 target.
+    assert inc == pytest.approx(0.05, rel=1e-9)
+    assert reb == pytest.approx(0.05, rel=1e-9)
     assert inc == pytest.approx(reb, rel=1e-9)
+
+
+def test_true_delta_advances_running_net_in_normalizer_ms1():
+    """ms1 unit-level: a true-delta record advances the normalizer's in-memory
+    running_net by its delta (mirroring the incremental fold's persisted
+    old_qty + delta), so a SUBSEQUENT absolute-target record differences against the
+    advanced base — NOT the stale pre-delta base.
+
+    RED before the fix: the second delta_for returned 0.0 (target 0.05 - stale net 0.05).
+    GREEN: it returns -0.02 (target 0.05 - advanced net 0.07).
+    """
+    from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
+
+    n = FillDeltaNormalizer()
+    abs_open = _rec("AAPL", 0.05, pid="x0", asof="t0")
+    assert n.delta_for(abs_open) == pytest.approx(0.05)  # net -> 0.05
+
+    delta_rec = _rec("AAPL", 0.02, pid="x1", asof="t1")
+    delta_rec["schema_version"] = "true-delta-v1"
+    assert n.delta_for(delta_rec) == pytest.approx(0.02)  # passthrough, net -> 0.07
+
+    abs_reaffirm = _rec("AAPL", 0.05, pid="x2", asof="t2")
+    # target 0.05 vs ADVANCED net 0.07 -> -0.02 (was 0.0 with the stale net pre-fix).
+    assert n.delta_for(abs_reaffirm) == pytest.approx(-0.02)
 
 
 def test_multi_account_metadata_only_rebuild_matches_incremental_cs64(tmp_path, monkeypatch):

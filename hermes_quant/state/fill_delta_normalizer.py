@@ -155,8 +155,11 @@ class FillDeltaNormalizer:
 
         For an absolute-target record this is ``target − running_net`` and the
         running net advances to the target. For a true-delta-schema record the
-        size field is already a delta, so it is returned unchanged (and does NOT
-        advance the carry-forward, since the producer is reporting increments).
+        size field is already a delta, so it is returned unchanged AND the running
+        net advances BY that delta (``running_net += delta``) — mirroring the
+        incremental fold, whose persisted qty advances ``old_qty + delta``. Both
+        folds therefore carry the same base into the next absolute-target
+        difference (the ms1 mixed-schema parity fix).
         """
         key = _bucket(rec)
         qty = self._quantity_of(rec)
@@ -165,10 +168,25 @@ class FillDeltaNormalizer:
         absolute = qty if qty is not None else float(rec.get("fill_size_pct", 0.0))
 
         if not is_absolute_target_record(rec):
-            # Already a traded delta — pass through untouched, do not re-difference.
-            # (Do not advance running_net: the producer is reporting increments, so
-            # a carry-forward derived from a partial stream would be wrong.)
-            return delta_from_net(rec, net_map.get(key, 0.0))
+            # Already a traded delta — pass it through untouched (do NOT re-difference
+            # it against the running net). But it MUST still advance running_net by that
+            # delta, because the incremental fold's persisted qty does exactly that:
+            # apply_execution computes new_qty = old_qty + delta (portfolio_state.py:984
+            # via _update_position) and writes it back, so the next absolute-target
+            # record there differences against (old_qty + delta). If the rebuild's
+            # in-memory net did NOT advance here, a bucket MIXING a true-delta fill and a
+            # later absolute-target fill would seed the carry-forward base from different
+            # values in the two folds (rebuild net stale, incremental qty advanced) and
+            # the next `target - net` derivation would diverge — the ms1 fold-divergence.
+            # Advancing by the delta keeps the carry-forward base byte-identical to the
+            # persisted qty in both folds. (running_net += delta is the in-memory mirror
+            # of new_qty = old_qty + delta.) DORMANT today: no producer emits a non-
+            # absolute-target schema_version, so net_map only ever sees absolute targets
+            # and this branch is unreachable in production — an all-absolute-target bucket
+            # is byte-identical because it never enters here.
+            delta = delta_from_net(rec, net_map.get(key, 0.0))
+            net_map[key] = net_map.get(key, 0.0) + delta
+            return delta
 
         # Absolute-target: derive via the ONE shared derivation, then advance the
         # in-memory running net to the target for the next record in this bucket.
