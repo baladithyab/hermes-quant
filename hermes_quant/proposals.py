@@ -286,6 +286,170 @@ class ProposalStore:
     # Lifecycle: approve / reject / expire
     # -----------------------------------------------------------------
 
+    def claim_for_approval(
+        self,
+        proposal_id: str,
+        *,
+        approver_user_id: str | None = None,
+        size_override_pct: float | None = None,
+    ) -> Proposal:
+        """ATOMICALLY claim a pending proposal for approval (ar16).
+
+        This is the compare-and-set that closes the ``quant_approve`` TOCTOU
+        double-fire window. The HITL approve flow used to do a non-atomic
+        check-then-act — ``store.get()`` to read ``state == 'pending'``, then
+        ``reactor.execute()`` to FIRE the order, then ``store.approve()`` to
+        advance state AFTER the fire. Two concurrent approves of the SAME
+        proposal_id both passed the read-state gate (state hadn't advanced
+        yet), both fired the reactor, and — because the reactor stamps a FRESH
+        ``asof_execution`` per call and the only idempotency is keyed on
+        ``(proposal_id, asof_execution, ...)`` — BOTH fills were recorded.
+        Capital moved twice.
+
+        The fix: transition the proposal out of ``pending`` *before* the fire,
+        in a single ``BEGIN IMMEDIATE`` transaction with a conditional
+        ``UPDATE ... WHERE state='pending'`` (the SQLite index is the cross-
+        process write-lock arbiter, matching ``daemon/halt_state`` and
+        ``state/portfolio_state``). Exactly ONE concurrent caller wins the
+        UPDATE (``rowcount == 1``); every other caller sees ``rowcount == 0``
+        and raises :class:`ProposalStateError` — so it never reaches the fire.
+
+        Safe-money polarity (per the ar16 brief): the claim advances the
+        proposal to ``approved`` (claimed) BEFORE the fire. If the fire then
+        fails, the proposal is left CLAIMED — a claimed-but-unfired proposal
+        that needs operator attention/re-approval is strictly safer than a
+        double-fire. The caller attaches the execution record afterward via
+        :meth:`record_execution`.
+
+        Raises:
+            KeyError: proposal not found.
+            ProposalExpiredError: TTL elapsed (auto-expired).
+            ProposalStateError: not pending (already claimed/approved/rejected
+                — i.e. a concurrent caller already won the claim).
+        """
+        approved_at = _iso(_utc_now())
+        with self._lock:
+            # Read current state for the TTL gate + to build the full record.
+            current = self._get_or_raise(proposal_id)
+            self._reject_if_expired(current)  # raises ProposalExpiredError if past TTL
+
+            updated = Proposal(
+                **{
+                    **_proposal_to_dict(current),
+                    "state": "approved",
+                    "approved_at": approved_at,
+                    "approver_user_id": approver_user_id,
+                    "size_override_pct": size_override_pct,
+                }
+            )
+            record = _proposal_to_dict(updated)
+
+            # Atomic compare-and-set on the SQLite index. BEGIN IMMEDIATE takes
+            # the write lock up-front so two processes serialize here; the
+            # WHERE state='pending' guard means only the FIRST to commit flips
+            # the row — every later contender updates 0 rows and loses.
+            with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    cur = conn.execute(
+                        "UPDATE proposals SET "
+                        "  state = 'approved', "
+                        "  approved_at = ?, "
+                        "  record_json = ? "
+                        "WHERE proposal_id = ? AND state = 'pending'",
+                        (
+                            approved_at,
+                            json.dumps(record, separators=(",", ":"), sort_keys=True),
+                            proposal_id,
+                        ),
+                    )
+                    won = cur.rowcount == 1
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+
+            if not won:
+                # Either a concurrent caller already claimed it, or it is no
+                # longer pending (rejected/expired/approved). Re-read to give a
+                # precise error and to surface expiry as ProposalExpiredError.
+                latest = self._get_or_raise(proposal_id)
+                self._reject_if_expired(latest)
+                raise ProposalStateError(
+                    f"proposal {proposal_id} is in state {latest.state!r}; "
+                    "expected 'pending' (already claimed/approved by a "
+                    "concurrent approve)"
+                )
+
+            # We won the claim. Append the approve event to the JSONL audit log
+            # (the source of truth) so the transition is durable + reconcilable.
+            # The SQLite row is already flipped by the UPDATE above; the
+            # append-only JSONL latest-event-per-id wins on reconcile.
+            self._append_audit(updated, event="approve")
+            return updated
+
+    def record_execution(
+        self,
+        proposal_id: str,
+        *,
+        execution: dict[str, Any] | None,
+    ) -> Proposal:
+        """Attach the fired execution record onto an already-claimed proposal
+        (ar16). Called AFTER :meth:`claim_for_approval` + ``reactor.execute``.
+
+        The state transition already happened in ``claim_for_approval`` (the
+        proposal is ``approved``); this only writes the execution payload onto
+        the existing approved record so the audit trail carries the fill. It is
+        a no-op-safe update of the ``execution`` field; it does NOT re-gate on
+        state (the proposal is already terminal-approved and the fire is done).
+        """
+        with self._lock:
+            current = self._get_or_raise(proposal_id)
+            updated = Proposal(
+                **{
+                    **_proposal_to_dict(current),
+                    "execution": execution,
+                }
+            )
+            self._persist(updated, event="approve")
+            return updated
+
+    def release_claim(self, proposal_id: str) -> Proposal | None:
+        """Roll a claimed (approved) proposal BACK to pending (ar16).
+
+        Used ONLY when the fire was a PROVEN no-capital refusal — the reactor
+        raised/refused before any fill landed on the executions bus (fill-size
+        invariant rejection, or pre-trade admissibility rejection). In those
+        cases no money moved, so the safest, least-surprising behavior is to
+        restore the proposal to ``pending`` exactly as the pre-ar16 flow did,
+        letting the operator revise + retry. This is NEVER called after a
+        successful fill — only on the no-capital-moved refusal branches.
+
+        Returns the re-pended proposal, or None if it is no longer in the
+        ``approved`` claimed state (defensive — never resurrects a fill).
+        """
+        with self._lock:
+            try:
+                current = self._get_or_raise(proposal_id)
+            except KeyError:
+                return None
+            # Only roll back a claim we made: approved with no execution
+            # attached. If an execution is present, a fill happened — refuse to
+            # re-pend (never resurrect a fired proposal).
+            if current.state != "approved" or current.execution is not None:
+                return None
+            updated = Proposal(
+                **{
+                    **_proposal_to_dict(current),
+                    "state": "pending",
+                    "approved_at": None,
+                    "approver_user_id": None,
+                    "size_override_pct": None,
+                }
+            )
+            self._persist(updated, event="create")
+            return updated
+
     def approve(
         self,
         proposal_id: str,
@@ -294,7 +458,15 @@ class ProposalStore:
         size_override_pct: float | None = None,
         execution: dict[str, Any] | None = None,
     ) -> Proposal:
-        """Advance pending → approved. Raises if not pending or expired."""
+        """Advance pending → approved. Raises if not pending or expired.
+
+        NOTE (ar16): this is the legacy non-atomic transition (read-then-write
+        under the in-process lock only). The HITL fire path in
+        ``tools.quant_approve`` no longer uses it — it claims atomically via
+        :meth:`claim_for_approval` BEFORE firing, then attaches the execution
+        via :meth:`record_execution`. ``approve`` is retained for direct
+        single-threaded callers/tests that advance state without a fire.
+        """
         with self._lock:
             current = self._get_or_raise(proposal_id)
             self._reject_if_expired(current)
@@ -590,12 +762,17 @@ class ProposalStore:
                 f"proposal {proposal.proposal_id} expired at {proposal.expires_at}"
             )
 
-    def _persist(self, proposal: Proposal, *, event: str) -> None:
-        """Atomic dual-write: JSONL append (truth), SQLite upsert (index).
+    def _append_audit(self, proposal: Proposal, *, event: str) -> None:
+        """Append one event line to the JSONL bus (the source of truth) and
+        emit the create-time governance event.
 
-        JSONL is written first; if SQLite write fails, the index can be
-        rebuilt from JSONL via _reconcile_index() (replays the append-only
-        log, latest-event-per-id wins, tolerant of corrupt trailing lines).
+        This is the JSONL half of :meth:`_persist`, factored out so the ar16
+        atomic-claim path (:meth:`claim_for_approval`) can write its audit line
+        WITHOUT re-running the SQLite upsert — the claim already flipped the
+        SQLite row inside its own ``BEGIN IMMEDIATE`` compare-and-set, so a
+        second upsert here would be redundant (and would race the very window
+        we just closed). The append-only JSONL is latest-event-per-id, so the
+        claim event lands durably for ``_reconcile_index``.
         """
         record = _proposal_to_dict(proposal)
         record["_event"] = event  # "create" | "approve" | "reject" | "expire"
@@ -651,6 +828,20 @@ class ProposalStore:
                     proposal.proposal_id,
                     e,
                 )
+
+    def _persist(self, proposal: Proposal, *, event: str) -> None:
+        """Atomic dual-write: JSONL append (truth), SQLite upsert (index).
+
+        JSONL is written first; if SQLite write fails, the index can be
+        rebuilt from JSONL via _reconcile_index() (replays the append-only
+        log, latest-event-per-id wins, tolerant of corrupt trailing lines).
+        """
+        # JSONL append (the source of truth) + create-time governance event.
+        self._append_audit(proposal, event=event)
+
+        record = _proposal_to_dict(proposal)
+        record["_event"] = event
+        record["_event_at"] = _iso(_utc_now())
 
         # SQLite upsert
         with self._conn() as conn:

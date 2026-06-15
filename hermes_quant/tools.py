@@ -718,11 +718,60 @@ def quant_approve(args: dict, **_kwargs) -> str:
             }
         )
 
-    # Fire the reactor BEFORE state advance — if React fails, the proposal stays
-    # pending and the operator can retry. select_reactor() dispatches on proposal
-    # kind: equity -> PaperReactor, multi-leg -> MultiLegPaperReactor (default-OFF;
-    # a MultiLegReactorDisabled raise leaves the proposal pending and surfaces the
-    # error — never a silent equity fill). HITL/CLI-only money seam.
+    # ar16 — ATOMICALLY claim the proposal out of `pending` BEFORE the fire.
+    # This closes the TOCTOU double-fire window: the old flow read state ==
+    # 'pending' here, fired the reactor, THEN advanced state — so two concurrent
+    # approves of the same proposal_id both passed the read-state gate and both
+    # fired (the reactor stamps a fresh asof_execution per call -> distinct
+    # idempotency keys -> two recorded fills -> capital moved twice). The claim
+    # is a single BEGIN IMMEDIATE compare-and-set (UPDATE ... WHERE state =
+    # 'pending'); exactly ONE caller wins and reaches the fire. A loser raises
+    # ProposalStateError and NEVER fires. Safe-money polarity: the proposal is
+    # left CLAIMED (approved) before the fire — if React then fails, a claimed-
+    # but-unfired proposal that needs operator re-approval is strictly safer
+    # than a double-fire; the execution is attached afterward via
+    # store.record_execution.
+    try:
+        store.claim_for_approval(
+            proposal_id,
+            approver_user_id=_kwargs.get("user_id"),
+            size_override_pct=size_override,
+        )
+    except ProposalExpiredError as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "state_mismatch",
+                "message": str(exc),
+                "proposal_id": proposal_id,
+            }
+        )
+    except ProposalStateError as exc:
+        # Lost the atomic claim (a concurrent approve already won, or the
+        # proposal is no longer pending). Do NOT fire.
+        return json.dumps(
+            {
+                "success": False,
+                "error": "state_mismatch",
+                "message": str(exc),
+                "proposal_id": proposal_id,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"claim failed: {exc}",
+                "proposal_id": proposal_id,
+            }
+        )
+
+    # Fire the reactor AFTER the atomic claim. The proposal is already advanced
+    # out of `pending`, so a re-entrant/concurrent approve cannot fire it again.
+    # select_reactor() dispatches on proposal kind: equity -> PaperReactor,
+    # multi-leg -> MultiLegPaperReactor (default-OFF; a MultiLegReactorDisabled
+    # raise surfaces the error — never a silent equity fill). HITL/CLI-only
+    # money seam.
     reactor = select_reactor(proposal)
     try:
         execution = reactor.execute(
@@ -733,6 +782,10 @@ def quant_approve(args: dict, **_kwargs) -> str:
         )
     except FillSizeInvariantError as exc:
         logger.warning("quant_approve: fill-size invariant rejected %s: %s", proposal_id, exc)
+        # PROVEN no-capital refusal: the reactor raised before any fill landed
+        # on the bus. Roll the ar16 claim back to `pending` so the operator can
+        # revise + retry, exactly as the pre-ar16 flow did. No money moved.
+        store.release_claim(proposal_id)
         return json.dumps(
             {
                 "success": False,
@@ -747,28 +800,37 @@ def quant_approve(args: dict, **_kwargs) -> str:
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("quant_approve: PaperReactor failed: %s", exc, exc_info=True)
+        # The reactor raised. We cannot prove a fill did NOT land, so we keep
+        # the safe-money polarity from the ar16 brief: leave the proposal
+        # CLAIMED (approved) rather than re-pend it — re-pending could let a
+        # second approve re-fire on top of a partial/ambiguous first fire
+        # (double-fire). A claimed-but-maybe-unfired proposal that needs
+        # operator attention is the safe direction. The settlement loop
+        # reconciles via signal_id.
         return json.dumps(
             {
                 "success": False,
                 "error": f"react failed: {exc}",
                 "proposal_id": proposal_id,
+                "state": "approved",
             }
         )
 
     # ADR-0077/0079 admissibility: if the reactor refused the short pre-trade
-    # (a 0-fill no-bus record flagged in reactor_metadata), do NOT advance the
-    # proposal to `approved` and do NOT report success — that would mark a
-    # broker-refused order as a successful approval (operator-facing dishonesty,
-    # found in the Wave-S review). Keep the proposal PENDING and surface the
-    # rejection at the top level so the audit trail is truthful. No capital moved.
+    # (a 0-fill no-bus record flagged in reactor_metadata), do NOT report
+    # success — that would mark a broker-refused order as a successful approval
+    # (operator-facing dishonesty, found in the Wave-S review). This is a PROVEN
+    # no-capital refusal (0-fill, no bus record), so roll the ar16 claim back to
+    # `pending` and surface the rejection — the operator may revise or reject.
     _rmeta = getattr(execution, "reactor_metadata", None) or {}
     if _rmeta.get("admissibility_rejected"):
+        store.release_claim(proposal_id)
         return json.dumps(
             {
                 "success": False,
                 "error": "admissibility_rejected",
                 "proposal_id": proposal_id,
-                "state": "pending",  # NOT advanced — operator may revise or reject
+                "state": "pending",  # rolled back — operator may revise or reject
                 "admissibility_state": _rmeta.get("admissibility_state"),
                 "admissibility_reason": _rmeta.get("admissibility_reason"),
                 "requested_fill_size_pct": fill_size_pct,
@@ -825,16 +887,17 @@ def quant_approve(args: dict, **_kwargs) -> str:
     except Exception as _shadow_exc:  # noqa: BLE001 — shadow must never break approve
         logger.warning("quant_approve: shadow hook failed (non-blocking): %s", _shadow_exc)
 
-    # Now advance state machine. If this fails, we have a paper exec on the
-    # bus without a corresponding approved proposal — we surface a warning
-    # and keep going. The settlement loop reconciles via signal_id.
+    # ar16: state already advanced to `approved` by the atomic claim BEFORE the
+    # fire. Now attach the execution record onto the claimed proposal so the
+    # audit trail carries the fill. The state transition is done; this is a
+    # field-only update (no re-gate on state). If it fails, the fill is already
+    # on the bus and the proposal is already approved; the settlement loop
+    # reconciles via signal_id — surface a warning and keep going.
     try:
         from hermes_quant.react.paper import _record_to_dict
 
-        approved = store.approve(
+        approved = store.record_execution(
             proposal_id,
-            approver_user_id=_kwargs.get("user_id"),
-            size_override_pct=size_override,
             execution=_record_to_dict(execution),
         )
     except (ProposalExpiredError, ProposalStateError) as exc:
