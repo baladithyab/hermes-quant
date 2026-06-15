@@ -166,12 +166,23 @@ class AnalystView:
     metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if self.direction not in (-1, 0, 1):
+        # av1: reject ``bool`` explicitly. In Python ``bool`` subclasses ``int``
+        # (``True == 1``, ``False == 0``, ``float(True) == 1.0``), so a bool would
+        # silently pass both the ``not in (-1,0,1)`` direction check and the
+        # ``float(val)`` [0,1] range checks below — slipping into the typed
+        # host-blind contract (Direction int / calibrated float) the core sizer
+        # and gate read. A bool direction even arithmetic-multiplies undetected in
+        # the vote (``v.direction * w * v.confidence``). Guard the bool type first.
+        if isinstance(self.direction, bool) or self.direction not in (-1, 0, 1):
             raise ValueError(
                 f"AnalystView.direction must be one of (-1, 0, 1), got {self.direction!r}"
             )
         for name in ("magnitude", "confidence", "confidence_raw"):
             val = getattr(self, name)
+            if isinstance(val, bool):
+                raise ValueError(
+                    f"AnalystView.{name} must be a real number in [0, 1], got {val!r}"
+                )
             try:
                 f = float(val)
             except (TypeError, ValueError):

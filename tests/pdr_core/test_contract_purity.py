@@ -273,6 +273,87 @@ def test_proposal_rejects_off_ladder_sizes(bad_size: float) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Gate 3 (av1) — AnalystView rejects bool where a Direction int / calibrated
+# float is required. In Python ``bool`` subclasses ``int`` (``True == 1``,
+# ``float(True) == 1.0``), so a bool silently passes ``direction not in
+# (-1,0,1)`` and the ``float(val)`` [0,1] range checks — corrupting the typed
+# host-blind PERCEPTION contract the core sizer/gate reads (aggregate.py votes
+# ``v.direction * w * v.confidence``; a bool arithmetic-multiplies undetected).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [True, False])
+def test_analyst_view_rejects_bool_direction(bad: bool) -> None:
+    """A bool ``direction`` must be rejected even though ``True in (-1,0,1)``."""
+    from hermes_quant.pdr_core.contracts import AnalystView
+
+    with pytest.raises(ValueError):
+        AnalystView(
+            analyst="m",
+            asset="AAPL",
+            asset_class="equity",
+            direction=bad,  # type: ignore[arg-type]
+            magnitude=0.5,
+            confidence=0.7,
+            confidence_raw=0.9,
+            horizon="1d",
+            asof_decision="t",
+            bar_ts="t",
+        )
+
+
+@pytest.mark.parametrize("field_name", ["magnitude", "confidence", "confidence_raw"])
+@pytest.mark.parametrize("bad", [True, False])
+def test_analyst_view_rejects_bool_magnitude_confidence(
+    field_name: str, bad: bool
+) -> None:
+    """A bool magnitude/confidence/confidence_raw must be rejected even though
+    ``float(True) == 1.0`` / ``float(False) == 0.0`` pass the [0,1] range check."""
+    from hermes_quant.pdr_core.contracts import AnalystView
+
+    kwargs = dict(
+        analyst="m",
+        asset="AAPL",
+        asset_class="equity",
+        direction=1,
+        magnitude=0.5,
+        confidence=0.7,
+        confidence_raw=0.9,
+        horizon="1d",
+        asof_decision="t",
+        bar_ts="t",
+    )
+    kwargs[field_name] = bad  # type: ignore[assignment]
+    with pytest.raises(ValueError):
+        AnalystView(**kwargs)  # type: ignore[arg-type]
+
+
+def test_analyst_view_accepts_valid_int_direction_and_float_fields() -> None:
+    """The non-triggering path stays byte-identical: a genuine int direction
+    (-1/0/1) and genuine float magnitude/confidence/confidence_raw construct."""
+    from hermes_quant.pdr_core.contracts import AnalystView
+
+    for direction in (-1, 0, 1):
+        av = AnalystView(
+            analyst="m",
+            asset="AAPL",
+            asset_class="equity",
+            direction=direction,
+            magnitude=0.0,
+            confidence=1.0,
+            confidence_raw=0.5,
+            horizon="1d",
+            asof_decision="t",
+            bar_ts="t",
+        )
+        assert av.direction == direction
+        assert type(av.direction) is int
+        assert av.magnitude == 0.0
+        assert av.confidence == 1.0
+        assert av.confidence_raw == 0.5
+
+
 def test_triad_round_trip_smoke() -> None:
     """Construct each member with realistic args (no exception) — guards the
     happy path so a future over-eager validator can't silently break it."""
