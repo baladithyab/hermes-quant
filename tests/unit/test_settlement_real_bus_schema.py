@@ -333,3 +333,189 @@ def test_realized_returns_by_signal_real_shape():
     trips, _ = join_exit_fills(recs)
     realized = realized_returns_by_signal(trips)
     assert realized == {"sig-1": pytest.approx(0.10)}
+
+
+# ---------------------------------------------------------------------------
+# i0c: the settlement FIFO must agree with the position fold on realized P&L.
+#
+# join_exit_fills' realized P&L is a LIVE money-safety input: it feeds the
+# kill-switch (autonomous.py:296 -> compute_cumulative_realized_pnl_pct ->
+# :445 `_cum_pnl = ...` -> :446 `if _cum_pnl <= -kill_switch_pct: trip`). The
+# position fold (reconstruct_from, under HERMES_QUANT_DELTA_NORMALIZER) feeds
+# the gate NAV. Under the production absolute-target ExecutionRecord schema,
+# fill_size_pct is the ABSOLUTE post-fill target, not a traded delta — a
+# re-affirmation re-stamps the SAME target. The raw FIFO read that field as a
+# delta and double-counted re-affirmations. Under the flag the FIFO runs the
+# SAME FillDeltaNormalizer pre-pass the position fold uses (cs85 single-net),
+# so realized P&L matches the position fold on the same stream.
+# ---------------------------------------------------------------------------
+
+
+class TestI0cFifoMatchesPositionFoldUnderNormalizerFlag:
+    def test_fifo_matches_position_fold_under_normalizer_flag(self, monkeypatch):
+        # Single-lane absolute-target stream: open +0.10 @100, re-affirm +0.10
+        # @105 (NO trade), re-affirm +0.10 @120 (NO trade), flatten to 0.0 @90.
+        # The position fold normalizer yields deltas [+0.10, 0, 0, -0.10] -> ONE
+        # 10%-long round-trip entry@100 -> exit@90 = a -10% realized LOSS. Under
+        # the flag the FIFO must book the SAME single -10% round-trip (the loss
+        # the kill-switch must see), not three phantom buy lots.
+        monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
+        recs = [
+            _bus_rec(proposal_id="t1", fill_size_pct=+0.10, fill_price=100.0,
+                     asof_execution="2026-06-14T01:00:00Z", signal_id="s1"),
+            _bus_rec(proposal_id="t2", fill_size_pct=+0.10, fill_price=105.0,
+                     asof_execution="2026-06-14T02:00:00Z", signal_id="s1"),
+            _bus_rec(proposal_id="t3", fill_size_pct=+0.10, fill_price=120.0,
+                     asof_execution="2026-06-14T03:00:00Z", signal_id="s1"),
+            _bus_rec(proposal_id="t4", fill_size_pct=0.0, fill_price=90.0,
+                     asof_execution="2026-06-14T04:00:00Z", signal_id="s2"),
+        ]
+        trips, open_lots = join_exit_fills(recs)
+        # Exactly ONE round-trip: the re-affirmations folded to delta 0 and were
+        # dropped; the flatten-to-0 became the closing delta.
+        assert len(trips) == 1
+        rt = trips[0]
+        assert rt.side == "buy"
+        assert rt.qty == pytest.approx(0.10)
+        assert rt.entry_price == pytest.approx(100.0)
+        assert rt.exit_price == pytest.approx(90.0)
+        # The -10% loss the position fold books -> the kill-switch input matches.
+        assert rt.realized_return == pytest.approx(-0.10)
+        assert open_lots == {}
+
+    def test_normalizer_off_is_byte_identical(self):
+        # Flag UNSET (production default): the SAME absolute-target re-affirmation
+        # stream is read RAW (fill_size_pct as a delta), so the three +0.10
+        # re-affirmations stack as three open buy lots and the 0.0 flatten is a
+        # zero-size record that is dropped -> 0 round-trips, three stacked lots.
+        # Pins the OFF default path so a future edit cannot silently change it.
+        recs = [
+            _bus_rec(proposal_id="t1", fill_size_pct=+0.10, fill_price=100.0,
+                     asof_execution="2026-06-14T01:00:00Z", signal_id="s1"),
+            _bus_rec(proposal_id="t2", fill_size_pct=+0.10, fill_price=105.0,
+                     asof_execution="2026-06-14T02:00:00Z", signal_id="s1"),
+            _bus_rec(proposal_id="t3", fill_size_pct=+0.10, fill_price=120.0,
+                     asof_execution="2026-06-14T03:00:00Z", signal_id="s1"),
+            _bus_rec(proposal_id="t4", fill_size_pct=0.0, fill_price=90.0,
+                     asof_execution="2026-06-14T04:00:00Z", signal_id="s2"),
+        ]
+        trips, open_lots = join_exit_fills(recs)
+        assert trips == []
+        bucket = ("paper-default", "crypto", "BTC/USDT")
+        assert len(open_lots[bucket]) == 3
+        assert {lot["side"] for lot in open_lots[bucket]} == {"buy"}
+        assert [lot["qty"] for lot in open_lots[bucket]] == pytest.approx([0.10, 0.10, 0.10])
+
+
+# ---------------------------------------------------------------------------
+# 335e: a DEFERRED exit must be able to settle later against a valid earlier
+# opening lot. The e8b9 fix (wave-9) deferred an unmatched exit under a
+# namespaced ("_deferred", *bucket) key instead of fabricating an opposing
+# residual lot — honest, but the deferred exit was only COPIED FORWARD verbatim
+# on subsequent calls and never re-fed into the matching loop, so it could
+# NEVER settle even when a valid opening lot later arrived. The realized P&L
+# permanently OMITTED a legitimately-matchable round-trip, so the kill-switch
+# _cum_pnl undercounted a real loss. The fix DRAINS the deferred queue back
+# into the matching stream so a later valid opener settles it.
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredExitDrainAndSettle:
+    _bucket = ("paper-default", "equity", "AAPL")
+
+    def _defer_call(self):
+        # CALL 1: carry-in a LATE buy@20:00 (lookahead); feed a sell exit@10:00.
+        # The exit cannot honestly close the later buy, so it DEFERS (the
+        # unchanged e8b9 behavior — pinned here).
+        carry = {
+            self._bucket: [
+                {"asset": "AAPL", "account_id": "paper-default",
+                 "asset_class": "equity", "side": "buy", "qty": 10.0,
+                 "price": 100.0,
+                 "asof": pd.Timestamp("2026-06-14T20:00:00Z"),
+                 "exec_id": "late-buy", "signal_id": "sig-buy",
+                 "fee_per_unit": 0.0},
+            ]
+        }
+        exit_rec = _bus_rec(
+            proposal_id="exit-1", fill_size_pct=-10.0, fill_price=110.0,
+            asof_execution="2026-06-14T10:00:00Z",
+            asset="AAPL", asset_class="equity", account_id="paper-default",
+            signal_id="sig-exit",
+        )
+        trips1, open1 = join_exit_fills([exit_rec], open_lots=carry)
+        assert trips1 == []  # deferred, not settled
+        deferred_key = ("_deferred", *self._bucket)
+        assert deferred_key in open1
+        assert open1[deferred_key][0]["side"] == "sell"
+        assert open1[deferred_key][0]["qty"] == pytest.approx(10.0)
+        return open1
+
+    def test_deferred_exit_settles_against_later_valid_opening_lot(self):
+        open1 = self._defer_call()
+        # CALL 2: a VALID buy@100 at t=05:00 arrives — EARLIER than the deferred
+        # sell@t=10:00, so it can honestly open and the deferred sell settles
+        # against it. (Carry-in still also holds the late buy@t=20:00.)
+        valid_buy = _bus_rec(
+            proposal_id="early-buy", fill_size_pct=10.0, fill_price=100.0,
+            asof_execution="2026-06-14T05:00:00Z",
+            asset="AAPL", asset_class="equity", account_id="paper-default",
+            signal_id="sig-early-buy",
+        )
+        trips2, open2 = join_exit_fills([valid_buy], open_lots=open1)
+        # The deferred round-trip is now REALIZED — the kill-switch sees it.
+        assert len(trips2) == 1
+        rt = trips2[0]
+        assert rt.side == "buy"
+        assert rt.entry_price == pytest.approx(100.0)
+        assert rt.exit_price == pytest.approx(110.0)
+        assert rt.realized_return == pytest.approx(0.10)
+        assert rt.entry_signal_id == "sig-early-buy"
+        assert rt.exit_signal_id == "sig-exit"
+        # The deferred bucket is DRAINED (no double-count, no lingering exit).
+        deferred_key = ("_deferred", *self._bucket)
+        assert deferred_key not in open2
+        # The late buy@t=20:00 still cannot honestly match a t=05/t=10 stream;
+        # it stays OPEN, exactly one direction in the real bucket.
+        assert open2[self._bucket][0]["side"] == "buy"
+        assert open2[self._bucket][0]["qty"] == pytest.approx(10.0)
+        assert {lot["side"] for lot in open2[self._bucket]} == {"buy"}
+
+    def test_deferred_exit_redefers_when_no_honest_opener(self):
+        open1 = self._defer_call()
+        # CALL 2: a buy@t=15:00 arrives — LATER than the deferred sell@t=10:00,
+        # so it STILL cannot honestly close the sell. The drain must RE-DEFER
+        # the sell (not lose it, not fabricate a return). Idempotent + honest.
+        late_buy = _bus_rec(
+            proposal_id="still-late-buy", fill_size_pct=10.0, fill_price=100.0,
+            asof_execution="2026-06-14T15:00:00Z",
+            asset="AAPL", asset_class="equity", account_id="paper-default",
+            signal_id="sig-still-late",
+        )
+        trips2, open2 = join_exit_fills([late_buy], open_lots=open1)
+        assert trips2 == []  # nothing honestly settles
+        deferred_key = ("_deferred", *self._bucket)
+        # The sell is RE-DEFERRED — still present, still pending, exactly once.
+        assert deferred_key in open2
+        assert open2[deferred_key][0]["side"] == "sell"
+        assert open2[deferred_key][0]["qty"] == pytest.approx(10.0)
+
+    def test_drain_and_normalizer_flag_coexist(self, monkeypatch):
+        # Interaction: with the i0c normalizer flag ON, the 335e drain still
+        # works. The re-fed deferred records carry EXPLICIT side/qty, so the
+        # normalizer pre-pass (which overrides fill_size_pct on this call's
+        # records) does not perturb them. The deferred sell still settles
+        # against the valid earlier buy.
+        monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
+        open1 = self._defer_call()
+        valid_buy = _bus_rec(
+            proposal_id="early-buy", fill_size_pct=10.0, fill_price=100.0,
+            asof_execution="2026-06-14T05:00:00Z",
+            asset="AAPL", asset_class="equity", account_id="paper-default",
+            signal_id="sig-early-buy",
+        )
+        trips2, open2 = join_exit_fills([valid_buy], open_lots=open1)
+        assert len(trips2) == 1
+        assert trips2[0].realized_return == pytest.approx(0.10)
+        deferred_key = ("_deferred", *self._bucket)
+        assert deferred_key not in open2

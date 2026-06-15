@@ -51,6 +51,7 @@ return.
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -639,16 +640,101 @@ def join_exit_fills(
             Quantity still in open_lots has realized_return = None semantics
             (it is simply absent from round_trips — never a fabricated 0).
     """
+    # Materialize the read-only input once (it may be a one-shot iterable).
+    raw_records = list(execution_records)
+
+    # i0c (ADR-0091 Option E, flag-gated): the production ExecutionRecord schema
+    # writes `fill_size_pct` as the ABSOLUTE post-fill target, but this FIFO reads
+    # it as a traded DELTA. Under HERMES_QUANT_DELTA_NORMALIZER==1 we run the ONE
+    # shared FillDeltaNormalizer as a pre-pass so the FIFO sees the true increment
+    # (re-affirm -> delta 0 -> skipped; flatten-to-0 -> the negative close delta),
+    # exactly mirroring the position fold (portfolio_state.py:621-633,662). Flag
+    # OFF (production default) => no pre-pass => the FIFO reads the raw field =>
+    # byte-identical to legacy. The normalizer's carry-forward delta = target -
+    # running_net is ORDER-DEPENDENT, so it must see records in asof order: we
+    # stable-sort a COPY by asof_execution (mirror portfolio_state.py:633) and
+    # override `fill_size_pct` on a SHALLOW COPY of each record (records are
+    # read-only per the docstring) BEFORE _normalize_exec_record runs.
+    if os.environ.get("HERMES_QUANT_DELTA_NORMALIZER", "0") == "1":
+        from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
+
+        _normalizer = FillDeltaNormalizer()
+        _ordered_for_norm = sorted(
+            raw_records, key=lambda r: r.get("asof_execution") or ""
+        )
+        normalized_records: list[dict] = []
+        for rec in _ordered_for_norm:
+            rec_copy = dict(rec)
+            rec_copy["fill_size_pct"] = _normalizer.delta_for(rec)
+            normalized_records.append(rec_copy)
+        raw_records = normalized_records
+
     # bucket_key -> list of open lots (FIFO; each lot is a mutable dict).
     lots: dict[tuple, list[dict]] = {}
+    # 335e: lots (deferred exits AND the real position lots that share a bucket
+    # with a deferred exit) re-expressed as records and re-fed into THIS call's
+    # matching stream. A deferred exit was previously copied forward verbatim and
+    # NEVER re-matched, so it could never settle even when a valid earlier opening
+    # lot arrived later. Re-feeding both the deferred exit and its bucket's real
+    # lots through the asof-sorted matcher lets the earlier opener settle the
+    # deferred exit; a deferred exit still without an honest opener RE-DEFERS.
+    redrain_records: list[dict] = []
+    # Which real buckets must be re-fed as records (because a deferred exit shares
+    # them) instead of pre-loaded into the FIFO queue — pre-loading would pin the
+    # carry-in lots at the FRONT of the FIFO and block an earlier-arriving opener.
+    deferred_real_buckets: set[tuple] = set()
+    if open_lots:
+        for k in open_lots:
+            if k and k[0] == "_deferred":
+                deferred_real_buckets.add(tuple(k[1:]))
+
     if open_lots:
         # Deep-ish copy so we never mutate the caller's carry-in structure.
         # Review-team-3 defect (4): re-coerce each carried-in lot's asof to UTC
         # tz-aware so a naive carry-in value (from an older record) never mixes
         # with this call's tz-aware exit asof at the asof-honesty comparison.
-        # Namespaced ("_deferred", ...) keys carry still-pending deferred exits
-        # forward verbatim — they are not position lots and are not re-matched.
         for k, v in open_lots.items():
+            is_deferred = bool(k) and k[0] == "_deferred"
+            real_bucket = tuple(k[1:]) if is_deferred else tuple(k)
+            if is_deferred or real_bucket in deferred_real_buckets:
+                # 335e: re-express each lot (deferred exit, OR a real position lot
+                # in a bucket that ALSO has a deferred exit) as a signed record so
+                # it rejoins the asof-sorted matching loop below. Side -> sign:
+                # buy -> +qty (opener), sell -> -qty (exit). The lot keeps its
+                # original asof, so the global re-sort orders the now-earlier
+                # opener before the deferred exit and the round-trip settles.
+                for lot in v:
+                    side = lot.get("side")
+                    qty = abs(float(lot.get("qty", 0.0)))
+                    if qty <= 0.0:
+                        continue
+                    signed = -qty if side == "sell" else qty
+                    asof = lot.get("asof")
+                    fee_per_unit = lot.get("fee_per_unit", 0.0) or 0.0
+                    redrain_records.append(
+                        {
+                            "asset": lot.get("asset"),
+                            "asset_class": lot.get("asset_class"),
+                            "account_id": lot.get("account_id"),
+                            "fill_size_pct": signed,
+                            "fill_price": lot.get("price"),
+                            "asof": asof,
+                            "asof_execution": asof,
+                            "exec_id": lot.get("exec_id"),
+                            "proposal_id": lot.get("exec_id"),
+                            "signal_id": lot.get("signal_id"),
+                            "fees": fee_per_unit * qty,
+                            # A re-drained DEFERRED EXIT must never OPEN a fresh
+                            # position lot — it was a closing intent. If the asof-
+                            # sorted matcher gives it no honest earlier opener to
+                            # close (empty / same-direction queue), it must RE-DEFER,
+                            # not become a phantom opener (which would invent a
+                            # lookahead round-trip). A re-fed REAL position lot has
+                            # no such tag — it is a genuine opener and opens freely.
+                            "_is_deferred_exit": is_deferred,
+                        }
+                    )
+                continue
             copied = []
             for lot in v:
                 lot_copy = dict(lot)
@@ -664,11 +750,31 @@ def join_exit_fills(
     # key on a real fill. The adapter derives them; non-fills return None and
     # are dropped (never fabricated). It also stamps the positional bus index
     # so defect (2)'s deterministic, open-before-close tie-break holds.
+    #
+    # 335e: the re-drained carry-in lots (deferred exits + their bucket's real
+    # lots, re-expressed as records above) are merged with this call's new records
+    # into ONE stream, then re-sorted by the asof-honest key. Each re-drained lot
+    # keeps its original asof, so a NEW opening lot whose asof is earlier than a
+    # deferred exit sorts first and the deferred exit settles against it; the
+    # existing matching loop, defer branch, and one-direction invariant are all
+    # unchanged. When there are no deferred buckets, redrain_records is empty and
+    # this is byte-identical to the legacy carry-in-pre-loaded path.
     indexed = []
-    for i, rec in enumerate(execution_records):
-        norm = _normalize_exec_record({**rec, "_idx": i})
+    next_idx = 0
+    for rec in redrain_records:
+        norm = _normalize_exec_record({**rec, "_idx": next_idx})
+        if norm is not None:
+            # _normalize_exec_record returns a fresh canonical dict and drops
+            # unknown keys; carry the deferred-exit marker forward so the matching
+            # loop can re-defer (not open) an unmatched deferred exit.
+            norm["_is_deferred_exit"] = bool(rec.get("_is_deferred_exit"))
+            indexed.append(norm)
+        next_idx += 1
+    for rec in raw_records:
+        norm = _normalize_exec_record({**rec, "_idx": next_idx})
         if norm is not None:
             indexed.append(norm)
+        next_idx += 1
     ordered = sorted(indexed, key=_exec_sort_key)
 
     round_trips: list[SettledRoundTrip] = []
@@ -704,6 +810,29 @@ def join_exit_fills(
         fee_per_unit = (fees / qty) if qty > 0 else 0.0
 
         if queue_side is None or queue_side == side:
+            # 335e: a re-drained DEFERRED EXIT that reaches the opening branch has
+            # no honest opposing opener earlier in the asof-sorted stream (the
+            # queue is empty or holds its OWN direction). It must NOT open a fresh
+            # position lot — that would invent a phantom opener (a lookahead round-
+            # trip when a later opener closes it). RE-DEFER it idempotently: hold
+            # it still-pending under the namespaced bucket exactly as the original
+            # deferral did, so the next incremental call can retry it.
+            if rec.get("_is_deferred_exit"):
+                deferred.setdefault(bucket, []).append(
+                    {
+                        "asset": rec.get("asset"),
+                        "account_id": rec.get("account_id"),
+                        "asset_class": rec.get("asset_class"),
+                        "side": side,
+                        "qty": qty,
+                        "price": fill_price,
+                        "asof": asof,
+                        "exec_id": rec.get("exec_id"),
+                        "signal_id": rec.get("signal_id"),
+                        "fee_per_unit": fee_per_unit,
+                    }
+                )
+                continue
             # Opening or adding to a same-direction lot — just enqueue.
             queue.append(
                 {
