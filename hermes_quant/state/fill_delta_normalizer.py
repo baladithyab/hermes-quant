@@ -24,13 +24,26 @@ state — it does NOT reuse state.db's running-net nor the settlement FIFO's lot
 Both consumers (the state.db rebuild/incremental fold and the settlement FIFO pre-pass)
 call THIS, so they cannot diverge into the two-views failure mode.
 
-Scope note (cr00): the carry-forward is computed in the *unit of whichever size field
-the record uses* — NAV-fraction for the ``fill_size_pct`` lane, true shares for the
-``reactor_metadata.quantity`` lane. A single ``(account, asset_class, asset)`` bucket
-that receives BOTH unit regimes (e.g. det-equity true-shares and paper NAV-fraction on
-the same symbol/account) cannot be reconciled here without a read-time mark-injection
-seam (qty×mark/equity); that unit-unification is the cr00 follow-up and is out of this
-module's scope. Within a single unit regime the carry-forward is exact.
+Scope note (cr00, cs85): the carry-forward keeps ONE running net per
+``(account, asset_class, asset)`` bucket — the SAME single number the incremental
+fold persists in ``positions.quantity`` (portfolio_state.py:960) and advances by
+``new_qty = old_qty + pos_delta`` (:985) for every fill, regardless of lane. The
+size is read in the unit of whichever field the record uses (NAV-fraction for the
+``fill_size_pct`` lane, true shares for the ``reactor_metadata.quantity`` lane), and
+that unit is carried IN the size value, not in a separate per-lane accumulator. This
+is what makes the rebuild and incremental folds AGREE on a mixed-lane bucket (cs85):
+both difference an absolute target against the same accumulated net.
+
+Within a single unit regime — the only production case today (the autonomous-tick
+PaperReactor is pure NAV-fraction; the det-equity lane is pure true-shares within its
+bucket) — the carry-forward is exact AND dimensionally correct. A single bucket that
+receives BOTH unit regimes (det-equity true-shares and paper NAV-fraction on the same
+symbol/account) is folded UNIT-AGNOSTICALLY here, matching the incremental column's
+existing unit-mixing so the two folds stay consistent; making that single net
+dimensionally correct (a read-time mark-injection seam, qty×mark/equity) is the cr00
+unit-unification follow-up and is out of this module's scope. Forcing that conversion
+HERE would re-diverge the rebuild from the canonical incremental column, so cs85
+delivers fold-CONSISTENCY and defers unit-CORRECTNESS to cr00.
 """
 
 from __future__ import annotations
@@ -176,27 +189,28 @@ class FillDeltaNormalizer:
     the fold's canonical order. The instance carries the per-bucket running net;
     do not share one instance across two independently-ordered passes.
 
-    Two parallel running-net maps are kept because the two size lanes are in
-    different units and must never be mixed in one accumulator:
-      - ``_net_pct``  for the ``fill_size_pct`` (NAV-fraction) lane;
-      - ``_net_qty``  for the ``reactor_metadata.quantity`` (true-shares) lane.
-    A record uses exactly one lane (quantity if present, else fill_size_pct),
-    matching the existing fold's ``pos_delta = leg_quantity if not None else
-    fill_size_pct`` selection.
+    ONE running net is kept per ``(account, asset_class, asset)`` bucket (cs85),
+    matching the incremental fold's SINGLE persisted ``positions.quantity`` column
+    (portfolio_state.py:960), which is advanced by ``new_qty = old_qty + pos_delta``
+    (:985) for EVERY fill regardless of lane. The lane unit (NAV-fraction for the
+    ``fill_size_pct`` lane, true shares for the ``reactor_metadata.quantity`` lane)
+    is carried IN the size value itself — not in a separate per-lane accumulator.
+
+    cs85 fold-consistency: the rebuild previously kept TWO parallel maps selected
+    per-record by lane, so a bucket that mixed a qty-lane fill and a later pct-lane
+    fill differenced the pct fill against a STALE pct-net of 0 (the qty fill never
+    advanced it) — diverging from the incremental single column, which advances on
+    every fill. Collapsing to one net makes the rebuild difference against the same
+    accumulated base the incremental column carries, so both folds agree on the same
+    record stream. (This commits the same unit-mixing the incremental column already
+    commits today; the dimensional unit-unification — a read-time qty×mark/equity
+    mark-injection seam — is the pre-existing cr00 follow-up dependency, see the
+    module Scope note, and is deliberately NOT forced here: it would re-diverge the
+    rebuild from the canonical incremental column.)
     """
 
     def __init__(self) -> None:
-        self._net_pct: dict[_BucketKey, float] = {}
-        self._net_qty: dict[_BucketKey, float] = {}
-
-    @staticmethod
-    def _quantity_of(rec: dict[str, Any]) -> float | None:
-        rmeta = rec.get("reactor_metadata") or {}
-        if isinstance(rmeta, dict):
-            q = rmeta.get("quantity")
-            if q is not None:
-                return _coerce_size(q, "reactor_metadata.quantity")
-        return None
+        self._net: dict[_BucketKey, float] = {}
 
     def delta_for(self, rec: dict[str, Any]) -> float:
         """Return the traded delta to fold for this record, in the record's own
@@ -212,13 +226,11 @@ class FillDeltaNormalizer:
         """
         key = _bucket(rec)
         try:
-            qty = self._quantity_of(rec)
-            # Lane selection mirrors the existing fold: quantity wins when present.
-            net_map = self._net_qty if qty is not None else self._net_pct
-            absolute = (
-                qty if qty is not None
-                else _coerce_size(rec.get("fill_size_pct", 0.0), "fill_size_pct")
-            )
+            # cs85: ONE net per bucket. The size is read in the record's own lane
+            # unit (quantity if present, else fill_size_pct — the SAME selection the
+            # incremental fold's leg_quantity/fill_size_pct does at portfolio_state.py
+            # :980-983); the unit is carried in the value, not in a separate map.
+            absolute = _absolute_size_of(rec)
         except _PoisonedSizeError as exc:
             # cs84: ABSTAIN on a poisoned raw size (NaN/inf/bool/non-numeric) — skip this
             # ONE record, return a 0.0 delta (a no-op in every downstream fold), and do
@@ -247,16 +259,18 @@ class FillDeltaNormalizer:
             # Advancing by the delta keeps the carry-forward base byte-identical to the
             # persisted qty in both folds. (running_net += delta is the in-memory mirror
             # of new_qty = old_qty + delta.) DORMANT today: no producer emits a non-
-            # absolute-target schema_version, so net_map only ever sees absolute targets
+            # absolute-target schema_version, so the net only ever sees absolute targets
             # and this branch is unreachable in production — an all-absolute-target bucket
             # is byte-identical because it never enters here.
-            delta = delta_from_net(rec, net_map.get(key, 0.0))
-            net_map[key] = net_map.get(key, 0.0) + delta
+            delta = delta_from_net(rec, self._net.get(key, 0.0))
+            self._net[key] = self._net.get(key, 0.0) + delta
             return delta
 
-        # Absolute-target: derive via the ONE shared derivation, then advance the
-        # in-memory running net to the target for the next record in this bucket.
-        running = net_map.get(key, 0.0)
+        # Absolute-target: derive via the ONE shared derivation against the single
+        # per-bucket net (cs85), then advance that net to the target for the next
+        # record in this bucket — exactly mirroring the incremental fold's single
+        # positions.quantity column (portfolio_state.py:960/979/985).
+        running = self._net.get(key, 0.0)
         delta = delta_from_net(rec, running)
-        net_map[key] = absolute
+        self._net[key] = absolute
         return delta

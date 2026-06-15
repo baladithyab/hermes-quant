@@ -23,7 +23,7 @@ import math
 import pytest
 
 from hermes_quant.react.base import SCHEMA_ABSOLUTE_TARGET
-from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
+from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer, delta_from_net
 
 
 def _r(asset="AAPL", acct="paper-default", ac="equity", *, fill_size_pct=None, quantity=None,
@@ -244,3 +244,69 @@ def test_cs84_valid_numeric_stream_is_byte_identical():
     m = FillDeltaNormalizer()
     assert m.delta_for(_r(asset="MSFT", quantity=33.33)) == 33.33
     assert abs(m.delta_for(_r(asset="MSFT", quantity=33.33))) < 1e-12
+
+
+# ── cs85: the two folds must share ONE running-net per bucket. The rebuild kept TWO
+# parallel maps (_net_pct + _net_qty) selected per-record by lane, so a bucket that
+# mixed a qty-lane fill and a later pct-lane fill differenced the pct fill against a
+# STALE _net_pct=0 (the qty fill never advanced it) — diverging from the incremental
+# fold, whose single persisted positions.quantity column (portfolio_state.py:960) is
+# advanced by EVERY delta regardless of lane. Collapse the two maps into one net so
+# both folds carry the same base. (Fold-CONSISTENCY only; the qty/pct unit-mixing in
+# that single column is the pre-existing cr00 unit-unification dependency, out of scope.)
+# ────────────────────────────────────────────────────────────────────────────────────
+
+
+def test_cs85_mixed_lane_bucket_folds_to_one_net():
+    """RED before the fix: one bucket (paper-default, equity, AAPL) receives a qty-lane
+    absolute target (quantity=10.0) then a pct-lane absolute target (fill_size_pct=0.05).
+    The rebuild's two-map normalizer differences the pct fill against _net_pct=0 -> 0.05,
+    but the incremental fold's single column (already advanced to 10.0 by the qty fill)
+    differences it against 10.0 -> -9.95. GREEN: the one-net collapse makes the rebuild
+    delta_for stream EQUAL the incremental single-column delta_from_net stream.
+    """
+    fill_a = _r(asset="AAPL", quantity=10.0)        # qty-lane absolute target = 10 shares
+    fill_b = _r(asset="AAPL", fill_size_pct=0.05)   # pct-lane absolute target = 0.05 NAV-frac
+
+    # Rebuild fold (the in-memory running-net normalizer).
+    n = FillDeltaNormalizer()
+    reb = [n.delta_for(fill_a), n.delta_for(fill_b)]
+
+    # Incremental fold (single persisted column): old_qty starts 0 and advances by each
+    # fold delta, exactly as apply_execution's new_qty = old_qty + pos_delta does
+    # (portfolio_state.py:960/979/985). delta_from_net is the SAME shared derivation.
+    net = 0.0
+    inc = []
+    for rec in (fill_a, fill_b):
+        d = delta_from_net(rec, net)
+        inc.append(d)
+        net += d
+
+    # The gate: the rebuild delta stream equals the incremental single-column stream.
+    assert reb == pytest.approx(inc), (
+        f"cs85 fold divergence: rebuild {reb} != incremental {inc}"
+    )
+    # And the rebuild's accumulated net (sum of its deltas, = the single positions
+    # column the rebuild writes) equals the incremental's accumulated net.
+    assert sum(reb) == pytest.approx(net)
+
+
+def test_cs85_single_lane_pct_byte_identical():
+    """The pure-pct production stream (autonomous-tick PaperReactor) must be BYTE-
+    IDENTICAL to the captured two-map baseline [0.05, 0.0, 0.03]: open 0.05, re-affirm
+    0.05 (-> 0), change to 0.08 (-> +0.03)."""
+    n = FillDeltaNormalizer()
+    deltas = [n.delta_for(_r(asset="AAPL", fill_size_pct=p)) for p in (0.05, 0.05, 0.08)]
+    assert deltas[0] == pytest.approx(0.05)
+    assert deltas[1] == pytest.approx(0.0)
+    assert deltas[2] == pytest.approx(0.03)
+
+
+def test_cs85_single_lane_qty_byte_identical():
+    """The pure-qty production stream (det-equity true-shares) must be BYTE-IDENTICAL
+    to the captured two-map baseline [33.33, 0.0, 16.67]."""
+    n = FillDeltaNormalizer()
+    deltas = [n.delta_for(_r(asset="AAPL", quantity=q)) for q in (33.33, 33.33, 50.0)]
+    assert deltas[0] == pytest.approx(33.33)
+    assert deltas[1] == pytest.approx(0.0)
+    assert deltas[2] == pytest.approx(16.67)
