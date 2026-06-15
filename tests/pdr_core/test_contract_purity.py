@@ -430,6 +430,175 @@ def test_proposal_and_fill_accept_valid_floats_byte_identical() -> None:
     assert fill.fill_size_pct == 0.0
 
 
+# ---------------------------------------------------------------------------
+# Gate 3c (cs83) — the NON-bool off-type hole, sibling of cs82. The fields are
+# declared ``float`` but the FROZEN dataclass STORES the constructor arg
+# unchanged: ``_on_ladder``/av1 only validate a LOCAL ``float(value)`` copy and
+# discard it, and ``math.isfinite(Decimal(..))`` is True. So a str/Decimal/numpy
+# value that coerces onto a rung / into [0,1] is stored RAW, off-type — a str
+# then crashes the money path (``< 0`` -> TypeError, ``* nav`` -> sequence
+# multiply) and Decimal/numpy is a silent type mismatch. Reject the type (the
+# only in-core producer, quarter_kelly_size, returns a genuine python float).
+# ---------------------------------------------------------------------------
+
+
+def _bad_offtype_values():
+    """str / Decimal / np.float32 values that coerce onto a rung but are NOT a
+    genuine int|float — each must be rejected at construction.
+
+    NOTE ``np.float64`` is deliberately NOT here: ``issubclass(np.float64, float)``
+    is True, so it IS a float (arithmetic and comparisons behave exactly like a
+    python float, no money-path crash) and passes the ``(int, float)`` guard.
+    ``np.float32`` is NOT a float subclass, so it is genuinely off-type."""
+    from decimal import Decimal
+
+    vals = ["0.05", Decimal("0.05")]
+    try:
+        import numpy as np  # noqa: PLC0415
+
+        vals.append(np.float32(0.05))
+    except Exception:  # noqa: BLE001 - numpy optional in the test env
+        pass
+    return vals
+
+
+@pytest.mark.parametrize("bad", _bad_offtype_values())
+def test_proposal_rejects_non_float_target_position_pct(bad) -> None:
+    """A str/Decimal/numpy ``target_position_pct`` that coerces onto rung 0.05
+    must be rejected — TODAY it is stored RAW (str ``'0.05'``) and crashes the
+    money path (``p.target_position_pct * nav`` sequence-multiplies the str)."""
+    from hermes_quant.pdr_core.contracts import Proposal
+
+    with pytest.raises(ValueError):
+        Proposal(
+            symbol="AAPL",
+            asset_class="equity",
+            target_position_pct=bad,  # type: ignore[arg-type]
+            gate_reason="x",
+            asof="t",
+        )
+
+
+@pytest.mark.parametrize("field_name", ["fill_price", "fill_size_pct"])
+@pytest.mark.parametrize("bad", _bad_offtype_values())
+def test_fill_rejects_non_float_price_and_size(field_name: str, bad) -> None:
+    """A str/Decimal/numpy ``fill_price``/``fill_size_pct`` must be rejected.
+    ``math.isfinite(Decimal(..))`` is True, so a Decimal/numpy value would be
+    stored RAW into the cash basis / FillDeltaNormalizer.running_net off-type."""
+    from hermes_quant.pdr_core.contracts import Fill
+
+    kwargs = dict(
+        proposal_id="prop_123",
+        asset="AAPL",
+        asset_class="equity",
+        fill_price=212.34,
+        fill_size_pct=0.10,
+        asof_execution="t",
+    )
+    kwargs[field_name] = bad  # type: ignore[assignment]
+    with pytest.raises(ValueError):
+        Fill(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field_name", ["magnitude", "confidence", "confidence_raw"])
+@pytest.mark.parametrize("bad", ["0.5"] + _bad_offtype_values())
+def test_analyst_view_rejects_non_float_magnitude_confidence(
+    field_name: str, bad
+) -> None:
+    """A str/Decimal/numpy magnitude/confidence/confidence_raw must be rejected —
+    av1's ``float(val)`` validates a discarded local copy, so a str ``'0.5'``
+    would be stored RAW and break aggregate.py's ``v.* w`` vote arithmetic."""
+    from hermes_quant.pdr_core.contracts import AnalystView
+
+    kwargs = dict(
+        analyst="m",
+        asset="AAPL",
+        asset_class="equity",
+        direction=1,
+        magnitude=0.5,
+        confidence=0.7,
+        confidence_raw=0.9,
+        horizon="1d",
+        asof_decision="t",
+        bar_ts="t",
+    )
+    kwargs[field_name] = bad  # type: ignore[assignment]
+    with pytest.raises(ValueError):
+        AnalystView(**kwargs)  # type: ignore[arg-type]
+
+
+def test_triad_accepts_genuine_float_and_int_byte_identical() -> None:
+    """The non-triggering path stays byte-identical: a genuine python float
+    rung and a genuine int rung (0) construct and store unchanged (the guard
+    rejects only off-TYPES, never a real number)."""
+    from hermes_quant.pdr_core.contracts import AnalystView, Fill, Proposal
+
+    # genuine float rung stores byte-identical
+    prop = _make_proposal(target_position_pct=0.05)
+    assert prop.target_position_pct == 0.05
+    assert type(prop.target_position_pct) is float
+
+    # genuine int 0 rung (on-ladder, not bool False) is accepted and kept int
+    prop0 = Proposal(
+        symbol="AAPL",
+        asset_class="equity",
+        target_position_pct=0,
+        gate_reason="flat",
+        asof="t",
+    )
+    assert prop0.target_position_pct == 0
+    assert type(prop0.target_position_pct) is int
+
+    fill = _make_fill()
+    assert fill.fill_price == 212.34
+    assert type(fill.fill_price) is float
+    assert type(fill.fill_size_pct) is float
+
+    # genuine int fill_price (e.g. $1) stays int; genuine int 0 size target ok
+    fill_int = Fill(
+        proposal_id="p",
+        asset="AAPL",
+        asset_class="equity",
+        fill_price=1,
+        fill_size_pct=0,
+        asof_execution="t",
+    )
+    assert fill_int.fill_price == 1
+    assert type(fill_int.fill_price) is int
+    assert fill_int.fill_size_pct == 0
+
+    # np.float64 IS a float subclass -> a legitimate passthrough (no crash,
+    # arithmetic/comparisons behave as float); it must be ACCEPTED, not rejected.
+    try:
+        import numpy as np  # noqa: PLC0415
+
+        prop_np = _make_proposal(target_position_pct=np.float64(0.05))
+        assert prop_np.target_position_pct == 0.05
+        assert isinstance(prop_np.target_position_pct, float)
+    except ImportError:
+        pass
+
+    av = _make_analyst_view()
+    assert type(av.magnitude) is float
+    assert type(av.confidence) is float
+    assert type(av.confidence_raw) is float
+    # genuine int confidence rung (0 / 1) is accepted and kept int
+    av_int = AnalystView(
+        analyst="m",
+        asset="AAPL",
+        asset_class="equity",
+        direction=1,
+        magnitude=1,
+        confidence=0,
+        confidence_raw=1,
+        horizon="1d",
+        asof_decision="t",
+        bar_ts="t",
+    )
+    assert av_int.magnitude == 1
+    assert type(av_int.magnitude) is int
+
+
 def test_triad_round_trip_smoke() -> None:
     """Construct each member with realistic args (no exception) — guards the
     happy path so a future over-eager validator can't silently break it."""

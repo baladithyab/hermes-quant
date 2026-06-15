@@ -183,6 +183,20 @@ class AnalystView:
                 raise ValueError(
                     f"AnalystView.{name} must be a real number in [0, 1], got {val!r}"
                 )
+            # cs83: reject any non-(int|float) type, BEFORE the float() coercion
+            # below. av1's ``float(val)`` validates a LOCAL copy then DISCARDS it,
+            # so a str/Decimal/numpy value that coerces into [0, 1] is STORED RAW
+            # on the frozen dataclass, off-type vs the declared float contract. A
+            # str confidence/magnitude then breaks the perception-fusion path
+            # (aggregate.py ``v.direction * w * v.confidence`` / ``v.magnitude * w``
+            # -> sequence-multiply / TypeError). (``bool`` is an ``int`` subclass;
+            # the bool guard above runs first so ``(int, float)`` won't re-admit it.)
+            if not isinstance(val, (int, float)):
+                raise ValueError(
+                    f"AnalystView.{name} must be a real number (int|float) in "
+                    f"[0, 1], got {type(val).__name__} {val!r} (a str/Decimal/numpy "
+                    "value is stored off-type and breaks the vote-fusion path)."
+                )
             try:
                 f = float(val)
             except (TypeError, ValueError):
@@ -235,6 +249,25 @@ class Proposal:
                 "Proposal.target_position_pct must be a real number on the "
                 f"discrete ladder, got bool {self.target_position_pct!r} "
                 "(a bool snaps to a ladder rung and corrupts the sized decision)."
+            )
+        # cs83: reject any non-(int|float) type, BEFORE the ladder check. The
+        # field is declared ``float`` but the FROZEN dataclass STORES the
+        # constructor argument unchanged, and ``_on_ladder`` only validates a
+        # local ``float(value)`` copy (line ~113) — so a str/Decimal/numpy value
+        # that happens to coerce onto a rung is STORED RAW, off-type. A str then
+        # crashes the money path (``p.target_position_pct < 0`` -> TypeError;
+        # ``p.target_position_pct * nav`` -> str sequence-multiply garbage); a
+        # Decimal/numpy is a silent type mismatch against the declared float
+        # contract. The sole in-core producer (quarter_kelly_size) returns a
+        # genuine python float, so reject (strict typed contract) rather than
+        # coerce. (``bool`` is an ``int`` subclass, so the bool guard MUST run
+        # first — it does — or ``(int, float)`` would re-admit it.)
+        if not isinstance(self.target_position_pct, (int, float)):
+            raise ValueError(
+                "Proposal.target_position_pct must be a real number (int|float) "
+                f"on the discrete ladder, got {type(self.target_position_pct).__name__} "
+                f"{self.target_position_pct!r} (a str/Decimal/numpy value is stored "
+                "off-type and breaks NAV sizing)."
             )
         if not _on_ladder(self.target_position_pct):
             raise ValueError(
@@ -292,11 +325,29 @@ class Fill:
         # in FillDeltaNormalizer.running_net as an absolute target. Mirror av1's
         # AnalystView guard: reject the bool type at the boundary first.
         for _name in ("fill_price", "fill_size_pct"):
-            if isinstance(getattr(self, _name), bool):
+            _val = getattr(self, _name)
+            if isinstance(_val, bool):
                 raise ValueError(
                     f"Fill.{_name} must be a real number, got bool "
-                    f"{getattr(self, _name)!r} (a bool slips through the "
+                    f"{_val!r} (a bool slips through the "
                     "isfinite/>0 checks and corrupts the cash basis / running_net)."
+                )
+            # cs83: reject any non-(int|float) type, BEFORE the isfinite/>0
+            # checks. The field is declared ``float`` but the FROZEN dataclass
+            # STORES the constructor argument unchanged. A str is already
+            # rejected here only by accident (``math.isfinite('1.5')`` raises);
+            # make that explicit and also catch the SILENT cases —
+            # ``math.isfinite(Decimal('1.5'))`` is True and numpy floats pass, so
+            # a Decimal/numpy value is STORED RAW into the cash basis /
+            # FillDeltaNormalizer.running_net, off-type vs the declared float
+            # contract. The shell pushes back a genuine float, so reject (strict
+            # typed contract). (``bool`` is an ``int`` subclass; the bool guard
+            # above runs first so ``(int, float)`` does not re-admit it.)
+            if not isinstance(_val, (int, float)):
+                raise ValueError(
+                    f"Fill.{_name} must be a real number (int|float), got "
+                    f"{type(_val).__name__} {_val!r} (a str/Decimal/numpy value "
+                    "is stored off-type and corrupts the cash basis / running_net)."
                 )
         if not math.isfinite(self.fill_size_pct):
             raise ValueError(
