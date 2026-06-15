@@ -602,90 +602,93 @@ class PortfolioState:
         """
         result = ReconstructionResult()
 
-        # ── 1. Read all records ──────────────────────────────────────────
-        records = _read_all_jsonl(executions_path)
-
-        # ── 2. Replay into in-memory accumulators ────────────────────────
+        # ── 1+2. Read + replay UNDER the write lock ──────────────────────
+        # ar05: the bus read MUST happen inside the BEGIN IMMEDIATE transaction
+        # (below), not here. Reading outside the write lock let a concurrent
+        # reactor apply_execution() interleave between the snapshot and the
+        # rebuild commit — the rebuild then deleted positions/cash and re-wrote
+        # only the STALE snapshot, permanently losing the concurrent fill (and,
+        # because processed_fills survived, blocking its incremental re-apply).
+        # Acquiring the write lock first (BEGIN IMMEDIATE) serializes any
+        # concurrent apply_execution AFTER this rebuild, so the snapshot+rebuild
+        # is atomic. Single-writer reconcile is byte-identical.
         positions: dict[tuple[str, str, str], dict[str, Any]] = {}
         cash_map: dict[str, float] = {}
         last_ts: dict[str, str] = {}  # account_id → latest asof seen
 
         initial_cash = _default_initial_cash()
 
-        # ADR-0091 Option E (default-OFF behind HERMES_QUANT_DELTA_NORMALIZER):
-        # convert each absolute-target fill into its TRADED DELTA at fold time via
-        # the ONE shared normalizer, so a re-affirmed unchanged target folds to a
-        # no-op instead of inflating (the AAPL-12x / BA-6x defect). Flag OFF
-        # ⇒ override is None ⇒ _replay_record reads the raw field, bit-for-bit legacy.
-        _normalizer = None
-        if os.environ.get("HERMES_QUANT_DELTA_NORMALIZER", "0") == "1":
-            from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
-
-            _normalizer = FillDeltaNormalizer()
-            # i0b no-lookahead/ordering guard: the carry-forward delta = target -
-            # running_net is ORDER-DEPENDENT, so the normalizer must see records in
-            # asof order, not raw file/append order. Stable-sort by asof_execution
-            # (stable ⇒ same-asof ties keep file order, so the per-bucket delta
-            # stream is deterministic and identical to a correctly-appended log).
-            # This runs ONLY on the normalizer path; flag OFF leaves `records` in raw
-            # file order, bit-for-bit legacy. The sort is global but the fold is
-            # per-bucket, so cross-bucket interleaving is unaffected.
-            records = sorted(records, key=lambda r: r.get("asof_execution") or "")
-
-        # cs57: the incremental fold dedups a true byte-duplicate (the C2
-        # append-before-apply crash-retry record) via INSERT OR IGNORE on processed_fills;
-        # reconstruct_from folds EVERY raw record with no dedup, so a duplicated line
-        # double-counts and the rebuild book DIVERGES from the deduped incremental book.
-        # Drop a record whose full cs51 5-col key was already folded in THIS rebuild pass,
-        # mirroring the incremental key (incl. leg_index ⇒ the cs51 same-OCC legs are NOT
-        # re-collapsed; only a genuine same-leg duplicate collides). Gated on a truthy
-        # proposal_id, exactly like the incremental dedup (`if proposal_id:`). A log with
-        # no duplicates leaves every key distinct ⇒ byte-identical to the legacy fold.
-        seen_keys: set[tuple[str, str, str, str, str]] = set()
-
-        for line_no, rec in enumerate(records, start=1):
-            try:
-                # cs57: dedup BEFORE folding. Skip the cs44 family-parent (no real key, it
-                # early-returns in _replay_record anyway) so it never enters seen_keys.
-                rec_asset_class = rec.get("asset_class", "equity")
-                if not _is_multileg_family_parent(rec_asset_class):
-                    proposal_id = rec.get("proposal_id") or ""
-                    if proposal_id:
-                        key = _dedup_key(rec)
-                        if key in seen_keys:
-                            # True byte-duplicate of an already-folded record: skip the
-                            # fold AND the executions_processed/accounts_seen bump, matching
-                            # the incremental rollback-books-nothing semantics. latest_asof
-                            # is unaffected (the dup shares the kept record's asof).
-                            continue
-                        seen_keys.add(key)
-                _override = _normalizer.delta_for(rec) if _normalizer is not None else None
-                _replay_record(
-                    rec, positions, cash_map, last_ts, initial_cash, _override
-                )
-                result.executions_processed += 1
-                # cs52: report the SAME resolved partition the fold booked into, so
-                # accounts_seen reflects alpaca-paper (account_id in reactor_metadata)
-                # rather than mis-reporting paper-default.
-                acct = _resolve_account(rec)
-                result.accounts_seen.add(acct)
-            except Exception as e:  # noqa: BLE001
-                result.errors.append((line_no, str(e)))
-                logger.warning("reconstruct_from: skipping record %d: %s", line_no, e)
-
-        # ── 3. Write to state.db atomically ──────────────────────────────
-        # cs62: derive the watermark from the asofs we actually FOLDED (last_ts is mutated
-        # only by a successful _replay_record), NOT from the raw record list. A poisoned
-        # future-bound asof now raises in _replay_record and never enters last_ts, so it can
-        # no longer wedge the watermark past real time. For a clean log every record folds,
-        # so max(last_ts.values()) == _latest_asof(records) (byte-identical); an empty or
-        # all-errored log leaves last_ts {} ⇒ None, matching the prior no-write path.
-        latest_asof = max(last_ts.values()) if last_ts else None
-
         with self._lock, self._conn() as conn:
-            # Cross-model review I2: BEGIN IMMEDIATE for write-lock-on-start.
+            # Cross-model review I2 + ar05: BEGIN IMMEDIATE acquires the write lock
+            # at transaction start, and the bus read + replay now happen INSIDE this
+            # transaction so a concurrent apply_execution() cannot interleave between
+            # the snapshot and the rebuild commit (which would permanently lose the
+            # concurrent fill — see ar05). The replay is pure in-memory; holding the
+            # write lock across it is acceptable for the operator-only reconcile path.
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # ── 1. Read all records (UNDER the write lock, ar05) ─────────
+                records = _read_all_jsonl(executions_path)
+
+                # ── 2. Replay into in-memory accumulators ────────────────────
+                # ADR-0091 Option E (default-OFF behind HERMES_QUANT_DELTA_NORMALIZER):
+                # convert each absolute-target fill into its TRADED DELTA at fold time
+                # via the ONE shared normalizer, so a re-affirmed unchanged target folds
+                # to a no-op instead of inflating (the AAPL-12x / BA-6x defect). Flag OFF
+                # ⇒ override is None ⇒ _replay_record reads the raw field, bit-for-bit legacy.
+                _normalizer = None
+                if os.environ.get("HERMES_QUANT_DELTA_NORMALIZER", "0") == "1":
+                    from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
+
+                    _normalizer = FillDeltaNormalizer()
+                    # i0b no-lookahead/ordering guard: the carry-forward delta =
+                    # target - running_net is ORDER-DEPENDENT, so the normalizer must
+                    # see records in asof order, not raw file/append order. Stable-sort
+                    # by asof_execution (stable ⇒ same-asof ties keep file order, so the
+                    # per-bucket delta stream is deterministic and identical to a
+                    # correctly-appended log). This runs ONLY on the normalizer path;
+                    # flag OFF leaves `records` in raw file order, bit-for-bit legacy.
+                    records = sorted(records, key=lambda r: r.get("asof_execution") or "")
+
+                # cs57: the incremental fold dedups a true byte-duplicate (the C2
+                # append-before-apply crash-retry record) via INSERT OR IGNORE on
+                # processed_fills; reconstruct_from folds EVERY raw record with no dedup,
+                # so a duplicated line double-counts and the rebuild book DIVERGES from
+                # the deduped incremental book. Drop a record whose full cs51 5-col key
+                # was already folded in THIS rebuild pass, mirroring the incremental key.
+                seen_keys: set[tuple[str, str, str, str, str]] = set()
+
+                for line_no, rec in enumerate(records, start=1):
+                    try:
+                        # cs57: dedup BEFORE folding. Skip the cs44 family-parent.
+                        rec_asset_class = rec.get("asset_class", "equity")
+                        if not _is_multileg_family_parent(rec_asset_class):
+                            proposal_id = rec.get("proposal_id") or ""
+                            if proposal_id:
+                                key = _dedup_key(rec)
+                                if key in seen_keys:
+                                    continue
+                                seen_keys.add(key)
+                        _override = (
+                            _normalizer.delta_for(rec) if _normalizer is not None else None
+                        )
+                        _replay_record(
+                            rec, positions, cash_map, last_ts, initial_cash, _override
+                        )
+                        result.executions_processed += 1
+                        # cs52: report the SAME resolved partition the fold booked into.
+                        acct = _resolve_account(rec)
+                        result.accounts_seen.add(acct)
+                    except Exception as e:  # noqa: BLE001
+                        result.errors.append((line_no, str(e)))
+                        logger.warning("reconstruct_from: skipping record %d: %s", line_no, e)
+
+                # ── 3. Write to state.db atomically ──────────────────────────
+                # cs62: derive the watermark from the asofs we actually FOLDED (last_ts
+                # is mutated only by a successful _replay_record), NOT from the raw record
+                # list. A poisoned future-bound asof raises in _replay_record and never
+                # enters last_ts, so it cannot wedge the watermark past real time.
+                latest_asof = max(last_ts.values()) if last_ts else None
                 # ft1: stamp the regime that BUILT this db so a later
                 # incremental apply can hard-refuse a flag-flip mismatch instead
                 # of phantom-selling. PRAGMA user_version takes a literal, not a

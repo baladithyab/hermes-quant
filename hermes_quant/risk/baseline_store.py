@@ -223,41 +223,61 @@ class DrawdownBaselineStore:
 
         try:
             with self._lock, self._conn() as conn:
-                row = conn.execute(
-                    "SELECT peak_equity, daily_open_equity, session_key "
-                    "FROM drawdown_baselines WHERE account_id=? AND asset_class=?",
-                    (account_id, asset_class),
-                ).fetchone()
+                # ar06: BEGIN IMMEDIATE acquires the SQLite write lock at the START
+                # of the read-then-upsert, so a concurrent same-account reconcile in
+                # another PROCESS (the process-local RLock above does not span
+                # processes) cannot read the same stale peak and lose the higher
+                # update. Without it, two processes both read old peak=P, the
+                # high-equity writer commits max(P,150)=150, then the low-equity
+                # writer — still holding its stale P read — commits max(P,120)=120,
+                # LOWERING the durable HWM below the true peak and making the ADR-0004
+                # drawdown breaker measure a smaller drawdown (fail-OPEN, violating the
+                # monotonic-HWM invariant). The 5s busy_timeout serializes the second
+                # writer so it reads the first's COMMITTED peak. Byte-identical when
+                # there is no concurrent same-account reconcile. Mirrors
+                # state/portfolio_state.py:910 + the ar04 halt_state fix.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT peak_equity, daily_open_equity, session_key "
+                        "FROM drawdown_baselines WHERE account_id=? AND asset_class=?",
+                        (account_id, asset_class),
+                    ).fetchone()
 
-                if row is None:
-                    peak = eq
-                    daily_open = eq
-                    sess = cur_session
-                else:
-                    peak = max(float(row["peak_equity"]), eq)
-                    if str(row["session_key"]) != cur_session:
-                        # New session boundary → re-anchor the daily open mark.
+                    if row is None:
+                        peak = eq
                         daily_open = eq
                         sess = cur_session
                     else:
-                        # Same session → keep the session-OPEN mark (NOT a
-                        # trailing high). A profitable session keeps the lower
-                        # open; a losing session still measures vs the open.
-                        daily_open = float(row["daily_open_equity"])
-                        sess = str(row["session_key"])
+                        peak = max(float(row["peak_equity"]), eq)
+                        if str(row["session_key"]) != cur_session:
+                            # New session boundary → re-anchor the daily open mark.
+                            daily_open = eq
+                            sess = cur_session
+                        else:
+                            # Same session → keep the session-OPEN mark (NOT a
+                            # trailing high). A profitable session keeps the lower
+                            # open; a losing session still measures vs the open.
+                            daily_open = float(row["daily_open_equity"])
+                            sess = str(row["session_key"])
 
-                now_iso = _utc_now_iso()
-                conn.execute(
-                    "INSERT INTO drawdown_baselines "
-                    "(account_id, asset_class, peak_equity, daily_open_equity, "
-                    " session_key, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(account_id, asset_class) DO UPDATE SET "
-                    "peak_equity=excluded.peak_equity, "
-                    "daily_open_equity=excluded.daily_open_equity, "
-                    "session_key=excluded.session_key, "
-                    "updated_at=excluded.updated_at",
-                    (account_id, asset_class, peak, daily_open, sess, now_iso),
-                )
+                    now_iso = _utc_now_iso()
+                    conn.execute(
+                        "INSERT INTO drawdown_baselines "
+                        "(account_id, asset_class, peak_equity, daily_open_equity, "
+                        " session_key, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(account_id, asset_class) DO UPDATE SET "
+                        "peak_equity=excluded.peak_equity, "
+                        "daily_open_equity=excluded.daily_open_equity, "
+                        "session_key=excluded.session_key, "
+                        "updated_at=excluded.updated_at",
+                        (account_id, asset_class, peak, daily_open, sess, now_iso),
+                    )
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+                else:
+                    conn.execute("COMMIT")
 
             # Keep the in-memory conservative shadow in sync (used iff a later
             # call fails closed) — and never let it decrease.
