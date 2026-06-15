@@ -365,6 +365,42 @@ class TestRule4Cooldown:
         # The point is we got past Rule 4
         assert g._n_silenced_cooldown == 0
 
+    def test_cooldown_unfed_when_no_loss_recorded(self, halt_state):
+        """cr12 OFF/byte-identical baseline: a gate that NEVER had record_loss()
+        called keeps _cooldowns empty, so Rule 4 silences nothing. This pins the
+        invariant the wire-up must NOT break on a no-loss path — record_loss is
+        the ONLY mutator of the cooldown state Rule 4 reads."""
+        g = DefaultRiskGate(RiskConfig(cooldown_after_loss_minutes=60))
+        assert g._cooldowns == {}
+        g.gate(
+            _signal(direction=1, magnitude=0.05, confidence=0.9),
+            _market(volatility=0.02),
+            _portfolio(),
+            halt_state,
+        )
+        # Rule 4 cannot fire without a recorded loss.
+        assert g._n_silenced_cooldown == 0
+        assert g._cooldowns == {}
+
+    def test_record_loss_then_cooldown_fires_same_instance(self, halt_state):
+        """cr12 decide->loss->decide contract on ONE persistent instance: after a
+        loss is recorded, a fresh decision whose portfolio.asof is inside the
+        cooldown window is silenced (the cooldown counter increments). This is the
+        exact contract the _settle_due wire must satisfy — a realized loss observed
+        during settlement must populate the SAME gate the next decide() consults."""
+        g = DefaultRiskGate(RiskConfig(cooldown_after_loss_minutes=1440))  # 24h
+        # No loss yet -> baseline decision passes Rule 4.
+        g.gate(_signal(), _market(), _portfolio(), halt_state)
+        assert g._n_silenced_cooldown == 0
+        # A realized loss is observed 30 min before the next decision's asof.
+        loss_at = pd.Timestamp("2026-05-12T23:30:00Z")
+        g.record_loss("alpaca-paper", "crypto", "BTC/USDT", loss_at)
+        # Next decision: portfolio.asof=2026-05-13T00:00:00 is 30 min after the
+        # loss, well inside the 1440-min window -> silenced by Rule 4.
+        action = g.gate(_signal(), _market(), _portfolio(), halt_state)
+        assert action is None
+        assert g._n_silenced_cooldown == 1
+
 
 # ---------------------------------------------------------------------------
 # Rule 5: Cost gate (synthesis-v2 §P0-A — uses expected_signed_edge)
