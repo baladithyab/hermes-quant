@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -136,6 +137,38 @@ def _synthetic_portfolio(
     """
     return Portfolio(
         account_id="advisor-synthetic",
+        asset_class=asset_class,
+        asof=asof,
+        positions={},
+        cash=equity,
+        equity_total=equity,
+        realized_pnl_total=0.0,
+        realized_fees_total=0.0,
+        peak_equity=equity,
+        daily_open_equity=equity,
+    )
+
+
+def _real_equity_portfolio(
+    account_id: str, asset_class: str, asof: pd.Timestamp, equity: float
+) -> Portfolio:
+    """cs86: a flat portfolio carrying the REAL account identity + REAL equity.
+
+    Mirrors ``_synthetic_portfolio`` in shape (flat, no positions) but uses the
+    REAL ``account_id`` / ``asset_class`` and ``equity_total=equity`` so the
+    store-backed gate reconciles + recomputes the drawdown / daily-loss circuit
+    breakers against the DURABLE high-water-mark peak + session-anchored daily-open
+    for the live partition (cs01 gate seam, gate.py:638-647).
+
+    ``peak_equity`` / ``daily_open_equity`` are seeded to ``equity`` as the
+    per-tick fail-CLOSED floor ONLY — the durable cross-tick HWM and session-open
+    come from ``baseline_store.reconcile`` (baseline_store.py:237-241), which is
+    the value that makes a peak-to-trough trip fire. This helper is only ever
+    reached behind the HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE flag with an injected
+    store; with the flag OFF the producer uses ``_synthetic_portfolio`` unchanged.
+    """
+    return Portfolio(
+        account_id=account_id,
         asset_class=asset_class,
         asof=asof,
         positions={},
@@ -722,6 +755,7 @@ def recommend(
     recipe_id: str | None = None,
     market_extras: Mapping[str, Any] | None = None,
     perception_frame: Any = None,
+    durable_equity_account: tuple[str, str, float] | None = None,
 ) -> dict[str, Any]:
     """Synchronous recommendation for a single symbol. Read-only (ADR-0014).
 
@@ -758,6 +792,24 @@ def recommend(
             branches; M06 ADMIT-before-GATE ordering preserved). When BOTH
             perception_frame and market_extras are passed, the frame wins (it
             already absorbed the semantic slice) and a caveat is appended.
+        durable_equity_account: cs86 OPT-IN seam — a
+            ``(account_id, asset_class, equity_total)`` triple carrying the REAL
+            account NAV the live tick observed. Default ``None``. When ``None``
+            (every caller today, every backtest, and the flag-OFF tick) the
+            producer is BYTE-IDENTICAL to before: ``_synthetic_portfolio`` + a
+            no-store ``DefaultRiskGate``. When provided AND
+            ``HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1`` (read at call time) the
+            producer constructs a durable ``DrawdownBaselineStore`` (cs01) pointed
+            at the live state.db dir, builds a real-equity portfolio for the given
+            partition, and injects the store into the gate so the Rule-1
+            (drawdown) / Rule-2 (daily-loss) circuit breakers measure against the
+            DURABLE high-water-mark peak + session-anchored daily-open instead of
+            the inception-collapsed baselines (which fail-OPEN on a
+            profitable-from-inception account that suffers a large peak-to-trough
+            fall). Fail-CLOSED: a None / non-finite / <=0 equity or a store
+            construct failure returns a GATED result, never a silent
+            synthetic-100k fall-open. The flag absent => the param is ignored =>
+            byte-identical (belt-and-suspenders).
 
     Returns:
         Structured dict per ADR-0014 §D1 return-shape table. Never raises
@@ -1162,13 +1214,65 @@ def recommend(
     result.aggregated_signal = _signal_to_dict(agg_signal)
 
     # ---- Step 7: risk gate ----
-    if risk_gate is None:
+    # cs86 (DEFAULT-OFF): wire cs01's durable drawdown baseline into the LIVE
+    # producer. cs01 left the gate seam (gate.py:414 baseline_store=) INERT twice
+    # over here — the producer builds DefaultRiskGate() with NO store AND feeds a
+    # synthetic flat 100k portfolio (drawdown always 0). When the operator opts in
+    # via HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1 (read at call time) AND the live
+    # tick threaded the REAL (account, asset_class, equity) via
+    # `durable_equity_account`, we instead build a durable DrawdownBaselineStore
+    # (cs01) over the live state.db dir + a real-equity portfolio + a store-backed
+    # gate, so the Rule-1/Rule-2 breakers measure against the DURABLE HWM peak +
+    # session-anchored daily-open (conservative-by-construction: the breaker can
+    # only trip EARLIER / equally). Flag OFF (production default) OR no
+    # `durable_equity_account` => byte-identical to before (no store import /
+    # construct / state.db write, synthetic portfolio, no-store gate).
+    durable_on = os.environ.get("HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE", "0") == "1"
+    use_durable = durable_on and durable_equity_account is not None
+
+    if use_durable:
+        acct_id, acct_asset_class, real_equity = durable_equity_account
+        # FAIL-CLOSED: a None / non-finite / <=0 NAV must NOT fall through to the
+        # synthetic 100k (which would re-OPEN the breaker). Gate the signal.
+        try:
+            eq_f = float(real_equity)
+        except (TypeError, ValueError):
+            eq_f = float("nan")
+        if not math.isfinite(eq_f) or eq_f <= 0:
+            return _gated_no_data(result, "durable_baseline_nav_unavailable")
+        # Construct the durable store over the LIVE state.db dir (cs01 default
+        # paths). FAIL-CLOSED on a construct error — never a silent fall-open.
+        try:
+            from hermes_quant.risk.baseline_store import DrawdownBaselineStore
+
+            store = DrawdownBaselineStore()
+        except Exception as exc:  # noqa: BLE001 - store failure must FAIL-CLOSED
+            logger.warning(
+                "advisor: durable baseline store construct failed (%s) — "
+                "failing CLOSED (gating)",
+                exc,
+                exc_info=True,
+            )
+            return _gated_no_data(result, "durable_baseline_store_error")
+        # Build the gate WITH the store, preserving any recipe/injected gate's
+        # RiskConfig (threshold profile) when present; else default RiskConfig
+        # (identical to the no-store fallback).
         from hermes_quant.risk.gate import DefaultRiskGate
 
-        risk_gate = DefaultRiskGate()
+        risk_gate = DefaultRiskGate(
+            config=getattr(risk_gate, "config", None), baseline_store=store
+        )
+        portfolio = _real_equity_portfolio(
+            acct_id, acct_asset_class, last_bar_ts_utc, eq_f
+        )
+    else:
+        if risk_gate is None:
+            from hermes_quant.risk.gate import DefaultRiskGate
+
+            risk_gate = DefaultRiskGate()
+        portfolio = _synthetic_portfolio(symbol, asset_class, last_bar_ts_utc)
 
     market = _bootstrap_market_state(symbol, asset_class, last_bar_ts_utc)
-    portfolio = _synthetic_portfolio(symbol, asset_class, last_bar_ts_utc)
     halt_state: HaltState = _EmptyHaltState()  # type: ignore[assignment]
 
     try:

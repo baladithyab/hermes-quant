@@ -581,6 +581,21 @@ def tick(
     # None frame is identical to not passing one.
     _inject_frame = os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "1") == "1"
 
+    # cs86 (DEFAULT-OFF): when the operator opts in via
+    # HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1, resolve the REAL paper-account NAV
+    # ONCE per tick and thread it into recommend() so the advisor's gate measures
+    # drawdown / daily-loss against the DURABLE HWM peak + session-open (cs01)
+    # rather than its synthetic flat 100k portfolio (which fails-OPEN). Flag OFF
+    # (production default) => `durable_equity` stays None => recommend() receives
+    # durable_equity_account=None => byte-identical call shape (no NAV resolved,
+    # no store, no state.db write). `_account_nav_usd()` is fail-closed (returns
+    # None on any failure); a None NAV flows through to recommend()'s flag-ON
+    # fail-CLOSED branch (durable_baseline_nav_unavailable), never a fall-open.
+    _durable_baseline = (
+        os.environ.get("HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE", "0") == "1"
+    )
+    _durable_nav = _account_nav_usd() if _durable_baseline else None
+
     for entry in watchlist:
         try:
             _frame = None
@@ -592,12 +607,18 @@ def tick(
                     asset_class=entry.asset_class,
                     timeframe=entry.timeframe,
                 )
+            _durable_equity_account = (
+                ("paper-default", entry.asset_class, _durable_nav)
+                if _durable_baseline
+                else None
+            )
             advisor_result = advisor_recommend(
                 symbol=entry.symbol,
                 asset_class=entry.asset_class,
                 timeframe=entry.timeframe,
                 include_lessons=True,
                 perception_frame=_frame,
+                durable_equity_account=_durable_equity_account,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
