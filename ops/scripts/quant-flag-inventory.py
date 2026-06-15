@@ -23,34 +23,63 @@ REPO = Path(__file__).resolve().parents[2]
 SRC = REPO / "hermes_quant"
 DOC = REPO / "docs" / "operations" / "FLAG-INVENTORY.md"
 
-# os.environ.get("HERMES_QUANT_X", "default") / getenv(...)  — flag named inline
+# os.environ.get("HERMES_QUANT_X", "default") / getenv(...)  — flag named inline, WITH a default
 _INLINE = re.compile(
     r"""(?:environ\.get|getenv)\(\s*['"]?(HERMES_QUANT_[A-Z_]+)['"]?\s*,\s*('[^']*'|"[^"]*"|None)"""
 )
+# os.environ.get("HERMES_QUANT_X")  — flag named inline, NO default (e.g. `== "1"` / `or ""`).
+# rt03: these default-OFF boolean reads were silently missed; capture them with an empty default.
+_INLINE_NODEF = re.compile(r"""(?:environ\.get|getenv)\(\s*['"](HERMES_QUANT_[A-Z_]+)['"]\s*\)""")
 # _FOO_FLAG = "HERMES_QUANT_X"  — flag bound to a module constant
 _CONST = re.compile(r"""([A-Z_]*(?:FLAG|ENV)[A-Z_]*)\s*=\s*['"](HERMES_QUANT_[A-Z_]+)['"]""")
-# os.environ.get(CONST, "default") — flag referenced via the constant
+# os.environ.get(CONST, "default") — flag referenced via the constant, WITH a default
 _VIA_CONST = re.compile(r"""(?:environ\.get|getenv)\(\s*([A-Z_]+)\s*,\s*('[^']*'|"[^"]*"|None)""")
+# os.environ.get(CONST)  — flag referenced via the constant, NO default
+_VIA_CONST_NODEF = re.compile(r"""(?:environ\.get|getenv)\(\s*([A-Z_]+)\s*\)""")
 
 
 def scan() -> dict[str, tuple[str, str]]:
-    """Return {flag: (default, 'relpath:line')}. First occurrence wins (deterministic by path sort)."""
+    """Return {flag: (default, 'relpath:line')}. Deterministic by path sort.
+
+    rt03 correctness: (a) constants are resolved PER-FILE (a single global consts dict made
+    generic names like ENV_FLAG/_FLAG collide last-write-wins, silently dropping flags); (b)
+    no-inline-default reads (``environ.get("X")`` / ``environ.get(CONST)``) are captured with an
+    empty default so money-path toggles read as ``== "1"`` (PORTFOLIO_CAPS, DISSENT_CAP) are not
+    missed. A WITH-default read always WINS over a no-default one for the same flag (so a real
+    literal default is never overwritten by an empty string)."""
     flags: dict[str, tuple[str, str]] = {}
-    consts: dict[str, str] = {}
-    files = sorted(SRC.rglob("*.py"))
-    for f in files:
-        consts.update({m.group(1): m.group(2) for m in _CONST.finditer(f.read_text(errors="ignore"))})
-    for f in files:
+    has_default: set[str] = set()
+
+    def _record(flag: str, default: str, loc: str, *, with_default: bool) -> None:
+        if flag in flags:
+            # A with-default reading upgrades a previously-recorded no-default one.
+            if with_default and flag not in has_default:
+                flags[flag] = (default, loc)
+                has_default.add(flag)
+            return
+        flags[flag] = (default, loc)
+        if with_default:
+            has_default.add(flag)
+
+    for f in sorted(SRC.rglob("*.py")):
         txt = f.read_text(errors="ignore")
         rel = f.relative_to(REPO)
+        # Constants are resolved PER-FILE (no cross-file collision).
+        consts = {m.group(1): m.group(2) for m in _CONST.finditer(txt)}
+
+        def _line(start: str, _rel: Path = rel, _txt: str = txt) -> str:
+            return f"{_rel}:{_txt[:start].count(chr(10)) + 1}"
+
         for m in _INLINE.finditer(txt):
-            flag, default = m.group(1), m.group(2).strip("'\"")
-            flags.setdefault(flag, (default, f"{rel}:{txt[:m.start()].count(chr(10)) + 1}"))
+            _record(m.group(1), m.group(2).strip("'\""), _line(m.start()), with_default=True)
         for m in _VIA_CONST.finditer(txt):
-            cname, default = m.group(1), m.group(2).strip("'\"")
-            if cname in consts:
-                flag = consts[cname]
-                flags.setdefault(flag, (default, f"{rel}:{txt[:m.start()].count(chr(10)) + 1}"))
+            if m.group(1) in consts:
+                _record(consts[m.group(1)], m.group(2).strip("'\""), _line(m.start()), with_default=True)
+        for m in _INLINE_NODEF.finditer(txt):
+            _record(m.group(1), "", _line(m.start()), with_default=False)
+        for m in _VIA_CONST_NODEF.finditer(txt):
+            if m.group(1) in consts:
+                _record(consts[m.group(1)], "", _line(m.start()), with_default=False)
     return flags
 
 
