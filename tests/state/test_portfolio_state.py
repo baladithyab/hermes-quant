@@ -86,15 +86,21 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 
 @pytest.fixture(autouse=True)
 def _legacy_delta_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin HERMES_QUANT_DELTA_NORMALIZER=0 for this legacy delta-semantics suite.
+    """Pin HERMES_QUANT_DELTA_NORMALIZER=0 for this legacy fill-fold suite.
 
     ADR-0091 Option E (the carry-forward normalizer) reinterprets the per-fill
     size field as an ABSOLUTE target at fold time when the flag is ON. The tests
-    in this file predate that and hand-feed DELTA-shaped records (e.g. +0.10 then
-    -0.05 expecting net 0.05), asserting the OLD summing semantics. They are
-    correct under the production default (flag OFF) and must NOT be run under an
-    ambient flag-ON regime, where the normalizer would (correctly) re-interpret
-    their deltas as absolute targets and the legacy assertions would fail.
+    in this file predate that and assert the OLD additive/summing fold semantics:
+    each record's ``fill_size_pct`` is summed as an increment (e.g. +0.10 then
+    -0.05 ⇒ net 0.05). NOTE (seed `rt02`): the records themselves carry
+    ``target_position_pct == fill_size_pct`` (absolute-target shaped, like every
+    real producer record) — it is the LEGACY FOLD that READS them additively, not
+    the records that are "delta-shaped". So under flag-ON the normalizer reads the
+    same records as absolute targets and a genuine multi-tick partial-add toward
+    one target becomes indistinguishable from a re-affirmation (the rt02 semantic
+    gap). These legacy assertions are correct under the production default (flag
+    OFF) and must NOT run under an ambient flag-ON regime, where the assertions
+    would (correctly, per Option E) flip.
 
     This autouse default is OVERRIDDEN by the one test that explicitly opts into
     the normalizer (TestMultipleSymbols::...flag-on..., which calls
