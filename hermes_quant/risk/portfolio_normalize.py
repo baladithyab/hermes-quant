@@ -254,6 +254,32 @@ def normalize_targets(
             for asset, t in per_symbol_targets
         ]
 
+    # ar07 (ar03-adjacent, demand axis): a non-finite INCOMING target also defeats
+    # the sizing comparisons (`size > 0` / `size > g_remaining` are all False for
+    # NaN, so the pick would be ACCEPTED at full size AND poison g_remaining for
+    # later picks under priority_rank). Silence each non-finite pick CLOSED here and
+    # size only the finite remainder, so one bad target can neither fire nor corrupt
+    # its batch siblings. A fully-finite batch is byte-identical (nonfinite_out empty).
+    nonfinite_out: list[NormalizedTarget] = [
+        NormalizedTarget(
+            asset=asset,
+            per_symbol_target_pct=t,
+            portfolio_target_pct=0.0,
+            scale_factor=0.0,
+            fired=False,
+            silence_reason="nonfinite_target",
+        )
+        for asset, t in per_symbol_targets
+        if not math.isfinite(t)
+    ]
+    if nonfinite_out:
+        finite_targets = [(asset, t) for asset, t in per_symbol_targets if math.isfinite(t)]
+        if not finite_targets:
+            return nonfinite_out
+        # Size the finite remainder through the normal path, then prepend the
+        # silenced non-finite picks (order within each group preserved).
+        return nonfinite_out + normalize_targets(finite_targets, state, caps)
+
     g_room, n_room, c_room = _headroom(state, caps)
 
     # If the existing book has already breached any cap, fail closed —

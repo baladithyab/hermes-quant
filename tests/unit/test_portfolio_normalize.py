@@ -377,3 +377,41 @@ def test_finite_book_is_byte_identical_after_guard() -> None:
     assert nt.fired is True
     out = normalize_targets([("MSFT", 0.10)], state, PortfolioCaps())
     assert out[0].fired is True
+
+
+# ---------------------------------------------------------------------------
+# ar07 (ar03-adjacent) — a NON-FINITE INCOMING per-symbol target must be
+# silenced, not fired at full size. ar03 guarded the existing book (gross/net);
+# this guards the demand axis. (archaeology-verify wo8wu8kou)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_targets_nan_incoming_target_silenced_scale_to_fit() -> None:
+    """A NaN incoming target must be silenced ('nonfinite_target'); finite siblings still fire."""
+    state = PortfolioState(positions={"AAPL": 0.10})  # finite book
+    out = normalize_targets([("MSFT", float("nan")), ("GOOG", 0.05)], state, PortfolioCaps())
+    by = {nt.asset: nt for nt in out}
+    assert by["MSFT"].fired is False, "a NaN incoming target must NOT fire at full size"
+    assert "nonfinite" in (by["MSFT"].silence_reason or "")
+    assert by["GOOG"].fired is True, "a finite sibling must still fire"
+
+
+def test_normalize_targets_nan_incoming_target_silenced_priority_rank() -> None:
+    """priority_rank: a NaN pick must be silenced and must NOT poison g_remaining for later picks."""
+    state = PortfolioState(positions={"AAPL": 0.10})
+    caps = PortfolioCaps(normalization="priority_rank")
+    out = normalize_targets(
+        [("MSFT", float("nan")), ("GOOG", 0.05), ("TSLA", 0.05)], state, caps
+    )
+    by = {nt.asset: nt for nt in out}
+    assert by["MSFT"].fired is False
+    # The finite picks must be unaffected by the NaN (g_remaining not poisoned).
+    assert by["GOOG"].fired is True
+    assert by["TSLA"].fired is True
+
+
+def test_normalize_targets_inf_incoming_target_silenced() -> None:
+    state = PortfolioState(positions={"AAPL": 0.10})
+    out = normalize_targets([("MSFT", float("inf"))], state, PortfolioCaps())
+    assert out[0].fired is False
+    assert "nonfinite" in (out[0].silence_reason or "")
