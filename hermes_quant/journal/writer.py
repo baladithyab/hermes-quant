@@ -1,6 +1,7 @@
 """hermes_quant.journal.writer — Atomic-rename markdown journal writer.
 
-Per ADR-0010 §Decision §4: write `.tmp` → fsync → rename. Crash-safe.
+Per ADR-0010 §Decision §4: write `.tmp` → fsync file → rename → fsync
+parent dir. Crash-safe.
 Per §8: Pydantic-only mutator surface; markdown is a render derivative.
 
 Locking: a single mutex on the file path so concurrent in-process writes
@@ -265,7 +266,17 @@ def append_human_override(
 
 
 def _atomic_write(target: Path, content: str) -> None:
-    """Write content to target.tmp, fsync, rename. Crash-safe."""
+    """Write content to target.tmp, fsync file, rename, fsync parent dir.
+
+    Crash-safe. This is the ADR-0010 settlement ledger (module docstring §1-4):
+    settlement_loop derives the always-on ADR-0016 kill-switch realized-P&L
+    basis from these entries, so a lost append/resolve understates the drawdown
+    and the rail fails OPEN. POSIX rename(2) only guarantees the new directory
+    entry survives a crash AFTER the CONTAINING DIRECTORY is itself fsync'd —
+    fsyncing only the file data leaves a window after os.replace in which a
+    power-loss can revert the rename. So we fsync the parent dir too (best
+    effort; mirrors the sibling durable writer governance/kill_switch).
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -274,6 +285,19 @@ def _atomic_write(target: Path, content: str) -> None:
         os.fsync(f.fileno())
     # Atomic rename. On POSIX this is hostile-thread-safe.
     os.replace(tmp, target)
+    # Parent-dir fsync so the rename itself survives a crash.
+    try:
+        dfd = os.open(str(target.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        logger.warning(
+            "journal: parent-dir fsync failed for %s; rename may not be "
+            "crash-durable",
+            target.parent,
+        )
 
 
 def _load_entries_safe(target: Path) -> list[SettlementEntry]:

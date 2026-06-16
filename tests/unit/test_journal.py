@@ -563,3 +563,80 @@ def test_get_recent_lessons_includes_reflection_when_resolved(tmp_path):
     assert lessons[0]["resolved"] is True
     assert lessons[0]["reflection"] is not None
     assert lessons[0]["reflection"]["thesis_held"] is True
+
+
+def test_atomic_write_fsyncs_parent_dir_after_rename(tmp_path, monkeypatch):
+    """_atomic_write must fsync the CONTAINING DIRECTORY after os.replace so the
+    rename itself survives a crash (POSIX rename(2) durability).
+
+    ADR-0010 §8 / module docstring designate this the settlement ledger.
+    settlement_loop derives the ADR-0016 always-on kill-switch realized-P&L
+    basis from these entries. The file-data fsync (fsync of the .tmp fd) is NOT
+    enough: POSIX rename(2) only guarantees the new directory entry survives a
+    crash AFTER the containing directory is itself fsync'd. On a
+    power-loss/kernel-panic in the window AFTER os.replace but BEFORE the new
+    directory entry is flushed, the rename can revert — the just-appended /
+    resolved SettlementEntry vanishes and the next process start reads a SMALLER
+    realized drawdown than reality, so the kill-switch fails to trip (fail-OPEN
+    on an always-on money rail).
+
+    A bare "fsync was called" assertion would pass vacuously (the file fd is
+    fsync'd today). So this asserts an fsync targets a fd that is a DIRECTORY
+    (S_ISDIR) AND that it follows the rename.
+    """
+    import os
+    import stat
+
+    journal = tmp_path / "journal.md"
+    tmp_target = journal.with_suffix(journal.suffix + ".tmp")
+
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    events: list[tuple[str, str]] = []
+
+    def spy_fsync(fd: int):  # type: ignore[no-untyped-def]
+        try:
+            st = os.fstat(fd)
+            is_dir = stat.S_ISDIR(st.st_mode)
+        except OSError:
+            is_dir = False
+        events.append(("fsync_dir" if is_dir else "fsync_file", str(fd)))
+        return real_fsync(fd)
+
+    def spy_replace(src, dst, *a, **k):  # type: ignore[no-untyped-def]
+        events.append(("replace", f"{src}->{dst}"))
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "replace", spy_replace)
+
+    append_pending(_make_entry(), path=journal)
+
+    # The rename must have happened.
+    replace_idx = next(
+        (
+            i
+            for i, (kind, what) in enumerate(events)
+            if kind == "replace" and what == f"{tmp_target}->{journal}"
+        ),
+        None,
+    )
+    assert replace_idx is not None, f"_atomic_write did not os.replace; events={events}"
+
+    # A directory fsync must occur AFTER the rename so the new dir entry is
+    # durable (the rename itself survives a crash).
+    dir_fsync_idx = next(
+        (i for i, (kind, _what) in enumerate(events) if kind == "fsync_dir"),
+        None,
+    )
+    assert dir_fsync_idx is not None, (
+        "_atomic_write fsync'd the file data but NEVER fsync'd the parent "
+        "directory after os.replace; the rename of the settlement ledger is "
+        "not crash-durable, so a lost append understates the ADR-0016 "
+        f"kill-switch realized-P&L basis (fail-OPEN). events={events}"
+    )
+    assert dir_fsync_idx > replace_idx, (
+        "parent-dir fsync must follow os.replace so the new directory entry "
+        f"is what gets flushed; events={events}"
+    )
