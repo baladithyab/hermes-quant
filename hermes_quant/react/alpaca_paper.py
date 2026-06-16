@@ -347,7 +347,14 @@ class AlpacaPaperReactor:
         except Exception as exc:  # noqa: BLE001 — surface broker/account errors
             raise AlpacaSubmitError(f"get_account() failed: {exc}") from exc
         equity = _to_float(getattr(account, "equity", None))
-        if equity is None or equity <= 0:
+        # NaN/inf MUST be rejected: ``_to_float`` catches only (TypeError,
+        # ValueError), so float(Decimal('NaN'))/float('inf')/float('1e400')
+        # succeed and return nan/inf. A non-finite NAV defeats BOTH the
+        # ``<= 0`` check here (nan<=0 / inf<=0 are False) AND the downstream
+        # zero-notional guard (nan<1.0 / +inf<1.0 are False), so it would size
+        # a NaN/inf-notional order. Finite-guard the NAV numerator (mirrors the
+        # math.isfinite price guards elsewhere on this path).
+        if equity is None or not math.isfinite(equity) or equity <= 0:
             raise AlpacaSubmitError(
                 f"account equity unavailable or non-positive ({equity!r}); "
                 "refusing to size an order off a bad NAV"

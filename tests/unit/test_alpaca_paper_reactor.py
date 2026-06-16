@@ -451,6 +451,51 @@ def test_terminal_reject_status_raises(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Non-finite NAV guard (ar32/ar49 family, on the NAV numerator)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "bad_equity",
+    [
+        __import__("decimal").Decimal("NaN"),  # Alpaca returns Decimals
+        "inf",  # transient string equity
+        "1e400",  # overflows to +inf via float()
+        "nan",
+        float("inf"),
+        float("nan"),
+    ],
+)
+def test_non_finite_equity_fails_closed(tmp_path, bad_equity):
+    """A non-finite broker equity (NaN/inf) must FAIL CLOSED in
+    _fetch_account_equity rather than sizing an order off a bad NAV.
+
+    ``to_float`` catches only (TypeError, ValueError), so float(Decimal('NaN')),
+    float('inf'), float('1e400') all SUCCEED and return nan/inf. The ``equity<=0``
+    guard does NOT catch them (nan<=0 is False, inf<=0 is False), and the
+    downstream ``round(notional,2) < 1.0`` zero-notional guard also misses them
+    (nan<1.0 is False, +inf<1.0 is False) — so a NaN/inf-notional order would
+    otherwise reach client.submit_order. The guard must be finite-aware."""
+    order = _FakeOrder(status="filled", filled_avg_price=100.0, filled_qty=1.0)
+    client = _FakeClient(equity=bad_equity, submit_result=order)
+    reactor = _reactor(client, tmp_path)
+
+    # 1. _fetch_account_equity must RAISE (not return nan/inf).
+    with pytest.raises(AlpacaSubmitError) as ei:
+        reactor._fetch_account_equity(client)
+    assert "equity" in str(ei.value).lower()
+
+    # 2. The full execute() path must also fail closed and NEVER submit an order.
+    with pytest.raises(AlpacaSubmitError):
+        reactor.execute(_proposal(), fill_size_pct=0.20)
+    assert client.submitted == []  # no NaN/inf-notional order reached the broker
+
+    # 3. No fabricated/garbage fill written to the bus.
+    lines = [ln for ln in reactor.executions_path.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 0
+
+
+# --------------------------------------------------------------------------- #
 # 5. Unfilled timeout -> fill_size_pct=0 + metadata
 # --------------------------------------------------------------------------- #
 
