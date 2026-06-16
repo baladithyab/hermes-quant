@@ -18,7 +18,6 @@ Design constraints (see ADR-0049):
 from __future__ import annotations
 
 import logging
-import math
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -458,13 +457,27 @@ def _update_position(
     Uses FIFO-compatible weighted-average entry price.
     """
     new_qty = old_qty + delta_qty
+    # Full close
     if abs(new_qty) < 1e-12:
         return 0.0, 0.0
-    if math.copysign(1, old_qty) == math.copysign(1, delta_qty) or old_qty == 0.0:
+
+    # Same direction: use product sign rather than math.copysign, which
+    # returns +1 for a +0.0/-0.0 delta and would misclassify a flat/zero
+    # delta. Mirrors canonical state.portfolio_state._update_position.
+    same_direction = (old_qty == 0.0) or (old_qty * delta_qty > 0)
+
+    if same_direction:
         # Adding to or initiating a position: weighted average
         total_cost = old_qty * old_avg + delta_qty * fill_price
         new_avg = total_cost / new_qty
+    elif (old_qty * new_qty) < 0:
+        # Direction flip: the opposing fill fully reversed the old lot and
+        # overshot. The surviving lot is a NEW position opened in the
+        # opposite direction at fill_price — it MUST NOT keep the old
+        # side's basis (that corrupts the shadow eval ledger, ADR-0049).
+        new_avg = fill_price
     else:
-        # Reducing a position: avg doesn't change
+        # Partial close (old and residual same sign): residual-lot rule —
+        # avg_entry_price of the surviving lot is unchanged.
         new_avg = old_avg
     return new_qty, new_avg
