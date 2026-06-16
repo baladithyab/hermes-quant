@@ -86,6 +86,18 @@ class GateConfig:
     threshold — edge of half a stdev combined with confidence > 0.65 is
     a meaningful quality bar."""
 
+    min_volatility: float = 0.001
+    """Positive FLOOR on the urgency divisor (10 bps). Without it, a
+    tiny-but-positive atr_relative (a flatlined / illiquid name where
+    atr/last_close ~ 1e-6) makes urgency = edge / vol explode, so the
+    autonomous FIRE gate clears trivially on pure noise — a finite-but-huge
+    urgency passes the `math.isfinite` guard. The floor bounds
+    urgency <= abs(edge) / 0.001 = 1000 * abs(edge): a 0.1% noise edge
+    yields urgency ~0.4 (correctly SILENCED at min_urgency=0.5) while a
+    genuine 1%+ edge still clears. The 10 bps value mirrors the module
+    author's own 'tiny ATR is noise' insight — MicrostructureLite treats
+    atr_rel < 0.005 as quiet/noise for the toxicity sub-signal."""
+
     min_analysts_emitted: int = 2
     """Minimum number of analysts that emitted a view. With 2 analysts
     in v0.1.2 (ClassicalTA + MicrostructureLite), require both. Default
@@ -240,6 +252,15 @@ def silence_bias_gate(
 
     if vol <= 0:
         vol = 0.01
+    # Positive FLOOR on the divisor (deep-review 2026-06-16): a tiny-but-positive
+    # vol (e.g. atr_relative ~1e-6 from a flatlined/illiquid name supplied via
+    # analyst metadata above) would otherwise make urgency = edge/vol explode and
+    # the FIRE gate clear trivially on pure noise. The `math.isfinite(urgency)`
+    # check below catches NaN/inf ONLY — a large FINITE urgency slips through. This
+    # is distinct from the NaN-fail-CLOSED family; it is the tiny-positive-finite
+    # gap. Floor justified by MicrostructureLite treating atr_rel<0.005 as noise.
+    if cfg.min_volatility > 0:
+        vol = max(vol, cfg.min_volatility)
     urgency = abs(expected_signed_edge) / vol
 
     # NaN-fail-CLOSED (deep-review 2026-06-07): a non-finite urgency (from a NaN

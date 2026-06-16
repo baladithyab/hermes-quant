@@ -123,6 +123,43 @@ def test_market_volatility_override():
     assert out.decision == GateDecision.SILENCE_LOW_URGENCY
 
 
+def test_silence_tiny_positive_atr_does_not_fire_on_noise():
+    """A tiny-but-positive atr_relative (flatlined/illiquid name) must NOT let a
+    pure-noise edge clear the urgency gate.
+
+    Defect (silence-bias urgency divisor had no positive vol FLOOR): the live
+    autonomous path calls silence_bias_gate WITHOUT market_volatility, so vol is
+    derived from analyst metadata. MicrostructureLite emits atr_relative
+    unconditionally and atr_relative = atr/last_close can be ~1e-6 for a
+    flatlined/illiquid name. The old code accepted any `atr_rel > 0` and only
+    clamped `vol <= 0`, so vol=1e-6 made urgency = abs(edge)/1e-6 astronomically
+    large. The `math.isfinite(urgency)` guard catches NaN/inf ONLY — a large
+    finite urgency slipped through to FIRE on noise.
+
+    With a positive floor on vol, a 0.1% noise edge can no longer clear the
+    Sharpe-like min_urgency=0.5 bar just because an analyst happened to supply a
+    tiny atr_relative. Compare with test_handles_zero_volatility_as_default /
+    no-metadata control, both of which correctly SILENCE the same noise edge.
+    """
+    # magnitude 0.001 = 0.1% noise; confidence 0.70 -> signed_edge = 0.001*(0.4)
+    # = 0.0004. With the floored divisor (>= 0.001) urgency <= ~0.4 < 0.5.
+    r = _result(confidence=0.70, magnitude=0.001, direction=1, atr_relative=1e-6)
+    out = silence_bias_gate(r)
+    assert out.decision == GateDecision.SILENCE_LOW_URGENCY
+    # And the divisor actually used must be the floor, not the raw 1e-6.
+    assert out.details["volatility"] >= 0.001
+
+
+def test_genuine_edge_still_fires_with_tiny_atr():
+    """The floor must not break a genuine signal: a 1%+ edge with the same tiny
+    atr_relative should still clear the urgency gate (no false-silence)."""
+    # magnitude 0.05 (5%), confidence 0.85 -> signed_edge = 0.05*0.7 = 0.035.
+    # urgency = 0.035 / 0.001 (floor) = 35 >> 0.5 -> FIRE.
+    r = _result(confidence=0.85, magnitude=0.05, direction=1, atr_relative=1e-6)
+    out = silence_bias_gate(r)
+    assert out.decision == GateDecision.FIRE
+
+
 # ---------------------------------------------------------------------------
 # Dim 3: compute budget (number of voices)
 # ---------------------------------------------------------------------------
