@@ -62,13 +62,15 @@ def test_kill_switch_fire_drains_state_json_atomically(
     class CrashAfterTmp(Exception):
         pass
 
-    real_replace = Path.replace
+    import os
 
-    def crashing_replace(self: Path, target):  # type: ignore[no-untyped-def]
+    def crashing_replace(src, dst, *a, **k):  # type: ignore[no-untyped-def]
         # The rename is the atomic boundary. We crash *before* it executes.
         raise CrashAfterTmp("simulated SIGKILL between tmp-write and rename")
 
-    monkeypatch.setattr(Path, "replace", crashing_replace)
+    # _write_state_atomic now renames via os.replace (durable tmp+fsync+rename,
+    # mirroring the sibling writers); patch that primitive.
+    monkeypatch.setattr(os, "replace", crashing_replace)
 
     with pytest.raises(CrashAfterTmp):
         kill_switch.fire("crash_test", "test")
@@ -78,7 +80,94 @@ def test_kill_switch_fire_drains_state_json_atomically(
     assert kill_switch.is_halted() is False
     # The tmp file may or may not exist; doesn't matter — it's not visible
     # under the canonical path.
-    Path.replace = real_replace  # type: ignore[method-assign]
+
+
+def test_kill_switch_write_state_fsyncs_before_rename(
+    gov_paths: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The halt flag must be durable BEFORE fire() returns.
+
+    ADR-0031 D3 + ADR-0016: the kill-switch is an always-on money-safety rail.
+    If state.json's page-cache page is lost to a power-loss/crash in the window
+    between fire() returning and the OS flushing, is_halted() reads False on the
+    next process start and the next decision tick resumes live entries
+    (fail-OPEN of the rail).
+
+    Mirror the sibling durable writers (journal._atomic_write,
+    autonomous.trip_kill_switch, audit_log.append): the tmp file's fd must be
+    fsync'd BEFORE os.replace makes it visible under the canonical path.
+
+    NOTE: audit_log.append (also called inside fire()) fsyncs too, so a bare
+    "fsync was called" assertion would pass vacuously. This test pins the fsync
+    to the state.json.tmp fd specifically and requires it to precede the rename.
+    """
+    import os
+
+    state_path = gov_paths / "state.json"
+    tmp_path_target = state_path.with_suffix(".json.tmp")
+
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    # Map fd -> path for the files we open for writing, so we can tell which
+    # fsync targets the state tmp file vs. the audit log.
+    fd_to_path: dict[int, str] = {}
+    events: list[tuple[str, str]] = []
+
+    builtin_open = open
+
+    def tracking_open(file, *args, **kwargs):  # type: ignore[no-untyped-def]
+        f = builtin_open(file, *args, **kwargs)
+        try:
+            fd_to_path[f.fileno()] = str(file)
+        except Exception:
+            pass
+        return f
+
+    def spy_fsync(fd: int) -> None:
+        events.append(("fsync", fd_to_path.get(fd, f"<fd:{fd}>")))
+        return real_fsync(fd)
+
+    def spy_replace(src, dst, *a, **k):  # type: ignore[no-untyped-def]
+        events.append(("replace", f"{src}->{dst}"))
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr("builtins.open", tracking_open)
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "replace", spy_replace)
+
+    kill_switch.fire("crash_durability", "test")
+
+    # Find the index of the fsync on the state tmp file and the index of the
+    # rename of that tmp file to the canonical state.json path.
+    fsync_idx = next(
+        (
+            i
+            for i, (kind, what) in enumerate(events)
+            if kind == "fsync" and what == str(tmp_path_target)
+        ),
+        None,
+    )
+    replace_idx = next(
+        (
+            i
+            for i, (kind, what) in enumerate(events)
+            if kind == "replace" and what == f"{tmp_path_target}->{state_path}"
+        ),
+        None,
+    )
+
+    assert fsync_idx is not None, (
+        f"_write_state_atomic did NOT fsync the state tmp file {tmp_path_target!s}; "
+        f"events={events}"
+    )
+    assert replace_idx is not None, (
+        f"_write_state_atomic did NOT os.replace the state tmp file; events={events}"
+    )
+    assert fsync_idx < replace_idx, (
+        "fsync of state.json.tmp must precede the rename so the halt flag is "
+        f"durable before fire() returns; events={events}"
+    )
 
 
 def test_kill_switch_clear_requires_token(gov_paths: Path) -> None:

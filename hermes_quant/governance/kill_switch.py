@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,11 +42,29 @@ def _read_state() -> dict[str, Any]:
 
 
 def _write_state_atomic(state: dict[str, Any]) -> None:
+    """Durably write state via tmp -> fsync -> rename (ADR-0031 D3).
+
+    The halt flag is an always-on money-safety rail (ADR-0016): it MUST be
+    durable before this returns. Without fsync, a power-loss/crash in the window
+    between the rename and the OS flushing the page cache loses the halt, and
+    is_halted() reads False on the next process start (fail-OPEN). Mirrors the
+    sibling durable writers (journal._atomic_write, autonomous.trip_kill_switch,
+    audit_log.append).
+    """
     path = _state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, sort_keys=True, default=str))
-    tmp.replace(path)  # atomic on POSIX
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(state, sort_keys=True, default=str))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)  # atomic on POSIX
+    # Parent-dir fsync so the rename itself survives a crash.
+    dfd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 def fire(reason: str, source: str) -> None:
