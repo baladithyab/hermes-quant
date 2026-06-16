@@ -32,3 +32,6 @@ quant-state/
 
 # Deep-work-loop workflow scratch (prove/plan traces; durable findings land in docs/research/)
 /research/temp/
+
+# Ephemeral agent worktrees (never repo content)
+.claude/worktrees/
