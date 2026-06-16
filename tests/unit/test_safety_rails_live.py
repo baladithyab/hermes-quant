@@ -79,7 +79,14 @@ def test_cum_pnl_realized_gain_is_positive(tmp_path, monkeypatch):
     assert auto.compute_cumulative_realized_pnl_pct(bus) > 0.0
 
 
-def test_cum_pnl_fails_open_to_zero_on_bad_nav(tmp_path, monkeypatch):
+def test_cum_pnl_bad_nav_cold_start_is_zero(tmp_path, monkeypatch):
+    # ar20: NAV unreadable with a realized loss BUT no last-known sidecar (cold start)
+    # falls back to the 0.0 floor — we cannot fabricate a loss fraction with no NAV and
+    # no prior value. (With a last-known present it carries forward instead — covered by
+    # test_killswitch_rail_failopen_ar19_ar21.py::test_ar20_nav_none_with_loss_carries_*.)
+    monkeypatch.setattr(auto, "QUANT_HOME", tmp_path, raising=False)
+    monkeypatch.setattr(auto, "_LAST_KNOWN_CUM_PNL_PATH",
+                        tmp_path / "no_last_known.json", raising=False)
     bus = _write_bus(tmp_path, [
         _fill("ASTS", 0.2, 100.0, "2026-06-01T15:00:00Z", "p1"),
         _fill("ASTS", -0.2, 80.0, "2026-06-02T15:00:00Z", "p2"),

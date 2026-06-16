@@ -1,0 +1,211 @@
+"""ar19/ar20/ar21 — close three fail-OPEN holes on the always-on ADR-0016 kill-switch rail.
+
+Found by the convergence review (wf wi06keswe), all RED-verified:
+
+  ar19 — settlement_loop._normalize_exec_record had NO cs44 multi_leg family-PARENT skip
+         (portfolio_state DOES skip it). The parent record (asset_class="multi_leg",
+         nonzero fill_size_pct) produced a PHANTOM round-trip in join_exit_fills ON TOP of
+         the real per-leg children -> the family's realized P&L was double-counted into
+         compute_cumulative_realized_pnl_pct (the live kill-switch basis). A phantom gain
+         masks a real loss -> the rail fails to trip.
+  ar20 — compute_cumulative_realized_pnl_pct returned a bare 0.0 when NAV was unreadable
+         (state.db corrupt/locked while executions.jsonl readable) even with a NONZERO
+         realized loss -> the D9 drawdown rail silently disarmed. The ar02 fix only
+         covered the OUTER except; this NAV-None branch was the sibling hole.
+  ar21 — _read_kill_switch returned tripped=False on a corrupt/torn EXISTING file ->
+         a previously-TRIPPED rail silently RE-ARMED trading. An existing-but-unreadable
+         flag must fail CLOSED (tripped=True); an ABSENT file stays not-tripped.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from hermes_quant import autonomous as auto
+
+
+def _write_bus(tmp_path: Path, fills: list[dict]) -> Path:
+    p = tmp_path / "executions.jsonl"
+    p.write_text("\n".join(json.dumps(f) for f in fills) + "\n", encoding="utf-8")
+    return p
+
+
+def _equity_fill(asset, pct, price, asof, pid, asset_class="equity", **extra):
+    rec = {
+        "asset": asset,
+        "asset_class": asset_class,
+        "timeframe": "1d",
+        "fill_size_pct": pct,
+        "fill_price": price,
+        "decision_price": price,
+        "asof_execution": asof,
+        "asof_decision": asof,
+        "bar_ts": asof,
+        "proposal_id": pid,
+        "signal_id": None,
+        "reactor_name": "paper",
+        "human_in_the_loop": True,
+        "play_tag": "autonomous",
+        "reactor_metadata": {"paper": True},
+        "target_position_pct": pct,
+        "approver_user_id": "test",
+    }
+    rec.update(extra)
+    return rec
+
+
+# --------------------------------------------------------------------------- #
+# ar19 — multi-leg family-PARENT must NOT double-count into the kill-switch basis
+# --------------------------------------------------------------------------- #
+def test_ar19_multileg_parent_does_not_double_count_realized_pnl(tmp_path, monkeypatch):
+    """A full open+close multi-leg family: the parent rollup (asset_class='multi_leg')
+    plus its per-leg child. The realized P&L must come from the CHILD round-trip ONLY —
+    the parent must be skipped, not produce a phantom second round-trip."""
+    monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100000.0)
+
+    # Per-leg us_option child: open +0.2 @ 100, close -0.2 @ 80 (a -20% lot).
+    child_open = _equity_fill(
+        "NVDA260626P00130000", 0.2, 100.0, "2026-06-01T15:00:00Z", "fam1",
+        asset_class="us_option",
+        reactor_metadata={"paper": True, "quantity": 1, "leg_index": 0, "role": "leg"},
+    )
+    child_close = _equity_fill(
+        "NVDA260626P00130000", -0.2, 80.0, "2026-06-02T15:00:00Z", "fam2",
+        asset_class="us_option",
+        reactor_metadata={"paper": True, "quantity": -1, "leg_index": 0, "role": "leg"},
+    )
+    # Family-PARENT rollups (asset_class="multi_leg", nonzero fill_size_pct, role=parent).
+    # These must be SKIPPED by _normalize_exec_record (ar19) — folding them produces a
+    # phantom round-trip that double-counts the family's realized P&L.
+    parent_open = _equity_fill(
+        "NVDA", 0.2, 100.0, "2026-06-01T15:00:00Z", "fam1",
+        asset_class="multi_leg",
+        reactor_metadata={"paper": True, "role": "parent"},
+    )
+    parent_close = _equity_fill(
+        "NVDA", -0.2, 80.0, "2026-06-02T15:00:00Z", "fam2",
+        asset_class="multi_leg",
+        reactor_metadata={"paper": True, "role": "parent"},
+    )
+
+    bus_with_parent = _write_bus(
+        tmp_path, [parent_open, child_open, parent_close, child_close]
+    )
+    with_parent = auto.compute_cumulative_realized_pnl_pct(bus_with_parent)
+
+    # The SAME family without the parent rollup rows — the true realized P&L.
+    child_only_path = tmp_path / "child_only.jsonl"
+    child_only_path.write_text(
+        "\n".join(json.dumps(f) for f in [child_open, child_close]) + "\n",
+        encoding="utf-8",
+    )
+    child_only = auto.compute_cumulative_realized_pnl_pct(child_only_path)
+
+    assert with_parent == child_only, (
+        "ar19: the multi_leg family-PARENT rollup double-counted realized P&L into the "
+        f"kill-switch basis (with-parent={with_parent} vs child-only={child_only}); the "
+        "parent must be skipped exactly like portfolio_state's cs44 fold-skip."
+    )
+    assert with_parent < 0.0  # the -20% lot is a real loss; sign must survive the skip
+
+
+def test_ar19_normalize_skips_multileg_parent_directly(tmp_path):
+    """Unit-level: _normalize_exec_record returns None for a multi_leg parent record."""
+    from hermes_quant.daemon.settlement_loop import _normalize_exec_record
+
+    parent = _equity_fill(
+        "NVDA", 0.2, 100.0, "2026-06-01T15:00:00Z", "fam1",
+        asset_class="multi_leg",
+        reactor_metadata={"paper": True, "role": "parent"},
+    )
+    assert _normalize_exec_record(parent) is None
+    # A real equity child is still normalized (not over-skipped).
+    child = _equity_fill("ASTS", 0.2, 100.0, "2026-06-01T15:00:00Z", "p1")
+    assert _normalize_exec_record(child) is not None
+
+
+# --------------------------------------------------------------------------- #
+# ar20 — NAV-None with a nonzero realized loss carries last-known forward
+# --------------------------------------------------------------------------- #
+def test_ar20_nav_none_with_loss_carries_last_known_forward(tmp_path, monkeypatch):
+    """A -20% realized loss with NAV unreadable must NOT return a bare 0.0 (which would
+    disarm the D9 rail); it carries the last-known fraction forward."""
+    monkeypatch.setattr(auto, "QUANT_HOME", tmp_path, raising=False)
+    monkeypatch.setattr(auto, "_LAST_KNOWN_CUM_PNL_PATH",
+                        tmp_path / "autonomous_cum_pnl_last_known.json", raising=False)
+    # Seed a last-known losing fraction (as a prior successful compute would have).
+    auto._persist_last_known_cum_pnl(-0.18)
+
+    bus = _write_bus(tmp_path, [
+        _equity_fill("ASTS", 0.2, 100.0, "2026-06-01T15:00:00Z", "p1"),
+        _equity_fill("ASTS", -0.2, 80.0, "2026-06-02T15:00:00Z", "p2"),
+    ])
+    monkeypatch.setattr(auto, "_account_nav_usd", lambda: None)  # NAV unreadable
+    frac = auto.compute_cumulative_realized_pnl_pct(bus)
+    assert frac == -0.18, (
+        "ar20: NAV-None with a nonzero realized loss must carry the last-known fraction "
+        f"forward (got {frac}); a bare 0.0 silently disarms the D9 drawdown rail."
+    )
+
+
+def test_ar20_nav_none_cold_start_empty_book_stays_zero(tmp_path, monkeypatch):
+    """No last-known + an EMPTY book + NAV-None: 0.0 is correct (no loss to mask)."""
+    monkeypatch.setattr(auto, "QUANT_HOME", tmp_path, raising=False)
+    monkeypatch.setattr(auto, "_LAST_KNOWN_CUM_PNL_PATH",
+                        tmp_path / "nolast.json", raising=False)
+    bus = _write_bus(tmp_path, [])  # empty book -> realized_pnl_usd == 0.0
+    monkeypatch.setattr(auto, "_account_nav_usd", lambda: None)
+    assert auto.compute_cumulative_realized_pnl_pct(bus) == 0.0
+
+
+def test_ar20_healthy_nav_unchanged(tmp_path, monkeypatch):
+    """Byte-identical on the healthy path: a real NAV computes the real fraction."""
+    bus = _write_bus(tmp_path, [
+        _equity_fill("ASTS", 0.2, 100.0, "2026-06-01T15:00:00Z", "p1"),
+        _equity_fill("ASTS", -0.2, 80.0, "2026-06-02T15:00:00Z", "p2"),
+    ])
+    monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100000.0)
+    assert auto.compute_cumulative_realized_pnl_pct(bus) < 0.0
+
+
+# --------------------------------------------------------------------------- #
+# ar21 — corrupt EXISTING kill-switch file fails CLOSED (tripped=True)
+# --------------------------------------------------------------------------- #
+def test_ar21_corrupt_existing_killswitch_file_fails_closed(tmp_path, monkeypatch):
+    ks = tmp_path / "autonomous_kill_switch.json"
+    # A torn/half write of a TRIPPED flag.
+    ks.write_text('{"tripped": tru', encoding="utf-8")
+    monkeypatch.setattr(auto, "KILL_SWITCH_PATH", ks, raising=False)
+    state = auto._read_kill_switch()
+    assert state.tripped is True, (
+        "ar21: a corrupt EXISTING kill-switch file must fail CLOSED (tripped=True) so a "
+        "previously-tripped rail cannot silently re-arm."
+    )
+    assert "unreadable" in (state.reason or "")
+
+
+def test_ar21_absent_killswitch_file_stays_not_tripped(tmp_path, monkeypatch):
+    ks = tmp_path / "does_not_exist.json"
+    monkeypatch.setattr(auto, "KILL_SWITCH_PATH", ks, raising=False)
+    state = auto._read_kill_switch()
+    assert state.tripped is False, "an ABSENT file is a legit cold start (not tripped)"
+
+
+def test_ar21_valid_tripped_file_reads_tripped(tmp_path, monkeypatch):
+    ks = tmp_path / "autonomous_kill_switch.json"
+    ks.write_text(json.dumps({
+        "tripped": True, "tripped_at": "2026-06-15T00:00:00Z",
+        "cumulative_pnl_pct": -0.2, "threshold_pct": 0.1, "reason": "drawdown",
+    }), encoding="utf-8")
+    monkeypatch.setattr(auto, "KILL_SWITCH_PATH", ks, raising=False)
+    assert auto._read_kill_switch().tripped is True
+
+
+def test_ar21_valid_untripped_file_reads_not_tripped(tmp_path, monkeypatch):
+    ks = tmp_path / "autonomous_kill_switch.json"
+    ks.write_text(json.dumps({
+        "tripped": False, "tripped_at": None,
+        "cumulative_pnl_pct": 0.0, "threshold_pct": 0.1, "reason": None,
+    }), encoding="utf-8")
+    monkeypatch.setattr(auto, "KILL_SWITCH_PATH", ks, raising=False)
+    assert auto._read_kill_switch().tripped is False

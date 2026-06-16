@@ -245,13 +245,29 @@ def _read_kill_switch() -> KillSwitchState:
             reason=d.get("reason"),
         )
     except Exception as exc:
-        logger.warning("autonomous: kill-switch read failed: %s", exc)
+        # ar21: we only reach here when the file EXISTS (the absent-file early
+        # return above already handled a legitimate not-tripped cold start) but is
+        # UNREADABLE / corrupt / torn (e.g. a half-written '{"tripped": tru'). An
+        # existing-but-unparseable kill-switch file must FAIL CLOSED — read it as
+        # TRIPPED — because the most dangerous interpretation is that the rail was
+        # tripped and the flag got corrupted; returning tripped=False here would
+        # silently RE-ARM a previously-tripped ADR-0016 rail. This mirrors the
+        # never-re-arm-on-degraded-read posture the sibling realized-P&L rail (ar02)
+        # already enforces. The ABSENT-file path stays tripped=False (unchanged), so
+        # this is byte-identical on the healthy and cold-start paths.
+        logger.warning(
+            "autonomous: kill-switch file present but UNREADABLE (%s); failing "
+            "CLOSED — treating the rail as TRIPPED so a corrupted flag cannot "
+            "silently re-arm trading. Operator must inspect/clear %s.",
+            exc,
+            KILL_SWITCH_PATH,
+        )
         return KillSwitchState(
-            tripped=False,
+            tripped=True,
             tripped_at=None,
             cumulative_pnl_pct=0.0,
             threshold_pct=0.10,
-            reason=None,
+            reason="kill_switch_file_unreadable_fail_closed",
         )
 
 
@@ -337,6 +353,25 @@ def compute_cumulative_realized_pnl_pct(
             realized_pnl_usd += rt.realized_return * entry_notional
         nav = _account_nav_usd()
         if nav is None or nav <= 0 or not math.isfinite(nav):
+            # ar20 (ar02 NAV-None sibling): NAV is unreadable (e.g. state.db corrupt/
+            # locked while executions.jsonl — a DISTINCT file — is still readable). If
+            # we computed a NONZERO realized P&L from a populated book, returning a bare
+            # 0.0 here silently disarms the D9 drawdown rail exactly as the outer-except
+            # fail-OPEN ar02 closed: a real losing book whose NAV momentarily can't be
+            # read would run un-halted. Carry the LAST-KNOWN fraction forward (conservative
+            # — a losing book that briefly can't price its NAV stays tripped) and surface
+            # the degraded-rail audit. A cold-start/empty book legitimately has
+            # realized_pnl_usd == 0.0 and there is no loss to mask, so it stays 0.0.
+            if realized_pnl_usd != 0.0 and math.isfinite(realized_pnl_usd):
+                last_known = _read_last_known_cum_pnl()
+                _emit_killswitch_degraded_audit(
+                    RuntimeError(
+                        f"NAV unreadable (nav={nav!r}) with nonzero realized "
+                        f"P&L={realized_pnl_usd:.2f}; carrying last-known forward"
+                    ),
+                    last_known,
+                )
+                return last_known if last_known is not None else 0.0
             return 0.0
         frac = realized_pnl_usd / nav
         if not math.isfinite(frac):

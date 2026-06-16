@@ -513,6 +513,22 @@ def _normalize_exec_record(rec: dict) -> dict | None:
     is not a well-formed fill (no signed size, non-positive price, …). None
     records are skipped by the caller — never fabricated.
     """
+    # ar19: SKIP the multi-leg family-PARENT rollup record, exactly as
+    # state.portfolio_state does in both folds (cs44, _is_multileg_family_parent).
+    # MultiLegPaperReactor._build_records writes a parent ExecutionRecord with
+    # asset_class=="multi_leg", asset=underlying, fill_price=net_fill, and a NONZERO
+    # fill_size_pct (the whole family's NAV fraction) IN ADDITION to the per-leg
+    # children. Without this skip the parent derives its own side/qty from that
+    # nonzero fraction and produces a PHANTOM round-trip in join_exit_fills, on top
+    # of the real per-leg child round-trips — double-counting the family's realized
+    # P&L into compute_cumulative_realized_pnl_pct (the live ADR-0016 kill-switch
+    # basis). A phantom contribution biases the rail (a phantom gain masks a real
+    # loss → the kill-switch fails to trip). asset_class=="multi_leg" is the
+    # parent-ONLY discriminator (no real position class is "multi_leg"; the children
+    # carry "equity"/"us_option"), so this is byte-identical for every real fill.
+    if rec.get("asset_class") == "multi_leg":
+        return None
+
     rmeta = rec.get("reactor_metadata")
     if not isinstance(rmeta, dict):
         rmeta = {}
