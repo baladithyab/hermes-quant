@@ -27,8 +27,39 @@ def _amzn_pmcc() -> PMCCPosition:
 
 def test_net_debit_matches_analysis():
     pos = _amzn_pmcc()
-    # (86.90 - 4.88) * 100 = 8202
+    # (86.90 - 4.88) * 100 = 8202 — 1:1 contracts, byte-identical pre/post ar26.
     assert abs(pos.net_debit() - 8202.0) < 1.0
+
+
+def _ratio_pmcc() -> PMCCPosition:
+    """A RATIO PMCC: 2 long LEAPS, 1 short cover (long.contracts != short.contracts)."""
+    return PMCCPosition(
+        symbol="NVDA",
+        opened_at="2026-05-30T18:00:00+00:00",
+        long_leg=OptionLeg("long", "2027-12-17", 120.0, 50.0, 0.45, 2),   # 2 contracts
+        short_leg=OptionLeg("short", "2026-07-02", 180.0, 3.0, 0.40, 1),  # 1 contract
+        spot_at_open=150.0,
+    )
+
+
+def test_ar26_net_debit_values_each_leg_by_its_own_contracts():
+    """ar26: on a ratio PMCC the short credit must be scaled by the SHORT leg's
+    contracts, not the long's. Correct = 50*100*2 - 3*100*1 = 10000 - 300 = 9700.
+    The pre-fix form (50-3)*100*2 = 9400 wrongly scaled the short credit by 2."""
+    pos = _ratio_pmcc()
+    assert pos.net_debit() == 9700.0, (
+        f"ar26: ratio PMCC net_debit must value each leg by its own contracts "
+        f"(got {pos.net_debit()}, want 9700.0; the pre-fix 9400.0 mis-scaled the short credit)"
+    )
+
+
+def test_ar26_unrealized_pnl_consistent_with_mark_basis():
+    """unrealized_pnl = net_value - net_debit must use the SAME per-leg basis mark_pmcc
+    uses (short valued by short.contracts), so a ratio PMCC's P&L is unbiased."""
+    pos = _ratio_pmcc()
+    mark = mark_pmcc(pos, spot=150.0, asof=date(2026, 5, 30))
+    # net_value (per-leg) - net_debit (per-leg) must equal unrealized_pnl exactly.
+    assert mark.unrealized_pnl == round(mark.net_value - pos.net_debit(), 2)
 
 
 def test_bs_deep_itm_leaps_high_delta():
