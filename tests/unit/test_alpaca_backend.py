@@ -397,6 +397,81 @@ def test_submit_option_mleg_reject_raises() -> None:
         )
 
 
+def test_submit_option_mleg_post_cancel_partial_records_child_fills() -> None:
+    # Cancel-vs-fill race (P3-B parity with equity cancel_and_settle): the mleg
+    # poll budget elapses with the parent still WORKING; the poll cancels the
+    # parent then re-reads once. The cancel removed the unfilled remainder but the
+    # parent settles to 'partially_filled' (NOT a terminal reject status) while its
+    # child .legs carry REAL positive fills. This partial MUST be recorded — not
+    # discarded as unfilled_timeout — or a genuinely-filled options position is
+    # orphaned live (the equity sibling records ANY positive partial regardless of
+    # the non-terminal parent status).
+    short, long = _vertical_legs()
+    working = _FakeOrder(order_id="parent-race", status="new", legs=[])  # never terminal
+    child_short = _FakeOrder(
+        order_id="leg-s", status="partially_filled", filled_avg_price=1.20, filled_qty=2,
+        side=OrderSide.SELL, position_intent=PositionIntent.SELL_TO_OPEN, symbol=short.symbol,
+    )
+    child_long = _FakeOrder(
+        order_id="leg-l", status="partially_filled", filled_avg_price=0.70, filled_qty=2,
+        side=OrderSide.BUY, position_intent=PositionIntent.BUY_TO_OPEN, symbol=long.symbol,
+    )
+    # Post-cancel re-read: parent is partially_filled (non-terminal, not in
+    # REJECT_STATUSES) with child legs that demonstrably moved.
+    post_cancel = _FakeOrder(
+        order_id="parent-race", status="partially_filled", filled_avg_price=0.50, filled_qty=2,
+        legs=[child_short, child_long],
+    )
+    client = _FakeClient(
+        submit_result=working, poll_order=working, post_cancel_order=post_cancel
+    )
+    res = _backend(client).submit_option_mleg(
+        (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-race"
+    )
+    # The parent was cancelled on timeout (P1-C) ...
+    assert client.cancel_calls == ["parent-race"]
+    # ... but the realized child partial is RECORDED, not collapsed to a no-fill.
+    assert res.status != "unfilled_timeout"
+    assert res.is_fill  # parent moved a position
+    assert res.order_id == "parent-race"
+    assert len(res.legs) == 2
+    fills_by_sym = {f.symbol: f for f in res.legs}
+    assert fills_by_sym[short.symbol].filled_qty == pytest.approx(-2.0)  # sell -> -
+    assert fills_by_sym[long.symbol].filled_qty == pytest.approx(2.0)  # buy -> +
+    assert fills_by_sym[short.symbol].filled_avg_price == pytest.approx(1.20)
+    assert res.net_fill_price == pytest.approx(0.50)
+
+
+def test_submit_option_mleg_post_cancel_clean_unfilled_stays_timeout() -> None:
+    # Non-regression for the genuinely-empty case: a post-cancel parent that is
+    # non-terminal with NO child fills must STILL collapse to unfilled_timeout
+    # (a clean 0-fill — no fabricated position, no orphaned working order).
+    short, long = _vertical_legs()
+    working = _FakeOrder(order_id="parent-clean", status="new", legs=[])
+    # Post-cancel re-read: still non-terminal, child legs present but zero-fill.
+    child_short = _FakeOrder(
+        order_id="leg-s", status="canceled", filled_avg_price=None, filled_qty=0,
+        side=OrderSide.SELL, position_intent=PositionIntent.SELL_TO_OPEN, symbol=short.symbol,
+    )
+    child_long = _FakeOrder(
+        order_id="leg-l", status="canceled", filled_avg_price=None, filled_qty=0,
+        side=OrderSide.BUY, position_intent=PositionIntent.BUY_TO_OPEN, symbol=long.symbol,
+    )
+    post_cancel = _FakeOrder(
+        order_id="parent-clean", status="partially_filled", legs=[child_short, child_long],
+    )
+    client = _FakeClient(
+        submit_result=working, poll_order=working, post_cancel_order=post_cancel
+    )
+    res = _backend(client).submit_option_mleg(
+        (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-clean"
+    )
+    assert client.cancel_calls == ["parent-clean"]
+    assert res.status == "unfilled_timeout"
+    assert res.filled_qty == 0.0
+    assert not res.is_fill
+
+
 def test_submit_option_mleg_requires_two_legs() -> None:
     one = OptionLeg(symbol=_occ("150", "C"), side="buy", position_intent="buy_to_open")
     client = _FakeClient(submit_result=_FakeOrder())

@@ -398,8 +398,19 @@ class AlpacaBackend:
                 time.sleep(self._poll_interval_s)
                 final = self._refresh(client, parent_id)
                 fstatus = str(getattr(final, "status", "") or "").lower()
+                # P3-B (parity with _alpaca_exec.cancel_and_settle): the cancel
+                # only removes the UNfilled remainder, so a cancel-vs-fill race can
+                # leave the parent reading back NON-terminal (e.g.
+                # 'partially_filled') in the brief window before its status settles
+                # — yet its child .legs already carry REAL fills. Record ANY
+                # realized child partial regardless of the (non-terminal) parent
+                # status; never discard a parent that demonstrably moved a position
+                # (else a genuinely-filled mleg is orphaned live). Only a parent
+                # with no child fill at all falls through to unfilled_timeout.
                 if final is not None and (
-                    fstatus == "filled" or fstatus in _alpaca_exec.REJECT_STATUSES
+                    fstatus == "filled"
+                    or fstatus in _alpaca_exec.REJECT_STATUSES
+                    or self._any_child_filled(final)
                 ):
                     return final, fstatus
                 return None, "unfilled_timeout"
@@ -410,6 +421,23 @@ class AlpacaBackend:
                 raise AlpacaSubmitError(
                     f"get_order_by_id({parent_id}) failed during mleg poll: {exc}"
                 ) from exc
+
+    @staticmethod
+    def _any_child_filled(parent: Any) -> bool:
+        """True iff any child ``.leg`` of an mleg parent carries a positive fill.
+
+        Mirrors ``_alpaca_exec.extract_fill``'s positive-fill test (price>0 AND
+        qty>0) but applied to the child legs — an mleg parent carries no single avg
+        price, so a cancel-vs-fill race is detected on the children. Used to decide
+        whether a NON-terminal post-cancel parent re-read still represents a real
+        realized partial that must be recorded (P3-B), not discarded as a no-fill.
+        """
+        for child in list(getattr(parent, "legs", None) or []):
+            price = _alpaca_exec.to_float(getattr(child, "filled_avg_price", None))
+            qty = _alpaca_exec.to_float(getattr(child, "filled_qty", None))
+            if price is not None and price > 0 and qty is not None and qty > 0:
+                return True
+        return False
 
     def _build_leg_fills(
         self, parent: Any, option_legs: tuple[Any, ...]
