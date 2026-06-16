@@ -100,3 +100,46 @@ def test_kill_switch_clear_rejects_wrong_scope_token(gov_paths: Path) -> None:
     bad_token = approvals.grant_token("promotion", "anything", granted_by="admin")
     with pytest.raises(NoApprovalError):
         kill_switch.clear(bad_token)
+
+
+def test_ar36_clear_rejects_expired_token_and_does_not_spend_valid_grant(gov_paths: Path) -> None:
+    """ar36: clear() must BIND the PASSED token. An EXPIRED token object must NOT clear the
+    rail just because SOME other valid grant exists for the same (scope, target_ref); and
+    that genuinely-valid grant must survive UNSPENT (the one-shot single-owner invariant)."""
+    kill_switch.fire("r", "s")
+    # An already-expired token for the right scope/target...
+    expired = approvals.grant_token(
+        "kill_switch_clear", "state.json", granted_by="admin", ttl_minutes=-1
+    )
+    # ...plus an unrelated genuinely-valid grant for the SAME scope/target.
+    valid = approvals.grant_token("kill_switch_clear", "state.json", granted_by="admin")
+
+    with pytest.raises(NoApprovalError):
+        kill_switch.clear(expired)
+    # The rail must STILL be halted (the expired token did not clear it).
+    assert kill_switch.is_halted() is True
+    # And the genuinely-valid grant must remain UNSPENT (re-usable for a real clear).
+    still_valid = approvals.require_human_token("kill_switch_clear", "state.json")
+    assert still_valid.token_id == valid.token_id
+    # A real clear with the valid token then works (and consumes it).
+    kill_switch.clear(valid)
+    assert kill_switch.is_halted() is False
+
+
+def test_ar37_forged_token_id_does_not_disarm_rail_on_disk(gov_paths: Path) -> None:
+    """ar37: consume_token must run BEFORE the cleared state is written. A forged token_id
+    (passes the scope check but is not a granted id) must leave the rail HALTED on disk —
+    not flip halt=False and only then raise."""
+    import dataclasses
+
+    kill_switch.fire("r", "s")
+    valid = approvals.grant_token("kill_switch_clear", "state.json", granted_by="admin")
+    # A token object that is the valid grant EXCEPT its token_id is forged.
+    forged = valid.model_copy(update={"token_id": "ap_FORGED_NEVER_GRANTED"}) \
+        if hasattr(valid, "model_copy") else dataclasses.replace(valid, token_id="ap_FORGED_NEVER_GRANTED")
+
+    with pytest.raises(NoApprovalError):
+        kill_switch.clear(forged)
+    # The rail MUST still be halted on disk (the forged clear did not silently disarm it).
+    assert kill_switch.is_halted() is True
+    assert json.loads(kill_switch.STATE_JSON_PATH.read_text())["halt"] is True
