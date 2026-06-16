@@ -431,6 +431,7 @@ class PaperReactor:
                 fill_price, slippage_breakdown = apply_slippage(
                     decision_price=decision_price,
                     target_pct=fill_size_pct,
+                    current_position_pct=self._current_position_pct(proposal),
                     asof_execution=now,
                     proposal_id=proposal.proposal_id,
                     asset_class=proposal.asset_class,
@@ -809,6 +810,41 @@ class PaperReactor:
             "cap_scale_factor": clipped.scale_factor,
         }
         return None, clipped.portfolio_target_pct, cap_metadata
+
+    def _current_position_pct(self, proposal: Any) -> float:
+        """Signed CURRENT position of proposal.symbol as a NAV fraction (ADR-0070).
+
+        Read so the slippage model can key its cost DIRECTION off the traded
+        delta (target - current), not the absolute target: a fill that REDUCES
+        exposure (trim a long / partially cover a short) is the opposite side
+        from the position it reduces, so the trader-adverse slip is reversed.
+
+        Resolves the account the SAME way the bus-append and cap paths do
+        (reactor_metadata.account_id override, else the "paper-default" sentinel)
+        so we read the correct book. Mirrors _portfolio_cap_clip's NAV-fraction
+        read (ADR-0041 §D7: positions are stored as signed NAV-fraction).
+
+        Silence-by-default: any state read failure (missing db, locked, schema
+        drift) returns 0.0, which makes apply_slippage fall back to the legacy
+        target-sign behavior rather than blocking the fill. A symbol with no open
+        position is also 0.0 (a genuine opening fill).
+        """
+        try:
+            from hermes_quant.state.portfolio_state import get_portfolio_state
+
+            rmeta = getattr(proposal, "reactor_metadata", None) or {}
+            account_id = (
+                (rmeta.get("account_id") if isinstance(rmeta, dict) else None)
+                or "paper-default"
+            )
+            positions = get_portfolio_state().get_positions(account_id)
+            pos = positions.get((proposal.asset_class, proposal.symbol))
+            if pos is None:
+                return 0.0
+            qty = float(pos.quantity)
+            return qty if math.isfinite(qty) else 0.0
+        except Exception:  # noqa: BLE001 — silence-by-default; never block a fill
+            return 0.0
 
     @staticmethod
     def _extract_decision_price(proposal: Any) -> float:

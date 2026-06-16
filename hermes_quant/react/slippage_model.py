@@ -25,10 +25,13 @@ Determinism: a hash of (proposal_id, asof_execution) seeds the per-fill RNG, so
 two replays of the same fill produce the same slippage. Replay equality (ADR-0009
 §replay-equality) holds even with stochastic slippage.
 
-Sign conventions:
-  Long fill (target > 0):  pays POSITIVE slippage → fill_price > decision_price.
-  Short fill (target < 0): pays POSITIVE slippage → fill_price < decision_price
-                           (you receive fewer dollars per share you sold short).
+Sign conventions (keyed off the TRADE DELTA = target_pct - current_position_pct,
+NOT the absolute target — a trim of a long is a SELL even though the target stays
+positive; ADR-0091 Option E makes the reactors pass the absolute post-fill target):
+  Buy  (delta > 0; open/add long OR cover a short): pays POSITIVE slippage →
+                           fill_price > decision_price (you pay up to buy).
+  Sell (delta < 0; trim/close a long OR add to a short): pays POSITIVE slippage →
+                           fill_price < decision_price (you receive fewer dollars).
   Either way, the trader is the price-taker; slippage is a cost.
 """
 
@@ -142,6 +145,7 @@ def apply_slippage(
     target_pct: float,
     asof_execution: str,
     proposal_id: str,
+    current_position_pct: float = 0.0,
     asset_class: str = "equity",
     config: PaperSlippageConfig | None = None,
     is_late_session: bool = False,
@@ -150,12 +154,19 @@ def apply_slippage(
 
     Args:
         decision_price: bar close at decision time. Must be > 0.
-        target_pct: signed position target as fraction of NAV. Sign drives
-            the slippage direction. Magnitude drives the impact term.
+        target_pct: signed POST-FILL position target as fraction of NAV
+            (ADR-0091 Option E absolute target, NOT the traded delta).
         asof_execution: ISO UTC timestamp of the fill, used as part of the
             deterministic RNG seed.
         proposal_id: the proposal ID that generated the fill, used as part
             of the deterministic RNG seed.
+        current_position_pct: signed CURRENT position as fraction of NAV,
+            BEFORE this fill. The traded delta is ``target_pct -
+            current_position_pct``; the SIGN of that delta — not the sign of
+            the absolute target — determines whether this fill buys (pays up,
+            fill > decision) or sells (receives less, fill < decision).
+            Defaults to 0.0, which makes a genuine opening fill byte-identical
+            to the prior target-sign behavior (delta == target).
         asset_class: "equity" | "crypto". Selects per-class config.
         config: explicit config override; if None, uses the asset_class default.
         is_late_session: if True, the auction-premium term is added. The
@@ -171,10 +182,13 @@ def apply_slippage(
             spread_bps, impact_bps, latency_drift_bps, auction_bps,
             total_bps_pre_cap, total_bps (post-cap).
 
-    Sign behavior:
-        target_pct > 0 (long):  fill_price > decision_price (paid more)
-        target_pct < 0 (short): fill_price < decision_price (received less)
-        target_pct = 0:         fill_price = decision_price (no fill)
+    Sign behavior (keyed off the TRADE DELTA = target_pct - current_position_pct):
+        delta > 0 (a BUY — open/add long, or cover a short):
+            fill_price > decision_price (paid more)
+        delta < 0 (a SELL — trim/close a long, or add to a short):
+            fill_price < decision_price (received less)
+        delta = 0 (no net trade):
+            fill_price = decision_price (no fill)
     """
     # NaN-fail-CLOSED (deep-review 2026-06-07): reject non-finite decision_price
     # too, not just <= 0. A NaN/inf would pass `<= 0` (NaN <= 0 is False) and
@@ -184,7 +198,19 @@ def apply_slippage(
 
     cfg = config if config is not None else config_for_asset_class(asset_class)
 
-    if target_pct == 0.0:
+    # NaN/inf-fail-CLOSED on the position input: a non-finite current_position_pct
+    # would poison the trade delta (NaN defeats every comparison; inf overflows
+    # the fill price). Degrade to 0.0 — the legacy target-sign behavior — rather
+    # than booking a NaN/inf fill price into the P&L ledger.
+    if not math.isfinite(current_position_pct):
+        current_position_pct = 0.0
+
+    # Traded delta = post-fill target minus the current position. The SIGN of the
+    # delta is the real transaction side (a trim of a long is a SELL even though
+    # the target stays positive); the MAGNITUDE is how much NAV actually trades.
+    trade_delta = target_pct - current_position_pct
+
+    if trade_delta == 0.0:
         return decision_price, {
             "spread_bps": 0.0,
             "impact_bps": 0.0,
@@ -199,11 +225,13 @@ def apply_slippage(
     # Spread-cross: fixed half-spread, paid every fill.
     spread_bps = cfg.spread_cross_bps
 
-    # Impact: linear in |target_pct| as a proxy for "% of NAV traded."
+    # Impact: linear in |trade_delta| as a proxy for "% of NAV traded."
     # impact_bps_per_pct_nav is calibrated so a 20% NAV equity fill yields
-    # ~10 bps impact at the default 0.5 bps/%. For more sophisticated
+    # ~10 bps impact at the default 0.5 bps/%. Keying off |trade_delta| (not the
+    # absolute target) means a small trim of a large position is charged only the
+    # impact of the small delta actually traded. For more sophisticated
     # ADV-normalized impact, see ADR-0070 §D70.5 (deferred).
-    size_pct = abs(target_pct) if target_pct != 0 else cfg.default_target_pct
+    size_pct = abs(trade_delta) if trade_delta != 0 else cfg.default_target_pct
     impact_bps = cfg.impact_bps_per_pct_nav * (size_pct * 100.0)
     # impact_bps_per_pct_nav is bps per 1% (=0.01); size_pct is a fraction
     # like 0.20 (=20%), so we multiply by 100 to get the 20× the per-1%
@@ -221,9 +249,11 @@ def apply_slippage(
     total_bps_pre_cap = spread_bps + impact_bps + latency_drift_bps + auction_bps
     total_bps = min(total_bps_pre_cap, cfg.max_total_bps)
 
-    # Sign of slippage cost: trader adverse regardless of direction.
-    # For a long, fill > decision; for a short, fill < decision.
-    direction_sign = 1.0 if target_pct > 0 else -1.0
+    # Sign of slippage cost: trader adverse regardless of direction, keyed off
+    # the TRADE DELTA (the real side), not the absolute target. A BUY (delta > 0:
+    # open/add long OR cover a short) pays up -> fill > decision; a SELL (delta < 0:
+    # trim/close a long OR add to a short) receives less -> fill < decision.
+    direction_sign = 1.0 if trade_delta > 0 else -1.0
     fill_price = decision_price * (1.0 + direction_sign * (total_bps / 1e4))
 
     return fill_price, {
