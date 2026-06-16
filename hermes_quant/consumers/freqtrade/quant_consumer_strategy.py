@@ -262,7 +262,16 @@ class HermesQuantConsumer(IStrategy):
             wallet_balance = self.wallets.get_total_stake_amount()
         except Exception:
             wallet_balance = max_stake
-        return min(max_stake, wallet_balance * target)
+        intended = wallet_balance * target
+        # Silence-by-default (ADR-0004): if the quant's intended notional is a positive
+        # value below the exchange minimum, it CANNOT be honored without breaching the
+        # deterministic quarter-Kelly sizing (kelly.py action_step/max_position). Per the
+        # freqtrade contract a returned positive stake < min_stake is silently clamped UP
+        # to min_stake — a dishonest OVER-SIZE. Return 0 (honest no-trade) instead. None
+        # min_stake means the exchange reports no minimum, so no clamp applies.
+        if min_stake is not None and 0 < intended < min_stake:
+            return 0
+        return min(max_stake, intended)
 
     def confirm_trade_entry(
         self, pair, order_type, amount, rate, time_in_force, current_time, entry_tag, side, **kwargs
