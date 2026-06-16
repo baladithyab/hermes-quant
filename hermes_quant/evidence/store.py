@@ -3,8 +3,12 @@
 
 Layout::
 
-    ~/.hermes/quant/evidence_store/year=YYYY/month=MM/kind=<kind>/part-NNNN.parquet
+    ~/.hermes/quant/evidence_store/year=YYYY/month=MM/kind=<kind>/part-<id>.parquet
     ~/.hermes/quant/evidence_store/evidence_index.db   (WAL-mode SQLite)
+
+Part files are named deterministically from the record ``id`` (one record per
+file) so that two cross-process appends of different records can never collide
+on the same parquet path or the same ``.tmp`` staging path.
 
 Append-only. Updates emit a new record with ``supersedes=<old_uuid>``.
 50GB local cap (overridable via ``HERMES_QUANT_EVIDENCE_DIR`` env var).
@@ -19,7 +23,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -134,13 +138,22 @@ class EvidenceStore:
             / f"kind={record.kind}"
         )
 
-    def _next_part_file(self, partition_dir: Path) -> Path:
+    def _part_file_for_record(self, partition_dir: Path, record: EvidenceRecord) -> Path:
+        """Deterministic per-record part-file name (ADR-0033 D3).
+
+        Naming the part file from the record's deterministic ``id`` (one record
+        per file) instead of a glob-derived sequential ``part-NNNN`` makes the
+        write cross-process safe: two DIFFERENT-id records can never resolve to
+        the same parquet path or the same ``.tmp`` staging path, so the prior
+        glob-then-replace TOCTOU (both racing appends globbing the partition
+        before either ``os.replace`` landed, then both choosing
+        ``part-0001.parquet`` + the shared ``part-0001.parquet.tmp``) is gone.
+        Two SAME-id appends resolve to the same name, which is exactly the
+        idempotent-dedup case (collapsed before write by the index pre-check and
+        again by ``INSERT OR IGNORE``).
+        """
         partition_dir.mkdir(parents=True, exist_ok=True)
-        existing = sorted(partition_dir.glob("part-*.parquet"))
-        if not existing:
-            return partition_dir / "part-0001.parquet"
-        last = int(existing[-1].stem.split("-")[1])
-        return partition_dir / f"part-{last + 1:04d}.parquet"
+        return partition_dir / f"part-{record.id}.parquet"
 
     # ---- write ----
     def append(self, record: EvidenceRecord) -> None:
@@ -159,14 +172,28 @@ class EvidenceStore:
                     return
             self._check_size_cap()
             partition_dir = self._partition_path(record)
-            target = self._next_part_file(partition_dir)
+            # Deterministic per-id part file: cross-process safe (no glob race,
+            # no shared .tmp). One record per file -> row_offset is always 0.
+            target = self._part_file_for_record(partition_dir, record)
             row_data = record.model_dump(mode="json")
             # Convert to PyArrow table.
             table = pa.Table.from_pylist([row_data])
-            # Write to a temp file then atomic-rename for crash safety.
-            tmp = target.with_suffix(".parquet.tmp")
-            pq.write_table(table, tmp)
-            os.replace(tmp, target)
+            # Write to a per-write-unique temp file then atomic-rename for crash
+            # safety. The uuid4 suffix means two concurrent appends (even of the
+            # same id) never share a .tmp path, so an os.replace can never
+            # consume another writer's staging file out from under it.
+            tmp = target.with_name(f"{target.name}.{uuid4().hex}.tmp")
+            try:
+                pq.write_table(table, tmp)
+                os.replace(tmp, target)
+            finally:
+                # If pq.write_table partially wrote then raised, don't leak the
+                # staging file. os.replace consumes tmp on success, so this only
+                # fires on the error path.
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
             with self._index_conn() as conn:
                 conn.execute(
                     "INSERT OR IGNORE INTO evidence_index (id, kind, symbol, source, "
@@ -202,11 +229,29 @@ class EvidenceStore:
             # The directory tree contains ``kind=<kind>`` segments which would
             # otherwise be auto-detected as partition columns and collide with
             # the ``kind`` column inside the file.
-            pf = pq.ParquetFile(part_path)
+            try:
+                pf = pq.ParquetFile(part_path)
+            except (FileNotFoundError, OSError):
+                # Index row points at a part file that is missing on disk (e.g.
+                # a torn write or a partition that was relocated). Fail closed:
+                # return None rather than crash a downstream lookahead check.
+                return None
             table = pf.read()
             data = table.to_pylist()
             if 0 <= row[1] < len(data):
-                return data[row[1]]
+                candidate = data[row[1]]
+                # Defense in depth against any part-file/index divergence: the
+                # row the index points at MUST carry the requested id. A
+                # mismatch (the historical glob-then-replace swap) would feed the
+                # ADR-0004/ADR-0033 no-lookahead gate the WRONG record's
+                # available_at, so we fail closed instead of returning a swap.
+                if candidate.get("id") == sid:
+                    return candidate
+                # Mismatch: scan the file for the requested id before giving up.
+                for r in data:
+                    if r.get("id") == sid:
+                        return r
+                return None
             return None
 
     def supersedes_chain(self, evidence_id: UUID | str) -> list[dict[str, Any]]:

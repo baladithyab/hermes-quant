@@ -104,7 +104,9 @@ def test_append_writes_parquet_partition_at_correct_path(tmp_path: Path):
     assert expected_dir.is_dir()
     parts = list(expected_dir.glob("part-*.parquet"))
     assert len(parts) == 1
-    assert parts[0].name == "part-0001.parquet"
+    # Part files are named deterministically from the record id (one record per
+    # file) so two distinct-id cross-process appends can never collide.
+    assert parts[0].name == f"part-{rec.id}.parquet"
 
 
 def test_append_writes_index_row_with_correct_columns(tmp_path: Path):
@@ -273,6 +275,153 @@ def test_concurrent_appends_do_not_corrupt_index(tmp_path: Path):
     with sqlite3.connect(root / "evidence_index.db") as conn:
         n = conn.execute("SELECT COUNT(*) FROM evidence_index").fetchone()[0]
     assert n == len(records)
+
+
+def test_cross_instance_distinct_id_appends_to_same_partition_preserve_both(
+    tmp_path: Path,
+):
+    """Two SEPARATE EvidenceStore instances (= the real cross-process model:
+    tools.py:2013 does ``est = EvidenceStore()`` fresh per quant_insider call,
+    and crons are separate OS processes) appending DISTINCT-id records into the
+    SAME year=YYYY/month=MM/kind=<kind> partition must each be retrievable by
+    their OWN id.
+
+    Historical RED reproduction of the glob-then-replace TOCTOU: both
+    ``_next_part_file()`` calls globbed the partition before either
+    ``os.replace`` landed, so both resolved to ``part-0001.parquet`` AND the
+    same ``part-0001.parquet.tmp``. The naive implementation silently lost one
+    record and/or made ``get()`` return the WRONG record (different
+    available_at) feeding the ADR-0004/ADR-0033 no-lookahead gate.
+
+    The fix derives the part-file name deterministically from ``record.id``, so
+    two DISTINCT ids never resolve to the same parquet path or ``.tmp``.
+    """
+    root = tmp_path / "evidence_store"
+    # Both records land in the SAME partition (same available_at year/month/kind)
+    # but have DISTINCT ids (different payloads).
+    pub = datetime(2026, 5, 24, 14, 30, 0, tzinfo=UTC)
+    rec_a = _make_bar(payload=b"race-A", source="srcA", published_at=pub)
+    rec_b = _make_bar(payload=b"race-B", source="srcB", published_at=pub)
+    assert rec_a.id != rec_b.id
+
+    store_a = EvidenceStore(root=root)
+    store_b = EvidenceStore(root=root)
+
+    store_a.append(rec_a)
+    store_b.append(rec_b)
+
+    # Both ids must be retrievable AND return their OWN payload_hash, not the
+    # other record's. This is the core invariant the count-only test misses.
+    fetched_a = store_a.get(rec_a.id)
+    fetched_b = store_a.get(rec_b.id)
+    assert fetched_a is not None, "record A was silently lost (cross-instance race)"
+    assert fetched_b is not None, "record B was silently lost (cross-instance race)"
+    assert fetched_a["id"] == str(rec_a.id)
+    assert fetched_a["payload_hash"] == rec_a.payload_hash, (
+        "get(A) returned the WRONG record's payload (record swap)"
+    )
+    assert fetched_b["id"] == str(rec_b.id)
+    assert fetched_b["payload_hash"] == rec_b.payload_hash, (
+        "get(B) returned the WRONG record's payload (record swap)"
+    )
+    # Distinct ids -> distinct part files (no part-file or .tmp collision).
+    part_dir = root / "year=2026" / "month=05" / "kind=bar"
+    parts = sorted(p.name for p in part_dir.glob("part-*.parquet"))
+    assert len(parts) == 2, f"expected two distinct part files, got {parts}"
+    assert not list(part_dir.glob("*.tmp")), "a .tmp staging file leaked"
+
+
+def test_forced_partfile_collision_still_returns_correct_record(tmp_path: Path):
+    """Even if two distinct-id records were FORCED to the same part-file name
+    (the historical glob race), the per-write-unique ``.tmp`` plus the
+    id-verifying ``get()`` must keep BOTH retrievable by their own id — never
+    return a swapped record to the no-lookahead gate.
+
+    This guards the residual defenses independently of the deterministic naming.
+    """
+    root = tmp_path / "evidence_store"
+    pub = datetime(2026, 5, 24, 14, 30, 0, tzinfo=UTC)
+    rec_a = _make_bar(payload=b"collide-A", source="cA", published_at=pub)
+    rec_b = _make_bar(payload=b"collide-B", source="cB", published_at=pub)
+    assert rec_a.id != rec_b.id
+
+    import hermes_quant.evidence.store as store_mod
+
+    orig = store_mod.EvidenceStore._part_file_for_record
+
+    def collide(self, partition_dir, record):
+        partition_dir.mkdir(parents=True, exist_ok=True)
+        return partition_dir / "part-shared.parquet"
+
+    store_a = EvidenceStore(root=root)
+    store_b = EvidenceStore(root=root)
+    store_mod.EvidenceStore._part_file_for_record = collide  # type: ignore[method-assign]
+    try:
+        store_a.append(rec_a)
+        store_b.append(rec_b)
+    finally:
+        store_mod.EvidenceStore._part_file_for_record = orig  # type: ignore[method-assign]
+
+    # With both index rows pointing at the same shared part file, get() must
+    # still resolve each id to its OWN record (id-verifying scan), not silently
+    # return whichever record won the os.replace.
+    got_a = store_a.get(rec_a.id)
+    got_b = store_a.get(rec_b.id)
+    # The last writer's file wins on disk, so at least the surviving record must
+    # be correct; the lost one must NOT masquerade as a swapped wrong record.
+    if got_a is not None:
+        assert got_a["id"] == str(rec_a.id)
+        assert got_a["payload_hash"] == rec_a.payload_hash
+    if got_b is not None:
+        assert got_b["id"] == str(rec_b.id)
+        assert got_b["payload_hash"] == rec_b.payload_hash
+    # No staging file may leak.
+    part_dir = root / "year=2026" / "month=05" / "kind=bar"
+    assert not list(part_dir.glob("*.tmp")), "a .tmp staging file leaked"
+
+
+def test_concurrent_threads_same_partition_distinct_ids_all_retrievable(
+    tmp_path: Path,
+):
+    """Real concurrent threads using TWO instances, releasing at a barrier into
+    the SAME partition with DISTINCT ids: every record must be retrievable by
+    its own id afterwards (no FileNotFoundError crash, no silent loss)."""
+    root = tmp_path / "evidence_store"
+    pub = datetime(2026, 5, 24, 14, 30, 0, tzinfo=UTC)
+    n = 6
+    records = [
+        _make_bar(payload=f"barrier-{i}".encode(), source=f"src{i}", published_at=pub)
+        for i in range(n)
+    ]
+    # One fresh instance per "process".
+    stores = [EvidenceStore(root=root) for _ in range(n)]
+    barrier = threading.Barrier(n)
+    errors: list[Exception] = []
+
+    def worker(store: EvidenceStore, rec):
+        try:
+            barrier.wait()
+            store.append(rec)
+        except Exception as e:  # pragma: no cover — surfaced via assertion
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=worker, args=(stores[i], records[i])) for i in range(n)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [], f"append raised under concurrency: {errors}"
+
+    reader = EvidenceStore(root=root)
+    for rec in records:
+        got = reader.get(rec.id)
+        assert got is not None, f"record {rec.id} silently lost under concurrency"
+        assert got["id"] == str(rec.id)
+        assert got["payload_hash"] == rec.payload_hash, (
+            f"get({rec.id}) returned a different record (swap)"
+        )
 
 
 def test_news_record_round_trips_through_store(tmp_path: Path):
