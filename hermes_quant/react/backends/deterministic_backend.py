@@ -34,6 +34,7 @@ read used by every other reactor seam.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from ..backend import (
@@ -133,6 +134,18 @@ class DeterministicBackend:
         BP (beyond a penny-rounding epsilon). A non-positive ``required_usd`` (a
         credit / zero-debit) is always allowed — credit collateral is the gate's job.
         """
+        # ar31: a NON-FINITE required notional must fail CLOSED. nan/inf defeat every
+        # comparison below (`nan <= 0` is False -> skips the credit early-return;
+        # `nan > bp + eps` is False -> skips the insufficiency raise), so a NaN notional
+        # would be ADMITTED past this anti-over-leverage BP rail and book a NaN-priced
+        # fill. This is the LIVE deterministic-equity path (HERMES_QUANT_DETERMINISTIC_
+        # EQUITY=1). A notional we cannot verify is finite is unverifiable against BP, so
+        # refuse it as a backend fault (mirrors the unknown-BP fail-closed below).
+        if not math.isfinite(required_usd):
+            raise BackendUnavailableError(
+                f"deterministic-backend: non-finite required notional ({required_usd!r}) "
+                f"for {what}; refusing the fill (fail-closed - cannot verify buying power)"
+            )
         if required_usd <= 0:
             return
         bp = self.buying_power()

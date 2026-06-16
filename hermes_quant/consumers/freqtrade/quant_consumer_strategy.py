@@ -31,6 +31,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import math
 import os
 from contextlib import contextmanager
 from datetime import datetime
@@ -231,7 +232,12 @@ class HermesQuantConsumer(IStrategy):
         if signal is None:
             return 0
         target = abs(float(signal.get("target_position_pct", 0.0)))
-        if target <= 0:
+        # ar31: a NON-FINITE target sizes the FULL allowed stake instead of silencing.
+        # float() does not catch nan/inf, and `target <= 0` is False for nan, so the
+        # guard below is bypassed and `min(max_stake, wallet * nan)` returns max_stake
+        # (and `min(max_stake, inf)` likewise) — a sizing fail-OPEN off an externally-
+        # writable signals.jsonl bus. Treat non-finite as a zero-size silence.
+        if not math.isfinite(target) or target <= 0:
             return 0
         try:
             wallet_balance = self.wallets.get_total_stake_amount()

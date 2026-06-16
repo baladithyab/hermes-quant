@@ -50,7 +50,15 @@ def _yf_forward_return(symbol: str, asof: date) -> float | None:
         close = close.iloc[:, 0]
     close = close.dropna()
     import pandas as pd
-    entry = close.index[close.index >= pd.Timestamp(asof)]
+    # ar29: enter at the NEXT bar STRICTLY AFTER asof, not the same-day bar. The asof is
+    # the signal's PUBLICATION time; using `>= asof` picks the bar ON asof when one
+    # exists, scoring an intraday-published signal against close[D] (the publication-day
+    # move it could not have captured) — a same-bar LOOKAHEAD. The consuming module's
+    # contract is explicit (catalyst/profitability.py:11-12, graph_mining.py:278: "the
+    # NEXT bar after asof, lookahead-honest"). `>` makes the entry the first tradeable
+    # bar after publication, matching that contract; this forward return drives the live
+    # CONSUMER_TREND_CONFIDENCE_HAIRCUT raise/prune decision, so the bias is load-bearing.
+    entry = close.index[close.index > pd.Timestamp(asof)]
     if len(entry) == 0:
         return None
     entry_px = float(close.loc[entry[0]])
