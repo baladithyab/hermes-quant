@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from hermes_quant.governance.analyst_admission import (
+    MIN_PROMOTABLE_DSR,
     AnalystAdmissionDecision,
     admit_to_committee,
     evaluate_analyst_admission,
@@ -37,7 +38,6 @@ from hermes_quant.governance.analyst_admission import (
     save_prior_best_dsr,
     score_analyst_oos,
 )
-
 
 # ---------------------------------------------------------------------------
 # the GATE contract — mirrors factors.weight_proposer.evaluate_against_holdout
@@ -85,11 +85,31 @@ def test_not_admitted_when_not_plateau_stable_even_if_beats_prior():
 
 def test_first_run_prior_best_neg_inf_admits_any_stable_positive():
     """First-ever candidate: prior_best defaults to -inf, so any plateau-stable
-    finite DSR strictly beats it (mirrors load_prior_best_dsr missing -> -inf)."""
+    DSR at/above the absolute floor strictly beats it (mirrors load_prior_best_dsr
+    missing -> -inf)."""
     d = evaluate_analyst_admission(
         "first", holdout_dsr=0.55, prior_best_dsr=float("-inf"), plateau_stable=True
     )
     assert d.admitted is True
+
+
+def test_first_run_no_edge_analyst_held_despite_neg_inf_baseline():
+    """RED for the missing absolute-DSR floor (analyst_admission.py admitted).
+
+    On the first run prior_best is -inf, so a NO-EDGE / losing analyst (near-0 DSR)
+    strictly beats it; a CONSISTENT loser is also plateau-stable. Before the fix this
+    admitted a guaranteed-loser analyst to the committee. The gate MUST reject any
+    candidate whose DSR is below the no-edge midpoint (MIN_PROMOTABLE_DSR), regardless
+    of the -inf baseline — mirroring the factor eval-gate floor."""
+    d = evaluate_analyst_admission(
+        "no_edge",
+        holdout_dsr=MIN_PROMOTABLE_DSR - 0.01,
+        prior_best_dsr=float("-inf"),
+        plateau_stable=True,
+    )
+    assert d.beats_prior_best is True
+    assert d.plateau_stable is True
+    assert d.admitted is False  # below the absolute floor -> held
 
 
 # ---------------------------------------------------------------------------

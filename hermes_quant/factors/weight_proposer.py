@@ -35,6 +35,15 @@ WEIGHT_CAP: float = 1.0          # a factor's candidate weight is clamped to [0,
 WEIGHT_FLOOR: float = 0.0        # rejected → silence-toward-0.
 MAX_STEP_PER_CYCLE: float = 0.10  # bounded per-cycle change (SkillOpt textual learning-rate analog).
 MIN_OBSERVATIONS: int = 30       # DSR is meaningless below this (dsr.py raises < 30); mirror it here.
+# Absolute promotability floor on the held-out DSR (ADR-0080 §D80.3). The eval gate's
+# checkpoint-fallback baseline is -inf on the first run (load_prior_best_dsr missing -> -inf),
+# so STRICTLY-beats-prior-best alone admits ANY finite DSR — including a consistent LOSER whose
+# n_trials=1 DSR underflows toward 0.0 (Φ of an extreme-negative z) and which is plateau-stable
+# (a consistent loser has low cross-fold Sharpe CV + sign-consistent folds, so the robustness
+# check does NOT reject it). 0.5 is the no-edge midpoint of the n_trials=1 PSR (Φ(0) for a
+# zero-Sharpe set): a POSITIVE-Sharpe edge is required to clear it. Without this floor the cron
+# would write advisory candidates for a guaranteed money-loser and ratchet the baseline to ~0.
+MIN_PROMOTABLE_DSR: float = 0.5
 # Tier → target weight (the proposal direction). premium gets the most headroom; rejected → 0.
 _TIER_TARGET: dict[str, float] = {
     "premium": 1.00,
@@ -365,6 +374,11 @@ def evaluate_against_holdout(
       (2) STRICTLY beats prior-best on held-out: holdout_dsr > prior_best_dsr (checkpoint-fallback —
           if not, revert: the returned set keeps proposals but eval_passed=False so the operator
           does NOT promote, and the set is appended to the rejected buffer);
+      (2b) absolute floor: holdout_dsr >= MIN_PROMOTABLE_DSR (the no-edge midpoint). On the FIRST
+          run prior_best is -inf, so (2) alone admits ANY finite DSR — including a consistent
+          LOSER (negative Sharpe -> DSR ~ 0.0) that is plateau-stable. The floor requires a
+          positive-Sharpe edge regardless of the baseline (without it the cron would write
+          advisory candidates for a guaranteed money-loser and ratchet the baseline to ~0);
       (3) robustness-not-peak: plateau_stable is True;
       (4) bounded: every proposed_weight in [FLOOR, CAP] (asserted; a violation is a hard error).
     Propose-only (5) is structural: this function never applies anything; it only annotates.
@@ -384,7 +398,13 @@ def evaluate_against_holdout(
             )
 
     beats_prior_best = holdout_dsr > prior_best_dsr   # (2) STRICT — a tie reverts.
-    eval_passed = bool(beats_prior_best and plateau_stable)   # (3) robustness-not-peak ANDed in.
+    # (2b) absolute floor: a no-edge / losing set must fail even when prior_best is the first-run
+    # -inf baseline. >= is inclusive so a set exactly at the no-edge midpoint is NOT promotable
+    # (it must clear the floor with a positive-Sharpe edge). NaN holdout_dsr fails closed: any
+    # comparison with NaN is False, so beats_prior_best and the floor both reject it.
+    eval_passed = bool(
+        beats_prior_best and plateau_stable and holdout_dsr >= MIN_PROMOTABLE_DSR
+    )   # (3) robustness-not-peak ANDed in.
 
     proposal_set.held_out_dsr = holdout_dsr
     proposal_set.held_out_sharpe_delta = holdout_sharpe_delta
