@@ -329,9 +329,15 @@ All 4 are **read-only data** (`money_write: false`, `underlying_can_write: false
 so safe to enable without the gate/HITL concerns that apply to alpaca/robinhood/longbridge. A gateway
 reload is needed for an already-running gateway to pick them up (`mcp_reload_confirm: true`).
 
-**Still DISABLED (cred-gated, until the operator loads creds):** alpaca (creds on disk; pinned
-read-only via ALPACA_TOOLSETS when enabled), robinhood, longbridge (all 3 have an underlying
-order/money surface — never auto-enabled), polygon, fred (read-only data, need an API key).
+**ENABLED (read-only, paper) — operator ran the enable (verified live 2026-06-16):** alpaca is in
+`~/.hermes/config.yaml` `mcp_servers:` with `ALPACA_PAPER_TRADE='true'` and the read-only
+`ALPACA_TOOLSETS='account,stock-data,crypto-data,options-data,assets,corporate-actions,news'` allowlist
+(no `trading`/`watchlists` toolset, so NO order tools; `update_account_config` is the expected
+account-toolset settings tool, not an order tool — see the §alpaca note above / seed 0fc0). Closes
+58e9/e18b/0fc0. RE-EVALUATE the `account`-included trade-off before ever flipping to a live account.
+
+**Still DISABLED (cred-gated, until the operator loads creds):** robinhood, longbridge (both have an
+underlying order/money surface — never auto-enabled), polygon, fred (read-only data, need an API key).
 
 Rollback any: remove its block from `~/.hermes/config.yaml` `mcp_servers:` (or `cp` the backup) + reload.
 
