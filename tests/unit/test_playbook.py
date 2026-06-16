@@ -513,14 +513,71 @@ def test_regime_gate_swing_unaffected_in_all_regimes() -> None:
 
 
 def test_regime_gate_packet_with_label_attr() -> None:
-    """Snapshot regime can be a RegimePacket-like object with a .label attribute."""
+    """Snapshot regime can be a RegimePacket-like object whose .label is a
+    real RegimeState enum (the production shape: build_regime_extras emits a
+    RegimePacket whose .label IS a RegimeState, not a plain string).
+
+    Regression guard for the str(RegimeState.BEAR) == 'RegimeState.BEAR' trap
+    on Python 3.11+ (PEP 663 str/Enum __str__ change): the gate must normalize
+    via the enum .value, not str(), or BEAR-deny silently dies.
+    """
+    from hermes_quant.regime.detector import RegimeState
+
     class FakeRegimePacket:
-        def __init__(self, label: str) -> None:
+        def __init__(self, label: object) -> None:
             self.label = label
+
     s = _good_covered_call_snapshot()
-    s["regime"] = FakeRegimePacket("bear")
+    s["regime"] = FakeRegimePacket(RegimeState.BEAR)  # REAL enum, not "bear"
     fit = score_covered_call(s)
     assert fit.eligible is False  # bear → deny
+
+
+def test_regime_gate_enum_label_denies_in_bear() -> None:
+    """End-to-end: an actual RegimePacket (label = RegimeState.BEAR enum) must
+    deny option-selling plays in BEAR, identical to the plain-string path.
+
+    Without enum-aware normalization, str(RegimeState.BEAR).lower() yields
+    'regimestate.bear' which never matches the 'bear' gate key -> fail-open.
+    """
+    from hermes_quant.playbook.scorers import _eval_regime_gate
+    from hermes_quant.regime.detector import RegimeState
+
+    cc = PROFILES["covered_call"]
+
+    class FakeRegimePacket:
+        def __init__(self, label: object) -> None:
+            self.label = label
+
+    action, reason = _eval_regime_gate(cc, {"regime": FakeRegimePacket(RegimeState.BEAR)})
+    assert action == "deny", f"BEAR enum should deny, got {action!r}"
+    assert reason is not None and "bear" in reason.lower()
+
+
+def test_regime_gate_enum_label_warns_in_volatile() -> None:
+    """A RegimePacket with label = RegimeState.VOLATILE enum must warn (not allow)."""
+    from hermes_quant.playbook.scorers import _eval_regime_gate
+    from hermes_quant.regime.detector import RegimeState
+
+    cc = PROFILES["covered_call"]
+
+    class FakeRegimePacket:
+        def __init__(self, label: object) -> None:
+            self.label = label
+
+    action, reason = _eval_regime_gate(cc, {"regime": FakeRegimePacket(RegimeState.VOLATILE)})
+    assert action == "warn", f"VOLATILE enum should warn, got {action!r}"
+    assert reason is not None and "volatile" in reason.lower()
+
+
+def test_regime_gate_dict_with_enum_label_value() -> None:
+    """A dict-shaped regime whose 'label' value is a RegimeState enum must deny in BEAR."""
+    from hermes_quant.playbook.scorers import _eval_regime_gate
+    from hermes_quant.regime.detector import RegimeState
+
+    cc = PROFILES["covered_call"]
+    action, _ = _eval_regime_gate(cc, {"regime": {"label": RegimeState.BEAR}})
+    assert action == "deny", f"dict with BEAR enum label should deny, got {action!r}"
 
 
 def test_regime_gate_dict_with_label_key() -> None:

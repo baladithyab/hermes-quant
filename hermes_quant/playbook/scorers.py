@@ -19,6 +19,7 @@ lazily inside compute_play_snapshot so unit tests don't require it.
 
 from __future__ import annotations
 
+import enum
 import logging
 import math
 import os
@@ -198,6 +199,20 @@ def _eval_eviction(snapshot: dict, rule: tuple) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+def _normalize_regime_label(raw: object) -> str:
+    """Coerce a regime label to its lowercase string key.
+
+    Handles the RegimeState enum (a ``str, Enum``) explicitly: on Python 3.11+
+    ``str(RegimeState.BEAR)`` is ``'RegimeState.BEAR'`` (PEP 663), so a naive
+    ``str(...).lower()`` would never match the ``regime_gates`` keys
+    ('bull'/'bear'/'volatile'/'unknown'). Using the enum ``.value`` recovers the
+    intended 'bear'. Plain strings pass through ``str().lower()`` unchanged.
+    """
+    if isinstance(raw, enum.Enum):
+        raw = raw.value
+    return str(raw).lower()
+
+
 def _eval_regime_gate(profile: PlayProfile, snapshot: dict) -> tuple[str, str | None]:
     """Evaluate the play's regime gate against the current snapshot regime.
 
@@ -219,12 +234,19 @@ def _eval_regime_gate(profile: PlayProfile, snapshot: dict) -> tuple[str, str | 
     if regime is None:
         return ("allow", None)
     # Extract string label from RegimePacket OR plain string.
+    #
+    # The label may be a RegimeState enum (a `str, Enum`, regime/detector.py).
+    # On Python 3.11+ (PEP 663) str(RegimeState.BEAR) == 'RegimeState.BEAR', so
+    # str(label).lower() would yield 'regimestate.bear' and NEVER match the
+    # 'bear'/'volatile'/... gate keys — a silent fail-open against a configured
+    # DENY. Normalize via the enum .value so 'bear' is recovered. Plain-string
+    # and dict-of-string labels are unchanged.
     if hasattr(regime, "label"):
-        label = str(regime.label).lower()
+        label = _normalize_regime_label(regime.label)
     elif isinstance(regime, str):
         label = regime.lower()
     elif isinstance(regime, dict):
-        label = str(regime.get("label", "")).lower()
+        label = _normalize_regime_label(regime.get("label", ""))
     else:
         return ("allow", None)
     action = profile.regime_gates.get(label, "allow")
