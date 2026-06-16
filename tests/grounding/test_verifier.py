@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_quant.grounding.data_grounding import Bar, build_ground_truth_block
+from hermes_quant.grounding.data_grounding import (
+    Bar,
+    build_ground_truth_block,
+    render_for_prompt,
+)
 from hermes_quant.grounding.verifier import (
     ClaimVerifier,
     VerificationResult,
-    extract_numerical_claims,
     extract_citation_markers,
+    extract_numerical_claims,
 )
 from hermes_quant.protocol import AnalystView
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -126,13 +129,21 @@ def test_accept_no_numerical_claims():
 
 
 def test_accept_view_with_citation_marker():
-    """Views that cite via [gt_...] marker must be accepted."""
+    """A price that IS in the block, cited with a real marker, must be accepted.
+
+    The price is formatted to ``:.4f`` so it matches how the block renders closes
+    (``render_for_prompt`` emits closes at ``:.4f``); the number then traces via the
+    substring check (a). A coarser ``:.2f`` rendering (e.g. ``174.50`` vs the block's
+    ``174.5000``) is deliberately NOT traceable under the word-boundary matcher and
+    must NOT be rescued by the adjacent marker — that proximity-credit path was the
+    F3 "one-citation-covers-all-fabricated-numbers" loophole and has been removed.
+    """
     block = _make_block("AAPL")
     # Use a real citation ID from the block
     cid = block.citation_ids[-1]  # last bar's close
     last_bar = block.ohlcv_60d[-1]
     rationale = (
-        f"The closing price was {last_bar.close:.2f} [{cid}], confirming the uptrend."
+        f"The closing price was {last_bar.close:.4f} [{cid}], confirming the uptrend."
     )
     view = _make_view(rationale)
     verifier = ClaimVerifier(threshold=0.5)
@@ -279,36 +290,38 @@ def test_threshold_strict_rejects_partial_citations():
     )
 
 
-def test_threshold_strict_rejects_fabricated_marker_proximity():
-    """Phantom price next to a FABRICATED (out-of-block) citation marker must be rejected.
+def test_threshold_strict_rejects_fabricated_number_near_valid_marker():
+    """A fabricated price within 80 chars of a VALID in-block marker must be rejected.
 
-    F3 regression: an LLM can append a syntactically-valid-but-fabricated marker
-    next to a fabricated price to steal proximity credit. The marker
-    ``[gt_AAPL_99999999_close]`` is NOT in block.citation_ids — placing 999.99
-    adjacent to it must NOT credit the claim. A separate, REAL citation appears
-    far away (>80 chars) so ``has_valid_explicit_citation`` is True, exposing the
-    bug where the proximity fallback matches ANY marker rather than a valid one.
+    F3 regression — the "one citation covers all fabricated numbers" loophole the
+    proximity check (verifier.py check (b)) claims to prevent. A single VALID in-block
+    citation marker (e.g. ``[gt_AAPL_20260507_close]``) sitting within the 80-char
+    proximity window of a fabricated number (150.00) must NOT credit that number. Block
+    markers are coarse — one marker per close — and cannot attest to an arbitrary
+    unrelated value (the cited marker here attests to close 172.0, not 150.00). A number
+    that is absent from ``render_for_prompt(block)`` must stay uncited regardless of an
+    adjacent valid marker; proximity is necessary-but-not-sufficient.
+
+    This supersedes the earlier ar65 fabricated-MARKER test: ar65 only rejected a
+    number next to an OUT-of-block marker, but still credited a number next to a
+    VALID marker — proximity itself was the hole, which this fix closes.
     """
     block = _make_block("AAPL", n_bars=5)
     real_cid = block.citation_ids[-1]
-    last_close = block.ohlcv_60d[-1].close
-    fabricated_marker = "gt_AAPL_99999999_close"
-    assert fabricated_marker not in set(block.citation_ids)
-    separator = "x" * 100  # force the real marker > 80 chars from the phantom price
-    rationale = (
-        f"Close was {last_close:.4f} [{real_cid}]. "
-        f"{separator}"
-        f"But our target is 999.99 [{fabricated_marker}]"
-    )
+    # 150.00 is well below the 170.00–172.00 close range and is NOT in the block render.
+    assert "150.00" not in render_for_prompt(block)
+    assert real_cid in set(block.citation_ids)
+    rationale = f"Target price is 150.00 based on momentum [{real_cid}]."
     view = _make_view(rationale)
     verifier = ClaimVerifier(threshold=1.0)
     result = verifier.verify(view, block)
     assert result.accepted is False, (
-        "A fabricated price adjacent to an out-of-block citation marker must be "
-        f"rejected at strict threshold. Got: {result.reason}"
+        "A fabricated price adjacent to a VALID in-block citation marker must be "
+        "rejected at strict threshold (one valid citation cannot cover an unrelated "
+        f"fabricated number). Got: {result.reason}"
     )
-    assert "999.99" in result.uncited_claims, (
-        f"999.99 should be flagged uncited. uncited={result.uncited_claims}"
+    assert "150.00" in result.uncited_claims, (
+        f"150.00 should be flagged uncited. uncited={result.uncited_claims}"
     )
 
 
