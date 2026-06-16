@@ -875,6 +875,54 @@ def quant_approve(args: dict, **_kwargs) -> str:
             default=str,
         )
 
+    # ar27: broker / backend NO-FILL parity (cs02/ar16 family). The DEFAULT
+    # PaperReactor stamps silenced=True on a no-fill (caught above), but the
+    # flag-gated reactors signal a no-fill DIFFERENTLY and carry NO `silenced`:
+    #   * DeterministicEquityReactor -> reactor_metadata.no_fill=True (+bp_rejected /
+    #     backend_unavailable) when buying power refuses the order (deterministic_equity.py:496)
+    #   * MultiLegPaperReactor._write_nofill_parent -> no_fill=True on a broker
+    #     non-fill terminal (multileg.py:924)
+    #   * AlpacaPaperReactor -> reactor_metadata.unfilled_timeout=True when the live
+    #     paper order does not fill within the poll window (alpaca_paper.py:215)
+    # None match the two guards above, so pre-ar27 they fell through to
+    # record_execution -> state=approved -> success:True echoing the REQUESTED size
+    # for a fill that NEVER happened (operator-facing dishonesty, Wave-S class), AND
+    # the pending proposal was irrecoverably consumed (could not be re-approved when
+    # BP freed). A no-fill is a PROVEN no-capital outcome (fill_size_pct=0, nothing on
+    # the bus), so roll the ar16 claim back to pending and report the rejection.
+    _nofill = (
+        _rmeta.get("no_fill") is True
+        or _rmeta.get("unfilled_timeout") is True
+        or _rmeta.get("bp_rejected") is True
+    )
+    if _nofill:
+        store.release_claim(proposal_id)
+        _reason = (
+            _rmeta.get("no_fill_reason")
+            or _rmeta.get("broker_status")
+            or ("unfilled_timeout" if _rmeta.get("unfilled_timeout") else "no_fill")
+        )
+        return json.dumps(
+            {
+                "success": False,
+                "error": "no_fill",
+                "proposal_id": proposal_id,
+                "state": "pending",  # NOT advanced — re-approvable when conditions change
+                "no_fill_reason": _reason,
+                "requested_fill_size_pct": _json_safe_float(fill_size_pct),
+                "realized_fill_size_pct": _json_safe_float(
+                    getattr(execution, "fill_size_pct", 0.0)
+                ),
+                "message": (
+                    "The reactor did NOT fill this order (e.g. buying-power refusal, "
+                    "broker non-fill, or unfilled-timeout); no capital moved and the "
+                    "proposal remains pending so it can be re-approved when conditions "
+                    "change. This is NOT a successful approval."
+                ),
+            },
+            default=str,
+        )
+
     # P1-B (shadow wiring): when HERMES_QUANT_ALPACA_SHADOW=1 and the fill we
     # just made went through the SYNTHETIC PaperReactor (reactor_name=="paper"),
     # ALSO submit the same proposal to Alpaca paper and log the divergence. This

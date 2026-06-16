@@ -387,6 +387,81 @@ def test_approve_cap_silenced_stays_pending_and_honest(
     assert final.state == "pending"
 
 
+@pytest.mark.parametrize(
+    "nofill_meta,label",
+    [
+        ({"no_fill": True, "no_fill_reason": "bp_rejected", "bp_rejected": True}, "deterministic_equity_bp_rejected"),
+        ({"no_fill": True, "broker_status": "rejected", "role": "parent"}, "multileg_nofill_parent"),
+        ({"unfilled_timeout": True, "alpaca_order_id": "ord-123"}, "alpaca_unfilled_timeout"),
+    ],
+)
+def test_approve_broker_nofill_stays_pending_and_honest(
+    isolated_store, monkeypatch, tmp_path, nofill_meta, label
+):
+    """ar27 (cs02/ar16 family): the flag-gated reactors signal a no-fill via
+    reactor_metadata.no_fill / unfilled_timeout / bp_rejected (NOT silenced). The
+    DEFAULT PaperReactor uses silenced=True (handled); these flag-gated lanes
+    previously fell through to record_execution -> state=approved -> success:True
+    echoing the REQUESTED size for a fill that never happened, AND irrecoverably
+    consumed the pending proposal. quant_approve must instead report success=False,
+    keep the proposal PENDING, and report realized 0.0 — never claim a no-fill as a
+    successful approval."""
+    _set_hitl_mode(monkeypatch, tmp_path)
+    _patch_default_store(monkeypatch, isolated_store)
+    exec_path = tmp_path / "executions.jsonl"
+    _patch_executions_path(monkeypatch, exec_path)
+
+    from hermes_quant.react.base import ExecutionRecord
+    import hermes_quant.react.dispatch as dispatch_module
+    import hermes_quant.tools as tools_module
+
+    proposal = isolated_store.propose(
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
+        advisor_result=_sample_advisor_result(kelly=0.10),
+    )
+
+    def _nofill_record(prop):
+        return ExecutionRecord(
+            proposal_id=prop.proposal_id,
+            signal_id=None,
+            asset=prop.symbol,
+            asset_class=prop.asset_class,
+            timeframe=prop.timeframe,
+            asof_decision="2026-06-15T00:00:00Z",
+            asof_execution="2026-06-15T00:00:00Z",
+            target_position_pct=0.10,
+            decision_price=100.0,
+            fill_price=100.0,
+            fill_size_pct=0.0,  # NO fill — no capital moved
+            reactor_name="paper",
+            human_in_the_loop=True,
+            reactor_metadata=dict(nofill_meta),
+        )
+
+    class _NoFillReactor:
+        name = "paper"
+
+        def execute(self, prop, **kwargs):
+            return _nofill_record(prop)
+
+    monkeypatch.setattr(dispatch_module, "select_reactor", lambda prop: _NoFillReactor())
+
+    out = tools_module.quant_approve(
+        {"proposal_id": proposal.proposal_id, "size_override_pct": 0.10}
+    )
+    parsed = json.loads(out)
+
+    assert parsed["success"] is False, f"{label}: a broker no-fill was reported as success: {parsed}"
+    assert parsed["state"] == "pending", f"{label}: proposal advanced past pending on a no-fill"
+    assert parsed.get("realized_fill_size_pct", 0.0) == 0.0
+    # The pending proposal was NOT consumed — operator can re-approve.
+    assert isolated_store.get(proposal.proposal_id).state == "pending"
+    # Nothing position-moving was written to the bus.
+    assert not exec_path.exists() or exec_path.read_text().strip() == ""
+
+
 # ---------------------------------------------------------------------------
 # 6: Approve already-approved -> state_mismatch
 # ---------------------------------------------------------------------------
