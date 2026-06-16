@@ -353,18 +353,23 @@ class HermesQuantConsumer(IStrategy):
         # Read recent records from bus
         records = _read_jsonl_tail(self.SIGNAL_BUS_PATH, n=200)
 
-        # Update heartbeat
+        # Update heartbeat. ar43: scan newest-first; the first record with a VALID,
+        # parseable asof wins. A null/empty/NaT asof (a garbage-producing daemon) must
+        # NOT poison _last_heartbeat with NaT — that would make the age check below
+        # evaluate `nan > dead_man_switch_seconds` (always False) and silently DISABLE
+        # the dead-man-switch (FAIL-OPEN on a safety rail). Funnel through _parse_asof_utc
+        # and `continue` past unparseable records so an earlier VALID heartbeat is still
+        # found; if none is valid, _last_heartbeat stays None and the
+        # no_heartbeat_observed branch fires after bootstrap.
         for r in reversed(records):
-            if r.get("type") == "heartbeat":
-                try:
-                    asof = pd.Timestamp(r["asof"])
-                    if asof.tzinfo is None:
-                        asof = asof.tz_localize("UTC")
-                    if self._last_heartbeat is None or asof > self._last_heartbeat:
-                        self._last_heartbeat = asof
-                    break
-                except (ValueError, KeyError):
-                    continue
+            if r.get("type") != "heartbeat":
+                continue
+            parsed = _parse_asof_utc(r.get("asof"))
+            if parsed is None:
+                continue
+            if self._last_heartbeat is None or parsed > self._last_heartbeat:
+                self._last_heartbeat = parsed
+            break
 
         # Cache latest signal per pair
         for r in records:
@@ -424,13 +429,20 @@ class HermesQuantConsumer(IStrategy):
             return None
 
         # Stale signal guard
+        # ar43: pd.Timestamp returns NaT (WITHOUT raising) for None / "" / nan / JSON-null
+        # asof — only literal-garbage strings raise. A NaT asof makes age_minutes NaN, and
+        # `nan > threshold` is False, so the staleness check would NOT trip and an
+        # unknowable-age signal would be RETURNED (fail-OPEN) to drive an entry + sizing.
+        # An asof we cannot order cannot establish freshness, so refuse to act — fail
+        # CLOSED, matching the documented contract that stale signals are ignored. Reuse
+        # the ar35 _parse_asof_utc helper (NaT/garbage -> None).
+        asof = _parse_asof_utc(sig.get("asof"))
+        if asof is None:
+            return None
         try:
-            asof = pd.Timestamp(sig["asof"])
-            if asof.tzinfo is None:
-                asof = asof.tz_localize("UTC")
-            now = pd.Timestamp(current_time) if current_time else pd.Timestamp.utcnow()
-            if now.tzinfo is None:
-                now = now.tz_localize("UTC")
+            now = _parse_asof_utc(current_time) if current_time else pd.Timestamp.utcnow().tz_localize("UTC")
+            if now is None:
+                return None
             age_minutes = (now - asof).total_seconds() / 60.0
             if age_minutes > self.max_signal_age_minutes:
                 return None
