@@ -145,6 +145,29 @@ def reconstruct_portfolio_state(
         if asset is None or target is None or ts is None:
             continue
 
+        # ar92: SKIP a NO-FILL record. A reactor that declines to fill (e.g. the LIVE
+        # DeterministicEquityReactor on a bp_rejected / backend_unavailable) appends a
+        # record carrying the REQUESTED target_position_pct (non-zero) with
+        # fill_price=0.0 / fill_size_pct=0.0 and reactor_metadata.no_fill=True, and
+        # deliberately does NOT reconcile state.db (the authoritative ledger correctly
+        # shows no position). But this LATEST-TARGET reconstruct keyed purely off
+        # target_position_pct, so a no-fill that is the latest record for a symbol
+        # conjured a PHANTOM position that never opened — inflating the autonomous
+        # portfolio-caps headroom charge (reactor_filter=None path, autonomous.py) so
+        # real picks are wrongly shrunk/silenced, and arming a spurious weekly CLOSE
+        # against the phantom (a real unintended short). A no-fill moved no position,
+        # so it must not define one. Discriminate on the explicit no_fill flag, with
+        # fill_price==0 AND fill_size_pct==0 as the corroborating fallback for records
+        # lacking the flag. A legitimate flatten-to-zero (real fill_price, target 0)
+        # is NOT a no-fill and is preserved.
+        _rmeta = rec.get("reactor_metadata") or {}
+        if _rmeta.get("no_fill") is True:
+            continue
+        _fp = rec.get("fill_price")
+        _fs = rec.get("fill_size_pct")
+        if _fp == 0.0 and _fs == 0.0:
+            continue
+
         if asof is not None and ts > asof:
             continue
 
