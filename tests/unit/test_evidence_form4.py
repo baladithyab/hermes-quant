@@ -144,6 +144,133 @@ def test_filing_date_eod_fallback_is_conservative():
     assert row2.filed_at > datetime(2025, 3, 19, tzinfo=UTC)
 
 
+# --- EST/EDT timezone correctness (the DST defect) ---------------------------
+# The Eastern offset is -05:00 in winter (EST, DST off ~Nov-Mar) and -04:00 in
+# summer (EDT). A hard-coded -04:00 anchors EST-season filings 1h too EARLY in
+# UTC, which fabricates earlier public availability -> lookahead. These cases
+# exercise WINTER dates (Jan/Feb) so the resolved offset must be -05:00.
+def test_compact_acceptance_in_winter_is_est_not_edt():
+    """Compact-legacy acceptance during EST season anchors at -05:00, not -04:00."""
+    # 2025-01-15 16:30:00 ET (EST, DST off) == 2025-01-15 21:30:00 UTC.
+    # The buggy hard-coded -04:00 would yield 20:30:00 UTC (1h too early).
+    payload = json.dumps(
+        {
+            "cik": 320193,
+            "tickers": ["AAPL"],
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["0000320193-25-000200"],
+                    "form": ["4"],
+                    # Compact legacy header form (no offset) -> Eastern wall-clock.
+                    "acceptanceDateTime": ["20250115163000"],
+                    "filingDate": ["2025-01-15"],
+                    "reportDate": ["2025-01-13"],
+                    "primaryDocument": ["xslF345X05/wk-form4_w.xml"],
+                }
+            },
+        }
+    ).encode()
+    filings = parse_submissions(payload)
+    assert len(filings) == 1
+    assert filings[0].filed_at == datetime(2025, 1, 15, 21, 30, 0, tzinfo=UTC)
+
+
+def test_filing_date_eod_fallback_in_winter_is_est():
+    """End-of-day filingDate fallback during EST season anchors at -05:00."""
+    # 2025-02-10 23:59:59 ET (EST) == 2025-02-11 04:59:59 UTC.
+    # The buggy hard-coded -04:00 would yield 2025-02-11 03:59:59 UTC (1h early).
+    payload = json.dumps(
+        {
+            "cik": 320193,
+            "tickers": ["AAPL"],
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["0000320193-25-000201"],
+                    "form": ["4"],
+                    "acceptanceDateTime": [""],  # absent -> EOD filingDate fallback
+                    "filingDate": ["2025-02-10"],
+                    "reportDate": ["2025-02-08"],
+                    "primaryDocument": ["xslF345X05/wk-form4_w2.xml"],
+                }
+            },
+        }
+    ).encode()
+    filings = parse_submissions(payload)
+    assert len(filings) == 1
+    assert filings[0].filed_at == datetime(2025, 2, 11, 4, 59, 59, tzinfo=UTC)
+
+
+def test_summer_acceptance_unchanged_edt():
+    """Sanity: an EDT (summer) compact acceptance is still -04:00 (no regression)."""
+    # 2025-07-15 16:30:00 ET (EDT) == 2025-07-15 20:30:00 UTC — same under both.
+    payload = json.dumps(
+        {
+            "cik": 320193,
+            "tickers": ["AAPL"],
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["0000320193-25-000202"],
+                    "form": ["4"],
+                    "acceptanceDateTime": ["20250715163000"],
+                    "filingDate": ["2025-07-15"],
+                    "reportDate": ["2025-07-13"],
+                    "primaryDocument": ["xslF345X05/wk-form4_s.xml"],
+                }
+            },
+        }
+    ).encode()
+    filings = parse_submissions(payload)
+    assert len(filings) == 1
+    assert filings[0].filed_at == datetime(2025, 7, 15, 20, 30, 0, tzinfo=UTC)
+
+
+def test_winter_lookahead_gate_rejects_asof_in_the_phantom_early_hour(tmp_path: Path):
+    """D5 gate: an asof in the 1h window the bug fabricated must be flagged.
+
+    The buggy -04:00 anchored the EST filing at 20:30Z; the true public moment is
+    21:30Z. An asof of 21:00Z is BEFORE the filing was actually public, so the
+    lookahead gate MUST flag it. Under the bug the gate would have falsely passed
+    (avail 20:30Z <= asof 21:00Z), consuming the record up to 1h early.
+    """
+    payload = json.dumps(
+        {
+            "cik": 320193,
+            "tickers": ["AAPL"],
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["0000320193-25-000203"],
+                    "form": ["4"],
+                    "acceptanceDateTime": ["20250115163000"],  # 16:30 EST
+                    "filingDate": ["2025-01-15"],
+                    "reportDate": ["2025-01-13"],
+                    "primaryDocument": ["xslF345X05/wk-form4_g.xml"],
+                }
+            },
+        }
+    ).encode()
+    row = parse_submissions(payload)[0]
+    ev = to_filing_evidence(row)
+    # available_at must be the TRUE public moment (21:30Z), not the phantom 20:30Z.
+    assert ev.available_at == datetime(2025, 1, 15, 21, 30, 0, tzinfo=UTC)
+
+    store = EvidenceStore(root=tmp_path / "evidence_store")
+    store.append(ev)
+    view = AnalystView(
+        analyst="insider_winter",
+        direction="long",
+        magnitude=0.01,
+        confidence=0.5,
+        confidence_raw=0.7,
+        horizon="1d",
+        evidence_ids=(str(ev.id),),
+    )
+    # asof at 21:00Z — inside the bug's phantom-early hour (20:30Z..21:30Z).
+    phantom = datetime(2025, 1, 15, 21, 0, 0, tzinfo=UTC)
+    res = check_view_lookahead(view, phantom, store)
+    assert res.ok is False  # gate fires: filing not yet public at 21:00Z
+    assert len(res.violations) == 1
+
+
 def test_skips_filing_with_no_parseable_timestamp():
     """A Form 4 with NO acceptance AND NO filingDate is SKIPPED (never now())."""
     filings = parse_submissions(_SUBMISSIONS_PAYLOAD)
