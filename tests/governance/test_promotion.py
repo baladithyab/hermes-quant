@@ -139,6 +139,99 @@ def test_promotion_gate_blocks_when_immutable_breach_count_nonzero(
     assert any("immutable_breaches_in_window" in r for r in decision.blocked_by)
 
 
+def test_promotion_gate_blocks_on_immutable_reason_without_legacy_flag(
+    audit_path: Path,
+) -> None:
+    """ADR-0031:204 contract — the breach is detected from the gate_rejection
+    *reason* referencing an IMMUTABLE_INVARIANTS rule, NOT from a payload flag
+    that no producer ever writes.
+
+    Regression for the latent fail-OPEN: risk/gate.py emits gate_rejection with
+    reason='net_delta_cap' / 'drawdown_circuit_breaker_*' / 'daily_loss_circuit_breaker_*'
+    and NEVER sets payload['immutable_breach']. With the old flag-only detector
+    immutable_breaches_in_window was structurally always 0, so a real
+    immutable-rule breach in the 30d window could NOT disqualify a paper→live
+    promotion. This event matches ADR-0031:204 verbatim (reason='net_delta_cap',
+    no immutable_breach flag)."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    audit_log.append(
+        GovernanceEvent(
+            kind="gate_rejection",
+            asof=NOW - timedelta(days=10),
+            source="risk_gate",
+            # NOTE: no 'immutable_breach' key — exactly what risk/gate.py emits.
+            payload={"reason": "net_delta_cap"},
+        )
+    )
+    metrics = promotion._collect_metrics(NOW)
+    assert metrics["immutable_breaches_in_window"] >= 1, (
+        "reason-based immutable-breach detection did not count a real "
+        "gate_rejection(reason='net_delta_cap') in the 30d window"
+    )
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is False
+    assert any("immutable_breaches_in_window" in r for r in decision.blocked_by)
+
+
+def test_promotion_gate_blocks_on_circuit_breaker_reason(
+    audit_path: Path,
+) -> None:
+    """A drawdown circuit-breaker rejection (reason='drawdown_circuit_breaker_0.1500',
+    the exact string risk/gate.py:544 emits) is an immutable MAX_DRAWDOWN_PCT
+    breach and must block promotion."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    audit_log.append(
+        GovernanceEvent(
+            kind="gate_rejection",
+            asof=NOW - timedelta(days=3),
+            source="risk_gate",
+            payload={"reason": "drawdown_circuit_breaker_0.1500"},
+        )
+    )
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is False
+    assert any("immutable_breaches_in_window" in r for r in decision.blocked_by)
+
+
+def test_promotion_gate_ignores_non_immutable_rejection_reason(
+    audit_path: Path,
+) -> None:
+    """A routine silence (reason='cost_gate_below_threshold', a discretionary
+    gate decision, NOT an immutable-rule breach) must NOT be counted as an
+    immutable breach — otherwise every cost-gate silence would fail-CLOSE the
+    promotion gate spuriously. This pins the predicate to immutable rules only."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    audit_log.append(
+        GovernanceEvent(
+            kind="gate_rejection",
+            asof=NOW - timedelta(days=2),
+            source="risk_gate",
+            payload={"reason": "cost_gate_below_threshold"},
+        )
+    )
+    metrics = promotion._collect_metrics(NOW)
+    assert metrics["immutable_breaches_in_window"] == 0
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is True, f"blocked_by={decision.blocked_by}"
+
+
+def test_promotion_gate_immutable_breach_respects_30d_window(
+    audit_path: Path,
+) -> None:
+    """A reason-based immutable breach OUTSIDE the 30d window must not count."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    audit_log.append(
+        GovernanceEvent(
+            kind="gate_rejection",
+            asof=NOW - timedelta(days=45),  # outside 30d window
+            source="risk_gate",
+            payload={"reason": "net_delta_cap"},
+        )
+    )
+    metrics = promotion._collect_metrics(NOW)
+    assert metrics["immutable_breaches_in_window"] == 0
+
+
 def test_promotion_gate_blocks_when_killswitch_in_14d_window(
     audit_path: Path,
 ) -> None:

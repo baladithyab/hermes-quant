@@ -26,8 +26,59 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from hermes_quant.governance import audit_log
+from hermes_quant.governance.invariants import IMMUTABLE_INVARIANTS
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Immutable-breach detection (ADR-0031 D6 / ADR-0031:204)
+# ---------------------------------------------------------------------------
+#
+# A paper→live promotion is disqualified by "zero immutable-rule breaches in
+# the rolling 30-day window" (ADR-0029 D7 / ADR-0031:91). The breach is read
+# from the `reason` of a `gate_rejection` audit row (ADR-0031:204 specifies
+# `reason="net_delta_cap"` as the canonical example), NOT from a payload flag.
+#
+# Historical bug: the detector keyed on `evt.payload['immutable_breach']`, a
+# flag NO producer ever writes (risk/gate.py:443-457 `_audit_rejection` emits
+# only asset/direction/magnitude/confidence/reason/asof/provenance). That made
+# `immutable_breaches_in_window` structurally 0 — a latent fail-OPEN where a
+# real immutable breach in the window could not block a paper→live promotion.
+#
+# The risk gate names circuit-breaker rejections by PREFIX (the numeric
+# magnitude is appended): risk/gate.py:544 `drawdown_circuit_breaker_{pct}`,
+# :557 `daily_loss_circuit_breaker_{pct}`. The options gate emits exact-match
+# reasons (options_gate.py: `net_delta_cap`, `net_delta_cap_at_size`). These
+# map onto immutable ADR-0027/ADR-0029 bounds (MAX_DRAWDOWN_PCT,
+# MAX_NET_DELTA_PCT_NAV). We also treat a reason that *names* any
+# `IMMUTABLE_INVARIANTS` member directly (e.g. `no_naked_short_options`) as a
+# breach, so the predicate tracks the single source of truth in invariants.py.
+#
+# Defined adjacent to the loop so the match set is auditable. Discretionary
+# silences (e.g. `cost_gate_below_threshold`, `min_trade_size`) are NOT
+# immutable-rule breaches and are deliberately excluded.
+_IMMUTABLE_BREACH_REASON_PREFIXES: frozenset[str] = frozenset(
+    {
+        "drawdown_circuit_breaker",  # MAX_DRAWDOWN_PCT (ADR-0027/0029)
+        "daily_loss_circuit_breaker",  # daily-loss immutable breaker
+        "net_delta_cap",  # MAX_NET_DELTA_PCT_NAV (ADR-0031:204 canonical)
+    }
+)
+
+
+def _reason_is_immutable_breach(reason: str) -> bool:
+    """True if a `gate_rejection` reason denotes an immutable-rule breach.
+
+    Matches either a known circuit-breaker/cap PREFIX (the magnitude is
+    appended to circuit-breaker reasons) or a reason that contains an
+    `IMMUTABLE_INVARIANTS` member name verbatim. Pure / side-effect-free so it
+    can be unit-tested in isolation."""
+    if not reason:
+        return False
+    if any(reason.startswith(prefix) for prefix in _IMMUTABLE_BREACH_REASON_PREFIXES):
+        return True
+    return any(invariant in reason for invariant in IMMUTABLE_INVARIANTS)
 
 
 # ---------------------------------------------------------------------------
@@ -204,14 +255,19 @@ def _collect_metrics(asof: datetime) -> dict[str, Any]:
         if evt.kind == "kill_switch_fired" and evt_asof >= window_14d_start:
             killswitch_in_14d = True
 
-        # Immutable breaches: gate_rejection events whose payload.reason
-        # references an IMMUTABLE_INVARIANTS member.
-        if (
-            evt.kind == "gate_rejection"
-            and evt_asof >= window_30d_start
-            and evt.payload.get("immutable_breach") is True
-        ):
-            immutable_breach_count += 1
+        # Immutable breaches: gate_rejection events in the 30d window whose
+        # payload.reason references an IMMUTABLE_INVARIANTS member (ADR-0031:204).
+        # We ALSO honor the legacy `immutable_breach` flag for backward
+        # compatibility, so a future producer can still set it explicitly — but
+        # the reason-based predicate is the load-bearing path, because that is
+        # what risk/gate.py actually emits (it never writes the flag).
+        if evt.kind == "gate_rejection" and evt_asof >= window_30d_start:
+            reason = str(evt.payload.get("reason", ""))
+            if (
+                evt.payload.get("immutable_breach") is True
+                or _reason_is_immutable_breach(reason)
+            ):
+                immutable_breach_count += 1
 
         # Calibrator drift snapshots emitted as promotion_event
         if evt.kind == "promotion_event" and evt_asof >= window_30d_start:
