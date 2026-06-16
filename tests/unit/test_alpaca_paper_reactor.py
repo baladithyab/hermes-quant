@@ -656,3 +656,82 @@ def test_missing_creds_fails_closed(tmp_path, monkeypatch):
     reactor = AlpacaPaperReactor(executions_path=tmp_path / "executions.jsonl")
     with pytest.raises(AlpacaSubmitError):
         reactor.execute(_proposal(), fill_size_pct=0.20)
+
+
+# --------------------------------------------------------------------------- #
+# 10. Non-finite / <=0 decision_price -> fail-closed silence (precondition parity
+#     with PaperReactor / DeterministicEquityReactor). A proposal that reaches
+#     execute() with no advisor decision_price AND no analyst_views.last_close
+#     makes _extract_decision_price return the 0.0 sentinel; the reactor must NOT
+#     submit a broker order off a corrupt entry-basis and must NOT record/reconcile
+#     a 0.0/NaN decision_price verbatim.
+# --------------------------------------------------------------------------- #
+
+
+def _proposal_missing_price(*, symbol: str = "AAPL") -> Proposal:
+    """A proposal whose advisor_result has no decision_price and empty views.
+
+    ``_extract_decision_price`` falls all the way through to the 0.0 sentinel.
+    """
+    return Proposal(
+        proposal_id=f"prop_2026-06-05T00:00:00_{symbol}_nodp",
+        state="pending",
+        symbol=symbol,
+        asset_class="equity",
+        timeframe="1d",
+        created_at="2026-06-05T00:00:00Z",
+        expires_at="2026-06-05T01:00:00Z",
+        advisor_result={
+            "as_of": "2026-06-05T00:00:00Z",
+            "signal_id": "sig-nodp",
+            "analyst_views": [],  # no last_close fallback
+            # NOTE: no "decision_price" key -> 0.0 sentinel from the extractor.
+        },
+    )
+
+
+def test_zero_decision_price_fails_closed_no_submit(tmp_path):
+    # The extractor would return 0.0 for this proposal.
+    assert AlpacaPaperReactor._extract_decision_price(_proposal_missing_price()) == 0.0
+
+    # Configure a fake that WOULD fill if the submit path were reached, so the
+    # test proves the guard short-circuits BEFORE any broker order.
+    order = _FakeOrder(status="filled", filled_avg_price=101.0, filled_qty=194.0)
+    client = _FakeClient(equity=98_000.0, submit_result=order)
+    reactor = _reactor(client, tmp_path)
+
+    rec = reactor.execute(_proposal_missing_price(), fill_size_pct=0.20)
+
+    # Fail-closed silence/no-fill record: zero fill, no fabricated price.
+    assert rec.fill_size_pct == 0.0
+    assert rec.fill_price == 0.0
+    assert rec.reactor_name == "alpaca_paper"
+    assert rec.reactor_metadata.get("silence_reason") == "zero_decision_price"
+
+    # The broker submit path was NEVER reached (no order submitted, no poll).
+    assert client.submitted == []
+    assert client.poll_calls == 0
+
+
+def test_zero_decision_price_not_reconciled_to_state(tmp_path, monkeypatch):
+    # apply_execution must NOT be called for the fail-closed silence record (an
+    # unfilled silence moves no position -> never poison state.db cost-basis).
+    order = _FakeOrder(status="filled", filled_avg_price=101.0, filled_qty=194.0)
+    client = _FakeClient(equity=98_000.0, submit_result=order)
+    reactor = _reactor(client, tmp_path)
+
+    calls: list[Any] = []
+
+    class _SpyState:
+        def apply_execution(self, record_dict: Any) -> None:
+            calls.append(record_dict)
+
+    monkeypatch.setattr(
+        "hermes_quant.state.portfolio_state.get_portfolio_state",
+        lambda: _SpyState(),
+    )
+
+    rec = reactor.execute(_proposal_missing_price(), fill_size_pct=0.20)
+
+    assert rec.fill_size_pct == 0.0
+    assert calls == []  # never reconciled
