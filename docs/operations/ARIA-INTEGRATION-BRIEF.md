@@ -38,14 +38,18 @@ paper — NEVER originate from an LLM/MCP tool call; they flow only through prop
 4. **Enable the Alpaca MCP (READ-ONLY pin)** in ~/.hermes/config.yaml mcp_servers via the
    mcp/optional-mcps/alpaca/manifest.yaml shape: `command: uvx, args: [alpaca-mcp-server]`, env from
    ~/.hermes/secrets/alpaca.env, **ALPACA_PAPER_TRADE=true** (paper account — non-negotiable).
-   **PIN `ALPACA_TOOLSETS` to the read-only allowlist** — `stock-data,crypto-data,options-data,assets,
-   corporate-actions,news` — so the server exposes ONLY data tools (live-probe-verified: 34 tools, zero
-   `place_*`/`cancel_*`/`close_*`/`replace`/`exercise`). Note: the `account` toolset is EXCLUDED because
-   it leaks the account-mutating `update_account_config` (seed 0fc0); re-adding `account` is a documented
-   operator trade-off (gains buying-power reads, re-introduces that one write tool). This is the ONLY safe
-   boundary — the MCP has no internal HITL hook and the host auto-exposes every tool to the chat LLM.
-   config.yaml + .env are tool-guarded, so the actual write is operator-gated (staged block + cred-bridge
-   one-liner in the run report). Confirm reload + verify the tool surface has NO order tools.
+   **PIN `ALPACA_TOOLSETS` to the no-order-authority allowlist** —
+   `account,stock-data,crypto-data,options-data,assets,corporate-actions,news` — so the server exposes
+   data tools PLUS account/buying-power reads, but NO `trading` toolset (zero `place_*`/`cancel_*`/`close_*`/
+   `replace`/`exercise`). Note (seed 0fc0, operator decision 2026-06-01 — canonical): the `account` toolset
+   IS INCLUDED (gains buying-power / position reads). It ships ONE settings-write tool,
+   `update_account_config`, which is NOT an order tool and moves no capital while `ALPACA_PAPER_TRADE=true`;
+   its presence is an EXPECTED, operator-accepted trade-off, not a leak. Excluding the `trading` toolset is
+   the safe boundary — the MCP has no internal HITL hook and the host auto-exposes every tool to the chat
+   LLM. config.yaml + .env are tool-guarded, so the actual enable is operator-gated (staged block +
+   cred-bridge one-liner in the run report). Confirm reload + verify the tool surface has NO ORDER tools
+   (`update_account_config` is expected; only `place_*`/`close_*`/`cancel_*`/`replace`/`exercise` are STOPs).
+   RE-EVALUATE the `account`-included trade-off before ever flipping to a live account.
 
 ## RAILS ARIA MUST HONOR (non-negotiable — these override the mission)
 - **Paper only**: ALPACA_PAPER_TRADE=true. Never enable live-money trading.

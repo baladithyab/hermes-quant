@@ -74,8 +74,16 @@ x_hermes_quant:
   provenance: official  # alpacahq org repo + PyPI author Alpaca
 
 post_install: |
-  READ-ONLY recipe. After loading creds into ~/.hermes/.env (or
+  NO-ORDER-AUTHORITY recipe (paper). After loading creds into ~/.hermes/.env (or
   ~/.hermes/secrets/alpaca.env) and copying this block into config.yaml
   mcp_servers, reload (mcp_reload_confirm: true will prompt). Verify the tool
-  list contains NO place_*_order / close_*_position / cancel_* / update_account_config
-  tools. If any appear, ALPACA_TOOLSETS was not applied — STOP and do not use.
+  list contains NO ORDER tools: place_*_order / close_*_position /
+  close_all_positions / cancel_* / replace_order / exercise_options_position.
+  If any appear, the `trading` toolset leaked into ALPACA_TOOLSETS — STOP and do
+  not use.
+  NOTE (seed 0fc0, operator decision 2026-06-01): `update_account_config` ships
+  with the `account` toolset, which IS in the shipped allowlist — so it WILL
+  appear, and that is EXPECTED, not a failure. It mutates only paper-account
+  SETTINGS (not an order tool) and ALPACA_PAPER_TRADE=true means no live capital.
+  Do NOT treat its presence as a STOP. RE-EVALUATE this trade-off before ever
+  flipping to a live account.
