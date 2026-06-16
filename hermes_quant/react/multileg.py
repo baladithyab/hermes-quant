@@ -1114,6 +1114,17 @@ def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
         "reactor_metadata": record.reactor_metadata or {},
         "bar_ts": record.bar_ts,
         "play_tag": record.play_tag,  # B13: source of the fire
+        # ar93: serialize schema_version (mirror paper.py:_record_to_dict). This is
+        # the ADR-0091 Option-E tag FillDeltaNormalizer.is_absolute_target_record()
+        # keys off. Omitting it meant a multi-leg record written with a non-None
+        # schema_version (the documented Option-E "new records stamp the version"
+        # path) would read back as schema_version=None -> is_absolute_target_record
+        # returns True -> the normalizer double-differences the legs -> wrong qty ->
+        # wrong NAV / kill-switch basis. Currently dormant (no producer stamps a
+        # non-None version yet, so both serializers read None and behavior is
+        # byte-identical) — a latent forward-compat defect on the immutable money-log,
+        # closed here so the multileg writer never silently strips the tag.
+        "schema_version": record.schema_version,
     }
 
 
