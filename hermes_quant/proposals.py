@@ -512,7 +512,33 @@ class ProposalStore:
 
     def expire_one(self, proposal_id: str) -> Proposal | None:
         """Force a pending proposal to expired (TTL sweep). Returns None
-        if already non-pending."""
+        if already non-pending.
+
+        Cross-process compare-and-set (TOCTOU fix): ``expire_one`` is driven by
+        callers in a DIFFERENT process from the HITL approve flow — the cron TTL
+        sweep (:meth:`sweep_expired`), ``quant_list_proposals``
+        (:meth:`list_pending` -> :meth:`sweep_expired`), and the lazy-expire
+        inside :meth:`get`. The pre-fix code did a non-atomic check-then-act: it
+        read ``state`` on one connection, checked ``state == 'pending'``, then ran
+        an UNCONDITIONAL ``ON CONFLICT DO UPDATE SET state='expired'`` in
+        :meth:`_persist`. The in-process ``self._lock`` gives NO cross-process
+        protection, so a sweeper that read a proposal as pending and then was
+        preempted while an approve advanced it to ``approved`` (and FIRED the
+        reactor) would resume from its STALE pending read and clobber the
+        approved+fired row back to ``expired`` (``execution=None``) — a
+        capital-moved position misrepresented as expired, and (since the JSONL
+        'expire' event is appended LAST and ``_reconcile_index`` is
+        last-event-per-id) the audit source-of-truth corrupted too.
+
+        The fix mirrors the SQLite-index-as-cross-process-arbiter pattern used by
+        ``daemon/halt_state`` and ``state/portfolio_state``: the transition is a
+        guarded ``UPDATE ... WHERE proposal_id=? AND state='pending'`` inside a
+        single ``BEGIN IMMEDIATE`` transaction. Exactly ONE contender wins
+        (``rowcount == 1``); a concurrent approve/reject/expire that already
+        advanced the row makes the CAS update 0 rows, and we return None WITHOUT
+        appending an 'expire' audit line — so an expire can never overwrite a
+        non-pending (approved/fired) row. Idempotent by construction.
+        """
         with self._lock:
             try:
                 current = self._get_or_raise(proposal_id)
@@ -527,8 +553,57 @@ class ProposalStore:
                     "expired_at": _iso(_utc_now()),
                 }
             )
-            self._persist(updated, event="expire")
+            # Run the guarded compare-and-set on the SQLite index FIRST (it is the
+            # cross-process write-lock arbiter), and append the 'expire' audit
+            # event to the JSONL bus ONLY when we win — mirroring the atomic
+            # transition idiom (CAS-then-audit). If a concurrent approve/reject/
+            # expire already advanced the row out of 'pending', the CAS updates 0
+            # rows and we return None WITHOUT appending a phantom 'expire' line
+            # (so neither the SQLite index nor the JSONL latest-event-per-id
+            # reconcile can resurrect the row as expired). No clobber.
+            won = self._cas_expire(proposal_id, updated)
+            if not won:
+                return None
+            self._append_audit(updated, event="expire")
             return updated
+
+    def _cas_expire(self, proposal_id: str, updated: Proposal) -> bool:
+        """Guarded SQLite transition pending -> expired. Returns True iff this
+        caller won the compare-and-set (the row was still 'pending').
+
+        BEGIN IMMEDIATE takes the write lock up-front so two processes serialize
+        here; the ``WHERE state='pending'`` guard means only the FIRST contender
+        flips the row — every later contender (or a concurrent approve/reject
+        that already advanced it) updates 0 rows and loses.
+        """
+        record = _proposal_to_dict(updated)
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "UPDATE proposals SET "
+                    "  state = 'expired', "
+                    "  expired_at = ?, "
+                    "  record_json = ? "
+                    "WHERE proposal_id = ? AND state = 'pending'",
+                    (
+                        updated.expired_at,
+                        json.dumps(record, separators=(",", ":"), sort_keys=True),
+                        proposal_id,
+                    ),
+                )
+                won = cur.rowcount == 1
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                logger.warning(
+                    "proposals: SQLite expire CAS failed for %s; JSONL is "
+                    "authoritative — re-read will reconstruct via JSONL scan",
+                    proposal_id,
+                    exc_info=True,
+                )
+                raise
+        return won
 
     def sweep_expired(self) -> int:
         """Sweep pending proposals whose expires_at is in the past.
@@ -766,13 +841,14 @@ class ProposalStore:
         """Append one event line to the JSONL bus (the source of truth) and
         emit the create-time governance event.
 
-        This is the JSONL half of :meth:`_persist`, factored out so the ar16
-        atomic-claim path (:meth:`claim_for_approval`) can write its audit line
-        WITHOUT re-running the SQLite upsert — the claim already flipped the
-        SQLite row inside its own ``BEGIN IMMEDIATE`` compare-and-set, so a
-        second upsert here would be redundant (and would race the very window
-        we just closed). The append-only JSONL is latest-event-per-id, so the
-        claim event lands durably for ``_reconcile_index``.
+        This is the JSONL half of :meth:`_persist`, factored out so the guarded
+        compare-and-set paths — the ar16 atomic-claim (:meth:`claim_for_approval`)
+        and the TTL-sweep (:meth:`expire_one`) — can write their audit line
+        WITHOUT re-running the unconditional SQLite upsert. Each already flipped
+        the SQLite row inside its own ``BEGIN IMMEDIATE`` compare-and-set, so a
+        second unconditional upsert here would be redundant and would race (or
+        defeat) the very window/guard we just closed. The append-only JSONL is
+        latest-event-per-id, so the event lands durably for ``_reconcile_index``.
         """
         record = _proposal_to_dict(proposal)
         record["_event"] = event  # "create" | "approve" | "reject" | "expire"
@@ -835,6 +911,13 @@ class ProposalStore:
         JSONL is written first; if SQLite write fails, the index can be
         rebuilt from JSONL via _reconcile_index() (replays the append-only
         log, latest-event-per-id wins, tolerant of corrupt trailing lines).
+
+        NOTE: this performs an UNCONDITIONAL upsert and is used by the
+        single-state-machine transitions (create / approve / reject) that hold
+        the in-process lock and read+write a single proposal. The TTL-sweep
+        ``expire_one`` path, which is driven cross-process, does NOT use this —
+        it runs a guarded compare-and-set via :meth:`_cas_expire` so a stale
+        sweeper read can never clobber a concurrently-approved row.
         """
         # JSONL append (the source of truth) + create-time governance event.
         self._append_audit(proposal, event=event)
