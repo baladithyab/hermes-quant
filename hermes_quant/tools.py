@@ -1979,6 +1979,7 @@ def quant_insider(args: dict, **_kwargs) -> str:
     since_raw = args.get("since")
     if since_raw:
         try:
+            from datetime import UTC as _UTC
             from datetime import datetime as _dt
 
             since = _dt.fromisoformat(str(since_raw))
@@ -1986,6 +1987,12 @@ def quant_insider(args: dict, **_kwargs) -> str:
             return json.dumps(
                 {"success": False, "error": f"unparseable since timestamp: {since_raw!r}"}
             )
+        # A bare ISO date (e.g. "2025-01-01") or a no-offset datetime yields a
+        # NAIVE datetime. filed_at in parse_submissions is tz-aware UTC, so a
+        # naive `since` would raise TypeError on the `filed_at < since` compare
+        # and drop EVERY filing behind an opaque error. Anchor naive input to UTC.
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=_UTC)
     do_store = bool(args.get("store", False))
 
     try:

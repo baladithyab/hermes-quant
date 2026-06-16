@@ -240,6 +240,12 @@ def parse_submissions(
     ``filed_at >= since``. Never raises: a malformed body -> ``[]``.
     """
     items: list[InsiderFiling] = []
+    # Defensive: filed_at is tz-aware UTC, so a NAIVE `since` (tzinfo=None, e.g.
+    # from a bare-date `datetime.fromisoformat("2025-01-01")`) would make the
+    # `filed_at < since` compare raise TypeError. Anchor a naive cutoff to UTC up
+    # front to uphold the "Never raises" contract regardless of the caller.
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
     try:
         doc = json.loads(raw)
     except (ValueError, TypeError) as e:

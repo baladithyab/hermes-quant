@@ -295,6 +295,27 @@ def test_since_filter_drops_earlier_filings():
     assert all(f.accession_number != "0000320193-25-000077" for f in filings)
 
 
+def test_since_filter_accepts_naive_cutoff_without_raising():
+    """A NAIVE ``since`` (bare-date / tzinfo=None) must NOT raise (docstring: 'Never raises').
+
+    Regression: ``filed_at`` is tz-aware UTC; comparing it against a naive
+    ``since`` raised TypeError("can't compare offset-naive and offset-aware
+    datetimes"). parse_submissions must treat a naive cutoff as UTC and
+    DATE-FILTER, not blow up (which previously dropped EVERY filing behind an
+    opaque generic error).
+    """
+    # datetime.fromisoformat("2025-03-18") -> naive midnight, tzinfo is None.
+    naive_cutoff = datetime(2025, 3, 18)  # noqa: DTZ001 - intentionally naive
+    assert naive_cutoff.tzinfo is None
+    filings = parse_submissions(_SUBMISSIONS_PAYLOAD, since=naive_cutoff)
+    # Treated as UTC: same result as the tz-aware cutoff above (row 0 dropped,
+    # rows accepted on/after 2025-03-18 kept) — NOT all-dropped, NOT an exception.
+    aware = parse_submissions(_SUBMISSIONS_PAYLOAD, since=datetime(2025, 3, 18, tzinfo=UTC))
+    assert {f.accession_number for f in filings} == {f.accession_number for f in aware}
+    assert len(filings) >= 1  # the date filter kept some, did not drop everything
+    assert all(f.accession_number != "0000320193-25-000077" for f in filings)
+
+
 # --- fail-closed / silence-by-default ----------------------------------------
 def test_fetch_silences_on_feed_failure():
     """A network failure returns ([], latency), never raises."""
@@ -469,3 +490,35 @@ def test_quant_insider_tool_silent_when_flag_off(monkeypatch):
     assert out["success"] is True
     assert out["enabled"] is False
     assert out["filings"] == []
+
+
+def test_quant_insider_tool_bare_date_since_filters_not_drops(monkeypatch):
+    """Flag ON + a natural bare-date ``since`` must DATE-FILTER, not opaque-fail.
+
+    Regression: ``datetime.fromisoformat('2025-01-01')`` is NAIVE; the tool only
+    caught ValueError, so the naive value flowed into parse_submissions where the
+    tz-aware ``filed_at < since`` comparison raised TypeError, propagated to the
+    tool's catch-all and returned ``{success: False}`` with EVERY filing dropped
+    behind a generic error. The fix coerces ``since`` to tz-aware UTC at the
+    boundary so the common bare-date input works.
+    """
+    monkeypatch.setenv("HERMES_QUANT_INSIDER_ENABLED", "1")
+    # Inject the offline fixture via the adapter's real fetch path (the tool calls
+    # fetch_form4_filings without a fetcher, which uses _fetch_raw when ON).
+    monkeypatch.setattr(form4, "_fetch_raw", _ok_fetcher)
+    from hermes_quant.tools import quant_insider
+
+    # Bare ISO date -> naive datetime. Before the fix this triggered the TypeError.
+    out = json.loads(quant_insider({"cik": "320193", "since": "2025-03-18"}))
+    assert out["success"] is True, out
+    assert out["enabled"] is True
+    # Date filter applied (treated as UTC): row 0 (accepted 2025-03-17) dropped,
+    # not ALL filings — count must be > 0 and the early accession absent.
+    accnos = {f["accession_number"] for f in out["filings"]}
+    assert "0000320193-25-000077" not in accnos
+    assert out["count"] >= 1
+
+    # Same with an explicit naive datetime form (T00:00:00, still tzinfo=None).
+    out2 = json.loads(quant_insider({"cik": "320193", "since": "2025-03-18T00:00:00"}))
+    assert out2["success"] is True, out2
+    assert out2["count"] == out["count"]
