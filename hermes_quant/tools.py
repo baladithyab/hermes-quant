@@ -286,16 +286,25 @@ def quant_recipes(args: dict, **_kwargs) -> str:
 
 
 def _read_pdr_mode() -> str:
-    """Read quant.pdr.mode from ~/.hermes/config.yaml. Defaults to 'advise'.
+    """Read quant.pdr.mode from the active (profile-aware) Hermes config.
 
     Per ADR-0015 §D7: the mode gate is read at every quant_propose call, NOT
     cached, so an operator can edit config + retry without a daemon restart.
+
+    Per ADR-0013 §D4: resolves the SAME profile-aware path the autonomous
+    engine reads (`~/.hermes/profiles/<name>/config.yaml` when HERMES_PROFILE
+    is set, else the global `~/.hermes/config.yaml`). Reading the global file
+    unconditionally would let a stale pre-migration global config override the
+    active profile's mode — a fail-OPEN at the HITL mode gate. Defaults to
+    'advise'.
     """
     try:
         import yaml
     except ImportError:
         return "advise"
-    cfg_path = Path.home() / ".hermes" / "config.yaml"
+    from hermes_quant.watchlist import get_config_path
+
+    cfg_path = get_config_path()
     if not cfg_path.exists():
         return "advise"
     try:
@@ -308,12 +317,17 @@ def _read_pdr_mode() -> str:
 
 
 def _read_learn_from_rejections() -> bool:
-    """quant.calibration.learn_from_rejections (default True per ADR-0015 §D8)."""
+    """quant.calibration.learn_from_rejections (default True per ADR-0015 §D8).
+
+    Profile-aware per ADR-0013 §D4 — same active-config path as _read_pdr_mode.
+    """
     try:
         import yaml
     except ImportError:
         return True
-    cfg_path = Path.home() / ".hermes" / "config.yaml"
+    from hermes_quant.watchlist import get_config_path
+
+    cfg_path = get_config_path()
     if not cfg_path.exists():
         return True
     try:
@@ -330,7 +344,9 @@ def _hitl_mode_mismatch_response(tool_name: str, mode: str) -> str:
             "success": False,
             "error": "mode_mismatch",
             "message": f"{tool_name} requires quant.pdr.mode=hitl; "
-            f"current mode={mode!r}. Set in ~/.hermes/config.yaml.",
+            f"current mode={mode!r}. Set in the active Hermes config "
+            f"(~/.hermes/profiles/<HERMES_PROFILE>/config.yaml when a profile "
+            f"is active, else ~/.hermes/config.yaml).",
             "current_mode": mode,
         }
     )

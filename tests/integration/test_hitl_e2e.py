@@ -876,3 +876,104 @@ def test_proposal_id_format_per_adr():
     # last part = 6 hex chars
     assert len(parts[-1]) == 6
     assert all(c in "0123456789abcdef" for c in parts[-1])
+
+
+# ---------------------------------------------------------------------------
+# Profile-aware mode-gate path resolution (ADR-0013 §D4 alignment)
+#
+# The HITL tools' mode gate (_read_pdr_mode in hermes_quant.tools) must read the
+# SAME profile-aware config path the autonomous engine reads. Otherwise a stale
+# pre-migration GLOBAL ~/.hermes/config.yaml (mode=hitl) can override the active
+# profile's ~/.hermes/profiles/<name>/config.yaml (mode=advise) — fail-OPEN: the
+# operator set advise (NO trading) but quant_approve would still fire a fill.
+# ---------------------------------------------------------------------------
+
+
+def _write_config(path: Path, mode: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"quant:\n  pdr:\n    mode: {mode}\n")
+
+
+def test_tools_read_pdr_mode_is_profile_aware(monkeypatch, tmp_path):
+    """RED: when HERMES_PROFILE is set, tools._read_pdr_mode must read the active
+    profile config — not the stale global file. Matches autonomous._read_pdr_mode."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "prod")
+
+    # Global says hitl (stale); active profile says advise (operator intent).
+    _write_config(tmp_path / ".hermes" / "config.yaml", "hitl")
+    _write_config(tmp_path / ".hermes" / "profiles" / "prod" / "config.yaml", "advise")
+
+    import hermes_quant.autonomous as autonomous
+    import hermes_quant.tools as tools
+
+    engine_mode = autonomous._read_pdr_mode()
+    tools_mode = tools._read_pdr_mode()
+
+    # Engine is the canonical reference: it reads the profile (advise).
+    assert engine_mode == "advise"
+    # Tools MUST agree — no precedence split between engine and HITL seams.
+    assert tools_mode == "advise", (
+        f"tools read stale GLOBAL mode={tools_mode!r} but active profile is "
+        f"engine_mode={engine_mode!r} — fail-OPEN at the HITL mode gate"
+    )
+
+
+def test_quant_approve_respects_profile_mode_advise(
+    isolated_store, monkeypatch, tmp_path
+):
+    """RED: with HERMES_PROFILE=prod (profile mode=advise) but a stale global
+    config (mode=hitl), quant_approve must refuse with mode_mismatch and NOT
+    proceed to select_reactor(...).execute(...). Currently it fires."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "prod")
+
+    _write_config(tmp_path / ".hermes" / "config.yaml", "hitl")
+    _write_config(tmp_path / ".hermes" / "profiles" / "prod" / "config.yaml", "advise")
+
+    # Store a REAL pending proposal so that, on the fail-open path, quant_approve
+    # passes the (stale) mode gate AND finds the proposal — reaching reactor
+    # dispatch. With the fix, the mode gate short-circuits before lookup.
+    _patch_default_store(monkeypatch, isolated_store)
+    proposal = isolated_store.propose(
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
+        advisor_result=_sample_advisor_result(),
+    )
+
+    # Guard: if the gate is (wrongly) bypassed, the reactor dispatch would be
+    # invoked. quant_approve does `from hermes_quant.react.dispatch import
+    # select_reactor`, so patch the dispatch module's symbol. We assert it is
+    # NEVER reached — the mode_mismatch must short-circuit first.
+    import hermes_quant.react.dispatch as dispatch_module
+    import hermes_quant.tools as tools
+
+    def _boom(*_a, **_k):
+        raise AssertionError(
+            "select_reactor reached in advise-only profile — mode gate failed OPEN"
+        )
+
+    monkeypatch.setattr(dispatch_module, "select_reactor", _boom, raising=False)
+
+    out = tools.quant_approve({"proposal_id": proposal.proposal_id})
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert parsed["error"] == "mode_mismatch"
+    assert parsed["current_mode"] == "advise"
+
+
+def test_tools_read_pdr_mode_global_when_no_profile(monkeypatch, tmp_path):
+    """Byte-identical when HERMES_PROFILE is unset: falls back to the global
+    ~/.hermes/config.yaml exactly as before."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+
+    _write_config(tmp_path / ".hermes" / "config.yaml", "hitl")
+
+    import hermes_quant.tools as tools
+
+    assert tools._read_pdr_mode() == "hitl"

@@ -1984,7 +1984,6 @@ def _autonomous_start(
     job's output, delivered via the operator's configured cron destination.
     """
     import os as _os
-    from pathlib import Path as _Path
 
     try:
         import yaml as _yaml
@@ -1992,7 +1991,12 @@ def _autonomous_start(
         print("hermes quant autonomous start: pyyaml is required")
         return 2
 
-    cfg_path = _Path.home() / ".hermes" / "config.yaml"
+    # ADR-0013 §D4: write to the SAME profile-aware path the engine + HITL tools
+    # read. Writing the global file unconditionally would land the mode in a
+    # different file than the profile-aware engine reads — a precedence split.
+    from hermes_quant.watchlist import get_config_path
+
+    cfg_path = get_config_path()
     if cfg_path.exists():
         cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     else:
@@ -2148,7 +2152,6 @@ def _create_autonomous_cron_job(*, cadence: str) -> dict:
 def _autonomous_stop() -> int:
     """Set quant.pdr.mode=advise — autonomous tick will refuse to fire."""
     import os as _os
-    from pathlib import Path as _Path
 
     try:
         import yaml as _yaml
@@ -2156,7 +2159,11 @@ def _autonomous_stop() -> int:
         print("hermes quant autonomous stop: pyyaml is required")
         return 2
 
-    cfg_path = _Path.home() / ".hermes" / "config.yaml"
+    # ADR-0013 §D4: write to the active profile-aware config (same path the
+    # engine + HITL tools read), not the global file unconditionally.
+    from hermes_quant.watchlist import get_config_path
+
+    cfg_path = get_config_path()
     if not cfg_path.exists():
         print("(no config.yaml — nothing to stop)")
         return 0
@@ -2350,11 +2357,13 @@ def _pretty_print_recommend(result: dict) -> None:
 
 
 def _show_config() -> None:
-    from pathlib import Path
-
     import yaml
 
-    cfg_path = Path.home() / ".hermes" / "config.yaml"
+    # ADR-0013 §D4: show the active profile-aware config (the one the engine +
+    # HITL tools actually read), so the operator sees the mode that is in force.
+    from hermes_quant.watchlist import get_config_path
+
+    cfg_path = get_config_path()
     if not cfg_path.exists():
         print(f"No config at {cfg_path}. Run `hermes quant setup` first.")
         return
