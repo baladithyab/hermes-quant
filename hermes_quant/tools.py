@@ -849,7 +849,11 @@ def quant_approve(args: dict, **_kwargs) -> str:
     # NOT report success with the ORIGINAL requested size (that marks a cap-refused
     # order as a successful approval and consumes the proposal so it cannot be
     # re-approved when headroom frees). Keep it PENDING and report realized 0.0.
+    # ar16: this is a PROVEN no-capital outcome (0-fill, no bus write), so roll the
+    # atomic claim back to `pending` — the store state must match the reported
+    # state="pending" (the claim advanced it to `approved` BEFORE the fire).
     if _rmeta.get("silenced"):
+        store.release_claim(proposal_id)
         return json.dumps(
             {
                 "success": False,
