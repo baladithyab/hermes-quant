@@ -476,6 +476,23 @@ def clip_one_to_remaining_headroom(
             silence_reason="zero_target",
         )
 
+    # ar78: fail CLOSED on a non-finite INCOMING target. ar07 partitions non-finite
+    # targets in the BATCH normalize_targets, and ar03 guards the existing book here —
+    # but this single-pick entry point (the autonomous cap path calls it directly) never
+    # guarded its own per_symbol_target_pct argument. A NaN/inf target slips past the
+    # `g_room/c_room <= 0` breach tests below (every NaN/inf comparison is False, and
+    # inf*scale stays inf), so an inf target FIRES unclipped. Silence it (fail-closed),
+    # mirroring ar07's nonfinite_target reason.
+    if not math.isfinite(per_symbol_target_pct):
+        return NormalizedTarget(
+            asset=asset,
+            per_symbol_target_pct=per_symbol_target_pct,
+            portfolio_target_pct=0.0,
+            scale_factor=0.0,
+            fired=False,
+            silence_reason="nonfinite_target",
+        )
+
     # ar03: fail CLOSED on a non-finite existing book (a NaN defeats the `<= 0`
     # breach test below — every NaN comparison is False).
     if not _book_is_finite(state):
