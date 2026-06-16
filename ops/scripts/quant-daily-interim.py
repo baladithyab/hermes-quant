@@ -417,7 +417,25 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
                     capped += 1
                     continue
                 # Accept the (possibly down-scaled) target into running state.
-                _running[sym] = _running.get(sym, 0.0) + clipped.portfolio_target_pct
+                # REPLACE, not ADD: clipped.portfolio_target_pct is the new ABSOLUTE
+                # target weight for `sym` (portfolio_normalize.py returns
+                # `portfolio_target = sign*accepted`), and the reactor records it with
+                # LATEST-TARGET semantics (portfolio/state.py + pdr_core
+                # CorePortfolioSnapshot: `positions[key] = latest target`, NOT a delta
+                # sum). The sibling autonomous-tick caller mirrors this with
+                # `portfolio_state.positions[entry.symbol] = effective_size`
+                # (autonomous.py:816/850). An ADDITIVE update here diverges only when
+                # `sym` is already in _running (seeded from the live book at the top of
+                # this fn, or re-fired this run): a held-symbol direction FLIP or a
+                # REDUCTION cancels/under-states that symbol's contribution to the
+                # running gross (e.g. seeded +0.50 flipped to a clipped -0.30 would
+                # record 0.50+(-0.30)=+0.20 instead of -0.30), phantom-lowering the
+                # gross the next pick sees and failing the cap OPEN — the exact runaway
+                # this gate guards. The flip is reachable: open_guard dedup is
+                # direction-aware ((symbol, sign) key), so a prior-day-held position
+                # flipping side is a NEW key, not deduped. For a brand-new symbol fired
+                # once, REPLACE and ADD are identical (0.0 + x == x).
+                _running[sym] = clipped.portfolio_target_pct
                 # ALWAYS pass the post-cap size downstream (not only when scaled):
                 # the reactor must fire exactly what the cap admitted, on every route.
                 _size_override = clipped.portfolio_target_pct
