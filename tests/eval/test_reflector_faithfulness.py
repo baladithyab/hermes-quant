@@ -149,6 +149,81 @@ def test_c_leakage_is_purely_deterministic_no_judge(golden: dict, trade_record: 
 
 
 # ---------------------------------------------------------------------------
+# (c') ABSENT / None tau_observable → leakage FAILS (fail-closed)
+#
+# None is the literal initial persisted value of tau_observable (a reflection
+# persisted before its tau was computed, or via a torn/partial write, carries
+# None — tests/memory/test_decisions.py asserts the initial row value is None).
+# The PRODUCTION retriever fail-CLOSES on None (excludes the reflection from
+# retrieval, retriever.py:366-367). This eval gate exists to CERTIFY the same
+# no-look-ahead rule, so it must ALSO treat an absent/None tau as a hard
+# leakage failure — never silently PASS it (which it did when None was routed
+# through _parse_dt → datetime.now(UTC), always after the deterministic floor).
+# Same _parse_dt(None)->now() fail-open family as ar29/ar33/ar35, at this site.
+# ---------------------------------------------------------------------------
+
+
+def test_cp_none_tau_fails_leakage(golden: dict, trade_record: dict, judge) -> None:
+    """tau_observable=None (the most-dishonest case: NO observability stamp) must
+    fail the no-leakage check, not silently pass. Mirrors the retriever's
+    fail-closed exclusion of None (retriever.py:366-367)."""
+    gate = ReflectorFaithfulnessGate()
+    none_tau = dict(golden["faithful_reflection"])
+    none_tau["tau_observable"] = None
+    verdict = gate.evaluate_one(none_tau, trade_record, judge=judge)
+    leakage = next(c for c in verdict.checks if c.name == "no_leakage")
+    assert leakage.passed is False, leakage.detail
+    assert verdict.passed is False
+    assert any("absent" in r.lower() or "none" in r.lower() for r in leakage.reasons), leakage.reasons
+
+
+def test_cp_missing_tau_key_fails_leakage(golden: dict, trade_record: dict, judge) -> None:
+    """A MISSING tau_observable key (.get -> None) is identical to None: fail-closed."""
+    gate = ReflectorFaithfulnessGate()
+    missing_tau = dict(golden["faithful_reflection"])
+    missing_tau.pop("tau_observable", None)
+    verdict = gate.evaluate_one(missing_tau, trade_record, judge=judge)
+    leakage = next(c for c in verdict.checks if c.name == "no_leakage")
+    assert leakage.passed is False, leakage.detail
+    assert verdict.passed is False
+
+
+def test_cp_blank_tau_fails_leakage(golden: dict, trade_record: dict, judge) -> None:
+    """A blank/whitespace tau_observable string is also an absent stamp: fail-closed
+    (do not let an empty string slip into _parse_dt and raise / coerce)."""
+    gate = ReflectorFaithfulnessGate()
+    blank_tau = dict(golden["faithful_reflection"])
+    blank_tau["tau_observable"] = "   "
+    verdict = gate.evaluate_one(blank_tau, trade_record, judge=judge)
+    leakage = next(c for c in verdict.checks if c.name == "no_leakage")
+    assert leakage.passed is False, leakage.detail
+    assert verdict.passed is False
+
+
+def test_cp_none_tau_fails_without_judge(golden: dict, trade_record: dict) -> None:
+    """The absent-tau failure is purely deterministic — no LLM judge needed."""
+    gate = ReflectorFaithfulnessGate()
+    none_tau = dict(golden["faithful_reflection"])
+    none_tau["tau_observable"] = None
+    verdict = gate.evaluate_one(none_tau, trade_record, judge=None)
+    leakage = next(c for c in verdict.checks if c.name == "no_leakage")
+    assert leakage.passed is False
+
+
+def test_cp_none_tau_fails_leakage_in_batch(golden: dict, trade_record: dict, judge) -> None:
+    """evaluate_batch shares the same _check_no_leakage — an absent tau must fail
+    there too (the holed check is line 455's per-reflection leakage call)."""
+    gate = ReflectorFaithfulnessGate()
+    none_tau = dict(golden["faithful_reflection"])
+    none_tau["tau_observable"] = None
+    records = {none_tau["decision_id"]: trade_record}
+    verdict = gate.evaluate_batch([none_tau], records, judge=judge)
+    leakage = next(c for c in verdict.checks if c.name == "no_leakage")
+    assert leakage.passed is False, leakage.detail
+    assert verdict.passed is False
+
+
+# ---------------------------------------------------------------------------
 # (d) unstable lesson_category across identical inputs → stability FAILS
 # ---------------------------------------------------------------------------
 

@@ -322,11 +322,46 @@ class ReflectorFaithfulnessGate:
     ) -> CheckResult:
         reasons: list[str] = []
 
-        # (A) tau_observable must be HONEST: at or after the deterministic floor.
-        # An understated tau admits the reflection to a future decision too early
-        # (the retriever / haircut guard is `tau < asof`).
-        tau = _parse_dt(reflection.get("tau_observable"))
-        tau_below_floor = tau < facts.tau_floor
+        # (A) tau_observable must be HONEST: PRESENT, parseable, AND at or after the
+        # deterministic floor.
+        #
+        # An ABSENT/None/blank tau is the most-dishonest case — there is NO
+        # observability stamp at all. It is the literal initial persisted value
+        # (a reflection written before its tau was computed, or via a torn/partial
+        # write, carries None). The PRODUCTION retriever fail-CLOSES on None
+        # (excludes the reflection from retrieval — retriever.py:366-367). This
+        # gate exists to CERTIFY that SAME no-look-ahead rule, so it MUST also
+        # fail-CLOSED here. We therefore distinguish absent/unparseable from
+        # parseable BEFORE the floor comparison instead of routing None through
+        # _parse_dt (which returns datetime.now(UTC) — always after the floor, so
+        # it would silently PASS the dishonest case). Same _parse_dt(None)->now()
+        # fail-open family fixed at the catalyst / semantic / freqtrade sites.
+        #
+        # An understated (present but too-early) tau admits the reflection to a
+        # future decision too early — the retriever / haircut guard is `tau < asof`.
+        raw_tau = reflection.get("tau_observable")
+        tau_missing = raw_tau is None or (isinstance(raw_tau, str) and not raw_tau.strip())
+        tau: datetime | None
+        tau_unparseable = False
+        if tau_missing:
+            tau = None
+            reasons.append(
+                "tau_observable is absent/None — unverifiable observability stamp; "
+                "fail-closed, matching the retriever's exclusion rule (retriever.py "
+                "treats a None tau as not-yet-observable and excludes it)."
+            )
+        else:
+            try:
+                tau = _parse_dt(raw_tau)
+            except (ValueError, TypeError):
+                tau = None
+                tau_unparseable = True
+                reasons.append(
+                    f"tau_observable {raw_tau!r} is unparseable as an ISO datetime — "
+                    f"unverifiable observability stamp; fail-closed."
+                )
+
+        tau_below_floor = tau is not None and tau < facts.tau_floor
         if tau_below_floor:
             reasons.append(
                 f"tau_observable {tau.isoformat()} is BEFORE the deterministic floor "
@@ -334,8 +369,12 @@ class ReflectorFaithfulnessGate:
                 f"future decision before its outcome was knowable (look-ahead)."
             )
 
-        # Observability horizon: nothing in a decision-feeding field may post-date this.
-        horizon = max(tau, facts.tau_floor, facts.asof_resolution)
+        # Observability horizon: nothing in a decision-feeding field may post-date
+        # this. When tau is absent/unparseable, fall back to the deterministic
+        # floor / resolution (the most-conservative horizon) for the date scan.
+        horizon = max(facts.tau_floor, facts.asof_resolution)
+        if tau is not None:
+            horizon = max(horizon, tau)
 
         # (B) the only free-form decision-feeding field — reflection_text — must
         # embed no event dated after the horizon (future knowledge carried past tau).
@@ -355,15 +394,18 @@ class ReflectorFaithfulnessGate:
                 f"leaking into a decision-feeding field."
             )
 
-        passed = not tau_below_floor and not future_dates
+        tau_absent = tau_missing or tau_unparseable
+        passed = not tau_absent and not tau_below_floor and not future_dates
         return CheckResult(
             name="no_leakage",
             passed=passed,
             reasons=reasons,
             detail={
-                "tau_observable": tau.isoformat(),
+                "tau_observable": tau.isoformat() if tau is not None else None,
                 "tau_floor": facts.tau_floor.isoformat(),
                 "tau_below_floor": tau_below_floor,
+                "tau_missing": tau_missing,
+                "tau_unparseable": tau_unparseable,
                 "observability_horizon": horizon.isoformat(),
                 "future_dates_in_text": future_dates,
             },
