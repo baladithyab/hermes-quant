@@ -179,7 +179,13 @@ def _collect_metrics(asof: datetime) -> dict[str, Any]:
     sharpe_ci_latest_asof: datetime | None = None
     rolling_30d_max_drawdown_pct = 0.0
 
-    for evt in audit_log.read():
+    # ar56 defense-in-depth: read only the kinds this collector consumes. The read side
+    # already skips extension kinds (audit_log.read, *_llm_call rows that would raise a
+    # ValidationError on GovernanceEvent reconstruction), but an explicit whitelist keeps
+    # this consumer robust independent of that skip and mirrors meta_retro's filtered reads.
+    for evt in audit_log.read(
+        kinds=["fill", "kill_switch_fired", "gate_rejection", "promotion_event"]
+    ):
         evt_asof = evt.asof
         if evt_asof.tzinfo is None:
             evt_asof = evt_asof.replace(tzinfo=UTC)

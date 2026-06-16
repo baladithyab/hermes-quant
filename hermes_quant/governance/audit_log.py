@@ -194,6 +194,20 @@ def read(
             if kinds is not None and row_kind not in kinds:
                 continue
 
+            # ar56: extension kinds (e.g. the *_llm_call rows written by the LLM
+            # producers via the raw append path that bypasses append()'s VALID_KINDS
+            # gate, ADR-0054) carry the CURRENT schema_version so they survive the
+            # version guard above — but GovernanceEvent.kind is a restricted Literal, so
+            # reconstructing one below raises a pydantic ValidationError. Skip-and-log
+            # them here (mirroring the corrupt-line / non-dict skips) so an UNFILTERED
+            # reader (kinds=None) — e.g. governance.promotion._collect_metrics — does not
+            # become permanently un-evaluable on a log poisoned by extension rows.
+            if row_kind not in VALID_KINDS:
+                logger.warning(
+                    "audit-log: skipping unknown/extension kind %r in %s", row_kind, path
+                )
+                continue
+
             asof_raw = row.get("asof")
             row_asof: datetime
             if isinstance(asof_raw, str):
