@@ -193,6 +193,11 @@ class HermesQuantConsumer(IStrategy):
         self._safe_stop_active = False
         self._safe_stop_reason = ""
         self._signal_cache: dict[str, dict] = {}  # latest signal per pair
+        # Edge-triggered drop-reason latch per pair so a degraded upstream is
+        # logged ONCE on the had-signal -> dropping transition (not every candle).
+        # value is the reason currently latched for the pair, or None when the
+        # pair last produced a usable signal (recovery clears it).
+        self._signal_drop_reason: dict[str, str | None] = {}
 
     # -------------------------------------------------------------------------
     # IStrategy hooks
@@ -426,15 +431,32 @@ class HermesQuantConsumer(IStrategy):
             pass
 
     def _latest_signal_for(self, pair: str, current_time) -> dict | None:
-        """Return the most recent valid signal for this pair, or None."""
+        """Return the most recent valid signal for this pair, or None.
+
+        The four fail-CLOSED drop branches below (no cached signal, wrong schema,
+        stale asof, unparseable asof) are correct money-software posture — a
+        degraded upstream must NOT produce a trade. But a bare `return None` makes
+        the halt unobservable: a daemon emitting fresh heartbeats but garbage
+        per-asset signals keeps the heartbeat dead-man-switch satisfied, so the
+        operator sees zero new trades, zero logs, and a live daemon —
+        indistinguishable from a deliberate quiet day (ar28: unobservable silence
+        on a money rail defeats the operator). Each drop therefore logs ONCE on the
+        had-signal -> dropping edge via _note_signal_drop (suppressed on repeats;
+        re-logged after recovery), mirroring the _enter_safe_stop idiom.
+        """
         self._refresh_state(current_time)
 
         sig = self._signal_cache.get(pair)
         if sig is None:
+            # No signal cached yet (startup / quiet pair) is the normal state, not
+            # a degradation of an existing signal — do not log/latch it.
             return None
 
         # Schema version check
         if sig.get("schema_version") != 1:
+            self._note_signal_drop(
+                pair, "bad_schema", f"schema_version={sig.get('schema_version')!r}"
+            )
             return None
 
         # Stale signal guard
@@ -454,11 +476,41 @@ class HermesQuantConsumer(IStrategy):
                 return None
             age_minutes = (now - asof).total_seconds() / 60.0
             if age_minutes > self.max_signal_age_minutes:
+                self._note_signal_drop(
+                    pair, "stale", f"age_minutes={age_minutes:.1f} > {self.max_signal_age_minutes}"
+                )
                 return None
-        except (ValueError, KeyError):
+        except (ValueError, KeyError) as e:
+            self._note_signal_drop(pair, "unparseable_asof", f"asof={sig.get('asof')!r} ({e})")
             return None
 
+        # Usable signal — clear any latched drop reason so a future drop logs again.
+        self._note_signal_recovery(pair)
         return sig
+
+    def _note_signal_drop(self, pair: str, reason: str, detail: str) -> None:
+        """Edge-triggered drop logging: warn ONCE on the transition into (or between)
+        drop reasons for a pair, then suppress repeats until the pair recovers.
+
+        Runs every candle per pair, so naive per-call logging would spam — we only
+        log when the latched reason for the pair changes (mirrors _enter_safe_stop,
+        which only logs on the not-active -> active edge)."""
+        if self._signal_drop_reason.get(pair) != reason:
+            logger.warning(
+                "signal dropped for %s: %s (%s) — trading halted for this pair "
+                "until a usable signal arrives (no trade emitted)",
+                pair,
+                reason,
+                detail,
+            )
+        self._signal_drop_reason[pair] = reason
+
+    def _note_signal_recovery(self, pair: str) -> None:
+        """Clear a pair's latched drop reason on a usable signal; log the recovery
+        edge so the operator can see WHEN trading resumed."""
+        if self._signal_drop_reason.get(pair) is not None:
+            logger.warning("signal recovered for %s — usable signal observed", pair)
+        self._signal_drop_reason[pair] = None
 
     def _enter_safe_stop(self, reason: str) -> None:
         if not self._safe_stop_active:
