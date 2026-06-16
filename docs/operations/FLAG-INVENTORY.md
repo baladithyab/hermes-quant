@@ -37,7 +37,7 @@
 | `HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD` | `0.85` | `hermes_quant/research/hypothesis_novelty.py:57` |
 | `HERMES_QUANT_IC_DEDUP_AT_INGEST` | `` | `hermes_quant/factors/alpha_zoo.py:333` |
 | `HERMES_QUANT_IC_DEDUP_THRESHOLD` | `0.99` | `hermes_quant/factors/ic_dedup.py:75` |
-| `HERMES_QUANT_INSIDER_ENABLED` | `0` | `hermes_quant/evidence/adapters/form4.py:82` |
+| `HERMES_QUANT_INSIDER_ENABLED` | `0` | `hermes_quant/evidence/adapters/form4.py:93` |
 | `HERMES_QUANT_JOURNAL_PATH` | `` | `hermes_quant/journal/writer.py:32` |
 | `HERMES_QUANT_KNOWLEDGE_CUTOFF` | `` | `hermes_quant/eval/stockbench.py:47` |
 | `HERMES_QUANT_LLM_BUDGET` | `0` | `hermes_quant/agents/llm_budget.py:176` |
@@ -52,13 +52,13 @@
 | `HERMES_QUANT_OPTIONS_LIVE_CHAIN` | `0` | `hermes_quant/options/data.py:427` |
 | `HERMES_QUANT_OVERNIGHT_DRIFT` | `0` | `hermes_quant/advisor.py:430` |
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:255` |
-| `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:469` |
+| `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:523` |
 | `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1298` |
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:206` |
 | `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:871` |
-| `HERMES_QUANT_PREWARM_WORKERS` | `` | `hermes_quant/playbook/scorers.py:781` |
-| `HERMES_QUANT_REFLECTION` | `1` | `hermes_quant/react/deterministic_equity.py:641` |
+| `HERMES_QUANT_PREWARM_WORKERS` | `` | `hermes_quant/playbook/scorers.py:803` |
+| `HERMES_QUANT_REFLECTION` | `1` | `hermes_quant/react/deterministic_equity.py:696` |
 | `HERMES_QUANT_REFLECTOR_LLM` | `0` | `hermes_quant/memory/reflector.py:559` |
 | `HERMES_QUANT_REGIME_HMM` | `` | `hermes_quant/regime/detector.py:123` |
 | `HERMES_QUANT_RESEARCH_DEBATE` | `0` | `hermes_quant/aggregators/llm_committee.py:1145` |
