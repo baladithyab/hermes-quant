@@ -307,10 +307,21 @@ def compute_cumulative_realized_pnl_pct(
 
     The kill-switch basis (ADR-0016 §D9). Uses the canonical FIFO matcher
     (`settlement_loop.join_exit_fills`) so this rail agrees with the daemon's
-    settlement accounting rather than reimplementing lot-matching. Each settled
-    round-trip contributes `realized_return × entry_notional`; we divide the sum
-    by current NAV to express the cumulative loss/gain as a fraction comparable
-    to `kill_switch_pct`.
+    settlement accounting rather than reimplementing lot-matching.
+
+    ar25 — UNITS FIX (was a P1 fail-OPEN). ``SettledRoundTrip.qty`` is the
+    NAV-FRACTION magnitude the fill moved the position by (``abs(fill_size_pct)``,
+    e.g. 0.05 = 5% of NAV — settlement_loop._normalize_exec_record), NOT a share
+    count. So each round-trip's P&L as a fraction of NAV is simply
+    ``realized_return × qty`` and the cumulative basis is the SUM of those — NAV
+    cancels and is never read. The prior code computed
+    ``realized_return × (qty × entry_price)`` and then divided the sum by current
+    NAV, which double-discounted by ≈nav/entry_price (~1000× for a $100 stock):
+    a genuine -10%-of-NAV realized drawdown read as ~-0.01%, so the trip check
+    ``_cum_pnl <= -kill_switch_pct`` was effectively dead on every NAV-fraction
+    lane (synthetic-paper/autonomous AND alpaca-paper both derive qty from
+    fill_size_pct). RED-verified empirically (50%-NAV position down 20% -> -0.0001
+    vs correct -0.10).
 
     Returns a SIGNED fraction: negative = net loss (e.g. -0.12 = down 12% of NAV
     on realized round-trips). Unrealized (still-open) positions are NOT counted —
@@ -326,6 +337,9 @@ def compute_cumulative_realized_pnl_pct(
     Cold start (no last-known) still returns 0.0 — we cannot fabricate a loss, and
     the deterministic gate (ADR-0004, independent + fail-CLOSED) remains the final
     authority. An empty/absent book legitimately returns 0.0 (no realized P&L yet).
+    The basis no longer reads NAV, so the old ar20 NAV-None degraded branch is moot
+    (structurally subsumed); the except-branch carry-forward below still guards a
+    FIFO-matcher / bus-parse fault.
     """
     try:
         from hermes_quant.daemon.settlement_loop import join_exit_fills
@@ -345,35 +359,15 @@ def compute_cumulative_realized_pnl_pct(
         if not records:
             return 0.0
         round_trips, _open = join_exit_fills(records)
-        realized_pnl_usd = 0.0
+        # ar25: qty is ALREADY a NAV-fraction, so a round-trip's NAV-fraction P&L is
+        # realized_return × qty. Sum directly — NAV cancels (do NOT multiply by
+        # entry_price, do NOT divide by NAV). A non-finite term is skipped.
+        frac = 0.0
         for rt in round_trips:
-            entry_notional = abs(rt.qty) * abs(rt.entry_price)
-            if not math.isfinite(rt.realized_return) or not math.isfinite(entry_notional):
+            term = rt.realized_return * rt.qty
+            if not math.isfinite(term):
                 continue
-            realized_pnl_usd += rt.realized_return * entry_notional
-        nav = _account_nav_usd()
-        if nav is None or nav <= 0 or not math.isfinite(nav):
-            # ar20 (ar02 NAV-None sibling): NAV is unreadable (e.g. state.db corrupt/
-            # locked while executions.jsonl — a DISTINCT file — is still readable). If
-            # we computed a NONZERO realized P&L from a populated book, returning a bare
-            # 0.0 here silently disarms the D9 drawdown rail exactly as the outer-except
-            # fail-OPEN ar02 closed: a real losing book whose NAV momentarily can't be
-            # read would run un-halted. Carry the LAST-KNOWN fraction forward (conservative
-            # — a losing book that briefly can't price its NAV stays tripped) and surface
-            # the degraded-rail audit. A cold-start/empty book legitimately has
-            # realized_pnl_usd == 0.0 and there is no loss to mask, so it stays 0.0.
-            if realized_pnl_usd != 0.0 and math.isfinite(realized_pnl_usd):
-                last_known = _read_last_known_cum_pnl()
-                _emit_killswitch_degraded_audit(
-                    RuntimeError(
-                        f"NAV unreadable (nav={nav!r}) with nonzero realized "
-                        f"P&L={realized_pnl_usd:.2f}; carrying last-known forward"
-                    ),
-                    last_known,
-                )
-                return last_known if last_known is not None else 0.0
-            return 0.0
-        frac = realized_pnl_usd / nav
+            frac += term
         if not math.isfinite(frac):
             return 0.0
         _persist_last_known_cum_pnl(frac)

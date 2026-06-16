@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from hermes_quant import autonomous as auto
 
 
@@ -125,47 +127,47 @@ def test_ar19_normalize_skips_multileg_parent_directly(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# ar20 — NAV-None with a nonzero realized loss carries last-known forward
+# ar20/ar25 — the basis no longer reads NAV, so NAV-None cannot disarm it.
+# (ar25 made the contribution realized_return × qty, where qty is already a
+# NAV-fraction. NAV is never read for the basis, which structurally subsumes the
+# old ar20 NAV-None fail-open — there is no NAV-None branch left to fail.)
 # --------------------------------------------------------------------------- #
-def test_ar20_nav_none_with_loss_carries_last_known_forward(tmp_path, monkeypatch):
-    """A -20% realized loss with NAV unreadable must NOT return a bare 0.0 (which would
-    disarm the D9 rail); it carries the last-known fraction forward."""
-    monkeypatch.setattr(auto, "QUANT_HOME", tmp_path, raising=False)
-    monkeypatch.setattr(auto, "_LAST_KNOWN_CUM_PNL_PATH",
-                        tmp_path / "autonomous_cum_pnl_last_known.json", raising=False)
-    # Seed a last-known losing fraction (as a prior successful compute would have).
-    auto._persist_last_known_cum_pnl(-0.18)
-
+def test_ar25_basis_independent_of_nav_none(tmp_path, monkeypatch):
+    """A 20%-NAV position down 20% (= -4% of NAV realized) computes the SAME fraction
+    whether NAV is readable or None — the ar25 basis does not divide by NAV, so a
+    momentarily-unreadable NAV can no longer disarm the D9 rail (the old ar20 hole)."""
     bus = _write_bus(tmp_path, [
         _equity_fill("ASTS", 0.2, 100.0, "2026-06-01T15:00:00Z", "p1"),
         _equity_fill("ASTS", -0.2, 80.0, "2026-06-02T15:00:00Z", "p2"),
     ])
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: None)  # NAV unreadable
-    frac = auto.compute_cumulative_realized_pnl_pct(bus)
-    assert frac == -0.18, (
-        "ar20: NAV-None with a nonzero realized loss must carry the last-known fraction "
-        f"forward (got {frac}); a bare 0.0 silently disarms the D9 drawdown rail."
-    )
+    frac_navnone = auto.compute_cumulative_realized_pnl_pct(bus)
+    monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100000.0)
+    frac_nav = auto.compute_cumulative_realized_pnl_pct(bus)
+    # 0.2 NAV-fraction lot, -20% return -> -0.04 of NAV; identical regardless of NAV.
+    assert frac_navnone == pytest.approx(-0.04)
+    assert frac_navnone == pytest.approx(frac_nav)
 
 
-def test_ar20_nav_none_cold_start_empty_book_stays_zero(tmp_path, monkeypatch):
-    """No last-known + an EMPTY book + NAV-None: 0.0 is correct (no loss to mask)."""
-    monkeypatch.setattr(auto, "QUANT_HOME", tmp_path, raising=False)
-    monkeypatch.setattr(auto, "_LAST_KNOWN_CUM_PNL_PATH",
-                        tmp_path / "nolast.json", raising=False)
-    bus = _write_bus(tmp_path, [])  # empty book -> realized_pnl_usd == 0.0
-    monkeypatch.setattr(auto, "_account_nav_usd", lambda: None)
-    assert auto.compute_cumulative_realized_pnl_pct(bus) == 0.0
-
-
-def test_ar20_healthy_nav_unchanged(tmp_path, monkeypatch):
-    """Byte-identical on the healthy path: a real NAV computes the real fraction."""
+def test_ar25_realistic_drawdown_trips_threshold(tmp_path, monkeypatch):
+    """ar25 RED→GREEN: a -10%-of-NAV realized drawdown reads -0.10 (was ~-0.0001 ~1000x
+    understated) so the default 10% kill threshold actually trips."""
     bus = _write_bus(tmp_path, [
-        _equity_fill("ASTS", 0.2, 100.0, "2026-06-01T15:00:00Z", "p1"),
-        _equity_fill("ASTS", -0.2, 80.0, "2026-06-02T15:00:00Z", "p2"),
+        _equity_fill("BIG", 0.5, 100.0, "2026-06-01T15:00:00Z", "p1"),
+        _equity_fill("BIG", -0.5, 80.0, "2026-06-02T15:00:00Z", "p2"),
     ])
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100000.0)
-    assert auto.compute_cumulative_realized_pnl_pct(bus) < 0.0
+    frac = auto.compute_cumulative_realized_pnl_pct(bus)
+    assert frac == pytest.approx(-0.10), (
+        f"ar25: a 50%-NAV position down 20% must read -0.10 of NAV (got {frac}); "
+        "the pre-fix ×entry_price ÷nav double-discount read ~-0.0001 and never tripped."
+    )
+    assert frac <= -0.10  # trips the default kill_switch_pct=0.10
+
+
+def test_ar25_empty_book_is_zero(tmp_path):
+    """An empty/absent book legitimately returns 0.0 (no realized P&L yet)."""
+    assert auto.compute_cumulative_realized_pnl_pct(_write_bus(tmp_path, [])) == 0.0
 
 
 # --------------------------------------------------------------------------- #

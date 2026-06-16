@@ -79,20 +79,21 @@ def test_cum_pnl_realized_gain_is_positive(tmp_path, monkeypatch):
     assert auto.compute_cumulative_realized_pnl_pct(bus) > 0.0
 
 
-def test_cum_pnl_bad_nav_cold_start_is_zero(tmp_path, monkeypatch):
-    # ar20: NAV unreadable with a realized loss BUT no last-known sidecar (cold start)
-    # falls back to the 0.0 floor — we cannot fabricate a loss fraction with no NAV and
-    # no prior value. (With a last-known present it carries forward instead — covered by
-    # test_killswitch_rail_failopen_ar19_ar21.py::test_ar20_nav_none_with_loss_carries_*.)
-    monkeypatch.setattr(auto, "QUANT_HOME", tmp_path, raising=False)
-    monkeypatch.setattr(auto, "_LAST_KNOWN_CUM_PNL_PATH",
-                        tmp_path / "no_last_known.json", raising=False)
+def test_cum_pnl_basis_is_nav_independent(tmp_path, monkeypatch):
+    # ar25: the basis is realized_return × qty where qty is ALREADY a NAV-fraction, so
+    # it does NOT read NAV. A 20%-NAV position down 20% = -4% of NAV realized, computed
+    # identically whether NAV is readable or None — NAV can no longer disarm the rail
+    # (this supersedes the old ar20 NAV-None fail-open, which is now structurally moot).
     bus = _write_bus(tmp_path, [
         _fill("ASTS", 0.2, 100.0, "2026-06-01T15:00:00Z", "p1"),
         _fill("ASTS", -0.2, 80.0, "2026-06-02T15:00:00Z", "p2"),
     ])
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: None)  # unknown NAV
-    assert auto.compute_cumulative_realized_pnl_pct(bus) == 0.0
+    frac_none = auto.compute_cumulative_realized_pnl_pct(bus)
+    monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100000.0)
+    frac_known = auto.compute_cumulative_realized_pnl_pct(bus)
+    assert frac_none == pytest.approx(-0.04)
+    assert frac_none == pytest.approx(frac_known)
 
 
 # --------------------------------------------------------------------------- #
