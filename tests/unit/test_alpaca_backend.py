@@ -102,6 +102,8 @@ class _FakeClient:
         poll_sequence: list[_FakeOrder] | None = None,
         poll_order: _FakeOrder | None = None,
         post_cancel_order: _FakeOrder | None = None,
+        cancel_raises: Exception | None = None,
+        post_cancel_get_raises: Exception | None = None,
     ) -> None:
         self._account = account if account is not None else _FakeAccount()
         self._account_raises = account_raises
@@ -110,10 +112,13 @@ class _FakeClient:
         self._poll_sequence = list(poll_sequence) if poll_sequence else None
         self._poll_order = poll_order
         self._post_cancel_order = post_cancel_order
+        self._cancel_raises = cancel_raises
+        self._post_cancel_get_raises = post_cancel_get_raises
         self.submitted: list[Any] = []
         self.poll_calls = 0
         self.cancel_calls: list[str] = []
         self._cancelled = False
+        self._post_cancel_get_fired = False
 
     def get_account(self) -> _FakeAccount:
         if self._account_raises is not None:
@@ -129,6 +134,15 @@ class _FakeClient:
 
     def get_order_by_id(self, order_id: str) -> _FakeOrder:
         self.poll_calls += 1
+        # A transient error on the post-cancel re-read (settlement UNKNOWN):
+        # the FIRST get_order_by_id after a cancel raises.
+        if (
+            self._cancelled
+            and self._post_cancel_get_raises is not None
+            and not self._post_cancel_get_fired
+        ):
+            self._post_cancel_get_fired = True
+            raise self._post_cancel_get_raises
         if self._cancelled and self._post_cancel_order is not None:
             return self._post_cancel_order
         if self._poll_sequence:
@@ -141,6 +155,8 @@ class _FakeClient:
     def cancel_order_by_id(self, order_id: str) -> None:
         self.cancel_calls.append(order_id)
         self._cancelled = True
+        if self._cancel_raises is not None:
+            raise self._cancel_raises
 
 
 def _backend(client: _FakeClient) -> AlpacaBackend:
@@ -467,6 +483,66 @@ def test_submit_option_mleg_post_cancel_clean_unfilled_stays_timeout() -> None:
         (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-clean"
     )
     assert client.cancel_calls == ["parent-clean"]
+    assert res.status == "unfilled_timeout"
+    assert res.filled_qty == 0.0
+    assert not res.is_fill
+
+
+def test_submit_option_mleg_cancel_unconfirmed_reread_fails_fails_closed() -> None:
+    """Settlement UNKNOWN on the mleg path must NOT collapse to a clean no-fill.
+
+    P1-C2 parity with the equity/single-option sibling
+    (``_alpaca_exec.cancel_and_settle``): on poll-budget timeout the mleg poll
+    cancels the still-WORKING parent then re-reads once. If (1)
+    ``cancel_order_by_id`` raises a transient broker/network error (the cancel is
+    UNCONFIRMED) AND (2) the post-cancel re-read ALSO raises, the parent may STILL
+    be working at the broker and may yet FILL — creating a real LIVE multi-leg
+    options position. Returning ``(None, 'unfilled_timeout')`` would have
+    ``submit_option_mleg`` report ``is_fill=False`` and the MultiLeg reactor write
+    a no-fill parent that reconciles NO position into state.db and is treated
+    terminally by every consumer — orphaning that position PERMANENTLY. It MUST
+    fail CLOSED, byte-identical to the active-poll re-read (L420) and the equity
+    ``cancel_and_settle`` (which RAISE on the SAME broker condition).
+    """
+    short, long = _vertical_legs()
+    working = _FakeOrder(order_id="parent-unknown", status="new", legs=[])
+    client = _FakeClient(
+        submit_result=working,
+        poll_order=working,
+        cancel_raises=RuntimeError("503 service unavailable (cancel)"),
+        post_cancel_get_raises=RuntimeError("503 service unavailable (re-read)"),
+    )
+    with pytest.raises(AlpacaSubmitError) as ei:
+        _backend(client).submit_option_mleg(
+            (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-unk"
+        )
+    # The cancel WAS attempted (and raised — unconfirmed).
+    assert client.cancel_calls == ["parent-unknown"]
+    # The error surfaces the UNKNOWN settlement, not a fabricated clean no-fill.
+    msg = str(ei.value).lower()
+    assert "parent-unknown" in msg
+    assert "settle" in msg or "unknown" in msg or "working" in msg
+
+
+def test_submit_option_mleg_confirmed_cancel_reread_fails_degrades_to_timeout() -> None:
+    """When the cancel SUCCEEDS (the working parent is provably gone) but the
+    post-cancel re-read raises transiently, there is no working order left to
+    orphan, so degrading to a clean unfilled_timeout no-fill is safe. This keeps
+    the fail-closed change NARROW — it only fires when the parent MIGHT still be
+    working (cancel UNCONFIRMED). Mirrors the equity sibling's confirmed-cancel +
+    re-read-raises degrade path."""
+    short, long = _vertical_legs()
+    working = _FakeOrder(order_id="parent-gone", status="new", legs=[])
+    client = _FakeClient(
+        submit_result=working,
+        poll_order=working,
+        # cancel_raises is None -> the cancel is CONFIRMED.
+        post_cancel_get_raises=RuntimeError("503 service unavailable (re-read)"),
+    )
+    res = _backend(client).submit_option_mleg(
+        (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-gone"
+    )
+    assert client.cancel_calls == ["parent-gone"]
     assert res.status == "unfilled_timeout"
     assert res.filled_qty == 0.0
     assert not res.is_fill

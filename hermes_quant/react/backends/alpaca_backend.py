@@ -387,16 +387,46 @@ class AlpacaBackend:
             # 'partially_filled' / 'new' / 'accepted' / 'pending_*' — NON-terminal.
             if time.monotonic() >= deadline:
                 # P1-C: cancel the working parent, then re-read once.
+                cancel_confirmed = True
                 try:
                     client.cancel_order_by_id(parent_id)
                 except Exception as exc:  # noqa: BLE001 — best-effort cancel
+                    cancel_confirmed = False
                     logger.warning(
                         "alpaca-backend: cancel mleg parent %s failed: %s",
                         parent_id,
                         exc,
                     )
                 time.sleep(self._poll_interval_s)
-                final = self._refresh(client, parent_id)
+                # P1-C2 (parity with _alpaca_exec.cancel_and_settle): re-read the
+                # parent. If the cancel was UNCONFIRMED (raised above) AND this
+                # re-read ALSO raises, settlement is UNKNOWN — the parent may still
+                # be WORKING and may yet fill, creating a real LIVE multi-leg
+                # position. Returning (None, 'unfilled_timeout') would orphan it
+                # PERMANENTLY (the no-fill record reconciles no position and is
+                # treated terminally by every consumer). Fail CLOSED — byte-identical
+                # to the active-poll re-read below (L420) and the equity sibling.
+                try:
+                    final = client.get_order_by_id(parent_id)
+                except Exception as exc:  # noqa: BLE001
+                    if not cancel_confirmed:
+                        raise AlpacaSubmitError(
+                            f"mleg parent {parent_id}: cancel was NOT confirmed and "
+                            f"the post-cancel re-read also failed ({exc}) — settlement "
+                            "UNKNOWN, the parent may still be working; refusing to "
+                            "record a clean no-fill"
+                        ) from exc
+                    # Cancel CONFIRMED: the parent is provably no longer working. A
+                    # transient re-read failure is safe to degrade to a clean
+                    # unfilled (no orphan risk).
+                    logger.warning(
+                        "alpaca-backend: post-cancel get_order_by_id(%s) failed "
+                        "after a CONFIRMED cancel: %s (parent provably no longer "
+                        "working — clean unfilled)",
+                        parent_id,
+                        exc,
+                    )
+                    final = None
                 fstatus = str(getattr(final, "status", "") or "").lower()
                 # P3-B (parity with _alpaca_exec.cancel_and_settle): the cancel
                 # only removes the UNfilled remainder, so a cancel-vs-fill race can
@@ -534,14 +564,3 @@ class AlpacaBackend:
             poll_interval_s=self._poll_interval_s,
             logger=logger,
         )
-
-    @staticmethod
-    def _refresh(client: Any, order_id: str) -> Any | None:
-        """Best-effort re-read of an order (for parent .legs after terminal)."""
-        try:
-            return client.get_order_by_id(order_id)
-        except Exception as exc:  # noqa: BLE001 — non-fatal; caller falls back
-            logger.warning(
-                "alpaca-backend: get_order_by_id(%s) refresh failed: %s", order_id, exc
-            )
-            return None
