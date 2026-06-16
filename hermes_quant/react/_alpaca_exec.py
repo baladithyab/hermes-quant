@@ -119,7 +119,9 @@ def poll_until_filled(
 
     P1-C: on timeout the order is still WORKING at the broker (DAY TIF) — we CANCEL
     it then re-read once: if the cancel raced a fill we record it (terminal), else
-    return None (a clean 0-fill with no working order left behind).
+    return None ONLY when the order is provably no longer working. An UNCONFIRMABLE
+    settlement (cancel did not confirm AND the re-read raised) fails CLOSED — see
+    ``cancel_and_settle``.
     """
     log = logger or logging.getLogger(__name__)
     deadline = time.monotonic() + poll_timeout_s
@@ -177,13 +179,26 @@ def cancel_and_settle(
     and orphan an unrecorded position. We cancel it, then re-read:
       * if the order had (or raced into) a partial/full fill -> record it (terminal
         — the cancel only removes the UNfilled remainder);
-      * otherwise -> None (a clean unfilled; no working order remains).
-    Cancel failures are non-fatal: we still re-read and report whatever filled.
+      * if the order is provably no longer working (cancel confirmed) and the
+        re-read shows no fill -> None (a clean unfilled; no working order remains).
+
+    Settlement-UNKNOWN fails CLOSED (P1-C2): if the cancel was NOT confirmed (the
+    ``cancel_order_by_id`` call raised) AND the post-cancel re-read ALSO raises, we
+    cannot prove the order stopped working — it may still be working at the broker
+    and may yet FILL, creating a real LIVE position. Returning None here would have
+    the caller write a fill_size_pct=0.0 / ``unfilled_timeout`` no-fill that never
+    reconciles state.db and is treated terminally by every consumer, orphaning that
+    position PERMANENTLY. So we RAISE ``AlpacaSubmitError`` — byte-identical to the
+    active-poll re-read (which raises on the SAME broker condition), surfacing the
+    unknown rather than collapsing it into a clean no-fill. A re-read that raises
+    after a CONFIRMED cancel still degrades to None (the order is provably gone).
     """
     log = logger or logging.getLogger(__name__)
+    cancel_confirmed = True
     try:
         client.cancel_order_by_id(order_id)
     except Exception as exc:  # noqa: BLE001 — cancel best-effort; still re-read
+        cancel_confirmed = False
         log.warning(
             "alpaca-exec: cancel_order_by_id(%s) failed on timeout: %s "
             "(re-reading to settle any partial)",
@@ -195,8 +210,20 @@ def cancel_and_settle(
     try:
         final = client.get_order_by_id(order_id)
     except Exception as exc:  # noqa: BLE001
+        if not cancel_confirmed:
+            # Settlement UNKNOWN: cancel UNCONFIRMED + re-read raised. The order may
+            # still be WORKING and may yet fill -> a 0.0 no-fill would orphan a real
+            # LIVE position. Fail CLOSED (matches the active-poll re-read at L162).
+            raise AlpacaSubmitError(
+                f"alpaca order {order_id}: cancel was NOT confirmed and the "
+                f"post-cancel re-read also failed ({exc}) — settlement UNKNOWN, the "
+                "order may still be working; refusing to record a clean no-fill"
+            ) from exc
+        # Cancel CONFIRMED: the order is provably no longer working. A transient
+        # re-read failure is safe to degrade to a clean unfilled (no orphan risk).
         log.warning(
-            "alpaca-exec: post-cancel get_order_by_id(%s) failed: %s",
+            "alpaca-exec: post-cancel get_order_by_id(%s) failed after a CONFIRMED "
+            "cancel: %s (order provably no longer working — clean unfilled)",
             order_id,
             exc,
         )

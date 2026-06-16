@@ -72,6 +72,11 @@ class _FakeClient:
     ``cancel_order_by_id`` records the cancel and (optionally) sets a
     ``post_cancel_order`` that subsequent get_order_by_id calls return — modeling
     a cancel that raced a realized partial.
+
+    ``post_cancel_get_raises`` (optional): if set, the FIRST get_order_by_id after
+    a cancel raises this exception — modeling a transient broker/network error on
+    the post-cancel re-read (settlement UNKNOWN). Combined with ``cancel_raises``
+    this models an UNCONFIRMED cancel followed by an UNKNOWN settlement.
     """
 
     def __init__(
@@ -84,6 +89,7 @@ class _FakeClient:
         poll_sequence: list[_FakeOrder] | None = None,
         post_cancel_order: _FakeOrder | None = None,
         cancel_raises: Exception | None = None,
+        post_cancel_get_raises: Exception | None = None,
     ) -> None:
         self._equity = equity
         self._submit_result = submit_result
@@ -92,10 +98,12 @@ class _FakeClient:
         self._poll_sequence = list(poll_sequence) if poll_sequence else None
         self._post_cancel_order = post_cancel_order
         self._cancel_raises = cancel_raises
+        self._post_cancel_get_raises = post_cancel_get_raises
         self.submitted: list[Any] = []
         self.poll_calls = 0
         self.cancel_calls: list[str] = []
         self._cancelled = False
+        self._post_cancel_get_fired = False
 
     def get_account(self) -> _FakeAccount:
         return _FakeAccount(self._equity)
@@ -109,6 +117,14 @@ class _FakeClient:
 
     def get_order_by_id(self, order_id: str) -> _FakeOrder:
         self.poll_calls += 1
+        # A transient error on the post-cancel re-read (settlement UNKNOWN).
+        if (
+            self._cancelled
+            and self._post_cancel_get_raises is not None
+            and not self._post_cancel_get_fired
+        ):
+            self._post_cancel_get_fired = True
+            raise self._post_cancel_get_raises
         # After a cancel, return the post-cancel snapshot if one was configured.
         if self._cancelled and self._post_cancel_order is not None:
             return self._post_cancel_order
@@ -298,6 +314,66 @@ def test_timeout_cancel_races_partial_fill_records_it(tmp_path):
     # unfilled_timeout key is absent — not present-and-False.
     assert "unfilled_timeout" not in rec.reactor_metadata
     assert rec.fill_price == 100.0
+
+
+def test_timeout_unconfirmed_cancel_then_reread_raises_fails_closed(tmp_path):
+    """Settlement UNKNOWN must NOT collapse to a clean 0.0 no-fill.
+
+    On poll-budget timeout cancel_and_settle is invoked for a still-WORKING DAY
+    order. If (1) cancel_order_by_id raises a transient broker/network error (the
+    cancel is UNCONFIRMED) AND (2) the post-cancel get_order_by_id raises the SAME
+    transient condition, the order may STILL be working at the broker and may yet
+    fill — creating a real LIVE position. The book MUST NOT record a clean
+    fill_size_pct=0.0 / unfilled_timeout no-fill (which never reconciles state.db
+    and is treated terminally by every consumer), orphaning that position
+    PERMANENTLY. It must fail CLOSED — matching the active-poll re-read which
+    RAISES AlpacaSubmitError on the byte-identical broker condition.
+    """
+    order = _FakeOrder(order_id="ord-unknown", status="accepted")
+    client = _FakeClient(
+        equity=98_000.0,
+        submit_result=order,
+        poll_order=order,
+        cancel_raises=Exception("503 service unavailable (cancel)"),
+        post_cancel_get_raises=Exception("503 service unavailable (re-read)"),
+    )
+    reactor = _reactor(client, tmp_path, poll_timeout_s=0.05, poll_interval_s=0.0)
+
+    with pytest.raises(AlpacaSubmitError) as ei:
+        reactor.execute(_proposal(), fill_size_pct=0.20)
+    # The error surfaces the UNKNOWN settlement, not a fabricated no-fill.
+    msg = str(ei.value).lower()
+    assert "ord-unknown" in msg
+    assert "settle" in msg or "unknown" in msg or "working" in msg
+
+    # NOTHING was written to the bus — a 0.0 no-fill record would orphan a
+    # possibly-live position the book never tracked.
+    lines = [ln for ln in reactor.executions_path.read_text().splitlines() if ln.strip()]
+    assert lines == []
+
+
+def test_timeout_confirmed_cancel_then_reread_raises_degrades_to_no_fill(tmp_path):
+    """When the cancel SUCCEEDS (the working order is provably gone) but the
+    post-cancel re-read raises transiently, there is no working order left to
+    orphan, so degrading to a clean unfilled_timeout no-fill is safe. This keeps
+    the fail-closed change narrow — it only fires when the order MIGHT still be
+    working (cancel unconfirmed)."""
+    order = _FakeOrder(order_id="ord-gone", status="accepted")
+    client = _FakeClient(
+        equity=98_000.0,
+        submit_result=order,
+        poll_order=order,
+        # cancel_raises is None -> the cancel is CONFIRMED.
+        post_cancel_get_raises=Exception("503 service unavailable (re-read)"),
+    )
+    reactor = _reactor(client, tmp_path, poll_timeout_s=0.05, poll_interval_s=0.0)
+
+    rec = reactor.execute(_proposal(), fill_size_pct=0.20)
+
+    assert rec.fill_size_pct == 0.0
+    assert rec.fill_price == 0.0
+    assert rec.reactor_metadata["unfilled_timeout"] is True
+    assert client.cancel_calls == ["ord-gone"]
 
 
 def test_done_for_day_with_partial_is_recorded_not_discarded(tmp_path):
