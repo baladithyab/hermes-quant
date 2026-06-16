@@ -1,6 +1,20 @@
-# Final backlog handoff — the 12 remaining open items (2026-06-16)
+# Final backlog handoff — the remaining open items (2026-06-16, updated 2026-06-15 session)
 
-**State:** `.seeds` = 195 total · 169 closed · 14 deferred-with-gate · **12 open-active**. The
+> **2026-06-15 UPDATE — agent-codeable axis re-opened and re-exhausted across 4 convergence reviews.**
+> After the `w52jkujdv` "nothing-agent-remains" verdict, three further adversarial convergence reviews
+> (`wff4dts6m`, `wi06keswe`, `wx53qceva`) each found a fresh wave of RED-verified money-software defects
+> the earlier passes missed — **ar11–ar24, all now fixed + committed** (brittle cap-seam test; off-axis
+> threshold finite-guards; true-unit-vs-NAV-fraction portfolio-cap bug in paper+multileg; quarterly
+> dead-executions schema-drift; quant_approve TOCTOU double-fire; three ADR-0016 kill-switch-rail
+> fail-opens — multileg-parent P&L double-count, NAV-None disarm, corrupt-flag re-arm; journal ledger
+> data-loss; the IC-dedup-at-ingest inert-gate wiring; the shadow-ledger split-transaction double-spend).
+> The defect-count per review fell **5 → 4 → 1**, and the seed-audit axis is now fully re-confirmed
+> exhausted (all open seeds truly operator/data/governance/network-gated, zero hidden agent sub-tasks).
+> One live-broker-path defect (**ar18**) is filed deferred-with-gate (not agent-reachable without broker
+> creds). **2f01 is now CLOSED** (ar23 fixed the inert IC-dedup wiring — the operator `.env` flip below
+> is now a *meaningful* enablement rather than a no-op). Net open-active: **11**.
+
+**State (pre-update baseline):** `.seeds` = 195 total · 169 closed · 14 deferred-with-gate · **12 open-active**. The
 agent-codeable axis is **exhausted** — a final concurrent review team (`w52jkujdv`) falsification-tested
 all 12 against actual code + ran the full sweep (**3074 passed, 2 skipped, 0 failed**) and returned
 **`nothing-agent-remains`**. Every open item's agent-side deliverable (code / tests / eval-axis /
@@ -29,7 +43,7 @@ Operator: paste the staged config block into `config.yaml`, wire the cred-bridge
 **Verify:** the alpaca MCP responds read-only; `ALPACA_PAPER_TRADE=true` is in effect. → agent closes
 58e9/e18b/0fc0 against live state.
 
-## B. Capability flag flips (closes ba90, 2f01; advances 6bb9)
+## B. Capability flag flips (closes ba90; advances 6bb9). [2f01 now CLOSED — see note]
 
 Each instrument is BUILT + green; only the `.env` flip remains (verified absent from live `.env`).
 
@@ -37,9 +51,17 @@ Each instrument is BUILT + green; only the `.env` flip remains (verified absent 
   wrapper. The ADR-0075 admission-precision eval axis (`hermes_quant/catalyst/eval.py:371
   run_admission_precision`, vacuous-pass-safe) is built + 91 tests green; run it on real admission
   episodes to a green hit-rate before the flip.
-- **2f01** — `echo 'HERMES_QUANT_IC_DEDUP_AT_INGEST=1' >> ~/.hermes/.env`. The `factor_returns`
-  register wiring is complete (`alpha_zoo.py:294/334/352`, `starter_set.py:272`). Enablement-only
-  (dedup is strictly tighter; no eval gate).
+- **2f01 — CLOSED 2026-06-15 (ar23, commit 1289f57).** This was NOT enablement-only: the production
+  caller `ops/scripts/quant-factor-weight-propose.py` registered the starter set BEFORE computing
+  factor returns, so `run_ic_gate = (flag AND factor_returns is not None)` was ALWAYS False — flipping
+  the flag was a **no-op**. ar23 re-ordered the caller (`compute_starter_factor_returns` first, then
+  `register_starter_set(zoo, factor_returns=...)`), so the gate now fires when the operator flips
+  `HERMES_QUANT_IC_DEDUP_AT_INGEST=1`. The flip is now a *meaningful* (optional) enablement, no longer
+  a tracked open seed.
+- **6bb9** — promote `PORTFOLIO_CAPS` + `PAPER_SLIPPAGE_MODEL=v0.2` to **code-default-ON** after ONE
+  clean side-by-side paper day. NOTE: both are ALREADY live via the armed-wrapper cron exports
+  (`~/.hermes/scripts/*-armed.sh`); 6bb9 is the *code-default* promotion (an operator process-gate:
+  observe one clean day, then the agent flips the code default in a flag-gated PR).
 - **6bb9** — promote `PORTFOLIO_CAPS` + `PAPER_SLIPPAGE_MODEL=v0.2` to **code-default-ON** after ONE
   clean side-by-side paper day. NOTE: both are ALREADY live via the armed-wrapper cron exports
   (`~/.hermes/scripts/*-armed.sh`); 6bb9 is the *code-default* promotion (an operator process-gate:
