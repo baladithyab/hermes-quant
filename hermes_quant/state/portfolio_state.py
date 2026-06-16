@@ -957,6 +957,19 @@ class PortfolioState:
         # ONE shared helper so the incremental and rebuild folds can never diverge on which
         # records they drop. Byte-identical to the prior inline block.
         _validate_asof(asof)
+        # ar62: reject non-finite fill numerics BEFORE touching DB state — mirrors the
+        # asof reject above (raises before the write lock). _read_all_jsonl decodes with
+        # json.loads at DEFAULT settings, which parses Infinity/-Infinity/NaN and the
+        # overflow literal 1e400 into inf/nan WITHOUT raising; producer-side float(...)
+        # coercions pass inf through too. A single non-finite fill_price flows into
+        # delta_cash and then equity, permanently poisoning balance_usd/equity_total with a
+        # sticky inf/nan (an inf even satisfies equity_total>0 in the NAV read). pos_delta
+        # already holds the float-coerced leg_quantity when present.
+        _validate_fill_numerics(
+            fill_price,
+            fill_size_pct,
+            pos_delta if leg_quantity is not None else None,
+        )
 
         initial_cash = _default_initial_cash()
         proposal_id = record.get("proposal_id") or ""
@@ -1185,11 +1198,26 @@ class PortfolioState:
 
         if row is None:
             return None
+        # ar62 defense-in-depth: a legacy / externally-mutated state.db could already hold
+        # a poisoned inf/nan cash row (written before the fold guards existed, or by a
+        # manual sqlite edit). Treat a non-finite balance or equity as "no usable cash row"
+        # (return None) rather than propagating inf/nan to every reader — react/paper.py's
+        # NAV read sees None and falls back to bootstrap instead of handing inf back as NAV
+        # (an inf even satisfies equity_total>0 there).
+        balance_usd = float(row["balance_usd"])
+        equity_total = float(row["equity_total"])
+        if not math.isfinite(balance_usd) or not math.isfinite(equity_total):
+            logger.warning(
+                "get_cash: non-finite cash row for account %r (balance_usd=%r, "
+                "equity_total=%r); returning None (bootstrap)",
+                account_id, balance_usd, equity_total,
+            )
+            return None
         return CashState(
             account_id=row["account_id"],
-            balance_usd=float(row["balance_usd"]),
+            balance_usd=balance_usd,
             last_update_at=row["last_update_at"],
-            equity_total=float(row["equity_total"]),
+            equity_total=equity_total,
         )
 
     def get_marked_equity(
@@ -1440,6 +1468,37 @@ def _latest_asof(records: list[dict[str, Any]]) -> str | None:
     return max(asofs) if asofs else None
 
 
+def _validate_fill_numerics(
+    fill_price: float,
+    fill_size_pct: float,
+    leg_quantity: float | None,
+) -> None:
+    """ar62: reject a fill record whose numeric inputs are non-finite.
+
+    Shared guard for BOTH ledger folds — incremental _apply_execution_unsafe and rebuild
+    _replay_record — factored like the asof reject so the two folds cannot diverge on
+    which records they drop. _read_all_jsonl decodes with json.loads at DEFAULT settings,
+    which parses Infinity/-Infinity/NaN and the overflow literal 1e400 into inf/nan WITHOUT
+    raising; producer-side float(...) coercions pass inf through too. A single non-finite
+    fill_price flows into delta_cash and then equity, permanently poisoning balance_usd /
+    equity_total with a sticky inf/nan (an inf even satisfies equity_total>0 in the NAV
+    read). A non-finite fill_size_pct / leg_quantity similarly makes new_qty nan. Raising
+    REJECTS the poisoned record (the incremental caller swallows + emits the
+    state_reconstruction_failed audit; the rebuild loop records it in errors) WITHOUT
+    touching DB state or the watermark — mirroring the asof reject. Finite -> byte-identical.
+
+    Raises:
+        ValueError: if any of fill_price, fill_size_pct, or (when present) leg_quantity is
+            not finite.
+    """
+    if not math.isfinite(fill_price):
+        raise ValueError(f"non-finite fill_price: {fill_price!r}")
+    if not math.isfinite(fill_size_pct):
+        raise ValueError(f"non-finite fill_size_pct: {fill_size_pct!r}")
+    if leg_quantity is not None and not math.isfinite(leg_quantity):
+        raise ValueError(f"non-finite reactor_metadata.quantity: {leg_quantity!r}")
+
+
 def _validate_asof(asof: str) -> None:
     """cs62: the SHARED no-lookahead/poison guard for asof_execution.
 
@@ -1603,6 +1662,16 @@ def _replay_record(
             leg_quantity = pos_delta_override
     else:
         pos_delta = float(leg_quantity) if leg_quantity is not None else fill_size_pct
+
+    # ar62: reject non-finite fill numerics in the REBUILD fold too (parity with the
+    # incremental _apply_execution_unsafe), so a poisoned inf/nan record the live book
+    # drops cannot be re-folded by a rebuild and corrupt state.db. Raises -> the rebuild
+    # loop records it in ReconstructionResult.errors WITHOUT touching the fold state.
+    _validate_fill_numerics(
+        fill_price,
+        fill_size_pct,
+        pos_delta if leg_quantity is not None else None,
+    )
 
     # Bootstrap cash for new accounts
     if acct not in cash_map:
