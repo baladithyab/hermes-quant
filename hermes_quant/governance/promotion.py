@@ -285,15 +285,28 @@ def evaluate(asof: datetime) -> PromotionDecision:
             f"< min={int(thresholds['min_paper_outcomes'])}"
         )
 
-    if metrics["sharpe_95ci_lower"] < float(thresholds["min_sharpe_95ci_lower"]):
+    # ar41: finite-guard the candidate METRIC side, not just the threshold side.
+    # _load_thresholds() already guards the thresholds (and the docstring warns
+    # "x < NaN never blocks ... the one failure mode a promotion gate must never"),
+    # but _collect_metrics reads sharpe/drawdown/drift via bare float() which accepts
+    # NaN/inf — and `nan < min` / `nan > max` are BOTH False, so a degenerate-bootstrap
+    # NaN metric silently bypassed every floor/ceiling. A non-finite candidate metric
+    # is un-evaluable, so it must BLOCK (fail-closed), mirroring the threshold guard.
+    _sharpe = metrics["sharpe_95ci_lower"]
+    if not math.isfinite(_sharpe):
+        blocked.append(f"sharpe_95ci_lower={_sharpe!r} is non-finite (un-evaluable; fail-closed)")
+    elif _sharpe < float(thresholds["min_sharpe_95ci_lower"]):
         blocked.append(
-            f"sharpe_95ci_lower={metrics['sharpe_95ci_lower']:.4f} "
+            f"sharpe_95ci_lower={_sharpe:.4f} "
             f"< min={thresholds['min_sharpe_95ci_lower']:.2f}"
         )
 
-    if metrics["rolling_30d_max_drawdown_pct"] > float(thresholds["max_rolling_30d_drawdown_pct"]):
+    _dd = metrics["rolling_30d_max_drawdown_pct"]
+    if not math.isfinite(_dd):
+        blocked.append(f"rolling_30d_max_drawdown_pct={_dd!r} is non-finite (un-evaluable; fail-closed)")
+    elif _dd > float(thresholds["max_rolling_30d_drawdown_pct"]):
         blocked.append(
-            f"rolling_30d_max_drawdown_pct={metrics['rolling_30d_max_drawdown_pct']:.4f} "
+            f"rolling_30d_max_drawdown_pct={_dd:.4f} "
             f"> max={thresholds['max_rolling_30d_drawdown_pct']:.4f}"
         )
 
@@ -307,9 +320,12 @@ def evaluate(asof: datetime) -> PromotionDecision:
             f"immutable_breaches_in_window={metrics['immutable_breaches_in_window']} (must be 0)"
         )
 
-    if metrics["calibrator_drift_max"] > float(thresholds["max_calibrator_drift"]):
+    _drift = metrics["calibrator_drift_max"]
+    if not math.isfinite(_drift):
+        blocked.append(f"calibrator_drift_max={_drift!r} is non-finite (un-evaluable; fail-closed)")
+    elif _drift > float(thresholds["max_calibrator_drift"]):
         blocked.append(
-            f"calibrator_drift_max={metrics['calibrator_drift_max']:.4f} "
+            f"calibrator_drift_max={_drift:.4f} "
             f"> max={thresholds['max_calibrator_drift']:.4f}"
         )
 

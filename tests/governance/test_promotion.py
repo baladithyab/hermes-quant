@@ -61,6 +61,50 @@ def test_promotion_gate_blocks_when_outcomes_below_adr29_threshold(
     assert any("paper_outcomes_count=99" in r for r in decision.blocked_by)
 
 
+def test_ar41_nan_sharpe_metric_blocks_not_bypasses(audit_path: Path) -> None:
+    """ar41: a NON-FINITE candidate sharpe_95ci_lower must BLOCK promotion (fail-closed),
+    not vacuously pass the floor. Pre-fix `nan < min` was False so the gate did not block —
+    the exact fail-open the module docstring warns about, guarded only on the threshold side."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    # A LATER snapshot (latest-wins) with a degenerate-bootstrap NaN sharpe.
+    audit_log.append(
+        GovernanceEvent(
+            kind="promotion_event",
+            asof=NOW - timedelta(hours=1),
+            source="weekly_retro",
+            payload={"sharpe_95ci_lower": float("nan")},
+        )
+    )
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is False, "ar41: a NaN sharpe metric vacuously passed the floor"
+    assert any("sharpe_95ci_lower" in r and "non-finite" in r for r in decision.blocked_by)
+
+
+def test_ar41_nonfinite_drawdown_drift_metric_blocks_at_comparison(audit_path: Path) -> None:
+    """ar41 defense-in-depth: even though the drawdown/drift max() reducer happens to
+    swallow a NaN audit snapshot (max(0.0, nan)==0.0), the comparison-site finite-guard
+    must BLOCK if a non-finite drawdown/drift metric ever reaches evaluate() by any route.
+    Verified by passing a constructed metrics dict straight into the block logic via a
+    monkeypatched _collect_metrics so the guard — not the reducer — is what is exercised."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    base = promotion._collect_metrics(NOW) if hasattr(promotion, "_collect_metrics") else None
+    if base is None:
+        # _collect_metrics is internal; fall back to driving evaluate() and asserting the
+        # sharpe vector (the confirmed-reachable one) — already covered above. Skip cleanly.
+        import pytest as _pytest
+        _pytest.skip("_collect_metrics not exposed; sharpe vector covers the reachable path")
+    for bad in ("rolling_30d_max_drawdown_pct", "calibrator_drift_max"):
+        m = dict(base)
+        m[bad] = float("nan")
+        # Re-run the block logic with the poisoned metric.
+        # (evaluate() reads metrics via _collect_metrics; monkeypatch it to return m.)
+        import unittest.mock as _mock
+        with _mock.patch.object(promotion, "_collect_metrics", return_value=m):
+            decision = promotion.evaluate(NOW)
+        assert decision.promoted is False, f"ar41: a non-finite {bad} vacuously passed"
+        assert any("non-finite" in r for r in decision.blocked_by)
+
+
 def test_promotion_gate_blocks_when_calibrator_drift_gt_5pct(
     audit_path: Path,
 ) -> None:
