@@ -256,9 +256,22 @@ def _read_silence_bias_config() -> GateConfig:
         # would make `metric < threshold` False -> a should-be-SILENCED signal FIRES).
         min_confidence=_finite_threshold(raw.get("min_confidence", 0.65), 0.65, "min_confidence"),
         min_urgency=_finite_threshold(raw.get("min_urgency", 0.5), 0.5, "min_urgency"),
-        min_analysts_emitted=int(raw.get("min_analysts_emitted", 2)),
-        max_recent_rejections=int(raw.get("max_recent_rejections", 3)),
-        salience_window_hours=int(raw.get("salience_window_hours", 168)),
+        # ar81: int-count guard on the silence-bias quorum/veto counts (the int analogue of
+        # the ar09 finite-threshold guard, reusing the ar61 _positive_int_count helper). A
+        # bare int(raw) on these operator-YAML values: inf->OverflowError / nan/float-string
+        # ->ValueError ABORTS the whole tick (no try/except at the call site); a float-form
+        # token (1.9) silently truncates a 2-of-N quorum to 1; 0/negative makes the quorum
+        # NEVER silence so a single-/zero-voice signal can FIRE (contradicts "single-voice is
+        # never enough in autonomous mode"). Fall CLOSED to the documented default.
+        min_analysts_emitted=_positive_int_count(
+            raw.get("min_analysts_emitted", 2), 2, "min_analysts_emitted"
+        ),
+        max_recent_rejections=_positive_int_count(
+            raw.get("max_recent_rejections", 3), 3, "max_recent_rejections"
+        ),
+        salience_window_hours=_positive_int_count(
+            raw.get("salience_window_hours", 168), 168, "salience_window_hours"
+        ),
     )
 
 
