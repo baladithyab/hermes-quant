@@ -199,6 +199,16 @@ def build_ground_truth_block(
     else:
         bars = list(ohlcv_bars)
 
+    # No-lookahead boundary: the builder is the designated as-of slice. Drop any bar
+    # dated strictly AFTER asof BEFORE the lookback trim, so a future close is never
+    # laundered into a citation_id (and thus never accepted by the ClaimVerifier as
+    # grounded truth). OhlcvCache.read() returns the full unsliced frame and the
+    # advisor seam passes ohlcv_bars straight through — this is the only enforcement
+    # point for the <= asof window asserted in the module header and _saliency_keep.
+    # asof and bar.date_str are both ISO-8601 'YYYY-MM-DD', so lexical <= is correct;
+    # deterministic, no wall-clock. (Mirrors the ar29 catalyst >asof next-bar fix.)
+    bars = [b for b in bars if b.date_str <= asof]
+
     # Trim to lookback window (keep the most recent `lookback_days` bars)
     if len(bars) > lookback_days:
         bars = bars[-lookback_days:]
