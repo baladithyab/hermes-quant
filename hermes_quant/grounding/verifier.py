@@ -188,7 +188,12 @@ class ClaimVerifier:
                 continue
             # Check (b): explicit citation marker adjacent to this claim (within 80 chars).
             # Proximity check prevents the "one citation covers all fabricated numbers" loophole.
-            if has_valid_explicit_citation and self._claim_near_citation(raw_claim, rationale):
+            # The adjacent marker must itself be a VALID block citation ID — a fabricated
+            # marker (syntactically valid but not in block.citation_ids) must not credit a
+            # phantom price (F3: LLM-fabricated price levels + fabricated citation markers).
+            if has_valid_explicit_citation and self._claim_near_citation(
+                raw_claim, rationale, valid_citation_ids
+            ):
                 cited.append(raw_claim)
                 continue
             uncited.append(raw_claim)
@@ -217,11 +222,22 @@ class ClaimVerifier:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _claim_near_citation(claim: str, text: str, window: int = 80) -> bool:
-        """Return True if *claim* appears within *window* chars of a citation marker in *text*.
+    def _claim_near_citation(
+        claim: str,
+        text: str,
+        valid_citation_ids: set[str] | None = None,
+        window: int = 80,
+    ) -> bool:
+        """Return True if *claim* is within *window* chars of a VALID citation marker.
 
         Proximity check prevents the loophole where one citation marker anywhere
         in the rationale is used to credit all fabricated numerical claims.
+
+        The adjacent marker must be a real block citation ID (its bare id must be in
+        *valid_citation_ids*). A syntactically-valid-but-fabricated marker that an LLM
+        placed next to a phantom price (e.g. ``[gt_AAPL_99999999_close]`` not in the
+        block) must NOT credit that claim — that is failure mode F3 the module exists
+        to eliminate. When *valid_citation_ids* is None (back-compat), any marker counts.
         """
         claim_pos = text.find(claim)
         if claim_pos < 0:
@@ -230,4 +246,7 @@ class ClaimVerifier:
         search_start = max(0, claim_pos - window)
         search_end = min(len(text), claim_pos + len(claim) + window)
         excerpt = text[search_start:search_end]
-        return bool(_CITATION_PATTERN.search(excerpt))
+        markers = _CITATION_PATTERN.findall(excerpt)
+        if valid_citation_ids is None:
+            return bool(markers)
+        return any(m.strip("[]") in valid_citation_ids for m in markers)

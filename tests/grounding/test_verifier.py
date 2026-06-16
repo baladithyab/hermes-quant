@@ -279,6 +279,39 @@ def test_threshold_strict_rejects_partial_citations():
     )
 
 
+def test_threshold_strict_rejects_fabricated_marker_proximity():
+    """Phantom price next to a FABRICATED (out-of-block) citation marker must be rejected.
+
+    F3 regression: an LLM can append a syntactically-valid-but-fabricated marker
+    next to a fabricated price to steal proximity credit. The marker
+    ``[gt_AAPL_99999999_close]`` is NOT in block.citation_ids — placing 999.99
+    adjacent to it must NOT credit the claim. A separate, REAL citation appears
+    far away (>80 chars) so ``has_valid_explicit_citation`` is True, exposing the
+    bug where the proximity fallback matches ANY marker rather than a valid one.
+    """
+    block = _make_block("AAPL", n_bars=5)
+    real_cid = block.citation_ids[-1]
+    last_close = block.ohlcv_60d[-1].close
+    fabricated_marker = "gt_AAPL_99999999_close"
+    assert fabricated_marker not in set(block.citation_ids)
+    separator = "x" * 100  # force the real marker > 80 chars from the phantom price
+    rationale = (
+        f"Close was {last_close:.4f} [{real_cid}]. "
+        f"{separator}"
+        f"But our target is 999.99 [{fabricated_marker}]"
+    )
+    view = _make_view(rationale)
+    verifier = ClaimVerifier(threshold=1.0)
+    result = verifier.verify(view, block)
+    assert result.accepted is False, (
+        "A fabricated price adjacent to an out-of-block citation marker must be "
+        f"rejected at strict threshold. Got: {result.reason}"
+    )
+    assert "999.99" in result.uncited_claims, (
+        f"999.99 should be flagged uncited. uncited={result.uncited_claims}"
+    )
+
+
 def test_threshold_lenient_accepts_partial_citations():
     """At threshold=0.1, a view with ≥10% citation coverage must be accepted."""
     block = _make_block("AAPL", n_bars=5)
