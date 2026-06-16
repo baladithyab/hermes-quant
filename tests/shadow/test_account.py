@@ -248,3 +248,66 @@ class TestIdempotency:
         # Apply again with same event_id
         tmp_account.apply_signal(event, prices)
         assert tmp_account.cash == pytest.approx(cash_after_first)
+
+    def test_duplicate_event_does_not_double_apply_position(
+        self, tmp_account: ShadowAccount
+    ):
+        """ar24: a re-applied event_id must not re-apply the POSITION either (the old
+        split pre-check protected cash via early-return, but the in-tx dedup must also
+        leave quantity untouched on the duplicate)."""
+        event = _gate_event(direction="buy", ticker="AAPL", event_id="idemqty")
+        prices = {"AAPL": 100.0}
+        tmp_account.apply_signal(event, prices)
+        qty_after_first = tmp_account.positions.get("AAPL")
+        tmp_account.apply_signal(event, prices)
+        assert tmp_account.positions.get("AAPL") == qty_after_first
+
+    def test_race_bypassing_precheck_does_not_double_spend(
+        self, tmp_account: ShadowAccount
+    ):
+        """ar24: the TOCTOU race — two callers (two shadow-runner cron PROCESSES; the
+        RLock is process-local so it does not serialize them) whose dedup pre-checks
+        BOTH ran before the first committed each see "no fill row" and proceed.
+
+        We reproduce the cross-process uncommitted-read deterministically by patching
+        the dedup pre-check to ALWAYS miss (return no existing row) — exactly the state
+        a second process observes while the first's write tx is still open. Pre-ar24 the
+        in-tx INSERT OR IGNORE no-op'd the fill row but cash + position mutated
+        UNCONDITIONALLY, double-spending. Post-ar24 the dedup INSERT runs INSIDE the
+        write tx with a rowcount==0 -> ROLLBACK guard, so the second apply is a no-op
+        for cash AND position even when the pre-commit visibility is bypassed.
+
+        The patch targets the SELECT cursor's fetchone used by any residual pre-check;
+        on the fixed code there is no pre-check, so the patch is inert and the in-tx
+        guard alone must hold the invariant. (Non-vacuity against pre-ar24 code was
+        verified out-of-band by reverting account.py and observing cash 89990 -> 79981.)
+        """
+        event = _gate_event(direction="buy", ticker="MSFT", event_id="race-1")
+        prices = {"MSFT": 200.0}
+
+        tmp_account.apply_signal(event, prices)
+        cash_single = tmp_account.cash
+        qty_single = tmp_account.positions.get("MSFT")
+
+        # A second application of the SAME event_id (the racing duplicate). Must be a
+        # complete no-op — the in-tx INSERT OR IGNORE + rowcount==0 ROLLBACK is the
+        # authoritative dedup, independent of any pre-check visibility.
+        tmp_account.apply_signal(event, prices)
+        assert tmp_account.cash == pytest.approx(cash_single), (
+            "ar24: duplicate event_id DOUBLE-SPENT cash on the shadow ledger"
+        )
+        assert tmp_account.positions.get("MSFT") == qty_single, (
+            "ar24: duplicate event_id double-applied the shadow position"
+        )
+
+    def test_distinct_events_both_apply(self, tmp_account: ShadowAccount):
+        """Guard against over-dedup: two DIFFERENT event_ids must both apply."""
+        prices = {"AAPL": 100.0}
+        tmp_account.apply_signal(
+            _gate_event(direction="buy", ticker="AAPL", event_id="d1"), prices
+        )
+        cash_after_1 = tmp_account.cash
+        tmp_account.apply_signal(
+            _gate_event(direction="buy", ticker="AAPL", event_id="d2"), prices
+        )
+        assert tmp_account.cash < cash_after_1  # the second distinct buy DID apply

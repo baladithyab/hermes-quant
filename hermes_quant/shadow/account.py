@@ -221,14 +221,16 @@ class ShadowAccount:
 
         event_id = audit_event.get("event_id", _utc_now_iso())
 
-        # Idempotency: skip if this event_id already processed
-        with self._lock, self._conn() as conn:
-            existing = conn.execute(
-                "SELECT event_id FROM shadow_fills WHERE event_id = ?", (event_id,)
-            ).fetchone()
-            if existing is not None:
-                return decision  # already applied
-
+        # ar24: idempotency is enforced INSIDE the write transaction below (the
+        # dedup INSERT OR IGNORE + a cur.rowcount==0 -> ROLLBACK guard), NOT via a
+        # separate pre-check SELECT. The old split-transaction pre-check was a TOCTOU:
+        # it ran in its OWN transaction, so two concurrent callers (two shadow-runner
+        # crons / threads — the RLock is process-local) whose pre-checks BOTH ran before
+        # the first committed each saw no fill row and proceeded; the in-tx INSERT OR
+        # IGNORE then no-op'd the duplicate fill LEDGER row, but cash + position were
+        # applied UNCONDITIONALLY a second time (double-spend on the eval ledger). This
+        # mirrors the canonical pattern in state.portfolio_state.apply_execution
+        # (dedup INSERT first, ROLLBACK on rowcount==0).
         sign = 1 if decision.action == "buy" else -1
 
         # Cost model: slippage (directional) + cost_bps (non-directional drag).
@@ -245,6 +247,30 @@ class ShadowAccount:
         with self._lock, self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # ar24: claim the event_id FIRST, inside this transaction. INSERT OR
+                # IGNORE no-ops if a prior commit already recorded this fill; a
+                # rowcount of 0 means a concurrent (or repeated) caller already
+                # applied it, so ROLLBACK and return WITHOUT re-applying cash/position.
+                # This is the authoritative dedup — there is no separate pre-check.
+                dedup_cur = conn.execute(
+                    "INSERT OR IGNORE INTO shadow_fills "
+                    "(event_id, ticker, action, size_fraction, fill_price, cost_bps, asof) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        event_id,
+                        ticker,
+                        decision.action,
+                        decision.size_fraction,
+                        fill_price,
+                        self.cost_model_bps,
+                        _utc_now_iso(),
+                    ),
+                )
+                if dedup_cur.rowcount == 0:
+                    # Already applied (duplicate event_id) — do NOT re-apply cash/position.
+                    conn.execute("ROLLBACK")
+                    return decision
+
                 cash_row = conn.execute(
                     "SELECT balance FROM shadow_cash WHERE id = 1"
                 ).fetchone()
@@ -274,21 +300,7 @@ class ShadowAccount:
                 cost_dollars = abs(shares) * fill_price * cost_fraction
                 new_cash = current_cash - (shares * fill_price) - cost_dollars
 
-                # Persist fill
-                conn.execute(
-                    "INSERT OR IGNORE INTO shadow_fills "
-                    "(event_id, ticker, action, size_fraction, fill_price, cost_bps, asof) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        event_id,
-                        ticker,
-                        decision.action,
-                        decision.size_fraction,
-                        fill_price,
-                        self.cost_model_bps,
-                        _utc_now_iso(),
-                    ),
-                )
+                # (Fill row already claimed at the top of this transaction — ar24.)
 
                 # Persist position
                 if abs(new_qty) < 1e-12:
