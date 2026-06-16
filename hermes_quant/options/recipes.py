@@ -194,6 +194,16 @@ def build_multi_leg_proposal(
     total_bpr: float = 0.0,
     portfolio_net_greeks=None,  # noqa: ANN001 — NetGreeks; default zero below
     open_strategies_on_underlying: int = 0,
+    # ADR-0027 D2/D4 cumulative assignment-cash cap. Sum of already-reserved CSP
+    # cash collateral + open CC stock basis for this account, EXCLUDING this
+    # candidate. Forwarded verbatim into options_gate, which enforces the
+    # max_assignment_risk_pct_nav invariant at the admitted contract count.
+    # Default 0.0 => no prior reservations => byte-identical (a single
+    # within-budget structure is unaffected). The caller that holds the
+    # portfolio book supplies the running total; absent it, 0.0 is fail-OPEN-safe
+    # only because the gate still binds THIS structure's own incremental cash
+    # against the cap.
+    open_assignment_cash: float = 0.0,
     cfg: OptionsRiskConfig | None = None,
     target_delta: float = _DEFAULT_TARGET_DELTA,
     dte_min: int = _DEFAULT_DTE_MIN,
@@ -297,6 +307,7 @@ def build_multi_leg_proposal(
         basis_per_share=basis_per_share,
         min_dte=min_dte,
         open_strategies_on_underlying=open_strategies_on_underlying,
+        open_assignment_cash=open_assignment_cash,
         event_risk=gate_event_risk,
         decision_asof=gate_decision_asof,
     )

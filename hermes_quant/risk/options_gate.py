@@ -475,6 +475,14 @@ def options_gate(
     min_dte: int | None = None,
     open_strategies_on_underlying: int = 0,
     edge: float = 0.0,
+    # ADR-0027 D2/D4 cumulative assignment-cash cap. The sum of ALREADY-reserved
+    # CSP cash collateral (strike*100*contracts) + open CC stock basis for this
+    # account, EXCLUDING this candidate. Default 0.0 => no prior reservations =>
+    # the only binding term is this structure's own incremental cash, so a single
+    # within-budget CSP/CC is byte-identical to today. The cap bounds the
+    # all-CSPs-assign tail (ADR-0027 D4 wheel HARD rule: "Sum of CSP cash
+    # reservations + CC stock basis <= max_assignment_risk_pct_nav").
+    open_assignment_cash: float = 0.0,
     # ADR-0084 O8 (earnings-proximity / IV-crush). ADDITIVE + DEFAULT-OFF at the
     # seam: event_risk=None => O8 never runs => byte-identical to today. The
     # check ALSO requires HERMES_QUANT_EVENT_RISK=1 (master flag), so even a
@@ -486,7 +494,9 @@ def options_gate(
     violation. Rules in order: O-classify -> O1 max-loss/margin -> O2 no-naked
     -> O3 gamma -> O4 theta -> O5 vega -> O6 BPR buffer -> O7 pin-risk ->
     O8 earnings-proximity (long-premium IV-crush) -> sizing -> min-contract
-    guard.
+    guard -> size-scaling re-checks -> cumulative assignment-cash cap (ADR-0027
+    D2/D4: open_assignment_cash + this structure's incremental CSP/CC cash
+    <= max_assignment_risk_pct_nav * nav).
 
     Raises OptionsGateDisabled unless HERMES_QUANT_OPTIONS_GATE=1.
     """
@@ -516,8 +526,8 @@ def options_gate(
     #     premium_received`), so a NaN premium poisons the same O6 buffer compare.
     #     (recipes.py builds this as `float(short.mid or 0.0) * 100`; `or 0.0`
     #     does NOT catch a NaN mid, so a NaN can reach the gate.)
-    # All three are caller-supplied money-state inputs we cannot validate; a
-    # non-finite value silences deterministically (reject), same posture as cr02.
+    # All are caller-supplied money-state inputs we cannot validate; a non-finite
+    # value silences deterministically (reject), same posture as cr02.
     if (
         not math.isfinite(spot)
         or not math.isfinite(nav)
@@ -528,6 +538,19 @@ def options_gate(
         return OptionsGateResult.silence(
             StructureBucket.NAKED,
             "nonfinite_market_input",
+        )
+
+    # ---- Finite-guard the cumulative-assignment-cash money input (ar88). ----
+    # A NaN/inf open_assignment_cash would defeat the `>` cap comparison below
+    # (nan > x is always False), silently admitting a structure that breaches the
+    # all-CSPs-assign cap — the recurring NaN-defeats-gate fail-open family. Kept
+    # as a SEPARATE guard with its own reason (distinct from the market-input
+    # guard above) so the diagnostic pinpoints the assignment-cash input. Fail
+    # CLOSED (silence), mirroring the math.isfinite guards elsewhere in the gate.
+    if not math.isfinite(open_assignment_cash):
+        return OptionsGateResult.silence(
+            StructureBucket.NAKED,
+            "open_assignment_cash_not_finite",
         )
 
     # ---- O-classify (D7 composite-intent feeds the classifier sizing). ----
@@ -917,6 +940,35 @@ def options_gate(
                     bucket, "csp_collateral_at_size", net_greeks=candidate_net,
                     bpr_estimate=bpr, max_loss=max_loss,
                 )
+
+    # ---- Cumulative assignment-cash cap (ADR-0027 D2/D4 HARD rule). ----
+    # The per-call collateral gate (_classify_structure + the at-size re-check
+    # above) only verifies THIS structure is individually cash-secured — it does
+    # NOT bound the PORTFOLIO-WIDE all-assign tail. ADR-0027 D4 (wheel) makes that
+    # explicit: "Sum of CSP cash reservations + CC stock basis <=
+    # max_assignment_risk_pct_nav". Without this rule N separately-admitted CSPs
+    # (each ~2.5% NAV Kelly-sized) reserve cumulative assignment cash far past the
+    # 20%-NAV cap. Compute THIS structure's incremental assignment cash at the
+    # ADMITTED contract count and silence if open_assignment_cash + incremental
+    # breaches the cap. CSP: strike*100*contracts (full assignment cash, premium
+    # NOT netted — matches the collateral gate). CC: basis_per_share*100*contracts
+    # (the stock basis backing the cover). Defined-risk spreads carry no
+    # assignment-cash obligation (max-loss-bound), so they contribute 0. Reject
+    # only — never a size-up; default open_assignment_cash=0.0 keeps a single
+    # within-budget structure byte-identical.
+    incremental_assignment_cash = 0.0
+    if bucket == StructureBucket.CASH_SECURED_PUT:
+        incremental_assignment_cash = strike * 100 * contracts
+    elif bucket == StructureBucket.COVERED_CALL:
+        incremental_assignment_cash = (basis_per_share or 0.0) * 100 * contracts
+    if (
+        open_assignment_cash + incremental_assignment_cash
+        > cfg.max_assignment_risk_pct_nav * nav
+    ):
+        return OptionsGateResult.silence(
+            bucket, "cumulative_assignment_risk_cap", net_greeks=candidate_net,
+            bpr_estimate=bpr, max_loss=max_loss,
+        )
 
     return OptionsGateResult(
         admitted=True,

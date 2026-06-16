@@ -973,3 +973,160 @@ def test_non_greeks_exception_silences_with_distinct_reason_not_mislabeled(caplo
     assert any(
         "unexpected error aggregating" in rec.getMessage() for rec in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# Cumulative assignment-cash cap (ADR-0027 D2 max_assignment_risk_pct_nav,
+# D4 wheel HARD rule: Sum of CSP cash reservations + CC stock basis <=
+# max_assignment_risk_pct_nav). Before this fix the cap was DECLARED on the
+# config (default 0.20) but enforced by NO O-rule: each CSP was admitted
+# individually, so N separate cash-secured puts could reserve cumulative
+# all-CSPs-assign cash far past 20% NAV — the exact tail this cap exists to
+# bound was silently uncapped.
+# ---------------------------------------------------------------------------
+
+
+def test_csp_silenced_when_cumulative_assignment_cash_exceeds_cap() -> None:
+    """RED: a second CSP whose incremental assignment cash pushes the cumulative
+    open CSP collateral past max_assignment_risk_pct_nav*nav MUST silence.
+
+    Construction (every value pins the boundary):
+      nav=1_000_000, cap=0.20 -> max cumulative assignment cash = 200_000
+      strike=100 -> incremental assignment cash = strike*100*contracts
+      kelly_target = 1_000_000 * 0.25 * 0.10 = 25_000
+        (action_step 0.05*nav=50_000 floors to 0 -> falls back to un-stepped 25_000)
+      contracts = floor(25_000 / (strike*100=10_000)) = 2
+      incremental = 100 * 100 * 2 = 20_000
+      open_assignment_cash = 185_000 (already-reserved collateral from prior CSPs)
+        185_000 + 20_000 = 205_000 > 200_000  => MUST REJECT
+    Zero gamma/vega/theta so the greek/BPR/collateral re-checks all pass cleanly;
+    the cumulative-assignment cap is demonstrably the binding reject.
+    """
+    flat_put = OptionLeg(
+        symbol="NVDA260612P00100000",
+        side="sell",
+        position_intent="sell_to_open",
+        greeks_at_decision=OptionGreeksSnapshot(
+            delta=-0.25, gamma=0.0, theta=0.05, vega=0.0, rho=-0.01
+        ),
+    )
+    res = options_gate(
+        [flat_put],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            nav=1_000_000.0,
+            strike=100.0,
+            options_buying_power=1_000_000.0,  # >> 2-lot collateral; isolates the cap
+            premium_received=250.0,
+            total_bpr=0.0,
+            min_dte=30,
+            open_assignment_cash=185_000.0,  # prior CSP reservations near the cap
+        ),
+    )
+    assert res.admitted is False, "cumulative-over-cap CSP must be REJECTED"
+    assert res.reason == "cumulative_assignment_risk_cap"
+    assert res.contracts == 0
+
+
+def test_csp_admitted_when_cumulative_assignment_cash_below_cap() -> None:
+    """Same construction as the reject case, but with open_assignment_cash low
+    enough that cumulative stays under the cap -> still admitted (the new rule is
+    purely additive; it never blocks a within-budget CSP).
+
+      open_assignment_cash = 100_000 ; incremental = 20_000
+      100_000 + 20_000 = 120_000 <= 200_000  => ADMIT
+    """
+    flat_put = OptionLeg(
+        symbol="NVDA260612P00100000",
+        side="sell",
+        position_intent="sell_to_open",
+        greeks_at_decision=OptionGreeksSnapshot(
+            delta=-0.25, gamma=0.0, theta=0.05, vega=0.0, rho=-0.01
+        ),
+    )
+    res = options_gate(
+        [flat_put],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            nav=1_000_000.0,
+            strike=100.0,
+            options_buying_power=1_000_000.0,
+            premium_received=250.0,
+            total_bpr=0.0,
+            min_dte=30,
+            open_assignment_cash=100_000.0,
+        ),
+    )
+    assert res.admitted is True
+    assert res.bucket == StructureBucket.CASH_SECURED_PUT
+    assert res.contracts == 2
+
+
+def test_csp_default_open_assignment_cash_is_byte_identical() -> None:
+    """Non-regression: omitting open_assignment_cash (default 0.0) preserves the
+    pre-fix admit on a single within-budget CSP — the new input defaults to no-op.
+    """
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=20_000.0,
+            premium_received=250.0,
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is True
+    assert res.bucket == StructureBucket.CASH_SECURED_PUT
+
+
+def test_csp_nan_open_assignment_cash_fails_closed() -> None:
+    """A NaN open_assignment_cash must FAIL CLOSED (silence), never admit. A NaN
+    defeats the `>` comparison (nan > x is always False), so a naive cap check
+    would silently admit — the recurring NaN-defeats-gate fail-open family. Mirror
+    the math.isfinite money-input guards."""
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=1_000_000.0,
+            premium_received=250.0,
+            min_dte=30,
+            open_assignment_cash=float("nan"),
+        ),
+    )
+    assert res.admitted is False, "NaN open_assignment_cash must fail closed"
+    assert res.reason == "open_assignment_cash_not_finite"
+    assert res.contracts == 0
+
+
+def test_covered_call_cumulative_assignment_cap_counts_stock_basis() -> None:
+    """The cap also bounds CC stock basis (ADR-0027 D4 wheel rule: 'Sum of CSP
+    cash reservations + CC stock basis <= max_assignment_risk_pct_nav'). A CC whose
+    incremental stock basis (basis_per_share*100*contracts) pushes cumulative past
+    the cap must silence.
+
+      nav=1_000_000, cap=0.20 -> 200_000
+      basis_per_share=100 -> incremental = 100*100*contracts
+      kelly_target = 25_000 ; contracts = floor(25_000 / (basis*100=10_000)) = 2
+      incremental = 100*100*2 = 20_000
+      open_assignment_cash = 190_000 -> 190_000 + 20_000 = 210_000 > 200_000 REJECT
+    """
+    res = options_gate(
+        [
+            StockLeg(underlying="NVDA", qty=100, basis_per_share=100.0),
+            _short_call("NVDA260612C00160000", delta=0.25, theta=0.05),
+        ],
+        **_base_kwargs(
+            held_shares=100_000,  # plenty of cover for any admitted size
+            nav=1_000_000.0,
+            strike=160.0,
+            basis_per_share=100.0,
+            min_dte=30,
+            open_assignment_cash=190_000.0,
+        ),
+    )
+    assert res.admitted is False, "cumulative-over-cap CC must be REJECTED"
+    assert res.reason == "cumulative_assignment_risk_cap"
+    assert res.contracts == 0

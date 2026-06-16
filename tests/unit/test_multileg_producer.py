@@ -180,6 +180,33 @@ def test_csp_builds_and_gates(gate_on, tmp_path) -> None:
     assert res.proposal.stock_leg is None  # CSP has no equity leg
 
 
+def test_csp_cumulative_assignment_cap_plumbed_through_producer(gate_on, tmp_path) -> None:
+    """ADR-0027 D2/D4: build_multi_leg_proposal forwards open_assignment_cash into
+    options_gate so the cumulative all-CSPs-assign cap is enforced end-to-end.
+
+    The 0.30-delta short put is strike 140 (one lot collateral = 140*100 = 14_000).
+    With nav=1_000_000 the cap is 0.20*nav = 200_000. open_assignment_cash=190_000
+    (prior CSP reservations) -> 190_000 + 14_000 = 204_000 > 200_000 -> the gate
+    must REJECT, no passing proposal is minted. Default (0.0) is byte-identical
+    (the test above admits the same CSP).
+    """
+    reader = ChainSnapshotReader(chains_dir=tmp_path)
+    _put_chain(reader)
+    res = build_multi_leg_proposal(
+        symbol="NVDA",
+        asof=ASOF,
+        strategy_kind="cash_secured_put",
+        reader=reader,
+        nav=1_000_000.0,
+        held_shares=0,
+        options_buying_power=5_000_000.0,
+        open_assignment_cash=190_000.0,
+    )
+    assert res.admitted is False
+    assert res.proposal is None
+    assert res.reason == "cumulative_assignment_risk_cap"
+
+
 # --------------------------------------------------------------------------- #
 # Persist -> store.get -> route -> fill
 # --------------------------------------------------------------------------- #
