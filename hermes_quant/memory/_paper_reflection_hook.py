@@ -84,6 +84,21 @@ def maybe_record_decision_on_open(record: Any, proposal: Any) -> None:
             or str(getattr(record, "asof_decision", "") or "")
             or str(getattr(record, "asof_execution", "") or "")
         )
+        # ar40: stash the OPEN fill price on the decision row so the close hook can
+        # compute the true open->close return. The decision schema has no dedicated
+        # price field, and the CLOSING ExecutionRecord carries only the CLOSE price — so
+        # without persisting the open price here, maybe_reflect_on_close fell back to the
+        # close record's own decision_price/fill_price as "entry_price", making
+        # raw_return = close-leg slippage (~0 on the paper passthrough) instead of the
+        # realized trade return — corrupting every Reflection's alpha_return /
+        # outcome_quality (advisory/learning plane only; never reaches a money gate).
+        # We carry it in the free-form signal_provenance dict to avoid a schema bump.
+        _open_price = float(
+            getattr(record, "fill_price", 0) or getattr(record, "decision_price", 0) or 0.0
+        )
+        _provenance = dict(agg.get("provenance") or rg.get("provenance") or {})
+        if _open_price > 0:
+            _provenance["open_fill_price"] = _open_price
         dec_id = dlog.record_decision(
             asof_decision=asof,
             ticker=asset,
@@ -98,7 +113,7 @@ def maybe_record_decision_on_open(record: Any, proposal: Any) -> None:
                 or f"{asset} {'long' if direction > 0 else 'short'} paper fill"
             )[:500],
             thesis_evidence_ids=adv.get("evidence_ids") or None,
-            signal_provenance=agg.get("provenance") or rg.get("provenance") or None,
+            signal_provenance=_provenance or None,
             risk_debate_summary=adv.get("risk_debate_summary"),
         )
         logger.info("decision-open-hook: recorded pending decision %s for %s", dec_id, asset)
@@ -163,8 +178,17 @@ def maybe_reflect_on_close(record: Any, proposal: Any) -> None:
             )
             return
 
-        # Build a minimal exit record
-        entry_price = float(decision_price or fill_price or 1.0)
+        # ar40: the OPEN price was stashed on the decision row's signal_provenance at
+        # open-time (maybe_record_decision_on_open). Prefer it so raw_return is the true
+        # open->close return; fall back to the close record's price ONLY if the open price
+        # is absent (legacy rows written before ar40) — the prior behavior, so old rows
+        # are unchanged rather than newly broken.
+        _prov = decision.get("signal_provenance") or {}
+        _open_px = _prov.get("open_fill_price") if isinstance(_prov, dict) else None
+        try:
+            entry_price = float(_open_px) if _open_px else float(decision_price or fill_price or 1.0)
+        except (TypeError, ValueError):
+            entry_price = float(decision_price or fill_price or 1.0)
         exit_record = {
             "asof_resolution": asof_execution,
             "entry_price": entry_price,

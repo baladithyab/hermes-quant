@@ -18,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_quant.memory._paper_reflection_hook import (
     maybe_record_decision_on_open,
     maybe_reflect_on_close,
@@ -119,6 +121,34 @@ def test_w1_full_loop_liveness_open_close_reflect_readback(monkeypatch, tmp_path
     block = format_context_block(ctx)
     assert block and block.strip(), "the closed loop must yield a non-empty lessons_block"
     assert "AAPL" in block
+
+
+def test_ar40_reflection_entry_price_is_open_not_close(monkeypatch, tmp_path) -> None:
+    """ar40: the close hook must compute raw_return from the OPEN fill price (stashed on
+    the decision row at open-time), NOT the closing record's own price. Open AAPL long @
+    150, close @ 165 (a true +10% long return). Pre-fix, entry_price came from the close
+    record (decision_price==fill_price==165) so raw_return == 0; post-fix it is +0.10."""
+    import json
+
+    _, refl_path = _patch_paths(monkeypatch, tmp_path)
+
+    open_rec = _record(asset="AAPL", fill_size_pct=0.10, decision_price=150.0, fill_price=150.0,
+                       asof_execution="2026-05-20T16:00:00+00:00")
+    maybe_record_decision_on_open(open_rec, _proposal(asof="2026-05-20T16:00:00+00:00", direction=1))
+
+    # Closing fill at 165 — its OWN decision_price==fill_price==165 (paper passthrough).
+    close_rec = _record(asset="AAPL", fill_size_pct=-0.10, decision_price=165.0, fill_price=165.0,
+                        asof_execution="2026-06-05T16:00:00+00:00")
+    maybe_reflect_on_close(close_rec, _proposal(asof="2026-06-05T16:00:00+00:00", direction=-1))
+
+    refls = [json.loads(ln) for ln in refl_path.read_text().splitlines() if ln.strip()]
+    assert refls, "a reflection must be persisted on close"
+    raw = float(refls[-1]["raw_return"])
+    # 165/150 - 1 = +0.10 (the true open->close return), NOT ~0 (close-leg slippage).
+    assert raw == pytest.approx(0.10, abs=1e-6), (
+        f"ar40: raw_return={raw} implies entry_price came from the CLOSE record (=> ~0), "
+        f"not the stashed OPEN price 150 (=> +0.10)"
+    )
 
 
 def test_w1_oracle_guard_excludes_future_reflection(monkeypatch, tmp_path) -> None:

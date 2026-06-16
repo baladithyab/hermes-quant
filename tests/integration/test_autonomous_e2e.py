@@ -203,6 +203,73 @@ def test_no_dry_run_calls_react_on_fire(
     assert result.decisions[0].execution_id == "exec_AAPL"
 
 
+def test_ar38_reactor_no_fill_record_does_not_count_as_a_fire(
+    isolate_config,
+    isolate_quant_home,
+):
+    """ar38: when _react returns None (the reactor RETURNED a no-fill/silence record,
+    e.g. a deterministic-equity BP refusal or a paper cap-silence), the tick must NOT
+    count a fire and must NOT mutate portfolio_state with a phantom position."""
+    _set_mode_autonomous(isolate_config)
+
+    # _react returns None == the reactor returned a no-fill/silence record.
+    with mock.patch("hermes_quant.autonomous._react", side_effect=lambda *a, **k: None):
+        result = tick(
+            dry_run=False,
+            symbols=[WatchlistEntry("AAPL", "equity", "1d")],
+            advisor_recommend=lambda **kw: _make_advisor_result(),
+        )
+
+    assert result.fires == 0, "ar38: a reactor no-fill was counted as a phantom fire"
+    assert result.silences == 1
+    assert result.decisions[0].execution_id is None
+    assert result.decisions[0].gate == "SILENCE_REACTOR_NO_FILL"
+
+
+def test_ar38_react_returns_none_on_silenced_record(isolate_quant_home, monkeypatch):
+    """Unit-level: _react must return None when the routed reactor RETURNS (not raises)
+    a record flagged silenced/no_fill (the autonomous-side of the cs02/ar16/ar27 gap)."""
+    from hermes_quant import autonomous as auto
+    from hermes_quant.react.base import ExecutionRecord
+
+    def _silenced_record(prop, **kwargs):
+        return ExecutionRecord(
+            proposal_id=prop.proposal_id,
+            signal_id=None,
+            asset=prop.symbol,
+            asset_class=prop.asset_class,
+            timeframe=prop.timeframe,
+            asof_decision="2026-06-16T00:00:00Z",
+            asof_execution="2026-06-16T00:00:00Z",
+            target_position_pct=0.05,
+            decision_price=100.0,
+            fill_price=0.0,
+            fill_size_pct=0.0,
+            reactor_name="paper",
+            human_in_the_loop=True,
+            reactor_metadata={"silenced": True, "silence_reason": "portfolio_cap_no_headroom"},
+        )
+
+    class _SilencingReactor:
+        name = "paper"
+
+        def execute(self, prop, **kwargs):
+            return _silenced_record(prop, **kwargs)
+
+    import hermes_quant.react.dispatch as dispatch_module
+    monkeypatch.setattr(dispatch_module, "select_reactor", lambda prop: _SilencingReactor())
+    monkeypatch.setattr(
+        "hermes_quant.react.dispatch.select_reactor", lambda prop: _SilencingReactor()
+    )
+
+    out = auto._react(
+        _make_advisor_result(),
+        WatchlistEntry("AAPL", "equity", "1d"),
+        0.05,
+    )
+    assert out is None, "ar38: _react must return None on a silenced/no-fill reactor record"
+
+
 def test_fill_size_invariant_rejection_silences_not_errors(
     isolate_config,
     isolate_quant_home,

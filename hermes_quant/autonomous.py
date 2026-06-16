@@ -1079,6 +1079,23 @@ def tick(
                         effective_size,
                         paper_zero_costs=bool(rails.get("paper_zero_costs", False)),
                     )
+                    # ar38: _react returns None when the reactor RETURNED a no-fill/
+                    # silence/reject record (no capital moved, nothing on the bus). Treat
+                    # it as a SILENCE — do NOT count a fire, do NOT consume a budget slot,
+                    # and do NOT mutate portfolio_state with a phantom position (which
+                    # would charge headroom against a position that never existed and
+                    # clip/silence subsequent REAL signals this tick).
+                    if execution_id is None:
+                        decision.gate = "SILENCE_REACTOR_NO_FILL"
+                        decision.details = {
+                            "reason": "reactor returned a no-fill/silence record",
+                            "would_have_fired": True,
+                            "original_gate": gate_result.decision.value,
+                            "requested_fill_size_pct": effective_size,
+                        }
+                        result.silences += 1
+                        result.decisions.append(decision)
+                        continue
                     decision.execution_id = execution_id
                     fires_this_tick += 1
                     # Update running portfolio state so the next pick sees the
@@ -1139,9 +1156,11 @@ def _react(
     fill_size_pct: float,
     *,
     paper_zero_costs: bool = False,
-) -> str:
+) -> str | None:
     """Fire the routed reactor for an autonomous decision and return the
-    synthesized proposal_id (used as the execution_id surfaced in tick output).
+    synthesized proposal_id (used as the execution_id surfaced in tick output),
+    or ``None`` if the reactor returned a NO-FILL/SILENCE record (ar38) so the
+    caller does NOT count a phantom fire or mutate portfolio state.
 
     We construct a minimal Proposal-shaped object on the fly so we can route it
     through the ONE dispatch chokepoint (``react.dispatch.select_reactor``) the
@@ -1194,12 +1213,45 @@ def _react(
     if paper_zero_costs and getattr(reactor, "name", None) != "paper":
         raise ValueError("paper_zero_costs is set but reactor is not paper")
 
-    reactor.execute(
+    record = reactor.execute(
         proposal,
         fill_size_pct=fill_size_pct,
         approver_user_id="autonomous",
         play_tag="autonomous",  # B13: stamp the autonomous-tick source on the fill
     )
+
+    # ar38: a reactor may RETURN (not raise) a NO-FILL / SILENCE / REJECT record —
+    # PaperReactor on a non-finite/<=0 price or a cap clip-to-zero (silenced=True,
+    # fill_size_pct=0.0), or DeterministicEquityReactor on a BP refusal / backend
+    # error (no_fill=True / bp_rejected=True, fill_size_pct=0.0). It returns-not-raises
+    # precisely because this fire loop calls execute() with no try/except. Previously
+    # the returned record was DISCARDED and _react returned pid unconditionally, so the
+    # loop counted a PHANTOM fire: result.fires++, a consumed per-tick/concurrency slot,
+    # and a phantom portfolio_state.positions[symbol] that then charged headroom against
+    # a position that never existed (clipping/silencing SUBSEQUENT real signals). This is
+    # the autonomous-side gap of the cs02/ar16/ar27 HITL no-fill fixes. Detect the no-fill
+    # and return None so the caller treats it as a silence (no fire-count, no state
+    # mutation, no phantom headroom). Byte-identical when the reactor actually fills.
+    _rmeta = getattr(record, "reactor_metadata", None) or {}
+    _realized = getattr(record, "fill_size_pct", None)
+    _is_nofill = (
+        _rmeta.get("silenced") is True
+        or _rmeta.get("no_fill") is True
+        or _rmeta.get("bp_rejected") is True
+        or _rmeta.get("unfilled_timeout") is True
+        or (_realized is not None and _realized == 0.0)
+    )
+    if _is_nofill:
+        logger.info(
+            "autonomous: reactor returned a NO-FILL/SILENCE for %s (reason=%s); NOT "
+            "counting a fire, NOT mutating portfolio state (phantom-fire guard)",
+            entry.symbol,
+            _rmeta.get("silence_reason")
+            or _rmeta.get("no_fill_reason")
+            or _rmeta.get("broker_status")
+            or "no_fill",
+        )
+        return None
 
     # Append a journal entry tagged with hitl_kind=approve (autonomous
     # treats itself as a non-human approver — the audit trail is uniform
