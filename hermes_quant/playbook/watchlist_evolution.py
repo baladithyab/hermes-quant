@@ -393,11 +393,47 @@ def _evolve_one_play(
                     )
                 )
 
-        # ---- Onboard rule (only if not evicted this run) ----------------
-        # ADR-0075: a catalyst-fast-tracked symbol needs 0 consecutive runs (a
-        # 1-day catalyst must be actionable that day); universe names keep the
-        # configured sticky window.
+        # ---- Catalyst admission priority (ADR-0075 symmetry) ------------
+        # The eviction path already protects a catalyst-admitted name from being
+        # slow-evicted within its horizon (_catalyst_eviction_protected). Without
+        # a symmetric admission priority, a play already at cap whose ordinary
+        # names all re-confirm active keeps active_count pinned at max_per_play,
+        # so a strong out-of-universe catalyst (fast_track + admitted_via=catalyst)
+        # — appended LAST to the scored universe — hits the onboard gate when the
+        # cap is full and is stranded as a candidate. The downstream autonomous
+        # tick only trades state=='active' rows, so the catalyst (the whole point
+        # of onboarding) is silently dropped, and cap-trim cannot rescue it (it
+        # only ever shrinks the already-active set, never promotes a candidate).
+        #
+        # Mirror the eviction-side asymmetry on the admission side: when a
+        # fast_track catalyst would onboard but the play is at cap, displace the
+        # lowest-scored UNPROTECTED active row already accepted this run so the
+        # catalyst takes the slot. Default-OFF (empty fast_track) -> no symbol is
+        # ever in fast_track, so this branch is dead and behavior is bit-identical.
         effective_sticky = 0 if symbol in fast_track else sticky_onboard_days
+        is_catalyst_admission = (
+            symbol in fast_track
+            and (admission_extras.get(symbol) or {}).get("admitted_via") == "catalyst"
+        )
+        if (
+            is_catalyst_admission
+            and row.state != STATE_EVICTED
+            and row.state != STATE_ACTIVE
+            and row.consecutive_days_above_floor >= effective_sticky
+            and active_count >= max_per_play
+            and max_per_play > 0
+        ):
+            displaced = _displace_lowest_active(
+                new_rows,
+                exclude_symbol=symbol,
+                asof=asof,
+                play=play,
+                position_lookup=position_lookup,
+            )
+            if displaced is not None:
+                events.append(displaced)
+                active_count -= 1
+
         if (
             row.state != STATE_EVICTED
             and row.state != STATE_ACTIVE
@@ -534,6 +570,76 @@ def _catalyst_eviction_protected(
         return bool(position_lookup(row.symbol))
     except Exception:  # noqa: BLE001 — missing position feed -> fail-safe hold
         return True
+
+
+def _displace_lowest_active(
+    new_rows: list[WatchlistEntry],
+    *,
+    exclude_symbol: str,
+    asof: pd.Timestamp,
+    play: str,
+    position_lookup: Callable[[str], bool] | None,
+) -> dict[str, Any] | None:
+    """Evict the lowest-scored UNPROTECTED active row in ``new_rows`` in place.
+
+    Used by the catalyst admission-priority branch: when a fast_track catalyst
+    would onboard into a full play, free exactly one slot by evicting the
+    weakest UNPROTECTED active ordinary row. This mirrors the eviction-side
+    ``_catalyst_eviction_protected`` asymmetry on the admission side — a
+    catalyst-admitted name that is within its horizon (and therefore protected)
+    is never the one displaced, so we never cannibalize one catalyst to admit
+    another mid-horizon.
+
+    Determinism: candidates are ranked by ``(-last_score, symbol)`` — descending
+    score, then symbol ascending as a stable tie-break — and the LAST of that
+    ranking (lowest score, then highest symbol) is displaced. NaN scores sort to
+    the tail (treated as lowest score → displaced first), matching
+    ``_enforce_cap_trim``'s NaN-safe ordering.
+
+    Mutates ``new_rows`` in place (the matched row is ``replace``d with an
+    evicted row) and returns the ``ACTION_EVICT`` journal event, or ``None`` if
+    there is no displaceable (unprotected, active) row. ``exclude_symbol`` (the
+    catalyst about to onboard) is never a candidate.
+    """
+
+    def _rank_key(r: WatchlistEntry) -> tuple[int, float, str]:
+        score = r.last_score
+        is_nan = score != score  # True only for NaN
+        return (1 if is_nan else 0, 0.0 if is_nan else -score, r.symbol)
+
+    best_idx: int | None = None
+    best_key: tuple[int, float, str] | None = None
+    for idx, r in enumerate(new_rows):
+        if r.state != STATE_ACTIVE or r.symbol == exclude_symbol:
+            continue
+        if _catalyst_eviction_protected(r, asof, position_lookup):
+            continue
+        # We want the LOWEST-scored row = the LARGEST rank key (NaN/lowest first).
+        key = _rank_key(r)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_idx = idx
+
+    if best_idx is None:
+        return None
+
+    victim = new_rows[best_idx]
+    reason = "displaced_by_catalyst"
+    new_rows[best_idx] = replace(
+        victim,
+        state=STATE_EVICTED,
+        eviction_reason=reason,
+        consecutive_days_above_floor=0,
+    )
+    return _event(
+        asof=asof,
+        play=play,
+        symbol=victim.symbol,
+        action=ACTION_EVICT,
+        reason=reason,
+        score_before=victim.last_score,
+        score_after=victim.last_score,
+    )
 
 
 def _enforce_cap_trim(
