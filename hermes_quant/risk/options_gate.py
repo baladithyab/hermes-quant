@@ -22,7 +22,7 @@ import logging
 import math
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
@@ -815,9 +815,30 @@ def options_gate(
     # re-aggregate at the admitted `contracts` and re-run every size-scaling cap;
     # any breach silences. The admitted-size aggregate is the authoritative
     # net_greeks reported. (Fail-closed on missing greeks, as above.)
+    #
+    # Covered-structure StockLeg cover MUST scale with the admitted lot count.
+    # `aggregate_net_greeks(legs, order_qty=contracts)` scales the OPTION legs by
+    # `contracts` (data.py:295) but treats StockLeg.qty as an ALREADY-scaled
+    # absolute share count (data.py:305 — NOT scaled by order_qty). The production
+    # CC recipe builds a 1-lot cover (StockLeg(qty=100), recipes.py:261) and only
+    # rebuilds it to qty=100*contracts AFTER the gate returns (recipes.py:324). If
+    # we aggregated the recipe's 1-lot stock against the N-lot option, the net-delta
+    # cap would be evaluated against |100 - 30N| share-deltas instead of the TRUE
+    # |100N - 30N| of the admitted N-lot position — understating the directional
+    # exposure (monotonically in N) and ADMITTING an over-the-cap covered call
+    # (fail-OPEN; the gate would size up the option but leave the cover at 1 lot).
+    # Rebuild every StockLeg to its admitted cover (100 * contracts shares) so the
+    # net-delta re-check evaluates the structure the order actually establishes.
+    # (Done only at the gate's known-1-lot recipe seam; scaling StockLeg.qty inside
+    # aggregate_net_greeks would double-scale a caller that passes a pre-scaled
+    # cover — which the existing tests and the post-gate recipe path both do.)
     if contracts != structural_contracts:
+        admitted_legs = [
+            replace(leg, qty=100 * contracts) if isinstance(leg, StockLeg) else leg
+            for leg in legs
+        ]
         try:
-            admitted_net = aggregate_net_greeks(legs, order_qty=contracts)
+            admitted_net = aggregate_net_greeks(admitted_legs, order_qty=contracts)
         except GreekComputationError as exc:
             return OptionsGateResult.silence(
                 bucket, f"greeks_unavailable: {exc}", bpr_estimate=bpr, max_loss=max_loss,

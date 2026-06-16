@@ -524,6 +524,70 @@ def test_gamma_cap_rechecked_at_admitted_size_not_one_lot() -> None:
     assert res.reason == "portfolio_gamma_cap_at_size"
 
 
+def test_net_delta_cap_rechecked_against_true_admitted_cover_not_one_lot() -> None:
+    """REGRESSION (covered-call net-delta at-size): the net-delta cap re-check must
+    aggregate the TRUE admitted structure, i.e. the StockLeg cover scaled to
+    100*contracts shares — NOT the 1-lot StockLeg(qty=100) the production recipe
+    passes at gate time (recipes.py:261 builds qty=100; recipes.py:324 rebuilds
+    qty=100*contracts only AFTER the gate returns).
+
+    `aggregate_net_greeks(legs, order_qty=contracts)` scales the OPTION legs by
+    `contracts` (data.py:295) but leaves StockLeg.qty UNSCALED (data.py:305).
+    Pre-fix, the at-size re-check therefore evaluated the net-delta cap against
+    (100-share cover + N-lot short call) = |100 - 30N| share-deltas, which UNDER-
+    states the true |100N - 30N| = |70N| of the admitted N-lot position. The
+    understatement grows monotonically with N, so a covered call whose TRUE
+    admitted net delta breaches the directional cap slips past the gate (fail-OPEN).
+
+    Construction (the claim scenario, every value pins the boundary):
+      NAV=300k, spot=20, basis=25 -> collateral_per_contract = 25*100 = 2_500
+      kelly_target = 300_000 * 0.25 * 0.10 = 7_500
+        (action_step 0.05*nav=15_000 floors 7_500 to 0 -> falls back to 7_500)
+      contracts = floor(7_500 / 2_500) = 3   (> structural_contracts=1)
+      max_net_delta_pct_nav = 0.005 -> directional cap = 0.005 * 300_000 = $1_500
+
+      short call delta = +0.30 (== cap, NOT > cap, passes the per-leg O-D4 rule).
+      structural (1-lot) net delta = +100 - 30 = +70 -> |70*20| = $1_400 < $1_500
+        (the pre-sizing net-delta check PASSES at 1 lot)
+      BUGGY at-size aggregate (stock UNSCALED) = +100 - 90 = +10
+        -> |10*20| = $200 < $1_500  (pre-fix ADMITS the over-cap 3-lot CC)
+      TRUE  at-size aggregate (stock = 100*3=300 shares) = +300 - 90 = +210
+        -> |210*20| = $4_200 > $1_500  (breaches the cap by ~2.8x)
+
+    Short call carries positive theta (theta-collecting) and small gamma/vega, so
+    the gamma/theta/vega at-size re-checks all pass cleanly; the net-delta-at-size
+    check is demonstrably the binding reject. This path is otherwise uncovered:
+    the existing at-size tests hand-build pre-scaled stock legs (qty=1000) and only
+    exercise gamma/BPR/collateral (which do not depend on stock delta).
+    """
+    delta_cap_cfg = OptionsRiskConfig(max_net_delta_pct_nav=0.005)
+    res = options_gate(
+        # Production recipe leg layout: 1-lot StockLeg cover + short call.
+        [
+            StockLeg(underlying="NVDA", qty=100, basis_per_share=25.0),
+            _short_call("NVDA260612C00022000", delta=0.30),
+        ],
+        **_base_kwargs(
+            cfg=delta_cap_cfg,
+            nav=300_000.0,
+            spot=20.0,
+            held_shares=300,  # covers the admitted 3 lots (structural classify=1 lot)
+            strike=22.0,
+            basis_per_share=25.0,
+            min_dte=30,
+            premium_received=200.0,
+        ),
+    )
+    # The order sizes to 3 lots; the TRUE 3-lot net delta ($4,200) breaches the
+    # $1,500 directional cap. The gate can only REJECT — it must not admit it.
+    assert res.contracts == 0
+    assert res.admitted is False, (
+        "over-the-cap 3-lot covered call must be REJECTED — the at-size net-delta "
+        "re-check must scale the stock cover to the admitted lot count"
+    )
+    assert res.reason == "net_delta_cap_at_size"
+
+
 # ---------------------------------------------------------------------------
 # REJECT-only invariant
 # ---------------------------------------------------------------------------
