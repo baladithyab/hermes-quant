@@ -601,6 +601,21 @@ def cached_fetch(
     contiguous -> no flag). A contiguous served window is byte-identical (flag
     absent); ``cutoff=None`` adds no flag.
     """
+    # cs79: normalize ``cutoff`` to tz-aware UTC ONCE, here, before any comparison.
+    # The cached ``timestamp`` column is tz-aware (datetime64[ns, UTC]); a tz-NAIVE
+    # ``cutoff`` raises ``TypeError: Invalid comparison between dtype=datetime64[ns,
+    # UTC] and Timestamp`` at EVERY comparison site below (the eligible filter, the
+    # cs43 right-edge bound, the cs50 contiguity check, the cs49/cs73 MISS gates). A
+    # reasonable library caller can pass a naive cutoff; normalizing at the single
+    # entry point makes all downstream comparisons safe. An already-aware cutoff is
+    # converted to UTC (tz_localize RAISES on an aware ts, so guard on ``tzinfo is
+    # None``); ``cutoff=None`` passes through untouched (byte-identical behaviour).
+    if cutoff is not None:
+        cutoff = pd.Timestamp(cutoff)
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.tz_localize("UTC")
+        else:
+            cutoff = cutoff.tz_convert("UTC")
     cache = OhlcvCache(
         provider=provider,
         symbol=symbol,

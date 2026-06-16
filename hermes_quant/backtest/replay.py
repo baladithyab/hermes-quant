@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -307,6 +308,22 @@ def replay(
 
     # Buy-and-hold reference (compute over the same window the strategy sees)
     bh_anchor_close = float(bars["close"].iloc[warmup_bars])
+    # cs80: fail-CLOSED on a non-finite/zero anchor close. The buy-and-hold
+    # leg is divided into `initial_equity`; a 0.0 anchor -> bh_qty=inf and a NaN
+    # anchor -> NaN poison, both of which silently corrupt the honesty metrics
+    # (buy_hold_total_return_pct / buy_hold_sharpe / excess_return_vs_buy_hold_pct)
+    # an operator reads to judge a strategy. A 0/NaN at the very first priced
+    # bar means the price series itself is corrupt at the decision boundary, so
+    # the WHOLE backtest is untrustworthy — raise, consistent with the
+    # insufficient-bars guard above. The operator must never receive a silent
+    # -inf/NaN excess-return.
+    if not math.isfinite(bh_anchor_close) or bh_anchor_close <= 0.0:
+        raise ValueError(
+            "buy-and-hold anchor close at warmup boundary "
+            f"(bar index {warmup_bars}) is non-finite or non-positive: "
+            f"{bh_anchor_close!r}; the price series is corrupt at the decision "
+            "boundary and the backtest cannot be computed honestly"
+        )
     bh_qty = initial_equity / bh_anchor_close
 
     n_decisions = 0
