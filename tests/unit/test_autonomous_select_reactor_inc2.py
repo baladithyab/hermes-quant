@@ -100,8 +100,11 @@ def test_flags_off_routes_paper_reactor_byte_identical(
 
     monkeypatch.setattr(dispatch_mod, "PaperReactor", _paper_factory)
 
-    pid = _react(_advisor_result(), _entry(), 0.05)
+    out = _react(_advisor_result(), _entry(), 0.05)
 
+    # ar38/ar80: _react returns (pid, realized_fill_size_pct) on a fire (None on no-fill).
+    assert out is not None, "reactor should have fired"
+    pid, _realized = out
     assert isinstance(pid, str) and pid
     # The routed reactor with both flags OFF is a PaperReactor (byte-identical
     # to the hardcoded type the seam constructed before the cutover).
@@ -166,7 +169,9 @@ def test_guard_silent_when_flag_routes_paper_and_zero_costs(
     monkeypatch.setattr(
         dispatch_mod, "PaperReactor", lambda *a, **k: PaperReactor(executions_path=bus)
     )
-    pid = _react(_advisor_result(), _entry(), 0.05, paper_zero_costs=True)
+    out = _react(_advisor_result(), _entry(), 0.05, paper_zero_costs=True)
+    assert out is not None, "reactor should have fired"
+    pid, _realized = out
     assert isinstance(pid, str) and pid
     lines = [ln for ln in bus.read_text().splitlines() if ln.strip()]
     assert len(lines) == 1
@@ -198,7 +203,10 @@ def test_flags_on_routes_same_reactor_as_select_reactor(
 
     monkeypatch.setattr(dispatch_mod, "select_reactor", _spy_select)
 
-    pid = _react(_advisor_result(), _entry(), 0.05)
+    out = _react(_advisor_result(), _entry(), 0.05)
+    # ar38/ar80: _react returns (pid, realized_fill_size_pct) on a fire (None on no-fill).
+    assert out is not None, "reactor should have fired"
+    pid, _realized = out
     assert isinstance(pid, str) and pid
 
     routed = captured["reactor"]
