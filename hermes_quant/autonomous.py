@@ -33,6 +33,9 @@ import json
 import logging
 import math
 import os
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,6 +53,148 @@ logger = logging.getLogger(__name__)
 
 QUANT_HOME = Path.home() / ".hermes" / "quant"
 KILL_SWITCH_PATH = QUANT_HOME / "autonomous_kill_switch.json"
+
+
+# ar73 / ADR-0016 §D9 concurrent-positions rail — account_id used to key the
+# per-account advisory lock. The autonomous paper path writes under the
+# execution-bus "paper-default" account sentinel (see react/paper.py +
+# compute_cumulative_realized_pnl_pct's same sentinel), so the rail lock is
+# keyed the same way: one in-flight rail-region per account.
+_AUTONOMOUS_ACCOUNT_ID = "paper-default"
+
+# Max wall-clock a second overlapping tick waits to acquire the §D9 rail lock
+# before giving up and SKIPPING this tick (silence-by-default; recoverable next
+# tick). A tick's rail-sensitive region is short (one watchlist pass), so this
+# is generous. Bounded so a stuck/dead holder can never wedge the cron forever.
+# Overridable via HERMES_QUANT_RAIL_LOCK_TIMEOUT_S (tests / tuning).
+_RAIL_LOCK_TIMEOUT_S = 30.0
+_RAIL_LOCK_TIMEOUT_ENV = "HERMES_QUANT_RAIL_LOCK_TIMEOUT_S"
+
+
+def _rail_lock_timeout_s() -> float:
+    """Resolve the §D9 rail-lock acquire timeout, honoring the env override.
+
+    ar10 finite-guard posture: reject NaN / inf / negative (an `inf` makes the
+    poll deadline never elapse, so a contended lock would spin forever instead
+    of SKIPPING the tick). Fall back to the finite default on any bad value.
+    """
+    raw = os.environ.get(_RAIL_LOCK_TIMEOUT_ENV)
+    if raw is None:
+        return _RAIL_LOCK_TIMEOUT_S
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _RAIL_LOCK_TIMEOUT_S
+    return val if (math.isfinite(val) and val >= 0.0) else _RAIL_LOCK_TIMEOUT_S
+
+
+@contextmanager
+def _account_rail_lock(account_id: str, *, lock_dir: Path) -> Iterator[bool]:
+    """Per-account advisory file lock around the ADR-0016 §D9 read-decide-fire
+    window of ``tick()``.
+
+    The §D9 concurrent-positions rail reads the WHOLE open book once at tick
+    start (OUTSIDE any lock) and then enforces ``max_concurrent_positions``
+    against tick-LOCAL counters (``open_positions_at_tick_start +
+    fires_this_tick``). Two overlapping ticks — the 0,30 cron (``hermes quant
+    autonomous tick``) and the agent TOOL path (``quant_autonomous_tick``) both
+    reach ``tick()`` — would otherwise each read the same stale pre-fire book
+    and each admit a DISTINCT new symbol, jointly breaching the account-wide
+    cap. The per-symbol bus serialization (``signal_bus.append_locked``) is
+    per-WRITE, not per-tick, and never serializes two DIFFERENT new symbols; the
+    reaction-layer locks are downstream of the §D9 read+enforce, which both
+    complete BEFORE ``execute()`` is entered, so they cannot close this race.
+
+    This lock is an ALWAYS-ON hard safety rail (not a default-OFF sizing
+    refinement): the read-decide-fire window must be atomic per account so a
+    second overlapping tick either (a) waits for the first to commit and then
+    re-reads the now-larger book (correctly silencing via
+    SILENCE_CONCURRENT_CAP), or (b) on timeout/contention SKIPS this tick — it
+    must NEVER proceed against a stale pre-fire count.
+
+    Yields ``True`` when the lock was acquired and the caller MUST run the rail
+    region; yields ``False`` when the caller should SKIP this tick.
+
+    Fail-OPEN-SAFE: ONLY a genuine flock-unsupported infrastructure error (a
+    platform without ``fcntl``, a read-only FS, an OSError that is NOT a
+    would-block) degrades to running unguarded — matching the documented
+    daemon/tick_lock posture (never wedge an always-on money tick on a transient
+    fs fault). A would-block / timeout is CONTENTION and SKIPS the tick (it does
+    NOT silently proceed unguarded).
+
+    The lock file lives under ``lock_dir`` (the live-fs ``QUANT_HOME``, like
+    ``daemon.tick_lock``), so a multiprocessing concurrency test agrees on the
+    same lock as long as the processes agree on the home.
+    """
+    lock_path = lock_dir / f"autonomous-rail-{account_id}.lock"
+    fd: int | None = None
+
+    # --- open/create the lock file -------------------------------------------
+    # A failure HERE is an infrastructure problem (no fs, no perms) -> FAIL OPEN.
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        logger.warning(
+            "autonomous: §D9 rail lock unavailable (%s); proceeding UNGUARDED "
+            "(fail-open-safe infra fallback)",
+            exc,
+        )
+        yield True
+        return
+
+    acquired = False
+    try:
+        import errno
+        import fcntl
+
+        timeout_s = _rail_lock_timeout_s()
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    # A non-contention flock error (e.g. flock unsupported on
+                    # this filesystem). Fail-OPEN-SAFE: run unguarded rather than
+                    # wedge the always-on tick on an infra fault.
+                    logger.warning(
+                        "autonomous: §D9 rail flock failed (%s); proceeding "
+                        "UNGUARDED (fail-open-safe infra fallback)",
+                        exc,
+                    )
+                    yield True
+                    return
+                if time.monotonic() >= deadline:
+                    # Contention persisted past the bound. SKIP this tick
+                    # (silence-by-default; recoverable next tick) rather than
+                    # proceed against a possibly-stale pre-fire count.
+                    logger.warning(
+                        "autonomous: §D9 rail lock contended for %.1fs on "
+                        "account=%s; SKIPPING this tick (recoverable next tick)",
+                        timeout_s,
+                        account_id,
+                    )
+                    yield False
+                    return
+                time.sleep(0.02)
+        yield True
+    finally:
+        try:
+            if acquired:
+                import fcntl
+
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -811,402 +956,445 @@ def tick(
     if not watchlist:
         return result
 
-    fires_this_tick = 0
-    journal_lessons_cache: dict[str, list[dict]] = {}
+    # ar73 / ADR-0016 §D9 concurrent-positions rail atomicity (cross-tick race fix).
+    # The open-book read + per-symbol enforce + fire loop below MUST be ATOMIC per
+    # account: two overlapping ticks (the 0,30 cron and the agent TOOL path both
+    # reach tick()) would otherwise each read the same stale pre-fire book and each
+    # admit a DISTINCT new symbol, jointly breaching max_concurrent_positions. The
+    # always-on per-account advisory lock makes a second overlapping tick wait for
+    # the first to commit and re-read the now-larger book (correctly silencing via
+    # SILENCE_CONCURRENT_CAP), or — on prolonged contention — SKIP this tick
+    # (silence-by-default; recoverable next tick). It is fail-open-safe to today's
+    # unguarded behavior ONLY on a genuine flock-unsupported infra error.
+    with _account_rail_lock(_AUTONOMOUS_ACCOUNT_ID, lock_dir=QUANT_HOME) as _rail_ok:
+        if not _rail_ok:
+            # Another tick holds the rail for this account and contention persisted
+            # past the bound. SKIP — do not fire against a stale pre-fire count. The
+            # empty result is honest: zero fires this tick, recoverable on the next.
+            return result
 
-    # ADR-0016 §D9 safety rail: max_concurrent_positions. Count the CURRENT open
-    # book once at tick start (independent of the portfolio-caps opt-in flag —
-    # this is a hard safety rail, not a sizing refinement, so it is always on).
-    # reconstruct_portfolio_state() returns {symbol: target_pct} for non-zero
-    # (open) positions only, so len() == current concurrent position count.
-    # cs16/ADR-0016: pass reactor_filter=None so this rail counts the WHOLE open
-    # equity book across EVERY reactor_name the live router can emit — paper,
-    # deterministic-equity (HERMES_QUANT_DETERMINISTIC_EQUITY=1), and alpaca_paper
-    # (HERMES_QUANT_ALPACA_PAPER=1). reconstruct_portfolio_state DEFAULTS to the
-    # paper-only slice (portfolio/state.py:40), which would UNDER-count the book
-    # (and let the rail open MORE than max_concurrent_positions) now that equity
-    # fills route to non-paper reactors. A safety rail must see the whole book.
-    # The per-symbol keying inside reconstruct_portfolio_state collapses a symbol
-    # written under two reactor names to ONE row at its latest target, so this
-    # cannot over-count a single logical position.
-    # cs19/ADR-0016 §D9: fail-CLOSED on a read EXCEPTION. reconstruct_portfolio_state
-    # is ALREADY internally fail-soft — a missing bus (portfolio/state.py:108-109) and
-    # an OSError (:117-118) return an EMPTY PortfolioState WITHOUT raising, which is a
-    # legitimate "no open book" the SUCCESS path below admits against. So the bare
-    # `except` here catches only GENUINELY-UNEXPECTED faults (a corrupt reconstruct, a
-    # programming error, a non-OSError filesystem fault). In that population we are BLIND
-    # to the real exposure, and assuming the book is EMPTY (full headroom) is the most
-    # dangerous possible assumption for a HARD safety rail. The conservative direction is
-    # to treat the unreadable book as AT-CAP and SILENCE new-symbol opens this tick
-    # (recoverable next tick once the read succeeds), via the `rail_read_failed` sentinel
-    # wired into the D9 check below. NOTE: a SUCCESSFUL empty read keeps the old admit
-    # behavior — only the EXCEPTION path fails closed.
-    open_positions_at_tick_start = 0
-    open_symbols_at_tick_start: set[str] = set()
-    rail_read_failed = False
-    try:
-        from hermes_quant.portfolio.state import reconstruct_portfolio_state as _recon
+        fires_this_tick = 0
+        journal_lessons_cache: dict[str, list[dict]] = {}
 
-        # Read from QUANT_HOME's bus explicitly (not the helper's hard-coded
-        # default) so the rail honors the same home the rest of this module uses
-        # — keeps it test-isolatable via the QUANT_HOME monkeypatch and correct
-        # when the home is reconfigured.
-        _open = _recon(QUANT_HOME / "executions.jsonl", reactor_filter=None).positions
-        open_symbols_at_tick_start = set(_open)
-        open_positions_at_tick_start = len(_open)
-    except Exception as _exc:  # noqa: BLE001 - never block tick on a read error
-        # cs19: fail-CLOSED for the HARD rail (was fail-open to count=0/empty-set).
-        rail_read_failed = True
-        logger.warning(
-            "autonomous: could not count open positions for concurrent-cap rail "
-            "(failing CLOSED — silencing NEW-symbol opens this tick): %s",
-            _exc,
-        )
-
-    # ADR-0071: portfolio-aware Stage-2 sizing. When the operator opts in
-    # via HERMES_QUANT_PORTFOLIO_CAPS=1, each fire is clipped greedily
-    # against running portfolio headroom (gross / net / cash caps). The
-    # default is OFF so this PR is observe-only on its first day; flip the
-    # env var on once the operator has reviewed a tick log post-merge.
-    portfolio_caps_enabled = os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") == "1"
-    portfolio_state = None
-    portfolio_caps = None
-    if portfolio_caps_enabled:
-        from hermes_quant.portfolio.state import reconstruct_portfolio_state
-        from hermes_quant.risk.portfolio_normalize import (
-            PortfolioCaps,
-            clip_one_to_remaining_headroom,
-            headroom_summary,
-        )
-
-        # cs16/ADR-0016: count the WHOLE open equity book (all reactor_names),
-        # not just the paper-only default slice — same rationale as the D9 rail
-        # above, so headroom is computed against the true book.
-        portfolio_state = reconstruct_portfolio_state(reactor_filter=None)
-        portfolio_caps = PortfolioCaps()
-        logger.info(
-            "autonomous: portfolio-caps gate ENABLED. initial state: %s",
-            headroom_summary(portfolio_state, portfolio_caps),
-        )
-
-    # ADR-0079 PDR-1 / M17: build the ONE PerceptionFrame here (inside tick), the
-    # producer BOTH the cron and the quant_autonomous_tick TOOL path reach — so
-    # the tool path perceives the same frame the cron does (closes the GAP-D /
-    # M17 tool-vs-cron semantic decoupling structurally, not via a second
-    # monkey-patch). Semantic is default ON (FLAGS.md Tier A); set
-    # HERMES_QUANT_SEMANTIC_ENABLED=0 to opt out — with the flag explicitly OFF
-    # there are no packets to carry, perception_frame=None is byte-identical to
-    # the pre-promotion path, and we skip the redundant fetch.
-    # build_perception_frame_live never raises (returns None on any error) and a
-    # None frame is identical to not passing one.
-    _inject_frame = os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "1") == "1"
-
-    # cs86 (DEFAULT-OFF): when the operator opts in via
-    # HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1, resolve the REAL paper-account NAV
-    # ONCE per tick and thread it into recommend() so the advisor's gate measures
-    # drawdown / daily-loss against the DURABLE HWM peak + session-open (cs01)
-    # rather than its synthetic flat 100k portfolio (which fails-OPEN). Flag OFF
-    # (production default) => `durable_equity` stays None => recommend() receives
-    # durable_equity_account=None => byte-identical call shape (no NAV resolved,
-    # no store, no state.db write). `_account_nav_usd()` is fail-closed (returns
-    # None on any failure); a None NAV flows through to recommend()'s flag-ON
-    # fail-CLOSED branch (durable_baseline_nav_unavailable), never a fall-open.
-    _durable_baseline = (
-        os.environ.get("HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE", "0") == "1"
-    )
-    _durable_nav = _account_nav_usd() if _durable_baseline else None
-
-    for entry in watchlist:
+        # ADR-0016 §D9 safety rail: max_concurrent_positions. Count the CURRENT open
+        # book once at tick start (independent of the portfolio-caps opt-in flag —
+        # this is a hard safety rail, not a sizing refinement, so it is always on).
+        # reconstruct_portfolio_state() returns {symbol: target_pct} for non-zero
+        # (open) positions only, so len() == current concurrent position count.
+        # cs16/ADR-0016: pass reactor_filter=None so this rail counts the WHOLE open
+        # equity book across EVERY reactor_name the live router can emit — paper,
+        # deterministic-equity (HERMES_QUANT_DETERMINISTIC_EQUITY=1), and alpaca_paper
+        # (HERMES_QUANT_ALPACA_PAPER=1). reconstruct_portfolio_state DEFAULTS to the
+        # paper-only slice (portfolio/state.py:40), which would UNDER-count the book
+        # (and let the rail open MORE than max_concurrent_positions) now that equity
+        # fills route to non-paper reactors. A safety rail must see the whole book.
+        # The per-symbol keying inside reconstruct_portfolio_state collapses a symbol
+        # written under two reactor names to ONE row at its latest target, so this
+        # cannot over-count a single logical position.
+        # cs19/ADR-0016 §D9: fail-CLOSED on a read EXCEPTION. reconstruct_portfolio_state
+        # is ALREADY internally fail-soft — a missing bus (portfolio/state.py:108-109) and
+        # an OSError (:117-118) return an EMPTY PortfolioState WITHOUT raising, which is a
+        # legitimate "no open book" the SUCCESS path below admits against. So the bare
+        # `except` here catches only GENUINELY-UNEXPECTED faults (a corrupt reconstruct, a
+        # programming error, a non-OSError filesystem fault). In that population we are BLIND
+        # to the real exposure, and assuming the book is EMPTY (full headroom) is the most
+        # dangerous possible assumption for a HARD safety rail. The conservative direction is
+        # to treat the unreadable book as AT-CAP and SILENCE new-symbol opens this tick
+        # (recoverable next tick once the read succeeds), via the `rail_read_failed` sentinel
+        # wired into the D9 check below. NOTE: a SUCCESSFUL empty read keeps the old admit
+        # behavior — only the EXCEPTION path fails closed.
+        open_positions_at_tick_start = 0
+        open_symbols_at_tick_start: set[str] = set()
+        rail_read_failed = False
         try:
-            _frame = None
-            if _inject_frame:
-                from hermes_quant.perception import build_perception_frame_live
+            from hermes_quant.portfolio.state import reconstruct_portfolio_state as _recon
 
-                _frame = build_perception_frame_live(
-                    entry.symbol,
-                    asset_class=entry.asset_class,
-                    timeframe=entry.timeframe,
-                )
-            _durable_equity_account = (
-                ("paper-default", entry.asset_class, _durable_nav)
-                if _durable_baseline
-                else None
-            )
-            advisor_result = advisor_recommend(
-                symbol=entry.symbol,
-                asset_class=entry.asset_class,
-                timeframe=entry.timeframe,
-                include_lessons=True,
-                perception_frame=_frame,
-                durable_equity_account=_durable_equity_account,
-            )
-        except Exception as exc:  # noqa: BLE001
+            # Read from QUANT_HOME's bus explicitly (not the helper's hard-coded
+            # default) so the rail honors the same home the rest of this module uses
+            # — keeps it test-isolatable via the QUANT_HOME monkeypatch and correct
+            # when the home is reconfigured.
+            _open = _recon(QUANT_HOME / "executions.jsonl", reactor_filter=None).positions
+            open_symbols_at_tick_start = set(_open)
+            open_positions_at_tick_start = len(_open)
+        except Exception as _exc:  # noqa: BLE001 - never block tick on a read error
+            # cs19: fail-CLOSED for the HARD rail (was fail-open to count=0/empty-set).
+            rail_read_failed = True
             logger.warning(
-                "autonomous: advisor failed for %s: %s",
-                entry.symbol,
-                exc,
-                exc_info=True,
+                "autonomous: could not count open positions for concurrent-cap rail "
+                "(failing CLOSED — silencing NEW-symbol opens this tick): %s",
+                _exc,
             )
-            result.decisions.append(
-                SymbolDecision(
+
+        # ADR-0071: portfolio-aware Stage-2 sizing. When the operator opts in
+        # via HERMES_QUANT_PORTFOLIO_CAPS=1, each fire is clipped greedily
+        # against running portfolio headroom (gross / net / cash caps). The
+        # default is OFF so this PR is observe-only on its first day; flip the
+        # env var on once the operator has reviewed a tick log post-merge.
+        portfolio_caps_enabled = os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") == "1"
+        portfolio_state = None
+        portfolio_caps = None
+        if portfolio_caps_enabled:
+            from hermes_quant.portfolio.state import reconstruct_portfolio_state
+            from hermes_quant.risk.portfolio_normalize import (
+                PortfolioCaps,
+                clip_one_to_remaining_headroom,
+                headroom_summary,
+            )
+
+            # cs16/ADR-0016: count the WHOLE open equity book (all reactor_names),
+            # not just the paper-only default slice — same rationale as the D9 rail
+            # above, so headroom is computed against the true book.
+            portfolio_state = reconstruct_portfolio_state(reactor_filter=None)
+            portfolio_caps = PortfolioCaps()
+            logger.info(
+                "autonomous: portfolio-caps gate ENABLED. initial state: %s",
+                headroom_summary(portfolio_state, portfolio_caps),
+            )
+
+        # ADR-0079 PDR-1 / M17: build the ONE PerceptionFrame here (inside tick), the
+        # producer BOTH the cron and the quant_autonomous_tick TOOL path reach — so
+        # the tool path perceives the same frame the cron does (closes the GAP-D /
+        # M17 tool-vs-cron semantic decoupling structurally, not via a second
+        # monkey-patch). Semantic is default ON (FLAGS.md Tier A); set
+        # HERMES_QUANT_SEMANTIC_ENABLED=0 to opt out — with the flag explicitly OFF
+        # there are no packets to carry, perception_frame=None is byte-identical to
+        # the pre-promotion path, and we skip the redundant fetch.
+        # build_perception_frame_live never raises (returns None on any error) and a
+        # None frame is identical to not passing one.
+        _inject_frame = os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "1") == "1"
+
+        # cs86 (DEFAULT-OFF): when the operator opts in via
+        # HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1, resolve the REAL paper-account NAV
+        # ONCE per tick and thread it into recommend() so the advisor's gate measures
+        # drawdown / daily-loss against the DURABLE HWM peak + session-open (cs01)
+        # rather than its synthetic flat 100k portfolio (which fails-OPEN). Flag OFF
+        # (production default) => `durable_equity` stays None => recommend() receives
+        # durable_equity_account=None => byte-identical call shape (no NAV resolved,
+        # no store, no state.db write). `_account_nav_usd()` is fail-closed (returns
+        # None on any failure); a None NAV flows through to recommend()'s flag-ON
+        # fail-CLOSED branch (durable_baseline_nav_unavailable), never a fall-open.
+        _durable_baseline = (
+            os.environ.get("HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE", "0") == "1"
+        )
+        _durable_nav = _account_nav_usd() if _durable_baseline else None
+
+        for entry in watchlist:
+            try:
+                _frame = None
+                if _inject_frame:
+                    from hermes_quant.perception import build_perception_frame_live
+
+                    _frame = build_perception_frame_live(
+                        entry.symbol,
+                        asset_class=entry.asset_class,
+                        timeframe=entry.timeframe,
+                    )
+                _durable_equity_account = (
+                    ("paper-default", entry.asset_class, _durable_nav)
+                    if _durable_baseline
+                    else None
+                )
+                advisor_result = advisor_recommend(
                     symbol=entry.symbol,
                     asset_class=entry.asset_class,
                     timeframe=entry.timeframe,
-                    gate="ERROR",
-                    error=f"advisor failed: {exc}",
+                    include_lessons=True,
+                    perception_frame=_frame,
+                    durable_equity_account=_durable_equity_account,
                 )
-            )
-            result.errors += 1
-            continue
-
-        # Pull lessons for salience check (already in advisor_result, but
-        # surface separately for the gate)
-        lessons = advisor_result.get("lessons") or []
-        journal_lessons_cache[entry.symbol] = lessons
-
-        # Run silence-bias gate
-        gate_result = silence_bias_gate(
-            advisor_result,
-            config=config,
-            journal_lessons=lessons,
-        )
-
-        decision = SymbolDecision(
-            symbol=entry.symbol,
-            asset_class=entry.asset_class,
-            timeframe=entry.timeframe,
-            gate=gate_result.decision.value,
-            details=gate_result.details,
-            advisor_result=advisor_result if rails.get("log_silences") else None,
-        )
-
-        if gate_result.fired:
-            # Per-tick safety rail (D9)
-            if fires_this_tick >= rails["max_per_tick_opens"]:
-                decision.gate = "SILENCE_PER_TICK_CAP"
-                decision.details = {
-                    "reason": (
-                        f"max_per_tick_opens={rails['max_per_tick_opens']} "
-                        "reached; this signal would have fired but tick is at cap"
-                    ),
-                    "would_have_fired": True,
-                    "original_gate": gate_result.decision.value,
-                }
-                result.silences += 1
-                result.decisions.append(decision)
-                continue
-
-            # Concurrent-positions safety rail (ADR-0016 §D9). The book already
-            # at the cap must not grow. Count = open positions at tick start +
-            # fires already executed this tick. A FIRE on a symbol we ALREADY
-            # hold is an adjustment (not a new slot), so it is exempt from the
-            # cap — only genuinely-new symbols consume a concurrency slot.
-            max_concurrent = rails["max_concurrent_positions"]
-            is_new_symbol = entry.symbol not in open_symbols_at_tick_start
-            projected_concurrent = open_positions_at_tick_start + fires_this_tick
-            # cs19/ADR-0016 §D9: a read-EXCEPTION on the book count fails CLOSED —
-            # treat the unreadable book as AT-CAP for any NEW-looking symbol. A
-            # SUCCESSFUL read (empty or populated) leaves rail_read_failed False, so
-            # the `or` short-circuits to the normal count test and behavior is byte-
-            # identical. Existing-symbol management is unaffected: the `is_new_symbol`
-            # guard still exempts a fire on a held symbol (the rail only converts a
-            # would-be NEW open into a SILENCE; it never blocks a close/adjustment).
-            if is_new_symbol and (
-                rail_read_failed or projected_concurrent >= max_concurrent
-            ):
-                decision.gate = "SILENCE_CONCURRENT_CAP"
-                _cap_reason = (
-                    "concurrent-cap book read FAILED; failing CLOSED — silencing this "
-                    "NEW-symbol open this tick (recoverable next tick)"
-                    if rail_read_failed
-                    else (
-                        f"max_concurrent_positions={max_concurrent} reached "
-                        f"({open_positions_at_tick_start} open at tick start "
-                        f"+ {fires_this_tick} fired this tick); this NEW-symbol "
-                        "signal would have fired but the book is at the cap"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "autonomous: advisor failed for %s: %s",
+                    entry.symbol,
+                    exc,
+                    exc_info=True,
+                )
+                result.decisions.append(
+                    SymbolDecision(
+                        symbol=entry.symbol,
+                        asset_class=entry.asset_class,
+                        timeframe=entry.timeframe,
+                        gate="ERROR",
+                        error=f"advisor failed: {exc}",
                     )
                 )
-                decision.details = {
-                    "reason": _cap_reason,
-                    "would_have_fired": True,
-                    "original_gate": gate_result.decision.value,
-                    "open_positions_at_tick_start": open_positions_at_tick_start,
-                    "rail_read_failed": rail_read_failed,
-                }
-                result.silences += 1
-                result.decisions.append(decision)
+                result.errors += 1
                 continue
 
-            # FIRE — emit Action (target_position_pct from advisor's
-            # risk_gate.kelly_fraction). React only if NOT dry_run.
-            rg = (advisor_result or {}).get("risk_gate") or {}
-            # Finite-guard the advisor's signed size (source advisor.py float() of
-            # action.target_position_pct is unguarded). A non-finite kelly would flow
-            # UNGUARDED to the admissibility unit bridge (a -inf kelly is < 0, so it
-            # enters the HERMES_QUANT_ADMISSIBILITY short branch and `math.floor` would
-            # raise, aborting the whole tick). Coerce non-finite -> 0.0 = no size = no
-            # fire (the silence-by-default contract). Defense-in-depth alongside the
-            # bridge's own fail-closed guard.
-            kelly = float(rg.get("kelly_fraction", 0.0))
-            if not math.isfinite(kelly):
-                kelly = 0.0
-            sig = (advisor_result or {}).get("aggregated_signal") or {}
+            # Pull lessons for salience check (already in advisor_result, but
+            # surface separately for the gate)
+            lessons = advisor_result.get("lessons") or []
+            journal_lessons_cache[entry.symbol] = lessons
 
-            # Stop-loss backstop (ADR-0016 §D9 defense-in-depth; deep-review
-            # 2026-06-07). Last line against a stopless full-size fire. Opt-in
-            # via rails["require_stop_loss"] (default False = legacy byte-
-            # identical). The trader's root-cause fix should mean stop_loss is
-            # never None here, but if it still is and the would-be size exceeds
-            # the allowed stopless band, either size DOWN to the band or SILENCE.
-            stopless_meta: dict[str, Any] | None = None
-            if rails.get("require_stop_loss"):
-                tp = (advisor_result or {}).get("trader_proposal") or {}
-                stop = tp.get("stop_loss")
-                stopless = stop is None or (
-                    isinstance(stop, (int, float)) and not math.isfinite(float(stop))
-                )
-                limit = float(rails["stopless_max_size_pct"])
-                if stopless and abs(kelly) > limit:
-                    if rails["stopless_mode"] == "silence":
-                        decision.gate = "SILENCE_NO_STOP_LOSS"
+            # Run silence-bias gate
+            gate_result = silence_bias_gate(
+                advisor_result,
+                config=config,
+                journal_lessons=lessons,
+            )
+
+            decision = SymbolDecision(
+                symbol=entry.symbol,
+                asset_class=entry.asset_class,
+                timeframe=entry.timeframe,
+                gate=gate_result.decision.value,
+                details=gate_result.details,
+                advisor_result=advisor_result if rails.get("log_silences") else None,
+            )
+
+            if gate_result.fired:
+                # Per-tick safety rail (D9)
+                if fires_this_tick >= rails["max_per_tick_opens"]:
+                    decision.gate = "SILENCE_PER_TICK_CAP"
+                    decision.details = {
+                        "reason": (
+                            f"max_per_tick_opens={rails['max_per_tick_opens']} "
+                            "reached; this signal would have fired but tick is at cap"
+                        ),
+                        "would_have_fired": True,
+                        "original_gate": gate_result.decision.value,
+                    }
+                    result.silences += 1
+                    result.decisions.append(decision)
+                    continue
+
+                # Concurrent-positions safety rail (ADR-0016 §D9). The book already
+                # at the cap must not grow. Count = open positions at tick start +
+                # fires already executed this tick. A FIRE on a symbol we ALREADY
+                # hold is an adjustment (not a new slot), so it is exempt from the
+                # cap — only genuinely-new symbols consume a concurrency slot.
+                max_concurrent = rails["max_concurrent_positions"]
+                is_new_symbol = entry.symbol not in open_symbols_at_tick_start
+                projected_concurrent = open_positions_at_tick_start + fires_this_tick
+                # cs19/ADR-0016 §D9: a read-EXCEPTION on the book count fails CLOSED —
+                # treat the unreadable book as AT-CAP for any NEW-looking symbol. A
+                # SUCCESSFUL read (empty or populated) leaves rail_read_failed False, so
+                # the `or` short-circuits to the normal count test and behavior is byte-
+                # identical. Existing-symbol management is unaffected: the `is_new_symbol`
+                # guard still exempts a fire on a held symbol (the rail only converts a
+                # would-be NEW open into a SILENCE; it never blocks a close/adjustment).
+                if is_new_symbol and (
+                    rail_read_failed or projected_concurrent >= max_concurrent
+                ):
+                    decision.gate = "SILENCE_CONCURRENT_CAP"
+                    _cap_reason = (
+                        "concurrent-cap book read FAILED; failing CLOSED — silencing this "
+                        "NEW-symbol open this tick (recoverable next tick)"
+                        if rail_read_failed
+                        else (
+                            f"max_concurrent_positions={max_concurrent} reached "
+                            f"({open_positions_at_tick_start} open at tick start "
+                            f"+ {fires_this_tick} fired this tick); this NEW-symbol "
+                            "signal would have fired but the book is at the cap"
+                        )
+                    )
+                    decision.details = {
+                        "reason": _cap_reason,
+                        "would_have_fired": True,
+                        "original_gate": gate_result.decision.value,
+                        "open_positions_at_tick_start": open_positions_at_tick_start,
+                        "rail_read_failed": rail_read_failed,
+                    }
+                    result.silences += 1
+                    result.decisions.append(decision)
+                    continue
+
+                # FIRE — emit Action (target_position_pct from advisor's
+                # risk_gate.kelly_fraction). React only if NOT dry_run.
+                rg = (advisor_result or {}).get("risk_gate") or {}
+                # Finite-guard the advisor's signed size (source advisor.py float() of
+                # action.target_position_pct is unguarded). A non-finite kelly would flow
+                # UNGUARDED to the admissibility unit bridge (a -inf kelly is < 0, so it
+                # enters the HERMES_QUANT_ADMISSIBILITY short branch and `math.floor` would
+                # raise, aborting the whole tick). Coerce non-finite -> 0.0 = no size = no
+                # fire (the silence-by-default contract). Defense-in-depth alongside the
+                # bridge's own fail-closed guard.
+                kelly = float(rg.get("kelly_fraction", 0.0))
+                if not math.isfinite(kelly):
+                    kelly = 0.0
+                sig = (advisor_result or {}).get("aggregated_signal") or {}
+
+                # Stop-loss backstop (ADR-0016 §D9 defense-in-depth; deep-review
+                # 2026-06-07). Last line against a stopless full-size fire. Opt-in
+                # via rails["require_stop_loss"] (default False = legacy byte-
+                # identical). The trader's root-cause fix should mean stop_loss is
+                # never None here, but if it still is and the would-be size exceeds
+                # the allowed stopless band, either size DOWN to the band or SILENCE.
+                stopless_meta: dict[str, Any] | None = None
+                if rails.get("require_stop_loss"):
+                    tp = (advisor_result or {}).get("trader_proposal") or {}
+                    stop = tp.get("stop_loss")
+                    stopless = stop is None or (
+                        isinstance(stop, (int, float)) and not math.isfinite(float(stop))
+                    )
+                    limit = float(rails["stopless_max_size_pct"])
+                    if stopless and abs(kelly) > limit:
+                        if rails["stopless_mode"] == "silence":
+                            decision.gate = "SILENCE_NO_STOP_LOSS"
+                            decision.details = {
+                                "reason": (
+                                    f"stop_loss is None and size {kelly:+.3f} exceeds "
+                                    f"stopless_max_size_pct={limit:.3f}; silenced "
+                                    "(stopless_mode=silence)"
+                                ),
+                                "would_have_fired": True,
+                                "original_gate": gate_result.decision.value,
+                            }
+                            result.silences += 1
+                            result.decisions.append(decision)
+                            continue
+                        # size_down (default): clamp magnitude to the allowed band,
+                        # preserving direction.
+                        capped = math.copysign(limit, kelly)
+                        stopless_meta = {
+                            "stopless_backstop": True,
+                            "kelly_before": kelly,
+                            "kelly_after": capped,
+                            "stopless_max_size_pct": limit,
+                        }
+                        kelly = capped
+
+                # ADR-0071: portfolio-aware Stage-2 clip. Greedy first-come-first-served
+                # — earlier picks consume the budget, later picks see the residual room.
+                # Order-dependent but operationally simpler than batching the loop.
+                effective_size = kelly
+                portfolio_clip_meta: dict[str, float | str | bool] | None = None
+                if (
+                    portfolio_caps_enabled
+                    and portfolio_state is not None
+                    and portfolio_caps is not None
+                ):
+                    clipped = clip_one_to_remaining_headroom(
+                        asset=entry.symbol,
+                        per_symbol_target_pct=kelly,
+                        state=portfolio_state,
+                        caps=portfolio_caps,
+                    )
+                    effective_size = clipped.portfolio_target_pct
+                    portfolio_clip_meta = {
+                        "per_symbol_kelly": kelly,
+                        "portfolio_target": clipped.portfolio_target_pct,
+                        "scale_factor": clipped.scale_factor,
+                        "fired": clipped.fired,
+                        "silence_reason": clipped.silence_reason or "",
+                    }
+                    if not clipped.fired:
+                        decision.gate = "SILENCE_PORTFOLIO_CAP"
                         decision.details = {
-                            "reason": (
-                                f"stop_loss is None and size {kelly:+.3f} exceeds "
-                                f"stopless_max_size_pct={limit:.3f}; silenced "
-                                "(stopless_mode=silence)"
-                            ),
+                            "reason": clipped.silence_reason or "portfolio_cap_bound",
                             "would_have_fired": True,
                             "original_gate": gate_result.decision.value,
+                            "per_symbol_kelly": kelly,
                         }
                         result.silences += 1
                         result.decisions.append(decision)
                         continue
-                    # size_down (default): clamp magnitude to the allowed band,
-                    # preserving direction.
-                    capped = math.copysign(limit, kelly)
-                    stopless_meta = {
-                        "stopless_backstop": True,
-                        "kelly_before": kelly,
-                        "kelly_after": capped,
-                        "stopless_max_size_pct": limit,
-                    }
-                    kelly = capped
 
-            # ADR-0071: portfolio-aware Stage-2 clip. Greedy first-come-first-served
-            # — earlier picks consume the budget, later picks see the residual room.
-            # Order-dependent but operationally simpler than batching the loop.
-            effective_size = kelly
-            portfolio_clip_meta: dict[str, float | str | bool] | None = None
-            if (
-                portfolio_caps_enabled
-                and portfolio_state is not None
-                and portfolio_caps is not None
-            ):
-                clipped = clip_one_to_remaining_headroom(
-                    asset=entry.symbol,
-                    per_symbol_target_pct=kelly,
-                    state=portfolio_state,
-                    caps=portfolio_caps,
-                )
-                effective_size = clipped.portfolio_target_pct
-                portfolio_clip_meta = {
-                    "per_symbol_kelly": kelly,
-                    "portfolio_target": clipped.portfolio_target_pct,
-                    "scale_factor": clipped.scale_factor,
-                    "fired": clipped.fired,
-                    "silence_reason": clipped.silence_reason or "",
-                }
-                if not clipped.fired:
-                    decision.gate = "SILENCE_PORTFOLIO_CAP"
-                    decision.details = {
-                        "reason": clipped.silence_reason or "portfolio_cap_bound",
-                        "would_have_fired": True,
-                        "original_gate": gate_result.decision.value,
-                        "per_symbol_kelly": kelly,
-                    }
-                    result.silences += 1
-                    result.decisions.append(decision)
-                    continue
+                # ADR-0077 pre-trade admissibility (DEFAULT-OFF, HERMES_QUANT_ADMISSIBILITY).
+                # A hard, fail-closed precondition UPSTREAM of the ADR-0004 gate: it can only
+                # REJECT a proposed short (-> SILENCE), never amplify or override. With the flag
+                # OFF this block is skipped entirely -> behavior is bit-for-bit identical to today.
+                #
+                # Unified seam (H-adm #2): this calls the SAME shared
+                # `admissibility.gate_order.admit_or_reject` seam the PaperReactor + HITL paths
+                # use, instead of an inline select_oracle + target_pct_to_shares + apply_verdict
+                # copy. One seam, no drift. The shared function honors the flag THROUGH
+                # select_oracle(); we keep the flag check + the `effective_size < 0` short-circuit
+                # here so the NAV / price lookups never run for a flag-OFF or non-short tick
+                # (bit-for-bit no-op when OFF, asserted by tests).
+                if os.environ.get("HERMES_QUANT_ADMISSIBILITY", "0") == "1" and effective_size < 0:
+                    from hermes_quant.admissibility import admit_or_reject
 
-            # ADR-0077 pre-trade admissibility (DEFAULT-OFF, HERMES_QUANT_ADMISSIBILITY).
-            # A hard, fail-closed precondition UPSTREAM of the ADR-0004 gate: it can only
-            # REJECT a proposed short (-> SILENCE), never amplify or override. With the flag
-            # OFF this block is skipped entirely -> behavior is bit-for-bit identical to today.
-            #
-            # Unified seam (H-adm #2): this calls the SAME shared
-            # `admissibility.gate_order.admit_or_reject` seam the PaperReactor + HITL paths
-            # use, instead of an inline select_oracle + target_pct_to_shares + apply_verdict
-            # copy. One seam, no drift. The shared function honors the flag THROUGH
-            # select_oracle(); we keep the flag check + the `effective_size < 0` short-circuit
-            # here so the NAV / price lookups never run for a flag-OFF or non-short tick
-            # (bit-for-bit no-op when OFF, asserted by tests).
-            if os.environ.get("HERMES_QUANT_ADMISSIBILITY", "0") == "1" and effective_size < 0:
-                from hermes_quant.admissibility import admit_or_reject
+                    # nav: the paper account NAV (`equity_total`), sourced the SAME way the
+                    # reactor does. It is used BOTH for the NAV-fraction->whole-share UNIT
+                    # BRIDGE and (as `account_equity`) for the live oracle's < $2,000 floor.
+                    # available_bp: a LIVE paper-account buying-power fetch (H-adm #1 closed)
+                    # — reuses the oracle's paper TradingClient via live_buying_power().
+                    # FAIL-CLOSED: any error / missing creds / non-positive => None, and the
+                    # short then fails-closed on the BP hard check (never a fabricated
+                    # sufficiency). Only fetched inside this admissibility-ON short branch.
+                    # Fail-closed: missing/non-positive NAV or price -> 0 shares -> REJECT.
+                    from hermes_quant.admissibility.oracle import live_buying_power
 
-                # nav: the paper account NAV (`equity_total`), sourced the SAME way the
-                # reactor does. It is used BOTH for the NAV-fraction->whole-share UNIT
-                # BRIDGE and (as `account_equity`) for the live oracle's < $2,000 floor.
-                # available_bp: a LIVE paper-account buying-power fetch (H-adm #1 closed)
-                # — reuses the oracle's paper TradingClient via live_buying_power().
-                # FAIL-CLOSED: any error / missing creds / non-positive => None, and the
-                # short then fails-closed on the BP hard check (never a fabricated
-                # sufficiency). Only fetched inside this admissibility-ON short branch.
-                # Fail-closed: missing/non-positive NAV or price -> 0 shares -> REJECT.
-                from hermes_quant.admissibility.oracle import live_buying_power
-
-                nav = _account_nav_usd()
-                price = _decision_price_from_advisor(advisor_result)
-                available_bp = live_buying_power()
-                verdict = admit_or_reject(
-                    entry.symbol,
-                    "short",
-                    effective_size,
-                    nav,
-                    price,
-                    datetime.now(tz=UTC),
-                    account_equity=nav,
-                    available_bp=available_bp,
-                )
-                if not verdict.admitted:
-                    decision.gate = "SILENCE_ADMISSIBILITY"
-                    decision.details = {
-                        "reason": verdict.reason,
-                        "admissibility_state": verdict.state.value,
-                        "qty_shares": verdict.qty_shares,
-                    }
-                    result.silences += 1
-                    result.decisions.append(decision)
-                    continue
-                effective_size = verdict.adjusted_target_pct
-
-            decision.action = {
-                "target_position_pct": effective_size,
-                "reason": rg.get("reason", "autonomous_silence_bias_fire"),
-                "direction": int(sig.get("direction", 0)),
-            }
-            if portfolio_clip_meta is not None:
-                decision.action["portfolio_clip"] = portfolio_clip_meta
-            if stopless_meta is not None:
-                decision.action["stopless_backstop"] = stopless_meta
-
-            if not dry_run:
-                try:
-                    execution_id = _react(
-                        advisor_result,
-                        entry,
+                    nav = _account_nav_usd()
+                    price = _decision_price_from_advisor(advisor_result)
+                    available_bp = live_buying_power()
+                    verdict = admit_or_reject(
+                        entry.symbol,
+                        "short",
                         effective_size,
-                        paper_zero_costs=bool(rails.get("paper_zero_costs", False)),
+                        nav,
+                        price,
+                        datetime.now(tz=UTC),
+                        account_equity=nav,
+                        available_bp=available_bp,
                     )
-                    # ar38: _react returns None when the reactor RETURNED a no-fill/
-                    # silence/reject record (no capital moved, nothing on the bus). Treat
-                    # it as a SILENCE — do NOT count a fire, do NOT consume a budget slot,
-                    # and do NOT mutate portfolio_state with a phantom position (which
-                    # would charge headroom against a position that never existed and
-                    # clip/silence subsequent REAL signals this tick).
-                    if execution_id is None:
-                        decision.gate = "SILENCE_REACTOR_NO_FILL"
+                    if not verdict.admitted:
+                        decision.gate = "SILENCE_ADMISSIBILITY"
                         decision.details = {
-                            "reason": "reactor returned a no-fill/silence record",
+                            "reason": verdict.reason,
+                            "admissibility_state": verdict.state.value,
+                            "qty_shares": verdict.qty_shares,
+                        }
+                        result.silences += 1
+                        result.decisions.append(decision)
+                        continue
+                    effective_size = verdict.adjusted_target_pct
+
+                decision.action = {
+                    "target_position_pct": effective_size,
+                    "reason": rg.get("reason", "autonomous_silence_bias_fire"),
+                    "direction": int(sig.get("direction", 0)),
+                }
+                if portfolio_clip_meta is not None:
+                    decision.action["portfolio_clip"] = portfolio_clip_meta
+                if stopless_meta is not None:
+                    decision.action["stopless_backstop"] = stopless_meta
+
+                if not dry_run:
+                    try:
+                        execution_id = _react(
+                            advisor_result,
+                            entry,
+                            effective_size,
+                            paper_zero_costs=bool(rails.get("paper_zero_costs", False)),
+                        )
+                        # ar38: _react returns None when the reactor RETURNED a no-fill/
+                        # silence/reject record (no capital moved, nothing on the bus). Treat
+                        # it as a SILENCE — do NOT count a fire, do NOT consume a budget slot,
+                        # and do NOT mutate portfolio_state with a phantom position (which
+                        # would charge headroom against a position that never existed and
+                        # clip/silence subsequent REAL signals this tick).
+                        if execution_id is None:
+                            decision.gate = "SILENCE_REACTOR_NO_FILL"
+                            decision.details = {
+                                "reason": "reactor returned a no-fill/silence record",
+                                "would_have_fired": True,
+                                "original_gate": gate_result.decision.value,
+                                "requested_fill_size_pct": effective_size,
+                            }
+                            result.silences += 1
+                            result.decisions.append(decision)
+                            continue
+                        decision.execution_id = execution_id
+                        fires_this_tick += 1
+                        # Update running portfolio state so the next pick sees the
+                        # post-fire headroom (the canonical state.db helper does
+                        # not reload mid-tick — we mutate here).
+                        if portfolio_state is not None:
+                            # `positions` dict is intentionally mutable here even though
+                            # PortfolioState is frozen — the dict is the inner mutable
+                            # container that we update without reconstructing the wrapper.
+                            portfolio_state.positions[entry.symbol] = effective_size
+                    except FillSizeInvariantError as exc:
+                        logger.warning(
+                            "autonomous: fill-size invariant rejected %s: %s",
+                            entry.symbol,
+                            exc,
+                        )
+                        decision.gate = "SILENCE_FILL_SIZE_INVARIANT"
+                        decision.details = {
+                            "reason": str(exc),
                             "would_have_fired": True,
                             "original_gate": gate_result.decision.value,
                             "requested_fill_size_pct": effective_size,
@@ -1214,56 +1402,30 @@ def tick(
                         result.silences += 1
                         result.decisions.append(decision)
                         continue
-                    decision.execution_id = execution_id
-                    fires_this_tick += 1
-                    # Update running portfolio state so the next pick sees the
-                    # post-fire headroom (the canonical state.db helper does
-                    # not reload mid-tick — we mutate here).
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "autonomous: React failed for %s: %s",
+                            entry.symbol,
+                            exc,
+                            exc_info=True,
+                        )
+                        decision.error = f"react_failed: {exc}"
+                        decision.gate = "ERROR"
+                        result.errors += 1
+                        result.decisions.append(decision)
+                        continue
+                else:
+                    fires_this_tick += 1  # count even in dry-run for cap math
+                    # In dry-run, simulate the state update so subsequent dry-run
+                    # picks see headroom consumption.
                     if portfolio_state is not None:
-                        # `positions` dict is intentionally mutable here even though
-                        # PortfolioState is frozen — the dict is the inner mutable
-                        # container that we update without reconstructing the wrapper.
                         portfolio_state.positions[entry.symbol] = effective_size
-                except FillSizeInvariantError as exc:
-                    logger.warning(
-                        "autonomous: fill-size invariant rejected %s: %s",
-                        entry.symbol,
-                        exc,
-                    )
-                    decision.gate = "SILENCE_FILL_SIZE_INVARIANT"
-                    decision.details = {
-                        "reason": str(exc),
-                        "would_have_fired": True,
-                        "original_gate": gate_result.decision.value,
-                        "requested_fill_size_pct": effective_size,
-                    }
-                    result.silences += 1
-                    result.decisions.append(decision)
-                    continue
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "autonomous: React failed for %s: %s",
-                        entry.symbol,
-                        exc,
-                        exc_info=True,
-                    )
-                    decision.error = f"react_failed: {exc}"
-                    decision.gate = "ERROR"
-                    result.errors += 1
-                    result.decisions.append(decision)
-                    continue
+
+                result.fires += 1
             else:
-                fires_this_tick += 1  # count even in dry-run for cap math
-                # In dry-run, simulate the state update so subsequent dry-run
-                # picks see headroom consumption.
-                if portfolio_state is not None:
-                    portfolio_state.positions[entry.symbol] = effective_size
+                result.silences += 1
 
-            result.fires += 1
-        else:
-            result.silences += 1
-
-        result.decisions.append(decision)
+            result.decisions.append(decision)
 
     return result
 
