@@ -75,11 +75,32 @@ def accrue_borrow_carry(
     total_fee = 0.0
     days_held = 0
     held_dates: list[date] = []
-    for on, close_price in close_by_date.items():
+    # ar90: each marked date's base fee already carries a weekend when it is a Friday
+    # (daily_borrow_fee ×3). But a marked date is borrowed for EVERY calendar day until
+    # the NEXT marked date — a market HOLIDAY (or any data gap) that extends the gap
+    # beyond what the base multiplier covers is otherwise UNPAID (e.g. Fri + Mon-holiday
+    # + Tue charges Fri×3 + Tue×1 and drops the Monday → short cost UNDERSTATED, the
+    # wrong-money direction the PIL guard below also guards). We add the SHORTFALL for
+    # the carried gap beyond the base, MEASURED from the held series (so it's correct for
+    # weekend-extending AND mid-week holidays AND data gaps), while leaving every normal
+    # weekend/Friday-close total byte-identical (gap == base ⇒ zero shortfall).
+    _norm_marks = sorted((_as_date(on), close_price) for on, close_price in close_by_date.items())
+    per_unit_day = (
+        abs(short_shares) * annual_cbr / DAY_COUNT_BASIS
+        if (short_shares < 0 and annual_cbr > 0)
+        else 0.0
+    )
+    for idx, (on_date, close_price) in enumerate(_norm_marks):
         days_held += 1
-        on_date = _as_date(on)
         held_dates.append(on_date)
         total_fee += daily_borrow_fee(short_shares, close_price, annual_cbr, on_date)
+        # Shortfall: calendar days this mark carries (to the next mark) beyond its base.
+        if idx + 1 < len(_norm_marks) and close_price > 0:
+            base_mult = 3 if on_date.weekday() == 4 else 1
+            gap_days = (_norm_marks[idx + 1][0] - on_date).days
+            shortfall_days = max(0, gap_days - base_mult)
+            if shortfall_days:
+                total_fee += per_unit_day * close_price * shortfall_days
 
     # The short was open across the CONTIGUOUS interval [min(held), max(held)] of the
     # daily marks. PIL is owed for any ex-div date the position spanned. Exact-key
