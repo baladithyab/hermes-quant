@@ -469,9 +469,25 @@ class AlpacaBackend:
                 if intent is not None
                 else (getattr(req_leg, "position_intent", None) if req_leg else None)
             )
-            price = _alpaca_exec.to_float(getattr(child, "filled_avg_price", None)) or 0.0
-            abs_qty = _alpaca_exec.to_float(getattr(child, "filled_qty", None)) or 0.0
-            signed = abs_qty if is_buy else -abs_qty
+            # Honesty rail (mirror the single-leg path's ``extract_fill``, which
+            # requires BOTH price>0 AND qty>0 — _alpaca_exec.extract_fill / the
+            # poll_until_filled "keep polling a 'filled' order whose avg price is
+            # not yet populated" branch). A child reporting a signed qty but an
+            # UNPOPULATED / non-positive avg price (None / <=0) is the cancel-vs-fill
+            # / partial-settle window _poll_mleg_parent explicitly tolerates — it is
+            # NOT-YET-SETTLED, not a 0.0-cost fill. Coercing price and qty
+            # INDEPENDENTLY (``price or 0.0`` / ``abs_qty or 0.0``) would book a
+            # phantom zero-cost option position (true-unit path: positions={(...):
+            # (-qty, 0.0)}, delta_cash=0) and bias the ADR-0016 kill-switch NAV.
+            # So emit a ZERO-fill LegFill (qty=0.0 / price=0.0) — a non-position-
+            # moving event the existing is_fill / child guards correctly reject.
+            price = _alpaca_exec.to_float(getattr(child, "filled_avg_price", None))
+            abs_qty = _alpaca_exec.to_float(getattr(child, "filled_qty", None))
+            if price is None or price <= 0.0 or abs_qty is None or abs_qty == 0.0:
+                price = 0.0
+                signed = 0.0
+            else:
+                signed = abs_qty if is_buy else -abs_qty
             status = str(getattr(child, "status", "") or "").lower() or "filled"
             fills.append(
                 FillResult(

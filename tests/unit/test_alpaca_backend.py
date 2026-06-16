@@ -481,6 +481,51 @@ def test_submit_option_mleg_requires_two_legs() -> None:
         )
 
 
+def test_submit_option_mleg_child_qty_no_price_is_not_a_fill() -> None:
+    """A child leg reporting ``filled_qty>0`` but ``filled_avg_price`` not yet
+    populated (None) is the cancel-vs-fill / partial-settle window
+    ``_poll_mleg_parent`` explicitly tolerates. It must NOT be coerced into a
+    price-0.0 ``FillResult`` (qty decoupled from price via ``or 0.0``) — that
+    books a phantom zero-cost option position (true-unit path:
+    ``positions={(...): (-5.0, 0.0)}``, ``delta_cash=0``) and pollutes the
+    ADR-0016 kill-switch NAV basis. Mirror the single-leg honesty rail
+    (``extract_fill`` requires BOTH price>0 AND qty!=0): a qty-but-no-price child
+    is not-yet-settled and reports ``is_fill is False``.
+    """
+    short, long = _vertical_legs()
+    # The LONG leg is genuinely filled (so _any_child_filled / the multileg child
+    # guard `any(lf.filled_qty != 0.0)` passes); the SHORT leg reports a real
+    # signed qty but its avg price has NOT yet settled (None).
+    child_long = _FakeOrder(
+        order_id="leg-l", status="filled", filled_avg_price=0.70, filled_qty=2,
+        side=OrderSide.BUY, position_intent=PositionIntent.BUY_TO_OPEN, symbol=long.symbol,
+    )
+    child_short = _FakeOrder(
+        order_id="leg-s", status="partially_filled", filled_avg_price=None, filled_qty=5,
+        side=OrderSide.SELL, position_intent=PositionIntent.SELL_TO_OPEN, symbol=short.symbol,
+    )
+    parent = _FakeOrder(
+        order_id="parent-x", status="filled", filled_avg_price=0.50, filled_qty=2,
+        legs=[child_long, child_short],
+    )
+    client = _FakeClient(submit_result=parent, poll_order=parent)
+    res = _backend(client).submit_option_mleg(
+        (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-x"
+    )
+    fills_by_sym = {f.symbol: f for f in res.legs}
+    # The genuinely-filled leg is recorded normally.
+    assert fills_by_sym[long.symbol].is_fill is True
+    assert fills_by_sym[long.symbol].filled_avg_price == pytest.approx(0.70)
+    # The qty-but-no-price short leg must NOT be a price-0.0 phantom fill.
+    short_fill = fills_by_sym[short.symbol]
+    assert short_fill.is_fill is False, (
+        "qty-but-no-price child coerced into a price-0.0 is_fill=True LegFill -> "
+        "phantom zero-cost option position"
+    )
+    # Honesty rail: never fabricate a non-zero qty at a 0.0 price.
+    assert not (short_fill.filled_qty != 0.0 and short_fill.filled_avg_price <= 0.0)
+
+
 # --------------------------------------------------------------------------- #
 # position_intent mapping
 # --------------------------------------------------------------------------- #
