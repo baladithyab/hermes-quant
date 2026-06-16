@@ -28,7 +28,7 @@
 | `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1087` |
 | `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1230` |
 | `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1309` |
-| `HERMES_QUANT_EVIDENCE_DIR` | `` | `hermes_quant/evidence/store.py:56` |
+| `HERMES_QUANT_EVIDENCE_DIR` | `` | `hermes_quant/evidence/store.py:60` |
 | `HERMES_QUANT_FUNDAMENTALS_ENABLED` | `0` | `hermes_quant/advisor.py:395` |
 | `HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG` | `1` | `hermes_quant/data/fundamentals_provider.py:146` |
 | `HERMES_QUANT_GRAPH_MINING` | `0` | `hermes_quant/catalyst/graph_mining.py:157` |
@@ -48,7 +48,7 @@
 | `HERMES_QUANT_MONTHLY_META_RETRO` | `0` | `hermes_quant/memory/meta_retro.py:70` |
 | `HERMES_QUANT_MULTILEG_REACTOR` | `0` | `hermes_quant/react/mleg_fill.py:116` |
 | `HERMES_QUANT_OPEN_GUARD` | `1` | `hermes_quant/risk/open_guard.py:304` |
-| `HERMES_QUANT_OPTIONS_GATE` | `0` | `hermes_quant/risk/options_gate.py:493` |
+| `HERMES_QUANT_OPTIONS_GATE` | `0` | `hermes_quant/risk/options_gate.py:503` |
 | `HERMES_QUANT_OPTIONS_LIVE_CHAIN` | `0` | `hermes_quant/options/data.py:427` |
 | `HERMES_QUANT_OVERNIGHT_DRIFT` | `0` | `hermes_quant/advisor.py:430` |
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:255` |
