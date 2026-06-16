@@ -9,7 +9,9 @@ the set STRICTLY beats prior-best AND is plateau-stable. Promotes NOTHING. Mirro
 catalyst-profitability watchdog: silent unless a factor crosses a tier boundary or the eval flips.
 
 No lookahead: the TRAIN/HOLDOUT split is positional on chronologically-ordered bars, so every
-HOLDOUT timestamp strictly post-dates TRAIN, and the proposer is handed TRAIN only. External-truth:
+HOLDOUT timestamp strictly post-dates TRAIN, and the proposer is handed TRAIN only. WITHIN the
+holdout score itself, the per-factor z-score normalization is CAUSAL/expanding (bar t uses only
+bars <= t — a full-window mean/std would leak future bars into bar t's position). External-truth:
 forward returns / OOS DSR come from market bars — never the proposer's own verdict re-ingested as
 truth (ADR-0080 §D80.3). Honesty rails = graph_mining.py. Promotion path = operator + ADR-0052 only.
 
@@ -267,8 +269,9 @@ def main() -> int:
 
 def _compute_holdout(proposal_set, holdout_bars, zoo):
     """Genuine held-out OOS score of the PROPOSED weight set on a strictly-later window the
-    proposer never saw. Builds the proposed-weight factor composite as a long/short position,
-    realizes it against NEXT-bar returns (no lookahead), scores OOS DSR, and derives
+    proposer never saw. Builds the proposed-weight factor composite as a long/short position
+    (per-factor z-score is CAUSAL/expanding — bar t uses only bars <= t, no within-holdout
+    lookahead), realizes it against NEXT-bar returns (no lookahead), scores OOS DSR, and derives
     plateau_stable from cross-fold Sharpe jitter (robustness, NOT the in-sample peak — the
     AMZN-weight lesson). Returns ``(holdout_dsr, holdout_sharpe, plateau_stable)``; conservative
     (-inf, 0.0, False) on insufficient/degenerate data so the cron buffers rather than promotes.

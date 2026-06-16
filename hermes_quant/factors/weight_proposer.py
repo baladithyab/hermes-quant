@@ -193,9 +193,11 @@ def propose_weights(
 # --- Held-out OOS scoring (external-truth: realized forward returns from market bars) --------
 # The cron passes the OOS *tail* the proposer never saw, plus a `compute_factor` callable
 # (AlphaZoo.compute). We build the PROPOSED-weight factor composite as a long/short position
-# series, realize it against next-bar returns (signal at t → return t→t+1, no lookahead), score
-# the OOS Sharpe → DSR, and read robustness from cross-fold Sharpe jitter (NOT the in-sample
-# peak — the AMZN-weight lesson). This module performs NO network I/O; bars are supplied.
+# series, realize it against next-bar returns (signal at t → return t→t+1, no lookahead). The
+# per-factor z-score normalization is CAUSAL/expanding (bar t uses only bars <= t — no
+# within-holdout lookahead from a full-window mean/std), then score the OOS Sharpe → DSR, and read
+# robustness from cross-fold Sharpe jitter (NOT the in-sample peak — the AMZN-weight lesson). This
+# module performs NO network I/O; bars are supplied.
 HOLDOUT_FOLDS: int = 4               # contiguous OOS sub-windows for the cross-fold jitter check.
 # plateau_stable iff the RELATIVE cross-fold Sharpe dispersion (coefficient of variation =
 # stdev/|mean|) is bounded AND a majority of folds keep the OOS sign. A relative cap (not an
@@ -213,10 +215,11 @@ def _composite_position(
 ):
     """Build the PROPOSED-weight factor composite as a per-bar long/short position in [-1, 1].
 
-    For each factor with a non-zero proposed weight: z-score its values over the holdout (so
-    factors are comparable), weight by `proposed_weight`, and sum. The composite's sign is the
-    position direction (positive factor predicts positive forward return — the IC convention in
-    ic_panel.py). Returns a pd.Series aligned to holdout_bars, or None if nothing weighted.
+    For each factor with a non-zero proposed weight: z-score its values with a CAUSAL/expanding
+    normalization (bar t uses only bars <= t, never the full window — no within-holdout lookahead),
+    weight by `proposed_weight`, and sum. The composite's sign is the position direction (positive
+    factor predicts positive forward return — the IC convention in ic_panel.py). Returns a pd.Series
+    aligned to holdout_bars, or None if nothing weighted.
     """
     import numpy as np
     import pandas as pd
@@ -232,10 +235,19 @@ def _composite_position(
         except Exception:  # noqa: BLE001 — a single bad factor must not crash the OOS score
             continue
         series = pd.Series(series).astype(float)
-        std = series.std(ddof=0)
-        if not np.isfinite(std) or std == 0.0:
-            continue  # degenerate / constant factor contributes no signal
-        z = (series - series.mean()) / std
+        # CAUSAL (expanding) z-score: bar t is normalized using ONLY bars <= t. A full-window
+        # mean/std would make bar t's z (and hence its np.sign() position at the return below)
+        # depend on bars t+1..T — a within-holdout lookahead that contaminates the realized OOS
+        # Sharpe → DSR → plateau that gate eval_passed. min_periods=2 mirrors the std(ddof=0)
+        # degeneracy guard; bars with a non-finite or zero expanding std contribute 0 (masked),
+        # which preserves the prior "constant/degenerate factor contributes no signal" behaviour
+        # per-bar instead of dropping the whole factor.
+        em = series.expanding(min_periods=2).mean()
+        es = series.expanding(min_periods=2).std(ddof=0)
+        es_valid = es.where(np.isfinite(es) & (es != 0.0))  # NaN where std is non-finite or zero
+        if not es_valid.notna().any():
+            continue  # degenerate / constant factor contributes no signal on any bar
+        z = ((series - em) / es_valid).where(es_valid.notna())
         contribution = z.fillna(0.0) * w
         combined = contribution if combined is None else combined.add(contribution, fill_value=0.0)
         total_w += w
