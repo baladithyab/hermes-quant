@@ -965,15 +965,43 @@ def _run_committee_safe(
         timeframe = str(sig_d.get("timeframe") or advisor_result.get("timeframe") or "1d")
         asset_class = str(sig_d.get("asset_class") or advisor_result.get("asset_class") or "equity")
         last_close = float(advisor_result.get("last_close") or 0.0)
-        asof = pd.to_datetime(
-            sig_d.get("asof") or advisor_result.get("asof") or pd.Timestamp.utcnow(),
-            utc=True,
-        ).tz_localize(None) if pd.to_datetime(
-            sig_d.get("asof") or advisor_result.get("asof") or pd.Timestamp.utcnow(),
-            utc=True,
-        ).tzinfo is not None else pd.to_datetime(
-            sig_d.get("asof") or advisor_result.get("asof") or pd.Timestamp.utcnow()
+
+        # No-lookahead anchor (ADR-0042 Oracle Fallacy HARD RULE) -------------
+        # The advisor's recommend() dict exposes the DECISION-BAR timestamp under
+        # the top-level keys ``as_of`` (advisor.py to_dict()) and ``bar_ts`` (the
+        # ADR-0068 split alias). The ``aggregated_signal`` sub-dict carries no
+        # asof key at all. There is NO top-level ``asof`` key — looking it up
+        # ALWAYS yields None and would silently fall back to wall-clock now().
+        # That wall-clock value flows into MarketContext.asof, which
+        # build_role_prompt threads into get_past_context(asof=...) +
+        # load_active_beliefs(role, ...); the retriever's Oracle guard excludes
+        # only reflections/beliefs observable >= asof. With asof = now (future
+        # relative to the decision bar), every lesson that became observable
+        # AFTER the bar but BEFORE now leaks into the portfolio_manager prompt.
+        # So we resolve the bar anchor ONLY from the keys the advisor actually
+        # emits and NEVER substitute wall-clock — if no bar anchor exists we
+        # defer the committee rather than inject future-knowledge.
+        _bar_anchor_raw = (
+            advisor_result.get("as_of")
+            or advisor_result.get("bar_ts")
+            or sig_d.get("as_of")
+            or sig_d.get("bar_ts")
+            # Last-resort: an explicit ``asof`` key IS a real bar timestamp when
+            # a caller carries one (it is never wall-clock — the advisor stamps
+            # decision_wall_clock separately). Accepted for forward-compat, but
+            # the wall-clock substitution is gone.
+            or advisor_result.get("asof")
+            or sig_d.get("asof")
         )
+        if _bar_anchor_raw is None:
+            return {
+                "turns": [],
+                "decision": None,
+                "error": None,
+                "deferred_reason": "no_bar_anchor_for_committee",
+            }
+        _asof_ts = pd.to_datetime(_bar_anchor_raw, utc=True)
+        asof = _asof_ts.tz_localize(None) if _asof_ts.tzinfo is not None else _asof_ts
 
         # Minimal stub bars frame so MarketContext(bars=...) constructor
         # validation (if any) doesn't reject. Only last_close is read by

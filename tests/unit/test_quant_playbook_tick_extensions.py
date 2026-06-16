@@ -268,3 +268,115 @@ def test_run_committee_safe_default_quick_model_is_valid(monkeypatch):
         "playbook-tick.py must NOT reference claude-haiku-4.6 — that model "
         "ID does not exist on OpenRouter and causes BadRequestError"
     )
+
+
+def test_run_committee_safe_asof_uses_bar_anchor_not_wall_clock(monkeypatch):
+    """ar89 NO-LOOKAHEAD GUARD (ADR-0042 Oracle Fallacy hard rule).
+
+    The advisor's recommend() dict exposes the decision-bar timestamp under
+    the top-level keys ``as_of`` and ``bar_ts`` (advisor.py to_dict() + the
+    ADR-0068 split at advisor.py:1185). There is NO top-level ``asof`` key,
+    and the ``aggregated_signal`` sub-dict (_signal_to_dict) carries no
+    asof/as_of key at all.
+
+    Previously _run_committee_safe built MarketContext.asof from
+    ``sig_d.get("asof") or advisor_result.get("asof") or pd.Timestamp.utcnow()``
+    — both lookups for the nonexistent ``asof`` key are ALWAYS None, so the
+    expression ALWAYS resolved to wall-clock now(). That wall-clock value
+    becomes MarketContext.asof, which build_role_prompt threads into
+    get_past_context(asof=now) + load_active_beliefs(role, now). The Oracle
+    Fallacy guard (retriever.py:371 `if tau >= asof: continue`) then admits
+    every reflection/belief that became observable AFTER the decision bar but
+    BEFORE now — a no-lookahead leak into the portfolio_manager LLM prompt.
+
+    This feeds a REAL recommend()-shaped dict (as_of + bar_ts, NO asof) into
+    _run_committee_safe and asserts MarketContext.asof equals the decision-bar
+    anchor — NOT a value at/after wall-clock now().
+    """
+    import datetime as _dt
+
+    import pandas as pd
+
+    monkeypatch.setenv("HERMES_QUANT_DELIBERATIVE", "1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-deliberative-shim-not-real")
+    m = _load_tick_module(monkeypatch)
+
+    captured: dict = {}
+
+    def fake_run_llm_committee(*, market_context, analyst_views, baseline_signal, config):
+        captured["market_context"] = market_context
+        captured["baseline_signal"] = baseline_signal
+        return []
+
+    import hermes_quant.aggregators.llm_committee as llm_mod
+    monkeypatch.setattr(llm_mod, "run_llm_committee", fake_run_llm_committee)
+
+    # Decision bar is well in the PAST relative to wall-clock now().
+    bar_anchor = "2026-05-26T20:00:00+00:00"
+    bar_ts = pd.to_datetime(bar_anchor).tz_localize(None)
+
+    out = m._run_committee_safe(
+        symbol="MDB",
+        # REAL recommend() dict shape: top-level as_of + bar_ts, NO `asof`.
+        advisor_result={
+            "symbol": "MDB",
+            "asset_class": "equity",
+            "timeframe": "1d",
+            "as_of": bar_anchor,
+            "bar_ts": bar_anchor,
+            "decision_wall_clock": _dt.datetime.now(_dt.UTC).isoformat(),
+            "last_close": 220.50,
+            "aggregated_signal": {
+                "asset": "MDB",
+                "timeframe": "1d",
+                "direction": 1,
+                "magnitude": 0.012,
+                "confidence": 0.65,
+                "confidence_raw": 0.7,
+                "horizon": "1d",
+                "aggregator": "bma",
+                "n_components": 1,
+                # NOTE: NO asof / as_of key here — matches _signal_to_dict.
+            },
+            "analyst_views": [
+                {
+                    "analyst": "ta_classic",
+                    "direction": 1,
+                    "magnitude": 0.012,
+                    "confidence": 0.65,
+                    "confidence_raw": 0.7,
+                    "horizon": "1d",
+                    "rationale": "bullish breakout",
+                },
+            ],
+        },
+        risk_mgmt_enabled=False,
+    )
+
+    assert out["error"] is None, (
+        f"reconstruction raised inside _run_committee_safe: {out['error']}"
+    )
+    assert "market_context" in captured, (
+        "run_llm_committee was never called — reconstruction bailed early "
+        f"with deferred_reason={out.get('deferred_reason')!r}"
+    )
+
+    mc_asof = pd.Timestamp(captured["market_context"].asof)
+    now = pd.Timestamp.utcnow().tz_localize(None)
+
+    # The Oracle guard excludes tau >= asof. If asof leaked to wall-clock now,
+    # it sits within seconds of now() and admits future reflections.
+    assert abs((now - mc_asof).total_seconds()) > 3600, (
+        f"MarketContext.asof={mc_asof} is within an hour of wall-clock "
+        f"now={now} — the no-lookahead anchor leaked to wall-clock (Oracle "
+        f"Fallacy: future reflections/beliefs leak into the committee prompt)"
+    )
+    # And it must equal the actual decision-bar anchor.
+    assert abs((mc_asof - bar_ts).total_seconds()) < 1.0, (
+        f"MarketContext.asof={mc_asof} != decision-bar anchor {bar_ts}"
+    )
+    # The reconstructed baseline signal asof must agree (committee audit/replay).
+    bs_asof = pd.Timestamp(captured["baseline_signal"].asof)
+    assert abs((bs_asof - bar_ts).total_seconds()) < 1.0, (
+        f"AggregatedSignal.asof={bs_asof} != decision-bar anchor {bar_ts}"
+    )
