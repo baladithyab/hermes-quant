@@ -28,6 +28,45 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# Gate-local mirror of hermes_quant.aggregators.bma.ABSTAIN_THRESHOLD. The
+# advisor appends EVERY non-None AnalystView to advisor_result['analyst_views']
+# (including KronosAnalyst's zero-confidence weight-load-failure abstain, which
+# is in the DEFAULT 3-analyst committee), and grounding-dropped views REMAIN in
+# that list (only annotated grounding_dropped=True). BMA's abstain filter and
+# grounding enforcement drop those from BMA's LOCAL vote membership — they NEVER
+# mutate advisor_result['analyst_views'], the dict THIS gate reads directly
+# (autonomous.py). So the Dim-3 quorum must apply the SAME membership rule BMA
+# does, or it counts phantom non-voters toward `min_analysts_emitted` and an
+# autonomous order can FIRE on fewer real voices than the operator demanded.
+# PINNED: keep this value identical to bma.ABSTAIN_THRESHOLD (0.10). The two
+# define the SAME notion of "this analyst actually voted"; a drift between them
+# reopens the count-vs-vote-membership gap this constant closes.
+_ABSTAIN_THRESHOLD = 0.10
+
+
+def _is_real_voter(view: dict[str, Any]) -> bool:
+    """A view counts toward the Dim-3 voice quorum iff it actually reached the
+    BMA vote — i.e. it is NOT grounding-dropped AND its confidence clears the
+    abstain threshold (fail-CLOSED on non-finite confidence: NaN >= thr is
+    False).
+
+    The `confidence` key is ALWAYS present on real advisor output
+    (advisor._view_to_dict). A MISSING key is treated as a voter (default
+    `_ABSTAIN_THRESHOLD`) so older/partial view shapes that omit confidence
+    are not silently down-counted — only an EXPLICIT abstain or an EXPLICIT
+    grounding-drop removes a voice."""
+    if not isinstance(view, dict):
+        return False
+    if view.get("grounding_dropped"):
+        return False
+    try:
+        conf = float(view.get("confidence", _ABSTAIN_THRESHOLD))
+    except (TypeError, ValueError):
+        # An unparseable confidence is not a credible vote; fail-CLOSED.
+        return False
+    return math.isfinite(conf) and conf >= _ABSTAIN_THRESHOLD
+
+
 # ---------------------------------------------------------------------------
 # Decision enum
 # ---------------------------------------------------------------------------
@@ -181,7 +220,16 @@ def silence_bias_gate(
         )
 
     sig = (advisor_result or {}).get("aggregated_signal") or {}
-    views = (advisor_result or {}).get("analyst_views") or []
+    raw_views = (advisor_result or {}).get("analyst_views") or []
+
+    # Count ONLY views that actually reached the BMA vote. The advisor leaves
+    # abstain (confidence < threshold) and grounding-dropped views in
+    # analyst_views for the audit trail; BMA filters them from its local vote
+    # but never from this dict. Counting len(analyst_views) here would let an
+    # autonomous order FIRE on fewer REAL voices than the operator demanded
+    # (e.g. min_analysts_emitted=3 satisfied by 2 real voices + 1 Kronos
+    # abstain). See _is_real_voter / _ABSTAIN_THRESHOLD above.
+    views = [v for v in raw_views if _is_real_voter(v)]
 
     # ---- Dim 3: Compute Budget (number of voices) ----
     # Check first because cheapest and zero-voice -> all other dims meaningless.
