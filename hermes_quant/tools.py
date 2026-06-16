@@ -993,13 +993,40 @@ def quant_approve(args: dict, **_kwargs) -> str:
             exc_info=True,
         )
 
+    # cs02 reporting-honesty: report the REALIZED fill, not the operator's
+    # REQUESTED size. Two live paths reach this success return with a nonzero
+    # PARTIAL fill (realized < requested) that is NOT a full silence and NOT a
+    # no-fill:
+    #   (1) PaperReactor + HERMES_QUANT_PORTFOLIO_CAPS=1 "partial scale" —
+    #       _portfolio_cap_clip clips fill_size_pct down and the reactor books a
+    #       REAL fill at record.fill_size_pct = clipped (paper.py partial-scale
+    #       branch), with cap_metadata carrying cap_scaled_from/to/factor.
+    #   (2) AlpacaPaperReactor on a done_for_day/canceled order with a realized
+    #       partial — record.fill_size_pct = realized_fill_pct (< requested) with
+    #       reactor_metadata alpaca_status/filled_qty/requested_target_pct
+    #       (alpaca_paper.py partial path).
+    # The local `fill_size_pct` here is the operator's REQUESTED size; echoing it
+    # as the prominent `fill_size_pct` OVERSTATES the realized size to the operator
+    # (operator-facing dishonesty, cs02 family). Surface both: keep the back-compat
+    # `fill_size_pct` key but set it to the REALIZED value so the prominent field
+    # is truthful, and add explicit requested/realized fields. A partial IS a
+    # successful approval — no state-machine change (state stays approved).
+    realized_fill_size_pct = getattr(execution, "fill_size_pct", fill_size_pct)
+    partial_fill = (
+        isinstance(realized_fill_size_pct, (int, float))
+        and abs(float(realized_fill_size_pct)) < abs(float(fill_size_pct)) - 1e-9
+    )
     return json.dumps(
         {
             "success": True,
             "proposal_id": proposal_id,
             "state": approved.state,
             "execution": _record_to_dict(execution),
-            "fill_size_pct": fill_size_pct,
+            # Back-compat key, now truthful: REALIZED (clipped/partial) fill.
+            "fill_size_pct": _json_safe_float(realized_fill_size_pct),
+            "requested_fill_size_pct": _json_safe_float(fill_size_pct),
+            "realized_fill_size_pct": _json_safe_float(realized_fill_size_pct),
+            "partial_fill": partial_fill,
         },
         default=str,
     )
