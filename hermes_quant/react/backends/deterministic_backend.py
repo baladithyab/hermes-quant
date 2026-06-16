@@ -288,14 +288,23 @@ class DeterministicBackend:
                     )
                 )
         # Apportion the residual net across unpriced legs by ratio_qty so the per-leg
-        # sum reconstructs the gate-approved net (mirrors the PaperBroker math).
+        # SIGNED contributions reconstruct the gate-approved net (mirrors the
+        # PaperBroker math). The residual is a SIGNED per-structure dollar amount:
+        # ``priced_sum`` carries an outer_qty factor that net_limit_price does NOT,
+        # so divide it back out before differencing. The per-contract price for a
+        # leg is ``sgn * residual_net / ratio_total`` so that the leg's signed
+        # contribution ``sgn * per_share * ratio_qty`` sums (over unpriced legs) to
+        # residual_net even when the unpriced legs have MIXED sides (a long+short
+        # pair or a net-credit). The old ``abs(residual)/outer_qty`` discarded the
+        # residual sign AND assumed same-sign legs, so opposite-side legs cancelled
+        # to a phantom net (e.g. a 4.00 debit booked as 0.00 cash + per-leg basis).
         if unpriced:
             ratio_total = sum(leg.ratio_qty for leg in unpriced) or 1
-            residual = (net_limit_price - priced_sum) / ratio_total
+            residual_net = net_limit_price - priced_sum / max(outer_qty, 1)
             for leg in unpriced:
                 sgn = 1.0 if leg.side == "buy" else -1.0
                 signed_qty = sgn * leg.ratio_qty * outer_qty
-                per_share = abs(residual) / max(outer_qty, 1)
+                per_share = sgn * residual_net / ratio_total
                 leg_fills.append(
                     FillResult(
                         symbol=leg.symbol,
