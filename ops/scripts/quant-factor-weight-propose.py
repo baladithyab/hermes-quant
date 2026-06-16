@@ -123,14 +123,28 @@ def _build_proposal_set(bars):
     Returns ``(proposal_set, zoo)``: the zoo is handed back so the held-out scorer can recompute
     the SAME factor series on the HOLDOUT tail (the proposer itself never sees the holdout — the
     split happens in main() before this is called). Current weights default to zero.
+
+    IC-dedup-at-ingest (B38 / ar23): the IC-dedup gate inside ``AlphaZoo.register`` only fires when
+    the operator flag ``HERMES_QUANT_IC_DEDUP_AT_INGEST=1`` is set AND a per-factor ``factor_returns``
+    mapping is supplied at register time. We therefore compute each starter factor's return series on
+    the bars FIRST (``compute_starter_factor_returns``), then hand that mapping to
+    ``register_starter_set`` so the gate can reject near-duplicates at ingest. Without this ordering
+    the returns were only available AFTER register (from ``evaluate_all``), so ``run_ic_gate`` was
+    always False and the flag was inert in production. Flag-OFF is byte-identical: with the flag unset
+    the gate is a no-op regardless of the mapping, so every factor still registers exactly as before.
     """
     from hermes_quant.factors.alpha_zoo import AlphaZoo
     from hermes_quant.factors.factor_oracle import FactorOracle
-    from hermes_quant.factors.starter_set import register_starter_set
+    from hermes_quant.factors.starter_set import (
+        compute_starter_factor_returns,
+        register_starter_set,
+    )
     from hermes_quant.factors.weight_proposer import propose_weights
 
     zoo = AlphaZoo()
-    register_starter_set(zoo)
+    # Compute factor returns BEFORE register so the IC-dedup gate has its input at ingest.
+    factor_returns = compute_starter_factor_returns(bars)
+    register_starter_set(zoo, factor_returns=factor_returns)
     verdicts = FactorOracle(zoo).evaluate_all(bars)
     return propose_weights(verdicts, current_weights=None), zoo
 

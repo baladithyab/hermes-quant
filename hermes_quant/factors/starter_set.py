@@ -27,6 +27,7 @@ from hermes_quant.factors.alpha_zoo import AlphaFactor, AlphaZoo
 
 if TYPE_CHECKING:
     import numpy as np
+    import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -275,3 +276,76 @@ def register_starter_set(
 
     logger.info("starter_set: registered %d factors", len(registered))
     return registered
+
+
+def compute_starter_factor_returns(
+    bars: pd.DataFrame,
+) -> dict[str, np.ndarray]:
+    """Compute each starter factor's series on *bars* -> ``{factor_name: returns}``.
+
+    This is the input the IC-dedup gate consumes at ingest. The mapping must be
+    built BEFORE :func:`register_starter_set` (the gate runs *during* register),
+    but the factor source code lives only in ``_STARTER_FACTORS`` and is not yet
+    in any registry — so we register the set into a THROWAWAY zoo (with the
+    IC-dedup gate forced off so all factors are admitted), compute each factor's
+    series on *bars*, and key the result by factor NAME (the key
+    :func:`register_starter_set` looks up).
+
+    The per-factor returns array is ``factor_series.dropna().values`` — the same
+    projection :class:`~hermes_quant.factors.factor_oracle.FactorOracle` uses to
+    feed the dedup gate, so the gate sees a consistent series whether it runs at
+    ingest (here) or during oracle scoring.
+
+    Args:
+        bars: OHLCV DataFrame the factor expressions evaluate against.
+
+    Returns:
+        ``{factor_name: np.ndarray}`` for every starter factor whose compute()
+        succeeds and yields >= 2 finite observations. A factor that fails to
+        compute or is degenerate (all-NaN / constant) is OMITTED so it registers
+        with ``factor_returns=None`` (gate no-op for it) rather than crashing the
+        ingest.
+    """
+    import tempfile
+
+    import numpy as np
+
+    # A throwaway, gate-OFF zoo whose only job is to give us compute() access to
+    # the starter factor expressions. Using its own injected ic_dedup gate that
+    # we never trip avoids any reliance on env state here.
+    with tempfile.TemporaryDirectory() as tmp:
+        probe_zoo = AlphaZoo(base_dir=tmp)
+        # register WITHOUT factor_returns so the gate never runs in the probe,
+        # regardless of the operator flag — we only want the compute() bridge.
+        name_to_id: dict[str, str] = {}
+        for defn in _STARTER_FACTORS:
+            factor = AlphaFactor(
+                name=defn["name"],
+                description=defn["description"],
+                source_code=defn["source_code"],
+                author="starter_set_v1",
+                tags=defn.get("tags", []),
+                params={},
+                version=1,
+            )
+            fid = probe_zoo.register(factor)
+            name_to_id[defn["name"]] = fid
+
+        out: dict[str, np.ndarray] = {}
+        for name, fid in name_to_id.items():
+            try:
+                series = probe_zoo.compute(fid, bars)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "compute_starter_factor_returns: %r compute failed: %s",
+                    name,
+                    exc,
+                )
+                continue
+            values = np.asarray(series, dtype=float)
+            finite = values[np.isfinite(values)]
+            if finite.size < 2:
+                # Degenerate / all-NaN: omit so it registers gate-off (no-op).
+                continue
+            out[name] = finite
+    return out
