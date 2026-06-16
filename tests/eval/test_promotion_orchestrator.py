@@ -369,6 +369,46 @@ def test_contamination_guard_flag_in_summary() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 13b. Non-finite Sortino serialises as JSON null (not `Infinity`/`NaN` tokens)
+# ---------------------------------------------------------------------------
+
+
+def test_summary_inf_sortino_serialises_as_null() -> None:
+    """A legitimate +inf Sortino (no-downside) → null in strict JSON.
+
+    `json.dumps` would otherwise emit the non-standard `Infinity` token, which
+    strict JSON readers (and `json.loads(..., parse_constant=...)` consumers of
+    promotion_decisions.jsonl) reject.
+    """
+    import json
+
+    result = _make_passing_result(sortino=float("inf"))
+    summary = _summarise_result(result)
+    assert summary["sortino"] is None
+    # Round-trips through STRICT json (no non-standard tokens permitted).
+    line = json.dumps(summary, default=str, allow_nan=False)
+    assert json.loads(line)["sortino"] is None
+
+
+def test_summary_nan_sortino_serialises_as_null() -> None:
+    """A NaN Sortino (malformed / empty window) → null in strict JSON."""
+    import json
+
+    result = _make_passing_result(sortino=float("nan"))
+    summary = _summarise_result(result)
+    assert summary["sortino"] is None
+    line = json.dumps(summary, default=str, allow_nan=False)
+    assert json.loads(line)["sortino"] is None
+
+
+def test_summary_finite_sortino_preserved() -> None:
+    """A finite Sortino is rounded and preserved (not nulled)."""
+    result = _make_passing_result(sortino=1.234567)
+    summary = _summarise_result(result)
+    assert summary["sortino"] == 1.234567
+
+
+# ---------------------------------------------------------------------------
 # 14. PromotionOrchestrator defaults: gate, log, harness are created lazily
 # ---------------------------------------------------------------------------
 

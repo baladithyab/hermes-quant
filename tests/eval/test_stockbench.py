@@ -33,6 +33,7 @@ from hermes_quant.eval.stockbench import (
     STOCKBENCHHarness,
     STOCKBENCHResult,
     _BuyAndHoldStrategy,
+    _compute_sortino,
     _SyntheticPriceSource,
 )
 
@@ -281,3 +282,71 @@ class TestSerialisation:
             "vs_buyhold_alpha", "contamination_guard_fired",
         }
         assert expected_keys.issubset(d.keys())
+
+
+# ---------------------------------------------------------------------------
+# Sortino downside-deviation semantics (MAR=0 RMS, not std about losers' mean)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeSortinoDownside:
+    """`_compute_sortino` must measure downside deviation as RMS about MAR=0.
+
+    The fail-open defect: ``np.std(neg, ddof=1)`` measures dispersion of the
+    losing days *about their own mean*. If every losing day has the SAME
+    magnitude (a fixed stop-loss, or steady down-drift at constant position
+    size), that dispersion collapses to ~0 and the old code returned +inf —
+    the BEST possible Sortino — even though the strategy is a net loser. A
+    spurious +inf clears the promotion gate (sortino > threshold), so a losing
+    strategy gets promoted to live trading. The correct Sortino uses the RMS of
+    ``min(r, 0)`` about a 0 minimum-acceptable-return, which is large (not zero)
+    when there are many losing days of equal magnitude.
+    """
+
+    def test_uniform_magnitude_losses_yield_finite_negative_sortino(self):
+        # Net-losing strategy: small up days, constant -2% stop-loss days.
+        rets = np.array(
+            [0.01, -0.02, 0.01, -0.02, 0.01, -0.02, 0.01, -0.02, 0.005, -0.02]
+        )
+        assert float(np.mean(rets)) < 0.0  # genuinely a losing strategy
+
+        sortino = _compute_sortino(rets)
+
+        # Must NOT be +inf — uniform-magnitude losers have real downside risk.
+        assert math.isfinite(sortino), (
+            f"uniform-magnitude losing days produced sortino={sortino!r}; "
+            "std(neg) about losers' own mean collapses to ~0 → spurious +inf "
+            "(fail-open: a net-losing strategy clears the promotion gate)"
+        )
+        # A net-losing strategy must have a negative Sortino so the gate rejects.
+        assert sortino < 0.0
+
+    def test_uniform_magnitude_losses_unannualised(self):
+        rets = np.array([0.005, -0.01, 0.004, -0.01, 0.003, -0.01])
+        sortino = _compute_sortino(rets, annualize=False)
+        assert math.isfinite(sortino)
+        assert sortino < 0.0
+
+    def test_no_downside_still_returns_inf(self):
+        # No negative day at all → the legitimate "no downside" case stays +inf.
+        rets = np.array([0.01, 0.02, 0.0, 0.005, 0.03])
+        assert _compute_sortino(rets) == float("inf")
+
+    def test_single_negative_day_is_finite(self):
+        # One losing day among gains: downside risk exists, Sortino is finite.
+        rets = np.array([0.01, 0.02, -0.015, 0.01, 0.02])
+        sortino = _compute_sortino(rets)
+        assert math.isfinite(sortino)
+
+    def test_len_lt_2_returns_nan(self):
+        # Existing guard preserved.
+        assert math.isnan(_compute_sortino(np.array([0.01])))
+        assert math.isnan(_compute_sortino(np.array([])))
+
+    def test_varied_downside_matches_rms_about_zero(self):
+        # Cross-check the formula against a hand-computed RMS-about-0 value.
+        rets = np.array([0.02, -0.01, 0.03, -0.03, 0.01, -0.02])
+        dd = np.minimum(rets, 0.0)
+        expected_dev = math.sqrt(float(np.mean(dd ** 2)))
+        expected = float(np.mean(rets)) / expected_dev * math.sqrt(252)
+        assert _compute_sortino(rets) == pytest.approx(expected, rel=1e-9)

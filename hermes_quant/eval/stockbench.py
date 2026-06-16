@@ -214,17 +214,34 @@ def _compute_max_drawdown(equity_curve: np.ndarray) -> float:
 
 
 def _compute_sortino(daily_returns: np.ndarray, *, annualize: bool = True) -> float:
-    """Sortino ratio = mean(r) / downside_std(r), optionally annualised."""
+    """Sortino ratio = mean(r) / downside_deviation(r), optionally annualised.
+
+    Downside deviation is the root-mean-square of the *below-target* returns
+    about a minimum-acceptable-return (MAR) of 0 — i.e. ``sqrt(mean(min(r,0)²))``
+    — NOT ``std(neg)`` about the losers' own mean.  The std-about-own-mean form
+    is a fail-open trap: a strategy whose losing days are all the SAME magnitude
+    (a fixed stop-loss, or steady down-drift at constant position size) has zero
+    dispersion *about its own mean* and would have collapsed below 1e-12 →
+    spurious +inf (the BEST possible Sortino) → cleared the promotion gate even
+    though the strategy is a net loser.  Measuring RMS about MAR=0 keeps the
+    downside deviation large (proportional to the loss magnitude), yielding a
+    finite — and correctly negative, for a net-losing strategy — Sortino that
+    the gate can reject.
+
+    The +inf return is reserved for the TRUE no-downside case only: when there
+    is not a single negative day, downside risk is genuinely zero and +inf
+    (unbounded risk-adjusted return) is the correct, intended signal.
+    """
     if len(daily_returns) < 2:
         return float("nan")
     mean_r = float(np.mean(daily_returns))
-    neg = daily_returns[daily_returns < 0]
-    if len(neg) == 0:
+    # RMS of below-MAR(=0) returns about 0, across ALL days (not just losers).
+    downside = np.minimum(daily_returns, 0.0)
+    downside_dev = math.sqrt(float(np.mean(downside ** 2)))
+    if downside_dev < 1e-12:
+        # No negative day at all → no downside risk → unbounded Sortino.
         return float("inf")
-    downside_std = float(np.std(neg, ddof=1))
-    if downside_std < 1e-12:
-        return float("inf")
-    ratio = mean_r / downside_std
+    ratio = mean_r / downside_dev
     if annualize:
         ratio *= math.sqrt(252)
     return float(ratio)

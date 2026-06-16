@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import secrets
 import threading
@@ -173,7 +174,10 @@ def _summarise_result(result: STOCKBENCHResult) -> dict[str, Any]:
         "benchmark": result.benchmark,
         "cumulative_return": round(result.cumulative_return, 6),
         "max_drawdown": round(result.max_drawdown, 6),
-        "sortino": round(result.sortino, 6) if result.sortino == result.sortino else None,  # NaN → None
+        # Serialise non-finite Sortino (NaN OR the legitimate no-downside +inf)
+        # as JSON null — `json.dumps` would otherwise emit the non-standard
+        # `Infinity`/`NaN` tokens, which strict JSON readers reject.
+        "sortino": round(result.sortino, 6) if math.isfinite(result.sortino) else None,
         "n_decisions": result.n_decisions,
         "decisions_per_day_avg": round(result.decisions_per_day_avg, 6),
         "vs_buyhold_alpha": round(result.vs_buyhold_alpha, 6),
