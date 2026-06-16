@@ -331,13 +331,25 @@ class ShadowAccount:
     # mark_to_market
     # ------------------------------------------------------------------
 
-    def mark_to_market(self, prices: dict[str, float]) -> dict[str, Any]:
+    def mark_to_market(
+        self,
+        prices: dict[str, float],
+        *,
+        asof: date | datetime | None = None,
+    ) -> dict[str, Any]:
         """Mark the portfolio to current prices and persist a P&L snapshot.
 
         Parameters
         ----------
         prices:
             Current prices keyed by ticker.
+        asof:
+            Optional session timestamp to stamp the ``shadow_pnl_history`` row
+            with.  Defaults to wall-clock now.  Historical replays MUST pass the
+            replay session date here, otherwise the row is dated to today and
+            falls outside the session window in
+            :meth:`ShadowAccountRunner.compare_to_real`, silently reporting the
+            rule's P&L as ``$0.00`` (see ADR-0049 / shadow-replay-daily.py).
 
         Returns
         -------
@@ -372,7 +384,7 @@ class ShadowAccount:
             pnl_today = equity_total - prior_equity
             pnl_total = equity_total - self.initial_cash
 
-            asof_str = _utc_now_iso()
+            asof_str = asof.isoformat() if asof is not None else _utc_now_iso()
             conn.execute(
                 "INSERT OR REPLACE INTO shadow_pnl_history "
                 "(asof, equity_total, cash, positions_value, pnl_today, pnl_total) "
