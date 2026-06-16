@@ -262,6 +262,151 @@ def test_corrupt_file_backs_up_and_recovers(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# ar22 — tolerant recovery: a torn / partially-corrupt journal must NOT
+# discard the whole settlement ledger. Recover the entries that DO parse.
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_pending(journal: Path) -> tuple[SettlementEntry, SettlementEntry]:
+    e1 = _make_entry("prop_20260513T100000_AAPL_a1", symbol="AAPL")
+    e2 = _make_entry("prop_20260513T110000_MSFT_b2", symbol="MSFT", direction=-1)
+    append_pending(e1, path=journal)
+    append_pending(e2, path=journal)
+    assert len(parse_journal(journal.read_text())) == 2
+    return e1, e2
+
+
+def test_invalid_utf8_tail_recovers_parseable_entries(tmp_path):
+    """RED for ar22: a torn write that injects invalid UTF-8 bytes must not
+    cause _load_entries_safe to discard every prior PENDING entry.
+
+    Pre-fix: read_text(encoding='utf-8') raises UnicodeDecodeError before
+    parse_journal runs, the whole journal is renamed to .bak, and 0 entries
+    are recovered — the next append silently drops the settlement ledger.
+    """
+    from hermes_quant.journal.writer import _load_entries_safe
+
+    journal = tmp_path / "journal.md"
+    e1, e2 = _seed_two_pending(journal)
+
+    # Mimic a torn write: append invalid UTF-8 bytes to the tail.
+    with open(journal, "ab") as f:
+        f.write(b"\xff\xfe torn-write garbage \x80\x81")
+
+    recovered = _load_entries_safe(journal)
+    ids = {e.entry_id for e in recovered}
+    # The two valid PENDING entries must survive — not be discarded.
+    assert e1.entry_id in ids
+    assert e2.entry_id in ids
+    assert len(recovered) == 2
+
+
+def test_invalid_utf8_next_append_preserves_prior_pending(tmp_path):
+    """RED for ar22 (the data-loss consequence): after a torn write, the
+    next append_pending must keep the prior PENDING entries, and a later
+    resolve() for one of them must succeed (not raise JournalEntryNotFound)."""
+    journal = tmp_path / "journal.md"
+    e1, e2 = _seed_two_pending(journal)
+
+    with open(journal, "ab") as f:
+        f.write(b"\xff\xfe torn-write garbage \x80\x81")
+
+    # Next append must NOT wipe the ledger.
+    e3 = _make_entry("prop_20260513T120000_NVDA_c3", symbol="NVDA")
+    append_pending(e3, path=journal)
+
+    parsed = parse_journal(journal.read_text())
+    ids = {e.entry_id for e in parsed}
+    assert {e1.entry_id, e2.entry_id, e3.entry_id} <= ids
+
+    # And resolving a prior PENDING entry still works.
+    settled = resolve(
+        e1.entry_id,
+        asof_settlement=e1.asof_decision + timedelta(hours=4),
+        exit_price=102.0,
+        raw_return=0.02,
+        alpha_return=0.012,
+        hold_minutes=240,
+        reflection=Reflection(thesis_held=True, magnitude_error=0.4),
+        path=journal,
+    )
+    assert settled.is_resolved()
+
+
+def test_truncated_mid_entry_recovers_complete_entries(tmp_path):
+    """A torn write that truncates mid-entry must still recover the entries
+    whose META blocks are complete."""
+    journal = tmp_path / "journal.md"
+    e1, e2 = _seed_two_pending(journal)
+
+    # Append a half-written entry block (META_BEGIN with no META_END) — the
+    # kind of tail a crash mid-render would leave behind.
+    with open(journal, "a", encoding="utf-8") as f:
+        f.write("\n## TSLA ↑ [pending]\n<!-- META_BEGIN -->\nentry_id: prop_x_TSLA_trunc\n")
+
+    from hermes_quant.journal.writer import _load_entries_safe
+
+    recovered = _load_entries_safe(journal)
+    ids = {e.entry_id for e in recovered}
+    assert e1.entry_id in ids
+    assert e2.entry_id in ids
+
+
+def test_one_bad_line_skipped_rest_recovered(tmp_path):
+    """A single unparseable line injected into one entry's meta block must
+    drop only that entry, not the whole ledger."""
+    journal = tmp_path / "journal.md"
+    e1, e2 = _seed_two_pending(journal)
+
+    # Corrupt e1's entry_id line so it fails to parse, leave e2 intact.
+    content = journal.read_text()
+    broken = content.replace(
+        "entry_id: prop_20260513T100000_AAPL_a1",
+        "entry_id:::: <<<garbage>>>",
+        1,
+    )
+    journal.write_text(broken)
+
+    from hermes_quant.journal.writer import _load_entries_safe
+
+    recovered = _load_entries_safe(journal)
+    ids = {e.entry_id for e in recovered}
+    # e2 survives; e1 was corrupted out.
+    assert e2.entry_id in ids
+    assert e1.entry_id not in ids
+
+
+def test_fully_valid_journal_unchanged_by_load(tmp_path):
+    """A healthy journal round-trips through _load_entries_safe with no
+    entry loss and no spurious .bak churn."""
+    from hermes_quant.journal.writer import _load_entries_safe
+
+    journal = tmp_path / "journal.md"
+    e1, e2 = _seed_two_pending(journal)
+    before = journal.read_text()
+
+    recovered = _load_entries_safe(journal)
+    assert {e.entry_id for e in recovered} == {e1.entry_id, e2.entry_id}
+    # No backup made for a healthy journal; original untouched.
+    assert not (tmp_path / "journal.md.bak").exists()
+    assert journal.read_text() == before
+
+
+def test_empty_and_absent_journal_load_returns_empty(tmp_path):
+    """An absent or empty journal loads cleanly as [] with no backup."""
+    from hermes_quant.journal.writer import _load_entries_safe
+
+    absent = tmp_path / "absent.md"
+    assert _load_entries_safe(absent) == []
+    assert not (tmp_path / "absent.md.bak").exists()
+
+    empty = tmp_path / "empty.md"
+    empty.write_text("")
+    assert _load_entries_safe(empty) == []
+    assert not (tmp_path / "empty.md.bak").exists()
+
+
+# ---------------------------------------------------------------------------
 # HITL integration
 # ---------------------------------------------------------------------------
 

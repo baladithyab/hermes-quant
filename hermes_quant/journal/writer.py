@@ -277,23 +277,76 @@ def _atomic_write(target: Path, content: str) -> None:
 
 
 def _load_entries_safe(target: Path) -> list[SettlementEntry]:
-    """Read existing entries; tolerate missing or corrupt file."""
+    """Read existing entries; tolerate a missing, empty, or partially-corrupt
+    file WITHOUT discarding the entries that still parse.
+
+    Per ADR-0010 this is the settlement ledger: silently dropping prior
+    PENDING entries is a data-loss defect (ar22). A torn write — an
+    invalid-UTF-8 tail, a truncated mid-entry block, or one mangled meta
+    line — must recover every entry whose META_BEGIN/META_END block is
+    still intact. ``parse_journal`` is already block-by-block tolerant; the
+    only thing that defeats it is ``read_text(encoding="utf-8")`` raising a
+    ``UnicodeDecodeError`` on the bad bytes *before* the parser ever runs.
+
+    So we read bytes and decode with ``errors="replace"``: the corrupt tail
+    becomes replacement chars (which fail to form a valid meta block and are
+    skipped), while the valid entries ahead of it survive. We still keep a
+    ``.bak`` safety copy when bytes were undecodable — but we COPY rather
+    than rename, so the live ledger keeps the recovered entries and the next
+    atomic write rewrites a clean file. Only a hard read error (the bytes
+    themselves are unreadable) falls back to ``[]``.
+    """
     if not target.exists():
         return []
     try:
-        return parse_journal(target.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
+        raw = target.read_bytes()
+    except OSError as exc:
         logger.warning(
-            "journal: parse failed for %s — %s. Starting fresh; backing up "
-            "old file as journal.md.bak",
+            "journal: could not read %s (%s); treating as empty without "
+            "touching the file",
             target,
             exc,
         )
+        return []
+
+    if not raw.strip():
+        return []
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # Torn write: salvage every entry whose block is still valid UTF-8
+        # rather than discarding the whole ledger.
+        logger.warning(
+            "journal: %s has undecodable bytes (%s); recovering parseable "
+            "entries and backing up the corrupt file as %s.bak",
+            target,
+            exc,
+            target.name,
+        )
+        text = raw.decode("utf-8", errors="replace")
         backup = target.with_suffix(target.suffix + ".bak")
         try:
-            target.rename(backup)
+            backup.write_bytes(raw)  # copy, don't rename — keep the live file
         except OSError:
-            logger.warning("journal: backup rename also failed; skipping")
+            logger.warning("journal: backup copy failed; continuing recovery")
+
+    try:
+        return parse_journal(text)
+    except Exception as exc:  # noqa: BLE001 — defensive; parse_journal is tolerant
+        logger.warning(
+            "journal: parse failed for %s — %s. Backing up as %s.bak and "
+            "starting fresh.",
+            target,
+            exc,
+            target.name,
+        )
+        backup = target.with_suffix(target.suffix + ".bak")
+        try:
+            if not backup.exists():
+                backup.write_bytes(raw)
+        except OSError:
+            logger.warning("journal: backup copy also failed; skipping")
         return []
 
 
