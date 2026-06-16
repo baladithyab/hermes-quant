@@ -469,6 +469,13 @@ class HermesQuantConsumer(IStrategy):
         # the ar35 _parse_asof_utc helper (NaT/garbage -> None).
         asof = _parse_asof_utc(sig.get("asof"))
         if asof is None:
+            # ar43/ar28: an absent/garbage/NaT asof is a fail-CLOSED drop — but it
+            # must be OBSERVABLE. A daemon emitting fresh heartbeats + garbage asof
+            # would otherwise drop every signal silently behind a satisfied dead-man-
+            # switch. _parse_asof_utc already swallowed the DateParseError (NaT/garbage
+            # -> None), so this branch — not the staleness try/except below — is the
+            # only place the unparseable-asof drop can be logged.
+            self._note_signal_drop(pair, "unparseable_asof", f"asof={sig.get('asof')!r}")
             return None
         try:
             now = _parse_asof_utc(current_time) if current_time else pd.Timestamp.utcnow().tz_localize("UTC")
