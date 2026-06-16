@@ -171,6 +171,58 @@ def test_ar25_empty_book_is_zero(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# ar34 — the kill-switch basis must NOT pool cross-account (freqtrade raw-coin) fills
+# --------------------------------------------------------------------------- #
+def _freqtrade_fill(asset, side, qty, price, asof, eid):
+    """A freqtrade consumer execution record: account_id='freqtrade', explicit side/qty
+    where qty is a RAW COIN COUNT (NOT a NAV fraction), no fill_size_pct/target."""
+    return {
+        "asset": asset,
+        "asset_class": "crypto",
+        "side": side,
+        "qty": qty,
+        "fill_price": price,
+        "decision_price": price,
+        "asof_execution": asof,
+        "asof": asof,
+        "exec_id": eid,
+        "signal_id": None,
+        "account_id": "freqtrade",
+        "reactor_metadata": {"account_id": "freqtrade"},
+    }
+
+
+def test_ar34_killswitch_excludes_freqtrade_account(tmp_path, monkeypatch):
+    """The paper-default autonomous lane's realized-drawdown basis must IGNORE a
+    cross-account freqtrade crypto round-trip whose qty is a raw coin count. Pooling a
+    0.5-coin qty as if it were a 50%-NAV fraction would corrupt (here, swamp) the rail."""
+    monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100_000.0)
+    # paper-default: a 20%-NAV position down 20% = -4% of NAV realized.
+    paper = [
+        _equity_fill("ASTS", 0.2, 100.0, "2026-06-01T15:00:00Z", "p1"),
+        _equity_fill("ASTS", -0.2, 80.0, "2026-06-02T15:00:00Z", "p2"),
+    ]
+    # freqtrade: a 0.5-coin round-trip up 50% (raw coins, NOT NAV) — would read as a huge
+    # spurious gain (+0.25) if pooled, masking the paper loss.
+    ft = [
+        _freqtrade_fill("ETH/USDT", "buy", 0.5, 100.0, "2026-06-01T16:00:00Z", "f1"),
+        _freqtrade_fill("ETH/USDT", "sell", 0.5, 150.0, "2026-06-02T16:00:00Z", "f2"),
+    ]
+    bus_mixed = _write_bus(tmp_path, paper + ft)
+    paper_only_path = tmp_path / "paper_only.jsonl"
+    paper_only_path.write_text("\n".join(json.dumps(f) for f in paper) + "\n", encoding="utf-8")
+
+    frac_mixed = auto.compute_cumulative_realized_pnl_pct(bus_mixed)
+    frac_paper = auto.compute_cumulative_realized_pnl_pct(paper_only_path)
+    assert frac_mixed == pytest.approx(frac_paper), (
+        f"ar34: the freqtrade cross-account round-trip polluted the paper-default kill-switch "
+        f"basis (mixed={frac_mixed} vs paper-only={frac_paper}); the basis must exclude non-"
+        f"paper-default accounts (raw-coin qty != NAV fraction)."
+    )
+    assert frac_mixed == pytest.approx(-0.04)  # the real paper loss, undistorted
+
+
+# --------------------------------------------------------------------------- #
 # ar21 — corrupt EXISTING kill-switch file fails CLOSED (tripped=True)
 # --------------------------------------------------------------------------- #
 def test_ar21_corrupt_existing_killswitch_file_fails_closed(tmp_path, monkeypatch):

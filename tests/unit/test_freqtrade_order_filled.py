@@ -112,3 +112,37 @@ def test_order_filled_sources_sell_fill_distinct_from_amount(strategy):
     assert recs[0]["side"] == "sell"
     assert recs[0]["fill_price"] == 158.10
     assert recs[0]["qty"] == 55.0
+
+
+def test_ar35_latest_signal_per_asset_is_chronological_not_lexical(strategy, monkeypatch):
+    """ar35: the per-asset 'latest signal' cache must order by PARSED TIMESTAMP, not by a
+    lexical asof-string compare. We write two ETH signals where the chronologically-LATER
+    one (12:00, naive 'YYYY-MM-DD HH:MM:SS') is lexically SMALLER than the earlier one
+    (11:00, '...T...Z') because ' ' (0x20) < 'T' (0x54). A lexical compare would cache the
+    STALE 11:00 'sell'; the fix must cache the fresh 12:00 'buy'."""
+    s, _ = strategy
+    sig_path = s.SIGNAL_BUS_PATH
+    # Earlier (11:00Z) bearish, later (12:00 naive) bullish — the later one must win.
+    earlier = {
+        "schema_version": 1, "asset": "ETH/USDT", "type": "signal",
+        "asof": "2026-05-31T11:00:00Z", "stance": "bearish",
+        "target_position_pct": -0.10,
+    }
+    later = {
+        "schema_version": 1, "asset": "ETH/USDT", "type": "signal",
+        "asof": "2026-05-31 12:00:00", "stance": "bullish",  # naive -> assumed UTC
+        "target_position_pct": 0.10,
+    }
+    # Lexical sanity: the later signal's asof string sorts BEFORE the earlier one.
+    assert later["asof"] < earlier["asof"], "test premise: later asof must be lexically smaller"
+    sig_path.write_text("\n".join(json.dumps(r) for r in [earlier, later]) + "\n", encoding="utf-8")
+
+    s._refresh_state(pd.Timestamp("2026-05-31T12:30:00Z"))
+
+    cached = s._signal_cache.get("ETH/USDT")
+    assert cached is not None
+    assert cached["asof"] == "2026-05-31 12:00:00", (
+        f"ar35: the cache kept the chronologically STALE signal via lexical compare "
+        f"(got asof={cached.get('asof')}, stance={cached.get('stance')}); must keep the 12:00 buy"
+    )
+    assert cached["stance"] == "bullish"

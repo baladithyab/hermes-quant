@@ -78,6 +78,25 @@ def append_locked(path: Path):
                 os.close(fd)
 
 
+def _parse_asof_utc(value: object) -> pd.Timestamp | None:
+    """Parse an ISO asof string to a UTC pd.Timestamp, or None if absent/unparseable/NaT.
+
+    ar35: used to order signals by CHRONOLOGY, not by lexical string compare (which only
+    sorts correctly when every asof shares one exact format). Naive timestamps are assumed
+    UTC (matching the heartbeat parse above). NaT / errors -> None so the caller can refuse
+    to act on an unorderable timestamp rather than mis-rank it.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except (ValueError, TypeError):
+        return None
+    if pd.isna(ts):
+        return None
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
 def _emit_execution(record: dict) -> None:
     line = json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
     encoded = line.encode("utf-8")
@@ -352,11 +371,26 @@ class HermesQuantConsumer(IStrategy):
             if r.get("type") == "heartbeat":
                 continue
             asset = r.get("asset")
-            if asset:
-                # Keep most recent per asset
-                cur = self._signal_cache.get(asset)
-                if cur is None or r.get("asof", "") > cur.get("asof", ""):
-                    self._signal_cache[asset] = r
+            if not asset:
+                continue
+            # ar35: keep most recent per asset by PARSED-TIMESTAMP order, not a LEXICAL
+            # string compare. `r["asof"] > cur["asof"]` on raw strings only sorts
+            # correctly when every asof shares one exact format; mixed forms (a trailing
+            # "Z" vs "+00:00", a naive "YYYY-MM-DD HH:MM:SS", differing precision) sort
+            # lexically out of chronological order, so a STALE signal can win the cache and
+            # the consumer then sizes/trades on its (possibly opposite) direction. Parse
+            # both to UTC Timestamps and compare those; an unparseable/NaT candidate is
+            # never allowed to displace an existing cached signal.
+            cur = self._signal_cache.get(asset)
+            if cur is None:
+                self._signal_cache[asset] = r
+                continue
+            new_ts = _parse_asof_utc(r.get("asof"))
+            cur_ts = _parse_asof_utc(cur.get("asof"))
+            if new_ts is None:
+                continue  # can't establish recency -> do not displace
+            if cur_ts is None or new_ts > cur_ts:
+                self._signal_cache[asset] = r
 
         # Dead-man-switch (synthesis-v2 §P0-C)
         bootstrap_age = (now - self._strategy_start_time).total_seconds()

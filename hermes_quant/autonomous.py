@@ -359,11 +359,23 @@ def compute_cumulative_realized_pnl_pct(
         if not records:
             return 0.0
         round_trips, _open = join_exit_fills(records)
-        # ar25: qty is ALREADY a NAV-fraction, so a round-trip's NAV-fraction P&L is
-        # realized_return × qty. Sum directly — NAV cancels (do NOT multiply by
-        # entry_price, do NOT divide by NAV). A non-finite term is skipped.
+        # ar34: this rail is the AUTONOMOUS lane's realized-drawdown as a fraction of the
+        # paper-default NAV. The shared executions.jsonl ALSO carries other accounts whose
+        # qty is in a DIFFERENT unit system — notably the freqtrade crypto consumer writes
+        # account_id="freqtrade" with qty = RAW COIN COUNT (e.g. 0.5 ETH), not a NAV
+        # fraction. Pooling a raw-coin qty into `Σ realized_return × qty` corrupts the
+        # paper-NAV fraction (0.5 coins reads as 50% of NAV) and can spuriously trip OR mask
+        # the kill-switch. Restrict to the autonomous lane's own account (paper-default —
+        # the sentinel _normalize_exec_record assigns when no explicit account_id is set);
+        # other accounts (freqtrade, and any future named/true-unit lane) have their own
+        # rails and must not pollute this NAV-fraction basis.
+        # ar25: within paper-default, qty is ALREADY a NAV-fraction, so a round-trip's
+        # NAV-fraction P&L is realized_return × qty. Sum directly — NAV cancels (do NOT
+        # multiply by entry_price, do NOT divide by NAV). A non-finite term is skipped.
         frac = 0.0
         for rt in round_trips:
+            if getattr(rt, "account_id", "paper-default") != "paper-default":
+                continue
             term = rt.realized_return * rt.qty
             if not math.isfinite(term):
                 continue
