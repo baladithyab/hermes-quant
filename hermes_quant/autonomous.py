@@ -1353,7 +1353,7 @@ def tick(
 
                 if not dry_run:
                     try:
-                        execution_id = _react(
+                        react_out = _react(
                             advisor_result,
                             entry,
                             effective_size,
@@ -1365,7 +1365,7 @@ def tick(
                         # and do NOT mutate portfolio_state with a phantom position (which
                         # would charge headroom against a position that never existed and
                         # clip/silence subsequent REAL signals this tick).
-                        if execution_id is None:
+                        if react_out is None:
                             decision.gate = "SILENCE_REACTOR_NO_FILL"
                             decision.details = {
                                 "reason": "reactor returned a no-fill/silence record",
@@ -1376,8 +1376,26 @@ def tick(
                             result.silences += 1
                             result.decisions.append(decision)
                             continue
+                        # ar80: _react returns (pid, realized_fill_size_pct). Charge the
+                        # reactor's REALIZED post-clip size into the running headroom, NOT
+                        # the pre-reactor-clip REQUESTED effective_size — the reactor
+                        # (PaperReactor._portfolio_cap_clip) independently re-reads the
+                        # PERSISTED book and may apply a SECOND, tighter clip. Charging the
+                        # requested size would OVER-charge the in-memory running headroom and
+                        # spuriously shrink/silence later picks. Fail toward the larger
+                        # effective_size (conservative — never UNDER-charge) if the realized
+                        # value is missing or non-finite or somehow larger than requested.
+                        execution_id, realized_size = react_out
                         decision.execution_id = execution_id
                         fires_this_tick += 1
+                        charged = effective_size
+                        if (
+                            realized_size is not None
+                            and isinstance(realized_size, (int, float))
+                            and math.isfinite(float(realized_size))
+                            and abs(float(realized_size)) <= abs(effective_size)
+                        ):
+                            charged = float(realized_size)
                         # Update running portfolio state so the next pick sees the
                         # post-fire headroom (the canonical state.db helper does
                         # not reload mid-tick — we mutate here).
@@ -1385,7 +1403,7 @@ def tick(
                             # `positions` dict is intentionally mutable here even though
                             # PortfolioState is frozen — the dict is the inner mutable
                             # container that we update without reconstructing the wrapper.
-                            portfolio_state.positions[entry.symbol] = effective_size
+                            portfolio_state.positions[entry.symbol] = charged
                     except FillSizeInvariantError as exc:
                         logger.warning(
                             "autonomous: fill-size invariant rejected %s: %s",
@@ -1436,11 +1454,20 @@ def _react(
     fill_size_pct: float,
     *,
     paper_zero_costs: bool = False,
-) -> str | None:
-    """Fire the routed reactor for an autonomous decision and return the
-    synthesized proposal_id (used as the execution_id surfaced in tick output),
-    or ``None`` if the reactor returned a NO-FILL/SILENCE record (ar38) so the
-    caller does NOT count a phantom fire or mutate portfolio state.
+) -> tuple[str, float | None] | None:
+    """Fire the routed reactor for an autonomous decision.
+
+    Returns ``None`` if the reactor returned a NO-FILL/SILENCE record (ar38) so the
+    caller does NOT count a phantom fire or mutate portfolio state. Otherwise returns
+    a ``(proposal_id, realized_fill_size_pct)`` pair (ar80): the proposal_id is the
+    synthesized execution_id surfaced in tick output, and realized_fill_size_pct is the
+    reactor's POST-clip ``record.fill_size_pct`` — PaperReactor.execute() independently
+    re-reads the PERSISTED book and may apply a SECOND, tighter portfolio-cap clip
+    (ADR-0087), so the realized size can be SMALLER than the requested fill_size_pct. The
+    caller charges this realized size into the in-memory running headroom so the next
+    pick sees ACTUAL consumption (not the over-charged requested size). realized is
+    ``None`` only if the record carries no usable fill_size_pct (caller falls back to the
+    requested size — conservative: never under-charges headroom).
 
     We construct a minimal Proposal-shaped object on the fly so we can route it
     through the ONE dispatch chokepoint (``react.dispatch.select_reactor``) the
@@ -1549,4 +1576,9 @@ def _react(
     except Exception as exc:  # noqa: BLE001
         logger.warning("autonomous: journal append failed: %s", exc, exc_info=True)
 
-    return pid
+    # ar80: return the reactor's REALIZED post-clip fill_size_pct alongside the pid so
+    # the caller charges ACTUAL consumption into the running headroom (the reactor may
+    # have applied a second, tighter ADR-0087 clip against the persisted book). _realized
+    # was captured above; a non-float (None) tells the caller to fall back conservatively.
+    realized_size = float(_realized) if isinstance(_realized, (int, float)) else None
+    return pid, realized_size

@@ -186,7 +186,7 @@ def test_no_dry_run_calls_react_on_fire(
 
     def fake_react(advisor_result, entry, kelly, **kwargs):
         react_calls.append((entry.symbol, kelly))
-        return f"exec_{entry.symbol}"
+        return (f"exec_{entry.symbol}", kelly)
 
     with mock.patch(
         "hermes_quant.autonomous._react",
@@ -489,7 +489,7 @@ def test_fire_decision_includes_action_and_execution_id(
     _set_mode_autonomous(isolate_config)
     with mock.patch(
         "hermes_quant.autonomous._react",
-        return_value="exec_AAPL_001",
+        return_value=("exec_AAPL_001", 0.05),
     ):
         result = tick(
             dry_run=False,
@@ -519,7 +519,7 @@ def test_react_failure_marks_decision_error_but_continues(
     def fake_react(advisor_result, entry, kelly, **kwargs):
         if entry.symbol == "AAPL":
             raise RuntimeError("paper bus full")
-        return f"exec_{entry.symbol}"
+        return (f"exec_{entry.symbol}", kelly)
 
     with mock.patch(
         "hermes_quant.autonomous._react",
@@ -554,7 +554,7 @@ def test_portfolio_caps_disabled_by_default_no_clip(
 
     def fake_react(advisor_result, entry, kelly, paper_zero_costs):
         fired_sizes.append(kelly)
-        return f"exec_{entry.symbol}"
+        return (f"exec_{entry.symbol}", kelly)
 
     with mock.patch("hermes_quant.autonomous._react", side_effect=fake_react):
         result = tick(
@@ -596,7 +596,7 @@ def test_portfolio_caps_enabled_clips_to_remaining_headroom(
 
     def fake_react(advisor_result, entry, kelly, paper_zero_costs):
         fired_sizes.append((entry.symbol, kelly))
-        return f"exec_{entry.symbol}"
+        return (f"exec_{entry.symbol}", kelly)
 
     # Six picks at 20% each → demand = 120% gross, default caps allow ≤ 80% (cash floor)
     # Order: greedy first-come-first-served. Default kelly=0.20 (from _make_advisor_result).
