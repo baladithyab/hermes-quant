@@ -131,6 +131,61 @@ def test_live_kill_switch_dry_run_does_not_persist(monkeypatch, tmp_path):
     assert not (tmp_path / "ks.json").exists()  # NOT persisted on dry run
 
 
+def _arm_for_live_trip(monkeypatch, tmp_path, *, cum_pnl=-0.20):
+    """Arm a non-dry-run autonomous tick that WILL trip the realized-P&L kill-switch,
+    with KILL_SWITCH_PATH + the governance audit log redirected into tmp_path."""
+    from hermes_quant.governance import audit_log
+    monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
+    monkeypatch.setattr(auto, "_read_kill_switch", lambda: auto.KillSwitchState(
+        tripped=False, tripped_at=None, cumulative_pnl_pct=0.0,
+        threshold_pct=0.10, reason=None))
+    monkeypatch.setattr(auto, "_read_safety_rails", lambda: {
+        "max_per_tick_opens": 1, "max_concurrent_positions": 5,
+        "kill_switch_pct": 0.10, "log_silences": False, "allow_live": True})
+    monkeypatch.setattr(auto, "compute_cumulative_realized_pnl_pct", lambda *a, **k: cum_pnl)
+    monkeypatch.setattr(auto, "KILL_SWITCH_PATH", tmp_path / "ks.json")
+    audit_path = tmp_path / "audit_log.jsonl"
+    monkeypatch.setattr(audit_log, "AUDIT_LOG_PATH", audit_path)
+    return audit_log, audit_path
+
+
+def test_ar28_live_trip_emits_kill_switch_fired_audit(monkeypatch, tmp_path):
+    """ar28: a NON-dry-run autonomous trip must write a kill_switch_fired governance
+    audit event (not just the sidecar JSON + a log line) so the trip is visible on the
+    canonical audit log."""
+    audit_log, _ = _arm_for_live_trip(monkeypatch, tmp_path)
+    res = auto.tick(dry_run=False, symbols=[])
+    assert res.kill_switch_state.tripped is True
+    fired = list(audit_log.read(kinds=["kill_switch_fired"]))
+    assert len(fired) == 1, "ar28: live kill-switch trip emitted NO kill_switch_fired audit event"
+    assert fired[0].source == "autonomous_kill_switch"
+    assert fired[0].payload.get("rail") == "cumulative_realized_pnl_pct"
+
+
+def test_ar28_live_trip_flips_promotion_killswitch_in_14d(monkeypatch, tmp_path):
+    """ar28: the emitted kill_switch_fired event must flip PromotionEvaluator's
+    killswitch_in_14d gate — a strategy that tripped the autonomous rail must be BLOCKED
+    from paper->live promotion in the trailing 14 days."""
+    audit_log, _ = _arm_for_live_trip(monkeypatch, tmp_path)
+    auto.tick(dry_run=False, symbols=[])
+    fired = list(audit_log.read(kinds=["kill_switch_fired"]))
+    assert len(fired) == 1
+    # The promotion gate reads kind=='kill_switch_fired' within the trailing-14d window.
+    assert any(e.kind == "kill_switch_fired" for e in fired), (
+        "ar28: promotion.py killswitch_in_14d would stay False -> a tripped strategy "
+        "could still be promoted paper->live within 14 days"
+    )
+
+
+def test_ar28_dry_run_trip_emits_no_audit(monkeypatch, tmp_path):
+    """A DRY-RUN trip persists nothing and emits no kill_switch_fired event (it is a
+    preview, not a real halt) — byte-identical to pre-ar28 on the dry-run path."""
+    audit_log, _ = _arm_for_live_trip(monkeypatch, tmp_path)
+    res = auto.tick(dry_run=True, symbols=[])
+    assert res.kill_switch_state.tripped is True
+    assert list(audit_log.read(kinds=["kill_switch_fired"])) == []
+
+
 def test_live_kill_switch_healthy_pnl_does_not_trip(monkeypatch):
     monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
     monkeypatch.setattr(auto, "_read_kill_switch", lambda: auto.KillSwitchState(

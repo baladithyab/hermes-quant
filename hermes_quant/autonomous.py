@@ -416,6 +416,47 @@ def _read_last_known_cum_pnl() -> float | None:
         return None
 
 
+def _emit_killswitch_fired_audit(
+    *, cumulative_pnl_pct: float, threshold_pct: float, reason: str
+) -> None:
+    """Emit a ``kill_switch_fired`` governance audit event when the autonomous LIVE
+    realized-P&L kill-switch trips (ar28). Best-effort — an audit-append failure must
+    NEVER break the trip (the sidecar JSON already halted trading; the audit is the
+    observability + promotion-gate side-effect, not the rail itself).
+
+    Why this is required (NOT cosmetic):
+      * The canonical operator observability surface is the governance audit log
+        (cli/status.py); without this event a real-money autonomous trip is
+        indistinguishable from "never tripped" on that surface.
+      * governance/promotion.py sets ``killswitch_in_14d`` ONLY from
+        ``kind=='kill_switch_fired'`` events and BLOCKS paper->live promotion when it is
+        True. A trip that emits no such event lets a strategy that just lost
+        >=kill_switch_pct of NAV slip through the trailing-14d promotion block.
+      * The sibling rails already do this (governance/kill_switch.fire(),
+        daemon/halt_state.register_halt()); this mirrors them + the best-effort
+        idiom of _emit_killswitch_degraded_audit.
+    """
+    try:
+        from hermes_quant.governance import audit_log
+        from hermes_quant.governance.audit_log import GovernanceEvent
+
+        audit_log.append(
+            GovernanceEvent(
+                kind="kill_switch_fired",
+                asof=datetime.now(tz=UTC),
+                source="autonomous_kill_switch",
+                payload={
+                    "rail": "cumulative_realized_pnl_pct",
+                    "cumulative_pnl_pct": cumulative_pnl_pct,
+                    "threshold_pct": threshold_pct,
+                    "reason": reason,
+                },
+            )
+        )
+    except Exception as audit_exc:  # noqa: BLE001 - audit is best-effort
+        logger.warning("autonomous: failed to emit kill_switch_fired audit: %s", audit_exc)
+
+
 def _emit_killswitch_degraded_audit(exc: Exception, last_known: float | None) -> None:
     """Emit an operator-visible audit event when the secondary kill-switch rail goes blind
     (ar02). Best-effort — an audit-append failure must never break the compute path."""
@@ -600,6 +641,14 @@ def tick(
         )
         if not dry_run:
             trip_kill_switch(
+                cumulative_pnl_pct=_cum_pnl,
+                threshold_pct=abs(_ks_threshold),
+                reason=reason,
+            )
+            # ar28: emit the kill_switch_fired governance event so the trip is visible on
+            # the canonical audit log AND so promotion.py's killswitch_in_14d block fires.
+            # Best-effort: the sidecar above already halted; the audit must never break it.
+            _emit_killswitch_fired_audit(
                 cumulative_pnl_pct=_cum_pnl,
                 threshold_pct=abs(_ks_threshold),
                 reason=reason,
