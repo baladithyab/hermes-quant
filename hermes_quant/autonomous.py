@@ -517,6 +517,26 @@ def trip_kill_switch(*, cumulative_pnl_pct: float, threshold_pct: float, reason:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, KILL_SWITCH_PATH)
+    # ar86: fsync the PARENT DIR so the rename ITSELF is crash-durable. fsyncing
+    # only the file fd flushes the file DATA but not the directory entry the rename
+    # created — a power-loss after os.replace returns can revert the rename, reading
+    # the kill-switch back to its PRE-trip state on reboot (a FAIL-OPEN on the
+    # ADR-0016 §D9 rail). Same atomic-write-durability pattern as the journal /
+    # artifacts writers (wave-6 538b2f6 / 8e69840). Best-effort: a dir-fsync failure
+    # must not mask a successful trip, so warn and proceed.
+    try:
+        dfd = os.open(str(KILL_SWITCH_PATH.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError as e:  # pragma: no cover - platform/fs dependent
+        logger.warning(
+            "kill-switch: parent-dir fsync failed for %s; the trip rename may not "
+            "survive a crash: %s",
+            KILL_SWITCH_PATH.parent,
+            e,
+        )
 
 
 def reset_kill_switch() -> bool:
