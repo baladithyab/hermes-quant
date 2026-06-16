@@ -117,13 +117,85 @@ def _read_silence_bias_config() -> GateConfig:
     )
 
 
+def _positive_int_count(raw: object, default: int, name: str) -> int:
+    """Coerce an operator-YAML count to a positive int, failing CLOSED.
+
+    The int-count analogue of the float-threshold finite-guard (the ar08-12
+    family). The §D9 safety-rail counts (max_per_tick_opens,
+    max_concurrent_positions) are HARD rails — a malformed operator value must
+    never silently neuter them or abort the tick.
+
+    Two distinct hazards this guards against, both of which `int(raw)` alone
+    mishandles:
+      1. Silent fail-OPEN: PyYAML parses a float-form token like
+         `1000000000.0` or `1.0e+9` to a Python float; `int(1e9)` succeeds and
+         the rail's `>= cap` test never trips -> the autonomous book grows
+         UNBOUNDED. We treat a non-int (float/str/…) as malformed and fall
+         CLOSED to the documented default.
+      2. Crash / DoS of the gate: `.inf` -> int() raises OverflowError; `.nan`
+         -> ValueError; `abc` / `1e9` (str) -> ValueError. Uncaught at the
+         `rails = _read_safety_rails()` call site, this aborts the ENTIRE tick
+         before any gate or kill-switch evaluation runs. We catch and fall
+         CLOSED instead.
+
+    A value < 1 would also disable the per-tick / concurrent rail (a cap of 0
+    can never be reached as a lower bound, and a negative is nonsense), so it
+    likewise falls back to the conservative default.
+
+    Byte-identical for any legal positive int (`int` or an int-valued config).
+    """
+    # Reject non-int types up front (a float like 1e9 from a YAML float-form
+    # token must NOT silently pass through as a billion-slot cap). bool is an
+    # int subclass but a True/False cap is nonsense -> treat as malformed.
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        try:
+            val = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            logger.warning(
+                "autonomous: safety-rail count %s=%r is not a valid integer; "
+                "falling CLOSED to default %d (D9 rail preserved)",
+                name,
+                raw,
+                default,
+            )
+            return default
+        # A float/str token that DID coerce (e.g. 1000000000.0 -> 1000000000):
+        # the operator wrote a non-int form for a hard-rail count. Falling
+        # closed is the conservative, fail-CLOSED choice — a billion-slot cap
+        # is a silent neuter, not a legitimate config.
+        logger.warning(
+            "autonomous: safety-rail count %s was configured as %r (a non-int "
+            "form, e.g. a float); falling CLOSED to default %d so the D9 rail "
+            "is not silently neutered",
+            name,
+            raw,
+            default,
+        )
+        return default
+    val = raw
+    if val < 1:
+        logger.warning(
+            "autonomous: safety-rail count %s=%d is < 1 (would disable the D9 "
+            "rail); falling CLOSED to default %d",
+            name,
+            val,
+            default,
+        )
+        return default
+    return val
+
+
 def _read_safety_rails() -> dict:
     cfg = _read_config()
     auto = (cfg.get("quant") or {}).get("autonomous") or {}
     risk = (cfg.get("quant") or {}).get("risk") or {}
     return {
-        "max_per_tick_opens": int(auto.get("max_per_tick_opens", 1)),
-        "max_concurrent_positions": int(auto.get("max_concurrent_positions", 5)),
+        "max_per_tick_opens": _positive_int_count(
+            auto.get("max_per_tick_opens", 1), 1, "max_per_tick_opens"
+        ),
+        "max_concurrent_positions": _positive_int_count(
+            auto.get("max_concurrent_positions", 5), 5, "max_concurrent_positions"
+        ),
         "kill_switch_pct": float(auto.get("kill_switch_pct", 0.10)),
         "log_silences": bool(auto.get("log_silences", False)),
         "allow_live": bool(auto.get("allow_live", False)),

@@ -652,3 +652,134 @@ def test_portfolio_caps_dry_run_simulates_state_consumption(
         d for d in result.decisions if d.gate == "SILENCE_PORTFOLIO_CAP"
     ]
     assert len(portfolio_silences) >= 1
+
+
+# ---------------------------------------------------------------------------
+# ADR-0016 §D9 safety-rail COUNT validation (max_per_tick_opens /
+# max_concurrent_positions). These are int-counts of the hard rail, read via
+# int() with no finite/positive guard. A float-form operator YAML value
+# (1000000000.0, 1.0e+9) silently neuters the rail (fail-OPEN, unbounded book);
+# .inf / .nan / garbage abort the entire tick uncaught (DoS of the gate before
+# any kill-switch evaluation). int-count cousin of the float-threshold family.
+# ---------------------------------------------------------------------------
+
+
+def _write_config_with_concurrent_token(cfg_path: Path, token: str) -> None:
+    """Write a config whose quant.autonomous.max_concurrent_positions is the raw
+    YAML token `token` (so an operator's `1.0e+9` / `.inf` / `.nan` value is
+    reproduced exactly through yaml.safe_load, not pre-coerced by the test)."""
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        "quant:\n"
+        "  pdr:\n"
+        "    mode: autonomous\n"
+        "  autonomous:\n"
+        "    max_per_tick_opens: 10\n"
+        f"    max_concurrent_positions: {token}\n",
+        encoding="utf-8",
+    )
+
+
+def _seed_open_positions(quant_home: Path, n: int) -> None:
+    """Seed `n` distinct open paper positions into executions.jsonl so the
+    tick's concurrent-cap rail counts them at tick start."""
+    rows = [
+        json.dumps(
+            {
+                "reactor_name": "paper",
+                "asset": f"HELD{i}",
+                "target_position_pct": 0.10,
+                "asof_execution": "2026-05-13T19:00:00Z",
+            }
+        )
+        for i in range(n)
+    ]
+    (quant_home / "executions.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def test_max_concurrent_float_form_does_not_neuter_d9_rail(
+    isolate_config, isolate_quant_home
+):
+    """Operator YAML `max_concurrent_positions: 1000000000.0` (float) must NOT
+    silently disable the §D9 concurrent-positions hard rail.
+
+    RED (pre-fix): int(1e9) = 1_000_000_000, so projected_concurrent (6 held +
+    fires) never reaches the cap and the new symbol FIREs -> the always-on
+    safety rail is silently neutered (fail-OPEN, unbounded book).
+    GREEN (post-fix): a float-form count falls CLOSED to the documented default
+    (5); with 6 positions already open, the new symbol is SILENCE_CONCURRENT_CAP.
+    """
+    _write_config_with_concurrent_token(isolate_config, "1000000000.0")
+    # 6 positions already open -> already over the default cap of 5.
+    _seed_open_positions(isolate_quant_home, 6)
+
+    result = tick(
+        dry_run=True,
+        symbols=[WatchlistEntry("NEWSYM", "equity", "1d")],
+        advisor_recommend=lambda **kw: _make_advisor_result(),
+    )
+
+    concurrent_caps = [
+        d for d in result.decisions if d.gate == "SILENCE_CONCURRENT_CAP"
+    ]
+    assert len(concurrent_caps) == 1, (
+        "float-form max_concurrent_positions silently neutered the D9 rail: "
+        f"decisions={[(d.symbol, d.gate) for d in result.decisions]}"
+    )
+    assert result.fires == 0
+
+
+@pytest.mark.parametrize("token", [".inf", ".nan", "abc", "1e9"])
+def test_safety_rail_count_garbage_does_not_abort_tick(
+    isolate_config, isolate_quant_home, token
+):
+    """Operator YAML `max_concurrent_positions: .inf` / `.nan` / non-numeric must
+    NOT abort the whole tick before any gate or kill-switch evaluation.
+
+    RED (pre-fix): int(float('inf')) -> OverflowError; int(nan) -> ValueError;
+    int('abc')/int('1e9') -> ValueError; all uncaught at `rails =
+    _read_safety_rails()` -> tick() raises and the §D9 / kill-switch gates never
+    run (DoS of the deterministic gate).
+    GREEN (post-fix): the count falls CLOSED to the documented default (5) with a
+    warning and the tick completes; with 6 held positions the new symbol is
+    SILENCE_CONCURRENT_CAP (rail still ENFORCED on the safe default).
+    """
+    _write_config_with_concurrent_token(isolate_config, token)
+    _seed_open_positions(isolate_quant_home, 6)
+
+    # Must not raise.
+    result = tick(
+        dry_run=True,
+        symbols=[WatchlistEntry("NEWSYM", "equity", "1d")],
+        advisor_recommend=lambda **kw: _make_advisor_result(),
+    )
+
+    # Rail is enforced on the safe default (5), not neutered or crashed.
+    concurrent_caps = [
+        d for d in result.decisions if d.gate == "SILENCE_CONCURRENT_CAP"
+    ]
+    assert len(concurrent_caps) == 1
+    assert result.fires == 0
+
+
+def test_read_safety_rails_falls_closed_on_bad_count(isolate_config):
+    """_read_safety_rails() returns the documented int defaults on a bad count
+    instead of crashing or returning a non-int (mirrors the float-threshold
+    finite-guard family)."""
+    import hermes_quant.autonomous as auto
+
+    for token, key, default in [
+        (".inf", "max_concurrent_positions", 5),
+        (".nan", "max_concurrent_positions", 5),
+        ("1000000000.0", "max_concurrent_positions", 5),
+        ("0", "max_concurrent_positions", 5),  # <1 would disable the rail
+        ("-3", "max_per_tick_opens", 1),
+        (".inf", "max_per_tick_opens", 1),
+    ]:
+        isolate_config.parent.mkdir(parents=True, exist_ok=True)
+        isolate_config.write_text(
+            "quant:\n  autonomous:\n" f"    {key}: {token}\n", encoding="utf-8"
+        )
+        rails = auto._read_safety_rails()
+        assert rails[key] == default, f"{key}={token!r} should fall closed to {default}"
+        assert isinstance(rails[key], int)
