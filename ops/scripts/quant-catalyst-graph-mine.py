@@ -56,7 +56,17 @@ def _yf_forward_return(symbol: str, asof: date) -> float | None:
         close = close.iloc[:, 0]
     close = close.dropna()
     import pandas as pd
-    entry = close.index[close.index >= pd.Timestamp(asof)]
+    # ar65: enter at the NEXT bar STRICTLY AFTER asof, not the same-day bar (the unfixed
+    # sibling of ar29 in quant-catalyst-profitability.py). The asof is the headline
+    # PUBLICATION time (propagation.py:201); yfinance daily bars are midnight-stamped, so
+    # `>= asof` picks the bar ON asof when one exists, scoring an intraday-published signal
+    # against close[D] (the publication-day move it could NOT have captured) — a same-bar
+    # LOOKAHEAD. The consuming module's contract is explicit (graph_mining.py:278: "the
+    # fetcher reads the NEXT bar after asof"). `>` makes the entry the first tradeable bar
+    # after publication; this forward return drives the per-edge sign_hit_rate ->
+    # suggested_effect_sign FLIP and the silence-only confidence_multiplier taper, so the
+    # bias is load-bearing on the advisory FLIP_SIGN/DOWNWEIGHT/PRUNE verdicts.
+    entry = close.index[close.index > pd.Timestamp(asof)]
     if len(entry) == 0:
         return None
     entry_px = float(close.loc[entry[0]])

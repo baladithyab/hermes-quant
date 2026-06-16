@@ -544,3 +544,48 @@ def test_cron_flag_off_silent(cron, monkeypatch, tmp_path, capsys):  # 17f / 16-
     monkeypatch.setattr(sys, "argv", ["prog"])
     assert cron.main() == 0
     assert capsys.readouterr().out == ""
+
+
+# ===========================================================================
+# ar65 — graph-mine forward-return fetcher enters the NEXT bar (> asof), not
+#         the same-day publication bar (the unfixed sibling of ar29).
+# ===========================================================================
+
+
+def test_ar65_graph_mine_forward_return_enters_next_bar_not_same_day(cron, monkeypatch):
+    """The graph-mine fetcher must enter the first TRADEABLE bar STRICTLY AFTER asof,
+    not the publication-day bar. asof is the headline PUBLICATION time
+    (propagation.py:201); yfinance daily bars are midnight-stamped, so a `>= asof`
+    selection picks the bar ON the publication day — a same-bar LOOKAHEAD that embeds
+    the publication-day move the signal could not have captured. graph_mining.py:278's
+    contract is explicit: "the fetcher reads the NEXT bar after asof". This is the
+    EXACT defect ar29 fixed in the profitability sibling; the graph-mine fetcher's
+    real _yf_forward_return entry-bar selection is never exercised by the injected
+    fetchers elsewhere in this file, so the lookahead was unguarded AND untested.
+
+    Same fixture as the ar29 profitability test:
+        close[D=2026-06-01]=100 (publication-day bar), close[D+1]=110 (first tradeable
+        bar after asof), exit -> 121.
+        - same-day (>=) entry yields 121/100 - 1 = 21%  (the LOOKAHEAD bias)
+        - next-bar (>)  entry yields 121/110 - 1 ~= 10% (lookahead-honest, correct)
+    """
+    import datetime as _dt
+
+    import pandas as pd
+
+    # Daily closes: a bar exists ON asof (an intraday-published signal). The 21-day
+    # fwd window exceeds the frame, so the exit falls to the last bar (121).
+    idx = pd.to_datetime(["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04"])
+    df = pd.DataFrame({"Close": pd.Series([100.0, 110.0, 121.0, 121.0], index=idx)})
+
+    import yfinance as yf
+    monkeypatch.setattr(yf, "download", lambda *a, **k: df)
+
+    ret = cron._yf_forward_return("X", _dt.date(2026, 6, 1))
+    assert ret is not None
+    # ar65: entry must be the NEXT bar (close[D+1]=110), NOT the same-day close[D]=100.
+    assert ret == pytest.approx((121.0 / 110.0 - 1) * 100), (
+        f"ar65: graph-mine forward return {ret} implies a same-day (>= asof) entry; "
+        f"the next-bar (> asof) contract (graph_mining.py:278) requires entry=110 -> "
+        f"{(121.0/110.0-1)*100:.4f}, not the lookahead {(121.0/100.0-1)*100:.4f}"
+    )
