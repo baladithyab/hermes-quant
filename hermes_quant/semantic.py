@@ -143,7 +143,24 @@ def validate_semantic_packet(
     if packet_asof > ctx_asof:
         return False, "future_packet"
     age_minutes = (ctx_asof - packet_asof).total_seconds() / 60.0
-    if age_minutes > max_age_minutes:
+    # ar50: finite-guard the operator-supplied staleness ceiling at the single
+    # chokepoint both the analyst and any direct caller route through. An
+    # operator recipe YAML (analyst_config.hermes_semantic.max_age_minutes) flows
+    # verbatim into the frozen dataclass and is fed here unchecked; a non-finite
+    # ceiling (.nan -> NaN, 1e400 -> inf) makes `age_minutes > ceiling` always
+    # False, silently DISABLING the freshness gate and admitting arbitrarily
+    # stale catalyst data into the live committee. A negative ceiling is also
+    # nonsensical. Clamp to the documented 1-day default so the abstain-on-stale
+    # behavior is preserved (the analyst's intended no-op default), byte-identical
+    # for any finite, non-negative ceiling. Threshold-side sibling of ar33
+    # (packet asof NaT, data side) and ar41 (governance/promotion thresholds).
+    try:
+        _ceiling = float(max_age_minutes)
+    except (TypeError, ValueError):
+        _ceiling = float("nan")
+    if not math.isfinite(_ceiling) or _ceiling < 0:
+        _ceiling = 24 * 60
+    if age_minutes > _ceiling:
         return False, "stale_packet"
 
     if (
