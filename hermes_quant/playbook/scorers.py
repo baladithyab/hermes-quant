@@ -556,8 +556,21 @@ def compute_play_snapshot(symbol: str, asof: date | datetime | None = None) -> d
         return snap
 
     # --- price history ------------------------------------------------- #
+    # auto_adjust=True so the STATISTICAL features (realized_vol_30d, rsi_14,
+    # atr, the 52-week-high window, five_d_return) AND the regime classifier
+    # see SPLIT-CONSISTENT closes. A corporate action (e.g. a 4:1 split) on
+    # the raw as-traded series would inject a single ln(0.25) log-return into
+    # _realized_vol — annualizing to a spurious ~22x realized_vol_30d that
+    # trips the swing vol_runaway eviction (profiles.py gt_field 2.0) and
+    # blows past the swing HARD admit band — and would inflate the raw 52-week
+    # high ~Nx so a name at its true high reads ~-75% below it (a covered_call
+    # / leaps soft-rule miss). The playbook is the ANALYSIS side, where
+    # back-adjustment IS wanted; the RAW-OHLC posture is reserved for the
+    # decision-price path only (cf. data/yfinance_provider.py:211). auto_adjust
+    # anchors on the most-recent bar, so last_close stays the raw as-traded
+    # price for the price-band gates (between 10/500, price_too_low).
     try:
-        hist = tk.history(period="1y", auto_adjust=False)
+        hist = tk.history(period="1y", auto_adjust=True)
     except Exception:
         hist = None
 
