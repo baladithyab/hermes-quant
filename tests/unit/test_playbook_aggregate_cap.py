@@ -106,12 +106,21 @@ def _force_all_fire(monkeypatch: pytest.MonkeyPatch, mod: Any) -> None:
 def _install_order_spy(monkeypatch: pytest.MonkeyPatch, mod: Any) -> list[dict[str, Any]]:
     placed: list[dict[str, Any]] = []
 
-    def fake_order(symbol: str, notional_usd: float, *, side: str = "buy") -> dict[str, Any]:
-        placed.append({"symbol": symbol, "notional_usd": notional_usd, "side": side})
+    def fake_order(
+        symbol: str,
+        notional_usd: float,
+        *,
+        side: str = "buy",
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        placed.append({
+            "symbol": symbol, "notional_usd": notional_usd, "side": side,
+            "client_order_id": client_order_id,
+        })
         idx = len(placed)
         return {
             "id": f"order-{idx}",
-            "client_order_id": f"client-{idx}",
+            "client_order_id": client_order_id or f"client-{idx}",
             "submitted_at": FIXED_TS,
         }
 

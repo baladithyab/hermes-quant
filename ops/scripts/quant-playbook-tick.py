@@ -37,16 +37,25 @@ this script's reason for existence), ADR-0029 (multi-leg reactor — pending).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import json
 import logging
 import math
 import os
+import re
 import sys
 import traceback
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+try:  # fcntl is POSIX-only; degrade to a no-op lock on platforms without it.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    _fcntl = None
 
 # Silence noisy third-party loggers up front (yfinance/curl_cffi/urllib3 emit
 # stderr noise that's not actionable from cron POV).
@@ -108,6 +117,75 @@ def append_journal(record: dict[str, Any]) -> None:
             os.fsync(f.fileno())
     except OSError as e:
         sys.stderr.write(f"playbook-tick journal write failed: {e}\n")
+
+
+# ---------- cross-process fire idempotency (ADR-0078 tick-lock parity) ----------
+def build_client_order_id(today_et: str, symbol: str, play: str) -> str:
+    """Deterministic client_order_id for a (date_et, symbol, play) logical fire.
+
+    The playbook raw-Alpaca fire path does NOT route through the paper-reactor
+    seam and so never acquires the per-symbol tick-lock that the reactor path
+    holds. Two concurrent armed runs (CRON-REGISTRY job #6 daily --armed + job
+    #10 hourly autonomous+armed, or an operator manual --armed run overlapping
+    the cron) can both read an identical `fired_set` lacking the not-yet-
+    journaled (symbol, play) and both POST. A *deterministic* client_order_id
+    makes the broker reject the duplicate: Alpaca enforces client_order_id
+    uniqueness per account, so the second POST of the same logical signal
+    fails server-side even under a fully lockless race.
+
+    Format: hq-playbook-<date>-<SYMBOL>-<play>, slugified to the broker-safe
+    charset and clamped to <=128 chars (Alpaca's client_order_id limit).
+    """
+    raw = f"hq-playbook-{today_et}-{symbol}-{play}"
+    slug = re.sub(r"[^A-Za-z0-9._-]", "-", raw)
+    return slug[:128]
+
+
+@contextlib.contextmanager
+def fire_lock(symbol: str, play: str, *, blocking: bool = True) -> Iterator[bool]:
+    """Per-(symbol, play) advisory flock that serializes the read->POST->journal
+    fire sequence across processes — the same intra-host coordination
+    react/paper.py's symbol_tick_lock provides for the reactor path.
+
+    Mirrors the repo's fcntl idiom (daemon/signal_bus.append_locked,
+    daemon/lock.DaemonLock): open O_RDWR|O_CREAT without O_TRUNC, flock LOCK_EX.
+
+    Yields True if the lock was acquired (caller may proceed), False if it was
+    contended under non-blocking mode (caller must treat as "another run owns
+    this fire" and skip). Fail-open-SAFE: if fcntl is unavailable on the
+    platform, yields True (no worse than the prior lockless behavior, and the
+    deterministic client_order_id still closes the broker-level double-order).
+    """
+    if _fcntl is None:  # pragma: no cover - non-POSIX fallback
+        yield True
+        return
+
+    # Derive the lock dir from PLAYBOOK_DIR at call time (not a frozen module
+    # constant) so the test fixtures' rebind of PLAYBOOK_DIR is honored and
+    # lock files stay inside the isolated fake-home.
+    fire_lock_dir = PLAYBOOK_DIR / "fire-locks"
+    fire_lock_dir.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^A-Za-z0-9._-]", "-", f"{symbol}-{play}")[:120]
+    lock_path = fire_lock_dir / f"{slug}.lock"
+    flags = _fcntl.LOCK_EX | (0 if blocking else _fcntl.LOCK_NB)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    acquired = False
+    try:
+        try:
+            _fcntl.flock(fd, flags)
+            acquired = True
+        except OSError as e:
+            if not blocking and e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                yield False
+                return
+            raise
+        yield True
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 # ---------- halt-state fail-closed gate ----------
@@ -222,11 +300,23 @@ def _load_creds() -> dict[str, str]:
     return out
 
 
-def place_paper_market_order(symbol: str, notional_usd: float, *, side: str = "buy") -> dict[str, Any]:
+def place_paper_market_order(
+    symbol: str,
+    notional_usd: float,
+    *,
+    side: str = "buy",
+    client_order_id: str | None = None,
+) -> dict[str, Any]:
     """Place a paper-account market order for `notional_usd` USD on `symbol`.
 
     Returns Alpaca's order JSON on 200/201, or {"error": ...} on failure.
     Never raises — a routing failure shouldn't crash the whole tick.
+
+    `client_order_id`, when supplied, is sent in the POST body so the broker
+    can enforce order-id uniqueness and reject a duplicate of the same logical
+    fire (see build_client_order_id). This is the broker-level half of the
+    concurrent double-fire guard; the local advisory flock (fire_lock) is the
+    other half.
     """
     import urllib.error
     import urllib.request
@@ -238,13 +328,16 @@ def place_paper_market_order(symbol: str, notional_usd: float, *, side: str = "b
     if not (key and secret and base):
         return {"error": "alpaca_creds_missing", "detail": "alpaca.env incomplete"}
 
-    body = json.dumps({
+    payload: dict[str, Any] = {
         "symbol": symbol,
         "notional": f"{notional_usd:.2f}",
         "side": side,
         "type": "market",
         "time_in_force": "day",
-    }).encode("utf-8")
+    }
+    if client_order_id:
+        payload["client_order_id"] = client_order_id
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(f"{base}/orders", data=body, method="POST")
     req.add_header("APCA-API-KEY-ID", key)
     req.add_header("APCA-API-SECRET-KEY", secret)
@@ -1125,6 +1218,8 @@ def process_pair(
     # 4. FIRE — place order (or dry-run skip)
     notional = kelly_to_notional(advisor_result)
     if dry_run:
+        # Dry-run never POSTs, so it needs neither the fire-lock nor a
+        # client_order_id — keep this path byte-identical to the prior behavior.
         return {**base,
                 "decision": "fire",
                 "gate": "FIRE",
@@ -1146,26 +1241,46 @@ def process_pair(
                     "notional_usd": journal_notional,
                     **aggregate_budget.journal_fields()}
 
-    order = place_paper_market_order(symbol, notional, side="buy")
-    if "error" in order:
-        return {**base, "decision": "gate_reject",
-                "gate": "FIRE_BUT_ROUTE_FAILED",
-                "confidence": confidence,
-                "reason": f"alpaca route failed: {order.get('error')}: {order.get('detail','')}",
-                "notional_usd": notional}
+    # Cross-process fire serialization (parity with react/paper.py symbol_tick_lock):
+    # acquire a per-(symbol, play) advisory flock, then RE-READ the authoritative
+    # on-disk fired set inside the lock. This closes the read-once-fired_set TOCTOU
+    # — a concurrent armed run that already POSTed + journaled this (symbol, play)
+    # is now visible, so we skip instead of double-firing. The deterministic
+    # client_order_id is the broker-level backstop if flock is unavailable.
+    with fire_lock(symbol, play) as locked:
+        if locked and (symbol, play) in fired_today_pairs():
+            return {**base, "decision": "idempotent_skip",
+                    "reason": "already fired today (concurrent run won the fire-lock)"}
 
-    if aggregate_budget is not None:
-        aggregate_budget.record_placed(notional)
+        client_order_id = build_client_order_id(today_et, symbol, play)
+        order = place_paper_market_order(
+            symbol, notional, side="buy", client_order_id=client_order_id,
+        )
+        if "error" in order:
+            return {**base, "decision": "gate_reject",
+                    "gate": "FIRE_BUT_ROUTE_FAILED",
+                    "confidence": confidence,
+                    "reason": f"alpaca route failed: {order.get('error')}: {order.get('detail','')}",
+                    "notional_usd": notional,
+                    "client_order_id": client_order_id}
 
-    return {**base,
-            "decision": "fire",
-            "gate": "FIRE",
-            "confidence": confidence,
-            "reason": reason,
-            "notional_usd": notional,
-            "order_id": order.get("id"),
-            "client_order_id": order.get("client_order_id"),
-            "submitted_at": order.get("submitted_at")}
+        if aggregate_budget is not None:
+            aggregate_budget.record_placed(notional)
+
+        fire_rec = {**base,
+                    "decision": "fire",
+                    "gate": "FIRE",
+                    "confidence": confidence,
+                    "reason": reason,
+                    "notional_usd": notional,
+                    "order_id": order.get("id"),
+                    "client_order_id": order.get("client_order_id") or client_order_id,
+                    "submitted_at": order.get("submitted_at")}
+        # Journal the fire BEFORE releasing the lock so the NEXT contender's
+        # in-lock fired_today_pairs() re-read sees this slot as claimed. The
+        # _journaled marker tells run_tick not to append a duplicate line.
+        append_journal(fire_rec)
+        return {**fire_rec, "_journaled": True}
 
 
 # ---------- main tick ----------
@@ -1240,7 +1355,13 @@ def run_tick(*, dry_run: bool) -> dict[str, Any]:
                 "trace": traceback.format_exc(),
                 "dry_run": dry_run,
             }
-        append_journal(rec)
+        # A real fire is journaled inside process_pair under the fire-lock (so
+        # the next contender's in-lock re-read sees the claimed slot). The
+        # _journaled marker means "already on disk" — don't double-append it.
+        if rec.pop("_journaled", False):
+            pass
+        else:
+            append_journal(rec)
         d = rec.get("decision")
         if d == "fire":
             summary["fired"] += 1
