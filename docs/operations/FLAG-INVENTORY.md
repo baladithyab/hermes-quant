@@ -59,7 +59,7 @@
 | `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:762` |
 | `HERMES_QUANT_PREWARM_WORKERS` | `` | `hermes_quant/playbook/scorers.py:781` |
 | `HERMES_QUANT_REFLECTION` | `1` | `hermes_quant/react/deterministic_equity.py:641` |
-| `HERMES_QUANT_REFLECTOR_LLM` | `0` | `hermes_quant/memory/reflector.py:554` |
+| `HERMES_QUANT_REFLECTOR_LLM` | `0` | `hermes_quant/memory/reflector.py:559` |
 | `HERMES_QUANT_REGIME_HMM` | `` | `hermes_quant/regime/detector.py:123` |
 | `HERMES_QUANT_RESEARCH_DEBATE` | `0` | `hermes_quant/aggregators/llm_committee.py:1145` |
 | `HERMES_QUANT_RESEARCH_LOOP` | `0` | `hermes_quant/research/research_loop.py:88` |
