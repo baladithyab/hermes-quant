@@ -369,14 +369,51 @@ def compute_cumulative_realized_pnl_pct(
         # the sentinel _normalize_exec_record assigns when no explicit account_id is set);
         # other accounts (freqtrade, and any future named/true-unit lane) have their own
         # rails and must not pollute this NAV-fraction basis.
-        # ar25: within paper-default, qty is ALREADY a NAV-fraction, so a round-trip's
-        # NAV-fraction P&L is realized_return × qty. Sum directly — NAV cancels (do NOT
+        # ar25: within paper-default, a SINGLE-LEG fill's qty is ALREADY a NAV-fraction, so
+        # its NAV-fraction P&L is realized_return × qty. Sum directly — NAV cancels (do NOT
         # multiply by entry_price, do NOT divide by NAV). A non-finite term is skipped.
+        #
+        # ar57: a MULTI-LEG per-leg child is the EXCEPTION. MultiLegPaperReactor._build_records
+        # writes EVERY leg's fill_size_pct == the WHOLE family's NAV fraction F (a proxy), so
+        # qty == F for every leg — NOT a true per-leg weight. Summing realized_return × F per
+        # leg (a) over-counts F once per leg (Σ = F×leg_count, not F) and (b) weights legs of
+        # vastly different true notionals EQUALLY, so a small offsetting option leg (+98% on
+        # premium kept) masks a large stock-leg loss → the basis biases POSITIVE and the
+        # kill-switch fails to trip on a genuine realized loss (fail-OPEN on the ADR-0016 rail).
+        # For a multi-leg leg the authoritative size is reactor_metadata.quantity (signed TRUE
+        # units, carried as rt.true_units); its real NAV-fraction P&L is
+        #   realized_return × (|true_units| × entry_price × contract_multiplier) / NAV
+        # which makes Σ over a family's legs equal the family's true net realized NAV fraction.
+        # We read NAV ONLY for these legs; a multi-leg leg with NAV unreadable or missing
+        # true_units fails CLOSED to the equal-F proxy (never silently drops a realized loss).
+        nav_usd: float | None = None
+        nav_resolved = False
         frac = 0.0
         for rt in round_trips:
             if getattr(rt, "account_id", "paper-default") != "paper-default":
                 continue
-            term = rt.realized_return * rt.qty
+            mleg_id = getattr(rt, "multi_leg_id", None)
+            true_units = getattr(rt, "true_units", None)
+            if mleg_id is not None and true_units is not None:
+                if not nav_resolved:
+                    nav_usd = _account_nav_usd()
+                    nav_resolved = True
+                mult = getattr(rt, "notional_multiplier", 1.0) or 1.0
+                if (
+                    nav_usd is not None
+                    and math.isfinite(nav_usd)
+                    and nav_usd > 0
+                    and math.isfinite(true_units)
+                    and math.isfinite(rt.entry_price)
+                ):
+                    leg_notional = abs(true_units) * abs(rt.entry_price) * abs(mult)
+                    term = rt.realized_return * (leg_notional / nav_usd)
+                else:
+                    # Fail CLOSED: NAV unreadable / non-finite inputs → fall back to the
+                    # equal-F proxy so a realized LOSS is never silently dropped to 0.
+                    term = rt.realized_return * rt.qty
+            else:
+                term = rt.realized_return * rt.qty
             if not math.isfinite(term):
                 continue
             frac += term

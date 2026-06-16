@@ -401,6 +401,15 @@ def dispatch_settlement(
 #   - deterministic: FIFO lot matching over records in bus order; no RNG, no
 #     clock reads.
 
+# ar57: US equity-option contract multiplier (shares controlled per contract). A
+# us_option fill_price is a PER-CONTRACT premium; true notional = premium × contracts
+# × 100. Mirrors portfolio_state._CONTRACT_MULTIPLIER / options.data._CONTRACT_MULTIPLIER;
+# defined locally so the daemon does not import the options package. Used ONLY to weight
+# multi-leg per-leg children by their TRUE per-leg notional fraction of NAV on the
+# kill-switch basis (compute_cumulative_realized_pnl_pct); has no effect on single-leg
+# round-trips (notional_multiplier defaults to 1.0).
+_OPTION_CONTRACT_MULTIPLIER = 100.0
+
 
 @dataclass(frozen=True)
 class SettledRoundTrip:
@@ -439,6 +448,19 @@ class SettledRoundTrip:
     The fee drag (prorated fees / entry notional) is subtracted from gross so
     the sign convention is "positive return == the lot made money".
     """
+    # ar57: multi-leg per-leg true-notional weighting (default None/0.0/1.0 keeps
+    # every single-leg / equity round-trip byte-identical). For a MultiLegPaperReactor
+    # per-leg CHILD, ``qty`` is the WHOLE-family NAV fraction F (the proxy
+    # _build_records writes on every leg), NOT a true per-leg weight. The kill-switch
+    # basis must instead weight each leg by its TRUE per-leg notional fraction of NAV,
+    # derived from the authoritative signed-true-units in reactor_metadata.quantity
+    # (multileg.py docstring declares ``quantity`` authoritative; the fraction a
+    # "proxy"). These carry that true unit count + the contract multiplier so the
+    # rail can compute abs(true_units)·entry_price·multiplier per leg. Non-multileg
+    # records leave multi_leg_id None and stay on the realized_return×qty fast-path.
+    multi_leg_id: str | None = None
+    true_units: float | None = None  # signed reactor_metadata.quantity (matched share)
+    notional_multiplier: float = 1.0  # 100 for us_option, 1 for equity
 
 
 def _coerce_asof(value) -> pd.Timestamp | None:
@@ -586,6 +608,27 @@ def _normalize_exec_record(rec: dict) -> dict | None:
     )
     exec_id = rec.get("exec_id") or rec.get("proposal_id")
 
+    # ar57: capture the multi-leg per-leg true-unit weighting inputs. A
+    # MultiLegPaperReactor child carries reactor_metadata.multi_leg_id + the
+    # authoritative signed TRUE units in reactor_metadata.quantity; its
+    # fill_size_pct (and hence qty above) is the WHOLE-family NAV fraction F (a
+    # proxy), the SAME for every leg. We surface multi_leg_id + true_units +
+    # the contract multiplier so the kill-switch basis can re-weight each leg by
+    # its real per-leg notional fraction of NAV instead of the equal-F proxy.
+    # A record with no multi_leg_id leaves these None/1.0 -> the existing
+    # realized_return × qty fast-path is byte-identical.
+    multi_leg_id = rmeta.get("multi_leg_id")
+    true_units = rmeta.get("quantity") if multi_leg_id is not None else None
+    try:
+        true_units_f = float(true_units) if true_units is not None else None
+    except (TypeError, ValueError):
+        true_units_f = None
+    notional_multiplier = (
+        _OPTION_CONTRACT_MULTIPLIER
+        if rec.get("asset_class") == "us_option"
+        else 1.0
+    )
+
     return {
         "side": side,
         "qty": qty_f,
@@ -597,6 +640,9 @@ def _normalize_exec_record(rec: dict) -> dict | None:
         "exec_id": exec_id,
         "signal_id": rec.get("signal_id"),
         "fees": fees,
+        "multi_leg_id": multi_leg_id,
+        "true_units": true_units_f,
+        "notional_multiplier": notional_multiplier,
         "_idx": rec.get("_idx", 0),
     }
 
@@ -862,6 +908,11 @@ def join_exit_fills(
                     "exec_id": rec.get("exec_id"),
                     "signal_id": rec.get("signal_id"),
                     "fee_per_unit": fee_per_unit,
+                    # ar57: carry the multi-leg per-leg true-notional weighting inputs
+                    # forward to the round-trip (None/1.0 for non-multileg lots).
+                    "multi_leg_id": rec.get("multi_leg_id"),
+                    "true_units": rec.get("true_units"),
+                    "notional_multiplier": rec.get("notional_multiplier", 1.0),
                 }
             )
             continue
@@ -895,6 +946,19 @@ def join_exit_fills(
             fee_drag = (prorated_fees / entry_notional) if entry_notional > 0 else 0.0
             realized_return = gross - fee_drag
 
+            # ar57: prorate the entry lot's signed TRUE units (reactor_metadata.quantity)
+            # to the matched fraction of this pairing. lot["qty"] here is the PRE-decrement
+            # NAV-fraction (the decrement below happens after this append), so
+            # matched/lot["qty"] is the fraction of the lot settled by this exit. None for
+            # non-multileg lots -> the round-trip's true_units stays None (fast-path).
+            lot_true_units = lot.get("true_units")
+            lot_qty = lot["qty"]
+            matched_true_units = (
+                lot_true_units * (matched / lot_qty)
+                if (lot_true_units is not None and lot_qty > 0)
+                else None
+            )
+
             round_trips.append(
                 SettledRoundTrip(
                     asset=lot["asset"],
@@ -912,6 +976,9 @@ def join_exit_fills(
                     exit_signal_id=rec.get("signal_id"),
                     fees=prorated_fees,
                     realized_return=realized_return,
+                    multi_leg_id=lot.get("multi_leg_id"),
+                    true_units=matched_true_units,
+                    notional_multiplier=lot.get("notional_multiplier", 1.0),
                 )
             )
 
@@ -922,6 +989,13 @@ def join_exit_fills(
 
         # Residual quantity beyond what the open queue could honestly settle.
         if remaining > 1e-12:
+            # ar57: prorate the residual's true units to the residual NAV-fraction.
+            rec_true_units = rec.get("true_units")
+            residual_true_units = (
+                rec_true_units * (remaining / qty)
+                if (rec_true_units is not None and qty > 0)
+                else None
+            )
             residual_lot = {
                 "asset": rec.get("asset"),
                 "account_id": rec.get("account_id"),
@@ -933,6 +1007,9 @@ def join_exit_fills(
                 "exec_id": rec.get("exec_id"),
                 "signal_id": rec.get("signal_id"),
                 "fee_per_unit": exit_fee_per_unit,
+                "multi_leg_id": rec.get("multi_leg_id"),
+                "true_units": residual_true_units,
+                "notional_multiplier": rec.get("notional_multiplier", 1.0),
             }
             if asof_honest_break:
                 # Defect (3): the queue still holds opposing lots that opened
