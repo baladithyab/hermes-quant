@@ -121,12 +121,17 @@ def test_react_guard_silent_for_paper_reactor_when_flag_set(
     holder = _patch_reactor(monkeypatch, name="paper")
 
     # Must not raise; execute() is a no-op stub so no real fill is written.
-    pid = _react(
+    out = _react(
         _advisor_result(),
         _entry(),
         fill_size_pct=0.05,
         paper_zero_costs=True,
     )
+    # ar38/ar80: _react returns (pid, realized_fill_size_pct) on a fire (None on no-fill).
+    # The stub reactor.execute() returns None (no record) -> not a no-fill record -> _react
+    # returns (pid, None).
+    assert out is not None
+    pid, _realized = out
     assert isinstance(pid, str) and pid, "expected a synthesized proposal_id"
     assert holder["reactor"].executed is True, (
         "paper reactor must proceed past the guard to execute()"
@@ -143,12 +148,14 @@ def test_react_guard_silent_for_non_paper_reactor_when_flag_unset(
     holder = _patch_reactor(monkeypatch, name="live")
 
     # paper_zero_costs defaults to False; pass explicitly for clarity.
-    pid = _react(
+    out = _react(
         _advisor_result(),
         _entry(),
         fill_size_pct=0.05,
         paper_zero_costs=False,
     )
+    assert out is not None
+    pid, _realized = out
     assert isinstance(pid, str) and pid
     assert holder["reactor"].executed is True, (
         "with the flag off the guard is bypassed and execution proceeds"
