@@ -15,9 +15,13 @@ import pytest
 from hermes_quant.memory import weekly_retro
 from hermes_quant.memory.weekly_retro import (
     BELIEF_BUDGET_PER_ROLE,
+    CURRENT_BELIEF_SCHEMA_VERSION,
+    HALF_LIFE_DAYS,
     MIN_SUPPORT_N,
     RECENCY_EXPIRE_EPSILON,
+    Belief,
     access_touch,
+    decay_and_promote,
     distill_beliefs,
     materialize_active,
     run_weekly_retro,
@@ -215,6 +219,108 @@ def test_finmem_access_bump_resets_recency(paths) -> None:
     assert touched
     assert touched[0].recency == 1.0
     assert touched[0].access_counter == 1
+
+
+# ---------------------------------------------------------------------------
+# FINMEM promotion recurrence must be order-invariant (no last-writer-wins)
+# ---------------------------------------------------------------------------
+
+
+def _belief(
+    *,
+    belief_id: str,
+    ticker: str,
+    alpha_evidence: float,
+    lesson_category: str = "momentum",
+    role: str = "portfolio_manager",
+    tier: str = "weekly",
+    importance: float = 1.0,
+    support_n: int = 5,
+    asof_distilled: datetime = ASOF,
+) -> Belief:
+    return Belief(
+        schema_version=CURRENT_BELIEF_SCHEMA_VERSION,
+        belief_id=belief_id,
+        tier=tier,
+        role=role,
+        lesson_category=lesson_category,
+        verbal_delta=f"belief for {ticker} {lesson_category}",
+        alpha_evidence=alpha_evidence,
+        support_n=support_n,
+        half_life_days=HALF_LIFE_DAYS[tier],
+        access_counter=0,
+        importance=importance,
+        recency=1.0,
+        oracle_provenance={"tau_observable_max": (ASOF - timedelta(days=1)).isoformat()},
+        asof_distilled=asof_distilled.isoformat(),
+        status="active",
+    )
+
+
+def test_decay_and_promote_recurrence_is_order_invariant() -> None:
+    """A same-(role,category) belief's promotion must NOT depend on `new` ordering.
+
+    distill_beliefs can emit two same-(role, lesson_category) beliefs for DIFFERENT
+    tickers in the same week (e.g. AAPL momentum alpha=+0.05 and TSLA momentum
+    alpha<=0). The promotion gate at decay_and_promote reads ONE survivor's alpha
+    sign to decide whether an ACTIVE same-category belief is upgraded weekly->monthly
+    (importance += K, half_life 14d -> 60d, i.e. 3x stickier in the live PM/RM prompt).
+    Permuting `new` must not flip the kept belief's tier / importance / half_life.
+    """
+    active = [_belief(belief_id="active-MSFT-momentum", ticker="MSFT", alpha_evidence=0.0)]
+    winner = _belief(belief_id="bel_weekly_pm_AAPL", ticker="AAPL", alpha_evidence=+0.05)
+    loser = _belief(belief_id="bel_weekly_pm_TSLA", ticker="TSLA", alpha_evidence=-0.03)
+
+    kept_a, _ = decay_and_promote(list(active), [winner, loser], asof=ASOF)
+    kept_b, _ = decay_and_promote(list(active), [loser, winner], asof=ASOF)
+
+    a = next(b for b in kept_a if b.belief_id == "active-MSFT-momentum")
+    b = next(x for x in kept_b if x.belief_id == "active-MSFT-momentum")
+
+    assert (a.tier, a.importance, a.half_life_days) == (
+        b.tier, b.importance, b.half_life_days
+    ), (
+        "decay_and_promote promotion must be order-invariant under permutation of "
+        f"`new`; got {(a.tier, a.importance, a.half_life_days)} vs "
+        f"{(b.tier, b.importance, b.half_life_days)} (last-writer-wins recurrence key)"
+    )
+
+
+def test_decay_and_promote_promotes_on_net_positive_category_evidence() -> None:
+    """With a genuine winner present, the active category belief IS promoted
+    (net support-weighted alpha is positive), regardless of which new belief is last."""
+    active = [_belief(belief_id="active-MSFT-momentum", ticker="MSFT", alpha_evidence=0.0)]
+    # AAPL winner clearly dominates (large magnitude + support); TSLA is flat.
+    winner = _belief(belief_id="bel_weekly_pm_AAPL", ticker="AAPL",
+                     alpha_evidence=+0.05, support_n=8)
+    flat = _belief(belief_id="bel_weekly_pm_TSLA", ticker="TSLA",
+                   alpha_evidence=0.0, support_n=4)
+
+    for ordering in ([winner, flat], [flat, winner]):
+        kept, _ = decay_and_promote(list(active), list(ordering), asof=ASOF)
+        promoted = next(b for b in kept if b.belief_id == "active-MSFT-momentum")
+        assert promoted.tier == "monthly", "net-positive category evidence must promote"
+        assert promoted.importance == 2.0
+        assert promoted.half_life_days == HALF_LIFE_DAYS["monthly"]
+
+
+def test_decay_and_promote_denies_on_net_nonpositive_category_evidence() -> None:
+    """When the dominant same-category evidence is a loss/flat, an active belief is
+    refreshed (access bump / recency reset) but NOT upgraded to monthly stickiness."""
+    active = [_belief(belief_id="active-MSFT-momentum", ticker="MSFT", alpha_evidence=0.0)]
+    # The loss dominates by support weight; the small winner cannot flip the net.
+    loser = _belief(belief_id="bel_weekly_pm_TSLA", ticker="TSLA",
+                    alpha_evidence=-0.05, support_n=9)
+    tiny_win = _belief(belief_id="bel_weekly_pm_AAPL", ticker="AAPL",
+                       alpha_evidence=+0.01, support_n=2)
+
+    for ordering in ([loser, tiny_win], [tiny_win, loser]):
+        kept, _ = decay_and_promote(list(active), list(ordering), asof=ASOF)
+        refreshed = next(b for b in kept if b.belief_id == "active-MSFT-momentum")
+        assert refreshed.tier == "weekly", "net-nonpositive evidence must not promote"
+        assert refreshed.importance == 1.0
+        assert refreshed.half_life_days == HALF_LIFE_DAYS["weekly"]
+        assert refreshed.access_counter == 1, "recurrence still bumps the access counter"
 
 
 # ---------------------------------------------------------------------------

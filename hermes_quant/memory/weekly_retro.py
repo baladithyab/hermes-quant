@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 from dataclasses import asdict, dataclass, field
@@ -379,9 +380,39 @@ def decay_and_promote(active: list[Belief], new: list[Belief], *, asof: datetime
     asof = _ensure_utc(asof)
     # Pattern-recurrence unit is (role, lesson_category) — the FINCON per-role,
     # per-category recurrence key. A belief whose pattern recurs in `new` is promoted.
-    new_by_key: dict[tuple[str, str], Belief] = {}
+    #
+    # distill_beliefs groups by (lesson_category, ticker), so a SINGLE week can emit
+    # two same-(role, lesson_category) new beliefs for different tickers (e.g. AAPL
+    # momentum alpha=+0.05 and TSLA momentum alpha<=0, both inside the top-budget set).
+    # The positive-alpha promotion gate below must reflect the WHOLE category's net
+    # evidence, NOT an arbitrary last-iterated survivor: a plain dict keyed on
+    # (role, lesson_category) would be last-writer-wins, letting an unrelated ticker's
+    # alpha sign decide a live belief's weekly->monthly promotion (3x stickier). We
+    # therefore AGGREGATE the recurring new beliefs per (role, lesson_category) by
+    # support-weighted mean alpha — making the gate order-invariant under any
+    # permutation of `new`. Non-finite alpha_evidence is dropped from the weighting
+    # (NaN/inf must never silently flip the gate; cf. the finite-guard family).
+    by_key: dict[tuple[str, str], list[Belief]] = {}
     for nb in new:
-        new_by_key[(nb.role, nb.lesson_category)] = nb
+        by_key.setdefault((nb.role, nb.lesson_category), []).append(nb)
+
+    new_alpha_by_key: dict[tuple[str, str], float] = {}
+    for key, group in by_key.items():
+        finite = [g for g in group if math.isfinite(float(g.alpha_evidence))]
+        if not finite:
+            # All non-finite: cannot establish positive evidence -> do not promote.
+            new_alpha_by_key[key] = 0.0
+            continue
+        total_support = sum(max(0, int(g.support_n)) for g in finite)
+        if total_support > 0:
+            new_alpha_by_key[key] = (
+                sum(float(g.alpha_evidence) * max(0, int(g.support_n)) for g in finite)
+                / total_support
+            )
+        else:
+            # No support weight to differentiate; fall back to the plain mean so the
+            # gate is still order-invariant (never depends on iteration order).
+            new_alpha_by_key[key] = sum(float(g.alpha_evidence) for g in finite) / len(finite)
 
     kept: list[Belief] = []
     expired: list[Belief] = []
@@ -392,13 +423,13 @@ def decay_and_promote(active: list[Belief], new: list[Belief], *, asof: datetime
         decayed = Belief(**asdict(b))
         decayed.recency = round(b.recency * _alpha(b.tier, days), 8)
 
-        recurrence = new_by_key.get((b.role, b.lesson_category))
-        if recurrence is not None:
+        key = (b.role, b.lesson_category)
+        if key in new_alpha_by_key:
             # PROMOTE on recurrence (FINMEM access-counter promotion).
             decayed.access_counter = b.access_counter + 1
             decayed.recency = 1.0
             decayed.asof_distilled = asof.isoformat()
-            if recurrence.alpha_evidence > 0:
+            if new_alpha_by_key[key] > 0:
                 decayed.importance = b.importance + IMPORTANCE_BONUS_K
                 if decayed.tier == "weekly":
                     decayed.tier = "monthly"
