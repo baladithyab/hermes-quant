@@ -23,7 +23,7 @@
 | `HERMES_QUANT_CATALYST_ONBOARDING` | `0` | `hermes_quant/catalyst/onboarding.py:101` |
 | `HERMES_QUANT_CONVERGENCE` | `0` | `hermes_quant/catalyst/synthesize.py:124` |
 | `HERMES_QUANT_DATA_FALLBACK` | `0` | `hermes_quant/data/chain.py:39` |
-| `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/daemon/settlement_loop.py:720` |
+| `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/autonomous.py:614` |
 | `HERMES_QUANT_DETERMINISTIC_EQUITY` | `0` | `hermes_quant/react/dispatch.py:80` |
 | `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1087` |
 | `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1230` |
@@ -56,9 +56,9 @@
 | `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1298` |
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:206` |
-| `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:1046` |
+| `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:1359` |
 | `HERMES_QUANT_PREWARM_WORKERS` | `` | `hermes_quant/playbook/scorers.py:803` |
-| `HERMES_QUANT_RAIL_LOCK_TIMEOUT_S` | `` | `hermes_quant/autonomous.py:81` |
+| `HERMES_QUANT_RAIL_LOCK_TIMEOUT_S` | `` | `hermes_quant/autonomous.py:82` |
 | `HERMES_QUANT_REFLECTION` | `1` | `hermes_quant/react/deterministic_equity.py:696` |
 | `HERMES_QUANT_REFLECTOR_LLM` | `0` | `hermes_quant/memory/reflector.py:559` |
 | `HERMES_QUANT_REGIME_HMM` | `` | `hermes_quant/regime/detector.py:123` |

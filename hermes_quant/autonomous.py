@@ -29,6 +29,7 @@ operator runs `hermes quant autonomous reset --confirm`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -577,78 +578,112 @@ def compute_cumulative_realized_pnl_pct(
         path = executions_path or (QUANT_HOME / "executions.jsonl")
         if not path.exists():
             return 0.0
-        records: list[dict] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
+
+        # ar39 — INCREMENTAL SETTLEMENT (was an unbounded per-tick read). The bus
+        # (executions.jsonl) is append-only and NEVER rotated (signal_bus.py: "Bus
+        # files are never rotated in v0.1"), so the old `path.read_text().splitlines()`
+        # + `join_exit_fills(all_records)` re-parsed and re-matched the ENTIRE lifetime
+        # bus on EVERY autonomous tick. Per-tick RSS + CPU grow without bound; the
+        # always-on §D9 rail eventually slows past the tick deadline / risks OOM
+        # (fail-OPEN on the secondary rail). The matcher already supports incremental
+        # settlement: `join_exit_fills(records, open_lots=carry_in)` returns the residual
+        # open-lot state to thread into the next call. We persist a durable checkpoint
+        # (byte offset consumed, carry-in open_lots, accumulated fraction from already-
+        # settled/evicted round-trips, file inode, max asof consumed) and each tick reads
+        # ONLY the bytes PAST the offset.
+        #
+        # CORRECTNESS (a wrong basis is worse than a slow one): the incremental result
+        # MUST EQUAL a full replay for ANY bus. A position OPENED in an early batch and
+        # CLOSED in a later batch is paired correctly because the carry-in open_lots
+        # holds the older opener (a naive tail-slice that dropped it would mis-pair the
+        # close — that is exactly what the cross-checkpoint equality test guards). The
+        # ONE case the carry-in cannot fix is a late append whose asof sorts BEFORE an
+        # already-evicted (settled) round-trip — join_exit_fills re-sorts only the carry-
+        # in + new records, not the evicted ones. We therefore guard on the max asof
+        # consumed: if any new record predates it, the bus is not asof-monotonic at this
+        # boundary and we FALL BACK to a full replay (fail-safe: correctness over speed).
+        # A missing/corrupt checkpoint, or a bus that shrank / was rotated (offset > file
+        # size, or a different inode), also falls back to a full replay and rebuilds the
+        # checkpoint.
+        ckpt = _read_incremental_checkpoint(path)
+        # The matcher's interpretation of the SAME bytes depends on
+        # HERMES_QUANT_DELTA_NORMALIZER (settlement_loop runs the FillDeltaNormalizer
+        # pre-pass under flag ON). A checkpoint built under one flag state is INVALID
+        # under the other — flipping the flag must change the live basis (ADR-0091 item
+        # 11). Invalidate (full replay) when the flag differs from the checkpoint's.
+        norm_flag = os.environ.get("HERMES_QUANT_DELTA_NORMALIZER", "0")
+        if ckpt is not None and ckpt.get("norm_flag") != norm_flag:
+            ckpt = None
+        new_lines, new_offset, full_replay = _read_bus_since_checkpoint(path, ckpt)
+        if full_replay:
+            # Cold start / corrupt checkpoint / shrink / rotation: replay from scratch.
+            carried_frac = 0.0
+            carry_open: dict | None = None
+            prev_max_asof: int | None = None
+        else:
+            carried_frac = ckpt["cum_frac"]  # type: ignore[index]
+            carry_open = _deserialize_open_lots(ckpt["open_lots"])  # type: ignore[index]
+            prev_max_asof = ckpt.get("max_asof_ns")  # type: ignore[union-attr]
+
+        new_records: list[dict] = []
+        for line in new_lines:
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                new_records.append(json.loads(line))
             except (ValueError, TypeError):
                 continue
-        if not records:
+
+        # Out-of-order guard: a new record older than an already-evicted settled record
+        # would diverge from a full replay (the evicted rt is not re-sorted). Fall back.
+        new_max_asof = prev_max_asof
+        if not full_replay and new_records:
+            batch_min, batch_max = _asof_bounds_ns(new_records)
+            if batch_min is not None and prev_max_asof is not None and batch_min < prev_max_asof:
+                full_replay = True
+            elif batch_max is not None:
+                new_max_asof = batch_max if prev_max_asof is None else max(prev_max_asof, batch_max)
+
+        if full_replay:
+            # Replay from scratch. Read as BYTES and consume only up to the last complete
+            # newline so the rebuilt offset never lands mid-line (a concurrent settlement
+            # writer may have a partial trailing line in flight).
+            raw = path.read_bytes()
+            last_nl = raw.rfind(b"\n")
+            consumed = raw[: last_nl + 1] if last_nl >= 0 else b""
+            new_records = []
+            for line in consumed.decode("utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    new_records.append(json.loads(line))
+                except (ValueError, TypeError):
+                    continue
+            carried_frac = 0.0
+            carry_open = None
+            new_offset = len(consumed)
+            _, new_max_asof = _asof_bounds_ns(new_records)
+
+        if not new_records and full_replay:
             return 0.0
-        round_trips, _open = join_exit_fills(records)
-        # ar34: this rail is the AUTONOMOUS lane's realized-drawdown as a fraction of the
-        # paper-default NAV. The shared executions.jsonl ALSO carries other accounts whose
-        # qty is in a DIFFERENT unit system — notably the freqtrade crypto consumer writes
-        # account_id="freqtrade" with qty = RAW COIN COUNT (e.g. 0.5 ETH), not a NAV
-        # fraction. Pooling a raw-coin qty into `Σ realized_return × qty` corrupts the
-        # paper-NAV fraction (0.5 coins reads as 50% of NAV) and can spuriously trip OR mask
-        # the kill-switch. Restrict to the autonomous lane's own account (paper-default —
-        # the sentinel _normalize_exec_record assigns when no explicit account_id is set);
-        # other accounts (freqtrade, and any future named/true-unit lane) have their own
-        # rails and must not pollute this NAV-fraction basis.
-        # ar25: within paper-default, a SINGLE-LEG fill's qty is ALREADY a NAV-fraction, so
-        # its NAV-fraction P&L is realized_return × qty. Sum directly — NAV cancels (do NOT
-        # multiply by entry_price, do NOT divide by NAV). A non-finite term is skipped.
-        #
-        # ar57: a MULTI-LEG per-leg child is the EXCEPTION. MultiLegPaperReactor._build_records
-        # writes EVERY leg's fill_size_pct == the WHOLE family's NAV fraction F (a proxy), so
-        # qty == F for every leg — NOT a true per-leg weight. Summing realized_return × F per
-        # leg (a) over-counts F once per leg (Σ = F×leg_count, not F) and (b) weights legs of
-        # vastly different true notionals EQUALLY, so a small offsetting option leg (+98% on
-        # premium kept) masks a large stock-leg loss → the basis biases POSITIVE and the
-        # kill-switch fails to trip on a genuine realized loss (fail-OPEN on the ADR-0016 rail).
-        # For a multi-leg leg the authoritative size is reactor_metadata.quantity (signed TRUE
-        # units, carried as rt.true_units); its real NAV-fraction P&L is
-        #   realized_return × (|true_units| × entry_price × contract_multiplier) / NAV
-        # which makes Σ over a family's legs equal the family's true net realized NAV fraction.
-        # We read NAV ONLY for these legs; a multi-leg leg with NAV unreadable or missing
-        # true_units fails CLOSED to the equal-F proxy (never silently drops a realized loss).
-        nav_usd: float | None = None
-        nav_resolved = False
-        frac = 0.0
-        for rt in round_trips:
-            if getattr(rt, "account_id", "paper-default") != "paper-default":
-                continue
-            mleg_id = getattr(rt, "multi_leg_id", None)
-            true_units = getattr(rt, "true_units", None)
-            if mleg_id is not None and true_units is not None:
-                if not nav_resolved:
-                    nav_usd = _account_nav_usd()
-                    nav_resolved = True
-                mult = getattr(rt, "notional_multiplier", 1.0) or 1.0
-                if (
-                    nav_usd is not None
-                    and math.isfinite(nav_usd)
-                    and nav_usd > 0
-                    and math.isfinite(true_units)
-                    and math.isfinite(rt.entry_price)
-                ):
-                    leg_notional = abs(true_units) * abs(rt.entry_price) * abs(mult)
-                    term = rt.realized_return * (leg_notional / nav_usd)
-                else:
-                    # Fail CLOSED: NAV unreadable / non-finite inputs → fall back to the
-                    # equal-F proxy so a realized LOSS is never silently dropped to 0.
-                    term = rt.realized_return * rt.qty
-            else:
-                term = rt.realized_return * rt.qty
-            if not math.isfinite(term):
-                continue
-            frac += term
+
+        round_trips, residual_open = join_exit_fills(new_records, open_lots=carry_open)
+        frac = carried_frac + _sum_round_trip_realized_fraction(round_trips)
         if not math.isfinite(frac):
             return 0.0
+
+        # Advance + persist the checkpoint so the NEXT tick reads only bytes past
+        # new_offset and carries forward the residual open lots + accumulated fraction.
+        _persist_incremental_checkpoint(
+            path,
+            offset=new_offset,
+            cum_frac=frac,
+            open_lots=residual_open,
+            max_asof_ns=new_max_asof,
+            norm_flag=norm_flag,
+        )
         _persist_last_known_cum_pnl(frac)
         return frac
     except Exception as exc:  # noqa: BLE001 - degraded rail: carry last-known forward, never silently re-arm
@@ -656,6 +691,284 @@ def compute_cumulative_realized_pnl_pct(
         last_known = _read_last_known_cum_pnl()
         _emit_killswitch_degraded_audit(exc, last_known)
         return last_known if last_known is not None else 0.0
+
+
+def _sum_round_trip_realized_fraction(round_trips) -> float:  # noqa: ANN001
+    """Sum the signed realized NAV-fraction contribution of a set of round-trips.
+
+    Factored out of compute_cumulative_realized_pnl_pct so the incremental path (ar39)
+    can sum ONLY the new batch's round-trips and add to the carried-forward accumulated
+    fraction, while preserving the exact ar34 / ar25 / ar57 weighting used by full replay.
+
+    ar34: this rail is the AUTONOMOUS lane's realized-drawdown as a fraction of the
+    paper-default NAV. The shared executions.jsonl ALSO carries other accounts whose
+    qty is in a DIFFERENT unit system — notably the freqtrade crypto consumer writes
+    account_id="freqtrade" with qty = RAW COIN COUNT (e.g. 0.5 ETH), not a NAV fraction.
+    Pooling a raw-coin qty into `Σ realized_return × qty` corrupts the paper-NAV fraction
+    (0.5 coins reads as 50% of NAV) and can spuriously trip OR mask the kill-switch.
+    Restrict to the autonomous lane's own account (paper-default — the sentinel
+    _normalize_exec_record assigns when no explicit account_id is set); other accounts
+    have their own rails and must not pollute this NAV-fraction basis.
+
+    ar25: within paper-default, a SINGLE-LEG fill's qty is ALREADY a NAV-fraction, so its
+    NAV-fraction P&L is realized_return × qty. Sum directly — NAV cancels (do NOT multiply
+    by entry_price, do NOT divide by NAV). A non-finite term is skipped.
+
+    ar57: a MULTI-LEG per-leg child is the EXCEPTION. MultiLegPaperReactor._build_records
+    writes EVERY leg's fill_size_pct == the WHOLE family's NAV fraction F (a proxy), so
+    qty == F for every leg — NOT a true per-leg weight. Summing realized_return × F per leg
+    (a) over-counts F once per leg and (b) weights legs of vastly different true notionals
+    EQUALLY, so a small offsetting option leg masks a large stock-leg loss → the basis
+    biases POSITIVE and the kill-switch fails to trip (fail-OPEN). For a multi-leg leg the
+    authoritative size is reactor_metadata.quantity (signed TRUE units, carried as
+    rt.true_units); its real NAV-fraction P&L is
+        realized_return × (|true_units| × entry_price × contract_multiplier) / NAV
+    which makes Σ over a family's legs equal the family's true net realized NAV fraction.
+    We read NAV ONLY for these legs; a multi-leg leg with NAV unreadable or missing
+    true_units fails CLOSED to the equal-F proxy (never silently drops a realized loss).
+    """
+    nav_usd: float | None = None
+    nav_resolved = False
+    frac = 0.0
+    for rt in round_trips:
+        if getattr(rt, "account_id", "paper-default") != "paper-default":
+            continue
+        mleg_id = getattr(rt, "multi_leg_id", None)
+        true_units = getattr(rt, "true_units", None)
+        if mleg_id is not None and true_units is not None:
+            if not nav_resolved:
+                nav_usd = _account_nav_usd()
+                nav_resolved = True
+            mult = getattr(rt, "notional_multiplier", 1.0) or 1.0
+            if (
+                nav_usd is not None
+                and math.isfinite(nav_usd)
+                and nav_usd > 0
+                and math.isfinite(true_units)
+                and math.isfinite(rt.entry_price)
+            ):
+                leg_notional = abs(true_units) * abs(rt.entry_price) * abs(mult)
+                term = rt.realized_return * (leg_notional / nav_usd)
+            else:
+                # Fail CLOSED: NAV unreadable / non-finite inputs → fall back to the
+                # equal-F proxy so a realized LOSS is never silently dropped to 0.
+                term = rt.realized_return * rt.qty
+        else:
+            term = rt.realized_return * rt.qty
+        if not math.isfinite(term):
+            continue
+        frac += term
+    return frac
+
+
+# --------------------------------------------------------------------------- #
+# ar39 — incremental-settlement checkpoint (durable sidecar per bus path)
+# --------------------------------------------------------------------------- #
+def _incremental_checkpoint_path(bus_path: Path) -> Path:
+    """Durable checkpoint sidecar for the incremental kill-switch basis (ar39).
+
+    Keyed to the bus filename so a test bus and the production bus never share a
+    checkpoint. Lives next to the bus (under QUANT_HOME in production)."""
+    return bus_path.with_name(bus_path.name + ".killswitch_cum_pnl_ckpt.json")
+
+
+def _serialize_open_lots(open_lots: dict | None) -> list:
+    """Serialize join_exit_fills' carry-out open_lots to a JSON-safe structure.
+
+    open_lots is {bucket_key_tuple: [lot_dict, ...]}; bucket keys are tuples (a real
+    bucket (account, asset_class, asset) or a namespaced ("_deferred", account,
+    asset_class, asset)); lot dicts may carry a pd.Timestamp ``asof``. We emit
+    [[key_as_list, [lot_with_isoformat_asof, ...]], ...]. On deserialize the asof goes
+    back through settlement_loop._coerce_asof (accepts ISO strings), so it round-trips
+    faithfully — the equality test vs full replay catches any drift."""
+    if not open_lots:
+        return []
+    out: list = []
+    for key, lots in open_lots.items():
+        key_list = list(key)
+        ser_lots = []
+        for lot in lots:
+            lot_copy = dict(lot)
+            asof = lot_copy.get("asof")
+            if asof is not None and hasattr(asof, "isoformat"):
+                lot_copy["asof"] = asof.isoformat()
+            ser_lots.append(lot_copy)
+        out.append([key_list, ser_lots])
+    return out
+
+
+def _deserialize_open_lots(serialized: list | None) -> dict | None:
+    """Inverse of _serialize_open_lots: rebuild the {tuple_key: [lot, ...]} carry-in.
+
+    asof stays an ISO string; join_exit_fills re-coerces it via _coerce_asof on carry-in."""
+    if not serialized:
+        return None
+    out: dict = {}
+    for entry in serialized:
+        key_list, lots = entry
+        out[tuple(key_list)] = [dict(lot) for lot in lots]
+    return out
+
+
+def _asof_bounds_ns(records: list[dict]) -> tuple[int | None, int | None]:
+    """Return (min, max) of the records' asof in integer nanoseconds, ignoring
+    unparseable / missing asof. Used for the ar39 out-of-order monotonicity guard."""
+    from hermes_quant.daemon.settlement_loop import _coerce_asof
+
+    lo: int | None = None
+    hi: int | None = None
+    for rec in records:
+        asof = _coerce_asof(rec.get("asof_execution") or rec.get("asof"))
+        if asof is None:
+            continue
+        ns = asof.value
+        lo = ns if lo is None else min(lo, ns)
+        hi = ns if hi is None else max(hi, ns)
+    return lo, hi
+
+
+_CKPT_FINGERPRINT_BYTES = 4096
+
+
+def _prefix_fingerprint(bus_path: Path, offset: int) -> str:
+    """Fingerprint the LAST <=4KB of the consumed prefix [0, offset).
+
+    Cheap (bounded read) rotation detector that does NOT rely on inode stability —
+    inodes can be reused after unlink+recreate, and a rotated bus of the SAME byte size
+    would otherwise leave offset==size with stale carried state (a real divergence from
+    full replay). If the bytes ending at the checkpoint offset differ from what we
+    consumed, the file was rewritten => full replay (fail-safe). offset==0 fingerprints
+    the empty prefix (a valid cold checkpoint)."""
+    if offset <= 0:
+        return hashlib.sha256(b"").hexdigest()
+    start = max(0, offset - _CKPT_FINGERPRINT_BYTES)
+    try:
+        with open(bus_path, "rb") as f:
+            f.seek(start)
+            chunk = f.read(offset - start)
+    except OSError:
+        return ""
+    h = hashlib.sha256()
+    h.update(str(offset).encode())
+    h.update(b"|")
+    h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_incremental_checkpoint(bus_path: Path) -> dict | None:
+    """Read the incremental checkpoint, or None if absent/corrupt/schema-mismatch.
+
+    A None return forces a full replay (fail-safe). The checkpoint carries the consumed
+    byte offset, the file inode it was built against, a fingerprint of the consumed prefix
+    tail, the accumulated cumulative fraction, the serialized carry-in open_lots, and the
+    max asof (ns) consumed so far."""
+    path = _incremental_checkpoint_path(bus_path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # Required keys; a missing one is treated as a corrupt checkpoint (full replay).
+        offset = int(data["offset"])
+        inode = int(data["inode"])
+        cum_frac = float(data["cum_frac"])
+        open_lots = data["open_lots"]
+        prefix_fp = str(data["prefix_fp"])
+        if not math.isfinite(cum_frac):
+            return None
+        return {
+            "offset": offset,
+            "inode": inode,
+            "cum_frac": cum_frac,
+            "open_lots": open_lots,
+            "max_asof_ns": data.get("max_asof_ns"),
+            "prefix_fp": prefix_fp,
+            "norm_flag": data.get("norm_flag"),
+        }
+    except Exception:  # noqa: BLE001 - a corrupt/partial checkpoint => full replay
+        return None
+
+
+def _read_bus_since_checkpoint(
+    bus_path: Path, ckpt: dict | None
+) -> tuple[list[str], int, bool]:
+    """Read ONLY the bus bytes past the checkpoint offset.
+
+    Returns (new_lines, new_offset, full_replay_required). full_replay_required is True
+    when there is no usable checkpoint, OR the bus shrank (offset > current size — the
+    file was truncated/rotated in place), OR the bus inode changed (rotated/recreated).
+    In all those cases the caller replays from scratch and rebuilds the checkpoint."""
+    try:
+        st = bus_path.stat()
+    except OSError:
+        return [], 0, True
+    cur_size = st.st_size
+    cur_inode = st.st_ino
+    if ckpt is None:
+        return [], cur_size, True
+    if ckpt["inode"] != cur_inode:
+        # Rotated / recreated under the same name — stale offset, replay.
+        return [], cur_size, True
+    if ckpt["offset"] > cur_size:
+        # Bus shrank (truncated in place) — stale offset, replay.
+        return [], cur_size, True
+    # Content check: the consumed-prefix tail must still match. Catches an in-place
+    # rewrite / same-size rotation / inode-reuse that the size+inode checks miss
+    # (correctness over speed: a mismatch => full replay).
+    if _prefix_fingerprint(bus_path, ckpt["offset"]) != ckpt["prefix_fp"]:
+        return [], cur_size, True
+    # Healthy incremental read: only the bytes appended since the checkpoint.
+    with open(bus_path, "rb") as f:
+        f.seek(ckpt["offset"])
+        tail = f.read()
+    # Consume only up to the LAST complete newline — a concurrent settlement writer may
+    # have a partial trailing line in flight. Leaving the partial line unconsumed (the
+    # offset stops at the last "\n") means the next tick re-reads it once it is complete,
+    # never dropping a fill (mirrors signal_bus.tail's partial-line buffering).
+    last_nl = tail.rfind(b"\n")
+    consumed = tail[: last_nl + 1] if last_nl >= 0 else b""
+    new_lines = consumed.decode("utf-8", errors="replace").splitlines()
+    new_offset = ckpt["offset"] + len(consumed)
+    return new_lines, new_offset, False
+
+
+def _persist_incremental_checkpoint(
+    bus_path: Path,
+    *,
+    offset: int,
+    cum_frac: float,
+    open_lots: dict | None,
+    max_asof_ns: int | None,
+    norm_flag: str,
+) -> None:
+    """Atomically persist the incremental checkpoint (ar39). Atomic tmp+fsync+rename,
+    best-effort — a persist failure must never break the healthy compute (next tick just
+    full-replays). Records the inode + consumed-prefix fingerprint so a rotation
+    invalidates the offset, and the normalizer-flag state so a flag flip forces a replay."""
+    path = _incremental_checkpoint_path(bus_path)
+    try:
+        try:
+            inode = bus_path.stat().st_ino
+        except OSError:
+            inode = 0
+        payload = {
+            "offset": int(offset),
+            "inode": int(inode),
+            "cum_frac": float(cum_frac),
+            "open_lots": _serialize_open_lots(open_lots),
+            "max_asof_ns": int(max_asof_ns) if max_asof_ns is not None else None,
+            "prefix_fp": _prefix_fingerprint(bus_path, int(offset)),
+            "norm_flag": str(norm_flag),
+            "asof": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, sort_keys=True))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - persistence is best-effort, never break the rail
+        logger.warning("autonomous: failed to persist incremental kill-switch checkpoint: %s", exc)
 
 
 _LAST_KNOWN_CUM_PNL_PATH = QUANT_HOME / "autonomous_cum_pnl_last_known.json"
