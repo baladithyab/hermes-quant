@@ -414,3 +414,54 @@ def test_whole_share_short_floor():
     # degenerate inputs -> 0 shares.
     assert target_pct_to_shares(-0.10, nav=0.0, price=33.0) == 0
     assert target_pct_to_shares(-0.10, nav=10_000.0, price=0.0) == 0
+
+
+def test_unit_bridge_non_finite_inputs_fail_closed_to_zero_shares():
+    # The unit bridge does math.floor((abs(target_pct) * nav) / price). A non-finite
+    # target_pct / nav / price must FAIL-CLOSED to 0 shares (the contract: 0 shares ->
+    # oracle REJECT), NOT raise OverflowError ('cannot convert float infinity to integer')
+    # or ValueError ('cannot convert float NaN to integer') out of the bridge — which
+    # would abort the autonomous tick mid-watchlist instead of silencing this entry.
+    inf = float("inf")
+    nan = float("nan")
+    # -inf target is the documented PRIMARY live trigger (kelly = -inf, -inf < 0 is True
+    # so it enters the admissibility short branch).
+    assert target_pct_to_shares(-inf, nav=100_000.0, price=50.0) == 0
+    assert target_pct_to_shares(inf, nav=100_000.0, price=50.0) == 0
+    assert target_pct_to_shares(nan, nav=100_000.0, price=50.0) == 0
+    # non-finite nav / price too (e.g. a corrupt NAV source) -> fail-closed, never raise.
+    assert target_pct_to_shares(-0.10, nav=inf, price=50.0) == 0
+    assert target_pct_to_shares(-0.10, nav=nan, price=50.0) == 0
+    assert target_pct_to_shares(-0.10, nav=100_000.0, price=inf) == 0
+    assert target_pct_to_shares(-0.10, nav=100_000.0, price=nan) == 0
+    # finite inputs are unchanged (byte-identical to before the guard).
+    assert target_pct_to_shares(-0.10, nav=10_000.0, price=33.0) == -30
+
+
+def test_admit_or_reject_non_finite_target_no_raise(monkeypatch):
+    # End-to-end: a -inf target_pct (the live `kelly = float(rg.get("kelly_fraction"))`
+    # path) reaches the unit bridge at gate_order.py BEFORE any oracle verdict. The
+    # PRIMARY contract is that admit_or_reject must NOT raise OverflowError/ValueError
+    # out of the seam (which would abort the whole autonomous tick mid-watchlist).
+    from hermes_quant.admissibility import admit_or_reject
+
+    # Flag OFF (default): NullShortabilityOracle ACCEPTs everything bit-for-bit, but the
+    # bridge must still not RAISE — qty resolves to 0 (fail-closed share count).
+    monkeypatch.delenv("HERMES_QUANT_ADMISSIBILITY", raising=False)
+    for bad in (float("-inf"), float("inf"), float("nan")):
+        verdict = admit_or_reject(
+            "GME", "short", bad, 100_000.0, 50.0, T,
+            account_equity=100_000.0, available_bp=None,
+        )
+        assert verdict.qty_shares == 0  # no raise; bridge fail-closed to 0 shares
+
+    # Flag ON: the live oracle sees a 0-share short -> REJECT (fail-closed), so the
+    # verdict is admitted=False -> SILENCE_ADMISSIBILITY, never a raise/abort.
+    monkeypatch.setenv("HERMES_QUANT_ADMISSIBILITY", "1")
+    for bad in (float("-inf"), float("inf"), float("nan")):
+        verdict = admit_or_reject(
+            "GME", "short", bad, 100_000.0, 50.0, T,
+            account_equity=100_000.0, available_bp=None,
+        )
+        assert verdict.admitted is False
+        assert verdict.qty_shares == 0

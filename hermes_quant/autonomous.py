@@ -931,7 +931,16 @@ def tick(
             # FIRE — emit Action (target_position_pct from advisor's
             # risk_gate.kelly_fraction). React only if NOT dry_run.
             rg = (advisor_result or {}).get("risk_gate") or {}
+            # Finite-guard the advisor's signed size (source advisor.py float() of
+            # action.target_position_pct is unguarded). A non-finite kelly would flow
+            # UNGUARDED to the admissibility unit bridge (a -inf kelly is < 0, so it
+            # enters the HERMES_QUANT_ADMISSIBILITY short branch and `math.floor` would
+            # raise, aborting the whole tick). Coerce non-finite -> 0.0 = no size = no
+            # fire (the silence-by-default contract). Defense-in-depth alongside the
+            # bridge's own fail-closed guard.
             kelly = float(rg.get("kelly_fraction", 0.0))
+            if not math.isfinite(kelly):
+                kelly = 0.0
             sig = (advisor_result or {}).get("aggregated_signal") or {}
 
             # Stop-loss backstop (ADR-0016 §D9 defense-in-depth; deep-review

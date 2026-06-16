@@ -33,8 +33,19 @@ def target_pct_to_shares(target_pct: float, nav: float, price: float) -> int:
     Shorts (target_pct < 0) floor toward zero in magnitude so a fractional short can never be
     emitted (live HTTP 422). Longs may be fractional elsewhere, but this helper returns whole
     shares for both so the admissibility path is uniform. price/nav must be > 0 (else 0 shares).
+
+    FAIL-CLOSED on non-finite inputs: a NaN/inf target_pct, nav, or price would make
+    `math.floor((abs(target_pct) * nav) / price)` raise (OverflowError for inf,
+    ValueError for NaN), which — reached from the autonomous tick via
+    `gate_order.admit_or_reject` — would abort the whole tick mid-watchlist instead of
+    silencing this one entry. Returning 0 shares makes the oracle REJECT (the contract:
+    admitted=False -> SILENCE_ADMISSIBILITY), never an assumed-safe fill.
     """
-    if price <= 0 or nav <= 0:
+    if (
+        not (math.isfinite(target_pct) and math.isfinite(nav) and math.isfinite(price))
+        or price <= 0
+        or nav <= 0
+    ):
         return 0
     raw = (abs(target_pct) * nav) / price
     shares = math.floor(raw)  # floor magnitude -> never over-shorts, never fractional
