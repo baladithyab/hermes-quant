@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -68,11 +69,37 @@ def _utc_now_iso() -> str:
 
 
 def _write_atomic_json(path: Path, data: list[dict]) -> None:
-    """Atomic-rename pattern for halt_state.json mirror."""
+    """Crash-durable atomic write of the halt_state.json mirror.
+
+    ar87 (atomic-write-durability family): this mirror is READ AS AUTHORITY by a
+    SEPARATE LIVE PROCESS — the freqtrade crypto strategy reads it (via
+    :func:`read_active_halts_from_mirror`) to avoid SQLite lock contention. A torn
+    or lost write therefore lets a live consumer read STALE halt state and trade an
+    asset that is actually halted (fail-OPEN on a halt rail). The prior
+    ``write_text`` + ``replace`` fsync'd NOTHING — neither the file data nor the
+    directory entry the rename creates. Now: write tmp -> fsync FILE -> rename ->
+    fsync PARENT DIR, matching the kill-switch / journal / artifacts writers
+    (ar86 / 538b2f6 / 8e69840). Best-effort dir-fsync (warn, never mask the write)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-    tmp.replace(path)  # atomic on POSIX
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2, sort_keys=True))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)  # atomic on POSIX
+    try:
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError as e:  # pragma: no cover - platform/fs dependent
+        logger.warning(
+            "halt_state mirror: parent-dir fsync failed for %s; the rename may not "
+            "survive a crash: %s",
+            path.parent,
+            e,
+        )
 
 
 class HaltStateSQLite:

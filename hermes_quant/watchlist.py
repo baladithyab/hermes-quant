@@ -283,3 +283,21 @@ def _save_config(path: Path, cfg: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    # ar87 (atomic-write-durability family): fsync the PARENT DIR so the rename
+    # itself survives a crash. The watchlist config is the persisted tradeable
+    # universe (admit/evict from evolve_watchlist); a lost rename reverts an
+    # admit/evict on reboot. fsyncing only the file fd flushes DATA, not the
+    # directory entry the rename creates. Best-effort: warn, never mask the write.
+    try:
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError as e:  # pragma: no cover - platform/fs dependent
+        logger.warning(
+            "watchlist: parent-dir fsync failed for %s; the config rename may not "
+            "survive a crash: %s",
+            path.parent,
+            e,
+        )
