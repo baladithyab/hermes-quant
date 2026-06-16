@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -144,6 +145,42 @@ class DeterministicEquityReactor:
         decision_price = self._pre._extract_decision_price(proposal)
         signal_id = self._pre._extract_signal_id(proposal)
         now = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # ar32: REJECT a non-finite / <=0 decision_price BEFORE sizing or slippage —
+        # the cr05 guard the sibling PaperReactor already has (paper.py:198), missing
+        # here on the now-LIVE deterministic-equity path (HERMES_QUANT_DETERMINISTIC_
+        # EQUITY=1). The later price guard (`price_for_qty <= 0`) does NOT catch NaN
+        # (`nan <= 0` is False; `nan > 0` is False so fill_price falls back to a NaN
+        # decision_price), so a NaN price would flow into `shares = notional/NaN = NaN`
+        # and book a NaN-priced, NaN-qty fill that corrupts the P&L ledger (and the
+        # _apply_slippage degrade-to-decision_price path can re-introduce a NaN too).
+        # Fail-closed with a surfaced no-fill (NOT a raise — the live fire loop calls
+        # execute() without try/except).
+        if not math.isfinite(decision_price) or decision_price <= 0.0:
+            logger.warning(
+                "det-equity-react: %s asset=%s REJECTED — decision_price=%r is "
+                "non-finite or <= 0; fail-closed no-fill (no NaN-priced fill booked)",
+                proposal.proposal_id,
+                proposal.symbol,
+                decision_price,
+            )
+            return self._nofill_record(
+                proposal,
+                signal_id=signal_id,
+                asof_decision=(proposal.advisor_result or {}).get("decision_wall_clock")
+                or (proposal.advisor_result or {}).get("as_of")
+                or now,
+                asof_execution=now,
+                decision_price=decision_price,
+                requested_pct=fill_size_pct,
+                bar_ts=(proposal.advisor_result or {}).get("bar_ts")
+                or (proposal.advisor_result or {}).get("as_of"),
+                play_tag=play_tag,
+                approver_user_id=approver_user_id,
+                reason="non_finite_decision_price",
+                reason_key="price_unknown",
+                cap_metadata=None,
+            )
 
         # ── precondition 2: short-equity admissibility (ADR-0077/0079) ──────────
         # DEFAULT-OFF behind HERMES_QUANT_ADMISSIBILITY; bit-for-bit no-op when the

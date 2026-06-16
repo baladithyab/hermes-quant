@@ -127,6 +127,14 @@ def validate_semantic_packet(
         packet_asof = pd.Timestamp(packet.asof)
     except Exception:
         return False, "invalid_asof"
+    # ar33: pd.Timestamp("") / pd.Timestamp(None) returns NaT WITHOUT raising, so the
+    # except above does not catch an empty/None asof. A NaT then defeats BOTH freshness
+    # gates below — `NaT > ctx_asof` is False (skips future_packet) and
+    # `(ctx_asof - NaT).total_seconds()` is NaN so `NaN > max_age` is False (skips
+    # stale_packet) — admitting an UNKNOWABLE-age semantic signal (fail-open). An
+    # un-timestamped packet must be rejected, not waved through.
+    if pd.isna(packet_asof):
+        return False, "invalid_asof"
     if packet_asof.tzinfo is None:
         packet_asof = packet_asof.tz_localize("UTC")
     else:
