@@ -417,7 +417,10 @@ class MultiLegPaperReactor:
         from hermes_quant.risk.portfolio_normalize import (
             PortfolioState as RiskPortfolioState,
         )
-        from hermes_quant.state.portfolio_state import get_portfolio_state
+        from hermes_quant.state.portfolio_state import (
+            get_portfolio_state,
+            position_gross_fraction,
+        )
 
         nav = _account_nav_usd()
         if nav is None or nav <= 0:
@@ -441,8 +444,7 @@ class MultiLegPaperReactor:
             # No measurable gross (degenerate / all-zero fill) — nothing to cap.
             return None
 
-        # Reconstruct the current book's gross from PortfolioState, reading
-        # positions as NAV-fraction quantities (ADR-0041), exactly as
+        # Reconstruct the current book's gross from PortfolioState, exactly as
         # PaperReactor._portfolio_cap_clip does.
         #
         # cs65: key the cap pos_map on the FULL canonical position key
@@ -455,15 +457,31 @@ class MultiLegPaperReactor:
         # a smaller (even zero) magnitude and under-count the book's true gross —
         # phantom headroom that wrongly admits an over-cap family. Keying on the
         # canonical key keeps the two positions distinct so each contributes its
-        # own |quantity| to gross_exposure_pct. (RiskPortfolioState.positions is
-        # a flat dict[str, float] whose keys are opaque — gross sums abs over
+        # own |gross-fraction| to gross_exposure_pct. (RiskPortfolioState.positions
+        # is a flat dict[str, float] whose keys are opaque — gross sums abs over
         # .values() — so a per-canonical-key string is sufficient and correct.)
+        #
+        # ar14 units fix (sibling of ar13 in PaperReactor): Position.quantity is
+        # UNIT-AMBIGUOUS. Legacy / single-leg equity stores it as a signed
+        # NAV-fraction (ADR-0041), but the ADR-0086/0088 true-unit path stores
+        # signed SHARES/CONTRACTS. Feeding a raw true-unit quantity (e.g. 100
+        # shares) into RiskPortfolioState reads it as a 10000% NAV-fraction, so
+        # g_room collapses to <=0 and EVERY legitimate subsequent family is
+        # silenced (fail-CLOSED over-count). position_gross_fraction normalizes
+        # each line to a NAV-fraction with the SAME net-liq valuation the
+        # equity_total fold uses; a legacy nav_fraction line is returned verbatim
+        # ⇒ a pure-NAV-fraction book is byte-identical.
         try:
             ps = get_portfolio_state()
             positions = ps.get_positions("paper-default")
+            # Reuse the NAV resolved (and fail-closed-validated) above — it is the
+            # same paper-account NAV the family-gross denominator uses, so the
+            # existing book and the new demand are measured against ONE NAV.
             pos_map: dict[str, float] = {}
             for (asset_class, symbol), position in positions.items():
-                pos_map[f"{asset_class}\x1f{symbol}"] = position.quantity
+                pos_map[f"{asset_class}\x1f{symbol}"] = position_gross_fraction(
+                    position, nav=nav
+                )
         except Exception as exc:  # noqa: BLE001 — fail-closed: unknown book => silence.
             logger.warning(
                 "multileg-react: cap book read failed (fail-closed silence): %s", exc
