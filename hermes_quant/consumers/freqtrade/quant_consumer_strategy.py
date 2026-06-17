@@ -421,14 +421,37 @@ class HermesQuantConsumer(IStrategy):
             if age > self.dead_man_switch_seconds:
                 self._enter_safe_stop("heartbeat_stale")
 
-        # Halt mirror check
-        try:
-            if self.HALT_STATE_MIRROR.exists():
+        # Halt mirror check — FAIL CLOSED on a corrupt / torn / unreadable mirror.
+        #
+        # The hermes daemon writes halt_state.json as the cross-process mirror of the
+        # durable SQLite halt registry (ADR-0009 / ADR-0016 §D9); this LIVE strategy
+        # reads it in a SEPARATE process to decide safe-stop. The writer docstring
+        # (daemon/halt_state._write_atomic_json) warns a torn/lost write lets a
+        # consumer "trade an asset that is actually halted (fail-OPEN on a halt rail)".
+        # The prior `except (...): pass` did exactly that — a corrupt/partial mirror
+        # was swallowed and the strategy kept trading. An UNREADABLE halt state must
+        # be treated as a HARD HALT (we cannot prove "no active halts"), matching the
+        # sibling ops driver ops/scripts/quant-autonomous-tick.read_active_halts, which
+        # returns a synthetic fail-closed halt on JSONDecodeError. Absent file = cold
+        # start = no halts (benign); empty list = no active halts (keep trading) —
+        # only an EXISTING-but-undecodable / wrong-shape mirror fails closed.
+        if self.HALT_STATE_MIRROR.exists():
+            try:
                 halts = json.loads(self.HALT_STATE_MIRROR.read_text())
-                if halts:
-                    self._enter_safe_stop(f"halt_active: {halts[0].get('reason', 'unknown')}")
-        except (json.JSONDecodeError, OSError):
-            pass
+            except (json.JSONDecodeError, OSError, ValueError) as exc:
+                self._enter_safe_stop(f"halt_mirror_corrupt_fail_closed: {exc}")
+            else:
+                if not isinstance(halts, list):
+                    # Valid JSON but not the expected list shape — structurally
+                    # corrupt; cannot establish 'no active halts' -> fail closed.
+                    self._enter_safe_stop(
+                        f"halt_mirror_bad_shape_fail_closed: {type(halts).__name__}"
+                    )
+                elif halts:
+                    first = halts[0] if isinstance(halts[0], dict) else {}
+                    self._enter_safe_stop(
+                        f"halt_active: {first.get('reason', 'unknown')}"
+                    )
 
     def _latest_signal_for(self, pair: str, current_time) -> dict | None:
         """Return the most recent valid signal for this pair, or None.
