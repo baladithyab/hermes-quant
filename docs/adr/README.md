@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-90 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
+91 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
 
 Status vocabulary: proposed | accepted | rejected | deprecated | superseded by ADR-NNNN. A compound status (e.g. "Part A accepted; Part B proposed") is the ADR's own — see the file.
 
@@ -94,5 +94,6 @@ Status vocabulary: proposed | accepted | rejected | deprecated | superseded by A
 | [ADR-0088](ADR-0088-pluggable-broker-backends-and-options-across-reactors.md) | Pluggable broker backends + stock-and-options across both reactors | proposed | 2026-06-05 |
 | [ADR-0089](ADR-0089-overnight-drift-conviction-modulator.md) | OvernightDriftAnalyst — a zero-turnover conviction modulator on hold-through-close daily positions | Proposed (2026-06-08) — IMPLEMENTED + eval-gated; analyst stays DEFAULT-OFF. Single-SPY ablation returned HOLD; multi-name fair re-test (QQQ/ARKK/TSLA/NVDA/GME/COIN) CONFIRMS HOLD decisively (d_sharpe −1.273, worse on every axis even on the research-favored cohort). Re-open now needs signal RE-DESIGN, not a universe change. See Acceptance gate + `docs/research/2026-06-08-multiname-fair-verdict-retest.md`. | 2026-06-08 |
 | [ADR-0090](ADR-0090-sizing-aware-portfolio-backtest-mode.md) | Sizing-aware multi-name portfolio backtest mode for trustworthy flag verdicts | Proposed (2026-06-08) — design + rationale pinned; build DEFERRED to operator greenlight (substantial new harness mode) | 2026-06-08 |
-| [ADR-0091](ADR-0091-reactors-emit-traded-delta.md) | Reactors must emit the traded delta in `fill_size_pct`, not the absolute target | proposed | 2026-06-10 |
+| [ADR-0091](ADR-0091-reactors-emit-traded-delta.md) | Resolve the fill-size delta-vs-target accounting defect (carry-forward fold, not producer rewrite) | accepted | 2026-06-10 |
 | [ADR-0092](ADR-0092-shared-pdr-core-two-integration-shells.md) | Extract a shared host-agnostic PDR core; hermes-quant and cowork-quant become thin integration shells over it | proposed | 2026-06-12 |
+| [ADR-0093](ADR-0093-host-neutral-product-name.md) | Adopt a host-neutral product name for the shared PDR core; "hermes-quant" is demoted to a shell name | proposed | 2026-06-17 |
