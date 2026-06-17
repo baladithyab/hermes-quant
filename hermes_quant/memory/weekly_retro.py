@@ -424,7 +424,37 @@ def decay_and_promote(active: list[Belief], new: list[Belief], *, asof: datetime
         decayed.recency = round(b.recency * _alpha(b.tier, days), 8)
 
         key = (b.role, b.lesson_category)
-        if key in new_alpha_by_key:
+        # ar99 idempotency / double-fire guard (ADR-0081 §4): the cron passes
+        # asof=now(), so a duplicate same-week firing (POSIX DOM/DOW OR-fire, manual
+        # re-run, or a retry after partial failure) re-distills the SAME trailing
+        # reflections into a NEW belief_id carrying the SAME backing decisions. Keyed
+        # only on (role, lesson_category), that was treated as a fresh "recurrence"
+        # and double-promoted (access_counter+1, importance+K, weekly->monthly) on
+        # ZERO new evidence.
+        #
+        # The duplicate-run signature is PROVABLE only when BOTH the active belief and
+        # the freshly-distilled beliefs carry decision_ids (the real distill_beliefs
+        # path sets them — :346): a same-week re-run yields fresh decision_ids that are
+        # a SUBSET of the active belief's prior set (no genuinely-new decision). When
+        # the fresh beliefs introduce a decision_id NOT already backing the active
+        # belief, it is genuine new evidence and promotes as before. When decision_ids
+        # are ABSENT on either side (legacy beliefs / un-provenanced fixtures), we
+        # CANNOT prove a duplicate, so we fall back to the prior category-recurrence
+        # behavior (promote) rather than silently suppress a real cross-ticker
+        # recurrence — fail-toward-the-legacy-semantics, not toward over-suppression.
+        recurrence_present = key in new_alpha_by_key
+        recurrence_is_genuine = recurrence_present  # default: legacy (no provenance to prove otherwise)
+        if recurrence_present:
+            prior_ids = set(b.oracle_provenance.get("decision_ids") or [])
+            fresh_ids: set = set()
+            for nb in by_key.get(key, []):
+                fresh_ids |= set(nb.oracle_provenance.get("decision_ids") or [])
+            # Only when we have provenance on BOTH sides can we distinguish a genuine
+            # recurrence from a same-evidence re-distillation. If we can, require a
+            # truly-new decision_id; otherwise keep the legacy promote.
+            if prior_ids and fresh_ids:
+                recurrence_is_genuine = bool(fresh_ids - prior_ids)
+        if recurrence_is_genuine:
             # PROMOTE on recurrence (FINMEM access-counter promotion).
             decayed.access_counter = b.access_counter + 1
             decayed.recency = 1.0
