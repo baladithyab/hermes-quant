@@ -85,17 +85,35 @@ asset is the core — and it deserves its own identity.
 
 ## Decision Outcome
 
-Chosen: **name the core `pdr-core` and the umbrella project "PDR" (Perceive-Decide-React),
-demoting "hermes-quant" to mean specifically the Hermes integration shell** — name only,
-no code move.
+**Direction chosen (operator, 2026-06-17): a FRESH CODENAME for the core** — a distinct
+product identity unburdened by either host name or the PDR acronym, demoting "hermes-quant"
+to mean specifically the Hermes integration shell. Name-only, no code move. The exact
+build-name string is PENDING the operator's pick from the curated slate below (or a
+write-in); `pdr_core/` remains the package dir until a future extraction ADR renames it.
 
-Rationale: `pdr-core` is already the dominant informal name and matches the `pdr_core/`
-package directory, so it carries zero novelty risk and needs the least doc churn; "PDR"
-as the umbrella is exactly what ADR-0079 already established the system to BE. This
-ratifies and regularizes existing usage rather than inventing identity, which is the
-right weight for a name-only round. A fresh external-facing codename can be chosen later
-if/when the core is physically extracted and published (a separate, deferred ADR) —
-nothing here blocks that.
+Rationale for a fresh codename over ratifying `pdr-core`: the engine "can run standalone
+or under a host" (operator framing), so a host-neutral, acronym-neutral identity is the
+cleanest for standalone/external framing — the same reason mature engines carry their own
+name (nautilus, lean, hummingbot) rather than being named after a wrapper. The PDR
+acronym describes the *architecture*; the codename names the *product*.
+
+### Curated codename slate (build-name pending operator pick)
+
+Each is short, pronounceable, low-collision with known trading frameworks
+(nautilus_trader / lean / vn.py / hummingbot / freqtrade), and ties to the core's
+actual character (a deterministic, consensus-gated, safety-first decision engine).
+
+| Codename | Why it fits the core | Watch-outs |
+|---|---|---|
+| **Quorum** (lead rec) | The deliberation core literally requires a QUORUM — `require_ensemble` means a lone analyst cannot fire; the BMA blend + risk committee must corroborate before a decision is authorized. Names the exact agentic-consensus mechanism that IS the Decide stage. | common English word; check package-name availability if ever published |
+| **Keel** | The structural backbone that keeps a vessel upright; the money-safety core that keeps the system from capsizing (silence-by-default, fail-closed). 4 letters, maritime (fits "navigate the market"), distinct, very low collision. | very short — may read as generic |
+| **Escapement** | The clockwork mechanism that releases energy one controlled tooth at a time = the deterministic gate releasing positions on the discrete ladder {0, ±0.05, …, ±0.20}. The most precise metaphor for "controlled, discrete, deterministic authority." | obscure; harder to spell/say |
+| **Fulcrum** | The balance/pivot point every decision turns on; the core balances perception against risk and explicitly rejects leverage-gambling (a fulcrum is about balance, not leverage-for-its-own-sake). | common in product names generally |
+
+Until the operator picks, docs SHOULD use "PDR core" descriptively (not a brand) so no
+premature name leaks into the codebase. Once picked, the chosen codename names the core;
+"PDR" stays available as the architecture acronym; "hermes-quant"/"cowork-quant" stay the
+shell names.
 
 Concretely, going forward:
 
