@@ -234,6 +234,32 @@ def _shares_needed(contracts: int) -> int:
     return 100 * contracts
 
 
+def _scale_cover_to_lots(
+    legs: Sequence[OptionLeg | StockLeg], *, lots: int
+) -> list[OptionLeg | StockLeg]:
+    """Rebuild every ``StockLeg`` cover to the ``lots``-lot footprint (100*lots shares)
+    so a net-greeks aggregation evaluates the structure the order actually establishes.
+
+    ``aggregate_net_greeks`` scales OPTION legs by ``order_qty`` (units = sign *
+    ratio_qty * order_qty * 100) but treats ``StockLeg.qty`` as an ALREADY-scaled
+    absolute share count (NOT scaled by order_qty — data.py). The covered-call recipe
+    builds a ONE-lot cover (``StockLeg(qty=100)``) and hands the gate that 1-lot stock.
+    Aggregating a 1-lot cover against an N-lot option footprint understates the
+    directional exposure (monotonically in N) and can FLIP the net-delta sign for a
+    ratio structure, ADMITTING an over-the-cap covered call (fail-OPEN). We rebuild the
+    cover to ``100 * lots`` (the same share count ``_shares_needed`` requires of the
+    classifier) at every gate aggregation so the net-delta / gamma / vega caps and the
+    reported ``net_greeks`` evaluate the true established position. Scaling here (the
+    gate's known-1-lot recipe seam) rather than inside ``aggregate_net_greeks`` avoids
+    double-scaling a caller that already passes a pre-scaled cover.
+    """
+    cover_shares = 100 * max(int(lots), 1)
+    return [
+        replace(leg, qty=cover_shares) if isinstance(leg, StockLeg) else leg
+        for leg in legs
+    ]
+
+
 def _max_loss(
     bucket: StructureBucket,
     *,
@@ -566,8 +592,18 @@ def options_gate(
     # per-lot aggregate would let a multi-lot order slip past O3/O5/net-delta.
     # A leg missing greeks raises GreekComputationError; we convert that to a
     # deterministic silence (reject) rather than aborting the tick (ADR-0027 D6).
+    #
+    # Scale the covered-structure StockLeg cover to the structural lot count too: a
+    # ratio_qty>1 short call has structural_contracts>1, and aggregating the recipe's
+    # 1-lot cover (StockLeg(qty=100)) against the N-lot option footprint understates
+    # (and can sign-flip) the net delta — fail-OPEN on the net-delta cap AND a wrong
+    # reported net_greeks. _scale_cover_to_lots rebuilds the cover to the
+    # 100*structural_contracts shares the classifier already requires (_shares_needed).
+    legs_at_structural = _scale_cover_to_lots(legs, lots=structural_contracts)
     try:
-        candidate_net = aggregate_net_greeks(legs, order_qty=structural_contracts)
+        candidate_net = aggregate_net_greeks(
+            legs_at_structural, order_qty=structural_contracts
+        )
     except GreekComputationError as exc:
         # GENUINELY missing/incomplete greeks => deterministic silence (reject),
         # the intended fail-closed path (ADR-0027 D6).
@@ -839,29 +875,23 @@ def options_gate(
     # any breach silences. The admitted-size aggregate is the authoritative
     # net_greeks reported. (Fail-closed on missing greeks, as above.)
     #
-    # Covered-structure StockLeg cover MUST scale with the admitted lot count.
-    # `aggregate_net_greeks(legs, order_qty=contracts)` scales the OPTION legs by
-    # `contracts` (data.py:295) but treats StockLeg.qty as an ALREADY-scaled
-    # absolute share count (data.py:305 — NOT scaled by order_qty). The production
-    # CC recipe builds a 1-lot cover (StockLeg(qty=100), recipes.py:261) and only
-    # rebuilds it to qty=100*contracts AFTER the gate returns (recipes.py:324). If
-    # we aggregated the recipe's 1-lot stock against the N-lot option, the net-delta
-    # cap would be evaluated against |100 - 30N| share-deltas instead of the TRUE
-    # |100N - 30N| of the admitted N-lot position — understating the directional
-    # exposure (monotonically in N) and ADMITTING an over-the-cap covered call
-    # (fail-OPEN; the gate would size up the option but leave the cover at 1 lot).
-    # Rebuild every StockLeg to its admitted cover (100 * contracts shares) so the
-    # net-delta re-check evaluates the structure the order actually establishes.
-    # (Done only at the gate's known-1-lot recipe seam; scaling StockLeg.qty inside
-    # aggregate_net_greeks would double-scale a caller that passes a pre-scaled
-    # cover — which the existing tests and the post-gate recipe path both do.)
+    # ar106: scale the covered-structure StockLeg cover to the ADMITTED lot count.
+    # `aggregate_net_greeks(legs, order_qty=contracts)` scales OPTION legs by
+    # `contracts` (data.py:295) but treats StockLeg.qty as an ALREADY-scaled absolute
+    # share count (data.py:305 — NOT scaled by order_qty). The CC recipe builds a
+    # 1-lot cover (StockLeg(qty=100), recipes.py:261) and only rebuilds it to
+    # qty=100*contracts AFTER the gate returns. Aggregating the 1-lot stock against
+    # the N-lot option would evaluate the net-delta cap against |100 - 30N| instead
+    # of the TRUE |100N - 30N| — understating exposure (monotonically in N) and
+    # ADMITTING an over-the-cap covered call (fail-OPEN). _scale_cover_to_lots rebuilds
+    # every StockLeg to its admitted cover; same fail-open closed at the first-pass
+    # aggregation above, here at the admitted size. (Scaling at the gate's known-1-lot
+    # recipe seam, not inside aggregate_net_greeks, avoids double-scaling a pre-scaled
+    # caller — which the existing tests and the post-gate recipe path both pass.)
     if contracts != structural_contracts:
-        admitted_legs = [
-            replace(leg, qty=100 * contracts) if isinstance(leg, StockLeg) else leg
-            for leg in legs
-        ]
+        legs_at_admitted = _scale_cover_to_lots(legs, lots=contracts)
         try:
-            admitted_net = aggregate_net_greeks(admitted_legs, order_qty=contracts)
+            admitted_net = aggregate_net_greeks(legs_at_admitted, order_qty=contracts)
         except GreekComputationError as exc:
             return OptionsGateResult.silence(
                 bucket, f"greeks_unavailable: {exc}", bpr_estimate=bpr, max_loss=max_loss,
