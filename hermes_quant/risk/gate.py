@@ -348,6 +348,62 @@ class RiskConfig:
         autonomous loop enforces that invariant before reaching the gate.
     """
 
+    def __post_init__(self) -> None:
+        """ar124: fail-CLOSED validation of the money-critical thresholds.
+
+        ``RiskConfig`` is built from operator-editable recipe YAML
+        (``recipes.instantiate_recipe_risk_gate`` → ``RiskConfig(**recipe.risk_gate_config)``)
+        with NO prior validation, and the frozen dataclass had no guard. A non-finite
+        threshold from YAML (``max_drawdown_pct: 1e400`` overflows to ``inf`` with no
+        error; ``.nan`` parses to NaN) silently DISABLES the rail it bounds: the Rule-1
+        drawdown breaker (``drawdown_pct > max_drawdown_pct``) and Rule-2 daily-loss
+        breaker compare ``> inf``/``> nan`` as always-False, so a catastrophic real
+        drawdown never trips/halts (fail-OPEN); ``max_position_pct = inf/nan`` likewise
+        defeats the quarter-Kelly position cap (``min(size, inf) == size``). This is the
+        operator-config seam that bypassed the ar08-12 finite-guard family. We fail LOUD
+        (recipe load already raises on bad config) rather than fail-open with a corrupt
+        rail — a non-finite or non-positive money threshold is a configuration error, not
+        a runtime degrade.
+
+        The breaker/cap thresholds must be finite and in (0, 1] (a fraction of NAV);
+        cost_multiple and min_trade_size must be finite and >= 0. Upper bounds are the
+        100%-of-NAV sanity ceiling, not the specific preset values (aggressive uses
+        max_position_pct=0.40, max_daily_loss_pct=0.10 — all within range).
+        """
+        def _frac_0_1(name: str, value: object, *, allow_zero: bool = False) -> None:
+            try:
+                v = float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise ValueError(f"RiskConfig.{name} must be a number, got {value!r}")
+            if not math.isfinite(v):
+                raise ValueError(
+                    f"RiskConfig.{name} must be finite (a NaN/inf threshold disables the "
+                    f"money rail it bounds — fail-OPEN); got {value!r}"
+                )
+            lo_ok = (v >= 0.0) if allow_zero else (v > 0.0)
+            if not (lo_ok and v <= 1.0):
+                raise ValueError(
+                    f"RiskConfig.{name} must be in "
+                    f"{'[0, 1]' if allow_zero else '(0, 1]'} (fraction of NAV); got {v}"
+                )
+
+        def _nonneg(name: str, value: object) -> None:
+            try:
+                v = float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise ValueError(f"RiskConfig.{name} must be a number, got {value!r}")
+            if not math.isfinite(v) or v < 0.0:
+                raise ValueError(
+                    f"RiskConfig.{name} must be finite and >= 0; got {value!r}"
+                )
+
+        # Rail-bounding fractions: a non-finite/out-of-range value disables the rail.
+        _frac_0_1("max_position_pct", self.max_position_pct)
+        _frac_0_1("max_drawdown_pct", self.max_drawdown_pct)
+        _frac_0_1("max_daily_loss_pct", self.max_daily_loss_pct)
+        _frac_0_1("min_trade_size", self.min_trade_size, allow_zero=True)
+        _nonneg("cost_multiple", self.cost_multiple)
+
     @classmethod
     def conservative(cls) -> RiskConfig:
         return cls(
