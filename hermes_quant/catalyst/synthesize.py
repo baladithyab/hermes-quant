@@ -146,8 +146,20 @@ def synthesize_packets(
         # matching log_propagations' row = dict(e); row["asof"] = ... ordering.
         if stamp_log_asof and propagation_log is not None:
             _asof = item.published_at.isoformat()
+            # ar126b: stamp a per-HEADLINE discriminator so the ar123 dedup key can tell
+            # two DISTINCT headlines for the same edge published in the same second apart
+            # from a true re-ingest of the SAME headline. Without it the dedup
+            # (symbol,source,relation,sign,weight,asof) collapses genuine corroborating
+            # evidence -> under-counts n_scored (fail-CLOSED, the opposite of the ar123
+            # over-count it fixed). Use the headline link (unique per GN item) else the
+            # title; a short stable hash keeps the row compact.
+            import hashlib as _hashlib
+            _hid_src = (item.link or item.title or "").strip()
+            _hid = _hashlib.sha1(_hid_src.encode("utf-8")).hexdigest()[:16] if _hid_src else ""
             for _row in propagation_log[_log_before:]:
                 _row["asof"] = _asof
+                if _hid:
+                    _row["headline_id"] = _hid
         prepared.append((item, cls, ents, results))
         for sym, res in results.items():
             if res.stance == "neutral" or res.confidence <= 0.0:

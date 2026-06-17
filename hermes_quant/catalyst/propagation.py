@@ -192,11 +192,17 @@ def _propagation_row_key(row: dict) -> tuple:
     """Content-identity key for a propagation-log row (ar123 dedup).
 
     A row is uniquely identified by its (symbol, source, relation, effect_sign, weight,
-    symbol_sign, catalyst_sign, asof). Two rows equal on this key are the SAME logical
-    propagation observation (same headline → same edge fire at the same publication
-    time), not two independent data points — so re-ingesting the same news window must
-    not double-count them. A genuine SECOND headline for the same edge has a different
-    ``asof`` (publication time), so it is NOT collapsed.
+    symbol_sign, catalyst_sign, asof, headline_id). Two rows equal on this key are the
+    SAME logical propagation observation (same headline → same edge fire at the same
+    publication time), not two independent data points — so re-ingesting the same news
+    window must not double-count them.
+
+    ar126b: ``headline_id`` (a stable hash of the source headline's link/title, stamped by
+    synthesize_packets) is part of the key so two GENUINELY-DISTINCT headlines for the
+    same edge published in the SAME second (identical ``asof``) are NOT collapsed —
+    without it the dedup would under-count real corroborating evidence (fail-CLOSED, the
+    opposite of the ar123 over-count). Rows lacking headline_id (legacy / a caller that
+    did not stamp it) fall back to asof-only identity (the ar123 behavior).
     """
     return (
         row.get("symbol"),
@@ -207,6 +213,7 @@ def _propagation_row_key(row: dict) -> tuple:
         row.get("symbol_sign"),
         row.get("catalyst_sign"),
         row.get("asof"),
+        row.get("headline_id"),
     )
 
 
