@@ -401,7 +401,15 @@ def replay(
         target_pct = float(rg.get("kelly_fraction", 0.0)) if rg_pass else 0.0
         sig = result.get("aggregated_signal") or {}
         direction = int(sig.get("direction", 0))
-        signed_target = direction * target_pct  # apply direction sign
+        # `kelly_fraction` is ALREADY SIGNED — it is a verbatim copy of
+        # Action.target_position_pct (protocol: "signed; -0.05 = 5% NAV short"),
+        # produced by quarter_kelly_size() which returns a negative target for a
+        # short signal. Multiplying by `direction` again double-applied the sign
+        # and INVERTED every short trade into a long (and back), systematically
+        # mis-scoring short-taking strategies against the ADR-0020 empirical
+        # gate. Use it directly, as every other consumer does (autonomous.py,
+        # tools.py, journal/writer.py).
+        signed_target = target_pct
 
         if rg_pass and abs(signed_target) > 1e-9:
             n_decisions += 1
