@@ -69,6 +69,11 @@ def compute_snapshot(home: Path, bus: Path) -> dict:
 
     snap: dict = {"asof": _now(), "bus": str(bus)}
 
+    # Anchor the line to the clean-window t0 (GATE-0). A reviewer reading perf.jsonl can
+    # see the window the number belongs to; None means the window was not anchored.
+    _anchor = _read_anchor(home)
+    snap["clean_window_t0"] = (_anchor or {}).get("t0") if _anchor else None
+
     if not bus.exists():
         snap["error"] = f"bus not found at {bus}"
         return snap
@@ -117,13 +122,64 @@ def compute_snapshot(home: Path, bus: Path) -> dict:
     return snap
 
 
-def write_run_card(run_dir: Path) -> dict:
-    """Record which rail flags were armed in this process env (call once at run start)."""
-    card = {
+def _read_anchor(home: Path) -> dict | None:
+    """Read the GATE-0 clean_window_start.json anchor (home IS the quant dir here).
+
+    The anchor (written by aegis-gate0-start.py via write_clean_window_start) captured the
+    canonical armed-flag snapshot AT t0 — that is the WINDOW's armed state, independent of
+    whatever env this snapshot process happens to run under. Returns None if absent.
+    """
+    p = home / "clean_window_start.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def write_run_card(run_dir: Path, home: Path | None = None) -> dict:
+    """Record the WINDOW's armed flags (from the GATE-0 anchor), the live env, and any DRIFT.
+
+    The prior version recorded only this process's env — which shows NONE when the snapshot
+    is run outside the armed cron wrapper, falsely implying a disarmed window. The fix: the
+    canonical "was this window armed" answer is the GATE-0 anchor's t0 snapshot. We record
+    BOTH the window (anchor) flags and the live env, and compute ``rail_drift`` — any flag
+    whose live value differs from the window value (a mid-window disarm is a real hazard the
+    operator must see, NOT silently). ``armed_source`` says which we trust.
+    """
+    live = {f: os.environ.get(f) for f in _RAIL_FLAGS}
+    anchor = _read_anchor(home) if home is not None else None
+    window_flags = (anchor or {}).get("armed_flags") if anchor else None
+
+    card: dict = {
         "run_started": _now(),
-        "rail_flags": {f: os.environ.get(f) for f in _RAIL_FLAGS},
+        "clean_window_t0": (anchor or {}).get("t0") if anchor else None,
+        "live_env_flags": live,
         "pdr_mode_note": "pdr.mode is read from ~/.hermes/config.yaml at tick time, not env",
     }
+    if window_flags:
+        # The window's canonical armed state (captured at GATE-0 t0).
+        card["window_armed_flags"] = window_flags
+        card["armed_source"] = "gate0_anchor"
+        # Drift = a rail flag whose LIVE value differs from the WINDOW value (a disarm).
+        drift = {
+            f: {"window": window_flags.get(f), "live": live.get(f)}
+            for f in _RAIL_FLAGS
+            if window_flags.get(f) != live.get(f)
+        }
+        if drift:
+            card["rail_drift"] = drift
+            card["rail_drift_warning"] = (
+                "LIVE rail flags differ from the GATE-0 window flags — a rail may have been "
+                "disarmed mid-window. The window's evidence is only valid while the rails "
+                "stay as armed at t0."
+            )
+    else:
+        # No anchor -> GATE-0 not run (or wrong home). Fall back to live env, flagged.
+        card["window_armed_flags"] = None
+        card["armed_source"] = "live_env (NO GATE-0 anchor found — window not anchored)"
+
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run-card.json").write_text(json.dumps(card, indent=2) + "\n", encoding="utf-8")
     return card
@@ -163,11 +219,18 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     if args.write_run_card:
-        card = write_run_card(run_dir)
+        card = write_run_card(run_dir, home=home)
         if not args.json:
-            armed = [f for f, v in card["rail_flags"].items() if v]
-            print(f"AEGIS run-card written: {run_dir / 'run-card.json'}")
-            print(f"  armed flags: {', '.join(armed) or 'NONE (rails disarmed!)'}")
+            win = card.get("window_armed_flags")
+            print(f"AEGIS run-card written: {run_dir / 'run-card.json'}  (source: {card.get('armed_source')})")
+            if win:
+                armed = [f for f, v in win.items() if v]
+                print(f"  window armed flags (GATE-0 t0={card.get('clean_window_t0')}): {', '.join(armed) or 'NONE'}")
+                if card.get("rail_drift"):
+                    print(f"  ⚠️  RAIL DRIFT vs window: {list(card['rail_drift'].keys())} — a rail may be disarmed mid-window")
+            else:
+                live_armed = [f for f, v in card["live_env_flags"].items() if v]
+                print(f"  no GATE-0 anchor; live-env armed flags: {', '.join(live_armed) or 'NONE (rails disarmed!)'}")
 
     snap = compute_snapshot(home, bus)
 
