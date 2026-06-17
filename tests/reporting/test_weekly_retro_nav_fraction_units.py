@@ -195,6 +195,72 @@ def test_true_unit_us_option_short_profits_when_mark_falls() -> None:
     assert reported > 0.0, "a short option whose mark fell must show a profit"
 
 
+def test_corrupt_nav_fraction_excluded_from_weekly_pnl() -> None:
+    """A nav_fraction row with |qty| > 1.0 is IMPOSSIBLE (max 100% of NAV) and is a
+    corrupt raw-share count (the 2026-06-08 AAPL=510 incident).
+
+    In the weekly retro's compute_unrealized_pnl, such a row MUST be excluded (not
+    present in the return dict, or present with unrealized_pnl=None) and MUST emit
+    a warning to stderr. Legit nav_fraction (qty=0.20) and true_unit (50 shares) must
+    be unaffected — byte-identical to the normal unit-aware path.
+
+    CORRUPT row (AAPL, nav_fraction, qty=510):
+      - At mark=$300, nav=$100k: fake unrealized ≈ 510*100_000*(300/299-1) ≈ +$170k.
+      - After the fix: EXCLUDED (must not appear in the result dict with a finite value).
+
+    LEGIT nav_fraction (NVDA, qty=0.20):
+      - unrealized = 0.20 * 100_000 * (110/100 - 1) = +$2,000 (unaffected).
+
+    TRUE-UNIT equity (BA, qty=50 shares, unit_kind='true_unit'):
+      - unrealized = (220 - 200) * 50 = +$1,000 (never filtered by nav_fraction guard).
+    """
+    mod = _load_weekly_retro_module()
+
+    import io
+    import sys as _sys
+
+    nav = 100_000.0
+    positions = [
+        # corrupt: nav_fraction but qty=510 (impossible raw share count)
+        ("AAPL", 510.0, 299.0, "equity", "nav_fraction"),
+        # legit nav_fraction
+        ("NVDA", 0.20, 100.0, "equity", "nav_fraction"),
+        # true-unit equity (det-equity shares) — must NOT be touched by nav_fraction guard
+        ("BA", 50.0, 200.0, "equity", "true_unit"),
+    ]
+    marks = {"AAPL": 300.0, "NVDA": 110.0, "BA": 220.0}
+
+    captured_stderr = io.StringIO()
+    old_stderr = _sys.stderr
+    _sys.stderr = captured_stderr
+    try:
+        out = mod.compute_unrealized_pnl(positions, marks, nav_ref=nav)
+    finally:
+        _sys.stderr = old_stderr
+    stderr_output = captured_stderr.getvalue()
+
+    # Warning MUST be emitted to stderr for the corrupt row.
+    assert "AAPL" in stderr_output or "corrupt" in stderr_output.lower() or "warn" in stderr_output.lower(), (
+        f"Expected a stderr warning for the corrupt AAPL nav_fraction row, got: {stderr_output!r}"
+    )
+
+    # Corrupt row must be absent OR present with unrealized_pnl=None — never a finite phantom value.
+    if "AAPL" in out:
+        assert out["AAPL"]["unrealized_pnl"] is None, (
+            f"corrupt AAPL must NOT have a finite unrealized_pnl; got {out['AAPL']['unrealized_pnl']}"
+        )
+    else:
+        pass  # excluded entirely — this is the preferred behaviour
+
+    # Legit nav_fraction: unrealized = qty * nav * (mark/avg - 1)
+    assert "NVDA" in out, "legit nav_fraction NVDA must still be valued"
+    assert out["NVDA"]["unrealized_pnl"] == pytest.approx(0.20 * 100_000.0 * (110.0 / 100.0 - 1.0))
+
+    # True-unit equity: share formula, mult=1
+    assert "BA" in out, "true_unit BA must still be valued"
+    assert out["BA"]["unrealized_pnl"] == pytest.approx((220.0 - 200.0) * 50.0)
+
+
 def test_true_unit_equity_det_equity_uses_share_formula_not_nav_fraction() -> None:
     """ar118 REGRESSION (weekly retro): a deterministic-equity EQUITY position is
     unit_kind='true_unit' (real signed SHARES, ADR-0086), NOT a NAV-fraction. The

@@ -310,6 +310,22 @@ def compute_unrealized_pnl(
             else asset_class == "us_option"
         )
         opt_mult = _CONTRACT_MULTIPLIER if asset_class == "us_option" else 1.0
+        # Defense-in-depth: a nav_fraction row with |qty| > 1.0+ε is IMPOSSIBLE
+        # (a NAV-fraction is bounded to ~[-1, 1] = 100% of NAV). A larger value
+        # is a corrupt raw-share count (e.g. the 2026-06-08 AAPL=510.03 incident
+        # that produced a fake +$70,605 unrealized in the 06-16 daily report).
+        # Exclude it and warn loudly — never emit a fabricated dollar figure.
+        # true_unit rows are unaffected (they legitimately have qty>1 as real shares).
+        _CORRUPT_THRESHOLD = 1.0 + 1e-9
+        if not true_unit and abs(qty_f) > _CORRUPT_THRESHOLD:
+            print(
+                f"WARNING: corrupt state.db row excluded from P&L — "
+                f"symbol={sym!r} unit_kind={unit_kind!r} qty={qty_f} "
+                f"(nav_fraction qty must be in [-1,1]; this looks like a raw share count). "
+                f"Row excluded to prevent a fabricated dollar figure in the report.",
+                file=sys.stderr,
+            )
+            continue
         # NAV-fraction rows need a NAV reference; without one we cannot value them
         # honestly, so drop them rather than emit a share-formula garbage figure.
         if not true_unit and nav_ref is None:

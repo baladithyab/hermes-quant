@@ -261,6 +261,33 @@ def compute_position_pnl(
         mark = marks.get(sym)
         pcl = prev_close.get(sym)
         e = dict(pos)
+        # Defense-in-depth: a nav_fraction row with |qty| > 1.0+ε is IMPOSSIBLE
+        # (a NAV-fraction is bounded to ~[-1, 1] = 100% of NAV). A larger value
+        # is a corrupt raw-share count (e.g. the 2026-06-08 AAPL=510.03 incident
+        # that produced a fake +$70,605 unrealized in the 06-16 daily report).
+        # Exclude it entirely and warn loudly — never emit a fabricated dollar figure.
+        # true_unit rows are unaffected (they legitimately have qty>1 as real shares).
+        _CORRUPT_THRESHOLD = 1.0 + 1e-9
+        if not true_unit and abs(qty) > _CORRUPT_THRESHOLD:
+            print(
+                f"WARNING: corrupt state.db row excluded from P&L — "
+                f"symbol={sym!r} unit_kind={pos.get('unit_kind')!r} qty={qty} "
+                f"(nav_fraction qty must be in [-1,1]; this looks like a raw share count). "
+                f"Row excluded to prevent a fabricated dollar figure in the report.",
+                file=sys.stderr,
+            )
+            e.update(
+                {
+                    "mark": mark if mark is not None else None,
+                    "market_value": None,
+                    "unrealized_pnl": None,
+                    "unrealized_pct": None,
+                    "today_pnl": None,
+                    "today_pct": None,
+                }
+            )
+            out.append(e)
+            continue
         # NAV-fraction rows need a NAV reference; without one we cannot value them
         # honestly, so treat them as un-markable (None) rather than emit garbage.
         if mark is None or (not true_unit and nav_ref is None):

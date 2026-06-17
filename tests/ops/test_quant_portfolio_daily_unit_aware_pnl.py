@@ -195,6 +195,89 @@ def test_true_unit_option_path_unchanged(tmp_path):
     assert p["market_value"] == pytest.approx(2.50 * 2.0 * 100.0)
 
 
+def test_corrupt_nav_fraction_excluded_from_pnl(tmp_path):
+    """A nav_fraction row with |qty| > 1.0 is IMPOSSIBLE (max 100% of NAV) and is a
+    corrupt raw-share count from the 2026-06-08 incident (AAPL=510.03 in state.db).
+
+    Such a row MUST be excluded from P&L / market-value computation and MUST emit a
+    warning to stderr. Legit nav_fraction (qty=0.20) and true_unit (50 shares) must
+    be unaffected — byte-identical to the normal path.
+
+    CORRUPT row (AAPL, nav_fraction, qty=510.03):
+      - At mark=$300 and nav=$100k: fake market_value = 510.03 * 100_000 = $51,003,000
+        and fake unrealized = 510.03 * 100_000 * (300/299 - 1) ≈ +$170k (impossible).
+      - After the fix: EXCLUDED → unrealized_pnl and market_value are NOT contributed.
+
+    LEGIT row (NVDA, nav_fraction, qty=0.20):
+      - market_value = 0.20 * 100_000 = $20,000 (unaffected).
+
+    TRUE-UNIT row (BA, equity, qty=50 shares, unit_kind='true_unit'):
+      - market_value = mark * 50 (unaffected, never filtered by the nav_fraction guard).
+    """
+    mod = _load_script(tmp_path)
+    _seed_state_db(
+        mod.STATE_DB_PATH,
+        rows=[
+            # corrupt: nav_fraction but quantity=510.03 (impossible, raw share count)
+            ("equity", "AAPL", 510.03, 299.0, "nav_fraction"),
+            # legit nav_fraction: 0.20 (within [-1, 1])
+            ("equity", "NVDA", 0.20, 100.0, "nav_fraction"),
+            # true_unit equity: 50 real shares — must NOT be touched by the nav_fraction guard
+            ("equity", "BA", 50.0, 200.0, "true_unit"),
+        ],
+        equity_total=100_000.0,
+    )
+    positions = mod.load_positions(account="paper-default")
+    assert len(positions) == 3
+    nav_ref = mod.load_nav_ref(account="paper-default")
+    assert nav_ref == 100_000.0
+
+    import io
+    import sys as _sys
+    captured_stderr = io.StringIO()
+    old_stderr = _sys.stderr
+    _sys.stderr = captured_stderr
+    try:
+        enriched = mod.compute_position_pnl(
+            positions, {"AAPL": 300.0, "NVDA": 110.0, "BA": 220.0}, {}, nav_ref
+        )
+    finally:
+        _sys.stderr = old_stderr
+    stderr_output = captured_stderr.getvalue()
+
+    # Warning MUST be emitted to stderr for the corrupt row.
+    assert "AAPL" in stderr_output or "corrupt" in stderr_output.lower() or "warn" in stderr_output.lower(), (
+        f"Expected a stderr warning for the corrupt AAPL nav_fraction row, got: {stderr_output!r}"
+    )
+
+    # Corrupt row: both market_value and unrealized_pnl must be None (excluded).
+    aapl_enriched = next(p for p in enriched if p["symbol"] == "AAPL")
+    assert aapl_enriched["market_value"] is None, (
+        f"corrupt nav_fraction AAPL must NOT contribute a market_value; got {aapl_enriched['market_value']}"
+    )
+    assert aapl_enriched["unrealized_pnl"] is None, (
+        f"corrupt nav_fraction AAPL must NOT contribute unrealized_pnl; got {aapl_enriched['unrealized_pnl']}"
+    )
+
+    # Legit nav_fraction: market_value = qty * nav_ref = 0.20 * 100_000 = 20_000.
+    nvda_enriched = next(p for p in enriched if p["symbol"] == "NVDA")
+    assert nvda_enriched["market_value"] == pytest.approx(0.20 * 100_000.0), (
+        f"legit nav_fraction NVDA market_value must be 0.20*nav_ref=$20,000; got {nvda_enriched['market_value']}"
+    )
+    assert nvda_enriched["unrealized_pnl"] == pytest.approx(
+        0.20 * 100_000.0 * (110.0 / 100.0 - 1.0)
+    ), "legit nav_fraction NVDA unrealized_pnl must be canonical form"
+
+    # True-unit equity: market_value = mark * qty = 220 * 50 = 11,000.
+    ba_enriched = next(p for p in enriched if p["symbol"] == "BA")
+    assert ba_enriched["market_value"] == pytest.approx(220.0 * 50.0), (
+        f"true_unit BA market_value must be mark*shares=$11,000; got {ba_enriched['market_value']}"
+    )
+    assert ba_enriched["unrealized_pnl"] == pytest.approx((220.0 - 200.0) * 50.0), (
+        f"true_unit BA unrealized_pnl must be (mark-avg)*shares=+$1,000; got {ba_enriched['unrealized_pnl']}"
+    )
+
+
 def test_true_unit_equity_det_equity_uses_share_formula_not_nav_fraction(tmp_path):
     """ar118 REGRESSION: a deterministic-equity EQUITY position is unit_kind='true_unit'
     (real signed SHARES, ADR-0086), NOT a NAV-fraction. The report must value it with the
