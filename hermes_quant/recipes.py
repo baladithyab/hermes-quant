@@ -245,9 +245,14 @@ def instantiate_recipe_analysts(recipe: PDRRecipe):
 
             out.append(MicrostructureLite(**kwargs))
         elif name == "kronos":
-            from hermes_quant.analysts.kronos import KronosAnalyst
+            from hermes_quant.analysts.kronos import KronosAnalyst, KronosConfig
 
-            out.append(KronosAnalyst(**kwargs))
+            # KronosAnalyst takes a KronosConfig object, not flat kwargs (unlike
+            # the dataclass-style analysts above). Bind the recipe's per-analyst
+            # config dict into a KronosConfig so the documented knobs (model,
+            # max_context, pred_len, …) actually reach the analyst. An empty
+            # config yields KronosConfig() — byte-identical to KronosAnalyst().
+            out.append(KronosAnalyst(config=KronosConfig(**kwargs) if kwargs else None))
         elif name == "hermes_semantic":
             from hermes_quant.analysts.semantic import HermesSemanticAnalyst
 
