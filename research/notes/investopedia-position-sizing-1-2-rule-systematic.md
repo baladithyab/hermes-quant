@@ -5,12 +5,12 @@ tags:
 - risk-per-trade
 - position-sizing
 created: '2026-06-17T15:15:05.060293Z'
-updated: '2026-06-17T15:42:46.680287Z'
+updated: '2026-06-17T20:28:23.297671Z'
 source: https://www.investopedia.com/articles/trading/04/091504.asp
 source_domain: www.investopedia.com
 fetched_at: '2026-06-17T15:15:05.060089Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

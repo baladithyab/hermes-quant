@@ -4,9 +4,9 @@ id: tradingagents-llm-as-final-authority-anti-pattern
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:03:41.050741Z'
-updated: '2026-06-17T15:42:46.570200Z'
+updated: '2026-06-17T20:28:23.157727Z'
 source: https://deepwiki.com/TauricResearch/TradingAgents
-status: review
+status: evergreen
 type: note
 tier: practitioner
 content_type: docs

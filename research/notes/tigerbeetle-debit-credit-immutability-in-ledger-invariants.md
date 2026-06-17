@@ -4,9 +4,9 @@ id: tigerbeetle-debit-credit-immutability-in-ledger-invariants
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:12:19.615200Z'
-updated: '2026-06-17T15:42:46.601495Z'
+updated: '2026-06-17T20:28:23.194025Z'
 source: https://docs.tigerbeetle.com/concepts/debit-credit
-status: review
+status: evergreen
 type: note
 tier: institutional
 content_type: docs

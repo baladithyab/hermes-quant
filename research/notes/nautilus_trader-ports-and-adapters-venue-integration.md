@@ -4,9 +4,9 @@ id: nautilus_trader-ports-and-adapters-venue-integration
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:03:09.242247Z'
-updated: '2026-06-17T15:42:46.560435Z'
+updated: '2026-06-17T20:28:23.146846Z'
 source: https://deepwiki.com/nautechsystems/nautilus_trader
-status: review
+status: evergreen
 type: note
 tier: practitioner
 content_type: docs

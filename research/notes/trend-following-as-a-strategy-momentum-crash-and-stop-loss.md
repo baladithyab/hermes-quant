@@ -4,12 +4,12 @@ id: trend-following-as-a-strategy-momentum-crash-and-stop-loss
 tags:
 - stop-loss
 created: '2026-06-17T15:16:51.991923Z'
-updated: '2026-06-17T15:42:46.698199Z'
+updated: '2026-06-17T20:28:23.317403Z'
 source: https://arxiv.org/abs/1704.01368
 source_domain: arxiv.org
 fetched_at: '2026-06-17T15:16:51.991727Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: institutional
 content_type: paper

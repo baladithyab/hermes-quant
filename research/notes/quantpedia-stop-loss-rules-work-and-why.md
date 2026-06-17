@@ -4,12 +4,12 @@ id: quantpedia-stop-loss-rules-work-and-why
 tags:
 - stop-loss
 created: '2026-06-17T15:10:52.734707Z'
-updated: '2026-06-17T15:42:46.648799Z'
+updated: '2026-06-17T20:28:23.258684Z'
 source: https://quantpedia.com/stop-loss-rules-work-why/
 source_domain: quantpedia.com
 fetched_at: '2026-06-17T15:10:52.734497Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

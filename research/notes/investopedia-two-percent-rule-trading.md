@@ -4,12 +4,12 @@ id: investopedia-two-percent-rule-trading
 tags:
 - risk-per-trade
 created: '2026-06-17T15:15:14.770497Z'
-updated: '2026-06-17T15:42:46.685041Z'
+updated: '2026-06-17T20:28:23.303020Z'
 source: https://www.investopedia.com/terms/t/two-percent-rule.asp
 source_domain: www.investopedia.com
 fetched_at: '2026-06-17T15:15:14.770283Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

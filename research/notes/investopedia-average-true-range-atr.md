@@ -4,12 +4,12 @@ id: investopedia-average-true-range-atr
 tags:
 - atr-stop
 created: '2026-06-17T15:12:59.881338Z'
-updated: '2026-06-17T15:42:46.671776Z'
+updated: '2026-06-17T20:28:23.286110Z'
 source: https://www.investopedia.com/terms/a/atr.asp
 source_domain: www.investopedia.com
 fetched_at: '2026-06-17T15:12:59.881102Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

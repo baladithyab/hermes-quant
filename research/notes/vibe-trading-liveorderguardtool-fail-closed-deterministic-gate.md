@@ -4,9 +4,9 @@ id: vibe-trading-liveorderguardtool-fail-closed-deterministic-gate
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:05:16.312955Z'
-updated: '2026-06-17T15:42:46.579340Z'
+updated: '2026-06-17T20:28:23.168398Z'
 source: https://deepwiki.com/HKUDS/Vibe-Trading
-status: review
+status: evergreen
 type: note
 tier: practitioner
 content_type: docs

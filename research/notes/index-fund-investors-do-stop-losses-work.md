@@ -4,12 +4,12 @@ id: index-fund-investors-do-stop-losses-work
 tags:
 - stop-loss-adversarial
 created: '2026-06-17T15:16:03.801216Z'
-updated: '2026-06-17T15:42:46.693565Z'
+updated: '2026-06-17T20:28:23.312551Z'
 source: https://indexfundinvestors.com/2021/12/14/do-stop-losses-work/
 source_domain: www.hugedomains.com
 fetched_at: '2026-06-17T15:16:03.801016Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

@@ -4,9 +4,9 @@ id: vnpy-basegateway-eventengine-canonical-object-seam
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:06:59.771608Z'
-updated: '2026-06-17T15:42:46.583866Z'
+updated: '2026-06-17T20:28:23.173540Z'
 source: https://deepwiki.com/vnpy/vnpy
-status: review
+status: evergreen
 type: note
 tier: practitioner
 content_type: docs

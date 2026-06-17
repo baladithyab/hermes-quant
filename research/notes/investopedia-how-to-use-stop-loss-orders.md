@@ -4,12 +4,12 @@ id: investopedia-how-to-use-stop-loss-orders
 tags:
 - stop-loss
 created: '2026-06-17T15:11:57.111271Z'
-updated: '2026-06-17T15:42:46.662281Z'
+updated: '2026-06-17T20:28:23.275514Z'
 source: https://www.investopedia.com/articles/stocks/09/use-stop-loss.asp
 source_domain: www.investopedia.com
 fetched_at: '2026-06-17T15:11:57.111057Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

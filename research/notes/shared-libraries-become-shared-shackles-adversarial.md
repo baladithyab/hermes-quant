@@ -4,9 +4,9 @@ id: shared-libraries-become-shared-shackles-adversarial
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:13:53.026190Z'
-updated: '2026-06-17T15:42:46.619554Z'
+updated: '2026-06-17T20:28:23.215315Z'
 source: https://stevenstuartm.com/blog/2026/01/06/the-false-economy-of-shared-libraries.html
-status: review
+status: evergreen
 type: note
 tier: commentary
 content_type: blog

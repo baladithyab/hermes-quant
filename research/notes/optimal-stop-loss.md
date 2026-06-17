@@ -4,12 +4,12 @@ id: optimal-stop-loss
 tags:
 - stop-loss
 created: '2026-06-17T15:10:20.991105Z'
-updated: '2026-06-17T15:42:46.640268Z'
+updated: '2026-06-17T20:28:23.247438Z'
 source: https://www.nber.org/papers/w2798
 source_domain: www.nber.org
 fetched_at: '2026-06-17T15:10:20.990892Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

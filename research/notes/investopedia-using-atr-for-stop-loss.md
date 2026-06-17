@@ -4,12 +4,12 @@ id: investopedia-using-atr-for-stop-loss
 tags:
 - atr-stop
 created: '2026-06-17T15:13:19.445937Z'
-updated: '2026-06-17T15:42:46.676023Z'
+updated: '2026-06-17T20:28:23.291330Z'
 source: https://www.investopedia.com/articles/trading/08/average-true-range.asp
 source_domain: www.investopedia.com
 fetched_at: '2026-06-17T15:13:19.445707Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

@@ -4,12 +4,12 @@ id: fidelity-stop-loss-orders
 tags:
 - stop-loss
 created: '2026-06-17T15:11:38.266285Z'
-updated: '2026-06-17T15:42:46.657898Z'
+updated: '2026-06-17T20:28:23.270989Z'
 source: https://www.fidelity.com/learning-center/trading-investing/trading/stop-loss-orders
 source_domain: www.fidelity.com
 fetched_at: '2026-06-17T15:11:38.266119Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

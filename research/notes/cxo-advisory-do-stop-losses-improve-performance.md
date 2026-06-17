@@ -5,12 +5,12 @@ tags:
 - stop-loss
 - stop-loss-adversarial
 created: '2026-06-17T15:10:54.825465Z'
-updated: '2026-06-17T15:42:46.653552Z'
+updated: '2026-06-17T20:28:23.265417Z'
 source: https://www.cxoadvisory.com/3793/individual-stocks/do-stop-losses-improve-performance/
 source_domain: www.cxoadvisory.com
 fetched_at: '2026-06-17T15:10:54.825230Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

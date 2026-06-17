@@ -4,12 +4,12 @@ id: volatility-managed-portfolios-moreira-muir-2017-arxiv
 tags:
 - volatility-targeting
 created: '2026-06-17T15:12:23.222006Z'
-updated: '2026-06-17T15:42:46.667110Z'
+updated: '2026-06-17T20:28:23.280953Z'
 source: https://arxiv.org/abs/1509.09247
 source_domain: arxiv.org
 fetched_at: '2026-06-17T15:12:23.221816Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: institutional
 content_type: paper

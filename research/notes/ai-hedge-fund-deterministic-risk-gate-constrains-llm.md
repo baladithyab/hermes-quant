@@ -4,9 +4,9 @@ id: ai-hedge-fund-deterministic-risk-gate-constrains-llm
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:05:15.887146Z'
-updated: '2026-06-17T15:42:46.574886Z'
+updated: '2026-06-17T20:28:23.163040Z'
 source: https://deepwiki.com/virattt/ai-hedge-fund
-status: review
+status: evergreen
 type: note
 tier: practitioner
 content_type: docs

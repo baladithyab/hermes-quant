@@ -2,24 +2,24 @@
 title: "Tag: stop-loss"
 id: "_tag-stop-loss"
 type: index
-created: 2026-06-17T15:42:47.141044+00:00
-updated: 2026-06-17T15:42:47.141044+00:00
+created: 2026-06-17T20:28:27.111052+00:00
+updated: 2026-06-17T20:28:27.111052+00:00
 ---
 
 # Tag: stop-loss
 
 **10** notes.
 
-- [[aqr-stop-loss-rules-research]] — AQR Stop-Loss Rules Research — AQR-style view: per-position stops are a blunt instrument vs volatility-targeting (size smaller at entry on high-vol names rather than install a fixed stop); but a hard stop remains the simplest tail-protection for a thin-history book. `review`
-- [[cxo-advisory-do-stop-losses-improve-performance]] — CXO Advisory: Do Stop-Losses Improve Performance? — CXO Advisory survey: empirical stop-loss studies are mixed; trailing stops on trending assets can help, fixed stops on mean-reverting equities often hurt via whipsaw. Adversarial source for the stop decision. `review`
-- [[fidelity-stop-loss-orders]] — Fidelity: Stop-Loss Orders — Fidelity practitioner primer on stop-loss order mechanics (stop vs stop-limit, market-gap risk). Thin reference note. `review`
-- [[investopedia-how-to-use-stop-loss-orders]] — Investopedia: How to Use Stop-Loss Orders — Investopedia comprehensive stop-loss guide: types (standard, stop-limit, trailing), benefits (disposition-effect removal, automation), risks (whipsaw on temporary dips), placement (percentage or ATR-based). Key: customize stop % to instrument's normal price movement. `review`
-- [[optimal-mean-reversion-trading-with-stop-loss-exit-leung-li-2016]] — Optimal Mean Reversion Trading with Stop-Loss Exit (Leung & Li 2016) — Leung & Li (2015 IJTAF): Optimal stop-loss for mean-reverting OU spread — entry region is a bounded price interval strictly above stop-loss level; higher stop-loss implies lower optimal take-profit; stop-loss placement is mathematically derivable given price-process model. `review`
-- [[optimal-stop-loss]] — Optimal Stop-Loss — Overview of optimal stop placement: stop distance should scale with instrument volatility; too-tight stops (< ~1 daily-sigma) churn on noise; placement is a joint problem with the take-profit / holding horizon. `review`
-- [[quantpedia-stop-loss-rules-work-and-why]] — QuantPedia: Stop Loss Rules Work and Why — QuantPedia: stop-loss rules can add value primarily as momentum-crash / tail protection; effectiveness depends on holding period and rebalancing frequency. A monthly stop on momentum portfolios reduced drawdown in cited studies. `review`
+- [[aqr-stop-loss-rules-research]] — AQR Stop-Loss Rules Research — AQR-style view: per-position stops are a blunt instrument vs volatility-targeting (size smaller at entry on high-vol names rather than install a fixed stop); but a hard stop remains the simplest tail-protection for a thin-history book. `evergreen`
+- [[cxo-advisory-do-stop-losses-improve-performance]] — CXO Advisory: Do Stop-Losses Improve Performance? — CXO Advisory survey: empirical stop-loss studies are mixed; trailing stops on trending assets can help, fixed stops on mean-reverting equities often hurt via whipsaw. Adversarial source for the stop decision. `evergreen`
+- [[fidelity-stop-loss-orders]] — Fidelity: Stop-Loss Orders — Fidelity practitioner primer on stop-loss order mechanics (stop vs stop-limit, market-gap risk). Thin reference note. `evergreen`
+- [[investopedia-how-to-use-stop-loss-orders]] — Investopedia: How to Use Stop-Loss Orders — Investopedia comprehensive stop-loss guide: types (standard, stop-limit, trailing), benefits (disposition-effect removal, automation), risks (whipsaw on temporary dips), placement (percentage or ATR-based). Key: customize stop % to instrument's normal price movement. `evergreen`
+- [[optimal-mean-reversion-trading-with-stop-loss-exit-leung-li-2016]] — Optimal Mean Reversion Trading with Stop-Loss Exit (Leung & Li 2016) — Leung & Li (2015 IJTAF): Optimal stop-loss for mean-reverting OU spread — entry region is a bounded price interval strictly above stop-loss level; higher stop-loss implies lower optimal take-profit; stop-loss placement is mathematically derivable given price-process model. `evergreen`
+- [[optimal-stop-loss]] — Optimal Stop-Loss — Overview of optimal stop placement: stop distance should scale with instrument volatility; too-tight stops (< ~1 daily-sigma) churn on noise; placement is a joint problem with the take-profit / holding horizon. `evergreen`
+- [[quantpedia-stop-loss-rules-work-and-why]] — QuantPedia: Stop Loss Rules Work and Why — QuantPedia: stop-loss rules can add value primarily as momentum-crash / tail protection; effectiveness depends on holding period and rebalancing frequency. A monthly stop on momentum portfolios reduced drawdown in cited studies. `evergreen`
 - [[risk-parity-stop-losses-for-systematic-equity]] — Risk Parity Stop-Losses for Systematic Equity — Short commentary note on per-position stops in a systematic-equity / risk-parity context (low word count; supporting reference only). `draft`
-- [[trend-following-as-a-strategy-momentum-crash-and-stop-loss]] — Trend Following as a Strategy: Momentum Crash and Stop Loss — Trend-following + momentum-crash literature: stops are the natural complement to momentum strategies — they exit as a trend breaks, capping exposure to the momentum-crash tail (the regime where Kaminski-Lo says stops help). `review`
-- [[two-centuries-of-trend-following-lemprire-et-al-2014]] — Two Centuries of Trend Following Lempérière et al 2014 — Lempérière et al (2014 arXiv): Two centuries of evidence for trend-following anomaly across 4 asset classes. t-stat ~10 since 1800. Saturation effect for large signals. Long trends statistically intact; short trends degraded. Supports momentum-crash protection via stop-loss in trend regime. `review`
+- [[trend-following-as-a-strategy-momentum-crash-and-stop-loss]] — Trend Following as a Strategy: Momentum Crash and Stop Loss — Trend-following + momentum-crash literature: stops are the natural complement to momentum strategies — they exit as a trend breaks, capping exposure to the momentum-crash tail (the regime where Kaminski-Lo says stops help). `evergreen`
+- [[two-centuries-of-trend-following-lemprire-et-al-2014]] — Two Centuries of Trend Following Lempérière et al 2014 — Lempérière et al (2014 arXiv): Two centuries of evidence for trend-following anomaly across 4 asset classes. t-stat ~10 since 1800. Saturation effect for large signals. Long trends statistically intact; short trends degraded. Supports momentum-crash protection via stop-loss in trend regime. `evergreen`
 
 ---
 *Auto-generated by hyperresearch. Do not edit manually.*

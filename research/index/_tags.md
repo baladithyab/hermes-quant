@@ -2,20 +2,42 @@
 title: "Tags Index"
 id: "_tags"
 type: index
-created: 2026-06-17T15:42:47.136752+00:00
-updated: 2026-06-17T15:42:47.136752+00:00
+created: 2026-06-17T20:28:27.080389+00:00
+updated: 2026-06-17T20:28:27.080389+00:00
 ---
 
 # Tags Index
 
-**7** unique tags.
+**29** unique tags.
 
 - **pdr-core-host-adapter-arch-e99014** (18 notes) → [[_tag-pdr-core-host-adapter-arch-e99014]]
+- **options-strategy** (16 notes) → [[_tag-options-strategy]]
+- **exit-strategy** (11 notes) → [[_tag-exit-strategy]]
 - **stop-loss** (10 notes) → [[_tag-stop-loss]]
+- **options-management** (8 notes) → [[_tag-options-management]]
+- **oms-combo** (3 notes) → [[_tag-oms-combo]]
+- **sharpe-ratio statistics** (3 notes) → [[_tag-sharpe-ratio statistics]]
+- **alpaca-options** (2 notes)
 - **atr-stop** (2 notes)
+- **minimum-track-record statistics** (2 notes)
+- **options-oms** (2 notes)
 - **risk-per-trade** (2 notes)
 - **stop-loss-adversarial** (2 notes)
+- **backtesting overfitting covariance-penalties** (1 notes)
+- **backtesting overfitting statistics** (1 notes)
+- **backtesting overfitting wfa** (1 notes)
+- **deflated-sharpe-ratio statistics** (1 notes)
+- **edge-detection paper-trading minimum-n** (1 notes)
+- **minimum-observations statistics edge-detection** (1 notes)
+- **minimum-trades statistics carver** (1 notes)
+- **multiple-comparisons thin-sample adversarial statistics** (1 notes)
+- **options-risk** (1 notes)
+- **paper trading edge validation** (1 notes)
 - **position-sizing** (1 notes)
+- **sharpe ratio bootstrap statistics** (1 notes)
+- **sharpe-ratio statistics confidence-interval** (1 notes)
+- **sharpe-ratio thin-sample** (1 notes)
+- **sharpe-statistics minimum-track-record** (1 notes)
 - **volatility-targeting** (1 notes)
 
 ---

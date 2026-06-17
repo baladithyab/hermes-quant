@@ -4,12 +4,12 @@ id: aqr-stop-loss-rules-research
 tags:
 - stop-loss
 created: '2026-06-17T15:15:48.238950Z'
-updated: '2026-06-17T15:42:46.689291Z'
+updated: '2026-06-17T20:28:23.307521Z'
 source: https://www.aqr.com/Insights/Research/Alternative-Thinking/Stop-Loss-Rules
 source_domain: www.aqr.com
 fetched_at: '2026-06-17T15:15:48.238721Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: unknown
 content_type: unknown

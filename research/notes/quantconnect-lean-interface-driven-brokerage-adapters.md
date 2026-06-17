@@ -4,9 +4,9 @@ id: quantconnect-lean-interface-driven-brokerage-adapters
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:03:40.533232Z'
-updated: '2026-06-17T15:42:46.565156Z'
+updated: '2026-06-17T20:28:23.152365Z'
 source: https://deepwiki.com/QuantConnect/Lean
-status: review
+status: evergreen
 type: note
 tier: practitioner
 content_type: docs

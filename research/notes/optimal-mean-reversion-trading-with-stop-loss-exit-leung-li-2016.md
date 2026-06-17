@@ -4,12 +4,12 @@ id: optimal-mean-reversion-trading-with-stop-loss-exit-leung-li-2016
 tags:
 - stop-loss
 created: '2026-06-17T15:10:22.914716Z'
-updated: '2026-06-17T15:42:46.644558Z'
+updated: '2026-06-17T20:28:23.252988Z'
 source: https://arxiv.org/abs/1411.5062
 source_domain: arxiv.org
 fetched_at: '2026-06-17T15:10:22.914520Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: institutional
 content_type: paper

@@ -4,9 +4,9 @@ id: profit-mirage-llm-financial-agent-information-leakage
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:12:18.682308Z'
-updated: '2026-06-17T15:42:46.593079Z'
+updated: '2026-06-17T20:28:23.184244Z'
 source: https://arxiv.org/abs/2510.07920
-status: review
+status: evergreen
 type: note
 tier: ground_truth
 content_type: paper

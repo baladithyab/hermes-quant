@@ -4,12 +4,12 @@ id: two-centuries-of-trend-following-lemprire-et-al-2014
 tags:
 - stop-loss
 created: '2026-06-17T15:17:10.367509Z'
-updated: '2026-06-17T15:42:46.702576Z'
+updated: '2026-06-17T20:28:23.322220Z'
 source: https://arxiv.org/abs/1404.3274
 source_domain: arxiv.org
 fetched_at: '2026-06-17T15:17:10.367304Z'
 fetch_provider: builtin
-status: review
+status: evergreen
 type: note
 tier: institutional
 content_type: paper
