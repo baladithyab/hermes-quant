@@ -33,6 +33,7 @@ from typing import Any
 from hermes_quant.protocol import AnalystView, MarketContext
 from hermes_quant.semantic import (
     SemanticPacket,
+    packet_asof_key,
     parse_semantic_packet,
     validate_semantic_packet,
 )
@@ -219,7 +220,12 @@ class HermesSemanticAnalyst:
                 last_reason = reason
         if not valid:
             return None, last_reason
-        valid.sort(key=lambda packet: packet.asof)
+        # ar-time-ordering: pick the genuinely-freshest packet by PARSED asof, not a
+        # lexical string compare. packet.asof is a producer-dependent string (synthesize
+        # emits +00:00; a model/human packet may use 'Z' or a non-UTC offset), so a string
+        # sort can mis-order mixed formats and return a STALE packet -> wrong trading
+        # direction. Stable sort + a parsed UTC key keeps single-format input byte-identical.
+        valid.sort(key=lambda packet: packet_asof_key(packet.asof))
         return valid[-1], "ok"
 
     def _abstain(self, ctx: MarketContext, reason: str) -> AnalystView:

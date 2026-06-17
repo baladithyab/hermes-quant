@@ -281,7 +281,14 @@ def build_perception_frame(
             # getattr(): getattr on a dict returns the default every time, which would
             # make saturation a SILENT no-op even with the flag ON (the basis would
             # always be "no_basis"). Verified against HEAD 2026-05-31.
-            _pkt = max(semantic_packets, key=lambda p: p.get("asof", ""))
+            # ar-time-ordering: select the SAME freshest packet the analyst does
+            # (HermesSemanticAnalyst._select_packet) — by PARSED asof, not a lexical
+            # string compare. packet["asof"] is a producer-dependent string (synthesize
+            # +00:00 vs model/human 'Z' or non-UTC offset); a string max() could pick a
+            # STALE packet and score saturation off the wrong basis. Single-format input
+            # stays byte-identical.
+            from hermes_quant.semantic import packet_asof_key
+            _pkt = max(semantic_packets, key=lambda p: packet_asof_key(p.get("asof", "")))
             _md = _pkt.get("metadata") or {}
             _cd = _md.get("confirm_date") if isinstance(_md, Mapping) else None
             # RR10: wire THIS symbol's velocity score (PDR-2) through when present, so

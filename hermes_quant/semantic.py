@@ -98,6 +98,34 @@ def parse_semantic_packet(payload: SemanticPacket | dict[str, Any]) -> SemanticP
     return SemanticPacket(**data)
 
 
+def packet_asof_key(asof: Any) -> pd.Timestamp:
+    """Return a tz-aware (UTC) ``pd.Timestamp`` recency key for a packet asof.
+
+    ``SemanticPacket.asof`` is a *string* whose format is producer-dependent:
+    synthesize.py emits ``...+00:00`` (catalyst/synthesize.py) while a model- or
+    human-authored packet may use ``Z`` or a non-UTC offset (e.g. ``-06:00``).
+    A LEXICAL compare on those mixed strings mis-orders them (``'T05...-06:00'``
+    sorts before ``'T10...+00:00'`` even though the former is the later instant;
+    a space separator sorts before ``'T'``), so a "freshest packet wins" selection
+    that keyed on the raw string could pick a STALE packet and flip the trading
+    direction. Parse first, normalise to UTC, then compare.
+
+    Unparseable / missing asof sorts to the oldest position (``pd.Timestamp.min``,
+    tz-aware) so a malformed packet never spuriously wins the recency selection.
+    For a SINGLE consistent format this returns the same ordering as a string sort,
+    so single-format callers stay byte-identical.
+    """
+    try:
+        ts = pd.Timestamp(asof)
+    except (ValueError, TypeError):
+        return pd.Timestamp.min.tz_localize("UTC")
+    if ts is None or pd.isna(ts):
+        return pd.Timestamp.min.tz_localize("UTC")
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
 def validate_semantic_packet(
     packet: SemanticPacket,
     *,
