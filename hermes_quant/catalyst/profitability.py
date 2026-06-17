@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -120,8 +121,15 @@ def measure_profitability(
             except (ValueError, AttributeError):
                 continue
             fwd = fetcher(sym, asof_date)
-            if fwd is None or fwd == 0:
-                continue  # no realized data or flat — unscored
+            # Finite-guard the realized return BEFORE it enters the sum: a non-finite
+            # bar (NaN/inf from a corrupt/delisted/divide-by-near-zero close) passes
+            # both ``is None`` and ``== 0`` (nan==0 / inf==0 are False) and would
+            # poison ``sum_signed_return`` for the WHOLE relation class -> the verdict
+            # the haircut-raise decision reads silently degrades (NaN > 0 is False).
+            # Treat non-finite exactly like missing data: unscored. Sibling guard:
+            # eval._is_finite_number / onboarding._is_finite_number.
+            if fwd is None or not math.isfinite(fwd) or fwd == 0:
+                continue  # no realized data, non-finite, or flat — unscored
             st = stats.setdefault(relation, RelationStats(relation=relation))
             st.n_scored += 1
             st.sum_signed_return += fwd if sym_sign > 0 else -fwd  # signed-aligned return

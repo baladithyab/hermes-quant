@@ -114,6 +114,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -315,8 +316,15 @@ def mine_graph(
             except (ValueError, AttributeError):
                 continue
             fwd = fetcher(sym, asof_date)
-            if fwd is None or fwd == 0:
-                continue  # no realized data or flat — unscored (profitability.py:121)
+            # ar102 family-completeness: finite-guard the realized return BEFORE the
+            # sum, identical to the profitability.py sibling. A non-finite bar
+            # (NaN/inf from a corrupt/delisted/divide-by-near-zero close) passes both
+            # ``is None`` and ``== 0`` (nan==0 / inf==0 are False) and would poison
+            # ``sum_signed_return`` for the WHOLE edge -> the FLIP_SIGN/PRUNE verdict
+            # (mean_signed_return > 0 / < 0, both False for NaN) silently mis-mines.
+            # mine_graph is LIVE (afa4: GRAPH_MINING=1 + cron enabled, propose-only).
+            if fwd is None or not math.isfinite(fwd) or fwd == 0:
+                continue  # no realized data, non-finite, or flat — unscored (profitability.py)
             key: EdgeKey = (source, sym, relation)
             ev = evidence.get(key)
             if ev is None:
