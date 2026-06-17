@@ -13,10 +13,72 @@ import pytest
 
 from hermes_quant.risk.per_position_stop import (
     DEFAULT_STOP_LOSS_PCT,
+    DEFAULT_TAKE_PROFIT_PCT,
     evaluate_stop,
+    evaluate_take_profit,
     position_unrealized_loss_pct,
     weighted_avg_entry_from_lots,
 )
+
+
+# --------------------------------------------------------------------------- #
+# AG-EQ-1 take-profit — symmetric to the stop, reuses the same sign primitive.
+# --------------------------------------------------------------------------- #
+def test_long_winner_takes_profit_at_target():
+    # Long up 20% >= 16% TP default -> take.
+    d = evaluate_take_profit(symbol="W", held_fraction=0.20, entry_price=100.0, mark_price=120.0)
+    assert d.should_take is True
+    assert d.gain_pct == pytest.approx(0.20, abs=1e-9)
+
+
+def test_long_winner_below_target_holds():
+    d = evaluate_take_profit(symbol="W", held_fraction=0.20, entry_price=100.0, mark_price=110.0)
+    assert d.should_take is False  # +10% < 16%
+    assert d.gain_pct == pytest.approx(0.10, abs=1e-9)
+
+
+def test_losing_position_never_takes_profit():
+    # A loser has negative gain — TP must never fire on it.
+    d = evaluate_take_profit(symbol="L", held_fraction=0.20, entry_price=100.0, mark_price=80.0)
+    assert d.should_take is False
+    assert d.gain_pct == pytest.approx(-0.20, abs=1e-9)
+
+
+def test_short_winner_takes_profit():
+    # Short at 100, price fell to 80 = +20% gain on a short -> take.
+    d = evaluate_take_profit(symbol="S", held_fraction=-0.20, entry_price=100.0, mark_price=80.0)
+    assert d.should_take is True
+    assert d.gain_pct == pytest.approx(0.20, abs=1e-9)
+
+
+def test_short_loser_never_takes_profit():
+    # Short at 100, price rose to 120 = a LOSS on a short -> must not take profit.
+    d = evaluate_take_profit(symbol="S", held_fraction=-0.20, entry_price=100.0, mark_price=120.0)
+    assert d.should_take is False
+    assert d.gain_pct == pytest.approx(-0.20, abs=1e-9)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_tp_nonfinite_mark_holds(bad):
+    d = evaluate_take_profit(symbol="N", held_fraction=0.20, entry_price=100.0, mark_price=bad)
+    assert d.should_take is False and d.gain_pct is None
+
+
+@pytest.mark.parametrize("bad_thr", [float("nan"), float("inf"), 0.0, -0.16])
+def test_tp_nonfinite_threshold_falls_back_to_default(bad_thr):
+    d = evaluate_take_profit(
+        symbol="T", held_fraction=0.20, entry_price=100.0, mark_price=120.0, threshold_pct=bad_thr
+    )
+    assert d.should_take is True  # 20% >= 16% default
+    assert DEFAULT_TAKE_PROFIT_PCT == 0.16
+
+
+def test_tp_and_sl_cannot_both_fire():
+    # The same position can't be both a >=16% gain and a >=8% loss.
+    long_up = (0.20, 100.0, 130.0)  # +30%
+    sl = evaluate_stop(symbol="X", held_fraction=long_up[0], entry_price=long_up[1], mark_price=long_up[2])
+    tp = evaluate_take_profit(symbol="X", held_fraction=long_up[0], entry_price=long_up[1], mark_price=long_up[2])
+    assert tp.should_take is True and sl.should_stop is False
 
 
 # --------------------------------------------------------------------------- #

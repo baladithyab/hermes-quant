@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**69 flags** (resolvable default).
+**71 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -23,7 +23,7 @@
 | `HERMES_QUANT_CATALYST_ONBOARDING` | `0` | `hermes_quant/catalyst/onboarding.py:101` |
 | `HERMES_QUANT_CONVERGENCE` | `0` | `hermes_quant/catalyst/synthesize.py:124` |
 | `HERMES_QUANT_DATA_FALLBACK` | `0` | `hermes_quant/data/chain.py:39` |
-| `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/autonomous.py:715` |
+| `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/autonomous.py:718` |
 | `HERMES_QUANT_DETERMINISTIC_EQUITY` | `0` | `hermes_quant/react/dispatch.py:80` |
 | `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1087` |
 | `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1245` |
@@ -54,11 +54,11 @@
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:255` |
 | `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:523` |
 | `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1323` |
-| `HERMES_QUANT_PER_POSITION_STOP` | `0` | `hermes_quant/autonomous.py:1681` |
+| `HERMES_QUANT_PER_POSITION_STOP` | `0` | `hermes_quant/autonomous.py:1771` |
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:206` |
-| `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:1760` |
-| `HERMES_QUANT_POST_LOSS_COOLDOWN` | `0` | `hermes_quant/autonomous.py:781` |
+| `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:1850` |
+| `HERMES_QUANT_POST_LOSS_COOLDOWN` | `0` | `hermes_quant/autonomous.py:784` |
 | `HERMES_QUANT_PREWARM_WORKERS` | `` | `hermes_quant/playbook/scorers.py:816` |
 | `HERMES_QUANT_RAIL_LOCK_TIMEOUT_S` | `` | `hermes_quant/autonomous.py:87` |
 | `HERMES_QUANT_REFLECTION` | `1` | `hermes_quant/react/deterministic_equity.py:696` |
@@ -72,8 +72,10 @@
 | `HERMES_QUANT_SEMANTIC_ENABLED` | `1` | `hermes_quant/advisor.py:412` |
 | `HERMES_QUANT_SHADOW_RULE_MINING` | `0` | `hermes_quant/shadow/rule_mining.py:162` |
 | `HERMES_QUANT_SIGNED_EQUITY` | `0` | `hermes_quant/state/portfolio_state.py:214` |
+| `HERMES_QUANT_SLIPPAGE_HAIRCUT` | `0` | `hermes_quant/risk/slippage_haircut.py:70` |
 | `HERMES_QUANT_STACKING` | `0` | `hermes_quant/aggregators/bma.py:277` |
 | `HERMES_QUANT_STRUCTURE_SELECT` | `0` | `hermes_quant/options/structure_select.py:111` |
+| `HERMES_QUANT_TAKE_PROFIT_SWEEP` | `0` | `hermes_quant/autonomous.py:1410` |
 | `HERMES_QUANT_TICK_LOCK` | `1` | `hermes_quant/react/paper.py:261` |
 | `HERMES_QUANT_TICK_LOCK_TIMEOUT_S` | `` | `hermes_quant/daemon/tick_lock.py:88` |
 | `HERMES_QUANT_TRADER_LLM` | `0` | `hermes_quant/agents/trader.py:504` |

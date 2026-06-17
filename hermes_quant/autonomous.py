@@ -391,6 +391,9 @@ def _read_safety_rails() -> dict:
         # (the env flag is read in tick(), not here). The threshold is finite-guarded to
         # the research-chosen 8% default (1.6% NAV at the 20% max position) so a
         # NaN/inf/<=0 operator value cannot silently disarm the rail (ar08/ar09 family).
+        "per_position_take_profit_pct": _finite_threshold(
+            auto.get("per_position_take_profit_pct", 0.16), 0.16, "per_position_take_profit_pct"
+        ),
         "per_position_stop_loss_pct": _finite_threshold(
             auto.get("per_position_stop_loss_pct", 0.08), 0.08, "per_position_stop_loss_pct"
         ),
@@ -1299,6 +1302,42 @@ def _emit_per_position_stop_audit(
         )
 
 
+def _emit_per_position_take_profit_audit(
+    *, symbol: str, gain_pct: float, threshold_pct: float, held_fraction: float
+) -> None:
+    """Emit a ``per_position_take_profit_fired`` governance audit event (best-effort).
+
+    Mirrors ``_emit_per_position_stop_audit`` (the ar28 observability lesson: a money
+    action with no audit trace is invisible to the governance log + downstream consumers).
+    The ``per_position_take_profit_fired`` kind MUST be registered in
+    governance/audit_log.py EventKind/VALID_KINDS or pydantic silently rejects it (the
+    exact ar28-pattern defect the iter-2 review caught on the stop audit)."""
+    try:
+        from hermes_quant.governance import audit_log
+        from hermes_quant.governance.audit_log import GovernanceEvent
+
+        audit_log.append(
+            GovernanceEvent(
+                kind="per_position_take_profit_fired",
+                asof=datetime.now(tz=UTC),
+                source="autonomous_per_position_take_profit",
+                payload={
+                    "rail": "per_position_unrealized_gain_pct",
+                    "symbol": symbol,
+                    "unrealized_gain_pct": gain_pct,
+                    "threshold_pct": threshold_pct,
+                    "held_fraction": held_fraction,
+                },
+            )
+        )
+    except Exception as audit_exc:  # noqa: BLE001 - audit is best-effort
+        logger.warning(
+            "autonomous: failed to emit per_position_take_profit_fired audit for %s: %s",
+            symbol,
+            audit_exc,
+        )
+
+
 def _establishing_avg_entry_price(symbol: str) -> float | None:
     """FIFO-consistent weighted-average entry price for an OPEN paper-default position.
 
@@ -1361,7 +1400,15 @@ def _run_per_position_stop_sweep(
     a missing number never fabricates an exit.
     """
     from hermes_quant.perception import build_perception_frame_live
-    from hermes_quant.risk.per_position_stop import evaluate_stop
+    from hermes_quant.risk.per_position_stop import evaluate_stop, evaluate_take_profit
+
+    # AG-EQ-1 (HERMES_QUANT_TAKE_PROFIT_SWEEP, default-OFF): when ON, the SAME sweep also
+    # force-exits a WINNING position whose unrealized gain breaches the take-profit target.
+    # Byte-identical when the flag is absent (tp_enabled stays False => only the stop fires,
+    # exactly as before). SL and TP share one mark + one entry-basis read per symbol and the
+    # one sign-correct primitive, so they can never disagree on direction.
+    tp_enabled = os.environ.get("HERMES_QUANT_TAKE_PROFIT_SWEEP", "0") == "1"
+    tp_pct = float(_read_safety_rails().get("per_position_take_profit_pct", 0.16))
 
     stopped: set[str] = set()
     for symbol, held in open_book.items():
@@ -1383,14 +1430,35 @@ def _run_per_position_stop_sweep(
                 mark_price=float(mark),
                 threshold_pct=stop_pct,
             )
-            if not decision.should_stop:
+            # Determine the exit reason: STOP takes precedence over TP (a position cannot be
+            # both past its loss stop and its gain target; the stop is the safety rail). TP
+            # only when the flag is ON and the stop did NOT fire.
+            exit_kind: str | None = None
+            tp_decision = None
+            if decision.should_stop:
+                exit_kind = "stop"
+            elif tp_enabled:
+                tp_decision = evaluate_take_profit(
+                    symbol=symbol,
+                    held_fraction=float(held),
+                    entry_price=float(entry_price),
+                    mark_price=float(mark),
+                    threshold_pct=tp_pct,
+                )
+                if tp_decision.should_take:
+                    exit_kind = "take_profit"
+            if exit_kind is None:
                 continue
             # Breach -> force-exit through the existing reactor chokepoint.
             entry = WatchlistEntry(symbol=symbol, asset_class="equity", timeframe="1d")
+            _reason = (
+                "autonomous_per_position_stop" if exit_kind == "stop"
+                else "autonomous_per_position_take_profit"
+            )
             advisor_result = {
                 "decision_price": float(mark),
                 "as_of": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "reason": "autonomous_per_position_stop",
+                "reason": _reason,
             }
             react_out = _react(
                 advisor_result,
@@ -1398,25 +1466,29 @@ def _run_per_position_stop_sweep(
                 0.0,  # POST-FILL flat target (ADR-0091 Option E absolute target, not the delta)
                 paper_zero_costs=paper_zero_costs,
             )
+            _fired_gate = "PER_POSITION_STOP_FIRED" if exit_kind == "stop" else "PER_POSITION_TAKE_PROFIT_FIRED"
+            _nofill_gate = "PER_POSITION_STOP_NO_FILL" if exit_kind == "stop" else "PER_POSITION_TAKE_PROFIT_NO_FILL"
             sym_decision = SymbolDecision(
                 symbol=symbol,
                 asset_class="equity",
                 timeframe="1d",
-                gate="PER_POSITION_STOP_FIRED",
+                gate=_fired_gate,
                 details={
                     "unrealized_loss_pct": decision.loss_pct,
-                    "threshold_pct": abs(stop_pct),
+                    "gain_pct": (tp_decision.gain_pct if tp_decision is not None else None),
+                    "threshold_pct": (abs(stop_pct) if exit_kind == "stop" else abs(tp_pct)),
+                    "exit_kind": exit_kind,
                     "held_fraction": float(held),
                     "mark_price": float(mark),
                     "entry_price": float(entry_price),
-                    "reason": decision.reason,
+                    "reason": (decision.reason if exit_kind == "stop" else tp_decision.reason),  # type: ignore[union-attr]
                 },
             )
             if react_out is None:
                 # The reactor returned a no-fill/silence (e.g. a clip-to-zero); the
                 # position was NOT flattened, so do NOT exempt it (let the normal loop
                 # still manage it) and record the attempt as a silence.
-                sym_decision.gate = "PER_POSITION_STOP_NO_FILL"
+                sym_decision.gate = _nofill_gate
                 sym_decision.details["no_fill"] = True
                 result.silences += 1
                 result.decisions.append(sym_decision)
@@ -1426,21 +1498,39 @@ def _run_per_position_stop_sweep(
             stopped.add(symbol)
             result.fires += 1
             result.decisions.append(sym_decision)
-            _emit_per_position_stop_audit(
-                symbol=symbol,
-                loss_pct=float(decision.loss_pct) if decision.loss_pct is not None else 0.0,
-                threshold_pct=abs(stop_pct),
-                held_fraction=float(held),
-            )
-            logger.info(
-                "autonomous: PER-POSITION STOP fired on %s (loss %.2f%% >= %.2f%%); "
-                "force-exited %.4f NAV-fraction via %s",
-                symbol,
-                (decision.loss_pct or 0.0) * 100,
-                abs(stop_pct) * 100,
-                held,
-                execution_id,
-            )
+            if exit_kind == "stop":
+                _emit_per_position_stop_audit(
+                    symbol=symbol,
+                    loss_pct=float(decision.loss_pct) if decision.loss_pct is not None else 0.0,
+                    threshold_pct=abs(stop_pct),
+                    held_fraction=float(held),
+                )
+                logger.info(
+                    "autonomous: PER-POSITION STOP fired on %s (loss %.2f%% >= %.2f%%); "
+                    "force-exited %.4f NAV-fraction via %s",
+                    symbol,
+                    (decision.loss_pct or 0.0) * 100,
+                    abs(stop_pct) * 100,
+                    held,
+                    execution_id,
+                )
+            else:
+                _gain = tp_decision.gain_pct if tp_decision is not None else 0.0
+                _emit_per_position_take_profit_audit(
+                    symbol=symbol,
+                    gain_pct=float(_gain) if _gain is not None else 0.0,
+                    threshold_pct=abs(tp_pct),
+                    held_fraction=float(held),
+                )
+                logger.info(
+                    "autonomous: PER-POSITION TAKE-PROFIT fired on %s (gain %.2f%% >= %.2f%%); "
+                    "force-exited %.4f NAV-fraction via %s",
+                    symbol,
+                    (_gain or 0.0) * 100,
+                    abs(tp_pct) * 100,
+                    held,
+                    execution_id,
+                )
         except Exception as exc:  # noqa: BLE001 - one symbol's failure must not abort the sweep
             logger.warning(
                 "autonomous: per-position stop sweep error on %s (HOLD): %s",

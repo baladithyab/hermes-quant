@@ -145,6 +145,83 @@ def evaluate_stop(
     )
 
 
+DEFAULT_TAKE_PROFIT_PCT = 0.16
+"""The flag-ON default per-position TAKE-PROFIT threshold (gain fraction from entry).
+
+16% position-level gain = +2R against the 8% stop (a 2:1 reward:risk take). Like the
+stop default, this is a STARTING POINT to be eval-gated on our own data, and TP strategy
+(all-at-once vs tranche vs trailing vs greeks-based) is a separate design axis (the
+research stream) — this is the simple all-at-once enforcement the tranche/trailing
+strategies build ON. Read from operator YAML (quant.autonomous.per_position_take_profit_pct)
+and finite-guarded to this default.
+"""
+
+
+@dataclass(frozen=True)
+class TakeProfitDecision:
+    """The per-position take-profit verdict for ONE open position.
+
+    ``should_take`` is True only when the position's unrealized GAIN from entry is finite
+    AND >= ``threshold_pct``. ``gain_pct`` is the signed gain as a fraction of entry
+    (0.16 = up 16%); None when not computable (non-finite mark/entry, zero entry, flat) ->
+    HOLD. Mirrors StopDecision so the sweep treats SL and TP symmetrically.
+    """
+
+    symbol: str
+    should_take: bool
+    gain_pct: float | None
+    reason: str
+
+
+def evaluate_take_profit(
+    *,
+    symbol: str,
+    held_fraction: float,
+    entry_price: float,
+    mark_price: float,
+    threshold_pct: float = DEFAULT_TAKE_PROFIT_PCT,
+) -> TakeProfitDecision:
+    """Decide whether ONE open WINNING position should be force-exited on a TP target.
+
+    The gain is exactly ``-position_unrealized_loss_pct(...)`` — we REUSE the same
+    sign-correct primitive the stop uses (a long gains when mark>entry; a short gains when
+    mark<entry), so SL and TP can never disagree on the sign convention. Fires only when
+    the gain is finite AND >= abs(threshold_pct). A non-finite threshold falls back to the
+    default (ar08 family). Non-computable gain (None) -> HOLD.
+    """
+    if not math.isfinite(threshold_pct) or threshold_pct <= 0.0:
+        threshold_pct = DEFAULT_TAKE_PROFIT_PCT
+    thr = abs(threshold_pct)
+
+    loss = position_unrealized_loss_pct(
+        held_fraction=held_fraction, entry_price=entry_price, mark_price=mark_price
+    )
+    if loss is None:
+        return TakeProfitDecision(
+            symbol=symbol,
+            should_take=False,
+            gain_pct=None,
+            reason="non_computable_gain (non-finite mark/entry, zero entry, or flat position) -> HOLD",
+        )
+    gain = -loss  # positive = winning
+    if gain >= thr:
+        return TakeProfitDecision(
+            symbol=symbol,
+            should_take=True,
+            gain_pct=gain,
+            reason=(
+                f"unrealized gain {gain * 100:.2f}% >= take-profit {thr * 100:.2f}% "
+                f"(held_fraction={held_fraction:+.4f})"
+            ),
+        )
+    return TakeProfitDecision(
+        symbol=symbol,
+        should_take=False,
+        gain_pct=gain,
+        reason=f"unrealized gain {gain * 100:.2f}% within take-profit {thr * 100:.2f}%",
+    )
+
+
 def weighted_avg_entry_from_lots(lots: list[dict]) -> float | None:
     """FIFO-consistent weighted-average entry price from settlement open-lots.
 

@@ -307,3 +307,78 @@ def test_per_position_stop_sweep_react_error_is_not_silent(monkeypatch):
         f"expected gate PER_POSITION_STOP_ERROR, got {result.decisions[0].gate}"
     )
     assert "stop_sweep_error" in (result.decisions[0].error or "")
+
+
+# --------------------------------------------------------------------------- #
+# AG-EQ-1 take-profit sweep (HERMES_QUANT_TAKE_PROFIT_SWEEP, default-OFF).
+# --------------------------------------------------------------------------- #
+def test_take_profit_fires_on_winner_when_flag_on(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    _set_mode_autonomous(isolate_config)
+    _seed_open_losing_position(isolate_quant_home)  # ASTS entry 118.17, +0.20
+    monkeypatch.setenv("HERMES_QUANT_PER_POSITION_STOP", "1")
+    monkeypatch.setenv("HERMES_QUANT_TAKE_PROFIT_SWEEP", "1")
+    # Mark WAY above entry -> +27% gain >= 16% TP -> take profit.
+    monkeypatch.setattr(
+        "hermes_quant.perception.build_perception_frame_live",
+        lambda *a, **k: _MarkFrame(150.0),
+    )
+    react_calls = []
+
+    def fake_react(advisor_result, entry, fill_size_pct, **kwargs):
+        react_calls.append((entry.symbol, fill_size_pct, advisor_result.get("reason")))
+        return ("exec_tp_asts", fill_size_pct)
+
+    monkeypatch.setattr("hermes_quant.autonomous._react", fake_react)
+    result = auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
+
+    assert react_calls, "TP must force-exit the winner via _react"
+    sym, fill, reason = react_calls[0]
+    assert sym == "ASTS"
+    assert fill == pytest.approx(0.0, abs=1e-9)  # flat absolute target (no double-slippage)
+    assert reason == "autonomous_per_position_take_profit"
+    tp_decisions = [d for d in result.decisions if d.gate == "PER_POSITION_TAKE_PROFIT_FIRED"]
+    assert len(tp_decisions) == 1
+    assert tp_decisions[0].details["exit_kind"] == "take_profit"
+    assert tp_decisions[0].details["gain_pct"] == pytest.approx(0.2693, abs=1e-2)
+
+
+def test_take_profit_does_not_fire_when_flag_off(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    _set_mode_autonomous(isolate_config)
+    _seed_open_losing_position(isolate_quant_home)
+    monkeypatch.setenv("HERMES_QUANT_PER_POSITION_STOP", "1")
+    monkeypatch.delenv("HERMES_QUANT_TAKE_PROFIT_SWEEP", raising=False)  # OFF
+    # A big winner — would TP if the flag were on; must NOT with it off.
+    monkeypatch.setattr(
+        "hermes_quant.perception.build_perception_frame_live",
+        lambda *a, **k: _MarkFrame(150.0),
+    )
+    react_calls = []
+    monkeypatch.setattr(
+        "hermes_quant.autonomous._react",
+        lambda *a, **k: react_calls.append(a) or ("x", 0.0),
+    )
+    result = auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
+    assert react_calls == [], "TP flag OFF: a winner must NOT be force-exited"
+    assert not any("TAKE_PROFIT" in d.gate for d in result.decisions)
+
+
+def test_stop_takes_precedence_over_take_profit(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    """A losing position triggers the STOP, never TP, even with both flags on."""
+    _set_mode_autonomous(isolate_config)
+    _seed_open_losing_position(isolate_quant_home)  # entry 118.17
+    monkeypatch.setenv("HERMES_QUANT_PER_POSITION_STOP", "1")
+    monkeypatch.setenv("HERMES_QUANT_TAKE_PROFIT_SWEEP", "1")
+    monkeypatch.setattr(
+        "hermes_quant.perception.build_perception_frame_live",
+        lambda *a, **k: _MarkFrame(93.44),  # -20.9% loss
+    )
+    monkeypatch.setattr("hermes_quant.autonomous._react", lambda *a, **k: ("exec_stop", 0.0))
+    result = auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
+    assert any(d.gate == "PER_POSITION_STOP_FIRED" for d in result.decisions)
+    assert not any("TAKE_PROFIT" in d.gate for d in result.decisions)
