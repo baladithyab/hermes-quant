@@ -50,10 +50,12 @@ return.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -1160,6 +1162,31 @@ def load_loss_cooldown_sidecar(
         return {}
 
 
+@contextmanager
+def _flocked_sidecar(path: Path):  # type: ignore[return]
+    """Acquire an exclusive cross-process flock on a `.lock` sidecar file.
+
+    Mirrors the ``_flocked`` pattern in ``hermes_quant.watchlist``.  The lock
+    file is a small sentinel alongside the sidecar; it is created on first use
+    and never deleted (deletion + recreation is a TOCTOU window that defeats
+    the flock).
+
+    The caller is responsible for ensuring ``path.parent`` exists before
+    invoking this helper.
+    """
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def persist_loss_cooldown_sidecar(
     losses: dict[tuple[str, str, str], pd.Timestamp],
     path: Path,
@@ -1170,26 +1197,31 @@ def persist_loss_cooldown_sidecar(
     (most-recent) timestamp so the sidecar records the last observed loss per
     bucket and does not regress on a re-parse. Atomic tmp+fsync+rename;
     best-effort — a persist failure must never break the healthy compute path.
+
+    Cross-process safety: an exclusive flock on a ``.lock`` sidecar serialises
+    concurrent cron + agent-tool callers so the read-merge-write is atomic
+    (ar24-family lost-update fix).
     """
     if not losses:
         return
     try:
-        existing = load_loss_cooldown_sidecar(path)
-        merged: dict[str, str] = {}
-        for k, ts in existing.items():
-            merged["|".join(k)] = ts.isoformat()
-        for k, ts in losses.items():
-            key_str = "|".join(k)
-            existing_ts = existing.get(k)
-            if existing_ts is None or ts > existing_ts:
-                merged[key_str] = ts.isoformat()
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(merged, sort_keys=True))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        with _flocked_sidecar(path):
+            existing = load_loss_cooldown_sidecar(path)
+            merged: dict[str, str] = {}
+            for k, ts in existing.items():
+                merged["|".join(k)] = ts.isoformat()
+            for k, ts in losses.items():
+                key_str = "|".join(k)
+                existing_ts = existing.get(k)
+                if existing_ts is None or ts > existing_ts:
+                    merged[key_str] = ts.isoformat()
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(merged, sort_keys=True))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
     except Exception as exc:  # noqa: BLE001 - best-effort; never break the rail
         logger.warning("settlement_loop: failed to persist loss-cooldown sidecar: %s", exc)
 
