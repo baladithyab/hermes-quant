@@ -605,17 +605,36 @@ def _annualised_sharpe(daily_rets: list[float]) -> float:
 
 
 def _annualised_sortino(daily_rets: list[float]) -> float:
-    """Annualised Sortino ratio (rf=0, downside std only)."""
+    """Annualised Sortino ratio (rf=0, downside deviation about MAR=0).
+
+    ar120: downside deviation is the root-mean-square of the below-MAR(=0) returns
+    across ALL days — ``sqrt(mean(min(r,0)²))`` — NOT ``std(neg, ddof=1)`` about the
+    losers' OWN mean. The std-about-own-mean form (the prior code) is a fail-open
+    trap (the ar85 family; the sibling eval.stockbench._compute_sortino was already
+    fixed and its docstring flags this exact form): a strategy whose losing days are
+    all the SAME magnitude (a fixed stop-loss, or steady down-drift at constant size)
+    has ~zero dispersion about its own mean, so std_down collapses to 0 and this
+    returned 0.0 — masking a real net loss from the d_sortino ablation comparison
+    (backtest/ablation.py, cli/ablate.py C2a). RMS-about-MAR keeps the downside
+    deviation proportional to the loss magnitude → a finite, correctly-negative
+    Sortino for a net loser. (This reporting/ablation helper preserves its 0.0
+    sentinel for the no-data and no-downside cases — the ablation consumer differences
+    two finite Sortinos; the legitimate +inf no-downside signal lives in stockbench,
+    which feeds the live promotion gate.)
+    """
     if len(daily_rets) < 2:
         return 0.0
     arr = np.array(daily_rets, dtype=float)
-    downside = arr[arr < 0]
-    if len(downside) < 2:
-        return float(np.mean(arr) * math.sqrt(252)) if np.mean(arr) > 0 else 0.0
-    std_down = float(np.std(downside, ddof=1))
-    if std_down == 0:
-        return 0.0
-    return float(np.mean(arr) / std_down * math.sqrt(252))
+    mean_r = float(np.mean(arr))
+    # RMS of below-MAR(=0) returns about 0, across ALL days (not just losers).
+    downside = np.minimum(arr, 0.0)
+    downside_dev = math.sqrt(float(np.mean(downside ** 2)))
+    if downside_dev < 1e-12:
+        # No negative day → no downside risk. This helper's consumer diffs two finite
+        # Sortinos, so keep the prior finite sentinel: a positive-mean no-downside book
+        # scores its annualised mean; a flat/negative one scores 0.0.
+        return float(mean_r * math.sqrt(252)) if mean_r > 0 else 0.0
+    return float(mean_r / downside_dev * math.sqrt(252))
 
 
 def _max_drawdown(nav_series: list[float]) -> float:
