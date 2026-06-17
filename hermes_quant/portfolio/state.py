@@ -31,6 +31,21 @@ from hermes_quant.risk.portfolio_normalize import PortfolioState
 
 _DEFAULT_EXECUTIONS_PATH = Path("~/.hermes/quant/executions.jsonl").expanduser()
 
+# The synthetic ``paper-default`` book is written by MORE THAN ONE reactor name.
+# The legacy ``PaperReactor`` stamps ``reactor_name="paper"``; the now-LIVE
+# ``DeterministicEquityReactor`` (HERMES_QUANT_DETERMINISTIC_EQUITY=1, set in
+# ~/.hermes/.env) stamps ``reactor_name="deterministic-equity"`` but writes the
+# SAME ``account_id="paper-default"`` partition (see its module docstring: "shares
+# the SAME book the autonomous tick + the legacy PaperReactor read/write"). A
+# ``reactor_filter="paper"`` view that exact-matched ONLY "paper" silently dropped
+# every deterministic-equity position, so the ADR-0016 §D9 max_concurrent_positions
+# HARD safety rail (which counts ``reconstruct_portfolio_state(...).positions``)
+# UNDERCOUNTED the real open book and admitted more concurrent fires than the rail
+# permits — a fail-open on a money safety rail. The Alpaca reactor
+# (``reactor_name="alpaca_paper"``, ``account_id="alpaca-paper"``) is a SEPARATE
+# shadow partition and is deliberately NOT in this set so it stays excluded.
+_PAPER_BOOK_REACTOR_NAMES: frozenset[str] = frozenset({"paper", "deterministic-equity"})
+
 
 def _record_account(rec: dict) -> str:
     """Resolve the account partition a bus record belongs to.
@@ -79,8 +94,18 @@ def reconstruct_portfolio_state(
             (= "the position is closed"). If False, they're retained as
             explicit zero entries.
         reactor_filter: only fills whose `reactor_name` matches contribute.
-            Default "paper" — keeps live broker fills out of the paper-state
-            view if/when both rails are running. Pass None to include all.
+            Default "paper" — the synthetic ``paper-default`` book FAMILY (ar97):
+            the legacy ``PaperReactor`` (``reactor_name="paper"``) + the now-LIVE
+            ``DeterministicEquityReactor`` (``reactor_name="deterministic-equity"``),
+            both of which write the SAME ``account_id=paper-default`` partition (see
+            ``_PAPER_BOOK_REACTOR_NAMES``). Exact-matching ONLY "paper" silently
+            dropped every deterministic-equity position, so any caller relying on the
+            default would undercount the open book (the ADR-0016 §D9 concurrent-position
+            rail is safe on the live path because cs16 passes ``reactor_filter=None``,
+            but the default semantics must still mean "the whole paper book"). Keeps the
+            SEPARATE ``alpaca-paper`` SHADOW book (``reactor_name="alpaca_paper"``) out
+            of the paper-state view. Any other explicit value is exact-matched. Pass
+            None to include ALL reactors.
         account: cs18 — if set (e.g. "paper-default"), only fills whose resolved
             account partition (see `_record_account`) matches contribute. This
             EXCLUDES the deliberately-separate ``alpaca-paper`` SHADOW book from a
@@ -130,7 +155,16 @@ def reconstruct_portfolio_state(
             continue  # valid JSON but not an object (corrupt/partial append) — skip
 
         if reactor_filter is not None:
-            if rec.get("reactor_name") != reactor_filter:
+            rec_reactor = rec.get("reactor_name")
+            # "paper" is the synthetic-book FAMILY (legacy PaperReactor +
+            # the now-LIVE DeterministicEquityReactor, both account_id=paper-default),
+            # not a single literal — otherwise the ADR-0016 §D9 concurrent-position
+            # rail undercounts deterministic-equity fills. Any OTHER filter value
+            # keeps exact-match semantics (e.g. an explicit reactor_filter="alpaca").
+            if reactor_filter == "paper":
+                if rec_reactor not in _PAPER_BOOK_REACTOR_NAMES:
+                    continue
+            elif rec_reactor != reactor_filter:
                 continue
 
         # cs18: when an account partition is requested, drop records that resolve
