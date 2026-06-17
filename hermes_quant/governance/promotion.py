@@ -233,6 +233,72 @@ def _drawdown_from_breaker_reason(reason: Any) -> float | None:
         return None
 
 
+def _max_calibrator_drift_in_window(window_start: datetime, asof: datetime) -> float:
+    """ar101: max abs(drift) from the calibrator drift-log within [window_start, asof].
+
+    The drift gate in `evaluate()` keys on `calibrator_drift_max`, but the ONLY
+    producer of a drift magnitude — `training.calibrator_drift.append_drift_log` —
+    writes its OWN ``~/.hermes/quant/calibrators/drift-log.jsonl`` plane, never a
+    governance ``promotion_event``. So `_collect_metrics` read the never-emitted
+    payload field, the value stayed 0.0, and the drift sub-gate was VACUOUS (a
+    drifted calibrator was NOT blocked from paper->live promotion — fail-OPEN, the
+    ar100 sibling). Rather than wire a NEW producer onto the governance log (a
+    cross-plane design choice), we teach the gate to READ the drift detector's
+    existing log directly — the minimal, source-of-truth derivation. Best-effort:
+    a missing/corrupt/unreadable log yields 0.0 (byte-identical to the prior vacuous
+    behavior — never blocks promotion on a read failure, never raises). Each row is
+    ``{schema_version, asof, drift, ...}`` (calibrator_drift.append_drift_log)."""
+    import json
+    from pathlib import Path
+
+    from hermes_quant.training.calibrator_drift import DRIFT_LOG_PATH
+
+    drift_max = 0.0
+    try:
+        path = Path(DRIFT_LOG_PATH)
+        if not path.exists():
+            return 0.0
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except (ValueError, TypeError):
+                continue  # tolerate a torn trailing append
+            if not isinstance(row, dict):
+                continue
+            row_asof = _parse_event_asof(row.get("asof"))
+            if row_asof is None or not (window_start <= row_asof <= asof):
+                continue
+            drift = row.get("drift")
+            if drift is None:
+                continue
+            try:
+                d = abs(float(drift))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(d):
+                drift_max = max(drift_max, d)
+    except OSError as exc:  # pragma: no cover - fs dependent
+        logger.warning("calibrator drift-log read failed (%s); drift gate sees 0.0", exc)
+        return 0.0
+    return drift_max
+
+
+def _parse_event_asof(value: Any) -> datetime | None:
+    """Parse an ISO-8601 asof string to a tz-aware UTC datetime, or None (never raises)."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
 def _collect_metrics(asof: datetime) -> dict[str, Any]:
     """Walk the audit log and compute the inputs to `PromotionDecision`."""
     if asof.tzinfo is None:
@@ -339,6 +405,17 @@ def _collect_metrics(asof: datetime) -> dict[str, Any]:
 
             if evt.payload.get("weekly_retro_promotion_readiness") is True:
                 weekly_retro_ready = True
+
+    # ar101: merge the calibrator drift-log max into calibrator_drift_max. The
+    # legacy promotion_event payload read above (`calibrator_drift`) is honored for
+    # backward compatibility / an explicit future producer, but the LOAD-BEARING
+    # source is the drift detector's own drift-log.jsonl — without this the drift
+    # sub-gate read the 0.0 default and never fired (fail-OPEN). max() keeps the
+    # conservative `>`-gate direction; the drift-log read is best-effort (0.0 on any
+    # failure) so a missing log is byte-identical to the prior vacuous behavior.
+    calibrator_drift_max = max(
+        calibrator_drift_max, _max_calibrator_drift_in_window(window_30d_start, asof)
+    )
 
     # Crude Sharpe point estimate from fills_pnl (mean / std). NOT used
     # for the gate — the gate uses sharpe_ci_lower which the meta-retro
