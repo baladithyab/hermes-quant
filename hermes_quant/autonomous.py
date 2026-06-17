@@ -1329,7 +1329,7 @@ def _run_per_position_stop_sweep(
             react_out = _react(
                 advisor_result,
                 entry,
-                -float(held),  # flatten the held NAV-fraction
+                0.0,  # POST-FILL flat target (ADR-0091 Option E absolute target, not the delta)
                 paper_zero_costs=paper_zero_costs,
             )
             sym_decision = SymbolDecision(

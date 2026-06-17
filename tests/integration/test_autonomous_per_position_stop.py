@@ -6,8 +6,9 @@ default-OFF flag HERMES_QUANT_PER_POSITION_STOP and force-exits a breaching posi
 the existing _react() chokepoint.
 
 RED-proof: with the flag ON, a position seeded at entry $118.17 marked at $93.44
-(-20.9%) MUST be force-exited (fill_size_pct = -held). With the flag OFF the tick is
-byte-identical (no stop fire, _react never called for a stop).
+(-20.9%) MUST be force-exited (fill_size_pct = 0.0 — the ADR-0091 Option E absolute
+flat target, NOT the negative delta -held). With the flag OFF the tick is byte-identical
+(no stop fire, _react never called for a stop).
 """
 from __future__ import annotations
 
@@ -105,11 +106,17 @@ def test_stop_fires_on_open_losing_position_when_flag_on(
     # Empty watchlist so the ONLY action this tick is the stop sweep.
     result = auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
 
-    # The stop must have force-exited ASTS via _react with the NEGATIVE held fraction.
+    # The stop must have force-exited ASTS via _react with fill_size_pct=0.0 (the
+    # ADR-0091 Option E absolute flat target, NOT the negative delta -held).
+    # Using 0.0 means apply_slippage sees trade_delta = 0.0 - current = -held (correct
+    # 1x impact), whereas -held would give trade_delta = -held - held = -2*held (2x impact).
     assert react_calls, "stop sweep must call _react to force-exit the losing position"
     sym, fill, reason = react_calls[0]
     assert sym == "ASTS"
-    assert fill == pytest.approx(-0.20, abs=1e-9), "must flatten the +0.20 held NAV-fraction"
+    assert fill == pytest.approx(0.0, abs=1e-9), (
+        "stop-loss must pass 0.0 (flat absolute target) not -held (delta) to _react; "
+        "passing -held doubles apply_slippage impact: trade_delta = -held - held = -2*held"
+    )
     assert reason == "autonomous_per_position_stop"
 
     # A PER_POSITION_STOP_FIRED decision is surfaced with the loss detail.
@@ -182,3 +189,56 @@ def test_no_mark_holds_when_flag_on(isolate_config, isolate_quant_home, monkeypa
     result = auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
     assert react_calls == [], "no mark -> HOLD, never force-exit on a missing price"
     assert not any(d.gate == "PER_POSITION_STOP_FIRED" for d in result.decisions)
+
+
+def test_per_position_stop_slippage_uses_flat_target(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    """Stop-loss exit must pass 0.0 (flat post-fill absolute target) not -held (delta) to _react.
+
+    RED before fix: the call was ``_react(..., -float(held), ...)`` i.e. target_pct=-0.20 for a
+    20% long.  apply_slippage then computes trade_delta = target_pct - current_position_pct =
+    -0.20 - 0.20 = -0.40, doubling the market-impact term (20 bps vs the correct 10 bps).
+
+    GREEN after fix: ``_react(..., 0.0, ...)`` i.e. target_pct=0.0 (flat absolute target per
+    ADR-0091 Option E).  trade_delta = 0.0 - 0.20 = -0.20 → correct 10 bps impact.
+
+    This test captures the target_pct that reaches apply_slippage by patching it in the
+    paper reactor module (the reactor the stop sweep reaches when all routing flags are OFF).
+    """
+    _set_mode_autonomous(isolate_config)
+    _seed_open_losing_position(isolate_quant_home)
+    monkeypatch.setenv("HERMES_QUANT_PER_POSITION_STOP", "1")
+    # Ensure routing flags are OFF so PaperReactor is selected (byte-identical default).
+    monkeypatch.delenv("HERMES_QUANT_DETERMINISTIC_EQUITY", raising=False)
+    monkeypatch.delenv("HERMES_QUANT_ALPACA_PAPER", raising=False)
+
+    monkeypatch.setattr(
+        "hermes_quant.perception.build_perception_frame_live",
+        lambda *a, **k: _MarkFrame(93.44),
+    )
+
+    captured_slippage_kwargs: list[dict] = []
+
+    from hermes_quant.react import slippage_model as _sm
+    _original_apply_slippage = _sm.apply_slippage
+
+    def capturing_apply_slippage(**kwargs):
+        captured_slippage_kwargs.append(dict(kwargs))
+        return _original_apply_slippage(**kwargs)
+
+    # apply_slippage is imported inside the execute() body via a local import, so patch
+    # it at the source module (hermes_quant.react.slippage_model) where the name lives.
+    monkeypatch.setattr("hermes_quant.react.slippage_model.apply_slippage", capturing_apply_slippage)
+
+    auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
+
+    assert captured_slippage_kwargs, (
+        "apply_slippage must be called by the stop-loss reactor path"
+    )
+    target = captured_slippage_kwargs[0]["target_pct"]
+    assert target == pytest.approx(0.0, abs=1e-9), (
+        f"stop-loss must pass target_pct=0.0 (flat absolute target, ADR-0091 Option E) "
+        f"not target_pct=-held ({target!r}); passing -held doubles slippage impact: "
+        f"trade_delta = -held - held = -2*held instead of 0.0 - held = -held"
+    )
