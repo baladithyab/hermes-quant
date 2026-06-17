@@ -64,6 +64,45 @@ HALT_MIRROR_PATH = QUANT_HOME / "halt_state.json"
 PLAYBOOK_DIR = QUANT_HOME / "playbook"
 WEEKLY_JOURNAL_PATH = PLAYBOOK_DIR / "weekly-journal.jsonl"
 
+# The account partition this weekly playbook manages. load_portfolio() reconstructs
+# pf.positions from EXACTLY this account+equity slice (reconstruct_portfolio(
+# account_id="paper-default", asset_class="equity"), cs24 below). But the per-asset
+# raw-executions readers (_held_nav_fraction / _establishing_leg, which back
+# find_entry_record + infer_play_tag) scan the SHARED executions.jsonl bus, which is
+# ALSO written by other accounts — the alpaca-paper SHADOW reactor (account_id=
+# "alpaca-paper", equity, the SAME tickers can collide e.g. AAPL) and the freqtrade
+# crypto consumer (account_id="freqtrade", qty in RAW COINS). Scanning those readers
+# WITHOUT an account filter pools a DIFFERENT account's record into the paper-default
+# decision: e.g. a later alpaca-paper AAPL target=0.10 overrides the real paper-default
+# target=0.30, so the armed close fires fill_size_pct=-0.10 and the live state.db delta
+# fold (new_qty = 0.30 + (-0.10) = 0.20) leaves a position the weekly reported CLOSED
+# still OPEN — a money fail-open on the live close path. We therefore filter every raw-
+# executions reader to THIS account, resolving each record's account the SAME way the
+# loader does (portfolio_loader._record_account / portfolio.state._record_account).
+WEEKLY_ACCOUNT = "paper-default"
+
+
+def _record_account(rec: dict) -> str:
+    """Resolve the account partition a bus record belongs to.
+
+    Verbatim mirror of hermes_quant.portfolio.state._record_account /
+    daemon.portfolio_loader._record_account (operator-approved cs18/cs24 ladder):
+    top-level ``account_id`` if truthy, else ``reactor_metadata.account_id`` if truthy,
+    else the ``"paper-default"`` sentinel. So a legacy/test record with NO account
+    stamp resolves to ``paper-default`` (byte-identical to the pre-filter behavior for
+    the single-account bus), an ``alpaca_paper`` fill resolves to ``alpaca-paper``, and
+    a freqtrade fill resolves to ``freqtrade`` — the latter two are then excluded from
+    this weekly's paper-default partition.
+    """
+    acct = rec.get("account_id")
+    if acct:
+        return str(acct)
+    meta_acct = (rec.get("reactor_metadata") or {}).get("account_id")
+    if meta_acct:
+        return str(meta_acct)
+    return "paper-default"
+
+
 ET = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
@@ -303,7 +342,9 @@ def _rec_side(rec: dict) -> str:
     return ""
 
 
-def _held_nav_fraction(executions: list[dict], asset: str) -> float:
+def _held_nav_fraction(
+    executions: list[dict], asset: str, *, account: str = WEEKLY_ACCOUNT
+) -> float:
     """Return the currently-held absolute NAV-fraction target for ``asset`` (0.0 absent).
 
     cs21: the armed close must fire ``fill_size_pct = -held`` (NOT 0.0) so it FLATTENS
@@ -329,6 +370,12 @@ def _held_nav_fraction(executions: list[dict], asset: str) -> float:
     for rec in executions:
         if rec.get("asset") != asset:
             continue
+        # Cross-account guard: the shared bus carries other accounts (alpaca-paper
+        # shadow equity, freqtrade crypto). A different account's later record must
+        # NOT override this account's held fraction — that would mis-size the armed
+        # close on the live state.db delta fold. Skip records outside this partition.
+        if _record_account(rec) != account:
+            continue
         ts = rec.get("asof_execution") or rec.get("asof") or ""
         if best_rec is None or ts >= best_ts:
             best_rec, best_ts = rec, ts
@@ -341,7 +388,13 @@ def _held_nav_fraction(executions: list[dict], asset: str) -> float:
 
 
 # ---------- establishing-leg selection (cs27/cs28) ----------
-def _establishing_leg(executions: list[dict], asset: str, position_qty: float = 0.0) -> dict | None:
+def _establishing_leg(
+    executions: list[dict],
+    asset: str,
+    position_qty: float = 0.0,
+    *,
+    account: str = WEEKLY_ACCOUNT,
+) -> dict | None:
     """Return the leg that ESTABLISHED the CURRENTLY-held position (None if absent).
 
     cs27/cs28 root question: which execution is the entry of a multi-fill position?
@@ -378,6 +431,12 @@ def _establishing_leg(executions: list[dict], asset: str, position_qty: float = 
     for rec in executions:
         if rec.get("asset") != asset:
             continue
+        # Cross-account guard (see _held_nav_fraction): another account's fill for the
+        # SAME ticker must not be picked as this position's establishing leg — that
+        # would corrupt days_held (the swing 60d stop) and the play classification
+        # (leaps vs swing -> wrong exit ruleset). Skip records outside this partition.
+        if _record_account(rec) != account:
+            continue
         side = _rec_side(rec)
         if side == desired_side:
             if candidate is None or boundary_since_candidate:
@@ -392,7 +451,13 @@ def _establishing_leg(executions: list[dict], asset: str, position_qty: float = 
 
 
 # ---------- play_tag inference ----------
-def infer_play_tag(executions: list[dict], asset: str, position_qty: float = 0.0) -> str:
+def infer_play_tag(
+    executions: list[dict],
+    asset: str,
+    position_qty: float = 0.0,
+    *,
+    account: str = WEEKLY_ACCOUNT,
+) -> str:
     """Infer the play from the leg that ESTABLISHED the currently-held position.
 
     The establishing leg (cs27/cs28: first fill of the held sign in the current run,
@@ -409,7 +474,7 @@ def infer_play_tag(executions: list[dict], asset: str, position_qty: float = 0.0
       3. Substring match on `signal_id`: 'leaps' or 'swing'
       4. Default: 'swing' (cautious — gets the swing exit rules)
     """
-    rec = _establishing_leg(executions, asset, position_qty)
+    rec = _establishing_leg(executions, asset, position_qty, account=account)
     if rec is not None:
         tag = rec.get("play_tag") or rec.get("recipe")
         if isinstance(tag, str) and tag and tag.lower() != "advisor":
@@ -422,7 +487,13 @@ def infer_play_tag(executions: list[dict], asset: str, position_qty: float = 0.0
 
 
 # ---------- entry context lookup ----------
-def find_entry_record(executions: list[dict], asset: str, position_qty: float = 0.0) -> dict | None:
+def find_entry_record(
+    executions: list[dict],
+    asset: str,
+    position_qty: float = 0.0,
+    *,
+    account: str = WEEKLY_ACCOUNT,
+) -> dict | None:
     """Establishing (run-opening) leg for the held position (= entry). None if absent.
 
     Returns the leg that ESTABLISHED the currently-held position: the first fill of
@@ -433,7 +504,7 @@ def find_entry_record(executions: list[dict], asset: str, position_qty: float = 
     buy with no flat/flip -> the establishing leg IS that buy, so a single-fill long
     is byte-identical to the pre-cs26 buy-only lookup.
     """
-    return _establishing_leg(executions, asset, position_qty)
+    return _establishing_leg(executions, asset, position_qty, account=account)
 
 
 def days_between_iso(asof_iso: str, now_dt: datetime) -> int:
