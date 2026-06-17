@@ -54,6 +54,11 @@ logger = logging.getLogger(__name__)
 
 QUANT_HOME = Path.home() / ".hermes" / "quant"
 KILL_SWITCH_PATH = QUANT_HOME / "autonomous_kill_switch.json"
+# HERMES_QUANT_POST_LOSS_COOLDOWN seam: durable sidecar recording the latest
+# realized-loss timestamp per (account_id, asset_class, asset) so Rule 4 of
+# DefaultRiskGate can fire across ticks (gate._cooldowns resets every tick).
+# Default path; the constant is module-level so tests can monkeypatch it.
+_LOSS_COOLDOWN_SIDECAR_PATH = QUANT_HOME / "loss_cooldown_state.json"
 
 
 # ar73 / ADR-0016 §D9 concurrent-positions rail — account_id used to key the
@@ -704,6 +709,12 @@ def compute_cumulative_realized_pnl_pct(
         if not math.isfinite(frac):
             return 0.0
 
+        # HERMES_QUANT_POST_LOSS_COOLDOWN seam: persist new realized losses to the
+        # durable sidecar so the next tick's gate can pre-seed Rule 4's _cooldowns.
+        # Flag OFF (default) => no sidecar write => byte-identical to pre-fix behavior.
+        if os.environ.get("HERMES_QUANT_POST_LOSS_COOLDOWN", "0") == "1" and round_trips:
+            _persist_round_trip_losses(round_trips, _LOSS_COOLDOWN_SIDECAR_PATH)
+
         # Advance + persist the checkpoint so the NEXT tick reads only bytes past
         # new_offset and carries forward the residual open lots + accumulated fraction.
         _persist_incremental_checkpoint(
@@ -1036,6 +1047,90 @@ def _read_last_known_cum_pnl() -> float | None:
         return val if math.isfinite(val) else None
     except Exception:  # noqa: BLE001 - a corrupt sidecar is treated as cold start
         return None
+
+
+# ---------------------------------------------------------------------------
+# HERMES_QUANT_POST_LOSS_COOLDOWN seam — Rule 4 live-path fix
+# ---------------------------------------------------------------------------
+
+
+def _persist_round_trip_losses(
+    round_trips: list,
+    sidecar_path: Path,
+) -> None:
+    """Persist realized-loss timestamps from new round-trips to the loss-cooldown
+    sidecar so the next tick's gate can pre-seed Rule 4's _cooldowns.
+
+    Only processes paper-default account_id round-trips (same filter as the
+    kill-switch basis) and only those whose realized_return is finite and < 0.
+    A loss is identified by realized_return < 0 (the FIFO matcher's sign convention:
+    positive = profit, negative = loss). asof_exit is used as loss_at (the time the
+    loss became locked in), UTC-normalized for clean Rule-4 comparison.
+
+    Best-effort — a persist failure must never break the healthy tick.
+    """
+    try:
+        from hermes_quant.daemon.settlement_loop import (
+            _coerce_asof,
+            persist_loss_cooldown_sidecar,
+        )
+
+        losses: dict[tuple[str, str, str], object] = {}
+        for rt in round_trips:
+            if getattr(rt, "account_id", "paper-default") != "paper-default":
+                continue
+            ret = getattr(rt, "realized_return", None)
+            if ret is None or not math.isfinite(ret) or ret >= 0.0:
+                continue
+            # asof_exit is the fill-time of the closing fill; UTC-normalized.
+            raw_asof = getattr(rt, "asof_exit", None)
+            ts = _coerce_asof(raw_asof)
+            if ts is None:
+                continue
+            key = (
+                str(getattr(rt, "account_id", "paper-default")),
+                str(getattr(rt, "asset_class", "equity")),
+                str(getattr(rt, "asset", "")),
+            )
+            # Keep the most recent loss per bucket.
+            existing = losses.get(key)
+            if existing is None or ts > existing:  # type: ignore[operator]
+                losses[key] = ts
+        if losses:
+            persist_loss_cooldown_sidecar(losses, sidecar_path)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001 - best-effort; never block the tick
+        logger.warning("autonomous: failed to persist round-trip losses to sidecar: %s", exc)
+
+
+def _build_gate_with_cooldowns(sidecar_path: Path):
+    """Build a DefaultRiskGate pre-seeded with loss timestamps from the sidecar.
+
+    This restores cross-tick Rule-4 state that was lost because the gate is
+    constructed fresh every tick (the gate is stateless; the sidecar is the
+    durable state). Returns a plain DefaultRiskGate (no injected cooldowns) on
+    any read failure — fail-silent so a corrupt sidecar cannot block trading.
+
+    Called ONLY when HERMES_QUANT_POST_LOSS_COOLDOWN=1 (the flag is checked by the
+    caller). When the flag is OFF the caller skips this entirely and the gate is
+    constructed normally by advisor.recommend() — byte-identical to pre-fix.
+    """
+    try:
+        from hermes_quant.daemon.settlement_loop import load_loss_cooldown_sidecar
+        from hermes_quant.risk.gate import DefaultRiskGate
+
+        gate = DefaultRiskGate()
+        cooldowns = load_loss_cooldown_sidecar(sidecar_path)
+        for (account_id, asset_class, asset), ts in cooldowns.items():
+            gate.record_loss(account_id, asset_class, asset, ts)
+        return gate
+    except Exception as exc:  # noqa: BLE001 - fail-silent; a broken gate is no gate
+        logger.warning("autonomous: could not build seeded gate from sidecar: %s", exc)
+        try:
+            from hermes_quant.risk.gate import DefaultRiskGate
+
+            return DefaultRiskGate()
+        except Exception:  # noqa: BLE001
+            return None
 
 
 def _emit_killswitch_fired_audit(
@@ -1649,6 +1744,18 @@ def tick(
         )
         _durable_nav = _account_nav_usd() if _durable_baseline else None
 
+        # HERMES_QUANT_POST_LOSS_COOLDOWN seam: build a DefaultRiskGate pre-seeded with
+        # loss timestamps from the durable sidecar ONCE per tick, then pass it into each
+        # advisor_recommend() call below via risk_gate=. This restores Rule 4's cross-tick
+        # state — the gate is normally constructed fresh per call (empty _cooldowns) so
+        # Rule 4 was structurally dead on the live path (the cooldown was recorded only in
+        # the backtest's _settle_due wire). Flag OFF (production default) => _seeded_gate
+        # stays None => advisor_recommend() is called WITHOUT risk_gate= => byte-identical
+        # to pre-fix behavior. Flag ON: the seeded gate is constructed from the sidecar;
+        # a sidecar read-failure falls back to a plain fresh gate (never None when ON).
+        _post_loss_cooldown = os.environ.get("HERMES_QUANT_POST_LOSS_COOLDOWN", "0") == "1"
+        _seeded_gate = _build_gate_with_cooldowns(_LOSS_COOLDOWN_SIDECAR_PATH) if _post_loss_cooldown else None
+
         # Per-position UNREALIZED-loss stop sweep (2026-06-17, the June-4 ASTS -20.9%
         # fix). DEFAULT-OFF: HERMES_QUANT_PER_POSITION_STOP unset => the whole block is
         # skipped and the tick is BYTE-IDENTICAL. When ON, before the watchlist loop we
@@ -1703,6 +1810,10 @@ def tick(
                     if _durable_baseline
                     else None
                 )
+                # HERMES_QUANT_POST_LOSS_COOLDOWN: inject pre-seeded gate when ON
+                # so Rule 4 (post-loss cooldown) is active across ticks. When OFF
+                # (default), _seeded_gate is None and recommend() builds its own
+                # gate — byte-identical to pre-fix behavior.
                 advisor_result = advisor_recommend(
                     symbol=entry.symbol,
                     asset_class=entry.asset_class,
@@ -1710,6 +1821,7 @@ def tick(
                     include_lessons=True,
                     perception_frame=_frame,
                     durable_equity_account=_durable_equity_account,
+                    risk_gate=_seeded_gate,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(

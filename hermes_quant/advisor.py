@@ -1271,12 +1271,22 @@ def recommend(
             return _gated_no_data(result, "durable_baseline_store_error")
         # Build the gate WITH the store, preserving any recipe/injected gate's
         # RiskConfig (threshold profile) when present; else default RiskConfig
-        # (identical to the no-store fallback).
+        # (identical to the no-store fallback). Also carry the injected gate's
+        # _cooldowns forward so a pre-seeded HERMES_QUANT_POST_LOSS_COOLDOWN gate
+        # (which populates _cooldowns before this call) is not silently reset by the
+        # store-attach rebuild — Rule 4 would otherwise be dead when both flags are ON.
         from hermes_quant.risk.gate import DefaultRiskGate
 
+        _prior_cooldowns = getattr(risk_gate, "_cooldowns", {}) if risk_gate is not None else {}
         risk_gate = DefaultRiskGate(
             config=getattr(risk_gate, "config", None), baseline_store=store
         )
+        # Re-populate from the prior gate's cooldowns (mirror record_loss semantics:
+        # only updates; no key is deleted). This is a no-op when the injected gate
+        # had no cooldowns (the default path today).
+        for (acct, ac, sym), state in _prior_cooldowns.items():
+            if state.last_loss_at is not None:
+                risk_gate.record_loss(acct, ac, sym, state.last_loss_at)
         portfolio = _real_equity_portfolio(
             acct_id, acct_asset_class, last_bar_ts_utc, eq_f
         )

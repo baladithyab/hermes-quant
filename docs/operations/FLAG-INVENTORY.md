@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**68 flags** (resolvable default).
+**69 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -23,11 +23,11 @@
 | `HERMES_QUANT_CATALYST_ONBOARDING` | `0` | `hermes_quant/catalyst/onboarding.py:101` |
 | `HERMES_QUANT_CONVERGENCE` | `0` | `hermes_quant/catalyst/synthesize.py:124` |
 | `HERMES_QUANT_DATA_FALLBACK` | `0` | `hermes_quant/data/chain.py:39` |
-| `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/autonomous.py:644` |
+| `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/autonomous.py:649` |
 | `HERMES_QUANT_DETERMINISTIC_EQUITY` | `0` | `hermes_quant/react/dispatch.py:80` |
 | `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1087` |
 | `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1245` |
-| `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1324` |
+| `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1334` |
 | `HERMES_QUANT_EVIDENCE_DIR` | `` | `hermes_quant/evidence/store.py:60` |
 | `HERMES_QUANT_FUNDAMENTALS_ENABLED` | `0` | `hermes_quant/advisor.py:395` |
 | `HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG` | `1` | `hermes_quant/data/fundamentals_provider.py:146` |
@@ -53,13 +53,14 @@
 | `HERMES_QUANT_OVERNIGHT_DRIFT` | `0` | `hermes_quant/advisor.py:430` |
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:255` |
 | `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:523` |
-| `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1313` |
-| `HERMES_QUANT_PER_POSITION_STOP` | `0` | `hermes_quant/autonomous.py:1506` |
+| `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1323` |
+| `HERMES_QUANT_PER_POSITION_STOP` | `0` | `hermes_quant/autonomous.py:1601` |
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:206` |
-| `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:1585` |
+| `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:1680` |
+| `HERMES_QUANT_POST_LOSS_COOLDOWN` | `0` | `hermes_quant/autonomous.py:715` |
 | `HERMES_QUANT_PREWARM_WORKERS` | `` | `hermes_quant/playbook/scorers.py:816` |
-| `HERMES_QUANT_RAIL_LOCK_TIMEOUT_S` | `` | `hermes_quant/autonomous.py:82` |
+| `HERMES_QUANT_RAIL_LOCK_TIMEOUT_S` | `` | `hermes_quant/autonomous.py:87` |
 | `HERMES_QUANT_REFLECTION` | `1` | `hermes_quant/react/deterministic_equity.py:696` |
 | `HERMES_QUANT_REFLECTOR_LLM` | `0` | `hermes_quant/memory/reflector.py:559` |
 | `HERMES_QUANT_REGIME_HMM` | `` | `hermes_quant/regime/detector.py:123` |

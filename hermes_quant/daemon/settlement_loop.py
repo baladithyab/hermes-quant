@@ -50,6 +50,7 @@ return.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections import defaultdict
@@ -1107,6 +1108,90 @@ def compute_horizon_return(
     entry_notional = ep * q
     fee_drag = (fees / entry_notional) if (fees and entry_notional > 0) else 0.0
     return gross - fee_drag
+
+
+# ---------------------------------------------------------------------------
+# Loss-cooldown sidecar (HERMES_QUANT_POST_LOSS_COOLDOWN seam)
+#
+# The live autonomous tick constructs a fresh DefaultRiskGate() on every call
+# so Rule 4 (post-loss cooldown, gate.py:608-614) was always dead — _cooldowns
+# is always empty. The fix: persist a small JSON sidecar recording the latest
+# realized-loss timestamp per (account_id, asset_class, asset). The autonomous
+# tick reads it back and pre-seeds the gate's _cooldowns before calling
+# advisor.recommend(). The gate is the final authority (ADR-0004); the sidecar
+# merely restores state the gate already knew how to use.
+#
+# File layout (JSON):
+#   {
+#     "<account_id>|<asset_class>|<asset>": "<ISO-8601 UTC timestamp>",
+#     ...
+#   }
+# A "|"-joined key avoids nested dicts while staying human-readable. Values
+# are UTC ISO strings that round-trip through _coerce_asof.
+# ---------------------------------------------------------------------------
+
+
+def load_loss_cooldown_sidecar(
+    path: Path,
+) -> dict[tuple[str, str, str], pd.Timestamp]:
+    """Read the loss-cooldown sidecar and return a {(acct, ac, asset): ts} dict.
+
+    Returns an empty dict on any read/parse error (cold start or corrupt file
+    is treated as no prior losses — conservative-silent: Rule 4 simply has no
+    data to work from, same as today's always-empty _cooldowns).
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[tuple[str, str, str], pd.Timestamp] = {}
+        for k, v in raw.items():
+            parts = k.split("|", 2)
+            if len(parts) != 3:
+                continue
+            ts = _coerce_asof(v)
+            if ts is None:
+                continue
+            out[tuple(parts)] = ts  # type: ignore[assignment]
+        return out
+    except Exception:  # noqa: BLE001 - always fail-silent (no prior-loss data)
+        return {}
+
+
+def persist_loss_cooldown_sidecar(
+    losses: dict[tuple[str, str, str], pd.Timestamp],
+    path: Path,
+) -> None:
+    """Atomically write / merge the loss-cooldown sidecar.
+
+    Reads the current sidecar first and MERGES: for each key, keep the LATEST
+    (most-recent) timestamp so the sidecar records the last observed loss per
+    bucket and does not regress on a re-parse. Atomic tmp+fsync+rename;
+    best-effort — a persist failure must never break the healthy compute path.
+    """
+    if not losses:
+        return
+    try:
+        existing = load_loss_cooldown_sidecar(path)
+        merged: dict[str, str] = {}
+        for k, ts in existing.items():
+            merged["|".join(k)] = ts.isoformat()
+        for k, ts in losses.items():
+            key_str = "|".join(k)
+            existing_ts = existing.get(k)
+            if existing_ts is None or ts > existing_ts:
+                merged[key_str] = ts.isoformat()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(merged, sort_keys=True))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - best-effort; never break the rail
+        logger.warning("settlement_loop: failed to persist loss-cooldown sidecar: %s", exc)
 
 
 def realized_returns_by_signal(
