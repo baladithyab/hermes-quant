@@ -360,7 +360,7 @@ def _read_safety_rails() -> dict:
         "max_concurrent_positions": _positive_int_count(
             auto.get("max_concurrent_positions", 5), 5, "max_concurrent_positions"
         ),
-        "kill_switch_pct": float(auto.get("kill_switch_pct", 0.10)),
+        "kill_switch_pct": _finite_threshold(auto.get("kill_switch_pct", 0.10), 0.10, "kill_switch_pct"),
         "log_silences": bool(auto.get("log_silences", False)),
         "allow_live": bool(auto.get("allow_live", False)),
         # Paper-mode-only cost-gate override. Default False (conservative).
