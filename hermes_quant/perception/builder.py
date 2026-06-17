@@ -81,7 +81,12 @@ def build_perception_frame(
         try:
             return provider.fetch_bars(symbol, timeframe, start, end, as_of=asof_ts)
         except TypeError as exc:
-            if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+            # ar108: require BOTH the bad-signature shape AND the literal `as_of`
+            # token so only a genuine no-as_of legacy provider degrades — the old
+            # `or "unexpected keyword"` swallowed an unrelated TypeError and dropped
+            # the no-lookahead as_of bound (fail-OPEN).
+            msg = str(exc)
+            if "as_of" in msg and ("unexpected keyword" in msg or "got multiple values" in msg):
                 return provider.fetch_bars(symbol, timeframe, start, end)
             raise
 

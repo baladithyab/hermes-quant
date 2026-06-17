@@ -238,8 +238,12 @@ def get_resampled_history(
         try:
             daily = provider.fetch_bars(symbol, "1d", start, end, as_of=asof_ts)
         except TypeError as exc:
-            # Older provider without as_of kwarg
-            if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+            # ar108: require BOTH the bad-signature shape AND the literal `as_of`
+            # token so only a genuine no-as_of legacy provider degrades — the old
+            # `or "unexpected keyword"` swallowed an unrelated TypeError and dropped
+            # the no-lookahead as_of bound (fail-OPEN).
+            _msg = str(exc)
+            if "as_of" in _msg and ("unexpected keyword" in _msg or "got multiple values" in _msg):
                 try:
                     daily = provider.fetch_bars(symbol, "1d", start, end)
                 except Exception as exc2:  # noqa: BLE001

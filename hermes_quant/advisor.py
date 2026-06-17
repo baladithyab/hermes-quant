@@ -505,8 +505,15 @@ def _fetch_bars_for_horizon(
     try:
         return provider.fetch_bars(symbol, horizon, start, end, as_of=asof_ts)
     except TypeError as exc:
-        # Older provider without as_of kwarg
-        if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+        # ar108: degrade to the no-as_of signature ONLY for a legacy provider that
+        # doesn't accept the as_of kwarg. The old `or "unexpected keyword"` was
+        # over-broad — an unrelated TypeError naming SOME OTHER unexpected keyword
+        # (or raised inside fetch_bars' body) was misclassified as legacy and silently
+        # retried WITHOUT as_of, DROPPING the no-lookahead bound (fail-OPEN). Require
+        # BOTH the bad-signature shape AND the literal `as_of` token; any other
+        # TypeError propagates.
+        msg = str(exc)
+        if "as_of" in msg and ("unexpected keyword" in msg or "got multiple values" in msg):
             return provider.fetch_bars(symbol, horizon, start, end)
         raise
 
@@ -938,7 +945,15 @@ def recommend(
                 # matches a kwarg-related signature mismatch — otherwise
                 # propagate (a provider that genuinely raises TypeError from
                 # its body should not be silently retried).
-                if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+                # ar108: the old `or "unexpected keyword"` did NOT achieve that
+                # stated intent — it swallowed ANY unexpected-keyword TypeError,
+                # dropping the no-lookahead as_of bound for an unrelated kwarg
+                # mismatch (fail-OPEN). Require BOTH the bad-signature shape AND the
+                # literal `as_of` token so only a genuine no-as_of provider degrades.
+                msg = str(exc)
+                if "as_of" in msg and (
+                    "unexpected keyword" in msg or "got multiple values" in msg
+                ):
                     return provider.fetch_bars(symbol, timeframe, start, end)
                 raise
 
