@@ -75,6 +75,6 @@
 | `HERMES_QUANT_TICK_LOCK` | `1` | `hermes_quant/react/paper.py:261` |
 | `HERMES_QUANT_TICK_LOCK_TIMEOUT_S` | `` | `hermes_quant/daemon/tick_lock.py:88` |
 | `HERMES_QUANT_TRADER_LLM` | `0` | `hermes_quant/agents/trader.py:504` |
-| `HERMES_QUANT_TREND_VELOCITY` | `0` | `hermes_quant/catalyst/synthesize.py:199` |
+| `HERMES_QUANT_TREND_VELOCITY` | `0` | `hermes_quant/catalyst/synthesize.py:211` |
 | `HERMES_QUANT_WATCHLIST_CAP_TRIM` | `0` | `hermes_quant/playbook/watchlist_evolution.py:169` |
 | `HERMES_QUANT_WEEKLY_RETRO` | `1` | `hermes_quant/aggregators/llm_committee.py:350` |
