@@ -53,6 +53,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import math
 import os
 from collections import defaultdict
 from contextlib import contextmanager
@@ -585,6 +586,17 @@ def _normalize_exec_record(rec: dict) -> dict | None:
         qty_f = float(qty)
         fill_price = float(rec["fill_price"])
     except (KeyError, TypeError, ValueError):
+        return None
+    # iter3: finite-guard BEFORE the <= gate. A NaN qty/fill_price (json.loads
+    # accepts bare NaN/Infinity; an upstream divide can also produce inf) defeats
+    # every comparison below (NaN <= 0 is False), so without this a NaN lot enters
+    # the FIFO queue as a "zombie" — it is never popped (NaN <= 1e-12 is False) and
+    # silently consumes every subsequent real exit for its bucket into matched=NaN,
+    # producing a round-trip with realized_return*NaN that _sum_round_trip_realized_
+    # fraction then drops (its own finite-guard `continue`s), UNDER-stating the
+    # kill-switch basis (fail-OPEN). Drop the record at parse time — byte-identical
+    # for every finite record (the ar08-12 NaN-defeats-the-gate family).
+    if not math.isfinite(qty_f) or not math.isfinite(fill_price):
         return None
     if qty_f <= 0 or fill_price <= 0:
         return None
