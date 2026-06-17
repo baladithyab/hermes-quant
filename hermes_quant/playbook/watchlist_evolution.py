@@ -32,12 +32,14 @@ Evict rule (in order of precedence)
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -170,6 +172,40 @@ def _watchlist_cap_trim_enabled() -> bool:
 # -----------------------------------------------------------------------------
 # Persistence
 # -----------------------------------------------------------------------------
+
+
+@contextmanager
+def _flocked(path: Path) -> Iterator[None]:
+    """Acquire an exclusive cross-process ``flock`` on a ``.lock`` sidecar.
+
+    ``evolve_watchlist`` is a read-modify-write on the live tradeable-universe
+    state file (``play-fit.json``): it READS the current ranked state, computes
+    onboard/evict transitions against it, then WRITES the WHOLE new state via
+    ``_atomic_write_json``. The atomic write is crash-safe, but without a
+    cross-process lock around the ENTIRE read-modify-write two concurrent
+    ``evolve_watchlist`` processes — a cron tick that overran its (600s) budget
+    while the next tick fires, or an operator manual re-run overlapping the cron
+    — both read the same prior state and the second writer's ``os.replace``
+    clobbers the first writer's transitions (a lost update; a freshly onboarded
+    tradeable symbol silently dropped, or an evict silently reverted).
+
+    This mirrors the sibling operator-watchlist module
+    (``hermes_quant.watchlist._flocked``), which already flocks the same class
+    of state. The lock is keyed on the state file path so two processes writing
+    the SAME ``play-fit.json`` serialize, while tests using distinct ``tmp_path``
+    state files never contend.
+    """
+    lock_path = path.with_suffix(path.suffix + ".evolve.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _read_universe(universe_path: Path) -> list[str]:
@@ -864,71 +900,88 @@ def evolve_watchlist(
         # onboards fire (0.5 < 0.65 default floor).
         scorer = stub_scorer(0.5)
 
-    _, current_state = _read_watchlist(watchlist_path)
+    # Cross-process serialization of the WHOLE read-modify-write (ar-concurrency
+    # family). ``evolve_watchlist`` READs the current ``play-fit.json``, computes
+    # onboard/evict transitions against it, then WRITEs the whole new state. The
+    # ``_atomic_write_json`` is crash-safe but does NOT serialize two concurrent
+    # processes; an flock around the entire read-modify-write does. Without it, a
+    # cron tick that overran its 600s budget (the timeout was bumped to 600s
+    # precisely because this loop runs long) overlapping the next tick — or an
+    # operator manual re-run overlapping the cron — both read the same prior state
+    # and the second writer clobbers the first's transitions (a lost onboard means
+    # a tradeable symbol the watchlist meant to activate is silently dropped; the
+    # downstream autonomous tick only trades state=='active' rows). The lock is
+    # keyed on the state-file path, so two processes writing the SAME play-fit.json
+    # serialize while tests on distinct paths never contend. Mirrors the sibling
+    # operator-watchlist module's flock on the same class of state.
+    with _flocked(watchlist_path):
+        # READ current state INSIDE the lock so a concurrent writer cannot land
+        # a new state between our read and our write.
+        _, current_state = _read_watchlist(watchlist_path)
 
-    new_state: dict[str, list[WatchlistEntry]] = {}
-    all_events: list[dict[str, Any]] = []
-    summary: dict[str, dict[str, Any]] = {}
+        new_state: dict[str, list[WatchlistEntry]] = {}
+        all_events: list[dict[str, Any]] = []
+        summary: dict[str, dict[str, Any]] = {}
 
-    for play in plays:
-        prior = current_state.get(play, [])
-        new_rows, events = _evolve_one_play(
-            play=play,
-            universe=universe,
-            current=prior,
-            scorer=scorer,
-            asof=asof,
-            onboard_floor=onboard_floor,
-            evict_floor=evict_floor,
-            sticky_onboard_days=sticky_onboard_days,
-            max_per_play=max_per_play,
-            eviction_rules=eviction_rules,
-            fast_track_symbols=fast_track_symbols,
-            admission_extras=admission_extras,
-            position_lookup=position_lookup,
-        )
-        new_state[play] = new_rows
-        all_events.extend(events)
+        for play in plays:
+            prior = current_state.get(play, [])
+            new_rows, events = _evolve_one_play(
+                play=play,
+                universe=universe,
+                current=prior,
+                scorer=scorer,
+                asof=asof,
+                onboard_floor=onboard_floor,
+                evict_floor=evict_floor,
+                sticky_onboard_days=sticky_onboard_days,
+                max_per_play=max_per_play,
+                eviction_rules=eviction_rules,
+                fast_track_symbols=fast_track_symbols,
+                admission_extras=admission_extras,
+                position_lookup=position_lookup,
+            )
+            new_state[play] = new_rows
+            all_events.extend(events)
 
-        active = [r for r in new_rows if r.state == STATE_ACTIVE]
-        n_onboarded = sum(1 for ev in events if ev["action"] == ACTION_ONBOARD)
-        n_evicted = sum(1 for ev in events if ev["action"] == ACTION_EVICT)
-        # Top 5 active rows (already sorted by score desc within active).
-        top5 = [(r.symbol, r.last_score) for r in active[:5]]
-        summary[play] = {
-            "n_active": len(active),
-            "n_onboarded_today": n_onboarded,
-            "n_evicted_today": n_evicted,
-            "top5": top5,
+            active = [r for r in new_rows if r.state == STATE_ACTIVE]
+            n_onboarded = sum(1 for ev in events if ev["action"] == ACTION_ONBOARD)
+            n_evicted = sum(1 for ev in events if ev["action"] == ACTION_EVICT)
+            # Top 5 active rows (already sorted by score desc within active).
+            top5 = [(r.symbol, r.last_score) for r in active[:5]]
+            summary[play] = {
+                "n_active": len(active),
+                "n_onboarded_today": n_onboarded,
+                "n_evicted_today": n_evicted,
+                "top5": top5,
+            }
+
+        # Persist new state + journal. B14(a): STATE FIRST, journal second.
+        #
+        # The original ordering wrote the journal first "so a crash leaves an
+        # audit trail". But state is the operational source of truth and the
+        # journal is its append-only audit derivative (per the module contract +
+        # ADR-0010 "markdown is a render derivative"). With journal-first, a crash
+        # between the two writes leaves journal events for transitions that never
+        # landed in play-fit.json; the *next* run then reads the stale pre-crash
+        # state, recomputes the SAME onboard/evict transitions, and re-appends them
+        # -- producing DUPLICATE journal entries (fresh event_id each) for one
+        # logical transition, corrupting the audit trail and any event-counting
+        # consumer.
+        #
+        # State-first closes that window: _atomic_write_json is crash-safe
+        # (tempfile + fsync + os.replace), so after it returns the new state is
+        # durable. If we then crash before appending the journal, the next run
+        # reads the NOW-CURRENT state, sees the transition already happened, and
+        # does NOT re-emit the event. Worst case is a single lost audit line on a
+        # crash in the narrow gap -- strictly safer than a duplicate, because the
+        # operational state stays consistent and self-correcting.
+        payload = {
+            "as_of": asof.isoformat(),
+            "plays": {p: [r.to_dict() for r in rows] for p, rows in new_state.items()},
         }
+        _atomic_write_json(watchlist_path, payload)
 
-    # Persist new state + journal. B14(a): STATE FIRST, journal second.
-    #
-    # The original ordering wrote the journal first "so a crash leaves an
-    # audit trail". But state is the operational source of truth and the
-    # journal is its append-only audit derivative (per the module contract +
-    # ADR-0010 "markdown is a render derivative"). With journal-first, a crash
-    # between the two writes leaves journal events for transitions that never
-    # landed in play-fit.json; the *next* run then reads the stale pre-crash
-    # state, recomputes the SAME onboard/evict transitions, and re-appends them
-    # -- producing DUPLICATE journal entries (fresh event_id each) for one
-    # logical transition, corrupting the audit trail and any event-counting
-    # consumer.
-    #
-    # State-first closes that window: _atomic_write_json is crash-safe
-    # (tempfile + fsync + os.replace), so after it returns the new state is
-    # durable. If we then crash before appending the journal, the next run
-    # reads the NOW-CURRENT state, sees the transition already happened, and
-    # does NOT re-emit the event. Worst case is a single lost audit line on a
-    # crash in the narrow gap -- strictly safer than a duplicate, because the
-    # operational state stays consistent and self-correcting.
-    payload = {
-        "as_of": asof.isoformat(),
-        "plays": {p: [r.to_dict() for r in rows] for p, rows in new_state.items()},
-    }
-    _atomic_write_json(watchlist_path, payload)
-
-    _append_journal(journal_path, all_events)
+        _append_journal(journal_path, all_events)
 
     return {
         "as_of": asof.isoformat(),
