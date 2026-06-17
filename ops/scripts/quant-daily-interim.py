@@ -340,19 +340,55 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
             _clip = clip_one_to_remaining_headroom
             _caps = PortfolioCaps.standard()  # 200% gross / 100% net / 20% cash
             _PState = PortfolioState
-            # Seed running state from the CURRENT live book so the cap is
-            # account-aware, not just per-run. state.db.positions.quantity is
-            # the net cumulative target weight per (asset_class, symbol).
-            import sqlite3 as _sq
-            import os as _os
-            _con = _sq.connect(_os.path.expanduser("~/.hermes/quant/state.db"), timeout=10)
-            live = {}
-            for _sym, _qty in _con.execute(
-                "SELECT symbol, quantity FROM positions WHERE account_id='paper-default'"
-            ).fetchall():
-                live[_sym] = float(_qty)
-            _con.close()
-            _running = dict(live)
+            # Seed running state from the CURRENT live paper book so the cap is
+            # account-aware, not just per-run.
+            #
+            # CORRECTNESS FIX (2026-06-10, ar117 back-port from the deployed cron):
+            # seed from the CANONICAL paper-book projection —
+            # reconstruct_portfolio_state(reactor_filter="paper") — NOT from
+            # state.db.positions.quantity. The state.db positions table is written by
+            # the ADDITIVE state/portfolio_state.py::reconstruct_from projection across
+            # ALL reactors, where `quantity` accumulates raw SHARE COUNTS, not
+            # normalized signed target weights. Treating those share counts as
+            # target_position_pct made the cap read a phantom gross of ~402% (e.g. a
+            # corrupt AAPL row at qty=399.93 from the 2026-06-08 reconstruct_from-
+            # after-flatten incident) and silenced EVERY advisor auto-fire on fake
+            # over-leverage while the real paper book was BA -0.20 = 20% gross.
+            # reconstruct_portfolio_state uses the same latest-target-supersedes,
+            # paper-only semantics as the ADR-0087 cap and the autonomous tick, so the
+            # advisor cap now agrees with every other firing surface. reactor_filter=
+            # "paper" is the paper-book FAMILY {paper, deterministic-equity} (ar97) and
+            # EXCLUDES the alpaca-paper shadow by reactor name, so it is immune to the
+            # ar114 cross-account latest-wins under-count (that bug was on the
+            # account=None autonomous headroom path). See docs/architecture/
+            # INCIDENT-2026-06-10-advisor-cap-phantom-gross.md.
+            from hermes_quant.portfolio.state import (
+                reconstruct_portfolio_state,
+                _DEFAULT_EXECUTIONS_PATH,
+            )
+            # FAIL-CLOSED STRICTNESS (Codex P1, 2026-06-10):
+            # reconstruct_portfolio_state is fail-SOFT — a missing, mis-mounted, or
+            # unreadable executions.jsonl returns an EMPTY PortfolioState (cash=100%)
+            # instead of raising. For a SAFETY gate that is wrong: a bus we cannot read
+            # is "headroom UNKNOWN", not "book is flat". Left unguarded, an operator
+            # with real paper exposure + a bad/mis-mounted bus would size against a
+            # fabricated 100%-cash book and auto-fire uncapped — the exact fail-OPEN
+            # posture PR #82 closed. So probe the bus explicitly and RAISE on
+            # missing/unreadable, letting the except block below fail CLOSED (block
+            # every fire). A bus that EXISTS and reads — even if it parses to an empty
+            # book (genuinely no open paper positions) — is accepted and seeds a flat
+            # running book. A system that has never recorded a paper fill blocking its
+            # advisor auto-fire is the safe default; the autonomous tick / any prior
+            # fill creates the bus.
+            _bus_path = _DEFAULT_EXECUTIONS_PATH
+            if not _bus_path.exists():
+                raise FileNotFoundError(
+                    f"paper execution bus not found at {_bus_path}; cannot "
+                    f"confirm portfolio headroom — failing closed"
+                )
+            _bus_path.read_bytes()  # readability probe; OSError -> fail closed
+            _paper_state = reconstruct_portfolio_state(reactor_filter="paper")
+            _running = dict(_paper_state.positions)
         except Exception as exc:
             # P1 (Codex review #82): FAIL CLOSED. This layer IS the backported
             # guard for the 2026-06-02 advisor-runaway incident. If we can't read
