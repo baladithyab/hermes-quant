@@ -960,3 +960,134 @@ def test_run_weekly_clean_equity_ticker_byte_identical(mod, monkeypatch):
     actions = [j.get("action") for j in journals if j.get("symbol") == "GOOGL"]
     assert "HOLD" in actions
     assert "TODO_ADR0029" not in actions
+
+
+# ---------------------- stale-loader-mark skip (portfolio_loader.py:382 defect) ----------------------
+#
+# When reconstruct_portfolio() is called WITHOUT a mark_prices kwarg (as the weekly
+# playbook does at line 585), portfolio_loader.py:382 falls back to entry_price as
+# the mark:  mark = mark_prices.get(asset, entry_price)  with mark_prices=={}.
+# So pos.mark_price == pos.avg_entry_price for every absolute-target position.
+#
+# On total yfinance failure fetch_mark_atr returns (None, None).  The original code
+# then did:
+#     if mark is None:
+#         mark = float(pos.mark_price)   # == avg_entry_price
+# which produces pnl_pct == 0.0 for every position, silently suppressing:
+#   • the >60d swing stop  (0.0 < 0  is False)
+#   • the LEAPS -25% drawdown close  (0.0 > 0.25 is False)
+#   • the take-profit (0.0 > any positive threshold is False)
+# and passing a corrupted entry_price as decision_price to _fire_equity_close.
+#
+# The fix: when mark is None AND _fallback == avg_entry (stale loader default),
+# emit SKIP_NO_MARK + continue — consistent with the fetch_mark_atr docstring
+# which says "caller HOLDs on missing data".
+
+def test_weekly_stale_loader_mark_60d_stop_suppressed_before_fix(mod, monkeypatch):
+    """RED test (documents the pre-fix silent suppression):
+    fetch_mark_atr=>(None,None) + pos.mark_price==avg_entry => pnl_pct==0.0
+    => the >60d swing stop does NOT fire (0.0 < 0 is False) => HOLD.
+
+    This test FAILS on the FIXED code (HOLD is absent; SKIP_NO_MARK is emitted).
+    It serves as the RED-proof: on the buggy code this assertion passes, proving the
+    >60d stop is silently suppressed.  Comment out for the GREEN run check below.
+    """
+    journals: list[dict] = []
+    monkeypatch.setattr(mod, "read_active_halts", lambda: [])
+    monkeypatch.setattr(mod, "fetch_mark_atr", lambda *a, **kw: (None, None))  # total failure
+    monkeypatch.setattr(mod, "infer_play_tag", lambda *a, **kw: "swing")
+    monkeypatch.setattr(mod, "fired_this_week", lambda *a, **kw: False)
+    monkeypatch.setattr(mod, "append_journal", lambda rec: journals.append(dict(rec)))
+
+    entry_rec = {"asof_execution": "2026-01-01T00:00:00+00:00", "target_position_pct": 0.08}
+    monkeypatch.setattr(mod, "find_entry_record", lambda *a, **kw: entry_rec)
+
+    from types import SimpleNamespace
+    # pos.mark_price == avg_entry_price == 118.17 (stale loader default)
+    pos = SimpleNamespace(asset="ASTS", qty=100.0, avg_entry_price=118.17, mark_price=118.17)
+    pf = SimpleNamespace(positions={"ASTS": pos})
+    monkeypatch.setattr(mod, "load_portfolio", lambda *a, **kw: (pf, [entry_rec]))
+
+    # Directly verify that pnl_pct == 0.0 is produced in the buggy path.
+    pnl, _ = mod.compute_pnl_drawdown(118.17, 118.17, 100.0)
+    assert pnl == pytest.approx(0.0), "pre-condition: stale mark => pnl_pct==0.0"
+    # And that decide_swing HOLDS at pnl==0.0 even >60d (the suppression).
+    d = mod.decide_swing(mod.SwingContext(days_held=170, pnl_pct=0.0, atr14_at_entry_pct=0.02))
+    assert d.action == "HOLD", "pre-condition: pnl_pct==0.0 suppresses the >60d stop"
+
+
+def test_weekly_skip_on_stale_loader_mark(mod, monkeypatch):
+    """GREEN test (proves the fix):
+    When fetch_mark_atr returns (None, None) and pos.mark_price == avg_entry_price
+    (stale loader default), run_weekly must emit SKIP_NO_MARK and NOT emit HOLD or
+    DRY_RUN_CLOSE.
+
+    RED on the buggy code: the stale mark falls through to pnl_pct==0.0 which
+    produces a HOLD journal entry, so 'SKIP_NO_MARK' is absent => AssertionError.
+    """
+    journals: list[dict] = []
+    monkeypatch.setattr(mod, "read_active_halts", lambda: [])
+    # Total yfinance failure — fetch_mark_atr returns (None, None)
+    monkeypatch.setattr(mod, "fetch_mark_atr", lambda *a, **kw: (None, None))
+    monkeypatch.setattr(mod, "infer_play_tag", lambda *a, **kw: "swing")
+    monkeypatch.setattr(mod, "fired_this_week", lambda *a, **kw: False)
+    monkeypatch.setattr(mod, "append_journal", lambda rec: journals.append(dict(rec)))
+
+    entry_rec = {"asof_execution": "2026-01-01T00:00:00+00:00", "target_position_pct": 0.08}
+    monkeypatch.setattr(mod, "find_entry_record", lambda *a, **kw: entry_rec)
+
+    from types import SimpleNamespace
+    # pos.mark_price == avg_entry_price == 118.17 (stale loader default; ASTS synthetic repro)
+    pos = SimpleNamespace(asset="ASTS", qty=100.0, avg_entry_price=118.17, mark_price=118.17)
+    pf = SimpleNamespace(positions={"ASTS": pos})
+    monkeypatch.setattr(mod, "load_portfolio", lambda *a, **kw: (pf, [entry_rec]))
+
+    summary = mod.run_weekly(armed=False)
+
+    actions = [j.get("action") for j in journals if j.get("symbol") == "ASTS"]
+    # The fix must emit SKIP_NO_MARK instead of silently HOLDing.
+    assert "SKIP_NO_MARK" in actions, (
+        f"Expected SKIP_NO_MARK (fix not applied), got: {actions}"
+    )
+    # Must NOT silently HOLD or attempt a close with a stale mark.
+    assert "HOLD" not in actions, (
+        f"HOLD must not be emitted when the mark is stale (pre-fix behavior): {actions}"
+    )
+    assert "DRY_RUN_CLOSE" not in actions, (
+        f"DRY_RUN_CLOSE must not be emitted with a stale mark: {actions}"
+    )
+    # errors counter incremented for the skip
+    assert summary["errors"] >= 1
+
+
+def test_weekly_real_fallback_mark_not_skipped(mod, monkeypatch):
+    """REGRESSION: if fetch_mark_atr fails but pos.mark_price DIFFERS from avg_entry
+    (i.e. the loader WAS given a real mark), run_weekly must NOT skip — it should use
+    the non-stale fallback mark and proceed normally (HOLD or CLOSE as usual).
+    """
+    journals: list[dict] = []
+    monkeypatch.setattr(mod, "read_active_halts", lambda: [])
+    # fetch_mark_atr fails, but the position has a real (different) mark
+    monkeypatch.setattr(mod, "fetch_mark_atr", lambda *a, **kw: (None, None))
+    monkeypatch.setattr(mod, "infer_play_tag", lambda *a, **kw: "swing")
+    monkeypatch.setattr(mod, "fired_this_week", lambda *a, **kw: False)
+    monkeypatch.setattr(mod, "append_journal", lambda rec: journals.append(dict(rec)))
+
+    entry_rec = {"asof_execution": "2026-06-10T00:00:00+00:00", "target_position_pct": 0.08}
+    monkeypatch.setattr(mod, "find_entry_record", lambda *a, **kw: entry_rec)
+
+    from types import SimpleNamespace
+    # mark_price (120.0) differs from avg_entry_price (118.17) — real mark was available
+    pos = SimpleNamespace(asset="ASTS", qty=100.0, avg_entry_price=118.17, mark_price=120.0)
+    pf = SimpleNamespace(positions={"ASTS": pos})
+    monkeypatch.setattr(mod, "load_portfolio", lambda *a, **kw: (pf, [entry_rec]))
+
+    summary = mod.run_weekly(armed=False)
+
+    actions = [j.get("action") for j in journals if j.get("symbol") == "ASTS"]
+    # Must NOT skip — pos.mark_price != avg_entry, so this is a real (non-stale) fallback.
+    assert "SKIP_NO_MARK" not in actions, (
+        f"Real fallback mark should NOT produce SKIP_NO_MARK: {actions}"
+    )
+    # A recent long (days_held~7) with a tiny gain -> HOLD is expected.
+    assert "HOLD" in actions, f"Expected HOLD for real-mark non-stale path: {actions}"

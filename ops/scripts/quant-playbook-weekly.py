@@ -810,7 +810,34 @@ def run_weekly(*, armed: bool) -> dict[str, Any]:
         avg_entry = float(pos.avg_entry_price)
         mark, atr_pct = fetch_mark_atr(asset, entry_date=entry_asof)
         if mark is None:
-            mark = float(pos.mark_price)
+            _fallback = float(pos.mark_price)
+            # If pos.mark_price == avg_entry_price the absolute-target loader returned
+            # a stale default (no mark_prices kwarg was passed — portfolio_loader.py:382
+            # uses entry_price as the dict-get default when mark_prices is empty).
+            # Treating a stale-default mark as the current price produces pnl_pct==0.0
+            # for EVERY position, which silently suppresses the >60d swing stop and
+            # the LEAPS -25% drawdown close (0.0 < 0 is False; 0.0 > 0.25 is False).
+            # Skip the position for this weekly run rather than fire decisions with a
+            # fabricated zero-pnl mark.  The HOLD/skip is strictly safer than the prior
+            # silent-corruption path (docstring of fetch_mark_atr says "caller HOLDs on
+            # missing data"; this makes it so).
+            if abs(_fallback - avg_entry) < 1e-9 * max(1.0, abs(avg_entry)):
+                summary["errors"] += 1
+                append_journal({
+                    "event": "decision",
+                    "run_id": run_id,
+                    "monday_et": monday,
+                    "symbol": asset,
+                    "play": play,
+                    "action": "SKIP_NO_MARK",
+                    "reason": (
+                        "fetch_mark_atr failed and pos.mark_price == avg_entry "
+                        "(stale loader default — no live mark available)"
+                    ),
+                    "armed": armed,
+                })
+                continue
+            mark = _fallback
         # Operator visibility: 'entry' when the at-entry anchor was honored,
         # 'recent_fallback' when the entry date was missing/unparseable (the ATR
         # may then reflect the recent window or the entry window's graceful
