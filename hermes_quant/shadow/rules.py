@@ -136,6 +136,28 @@ class ShadowRule(ABC):
             return 0.0
 
     @staticmethod
+    def _analyst_voted(payload: dict, *substrings: str) -> bool:
+        """True if a contributing analyst's name CONTAINS any of ``substrings``.
+
+        ar126: the gate emits ``signal_provenance.contributing_analysts`` with the REAL
+        analyst names — ``"hermes_semantic"`` (analysts/semantic.py:57) and
+        ``"classical-ta"`` (hyphen; analysts/classical_ta.py:136) — NOT bare tokens like
+        "semantic"/"classical_ta". The pre-ar126 rules matched a hardcoded alias TUPLE by
+        EXACT equality (``a in ("semantic","semantic_analyst",...)``), so SemanticOnlyRule
+        and the contributor half of TrendFollowingRule NEVER matched a real event →
+        residually vacuous even after ar122 fixed the int-direction parse. Substring +
+        separator-insensitive (hyphen/underscore stripped) matching tolerates the real
+        names AND any future rename/prefix. (SentimentOnlyRule stays correctly inert —
+        there is NO sentiment analyst in the codebase — until one is added.)
+        """
+        norm_subs = [s.replace("_", "").replace("-", "").lower() for s in substrings]
+        for a in ShadowRule._contributing_analysts(payload):
+            an = a.replace("_", "").replace("-", "").lower()
+            if any(s in an for s in norm_subs):
+                return True
+        return False
+
+    @staticmethod
     def _contributing_analysts(payload: dict) -> list[str]:
         """Return the list of contributing_analysts from signal_provenance."""
         sp = payload.get("signal_provenance", {})
@@ -148,13 +170,27 @@ class ShadowRule(ABC):
 
     @staticmethod
     def _classical_ta_direction(payload: dict) -> Optional[str]:
-        """Extract classical_ta analyst direction from payload."""
+        """Extract the classical-TA analyst's OWN direction from the payload.
+
+        ar126: the canonical source is ``signal_provenance.per_analyst_directions``
+        (the gate now emits {analyst_name: "buy"/"sell"/"flat"}), keyed by the REAL
+        analyst name ``"classical-ta"`` (hyphen). Match it separator-insensitively. The
+        legacy ``classical_ta_direction`` / ``analyst_votes`` paths are kept for any
+        producer that emits them, but the gate emits neither — before ar126 this method
+        always returned None, so TrendFollowingRule was vacuous.
+        """
         sp = payload.get("signal_provenance", {})
         if isinstance(sp, dict):
+            per_analyst = sp.get("per_analyst_directions")
+            if isinstance(per_analyst, dict):
+                for name, d in per_analyst.items():
+                    norm = str(name).replace("_", "").replace("-", "").lower()
+                    if "classicalta" in norm and isinstance(d, str) and d.lower() in ("buy", "sell"):
+                        return d.lower()
             ta_dir = sp.get("classical_ta_direction")
             if isinstance(ta_dir, str) and ta_dir.lower() in ("buy", "sell"):
                 return ta_dir.lower()
-        # Also check analyst_votes sub-dict
+        # Also check analyst_votes sub-dict (legacy / alternative producer).
         analyst_votes = payload.get("analyst_votes", {})
         if isinstance(analyst_votes, dict):
             ta_vote = analyst_votes.get("classical_ta", analyst_votes.get("ta"))
@@ -321,11 +357,9 @@ class SemanticOnlyRule(ShadowRule):
         if audit_event.get("kind") != "gate_approval":
             return None
         payload = audit_event.get("payload", {})
-        analysts = self._contributing_analysts(payload)
-        semantic_voted = any(
-            a in ("semantic", "semantic_analyst", "semanticanalyst") for a in analysts
-        )
-        if not semantic_voted:
+        # ar126: match the REAL analyst name "hermes_semantic" (substring, separator-
+        # insensitive) — the prior exact-tuple match never fired in prod.
+        if not self._analyst_voted(payload, "semantic"):
             return None
         direction = self._direction_from_payload(payload)
         if direction is None:
@@ -364,11 +398,10 @@ class SentimentOnlyRule(ShadowRule):
         if audit_event.get("kind") != "gate_approval":
             return None
         payload = audit_event.get("payload", {})
-        analysts = self._contributing_analysts(payload)
-        sentiment_voted = any(
-            a in ("sentiment", "sentiment_analyst", "sentimentanalyst") for a in analysts
-        )
-        if not sentiment_voted:
+        # ar126: substring/separator-insensitive match. NOTE: there is currently NO
+        # sentiment analyst in the codebase, so this rule is intentionally INERT (records
+        # nothing) until one is added — that is a hypothesis-pending rule, not a bug.
+        if not self._analyst_voted(payload, "sentiment"):
             return None
 
         # Try to get the sentiment analyst's specific direction

@@ -117,6 +117,13 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
     md = dict(signal.metadata or {})
 
     analyst_view_ids: list[str] = []
+    # ar126: per-analyst direction map {analyst_name: "buy"|"sell"|"flat"}. Additive
+    # field (no existing consumer reads it, so byte-identical to those). The ADR-0049
+    # shadow TrendFollowingRule needs the classical-TA analyst's OWN direction to test
+    # the "TA + advisor agree" confluence hypothesis; without this the rule was vacuous
+    # (it had no per-analyst direction to read). Derived from signal.components, the
+    # canonical per-view source (AnalystView.analyst + .direction).
+    per_analyst_directions: dict[str, str] = {}
     for v in components:
         v_md = dict(v.metadata or {})
         # Per-view stable ID — present on Wave-1+ analyst views; falls back
@@ -127,6 +134,15 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
             analyst_view_ids.append(str(vid))
         else:
             analyst_view_ids.append(f"{v.analyst}:{v.horizon}")
+        try:
+            d = int(v.direction)
+        except (TypeError, ValueError):
+            continue
+        # Last-writer-wins per analyst name (a single analyst contributes one view
+        # per tick in practice); map the signed int to the shadow-rule vocabulary.
+        per_analyst_directions[str(v.analyst)] = (
+            "buy" if d > 0 else "sell" if d < 0 else "flat"
+        )
 
     # Discriminative counts. PREFER signal.components (richest source —
     # carries per-view IDs and exact analyst names). When components is
@@ -176,6 +192,7 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
         "bma_weights": md.get("bma_weights"),
         "aggregator_class": signal.aggregator,
         "analyst_view_ids": analyst_view_ids,
+        "per_analyst_directions": per_analyst_directions,  # ar126 (additive)
         "data_quality": dq,
     }
 
