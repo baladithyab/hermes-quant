@@ -484,7 +484,27 @@ class ReflectorFaithfulnessGate:
         the cross-reflection lesson_category stability (#3).
 
         ``trade_records`` is keyed by ``decision_id``.
+
+        An EMPTY reflection batch is insufficient data and fails CLOSED: the
+        per-reflection grounding/leakage results would otherwise fold through
+        ``all([]) == True`` (and an empty corpus has no lesson-category drift),
+        so a zero-reflection run would certify PASS having certified NOTHING.
+        The verdict a human reads before flipping the flag must not read as a
+        clean PASS off zero evaluated reflections.
         """
+        if not reflections:
+            insufficient = CheckResult(
+                name="batch_non_empty",
+                passed=False,
+                reasons=[
+                    "empty reflection batch — insufficient data to certify "
+                    "faithfulness; fail-closed (a zero-reflection run certifies "
+                    "nothing and must not read as PASS)."
+                ],
+                detail={"n_reflections": 0},
+            )
+            return self._finalize([insufficient], judge_used=judge is not None)
+
         facts_by_decision: dict[str, TradeFacts] = {}
         per_grounding: list[CheckResult] = []
         per_leakage: list[CheckResult] = []
