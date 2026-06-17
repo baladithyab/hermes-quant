@@ -1388,9 +1388,28 @@ def tick(
             )
 
             # cs16/ADR-0016: count the WHOLE open equity book (all reactor_names),
-            # not just the paper-only default slice — same rationale as the D9 rail
+            # not just the legacy paper-only slice — same rationale as the D9 rail
             # above, so headroom is computed against the true book.
-            portfolio_state = reconstruct_portfolio_state(reactor_filter=None)
+            #
+            # ar114: scope to account="paper-default" (the {paper,
+            # deterministic-equity} family this cap governs), NOT account=None. The
+            # §D9 COUNT rail above can over-count symbols safely under account=None —
+            # more cardinality only BLOCKS new opens. But THIS headroom path sums
+            # GROSS exposure, and reconstruct_portfolio_state collapses each asset to
+            # its LATEST-asof target (it does NOT sum across books). Under account=None
+            # a smaller, more-recent alpaca-paper SHADOW target for a ticker REPLACES
+            # the larger real paper-default position — UNDER-counting gross, inflating
+            # headroom, and over-trading (fail-open). Scoping by account drops the
+            # shadow book BEFORE the collapse (cs18 partition; mirrors the cs25 flatten
+            # seam). alpaca_paper is default-OFF, so this is a byte-identical no-op on
+            # the live single-book bus and closes the fail-open the moment
+            # HERMES_QUANT_ALPACA_PAPER is flipped on. Explicit QUANT_HOME bus path for
+            # home-consistency + test isolation, like the §D9 rail above.
+            portfolio_state = reconstruct_portfolio_state(
+                QUANT_HOME / "executions.jsonl",
+                reactor_filter=None,
+                account="paper-default",
+            )
             portfolio_caps = PortfolioCaps()
             logger.info(
                 "autonomous: portfolio-caps gate ENABLED. initial state: %s",

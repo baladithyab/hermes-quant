@@ -143,22 +143,31 @@ def test_whole_book_no_double_count(tmp_path: Path) -> None:
 def test_d9_rail_counts_all_reactor_names(tmp_path, monkeypatch) -> None:
     """The source-bound RED->GREEN guard.
 
-    Both the D9 count path and the portfolio-caps path inside autonomous.tick must
-    pass reactor_filter=None. FAILS RED on current source (no kwarg present); PASSES
-    GREEN only after the fix. Paired with a behavioral arm that exercises the exact
-    rail expression against the 3-reactor bus.
+    The D9 COUNT rail must pass reactor_filter=None (count the WHOLE open book — a
+    cardinality rail over-counts safely). The portfolio-caps HEADROOM path must ALSO
+    pass reactor_filter=None BUT scoped to account="paper-default" (ar114): headroom
+    sums GROSS, and reconstruct_portfolio_state collapses each asset to its latest-asof
+    target without summing across books, so an unscoped pool lets a small, late
+    alpaca-shadow target REPLACE a larger real position -> under-count -> over-trade
+    (fail-open). The behavioral wiring proof lives in
+    tests/integration/test_autonomous_headroom_account_scope_ar114.py (a call spy); this
+    arm just pins the two distinct rail SHAPES in source. Whitespace is normalized so
+    the multi-line ar114 call still matches (ar11: keep source-text guards de-brittled).
     """
     src = inspect.getsource(auto.tick)
+    norm = " ".join(src.split())  # collapse newlines/indent so multi-line calls match
 
-    # The D9 hard-rail count path (QUANT_HOME bus, explicit path).
+    # The D9 hard-rail count path (QUANT_HOME bus, explicit path) — whole book.
     assert "reactor_filter=None).positions" in src, (
         "the D9 max_concurrent_positions count path in autonomous.tick must pass "
         "reactor_filter=None so it counts the WHOLE open equity book"
     )
-    # The portfolio-caps path (bare reconstruct_portfolio_state()).
-    assert "reconstruct_portfolio_state(reactor_filter=None)" in src, (
-        "the portfolio-caps path in autonomous.tick must pass reactor_filter=None "
-        "so headroom is computed against the WHOLE open equity book"
+    # The portfolio-caps HEADROOM path — whole book by reactor, but account-scoped to
+    # the paper-default book the cap governs (ar114 fail-open fix).
+    assert 'reactor_filter=None, account="paper-default"' in norm, (
+        "ar114: the portfolio-caps headroom path in autonomous.tick must pass "
+        'reactor_filter=None, account="paper-default" so gross is summed over the real '
+        "paper-default book, not a cross-account pool that under-counts via latest-wins"
     )
     # And the buggy bare-default forms must be GONE from both rail call sites.
     assert 'QUANT_HOME / "executions.jsonl").positions' not in src, (
