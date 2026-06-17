@@ -4,8 +4,9 @@ id: dual-write-problem-and-event-sourcing-as-the-cure
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:12:19.205280Z'
+updated: '2026-06-17T15:42:46.597255Z'
 source: https://www.confluent.io/blog/dual-write-problem/
-status: draft
+status: review
 type: note
 tier: institutional
 content_type: article

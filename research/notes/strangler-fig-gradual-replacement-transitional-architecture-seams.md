@@ -4,8 +4,9 @@ id: strangler-fig-gradual-replacement-transitional-architecture-seams
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:14:58.542808Z'
+updated: '2026-06-17T15:42:46.636154Z'
 source: https://martinfowler.com/bliki/StranglerFigApplication.html
-status: draft
+status: review
 type: note
 tier: institutional
 content_type: article

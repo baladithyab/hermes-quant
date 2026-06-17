@@ -4,8 +4,9 @@ id: safe-rl-shielding-formal-monotonic-restriction-prior-art
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:12:20.010209Z'
+updated: '2026-06-17T15:42:46.606355Z'
 source: https://cacm.acm.org/research/shields-for-safe-reinforcement-learning/
-status: draft
+status: review
 type: note
 tier: ground_truth
 content_type: paper

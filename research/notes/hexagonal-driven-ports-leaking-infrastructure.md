@@ -4,8 +4,9 @@ id: hexagonal-driven-ports-leaking-infrastructure
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:13:52.525352Z'
+updated: '2026-06-17T15:42:46.615235Z'
 source: https://journal.optivem.com/p/hexagonal-architecture-your-driven-ports-are-leaking-infrastructure
-status: draft
+status: review
 type: note
 tier: practitioner
 content_type: blog

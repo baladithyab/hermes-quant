@@ -4,8 +4,9 @@ id: deepfund-time-travel-is-cheating-leakage-free-live-eval
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:13:53.492895Z'
+updated: '2026-06-17T15:42:46.623667Z'
 source: https://arxiv.org/abs/2505.11065
-status: draft
+status: review
 type: note
 tier: ground_truth
 content_type: paper

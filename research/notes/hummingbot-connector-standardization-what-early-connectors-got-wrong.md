@@ -4,8 +4,9 @@ id: hummingbot-connector-standardization-what-early-connectors-got-wrong
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:07:00.312392Z'
+updated: '2026-06-17T15:42:46.588641Z'
 source: https://deepwiki.com/hummingbot/hummingbot
-status: draft
+status: review
 type: note
 tier: practitioner
 content_type: docs

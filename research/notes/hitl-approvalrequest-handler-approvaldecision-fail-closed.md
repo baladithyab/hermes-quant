@@ -4,8 +4,9 @@ id: hitl-approvalrequest-handler-approvaldecision-fail-closed
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:13:54.522681Z'
+updated: '2026-06-17T15:42:46.631716Z'
 source: https://docs.agentos.sh/features/human-in-the-loop
-status: draft
+status: review
 type: note
 tier: practitioner
 content_type: docs

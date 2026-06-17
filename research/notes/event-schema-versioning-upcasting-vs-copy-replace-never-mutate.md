@@ -4,8 +4,9 @@ id: event-schema-versioning-upcasting-vs-copy-replace-never-mutate
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:12:20.436306Z'
+updated: '2026-06-17T15:42:46.610815Z'
 source: https://event-driven.io/en/simple_events_versioning_patterns/
-status: draft
+status: review
 type: note
 tier: practitioner
 content_type: article

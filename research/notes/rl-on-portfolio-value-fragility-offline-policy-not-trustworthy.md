@@ -4,8 +4,9 @@ id: rl-on-portfolio-value-fragility-offline-policy-not-trustworthy
 tags:
 - pdr-core-host-adapter-arch-e99014
 created: '2026-06-13T20:13:53.993589Z'
+updated: '2026-06-17T15:42:46.627763Z'
 source: https://arxiv.org/abs/2505.12759
-status: draft
+status: review
 type: note
 tier: ground_truth
 content_type: paper
