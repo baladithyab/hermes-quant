@@ -45,6 +45,7 @@ EventKind = Literal[
     "retro_amendment_applied",
     "state_reconstruction_failed",
     "research_debate",  # ADR-0065 (v0.6.1, G1): Bull/Bear adversarial stage.
+    "per_position_stop_fired",  # per-position unrealized-loss stop (the 2026-06-04 ASTS fix).
 ]
 
 VALID_KINDS: tuple[str, ...] = (
@@ -57,6 +58,7 @@ VALID_KINDS: tuple[str, ...] = (
     "retro_amendment_applied",
     "state_reconstruction_failed",
     "research_debate",  # ADR-0065 (v0.6.1, G1): Bull/Bear adversarial stage.
+    "per_position_stop_fired",  # per-position unrealized-loss stop (the 2026-06-04 ASTS fix).
 )
 
 
