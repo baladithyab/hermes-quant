@@ -275,6 +275,73 @@ class TestTrendFollowingRule:
 # ===========================================================================
 
 
+def _real_gate_emitter_event(direction_int: int, ticker: str = "AAPL") -> dict:
+    """Build the EXACT payload the canonical gate emitter writes (risk/gate.py +
+    pdr_core/gate.py _audit_approval): flat ``direction`` as a SIGNED INT, ``asset``
+    (not ``ticker``), ``signal_provenance`` WITHOUT an ``advisor_direction`` string and
+    WITHOUT ``advisor_result``. This is what scripts/shadow-replay-daily.py actually
+    feeds the rules in production — the prior string-only helper masked the ar122 bug.
+    """
+    return {
+        "event_id": "evt-real",
+        "kind": "gate_approval",
+        "asof": _NOW.isoformat(),
+        "source": "risk.gate",
+        "payload": {
+            "asset": ticker,
+            "direction": direction_int,  # int(signal.direction): 1 / -1 / 0
+            "magnitude": 0.05,
+            "confidence": 0.8,
+            "target_position_pct": 0.10,
+            "reason": "ok",
+            "asof": _NOW.isoformat(),
+            "signal_provenance": {
+                "vote_share": 0.7,
+                "contributing_analysts": ["semantic", "sentiment", "classical_ta"],
+            },
+        },
+    }
+
+
+class TestAr122RealGateEmitterIntDirection:
+    """ar122: the shadow rules must act on the REAL gate_approval shape (flat int
+    direction), not only the string fixtures the other tests use. RED before the fix:
+    every rule returned None on the int payload → the ADR-0049 shadow eval ledger was
+    vacuous in production.
+    """
+
+    def test_always_follow_acts_on_int_long(self):
+        d = AlwaysFollowAdvisorRule().evaluate(_real_gate_emitter_event(1))
+        assert d is not None, (
+            "ar122: AlwaysFollowAdvisorRule returned None on the REAL gate payload "
+            "(flat direction=1 int) — the shadow eval is vacuous in prod"
+        )
+        assert d.action == "buy"
+
+    def test_always_follow_acts_on_int_short(self):
+        d = AlwaysFollowAdvisorRule().evaluate(_real_gate_emitter_event(-1))
+        assert d is not None and d.action == "sell"
+
+    def test_inverse_consensus_acts_on_int(self):
+        d = InverseConsensusRule().evaluate(_real_gate_emitter_event(1))
+        assert d is not None, "ar122: InverseConsensusRule vacuous on the real int payload"
+        assert d.action == "sell"  # inverse of a long
+
+    def test_flat_int_direction_is_none(self):
+        # direction=0 (flat) is genuinely undeterminable → None (not a spurious fire).
+        assert AlwaysFollowAdvisorRule().evaluate(_real_gate_emitter_event(0)) is None
+
+    def test_at_least_one_default_rule_fires_on_real_payload(self):
+        """The whole point of ADR-0049: at least one shadow rule records a decision
+        from a real gate_approval. Pre-ar122 ALL five returned None."""
+        ev = _real_gate_emitter_event(1)
+        decisions = [r.evaluate(ev) for r in default_rules()]
+        assert any(d is not None for d in decisions), (
+            "ar122: NO default shadow rule acted on the real int-direction gate event "
+            "— the ADR-0049 eval ledger records zero decisions in production"
+        )
+
+
 class TestDefaultRules:
     def test_returns_five_rules(self):
         rules = default_rules()

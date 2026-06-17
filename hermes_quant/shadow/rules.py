@@ -89,9 +89,18 @@ class ShadowRule(ABC):
         Checks, in order:
         1. ``payload["advisor_result"]["direction"]``  (structured output path)
         2. ``payload["signal_provenance"]["advisor_direction"]``  (legacy path)
-        3. ``payload["direction"]``  (flat legacy)
+        3. ``payload["direction"]``  (flat) — the CANONICAL field the gate emits.
 
-        Returns None if no direction can be determined.
+        ar122: the canonical gate emitter (risk/gate.py + pdr_core/gate.py
+        _audit_approval) writes ``payload["direction"] = int(signal.direction)`` — a
+        SIGNED INT (1=long/buy, -1=short/sell, 0=flat), NOT a "buy"/"sell" string. The
+        prior string-only parse returned None for EVERY real gate_approval event, so the
+        ADR-0049 shadow-counterfactual eval ledger (scripts/shadow-replay-daily.py →
+        runner.replay_session → account.apply_signal) recorded ZERO decisions in
+        production — a vacuous eval surface masked by string-only test fixtures. We now
+        accept the int the producer actually emits AND keep the legacy string paths
+        (and the bool guard so True/False is not mis-read as 1/0). Returns None for a
+        flat (0) or undeterminable direction.
         """
         for path in (
             ("advisor_result", "direction"),
@@ -100,12 +109,10 @@ class ShadowRule(ABC):
             obj = payload
             for key in path:
                 obj = obj.get(key) if isinstance(obj, dict) else None
-            if isinstance(obj, str) and obj.lower() in ("buy", "sell"):
-                return obj.lower()  # type: ignore[return-value]
-        flat = payload.get("direction")
-        if isinstance(flat, str) and flat.lower() in ("buy", "sell"):
-            return flat.lower()  # type: ignore[return-value]
-        return None
+            mapped = _coerce_direction(obj)
+            if mapped is not None:
+                return mapped
+        return _coerce_direction(payload.get("direction"))
 
     @staticmethod
     def _ticker_from_payload(payload: dict) -> str:
@@ -195,6 +202,30 @@ def _parse_asof(audit_event: dict) -> datetime:
             pass
     from datetime import timezone
     return datetime.now(timezone.utc)
+
+
+def _coerce_direction(obj: object) -> Optional[Literal["buy", "sell"]]:
+    """Normalize a direction value to "buy"/"sell"/None.
+
+    ar122: accepts BOTH the canonical signed-int form the gate emits
+    (``int(signal.direction)``: 1=buy, -1=sell, 0=flat→None) AND the legacy
+    "buy"/"sell" string. A bool is rejected before the int branch (``True``/``False``
+    must not be silently read as 1/0). NaN/other → None.
+    """
+    if isinstance(obj, str):
+        low = obj.lower()
+        return low if low in ("buy", "sell") else None  # type: ignore[return-value]
+    if isinstance(obj, bool):
+        return None
+    if isinstance(obj, (int, float)):
+        if not math.isfinite(obj):
+            return None
+        if obj > 0:
+            return "buy"
+        if obj < 0:
+            return "sell"
+        return None  # flat (0)
+    return None
 
 
 def _opposite(direction: Literal["buy", "sell"]) -> Literal["buy", "sell"]:
