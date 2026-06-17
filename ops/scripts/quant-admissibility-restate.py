@@ -114,11 +114,27 @@ def restate_book(
     for pos in shorts:
         asof = _parse_asof(pos.last_update_at)
         snap = snapshot.get(pos.symbol)
-        # Convert the stored NAV-fraction position to a whole-share count using the
-        # account NAV + avg_entry_price (our only offline price; documented proxy). The
-        # oracle's whole-share check needs SHARES, not a fraction — passing abs(quantity)
-        # (the fraction) made every short fractional -> blanket FRACTIONAL_SHORT.
-        signed_shares = target_pct_to_shares(pos.quantity, account_nav, pos.avg_entry_price)
+        # Resolve the short's whole-share count. ar118: Position.quantity is NOT
+        # uniformly a NAV-fraction — branch on the authoritative unit_kind column.
+        #   * true_unit (ADR-0086/0088; the now-LIVE deterministic-equity reactor's
+        #     EQUITY shorts, plus us_option legs): quantity is ALREADY signed
+        #     SHARES/CONTRACTS. Use it directly (a us_option contract is 100 shares
+        #     of deliverable, but the borrow-carry below is an equity-share concept,
+        #     so we keep the contract/share count as stored and let the ×100 only
+        #     matter for option NOTIONAL, which this coarse audit does not compute).
+        #     Running it through target_pct_to_shares would re-multiply the share
+        #     count by NAV (~hundreds×), poisoning the oracle's whole-share check
+        #     AND the est_carry notional.
+        #   * nav_fraction (legacy / single-leg equity): quantity IS a signed
+        #     fraction of NAV — convert via the account NAV + avg_entry_price proxy
+        #     (the oracle's whole-share check needs SHARES, not a fraction).
+        unit_kind = getattr(pos, "unit_kind", "nav_fraction")
+        if unit_kind == "true_unit":
+            signed_shares = int(pos.quantity)
+        else:
+            signed_shares = target_pct_to_shares(
+                pos.quantity, account_nav, pos.avg_entry_price
+            )
         qty = abs(signed_shares)
         # Populate the account/quote context the hardened oracle now REQUIRES for an
         # opening short. avg_entry_price is the only offline quote we have (proxy);
@@ -172,8 +188,10 @@ def restate_book(
         "total_est_borrow_carry_usd": round(total_carry, 4),
         "rows": rows,
         "restated_note": (
-            "Positions are NAV fractions (cumulative fill_size_pct), converted to whole shares "
-            "via target_pct_to_shares(quantity, account_equity_total, avg_entry_price); "
+            "Positions: true_unit rows (ADR-0086/0088; det-equity shorts + option legs) carry "
+            "signed shares/contracts used directly; nav_fraction rows (legacy equity, cumulative "
+            "fill_size_pct) are converted to whole shares via "
+            "target_pct_to_shares(quantity, account_equity_total, avg_entry_price) (ar118). "
             "avg_entry_price is the offline quote proxy and equity_total backs both account_equity "
             "and available_bp. Coarse one-mark borrow estimate over calendar days held; NOT a daily "
             "mark-to-market. Admissibility uses the asof-snapshot (or live get_asset); names absent "

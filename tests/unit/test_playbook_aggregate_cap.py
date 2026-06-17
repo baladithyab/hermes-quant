@@ -315,6 +315,42 @@ def test_real_open_positions_gross_usd_is_equity_times_gross_nav_fraction(monkey
     assert gross == pytest.approx(180_000.0)
 
 
+def test_real_open_positions_gross_usd_true_unit_equity_normalized(monkeypatch, tmp_path):
+    """ar118: a det-equity true_unit EQUITY row holds REAL SHARES, not a NAV-fraction.
+    read_real_open_positions_gross_usd must normalize it via the unit_kind-aware seam
+    (position_gross_fraction: qty*avg_price*mult/nav), NOT Σ|raw quantity|.
+
+    100 shares of AAPL @ $150, NAV $100k → NAV-fraction 100*150/100_000 = 0.15 → gross
+    USD = 100_000 × 0.15 = $15,000. The pre-fix Σ|quantity| read 100 as a 10000%
+    NAV-fraction → 100_000 × 100 = $10,000,000 (~667× over-count) → blows the USD ceiling
+    and over-silences every fire (fail-CLOSED). DETERMINISTIC_EQUITY=1 is live.
+    """
+    mod = _load_tick_module(monkeypatch, tmp_path / "qpt_real_tu", name="qpt_real_tu")
+
+    class _TrueUnitPos:
+        asset_class = "equity"
+        symbol = "AAPL"
+        quantity = 100.0  # REAL signed shares (det-equity), not a NAV-fraction
+        avg_entry_price = 150.0
+        unit_kind = "true_unit"
+
+    class _State:
+        def get_positions(self, account_id):
+            assert account_id == "paper-default"
+            return {("equity", "AAPL"): _TrueUnitPos()}
+
+    import hermes_quant.state.portfolio_state as ps_mod
+    monkeypatch.setattr(ps_mod, "get_portfolio_state", lambda: _State())
+    gross = mod.read_real_open_positions_gross_usd(100_000.0)
+    # 100sh × $150 / 100_000 = 0.15 NAV-fraction; × equity 100_000 = $15,000.
+    assert gross == pytest.approx(15_000.0), (
+        f"ar118: true_unit equity gross must be equity×(shares*price/nav)=$15,000, not "
+        f"the Σ|quantity| phantom $10,000,000; got {gross}"
+    )
+    # Explicitly NOT the ~667× phantom the bare-Σ|quantity| produced.
+    assert gross != pytest.approx(100_000.0 * 100.0)
+
+
 def test_real_open_positions_gross_usd_empty_book_is_zero(monkeypatch, tmp_path):
     """A book with no open positions → 0.0 (byte-identical to today's behavior)."""
     mod = _load_tick_module(monkeypatch, tmp_path / "qpt_real_empty", name="qpt_real_empty")

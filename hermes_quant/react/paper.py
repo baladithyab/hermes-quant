@@ -824,13 +824,28 @@ class PaperReactor:
         so we read the correct book. Mirrors _portfolio_cap_clip's NAV-fraction
         read (ADR-0041 §D7: positions are stored as signed NAV-fraction).
 
+        ar118: the position's quantity is NOT uniformly a NAV-fraction. The
+        now-LIVE deterministic-equity reactor writes true_unit EQUITY rows (real
+        signed SHARES) into the SHARED paper-default book; if HERMES_QUANT_
+        DETERMINISTIC_EQUITY is later flipped OFF, PaperReactor fires equity again
+        and would read that pre-existing true_unit row's raw share count (e.g.
+        100) as a 10000% NAV-fraction — flipping the slippage trade-delta
+        direction and saturating the impact term. So normalize via the canonical
+        unit_kind-aware seam (position_gross_fraction) like the det-equity sibling
+        (_current_position_pct) and the cap (_portfolio_cap_clip) do. A
+        nav_fraction row returns its quantity verbatim (byte-identical to the
+        prior path); a true_unit row is converted qty*price*mult/nav.
+
         Silence-by-default: any state read failure (missing db, locked, schema
         drift) returns 0.0, which makes apply_slippage fall back to the legacy
         target-sign behavior rather than blocking the fill. A symbol with no open
         position is also 0.0 (a genuine opening fill).
         """
         try:
-            from hermes_quant.state.portfolio_state import get_portfolio_state
+            from hermes_quant.state.portfolio_state import (
+                get_portfolio_state,
+                position_gross_fraction,
+            )
 
             rmeta = getattr(proposal, "reactor_metadata", None) or {}
             account_id = (
@@ -841,8 +856,13 @@ class PaperReactor:
             pos = positions.get((proposal.asset_class, proposal.symbol))
             if pos is None:
                 return 0.0
-            qty = float(pos.quantity)
-            return qty if math.isfinite(qty) else 0.0
+            # ar118: unit_kind-aware signed NAV-fraction (nav_fraction -> verbatim;
+            # true_unit shares/contracts -> qty*avg_price*mult/nav). NAV via the SAME
+            # _account_nav_usd() helper the sibling _portfolio_cap_clip uses;
+            # position_gross_fraction fails closed to the raw quantity if NAV/price is
+            # unusable (the pre-fix value).
+            frac = position_gross_fraction(pos, nav=_account_nav_usd())
+            return frac if math.isfinite(frac) else 0.0
         except Exception:  # noqa: BLE001 — silence-by-default; never block a fill
             return 0.0
 

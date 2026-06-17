@@ -406,28 +406,31 @@ def read_real_open_positions_gross_usd(equity_usd: float) -> float | None:
     in the SAME USD unit — otherwise the cap counts only this tick's own fires
     and admits fires that breach the gross ceiling against the true book (cap2).
 
-    UNIT (verified against the canonical money-state code):
-        Position.quantity is a SIGNED NAV-FRACTION, NOT a share count. The
-        PaperReactor persists fill_size_pct (a signed fraction of NAV) straight
-        into the position's quantity field (state.portfolio_state §3; react/
-        paper.py:69 with reactor_metadata.quantity ABSENT for an equity fill —
-        the playbook fires equity only, EQUITY_PLAYS). The canonical ADR-0071
-        gross cap measures the existing book as Σ |Position.quantity| (react/
-        multileg.py:461-466 feeds bare quantity into RiskPortfolioState whose
-        gross_exposure_pct = Σ|p|; risk.portfolio_normalize:116-117) and
-        compares it against caps.max_gross_exposure_pct — a NAV-fraction.
+    UNIT (ar118 — verified against the canonical money-state code):
+        Position.quantity is NOT uniformly a NAV-fraction. A legacy/equity
+        nav_fraction row stores a signed fraction of NAV, but a true_unit row
+        (ADR-0086/0088: any fill with reactor_metadata.quantity — us_option
+        contracts AND the now-LIVE deterministic-equity EQUITY reactor's real
+        SHARES) stores signed UNITS. The positions table carries the regime in
+        its ``unit_kind`` column; the canonical Σ-of-NAV-fraction is therefore
+        ``Σ |position_gross_fraction(pos, nav)|`` (state.portfolio_state, ar14),
+        the SAME seam react/multileg.py (position_gross_fraction) and the
+        ADR-0071 caps read — NOT a bare Σ |quantity|. The prior bare-Σ|quantity|
+        here treated a det-equity 100-share row as a 10000% NAV-fraction
+        (≈667× over-count of gross), blowing the USD ceiling and over-silencing
+        every playbook fire (fail-CLOSED). DETERMINISTIC_EQUITY=1 is live, so the
+        true_unit equity row class is real on the paper-default book.
 
-        So the book's gross NAV-fraction is Σ |quantity|, and its USD gross
-        (matching this cap's USD ceiling = equity × gross_headroom) is
-        equity_usd × Σ |quantity|. Multiplying quantity by avg_entry_price (a
-        per-share price) would mix a NAV-fraction with a price — a unit error
-        that under-counts by orders of magnitude and re-introduces cap2.
+        So the book's gross NAV-fraction is Σ |position_gross_fraction|, and its
+        USD gross (matching this cap's USD ceiling = equity × gross_headroom) is
+        equity_usd × that sum.
 
     Args:
         equity_usd: the SAME validated, finite-positive account equity the cap
             ceiling is denominated against (build_aggregate_tick_budget passes
             the already-checked equity), so the consumed side and the ceiling
-            share one NAV reference.
+            share one NAV reference. Also the NAV used to normalize a true_unit
+            row to its NAV-fraction.
 
     Returns:
         0.0 for an empty/absent book (BYTE-IDENTICAL to the prior consumed=0
@@ -437,10 +440,19 @@ def read_real_open_positions_gross_usd(equity_usd: float) -> float | None:
         fires rather than assuming an empty book.
     """
     try:
-        from hermes_quant.state.portfolio_state import get_portfolio_state
+        from hermes_quant.state.portfolio_state import (
+            get_portfolio_state,
+            position_gross_fraction,
+        )
 
         positions = get_portfolio_state().get_positions(PAPER_ACCOUNT_ID)
-        gross_nav_fraction = sum(abs(float(pos.quantity)) for pos in positions.values())
+        # ar118: normalize each line to its signed NAV-fraction via the canonical
+        # unit_kind-aware seam (true_unit shares/contracts -> qty*price*mult/nav;
+        # nav_fraction -> verbatim), then sum |.| — the ADR-0071 gross measure.
+        gross_nav_fraction = sum(
+            abs(position_gross_fraction(pos, nav=equity_usd))
+            for pos in positions.values()
+        )
         gross = equity_usd * gross_nav_fraction
     except Exception:
         return None

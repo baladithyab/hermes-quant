@@ -273,3 +273,72 @@ def test_restate_main_json_runs(restate_mod, tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["account_id"] == "paper-default"
     assert payload["n_shorts"] == 4
+
+
+def _make_true_unit_state_db(tmp_path: Path) -> Path:
+    """A state.db with ONE det-equity true_unit EQUITY short (real signed SHARES).
+
+    The PortfolioState migration adds the unit_kind column (default nav_fraction); we
+    UPDATE the row to 'true_unit' to model the deterministic-equity reactor's write.
+    -150 shares of GME @ $20, NAV $130k.
+    """
+    from hermes_quant.state.portfolio_state import PortfolioState
+
+    db = tmp_path / "state.db"
+    PortfolioState(state_db_path=db)  # creates schema incl. the unit_kind column
+    ts = "2026-05-25T14:00:00Z"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO positions "
+        "(account_id, asset_class, symbol, quantity, avg_entry_price, last_update_at, unit_kind) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("paper-default", "equity", "GME", -150.0, 20.0, ts, "true_unit"),
+    )
+    conn.execute(
+        "INSERT INTO cash (account_id, balance_usd, last_update_at, equity_total) "
+        "VALUES (?,?,?,?)",
+        ("paper-default", 130_000.0, ts, 130_000.0),
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_restate_true_unit_equity_uses_shares_directly_not_target_pct(restate_mod, tmp_path):
+    """ar118: a det-equity true_unit EQUITY short stores REAL SHARES (quantity=-150),
+    NOT a NAV-fraction. restate_book must use the share count DIRECTLY, not run it
+    through target_pct_to_shares (which would read -150 as a -15000% NAV-fraction and
+    re-multiply by NAV → ~ -975,000 shares, poisoning the oracle whole-share check AND
+    the borrow-carry notional).
+
+    -150 shares @ $20, NAV $130k, held 5 days, cbr 0.30%:
+      CORRECT qty_shares = -150 ; est_carry = 150*20*0.003/365*5 ≈ $0.1233
+      WRONG (target_pct_to_shares(-150,130k,20)) = floor(150*130000/20) = -975,000
+            → est_carry ≈ 975000*20*0.003/365*5 ≈ $801  (~6500× over).
+    """
+    db = _make_true_unit_state_db(tmp_path)
+    snapshot = {
+        "GME": ETBSnapshotEntry("GME", "2026-05-25", True, True, True, 0.0030),
+    }
+    oracle = StaticETBAllowlistOracle(snapshot)
+    now = datetime(2026, 5, 30, 0, 0, 0, tzinfo=UTC)
+    result = restate_mod.restate_book(
+        db, "paper-default", snapshot, oracle, asof_snapshot="2026-05-25", now=now
+    )
+    by_symbol = {r["symbol"]: r for r in result["rows"]}
+    assert "GME" in by_symbol, f"GME short missing from restate: {result}"
+
+    # The share count is used DIRECTLY (-150), not re-derived from NAV.
+    assert by_symbol["GME"]["qty_shares"] == -150, (
+        f"ar118: a true_unit equity short must use its stored share count (-150) "
+        f"directly; got {by_symbol['GME']['qty_shares']} (target_pct_to_shares would "
+        "have returned ~ -975,000 from reading -150 as a NAV-fraction)"
+    )
+    # Borrow carry is the honest ~$0.12, not the ~$800 the NAV re-multiply produced.
+    carry = by_symbol["GME"]["est_borrow_carry_usd"]
+    expected = 150 * 20.0 * 0.0030 / 365 * 5
+    assert carry == pytest.approx(expected, abs=0.05), (
+        f"ar118: borrow carry must be ~${expected:.4f} (150 shares), not the phantom "
+        f"NAV-re-multiplied figure; got ${carry}"
+    )
+    assert carry < 1.0, "the phantom ~$800 carry (975k shares) must not appear"

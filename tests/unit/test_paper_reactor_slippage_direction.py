@@ -165,6 +165,59 @@ class TestPaperReactorSlippageDirection:
 
         assert record.fill_price > record.decision_price
 
+    def test_true_unit_equity_position_normalized_not_read_as_raw_shares(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ar118: a det-equity true_unit EQUITY row in the shared paper-default book
+        holds REAL SHARES, not a NAV-fraction. PaperReactor._current_position_pct must
+        normalize it via the unit_kind-aware seam (position_gross_fraction), NOT read
+        the raw share count.
+
+        Held +100 shares of AAPL @ avg $150, NAV $100k → a +15% NAV long. ADD to it
+        with a +0.20 target → trade delta = 0.20 - 0.15 = +0.05 (a BUY: fill ABOVE
+        decision). The pre-fix code read quantity=100 as a 10000% position, so
+        trade_delta = 0.20 - 100 = -99.85 → flipped the slippage to a SELL (fill BELOW
+        decision) and saturated the impact term. This test pins the corrected BUY
+        direction. (Reachable when HERMES_QUANT_DETERMINISTIC_EQUITY is flipped OFF
+        after det-equity opened a true_unit row on the shared paper-default book.)
+        """
+        monkeypatch.setenv("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.2")
+        monkeypatch.delenv("HERMES_QUANT_PORTFOLIO_CAPS", raising=False)
+        # Pin a deterministic NAV so position_gross_fraction(100sh × $150 / NAV) is a
+        # clean +0.15 (the helper paper.py uses is module-level _account_nav_usd).
+        import hermes_quant.react.paper as paper_mod
+
+        monkeypatch.setattr(paper_mod, "_account_nav_usd", lambda: 100_000.0)
+
+        import hermes_quant.state.portfolio_state as ps_mod
+        from hermes_quant.state.portfolio_state import PortfolioState as DBPortfolioState
+
+        class _TrueUnitPos:
+            # Mirrors a det-equity EQUITY Position: real signed SHARES + the regime
+            # marker the canonical position_gross_fraction branches on.
+            quantity = 100.0
+            avg_entry_price = 150.0
+            asset_class = "equity"
+            unit_kind = "true_unit"
+
+        ps_instance = DBPortfolioState(state_db_path=tmp_path / "state.db")
+        _seed_book(ps_instance, {("equity", "AAPL"): _TrueUnitPos()})
+
+        reactor = PaperReactor(executions_path=tmp_path / "executions.jsonl")
+        proposal = _make_proposal("AAPL")
+
+        with patch.object(ps_mod, "_singleton", ps_instance):
+            record = reactor.execute(proposal, fill_size_pct=0.20)
+
+        # +0.15 held, +0.20 target → +0.05 BUY → fill ABOVE decision. The raw-share
+        # bug would have made this a SELL (fill below decision).
+        assert record.fill_price > record.decision_price, (
+            f"ar118: adding to a true_unit equity long (15%→20%) is a BUY; fill must be "
+            f"ABOVE decision, got fill={record.fill_price} decision={record.decision_price}. "
+            "A fill BELOW decision means _current_position_pct read the raw 100-share "
+            "count as a 10000% position and flipped the slippage direction."
+        )
+
     def test_state_read_failure_degrades_to_legacy(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
