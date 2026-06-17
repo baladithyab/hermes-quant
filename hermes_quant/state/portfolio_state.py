@@ -589,17 +589,42 @@ class PortfolioState:
         rows, which legacy DBs do not have). No PK change, so a plain
         ADD COLUMN suffices (unlike processed_fills). Idempotent: a no-op once
         the column exists (fresh DBs already get it from _SCHEMA).
+
+        CRASH-SAFETY / CONCURRENCY (mirrors _migrate_processed_fills / ar116):
+        _conn() opens with isolation_level=None (autocommit), so a bare ALTER
+        TABLE commits immediately. Two concurrent processes that both pass the
+        outer PRAGMA check will BOTH attempt the ALTER — the second raises
+        ``OperationalError: duplicate column name: unit_kind`` and crashes the
+        PortfolioState constructor (bricking the reactor / reconcile-cron for
+        that process). The fix wraps the migration in BEGIN IMMEDIATE so only
+        one process holds the write lock; the other blocks, then re-checks
+        inside the lock and exits cleanly (column already present).
         """
         info = list(conn.execute("PRAGMA table_info(positions)"))
         if not info:
             return  # table not created yet (defensive; executescript creates it first)
         cols = {row[1] for row in info}
         if "unit_kind" in cols:
-            return  # already present (fresh DB or already migrated)
-        conn.execute(
-            f"ALTER TABLE positions ADD COLUMN unit_kind TEXT NOT NULL "
-            f"DEFAULT '{_UNIT_KIND_NAV_FRACTION}'"
-        )
+            return  # fast path: already present (fresh DB or already migrated), no lock needed
+        # Acquire write lock before ALTER so two concurrent processes cannot both
+        # pass the outer check and race to issue the ALTER — the second would crash
+        # with "duplicate column name: unit_kind" (same pattern as
+        # _migrate_processed_fills / ar116).
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-check inside the lock: another process may have completed the
+            # migration between our outer PRAGMA check and BEGIN IMMEDIATE.
+            info2 = list(conn.execute("PRAGMA table_info(positions)"))
+            cols2 = {row[1] for row in info2}
+            if "unit_kind" not in cols2:
+                conn.execute(
+                    f"ALTER TABLE positions ADD COLUMN unit_kind TEXT NOT NULL "
+                    f"DEFAULT '{_UNIT_KIND_NAV_FRACTION}'"
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     # ------------------------------------------------------------------
     # ft1: delta-normalizer regime stamp (read / check)
