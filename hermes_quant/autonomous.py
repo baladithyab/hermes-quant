@@ -456,6 +456,72 @@ def _account_nav_usd() -> float | None:
         return None
 
 
+def _account_nav_mtm() -> float | None:
+    """MTM-first NAV for the paper account, used by the durable drawdown baseline.
+
+    Called only when HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1.  Attempts to
+    compute true mark-to-market equity via PortfolioState.get_marked_equity()
+    using the latest close price from build_perception_frame_live for each open
+    position.  Falls back to cost-basis NAV (_account_nav_usd()) if:
+      - no positions are open (cost-basis == MTM for a cash-only book), OR
+      - all mark fetches fail (network error, perception unavailable), OR
+      - the MTM result is non-finite or <= 0.
+
+    Rationale: cash.equity_total (the source of _account_nav_usd) is written by
+    apply_execution() using avg_entry_price — cost-basis arithmetic that is
+    self-cancelling for NAV-fraction fills.  A position bought at $50 and marked
+    at $40 does NOT reduce equity_total.  The durable HWM would therefore anchor
+    to initial_cash and the ADR-0004 drawdown breaker would never trip, even as
+    real unrealized losses accumulate (P2 fail-open confirmed on HEAD 6cbab3f).
+
+    This function is purely additive behind the existing flag and does NOT change
+    behaviour when the flag is absent (autonomous.py:1745 guards the call).
+    """
+    cost_basis = _account_nav_usd()
+    try:
+        from hermes_quant.perception import build_perception_frame_live
+        from hermes_quant.state.portfolio_state import get_portfolio_state
+
+        ps = get_portfolio_state()
+        positions = ps.get_positions("paper-default")
+        if not positions:
+            # Cash-only book: cost-basis == MTM; skip the per-symbol fetch.
+            return cost_basis
+
+        mark_prices: dict[str | tuple[str, str], float] = {}
+        for (asset_class, symbol) in positions:
+            try:
+                frame = build_perception_frame_live(
+                    symbol, asset_class=asset_class, timeframe="1d"
+                )
+                mark = getattr(frame, "last_close", None) if frame is not None else None
+                if mark is not None and math.isfinite(mark) and mark > 0:
+                    # cs35-compatible: composite key (asset_class, symbol) first so
+                    # get_marked_equity resolves the right mark for same-underlying
+                    # equity + us_option positions.
+                    mark_prices[(asset_class, symbol)] = mark
+                    mark_prices[symbol] = mark  # bare-symbol fallback
+            except Exception as _mark_exc:  # noqa: BLE001
+                logger.debug(
+                    "autonomous: MTM mark fetch failed for %s/%s (falling back "
+                    "to avg_entry for this position): %s",
+                    asset_class,
+                    symbol,
+                    _mark_exc,
+                )
+
+        me = ps.get_marked_equity("paper-default", mark_prices)
+        if me is not None and math.isfinite(me.marked_equity) and me.marked_equity > 0:
+            return float(me.marked_equity)
+        return cost_basis
+    except Exception as exc:  # noqa: BLE001 — fail-closed: cost-basis is always >= MTM for long-only book
+        logger.debug(
+            "autonomous: MTM nav unavailable, using cost-basis for durable baseline: %s",
+            exc,
+        )
+        return cost_basis
+
+
 # ---------------------------------------------------------------------------
 # Kill-switch state
 # ---------------------------------------------------------------------------
@@ -1750,13 +1816,18 @@ def tick(
         # rather than its synthetic flat 100k portfolio (which fails-OPEN). Flag OFF
         # (production default) => `durable_equity` stays None => recommend() receives
         # durable_equity_account=None => byte-identical call shape (no NAV resolved,
-        # no store, no state.db write). `_account_nav_usd()` is fail-closed (returns
-        # None on any failure); a None NAV flows through to recommend()'s flag-ON
-        # fail-CLOSED branch (durable_baseline_nav_unavailable), never a fall-open.
+        # no store, no state.db write). `_account_nav_mtm()` is fail-closed (returns
+        # None on any failure, falls back to cost-basis if marks are unavailable);
+        # a None NAV flows through to recommend()'s flag-ON fail-CLOSED branch
+        # (durable_baseline_nav_unavailable), never a fall-open.
+        # ar_durable_mtm: use _account_nav_mtm() (not _account_nav_usd()) so the
+        # durable HWM is anchored to true MTM equity — including open unrealized
+        # losses — rather than cost-basis equity_total which is self-cancelling for
+        # NAV-fraction fills (equity_total stays at initial_cash after a BUY).
         _durable_baseline = (
             os.environ.get("HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE", "0") == "1"
         )
-        _durable_nav = _account_nav_usd() if _durable_baseline else None
+        _durable_nav = _account_nav_mtm() if _durable_baseline else None
 
         # HERMES_QUANT_POST_LOSS_COOLDOWN seam: build a DefaultRiskGate pre-seeded with
         # loss timestamps from the durable sidecar ONCE per tick, then pass it into each
