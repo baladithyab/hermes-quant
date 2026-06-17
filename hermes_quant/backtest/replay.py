@@ -223,6 +223,26 @@ class _ReplayProvider:
 # ---------------------------------------------------------------------------
 
 
+def _max_drawdown_pct(equity_curve: pd.Series) -> float:
+    """Maximum peak-to-trough drawdown (negative fraction), peak-denominator guarded.
+
+    ar121: mirrors the canonical guarded form in eval/stockbench.py and
+    backtest/engine.py — divides by ``where(peak > 0, peak, 1.0)`` rather than the raw
+    running peak. A signed-position book (``PaperPortfolio.equity = cash + qty*mark``
+    with shorts) can drive NAV through 0 — a short that rallies hard — so the running
+    peak can be <= 0; the bare ``/running_max`` then divides by zero and yields
+    ``-inf``/NaN for the whole-series ``max_dd_pct``. The guard returns the correctly
+    scaled finite drawdown. Positive-NAV books are byte-identical (the guard only
+    rewrites a non-positive peak, which a positive book never has). Empty/degenerate
+    series → 0.0.
+    """
+    if equity_curve is None or len(equity_curve) == 0:
+        return 0.0
+    running_max = equity_curve.cummax()
+    drawdowns = (equity_curve - running_max) / running_max.where(running_max > 0, 1.0)
+    return float(drawdowns.min()) if len(drawdowns) else 0.0
+
+
 def replay(
     bars: pd.DataFrame,
     *,
@@ -508,10 +528,8 @@ def replay(
         else 0.0
     )
 
-    # Max drawdown
-    running_max = equity_curve.cummax()
-    drawdowns = (equity_curve - running_max) / running_max
-    max_dd_pct = float(drawdowns.min()) if len(drawdowns) else 0.0
+    # Max drawdown (ar121: peak-guarded — see _max_drawdown_pct).
+    max_dd_pct = _max_drawdown_pct(equity_curve)
 
     # Deflated Sharpe (PSR with n_trials=1) — only when n_observations >= 30
     if n_observations >= 30:
