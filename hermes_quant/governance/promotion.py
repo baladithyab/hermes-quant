@@ -372,7 +372,22 @@ def _collect_metrics(asof: datetime) -> dict[str, Any]:
         if evt.kind == "gate_rejection" and evt_asof >= window_30d_start:
             breaker_dd = _drawdown_from_breaker_reason(evt.payload.get("reason"))
             if breaker_dd is not None:
-                rolling_30d_max_drawdown_pct = max(rolling_30d_max_drawdown_pct, breaker_dd)
+                # ar100 follow-up: a NON-FINITE breaker magnitude must PROPAGATE so the
+                # evaluate() ar41 finite-guard fail-CLOSES on it. A bare
+                # `max(rolling, breaker_dd)` SWALLOWS a NaN — `max(0.0, nan)` returns
+                # 0.0 (CPython keeps the first arg when no later arg is strictly
+                # greater) — so a `drawdown_circuit_breaker_nan` reason would silently
+                # read as a clean 0.0 and the drawdown gate would NOT block (fail-OPEN,
+                # the one failure mode a money gate must never have). `inf` already
+                # reaches the guard via max(); only nan is swallowed. Mirror the ar101
+                # drift derivation, but for a money DRAWDOWN treat un-evaluable as
+                # un-promotable: carry the non-finite value forward rather than dropping
+                # it. (The legitimate producer finite-guards drawdown_pct before
+                # emitting, so the happy path is byte-identical.)
+                if not math.isfinite(breaker_dd):
+                    rolling_30d_max_drawdown_pct = breaker_dd
+                else:
+                    rolling_30d_max_drawdown_pct = max(rolling_30d_max_drawdown_pct, breaker_dd)
 
         # Calibrator drift snapshots emitted as promotion_event
         if evt.kind == "promotion_event" and evt_asof >= window_30d_start:

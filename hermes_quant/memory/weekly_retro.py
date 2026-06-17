@@ -444,9 +444,10 @@ def decay_and_promote(active: list[Belief], new: list[Belief], *, asof: datetime
         # recurrence — fail-toward-the-legacy-semantics, not toward over-suppression.
         recurrence_present = key in new_alpha_by_key
         recurrence_is_genuine = recurrence_present  # default: legacy (no provenance to prove otherwise)
+        prior_ids: set = set()
+        fresh_ids: set = set()
         if recurrence_present:
             prior_ids = set(b.oracle_provenance.get("decision_ids") or [])
-            fresh_ids: set = set()
             for nb in by_key.get(key, []):
                 fresh_ids |= set(nb.oracle_provenance.get("decision_ids") or [])
             # Only when we have provenance on BOTH sides can we distinguish a genuine
@@ -464,6 +465,20 @@ def decay_and_promote(active: list[Belief], new: list[Belief], *, asof: datetime
                 if decayed.tier == "weekly":
                     decayed.tier = "monthly"
                     decayed.half_life_days = HALF_LIFE_DAYS["monthly"]
+            # ar99 follow-up (idempotency durability): MERGE the genuinely-new
+            # decision_ids into the kept belief's provenance so prior_ids GROWS.
+            # Without this, a genuine recurrence that introduced d3 leaves the kept
+            # belief recording only the OLD {d1,d2}, so the very next same-week
+            # DUPLICATE firing re-distills the same trailing corpus, recomputes
+            # `fresh_ids - prior_ids = {d3}` AGAIN, and double-promotes on zero new
+            # evidence — defeating the new-evidence guard the moment any genuine
+            # recurrence occurs. Only union when BOTH sides carried provenance (the
+            # same precondition the guard uses) so the legacy/un-provenanced path is
+            # byte-identical. sorted() for deterministic on-disk ordering.
+            if prior_ids and fresh_ids and (fresh_ids - prior_ids):
+                merged = dict(decayed.oracle_provenance)
+                merged["decision_ids"] = sorted(prior_ids | fresh_ids)
+                decayed.oracle_provenance = merged
 
         if decayed.recency < RECENCY_EXPIRE_EPSILON:
             decayed.status = "expired"
