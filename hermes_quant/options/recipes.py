@@ -58,7 +58,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
-StrategyKind = Literal["covered_call", "cash_secured_put", "wheel"]
+StrategyKind = Literal["covered_call", "cash_secured_put", "wheel", "bull_put_spread"]
+
+# ADR-0098 Step 2: the first defined-risk credit vertical (bull put spread).
+# Flag guards the selection seam; the producer itself is always importable (pure).
+_VERTICAL_SPREADS_FLAG = "HERMES_QUANT_VERTICAL_SPREADS"
 
 # Default leg-selection knobs (deterministic; no optimization, no LLM).
 _DEFAULT_TARGET_DELTA = 0.30  # |delta| target for the short leg (income workhorse)
@@ -115,7 +119,14 @@ def _eligible_snapshots(
             continue
         if not (dte_min <= s.dte <= dte_max):
             continue
-        if s.mid is None or s.mid <= 0:
+        # wave2-review FIX (fail-OPEN, ar03/ar08 family): a float('nan') mid passes
+        # BOTH `mid is None` (False) AND `mid <= 0` (NaN<=0 is False), so it entered the
+        # candidate list, got selected as a spread leg, and _finite_mid then coerced it to
+        # 0.0 — treating a long PROTECTION leg as FREE, understating max_loss and letting
+        # the gate admit too many contracts (the long leg is what makes a vertical
+        # defined-risk). math.isfinite is the canonical NaN/inf checkpoint here; this also
+        # protects CC/CSP which share this filter.
+        if s.mid is None or not math.isfinite(s.mid) or s.mid <= 0:
             continue
         if s.greeks.delta is None:
             continue
@@ -174,6 +185,57 @@ def _snapshot_to_short_leg(snap: OptionSnapshot) -> OptionLeg:
         greeks_at_decision=snap.greeks,
         fill_price=snap.mid,  # the decision-time net price anchor (paper)
     )
+
+
+def _snapshot_to_long_leg(snap: OptionSnapshot) -> OptionLeg:
+    """Build a buy_to_open OptionLeg (the long PROTECTION leg) for a defined-risk spread."""
+    return OptionLeg(
+        symbol=snap.symbol,
+        side="buy",
+        position_intent="buy_to_open",
+        ratio_qty=1,
+        greeks_at_decision=snap.greeks,
+        fill_price=snap.mid,
+    )
+
+
+def _pick_long_put(
+    snaps: list[OptionSnapshot],
+    *,
+    short: OptionSnapshot,
+    min_width_pct: float = 0.01,
+) -> OptionSnapshot:
+    """Pick the further-OTM (lower-strike) put that protects the short put.
+
+    Requirements:
+      * Same expiry (same DTE window, already filtered by _eligible_snapshots).
+      * Strike STRICTLY LESS THAN the short strike (so width = short_K - long_K > 0).
+      * ``min_width_pct`` of the short strike (floor a degenerate near-zero spread).
+    Picks the HIGHEST eligible strike below the short strike (narrowest spread that
+    is still a meaningful width). Ties broken by the existing deterministic ordering
+    (dte, strike, symbol). Raises RecipeBuildError when no eligible long put exists.
+    """
+    from hermes_quant.options.occ import parse_occ
+
+    short_strike = float(parse_occ(short.symbol).strike)
+    short_expiry = parse_occ(short.symbol).expiry
+    min_width = short_strike * min_width_pct
+
+    candidates = [
+        s for s in snaps
+        if (
+            parse_occ(s.symbol).expiry == short_expiry
+            and float(parse_occ(s.symbol).strike) < short_strike
+            and (short_strike - float(parse_occ(s.symbol).strike)) >= min_width
+        )
+    ]
+    if not candidates:
+        raise RecipeBuildError(
+            f"no eligible long-put strike below short {short_strike:.2f} "
+            f"(min_width={min_width:.2f}) for a bull-put-spread protection leg"
+        )
+    # Highest qualifying strike = narrowest valid width (income-maximizing, still defined-risk).
+    return max(candidates, key=lambda s: (float(parse_occ(s.symbol).strike), s.dte, s.symbol))
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +426,201 @@ def build_multi_leg_proposal(
             f"{strategy_kind} on {symbol.upper()} @ K={strike} dte={min_dte} "
             f"|delta|~{abs(short.greeks.delta or 0.0):.2f}; gate bucket "
             f"{gate_result.bucket.value}, {contracts} contract(s)"
+        ),
+        source_recipe_id=source_recipe_id,
+    )
+    return MultiLegBuildResult(
+        admitted=True,
+        proposal=proposal,
+        bucket=gate_result.bucket,
+        reason=None,
+        contracts=contracts,
+    )
+
+
+def build_bull_put_spread_proposal(
+    *,
+    symbol: str,
+    asof: datetime,
+    chain: OptionChain | None = None,
+    reader: ChainSnapshotReader | None = None,
+    nav: float,
+    options_buying_power: float,
+    total_bpr: float = 0.0,
+    portfolio_net_greeks=None,  # noqa: ANN001 — NetGreeks; default zero below
+    open_strategies_on_underlying: int = 0,
+    cfg: OptionsRiskConfig | None = None,
+    target_delta: float = _DEFAULT_TARGET_DELTA,
+    dte_min: int = _DEFAULT_DTE_MIN,
+    dte_max: int = _DEFAULT_DTE_MAX,
+    source_recipe_id: str = "options.recipes.build_bull_put_spread_proposal",
+    proposal_id: str | None = None,
+    event_risk: Mapping | None = None,
+) -> MultiLegBuildResult:
+    """Build + gate (NOT persist) a BULL PUT SPREAD (ADR-0098 Step 2).
+
+    A bull put spread = SELL 1 OTM put (short, ~0.20-0.30 delta) + BUY 1 further-OTM
+    put (long protection leg, position_intent='buy_to_open') at a lower strike on the
+    SAME expiry. The long leg caps the loss at (short_K - long_K - net_credit)*100 per
+    contract, making max_loss FINITE and DEFINED (ADR-0098: "naked short put is
+    PERMANENTLY excluded — a bull-put-spread is the DEFINED-RISK version").
+
+    DEFAULT-OFF: this function is always callable (for tests), but the CALLER in the
+    strategy-selection table gates entry via HERMES_QUANT_VERTICAL_SPREADS=1 (see
+    structure_select.py). The gate itself (options_gate) further requires
+    HERMES_QUANT_OPTIONS_GATE=1. Without the latter, this raises OptionsGateDisabled.
+
+    Returns a MultiLegBuildResult with:
+      * admitted=True, proposal=<minted via from_gate_result> on gate ADMIT.
+      * admitted=False, proposal=None on gate REJECT or non-finite inputs.
+    """
+    from hermes_quant.options.data import NetGreeks
+
+    cfg = cfg or OptionsRiskConfig()
+    portfolio_net_greeks = portfolio_net_greeks or NetGreeks.zero()
+
+    if chain is None:
+        if reader is None:
+            reader = ChainSnapshotReader()
+        chain = reader.replay_chain(symbol, asof)
+
+    spot = float(chain.underlying_spot)
+    if spot <= 0:
+        raise RecipeBuildError(f"non-positive underlying spot for {symbol}: {spot}")
+
+    # Select OTM puts in the DTE window.
+    snaps = _eligible_snapshots(chain, right="P", dte_min=dte_min, dte_max=dte_max)
+
+    # Short leg: ~0.20-0.30 delta OTM put (income workhorse; same selection as CSP).
+    short = _pick_by_target_delta(snaps, target_delta=target_delta)
+    short_leg = _snapshot_to_short_leg(short)
+    short_strike = float(parse_strike(short.symbol))
+    min_dte = short.dte
+    short_mid = _finite_mid(short.mid)
+
+    # Long leg: further-OTM (lower-strike) put on the same expiry — the protection.
+    # _pick_long_put reuses the same `snaps` list (already DTE-filtered + right="P").
+    long = _pick_long_put(snaps, short=short)
+    long_leg = _snapshot_to_long_leg(long)
+    long_strike = float(parse_strike(long.symbol))
+    long_mid = _finite_mid(long.mid)
+
+    # Spread economics. Non-finite mid must fail-CLOSED (never flow into gate math).
+    # _finite_mid already coerces NaN/inf -> 0.0 for each leg; a zero long_mid is
+    # still a valid (conservative) price (free protection); a zero short_mid means
+    # we received no credit, which the gate may reject via min_trade_size (BPR=0,
+    # contracts=0). Both are handled deterministically downstream.
+    width = short_strike - long_strike  # USD per share; always > 0 by construction
+    net_credit = short_mid - long_mid   # per share (not yet x100)
+    if not math.isfinite(width) or width <= 0:
+        raise RecipeBuildError(
+            f"bull_put_spread: non-positive width={width:.4f} "
+            f"(short={short_strike}, long={long_strike})"
+        )
+
+    # max_loss = (width - net_credit) * 100 per contract. MUST be finite + positive.
+    # The gate re-derives this via _max_loss and enforces it; we compute it here for
+    # the rationale and as a pre-flight non-finite guard (fail-CLOSED).
+    max_loss_per_contract = (width - max(net_credit, 0.0)) * 100
+    if not math.isfinite(max_loss_per_contract) or max_loss_per_contract <= 0:
+        logger.info(
+            "options.recipes: %s bull_put_spread non-finite or zero max_loss=%s; "
+            "rejecting before gate",
+            symbol,
+            max_loss_per_contract,
+        )
+        from hermes_quant.risk.options_gate import StructureBucket
+        return MultiLegBuildResult(
+            admitted=False,
+            proposal=None,
+            bucket=StructureBucket.DEFINED_RISK,
+            reason="bull_put_spread_max_loss_not_finite_or_nonpositive",
+            contracts=0,
+        )
+
+    premium_received = max(net_credit, 0.0) * 100.0   # per contract (credit spread)
+    premium_paid = max(-net_credit, 0.0) * 100.0      # 0 for a net-credit spread
+
+    legs = [short_leg, long_leg]
+
+    # ADR-0084 O8 carrier (DEFAULT-OFF, additive — same pattern as CC/CSP).
+    if os.environ.get(_EVENT_RISK_FLAG, "0") == "1":
+        gate_event_risk: Mapping | None = event_risk
+        gate_decision_asof: datetime | None = asof
+    else:
+        gate_event_risk = None
+        gate_decision_asof = None
+
+    gate_result = options_gate(
+        legs,
+        strategy_kind="bull_put_spread",
+        underlying=symbol.upper(),
+        spot=spot,
+        nav=nav,
+        held_shares=0,
+        options_buying_power=options_buying_power,
+        premium_received=premium_received,
+        portfolio_net_greeks=portfolio_net_greeks,
+        total_bpr=total_bpr,
+        cfg=cfg,
+        composite_intent=None,
+        strike=short_strike,
+        width=width,
+        net_credit=max(net_credit, 0.0),
+        net_debit=max(-net_credit, 0.0),
+        premium_paid=premium_paid,
+        basis_per_share=None,
+        min_dte=min_dte,
+        open_strategies_on_underlying=open_strategies_on_underlying,
+        event_risk=gate_event_risk,
+        decision_asof=gate_decision_asof,
+    )
+
+    if not gate_result.admitted:
+        logger.info(
+            "options.recipes: %s bull_put_spread gate-rejected: %s",
+            symbol,
+            gate_result.reason,
+        )
+        return MultiLegBuildResult(
+            admitted=False,
+            proposal=None,
+            bucket=gate_result.bucket,
+            reason=gate_result.reason,
+            contracts=gate_result.contracts,
+        )
+
+    contracts = max(int(gate_result.contracts), 1)
+
+    # Net price: credit received (short_mid - long_mid) per share * 100 * contracts.
+    # Stored as NEGATIVE Decimal (credit received convention, matching CC/CSP).
+    net_credit_per_contract = Decimal(str(short_mid)) * 100 - Decimal(str(long_mid)) * 100
+    net_debit_credit = (-net_credit_per_contract * Decimal(contracts)).quantize(
+        Decimal("0.01")
+    )
+
+    if proposal_id is None:
+        proposal_id = _mint_proposal_id(symbol, asof)
+
+    proposal = MultiLegProposal.from_gate_result(
+        gate_result=gate_result,
+        proposal_id=proposal_id,
+        asof=asof,
+        strategy_kind="bull_put_spread",
+        underlying=symbol.upper(),
+        option_legs=(short_leg, long_leg),
+        stock_leg=None,
+        outer_qty=contracts,
+        net_debit_credit=net_debit_credit,
+        max_gain=Decimal(str(round(premium_received * contracts, 2))),
+        breakeven_underlying=(Decimal(str(short_strike - max(net_credit, 0.0))),),
+        rationale=(
+            f"bull_put_spread on {symbol.upper()} @ short K={short_strike} / "
+            f"long K={long_strike} dte={min_dte} "
+            f"|delta|~{abs(short.greeks.delta or 0.0):.2f}; "
+            f"width={width:.2f} net_credit={net_credit:.4f}/share "
+            f"max_loss={max_loss_per_contract:.2f}/contract; "
+            f"gate bucket {gate_result.bucket.value}, {contracts} contract(s)"
         ),
         source_recipe_id=source_recipe_id,
     )

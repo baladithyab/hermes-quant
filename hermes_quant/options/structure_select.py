@@ -11,8 +11,8 @@ no network, no I/O). It maps
 
 where ``StrategyKind`` is *exactly* the producer's buildable set
 (``options/recipes.py`` ``StrategyKind`` ≡ ``tools._MULTI_LEG_STRATEGIES`` =
-``{covered_call, cash_secured_put, wheel}``) and ``None`` means **abstain**
-(silence-by-default → today's equity path).
+``{covered_call, cash_secured_put, wheel, bull_put_spread}``) and ``None`` means
+**abstain** (silence-by-default → today's equity path).
 
 What this module is NOT (the rails, ADR-0082 §"Rails preserved"):
 
@@ -22,10 +22,10 @@ What this module is NOT (the rails, ADR-0082 §"Rails preserved"):
     there. The table only narrows the *candidate* ``StrategyKind``; the gate decides
     what (if anything) trades.
   * NOT naked-capable — it only ever emits gate-admissible, collateral-secured /
-    defined-risk-income buckets (CC / CSP / wheel). Anything outside that set
-    (verticals, condors, calendars, straddles) is **not producible** by the existing
-    ``build_multi_leg_proposal`` and therefore resolves to ``None`` (abstain), never
-    to a structure the producer cannot honestly build.
+    defined-risk-income buckets (CC / CSP / wheel / bull_put_spread). Anything
+    outside that set (condors, calendars, straddles, naked shorts) is **not
+    producible** by the existing producers and therefore resolves to ``None``
+    (abstain), never to a structure the producer cannot honestly build.
   * NOT default-on — the selection seam is behind ``HERMES_QUANT_STRUCTURE_SELECT=1``.
     When the flag is OFF (or ``structure_intent`` is absent / ``NONE``, or there is no
     table match, or the intent is a non-producible one), ``select_structure`` returns
@@ -59,17 +59,25 @@ __all__ = [
     "Direction",
     "IVRegime",
     "STRUCTURE_SELECT_FLAG",
+    "VERTICAL_SPREADS_FLAG",
     "classify_iv_regime",
     "direction_from_rating",
     "select_structure",
     "select_structure_for_plan",
     "structure_select_enabled",
+    "vertical_spreads_enabled",
 ]
 
 # The single env flag that gates the SELECTION SEAM (not the pure table). The pure
 # ``select_structure`` is always callable for tests; consumers wire through
 # ``select_structure_for_plan`` which honours this flag (default-OFF).
 STRUCTURE_SELECT_FLAG = "HERMES_QUANT_STRUCTURE_SELECT"
+
+# ADR-0098 Step 2: flag that gates the DEFINED_RISK_CREDIT table rows. DEFAULT-OFF.
+# When absent, select_structure NEVER returns 'bull_put_spread' (byte-identical to
+# today — only CC/CSP/wheel selectable via the PREMIUM_CAPTURE rows). Only a literal
+# "1" enables it (same fail-closed convention as every other money-path flag).
+VERTICAL_SPREADS_FLAG = "HERMES_QUANT_VERTICAL_SPREADS"
 
 # IV-rank classification cut points (percent points, 0..100). ADR-0082 STARTING
 # POINTS; eval-gated. Half-open so every finite IV-rank lands in exactly one regime:
@@ -109,6 +117,16 @@ def structure_select_enabled() -> bool:
     Fail-closed: any value other than the literal ``"1"`` is treated as OFF, so a
     typo / partial config never silently enables a money-path structural seam."""
     return os.environ.get(STRUCTURE_SELECT_FLAG, "0") == "1"
+
+
+def vertical_spreads_enabled() -> bool:
+    """True iff the defined-risk credit vertical seam is enabled (``=1``). Default-OFF.
+
+    ADR-0098 Step 2: gates the DEFINED_RISK_CREDIT rows in ``_STRUCTURE_TABLE``.
+    When OFF, ``select_structure`` NEVER returns ``'bull_put_spread'`` (the table
+    rows for defined_risk_credit are masked at read time). A literal ``"1"`` is the
+    ONLY enabling value — fail-closed, same convention as every money-path flag."""
+    return os.environ.get(VERTICAL_SPREADS_FLAG, "0") == "1"
 
 
 def classify_iv_regime(iv_rank: float) -> IVRegime | None:
@@ -191,10 +209,22 @@ _STRUCTURE_TABLE: dict[tuple[Direction, str, IVRegime], str] = {
     (Direction.NEUTRAL, "premium_capture", IVRegime.MID): "wheel",
     (Direction.NEUTRAL, "premium_capture", IVRegime.HIGH): "wheel",
     # LOW IV-regime PREMIUM_CAPTURE is intentionally ABSENT for every stance
-    # (thin premium -> abstain). DEFINED_RISK_CREDIT / DEFINED_RISK_DEBIT /
-    # LONG_PREMIUM are intentionally ABSENT for every (stance, regime) because the
-    # existing producer cannot build verticals / condors / straddles / calendars;
-    # they resolve to None (abstain) until a producer for them exists.
+    # (thin premium -> abstain).
+    # --- DEFINED_RISK_CREDIT: ADR-0098 Step 2 (bull_put_spread). ---
+    # Bullish defined-risk credit: bull put spread — collect credit for a bullish
+    # view while capping max loss via the long protection leg. Only MID/HIGH IV
+    # (thin premium at LOW IV makes the spread uneconomical). BEARISH / NEUTRAL
+    # defined-risk-credit rows are intentionally ABSENT until a bear-call-spread
+    # producer exists.
+    # IMPORTANT: these rows are MASKED by select_structure when
+    # HERMES_QUANT_VERTICAL_SPREADS != "1" — the flag gate lives in select_structure,
+    # not the table literal, so the table remains a single source of truth and the
+    # gate can be eval-toggled without editing the table.
+    (Direction.BULLISH, "defined_risk_credit", IVRegime.MID): "bull_put_spread",
+    (Direction.BULLISH, "defined_risk_credit", IVRegime.HIGH): "bull_put_spread",
+    # DEFINED_RISK_DEBIT / LONG_PREMIUM are intentionally ABSENT for every
+    # (stance, regime) because no producer for them exists yet; they resolve to
+    # None (abstain) until a producer exists.
 }
 
 
@@ -237,7 +267,19 @@ def select_structure(
     if regime is None:
         return None  # unknown vol regime -> abstain (fail-closed).
 
-    return _STRUCTURE_TABLE.get((direction, structure_intent.value, regime))
+    result = _STRUCTURE_TABLE.get((direction, structure_intent.value, regime))
+
+    # ADR-0098 Step 2: mask defined_risk_credit table results when the vertical
+    # spreads flag is OFF (default). This preserves byte-identity: the only change
+    # relative to today is that a DEFINED_RISK_CREDIT intent now maps to
+    # 'bull_put_spread' in the table, but the selection is suppressed to None
+    # (abstain -> equity path) until the operator sets HERMES_QUANT_VERTICAL_SPREADS=1.
+    # A PREMIUM_CAPTURE / DEFINED_RISK_DEBIT / LONG_PREMIUM result is unaffected.
+    if result is not None and structure_intent.value == "defined_risk_credit":
+        if not vertical_spreads_enabled():
+            return None  # flag OFF -> abstain (byte-identical to today).
+
+    return result
 
 
 def select_structure_for_plan(

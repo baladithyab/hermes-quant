@@ -365,7 +365,12 @@ def _json_safe_float(value: Any) -> float | str:
 # ---------------------------------------------------------------------------
 
 
-_MULTI_LEG_STRATEGIES = {"covered_call", "cash_secured_put", "wheel"}
+_MULTI_LEG_STRATEGIES = {"covered_call", "cash_secured_put", "wheel", "bull_put_spread"}
+
+# ADR-0098 Step 2 (bull_put_spread): defined-risk credit vertical strategies.
+# Gated by HERMES_QUANT_VERTICAL_SPREADS=1 in the selection seam; the producer
+# and tools path accept them when HERMES_QUANT_OPTIONS_GATE=1 (the universal gate).
+_VERTICAL_SPREAD_STRATEGIES = {"bull_put_spread"}
 
 
 def _maybe_propose_multi_leg(symbol: str, args: dict) -> str | None:
@@ -399,11 +404,21 @@ def _maybe_propose_multi_leg(symbol: str, args: dict) -> str | None:
             }
         )
 
+    # ADR-0098 Step 2: vertical spreads (bull_put_spread) require an additional flag.
+    # DEFAULT-OFF: without HERMES_QUANT_VERTICAL_SPREADS=1 the strategy_kind check
+    # below routes the caller to the equity path (byte-identical to today).
+    if (
+        strategy_kind in _VERTICAL_SPREAD_STRATEGIES
+        and os.environ.get("HERMES_QUANT_VERTICAL_SPREADS", "0") != "1"
+    ):
+        return None  # flag OFF -> equity path; byte-identical.
+
     try:
         from hermes_quant.options.data import ChainSnapshotReader
         from hermes_quant.options.recipes import (
             RecipeBuildError,
             build_and_persist_multi_leg,
+            build_bull_put_spread_proposal,
         )
         from hermes_quant.proposals import get_default_store
         from hermes_quant.risk.options_gate import OptionsGateDisabled
@@ -460,17 +475,42 @@ def _maybe_propose_multi_leg(symbol: str, args: dict) -> str | None:
 
     store = get_default_store()
     try:
-        result, record = build_and_persist_multi_leg(
-            store=store,
-            symbol=symbol,
-            asof=asof,
-            strategy_kind=strategy_kind,  # type: ignore[arg-type]
-            nav=nav,
-            options_buying_power=options_buying_power,
-            held_shares=held_shares,
-            reader=reader,
-            ttl_minutes=int(args.get("ttl_minutes", 15)),
-        )
+        if strategy_kind == "bull_put_spread":
+            # ADR-0098 Step 2: route to the dedicated defined-risk credit vertical
+            # producer instead of the CC/CSP/wheel build_and_persist path. The
+            # producer already requires HERMES_QUANT_OPTIONS_GATE=1 (via options_gate).
+            # We build + persist manually here (same pattern as build_and_persist_multi_leg).
+            from hermes_quant.options.recipes import _default_advisor_result, _result_to_gate
+            bps_result = build_bull_put_spread_proposal(
+                symbol=symbol,
+                asof=asof,
+                nav=nav,
+                options_buying_power=options_buying_power,
+                reader=reader,
+            )
+            if bps_result.proposal is None:
+                result, record = bps_result, None
+            else:
+                _advisor = _default_advisor_result(bps_result)
+                _record = store.propose_multi_leg(
+                    proposal=bps_result.proposal,
+                    gate_result=_result_to_gate(bps_result),
+                    advisor_result=_advisor,
+                    ttl_minutes=int(args.get("ttl_minutes", 15)),
+                )
+                result, record = bps_result, _record
+        else:
+            result, record = build_and_persist_multi_leg(
+                store=store,
+                symbol=symbol,
+                asof=asof,
+                strategy_kind=strategy_kind,  # type: ignore[arg-type]
+                nav=nav,
+                options_buying_power=options_buying_power,
+                held_shares=held_shares,
+                reader=reader,
+                ttl_minutes=int(args.get("ttl_minutes", 15)),
+            )
     except OptionsGateDisabled:
         return json.dumps(
             {
