@@ -299,9 +299,15 @@ def is_late_session_equity(asof_execution: str, *, minutes_before_close: int = 3
     et_wall = wall.astimezone(et)
     close_t = time(16, 0)
     et_close = datetime.combine(et_wall.date(), close_t, tzinfo=et)
-    et_late_window_start = et_close.replace(hour=15, minute=60 - minutes_before_close)
-    # Above hack handles minutes_before_close=30 → 15:30 ET; for general
-    # minutes_before_close, compute via timedelta.
+    # ar94: compute the window start via timedelta — correct for ANY
+    # minutes_before_close. A prior `et_close.replace(hour=15, minute=60 -
+    # minutes_before_close)` line was dead (immediately overwritten) yet still
+    # EXECUTED, and raised `ValueError: minute must be in 0..59` for any
+    # minutes_before_close > 60 (negative minute) or < 0 — a latent crash on the
+    # LIVE deterministic-equity / paper slippage paths if a wider auction window was
+    # ever configured. The default (30) was safe, masking it. timedelta has no such
+    # bound and also correctly spans windows > 60 min (which replace(hour=15) could
+    # never express).
     from datetime import timedelta
     et_late_window_start = et_close - timedelta(minutes=minutes_before_close)
 
