@@ -142,3 +142,54 @@ def test_nav_fraction_row_dropped_when_nav_ref_unavailable() -> None:
     # must NOT happen is a finite share-formula dollar figure.
     if "AAPL" in out:
         assert out["AAPL"]["unrealized_pnl"] is None
+
+
+def test_true_unit_us_option_uses_share_formula_times_100() -> None:
+    """A us_option row is TRUE-UNIT (real signed contracts), valued via the
+    contract-multiplier share form — the EXACT branch the ar60 daily sibling pins
+    (tests/ops/test_quant_portfolio_daily_unit_aware_pnl.py::test_true_unit_option_path_unchanged).
+
+    A 2-contract long bought at 1.50 marking 2.50:
+      unrealized = (2.50 - 1.50) * 2 * 100 = +$200  (NOT the NAV-fraction form).
+
+    Non-vacuity: the assertion would be wrong if the option fell through the
+    NAV-fraction branch — qty * nav_ref * (mark/avg - 1) with any plausible nav_ref
+    is nowhere near 200 — and the row must NOT be dropped on nav_ref=None (a
+    true-unit row needs no NAV reference). This pins the us_option *100 form so the
+    weekly retro can never silently apply the NAV-fraction form to a real option.
+    """
+    mod = _load_weekly_retro_module()
+
+    # 4-tuple state.db read shape: (symbol, quantity_contracts, avg, asset_class).
+    positions = [("NVDA260117C00120000", 2.0, 1.50, "us_option")]
+    marks = {"NVDA260117C00120000": 2.50}
+
+    # nav_ref=None on purpose: a true-unit option must NOT be dropped for lack of a
+    # NAV reference (only NAV-fraction rows need one).
+    out = mod.compute_unrealized_pnl(positions, marks, nav_ref=None)
+
+    assert "NVDA260117C00120000" in out, (
+        "a true-unit us_option row must be valued (it needs no nav_ref), not dropped"
+    )
+    reported = out["NVDA260117C00120000"]["unrealized_pnl"]
+    assert reported == pytest.approx((2.50 - 1.50) * 2.0 * 100.0)  # +$200
+    # Guard the units did NOT silently use the bare share formula without the ×100.
+    assert reported != pytest.approx(2.0)
+
+
+def test_true_unit_us_option_short_profits_when_mark_falls() -> None:
+    """A SHORT us_option (negative contracts) profits when the mark falls — pins
+    both the ×100 scale and the sign on the true-unit branch.
+
+    -3 contracts written at 4.00, mark falls to 2.50:
+      unrealized = (2.50 - 4.00) * (-3) * 100 = +$450 (a short gains as the mark drops).
+    """
+    mod = _load_weekly_retro_module()
+
+    positions = [("AAPL260117P00150000", -3.0, 4.00, "us_option")]
+    marks = {"AAPL260117P00150000": 2.50}
+
+    out = mod.compute_unrealized_pnl(positions, marks, nav_ref=None)
+    reported = out["AAPL260117P00150000"]["unrealized_pnl"]
+    assert reported == pytest.approx((2.50 - 4.00) * -3.0 * 100.0)  # +$450
+    assert reported > 0.0, "a short option whose mark fell must show a profit"
