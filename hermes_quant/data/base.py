@@ -113,16 +113,27 @@ def _fetch_bars_with_optional_asof(
     """Call ``provider.fetch_bars`` with the leaf no-lookahead ``as_of`` cutoff,
     degrading gracefully for an older provider that predates the ``as_of`` kwarg.
 
-    Mirrors the advisor / horizon_cache TypeError-retry idiom: pass ``as_of``
-    first; on a TypeError that names the kwarg, retry without it (a legacy
-    provider that windows by ``end`` keeps its existing — if weaker — bound).
+    Pass ``as_of`` first; ONLY retry without it when the TypeError is a genuine
+    "this provider's signature has no ``as_of`` kwarg" error — an
+    unexpected-keyword signature mismatch that NAMES ``as_of``. CPython's own
+    legacy message always names the offending kwarg
+    (``... got an unexpected keyword argument 'as_of'``), so requiring BOTH the
+    unexpected-keyword shape AND the literal ``as_of`` token degrades the real
+    legacy provider while letting an UNRELATED ``TypeError`` raised from inside
+    ``fetch_bars`` (a downstream lib kwarg-typo, a pandas API change, etc.)
+    PROPAGATE. The earlier ``or "unexpected keyword"`` form was fail-OPEN: any
+    unexpected-keyword error from the provider BODY was misclassified as
+    "legacy" and silently retried WITHOUT the cutoff, re-dropping the
+    no-lookahead bound this function exists to enforce.
     """
     try:
         return provider.fetch_bars(
             asset, timeframe, start, end, use_cache=use_cache, as_of=as_of
         )
     except TypeError as exc:
-        if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+        msg = str(exc)
+        # Genuine legacy-signature gap: an unexpected-keyword error naming as_of.
+        if ("unexpected keyword" in msg or "got multiple values" in msg) and "as_of" in msg:
             return provider.fetch_bars(asset, timeframe, start, end, use_cache=use_cache)
         raise
 
