@@ -379,6 +379,16 @@ def _read_safety_rails() -> dict:
             auto.get("stopless_max_size_pct", 0.05), 0.05, "stopless_max_size_pct"
         ),
         "stopless_mode": str(auto.get("stopless_mode", "size_down")),
+        # Per-position UNREALIZED-loss stop (2026-06-17, the June-4 ASTS -20.9% fix).
+        # Distinct from the entry-size `require_stop_loss` backstop above: this watches
+        # an OPEN position decline and force-exits it when its unrealized loss from
+        # entry breaches the threshold. Gated default-OFF by HERMES_QUANT_PER_POSITION_STOP
+        # (the env flag is read in tick(), not here). The threshold is finite-guarded to
+        # the research-chosen 8% default (1.6% NAV at the 20% max position) so a
+        # NaN/inf/<=0 operator value cannot silently disarm the rail (ar08/ar09 family).
+        "per_position_stop_loss_pct": _finite_threshold(
+            auto.get("per_position_stop_loss_pct", 0.08), 0.08, "per_position_stop_loss_pct"
+        ),
     }
 
 
@@ -1093,6 +1103,194 @@ def _emit_killswitch_degraded_audit(exc: Exception, last_known: float | None) ->
         logger.warning("autonomous: failed to emit kill-switch degraded audit: %s", audit_exc)
 
 
+def _emit_per_position_stop_audit(
+    *, symbol: str, loss_pct: float, threshold_pct: float, held_fraction: float
+) -> None:
+    """Emit a ``per_position_stop_fired`` governance audit event (best-effort).
+
+    Mirrors ``_emit_killswitch_fired_audit``: the forced exit is the rail; the audit is
+    the operator-observability side-effect (a stop with no audit trace is an invisible
+    money action — the ar28 lesson). Never breaks the stop on an append failure.
+    """
+    try:
+        from hermes_quant.governance import audit_log
+        from hermes_quant.governance.audit_log import GovernanceEvent
+
+        audit_log.append(
+            GovernanceEvent(
+                kind="per_position_stop_fired",
+                asof=datetime.now(tz=UTC),
+                source="autonomous_per_position_stop",
+                payload={
+                    "rail": "per_position_unrealized_loss_pct",
+                    "symbol": symbol,
+                    "unrealized_loss_pct": loss_pct,
+                    "threshold_pct": threshold_pct,
+                    "held_fraction": held_fraction,
+                },
+            )
+        )
+    except Exception as audit_exc:  # noqa: BLE001 - audit is best-effort
+        logger.warning(
+            "autonomous: failed to emit per_position_stop_fired audit for %s: %s",
+            symbol,
+            audit_exc,
+        )
+
+
+def _establishing_avg_entry_price(symbol: str) -> float | None:
+    """FIFO-consistent weighted-average entry price for an OPEN paper-default position.
+
+    Reuses the CANONICAL settlement matcher (``settlement_loop.join_exit_fills`` ->
+    ``open_lots``) — the SAME lot-matching the kill-switch basis and settlement use, so
+    the stop's cost basis agrees with them rather than re-deriving lot logic (the
+    duplicated-metric defect family). Returns None on any read/parse failure or when the
+    symbol has no open paper-default lots (caller treats None as "no basis -> HOLD").
+    """
+    try:
+        from hermes_quant.daemon.settlement_loop import join_exit_fills
+        from hermes_quant.risk.per_position_stop import weighted_avg_entry_from_lots
+
+        path = QUANT_HOME / "executions.jsonl"
+        if not path.exists():
+            return None
+        recs: list[dict] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict):
+                recs.append(rec)
+        _rts, open_lots = join_exit_fills(recs)
+        # open_lots is keyed (account_id, asset_class, asset); sum the lots for THIS
+        # symbol on the paper-default account across asset_classes (equity is the only
+        # one with a per-position stop today; the key match is by symbol + account).
+        lots: list[dict] = []
+        for (acct, _ac, asset), bucket in open_lots.items():
+            if acct == "paper-default" and asset == symbol:
+                lots.extend(bucket)
+        return weighted_avg_entry_from_lots(lots)
+    except Exception as exc:  # noqa: BLE001 - fail-soft: no basis -> HOLD
+        logger.warning(
+            "autonomous: could not resolve entry basis for stop on %s (HOLD): %s",
+            symbol,
+            exc,
+        )
+        return None
+
+
+def _run_per_position_stop_sweep(
+    *,
+    open_book: dict[str, float],
+    stop_pct: float,
+    paper_zero_costs: bool,
+    result: "TickResult",
+) -> set[str]:
+    """Force-exit each open position whose unrealized loss breaches the stop threshold.
+
+    Returns the set of symbols that were force-exited this tick (the caller exempts them
+    from the watchlist loop + frees their concurrency slot). Each force-exit reuses the
+    existing ``_react()`` chokepoint with ``fill_size_pct = -held`` so it inherits the
+    SAME routed reactor + no-fill guards as a normal fire. A symbol is HELD (not stopped)
+    on any non-computable input (no mark, no entry basis, non-finite) — silence-by-default:
+    a missing number never fabricates an exit.
+    """
+    from hermes_quant.perception import build_perception_frame_live
+    from hermes_quant.risk.per_position_stop import evaluate_stop
+
+    stopped: set[str] = set()
+    for symbol, held in open_book.items():
+        try:
+            if not isinstance(held, (int, float)) or not math.isfinite(held) or held == 0.0:
+                continue
+            # Mark to the latest close via the same live-data path the watchlist loop uses.
+            frame = build_perception_frame_live(symbol, asset_class="equity", timeframe="1d")
+            mark = getattr(frame, "last_close", None) if frame is not None else None
+            if mark is None:
+                continue  # no usable mark -> HOLD
+            entry_price = _establishing_avg_entry_price(symbol)
+            if entry_price is None:
+                continue  # no cost basis -> HOLD
+            decision = evaluate_stop(
+                symbol=symbol,
+                held_fraction=float(held),
+                entry_price=float(entry_price),
+                mark_price=float(mark),
+                threshold_pct=stop_pct,
+            )
+            if not decision.should_stop:
+                continue
+            # Breach -> force-exit through the existing reactor chokepoint.
+            entry = WatchlistEntry(symbol=symbol, asset_class="equity", timeframe="1d")
+            advisor_result = {
+                "decision_price": float(mark),
+                "as_of": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "reason": "autonomous_per_position_stop",
+            }
+            react_out = _react(
+                advisor_result,
+                entry,
+                -float(held),  # flatten the held NAV-fraction
+                paper_zero_costs=paper_zero_costs,
+            )
+            sym_decision = SymbolDecision(
+                symbol=symbol,
+                asset_class="equity",
+                timeframe="1d",
+                gate="PER_POSITION_STOP_FIRED",
+                details={
+                    "unrealized_loss_pct": decision.loss_pct,
+                    "threshold_pct": abs(stop_pct),
+                    "held_fraction": float(held),
+                    "mark_price": float(mark),
+                    "entry_price": float(entry_price),
+                    "reason": decision.reason,
+                },
+            )
+            if react_out is None:
+                # The reactor returned a no-fill/silence (e.g. a clip-to-zero); the
+                # position was NOT flattened, so do NOT exempt it (let the normal loop
+                # still manage it) and record the attempt as a silence.
+                sym_decision.gate = "PER_POSITION_STOP_NO_FILL"
+                sym_decision.details["no_fill"] = True
+                result.silences += 1
+                result.decisions.append(sym_decision)
+                continue
+            execution_id, _realized = react_out
+            sym_decision.execution_id = execution_id
+            stopped.add(symbol)
+            result.fires += 1
+            result.decisions.append(sym_decision)
+            _emit_per_position_stop_audit(
+                symbol=symbol,
+                loss_pct=float(decision.loss_pct) if decision.loss_pct is not None else 0.0,
+                threshold_pct=abs(stop_pct),
+                held_fraction=float(held),
+            )
+            logger.info(
+                "autonomous: PER-POSITION STOP fired on %s (loss %.2f%% >= %.2f%%); "
+                "force-exited %.4f NAV-fraction via %s",
+                symbol,
+                (decision.loss_pct or 0.0) * 100,
+                abs(stop_pct) * 100,
+                held,
+                execution_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - one symbol's failure must not abort the sweep
+            logger.warning(
+                "autonomous: per-position stop sweep error on %s (HOLD): %s",
+                symbol,
+                exc,
+                exc_info=True,
+            )
+            continue
+    return stopped
+
+
 # ---------------------------------------------------------------------------
 # Tick orchestration
 # ---------------------------------------------------------------------------
@@ -1299,7 +1497,13 @@ def tick(
         kill_switch_state=ks,
     )
 
-    if not watchlist:
+    # Empty-watchlist short-circuit. BYTE-IDENTICAL when the per-position stop is OFF
+    # (the production default): no watchlist -> no work -> return. But an open position
+    # can need STOPPING regardless of whether there are new signals to evaluate, so when
+    # HERMES_QUANT_PER_POSITION_STOP=1 we fall through to run the stop sweep against the
+    # open book even with an empty watchlist (the watchlist loop below still iterates
+    # zero times — the only added work is the stop sweep on already-open positions).
+    if not watchlist and os.environ.get("HERMES_QUANT_PER_POSITION_STOP", "0") != "1":
         return result
 
     # ar73 / ADR-0016 §D9 concurrent-positions rail atomicity (cross-tick race fix).
@@ -1351,6 +1555,7 @@ def tick(
         # behavior — only the EXCEPTION path fails closed.
         open_positions_at_tick_start = 0
         open_symbols_at_tick_start: set[str] = set()
+        open_book_at_tick_start: dict[str, float] = {}  # {symbol: held NAV-fraction}
         rail_read_failed = False
         try:
             from hermes_quant.portfolio.state import reconstruct_portfolio_state as _recon
@@ -1362,6 +1567,7 @@ def tick(
             _open = _recon(QUANT_HOME / "executions.jsonl", reactor_filter=None).positions
             open_symbols_at_tick_start = set(_open)
             open_positions_at_tick_start = len(_open)
+            open_book_at_tick_start = dict(_open)  # snapshot for the per-position stop sweep
         except Exception as _exc:  # noqa: BLE001 - never block tick on a read error
             # cs19: fail-CLOSED for the HARD rail (was fail-open to count=0/empty-set).
             rail_read_failed = True
@@ -1443,7 +1649,45 @@ def tick(
         )
         _durable_nav = _account_nav_usd() if _durable_baseline else None
 
+        # Per-position UNREALIZED-loss stop sweep (2026-06-17, the June-4 ASTS -20.9%
+        # fix). DEFAULT-OFF: HERMES_QUANT_PER_POSITION_STOP unset => the whole block is
+        # skipped and the tick is BYTE-IDENTICAL. When ON, before the watchlist loop we
+        # mark each OPEN position to its latest close and force-exit any whose unrealized
+        # loss from its FIFO entry basis breaches per_position_stop_loss_pct. This is the
+        # ONLY rail that sees a single open position bleeding (the kill-switch is
+        # realized-only, autonomous.py:578; the portfolio drawdown breaker can't see a
+        # -4%-NAV single position under its 15% threshold). The forced exit REUSES the
+        # existing _react() chokepoint (fill_size_pct = -held), so it inherits the same
+        # routed reactor + cap-clip + no-fill guards as a normal fire.
+        _stopped_symbols: set[str] = set()
+        if not dry_run and os.environ.get("HERMES_QUANT_PER_POSITION_STOP", "0") == "1":
+            try:
+                _stopped_symbols = _run_per_position_stop_sweep(
+                    open_book=open_book_at_tick_start,
+                    stop_pct=float(rails.get("per_position_stop_loss_pct", 0.08)),
+                    paper_zero_costs=bool(rails.get("paper_zero_costs", False)),
+                    result=result,
+                )
+            except Exception as _stop_exc:  # noqa: BLE001 - never block the tick on the stop sweep
+                logger.warning(
+                    "autonomous: per-position stop sweep failed (continuing tick): %s",
+                    _stop_exc,
+                    exc_info=True,
+                )
+                _stopped_symbols = set()
+            # A stop-closed symbol's slot is freed and it must NOT be re-opened or
+            # adjusted in the SAME tick (avoid double-action against a position we just
+            # flattened). Drop it from the concurrent-cap accounting so the freed slot is
+            # available to a genuinely-new symbol, and skip it in the watchlist loop below.
+            for _sym in _stopped_symbols:
+                if _sym in open_symbols_at_tick_start:
+                    open_symbols_at_tick_start.discard(_sym)
+                    open_positions_at_tick_start = max(0, open_positions_at_tick_start - 1)
+
         for entry in watchlist:
+            if entry.symbol in _stopped_symbols:
+                # Force-exited by the stop sweep this tick; do not re-evaluate it now.
+                continue
             try:
                 _frame = None
                 if _inject_frame:
