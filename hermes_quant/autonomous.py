@@ -1382,6 +1382,20 @@ def _run_per_position_stop_sweep(
                 exc,
                 exc_info=True,
             )
+            # Mirror the watchlist loop's BLE001 handler (line ~2144): record a
+            # gate=PER_POSITION_STOP_ERROR decision so the error is observable on the
+            # tick output and result.errors is incremented. A bare `continue` here is
+            # fail-open: the symbol is silently omitted from `stopped` with no audit
+            # trail (the per-position stop rail is a safety rail — silence defeats it).
+            sym_decision = SymbolDecision(
+                symbol=symbol,
+                asset_class="equity",
+                timeframe="1d",
+                gate="PER_POSITION_STOP_ERROR",
+                error=f"stop_sweep_error: {exc}",
+            )
+            result.errors += 1
+            result.decisions.append(sym_decision)
             continue
     return stopped
 

@@ -242,3 +242,68 @@ def test_per_position_stop_slippage_uses_flat_target(
         f"not target_pct=-held ({target!r}); passing -held doubles slippage impact: "
         f"trade_delta = -held - held = -2*held instead of 0.0 - held = -held"
     )
+
+
+def test_per_position_stop_sweep_react_error_is_not_silent(monkeypatch):
+    """A ValueError from _react inside the stop sweep must produce gate=PER_POSITION_STOP_ERROR,
+    not silently omit the symbol (fail-open on a safety rail).
+
+    RED (before fix): the except block only did `continue`; result.errors == 0 and no
+    decision was recorded -> the error was invisible (fail-open on the stop rail).
+    GREEN (after fix): result.errors == 1 and the decision carries gate=PER_POSITION_STOP_ERROR.
+
+    Scenario: paper_zero_costs=True + HERMES_QUANT_DETERMINISTIC_EQUITY=1 causes _react to
+    raise ValueError("paper_zero_costs is set but reactor is not paper").
+    """
+    import hermes_quant.autonomous as auto_mod
+    import hermes_quant.perception as perc_mod
+    import hermes_quant.risk.per_position_stop as pps_mod
+    from hermes_quant.autonomous import TickResult, _run_per_position_stop_sweep
+    from hermes_quant.risk.per_position_stop import StopDecision
+
+    # Force _react to raise the exact ValueError the verifier confirmed.
+    def _bad_react(*args, **kwargs):
+        raise ValueError("paper_zero_costs is set but reactor is not paper")
+
+    monkeypatch.setattr(auto_mod, "_react", _bad_react)
+
+    # Force evaluate_stop to always say should_stop=True so the breach branch is reached.
+    monkeypatch.setattr(
+        pps_mod,
+        "evaluate_stop",
+        lambda **kw: StopDecision(symbol=kw.get("symbol", "UNKNOWN"), should_stop=True, loss_pct=-0.15, reason="test"),
+    )
+
+    # Provide a valid mark price so the sweep reaches the _react call.
+    class _FakeFrame:
+        last_close = 100.0
+
+    monkeypatch.setattr(
+        perc_mod, "build_perception_frame_live", lambda *a, **kw: _FakeFrame()
+    )
+
+    # Provide a valid entry price.
+    monkeypatch.setattr(auto_mod, "_establishing_avg_entry_price", lambda sym: 110.0)
+
+    result = TickResult(asof="2026-06-17T00:00:00Z", mode="autonomous", dry_run=False, watchlist_size=0)
+    stopped = _run_per_position_stop_sweep(
+        open_book={"ASTS": 0.05},
+        stop_pct=0.08,
+        paper_zero_costs=True,
+        result=result,
+    )
+
+    # The position was NOT stopped (reactor raised, so no fill was executed) — correct.
+    assert "ASTS" not in stopped, "a failed _react must not mark the symbol as stopped"
+
+    # GREEN: result.errors must be 1 and the decision gate must be PER_POSITION_STOP_ERROR.
+    # RED (before fix): result.errors == 0 and result.decisions == [] (silent fail-open).
+    assert result.errors == 1, (
+        f"expected 1 error for the _react failure, got {result.errors}; "
+        "the stop sweep was silently fail-open before the fix"
+    )
+    assert len(result.decisions) == 1
+    assert result.decisions[0].gate == "PER_POSITION_STOP_ERROR", (
+        f"expected gate PER_POSITION_STOP_ERROR, got {result.decisions[0].gate}"
+    )
+    assert "stop_sweep_error" in (result.decisions[0].error or "")
