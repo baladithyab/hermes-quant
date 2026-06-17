@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-95 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
+97 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
 
 Status vocabulary: proposed | accepted | rejected | deprecated | superseded by ADR-NNNN. A compound status (e.g. "Part A accepted; Part B proposed") is the ADR's own — see the file.
 
@@ -101,3 +101,5 @@ Status vocabulary: proposed | accepted | rejected | deprecated | superseded by A
 | [ADR-0095](ADR-0095-single-contract-source-of-truth.md) | One canonical contract — collapse the duplicated AnalystView / Proposal / Fill definitions | proposed | 2026-06-17 |
 | [ADR-0096](ADR-0096-pre-autonomous-decision-quality-gates.md) | Pre-autonomous decision-quality gates — correlation sizing, human-filter honesty, calibration warm-up, regime uncertainty | proposed | 2026-06-17 |
 | [ADR-0097](ADR-0097-paper-vs-live-slippage-haircut.md) | Paper-vs-live slippage haircut — make the paper track record live-realistic before it gates capital | proposed | 2026-06-17 |
+| [ADR-0098](ADR-0098-options-strategy-taxonomy-and-two-level-multileg.md) | AEGIS strategy taxonomy (admissible structures) + the 2-level multi-leg model | proposed | 2026-06-17 |
+| [ADR-0099](ADR-0099-tpsl-strategy-and-clean-window-gates.md) | TP/SL strategy (tranche/trailing/greeks), stock-options parity, and the clean-window gates | proposed | 2026-06-17 |
