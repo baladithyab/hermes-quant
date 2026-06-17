@@ -466,6 +466,15 @@ class ProposalStore:
         :meth:`claim_for_approval` BEFORE firing, then attaches the execution
         via :meth:`record_execution`. ``approve`` is retained for direct
         single-threaded callers/tests that advance state without a fire.
+
+        Cross-process compare-and-set (symmetric to the ar16 ``expire_one`` fix):
+        even this legacy path must not clobber a row a concurrent
+        :meth:`claim_for_approval` already advanced to ``approved`` (and FIRED) —
+        the old UNCONDITIONAL ``_persist`` would overwrite the fired row's
+        ``record_json`` with this call's ``execution=None``, dropping the realized
+        fill. The transition now runs the guarded ``UPDATE ... WHERE
+        state='pending'`` (:meth:`_cas_from_pending`) and appends the 'approve'
+        audit line ONLY when it wins; a loser re-reads and raises.
         """
         with self._lock:
             current = self._get_or_raise(proposal_id)
@@ -482,7 +491,18 @@ class ProposalStore:
                     "execution": execution,
                 }
             )
-            self._persist(updated, event="approve")
+            if not self._cas_from_pending(proposal_id, updated):
+                # Lost the race: a concurrent claim/expire already advanced the
+                # row out of 'pending'. Re-read for a precise error (expiry ->
+                # ProposalExpiredError). NEVER overwrite the fired row.
+                latest = self._get_or_raise(proposal_id)
+                self._reject_if_expired(latest)
+                raise ProposalStateError(
+                    f"proposal {proposal_id} is in state {latest.state!r}; "
+                    "expected 'pending' (a concurrent claim/expire already "
+                    "advanced it — refusing to clobber a non-pending row)"
+                )
+            self._append_audit(updated, event="approve")
             return updated
 
     def reject(
@@ -491,7 +511,27 @@ class ProposalStore:
         *,
         reason: str,
     ) -> Proposal:
-        """Advance pending → rejected. Reason is required."""
+        """Advance pending → rejected. Reason is required.
+
+        Cross-process compare-and-set (symmetric to the ar16 ``expire_one`` fix):
+        ``reject`` is reachable from ``quant_reject`` (an MCP/CLI process) while a
+        concurrent ``claim_for_approval`` (the ``quant_approve`` fire path) runs in
+        a DIFFERENT process. The pre-fix code did a non-atomic check-then-act —
+        read ``state == 'pending'``, then an UNCONDITIONAL ``_persist`` upsert — so
+        a reject that read a STALE pending snapshot and was preempted while an
+        approve advanced the row to ``approved`` (and FIRED the reactor) would
+        resume and clobber the approved+fired row back to ``rejected``
+        (``execution=None``): a capital-moved position misrepresented as rejected
+        on both the SQLite index and the JSONL audit source-of-truth (the 'reject'
+        line is appended last; ``_reconcile_index`` is latest-event-per-id). The
+        in-process ``self._lock`` gives NO cross-process protection.
+
+        The transition now runs the guarded ``UPDATE ... WHERE state='pending'``
+        compare-and-set (:meth:`_cas_from_pending`) and appends the 'reject' audit
+        line ONLY when it wins. A concurrent approve/expire that already advanced
+        the row makes the CAS update 0 rows; we then re-read and raise (surfacing
+        expiry as ``ProposalExpiredError``) rather than overwrite the fired row.
+        """
         if not reason or not reason.strip():
             raise ValueError("rejection reason is required (non-empty string)")
         with self._lock:
@@ -507,7 +547,18 @@ class ProposalStore:
                     "rejection_reason": reason.strip(),
                 }
             )
-            self._persist(updated, event="reject")
+            if not self._cas_from_pending(proposal_id, updated):
+                # Lost the race: a concurrent approve/expire already advanced the
+                # row out of 'pending'. Re-read to give a precise error and to
+                # surface expiry as ProposalExpiredError. NEVER overwrite the row.
+                latest = self._get_or_raise(proposal_id)
+                self._reject_if_expired(latest)
+                raise ProposalStateError(
+                    f"proposal {proposal_id} is in state {latest.state!r}; "
+                    "expected 'pending' (a concurrent approve/expire already "
+                    "advanced it — refusing to clobber a non-pending row)"
+                )
+            self._append_audit(updated, event="reject")
             return updated
 
     def expire_one(self, proposal_id: str) -> Proposal | None:
@@ -576,17 +627,50 @@ class ProposalStore:
         flips the row — every later contender (or a concurrent approve/reject
         that already advanced it) updates 0 rows and loses.
         """
+        return self._cas_from_pending(proposal_id, updated)
+
+    def _cas_from_pending(self, proposal_id: str, updated: Proposal) -> bool:
+        """Guarded SQLite transition pending -> {expired|rejected|approved}.
+
+        Returns True iff this caller won the compare-and-set (the row was still
+        'pending'). This is the cross-process write-lock arbiter shared by every
+        pending -> terminal transition: ``expire_one`` (via :meth:`_cas_expire`),
+        :meth:`reject`, and the legacy :meth:`approve`. ``BEGIN IMMEDIATE`` takes
+        the write lock up-front so two processes serialize here; the ``WHERE
+        state='pending'`` guard means only the FIRST contender flips the row —
+        every later contender (or a concurrent approve/reject/expire that already
+        advanced the row out of 'pending') updates 0 rows and loses.
+
+        Money-software rail (symmetric to the ar16 expire_one fix): the in-process
+        ``self._lock`` gives NO cross-process protection, so a reject/approve that
+        read a STALE 'pending' snapshot and was preempted while a concurrent claim
+        advanced the row to 'approved' (and FIRED the reactor) must NOT clobber the
+        approved+fired row back to rejected/approved-with-no-execution. The guard
+        makes such a stale write update 0 rows; the caller then re-reads and
+        raises ProposalStateError rather than dropping the realized fill.
+
+        The full record (incl. ``record_json``, the source-of-truth shape) is
+        written so the SQLite index stays consistent; the JSONL audit line is
+        appended by the caller ONLY on a win (CAS-then-audit), so a losing
+        contender never appends a phantom terminal event that ``_reconcile_index``
+        (latest-event-per-id) could resurrect.
+        """
         record = _proposal_to_dict(updated)
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = conn.execute(
                     "UPDATE proposals SET "
-                    "  state = 'expired', "
+                    "  state = ?, "
+                    "  approved_at = ?, "
+                    "  rejected_at = ?, "
                     "  expired_at = ?, "
                     "  record_json = ? "
                     "WHERE proposal_id = ? AND state = 'pending'",
                     (
+                        updated.state,
+                        updated.approved_at,
+                        updated.rejected_at,
                         updated.expired_at,
                         json.dumps(record, separators=(",", ":"), sort_keys=True),
                         proposal_id,
@@ -597,8 +681,9 @@ class ProposalStore:
             except Exception:
                 conn.execute("ROLLBACK")
                 logger.warning(
-                    "proposals: SQLite expire CAS failed for %s; JSONL is "
+                    "proposals: SQLite %s CAS failed for %s; JSONL is "
                     "authoritative — re-read will reconstruct via JSONL scan",
+                    updated.state,
                     proposal_id,
                     exc_info=True,
                 )
