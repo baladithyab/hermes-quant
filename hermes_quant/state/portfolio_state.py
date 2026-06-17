@@ -528,30 +528,53 @@ class PortfolioState:
         # idempotency is preserved exactly (an omitted NOT NULL DEFAULT '' column is
         # filled with the default on INSERT). asset/asset_class likewise default to '' for
         # a 2-col legacy source that lacks them.
-        conn.execute(
-            """
-            CREATE TABLE processed_fills_new (
-                proposal_id    TEXT NOT NULL,
-                asof_execution TEXT NOT NULL,
-                asset          TEXT NOT NULL DEFAULT '',
-                asset_class    TEXT NOT NULL DEFAULT '',
-                leg_index      TEXT NOT NULL DEFAULT '',
-                applied_at     TEXT NOT NULL,
-                PRIMARY KEY (proposal_id, asof_execution, asset, asset_class, leg_index)
+        #
+        # ar116 CRASH-SAFETY / IDEMPOTENCY (money-rail): _conn() runs in autocommit
+        # (isolation_level=None), so without an explicit transaction each statement
+        # below commits independently. A crash / SIGKILL / concurrent-process
+        # interleave between CREATE processed_fills_new and the final RENAME would
+        # leave an ORPHAN processed_fills_new table AND the legacy processed_fills
+        # still in place; the NEXT PortfolioState() construction would re-enter this
+        # branch (PK still legacy) and the bare `CREATE TABLE processed_fills_new`
+        # would raise "table already exists" — permanently BRICKING every reactor /
+        # reconcile-cron that constructs PortfolioState (fail-closed: the money path
+        # can no longer initialize, and retries never recover). Two guards make the
+        # re-run safe: (1) DROP any orphan from a prior aborted run before CREATE, so
+        # the recovery path is idempotent; (2) wrap the whole rebuild in one
+        # BEGIN IMMEDIATE / COMMIT so a crash mid-rebuild atomically rolls back to the
+        # legacy table — no orphan, no half-migrated state. ROLLBACK on any failure.
+        # (Ported from agent commit 45a6c2d, adapted to the 5-col cs51 leg_index PK.)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DROP TABLE IF EXISTS processed_fills_new")
+            conn.execute(
+                """
+                CREATE TABLE processed_fills_new (
+                    proposal_id    TEXT NOT NULL,
+                    asof_execution TEXT NOT NULL,
+                    asset          TEXT NOT NULL DEFAULT '',
+                    asset_class    TEXT NOT NULL DEFAULT '',
+                    leg_index      TEXT NOT NULL DEFAULT '',
+                    applied_at     TEXT NOT NULL,
+                    PRIMARY KEY (proposal_id, asof_execution, asset, asset_class, leg_index)
+                )
+                """
             )
-            """
-        )
-        existing = {row[1] for row in info}
-        asset_expr = "asset" if "asset" in existing else "''"
-        class_expr = "asset_class" if "asset_class" in existing else "''"
-        conn.execute(
-            f"INSERT OR IGNORE INTO processed_fills_new "
-            f"(proposal_id, asof_execution, asset, asset_class, applied_at) "
-            f"SELECT proposal_id, asof_execution, {asset_expr}, {class_expr}, applied_at "
-            f"FROM processed_fills"
-        )
-        conn.execute("DROP TABLE processed_fills")
-        conn.execute("ALTER TABLE processed_fills_new RENAME TO processed_fills")
+            existing = {row[1] for row in info}
+            asset_expr = "asset" if "asset" in existing else "''"
+            class_expr = "asset_class" if "asset_class" in existing else "''"
+            conn.execute(
+                f"INSERT OR IGNORE INTO processed_fills_new "
+                f"(proposal_id, asof_execution, asset, asset_class, applied_at) "
+                f"SELECT proposal_id, asof_execution, {asset_expr}, {class_expr}, applied_at "
+                f"FROM processed_fills"
+            )
+            conn.execute("DROP TABLE processed_fills")
+            conn.execute("ALTER TABLE processed_fills_new RENAME TO processed_fills")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _migrate_positions_unit_kind(conn: sqlite3.Connection) -> None:
