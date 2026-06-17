@@ -70,8 +70,8 @@ def load_positions(account: str = "paper-default") -> list[dict]:
     try:
         conn = sqlite3.connect(STATE_DB_PATH)
         rows = conn.execute(
-            "SELECT asset_class, symbol, quantity, avg_entry_price, last_update_at "
-            "FROM positions WHERE account_id = ? AND quantity != 0",
+            "SELECT asset_class, symbol, quantity, avg_entry_price, last_update_at, "
+            "unit_kind FROM positions WHERE account_id = ? AND quantity != 0",
             (account,),
         ).fetchall()
         conn.close()
@@ -79,16 +79,22 @@ def load_positions(account: str = "paper-default") -> list[dict]:
         print(f"⚠️  state.db read failed: {e}", file=sys.stderr)
         return []
     out = []
-    for acls, sym, qty, avg, ts in rows:
+    for acls, sym, qty, avg, ts, unit_kind in rows:
         try:
             out.append(
                 {
                     "symbol": str(sym),
-                    # asset_class is the only regime marker available at report time:
-                    # 'us_option' rows are TRUE-UNIT (real signed contracts, ADR-0088),
-                    # every other class is the legacy NAV-FRACTION equity path
-                    # (Position.quantity = signed fraction of NAV — get_marked_equity).
                     "asset_class": str(acls) if acls else "equity",
+                    # ar118: the AUTHORITATIVE regime marker is the unit_kind COLUMN
+                    # (portfolio_state.py writes 'true_unit' iff reactor_metadata.quantity
+                    # is present), NOT a re-derivation from asset_class. The old
+                    # asset_class=='us_option' heuristic MISSED the deterministic-equity
+                    # reactor's EQUITY positions, which are ALSO true-unit (real signed
+                    # SHARES, ADR-0086/0088) — reading those as NAV-fractions over-stated
+                    # market value + P&L by ~nav_ref/mark (≈1000×). DETERMINISTIC_EQUITY=1
+                    # is LIVE, so this row class is real. Default 'nav_fraction' matches the
+                    # column default for a legacy row written before the unit_kind column.
+                    "unit_kind": str(unit_kind) if unit_kind else "nav_fraction",
                     "qty": float(qty),
                     "avg_entry": float(avg),
                     "last_update_at": str(ts) if ts else None,
@@ -237,8 +243,21 @@ def compute_position_pnl(
     for pos in positions:
         sym, qty, avg = pos["symbol"], pos["qty"], pos["avg_entry"]
         asset_class = pos.get("asset_class", "equity")
-        true_unit = asset_class == "us_option"
-        mult = _CONTRACT_MULTIPLIER if true_unit else 1.0
+        # ar118: drive the unit regime off the stored unit_kind COLUMN, not a
+        # re-derivation from asset_class. A 'true_unit' row holds REAL signed units
+        # (option contracts OR det-equity shares); the contract multiplier (×100)
+        # applies ONLY to options. So a true-unit EQUITY (deterministic-equity) row
+        # uses the share formula with mult=1 — the case the old
+        # `true_unit = asset_class=='us_option'` heuristic wrongly sent down the
+        # NAV-fraction branch (≈1000× over-statement). Fall back to the asset_class
+        # heuristic only if unit_kind is absent (older row dict without the field).
+        unit_kind = pos.get("unit_kind")
+        true_unit = (
+            unit_kind == "true_unit"
+            if unit_kind is not None
+            else asset_class == "us_option"
+        )
+        mult = _CONTRACT_MULTIPLIER if asset_class == "us_option" else 1.0
         mark = marks.get(sym)
         pcl = prev_close.get(sym)
         e = dict(pos)

@@ -104,22 +104,24 @@ def load_reflections() -> list[dict]:
 def load_positions() -> list[tuple]:
     """Return current positions from state.db.
 
-    Shape: ``[(symbol, quantity, avg_entry_price, asset_class), ...]``.
+    Shape: ``[(symbol, quantity, avg_entry_price, asset_class, unit_kind), ...]``.
 
-    ``asset_class`` is the only regime marker available at report time and is
-    required to value rows honestly (see ``compute_unrealized_pnl``):
-    ``us_option`` rows are TRUE-UNIT signed contracts (ADR-0088); every other
-    class is the legacy NAV-FRACTION equity path (``quantity`` is a signed
-    fraction of NAV, NOT shares). A missing/empty asset_class defaults to the
-    NAV-fraction equity path. Backward-compatible: callers that unpack the first
-    three elements still work, but the in-tree caller now consumes the 4th.
+    ``unit_kind`` (ar118) is the AUTHORITATIVE per-row unit regime written by
+    portfolio_state.py ('true_unit' iff reactor_metadata.quantity was present, else
+    'nav_fraction'); ``compute_unrealized_pnl`` values rows off it. The prior shape
+    re-derived the regime from ``asset_class=='us_option'``, which MISSED the
+    deterministic-equity reactor's EQUITY positions (also true-unit real SHARES) and
+    over-stated their P&L ~1000×. A missing/empty unit_kind defaults to 'nav_fraction'
+    (the column default). Backward-compatible: callers that unpack the first three
+    elements still work, the in-tree caller now consumes the 4th + 5th.
     """
     if not STATE_DB_PATH.exists():
         return []
     try:
         conn = sqlite3.connect(STATE_DB_PATH)
         rows = conn.execute(
-            "SELECT symbol, quantity, avg_entry_price, asset_class FROM positions"
+            "SELECT symbol, quantity, avg_entry_price, asset_class, unit_kind "
+            "FROM positions"
         ).fetchall()
         conn.close()
         return rows
@@ -274,9 +276,10 @@ def compute_unrealized_pnl(
     it is unavailable, a NAV-fraction row is dropped rather than emitting the
     share-formula lie (silence-by-default).
 
-    Accepts both the 4-tuple (symbol, qty, avg, asset_class) state.db read shape
-    and the legacy 3-tuple (asset_class then defaults to the NAV-fraction equity
-    path) for backward compatibility.
+    Accepts the 5-tuple (symbol, qty, avg, asset_class, unit_kind) state.db read
+    shape (ar118), the prior 4-tuple (unit_kind then defaults to nav_fraction), and
+    the legacy 3-tuple (asset_class defaults to the NAV-fraction equity path) for
+    backward compatibility.
     """
     out = {}
     for row in positions:
@@ -284,6 +287,14 @@ def compute_unrealized_pnl(
         qty = row[1]
         avg_entry = row[2]
         asset_class = str(row[3]) if len(row) > 3 and row[3] else "equity"
+        # ar118: unit regime comes from the stored unit_kind COLUMN (5th element),
+        # not a re-derivation from asset_class. A 'true_unit' row holds REAL signed
+        # units; the option ×100 multiplier applies only to us_option, so a true-unit
+        # EQUITY (deterministic-equity, LIVE) row uses the share formula with mult=1 —
+        # the case the old asset_class=='us_option' heuristic wrongly valued as a
+        # NAV-fraction (~1000× over-statement). Fall back to the heuristic when the
+        # 5th element is absent (legacy caller / pre-unit_kind row).
+        unit_kind = str(row[4]) if len(row) > 4 and row[4] else None
         if not qty or not avg_entry:
             continue
         mark = marks.get(sym)
@@ -293,13 +304,20 @@ def compute_unrealized_pnl(
         qty_f = float(qty)
         avg_f = float(avg_entry)
         mark_f = float(mark)
-        true_unit = asset_class == "us_option"
+        true_unit = (
+            unit_kind == "true_unit"
+            if unit_kind is not None
+            else asset_class == "us_option"
+        )
+        opt_mult = _CONTRACT_MULTIPLIER if asset_class == "us_option" else 1.0
         # NAV-fraction rows need a NAV reference; without one we cannot value them
         # honestly, so drop them rather than emit a share-formula garbage figure.
         if not true_unit and nav_ref is None:
             continue
         if true_unit:
-            unreal = (mark_f - avg_f) * qty_f * _CONTRACT_MULTIPLIER
+            # ar118: real signed units. ×100 only for option contracts; a true-unit
+            # equity (det-equity shares) uses mult=1 (opt_mult resolved above).
+            unreal = (mark_f - avg_f) * qty_f * opt_mult
         else:
             # NAV-fraction: the documented get_marked_equity dollar form.
             unreal = qty_f * nav_ref * (mark_f / avg_f - 1.0)

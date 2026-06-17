@@ -58,7 +58,11 @@ def _seed_state_db(
 ) -> None:
     """Seed a minimal state.db with positions (+ optional cash).
 
-    `rows` is a list of (asset_class, symbol, quantity, avg_entry_price) tuples.
+    `rows` is a list of (asset_class, symbol, quantity, avg_entry_price) tuples, or
+    (asset_class, symbol, quantity, avg_entry_price, unit_kind) 5-tuples (ar118). When
+    unit_kind is omitted it defaults production-faithfully: 'true_unit' for us_option
+    (ADR-0088), else 'nav_fraction' (the column default). The schema now carries the
+    unit_kind column the real state.db has (portfolio_state.py _SCHEMA).
     """
     conn = sqlite3.connect(db_path)
     conn.execute(
@@ -70,6 +74,7 @@ def _seed_state_db(
             quantity        REAL NOT NULL,
             avg_entry_price REAL NOT NULL,
             last_update_at  TEXT NOT NULL,
+            unit_kind       TEXT NOT NULL DEFAULT 'nav_fraction',
             PRIMARY KEY (account_id, asset_class, symbol)
         )
         """
@@ -84,10 +89,16 @@ def _seed_state_db(
         )
         """
     )
-    for asset_class, symbol, qty, avg in rows or []:
+    for row in rows or []:
+        asset_class, symbol, qty, avg = row[0], row[1], row[2], row[3]
+        unit_kind = (
+            row[4]
+            if len(row) > 4
+            else ("true_unit" if asset_class == "us_option" else "nav_fraction")
+        )
         conn.execute(
-            "INSERT INTO positions VALUES (?,?,?,?,?,?)",
-            (account, asset_class, symbol, qty, avg, "2026-06-14T20:00:00+00:00"),
+            "INSERT INTO positions VALUES (?,?,?,?,?,?,?)",
+            (account, asset_class, symbol, qty, avg, "2026-06-14T20:00:00+00:00", unit_kind),
         )
     if equity_total is not None:
         conn.execute(
@@ -182,3 +193,44 @@ def test_true_unit_option_path_unchanged(tmp_path):
     p = enriched[0]
     assert p["unrealized_pnl"] == pytest.approx((2.50 - 1.50) * 2.0 * 100.0)
     assert p["market_value"] == pytest.approx(2.50 * 2.0 * 100.0)
+
+
+def test_true_unit_equity_det_equity_uses_share_formula_not_nav_fraction(tmp_path):
+    """ar118 REGRESSION: a deterministic-equity EQUITY position is unit_kind='true_unit'
+    (real signed SHARES, ADR-0086), NOT a NAV-fraction. The report must value it with the
+    SHARE formula (mult=1, no ×100 contract multiplier), NOT the NAV-fraction form that
+    the old `true_unit = asset_class=='us_option'` heuristic forced it into.
+
+    50 shares of AAPL @ avg=$100, mark=$110, nav_ref=$100k:
+      CORRECT (share):       market_value = 110*50      = $5,500
+                             unrealized   = (110-100)*50 = +$500
+      WRONG (old, NAV-frac): market_value = 50*100_000             = $5,000,000  (1000×)
+                             unrealized   = 50*100_000*(110/100-1)  = +$500,000   (1000×)
+    DETERMINISTIC_EQUITY=1 is LIVE, so this row class is real on the production book.
+    """
+    mod = _load_script(tmp_path)
+    _seed_state_db(
+        mod.STATE_DB_PATH,
+        # 5-tuple: explicit unit_kind='true_unit' on an EQUITY row (det-equity shares).
+        rows=[("equity", "AAPL", 50.0, 100.0, "true_unit")],
+        equity_total=100_000.0,
+    )
+    positions = mod.load_positions(account="paper-default")
+    assert len(positions) == 1
+    assert positions[0]["unit_kind"] == "true_unit"
+    nav_ref = mod.load_nav_ref(account="paper-default")
+    enriched = mod.compute_position_pnl(positions, {"AAPL": 110.0}, {}, nav_ref)
+    p = enriched[0]
+
+    # Share formula, mult=1 (equity true-unit, NOT the option ×100).
+    assert p["market_value"] == pytest.approx(110.0 * 50.0), (
+        f"ar118: true-unit equity market_value must be mark*shares=$5,500, "
+        f"not the NAV-fraction $5,000,000; got {p['market_value']}"
+    )
+    assert p["unrealized_pnl"] == pytest.approx((110.0 - 100.0) * 50.0), (
+        f"ar118: true-unit equity unrealized must be (mark-avg)*shares=+$500, "
+        f"not the NAV-fraction +$500,000; got {p['unrealized_pnl']}"
+    )
+    # Explicitly NOT the phantom NAV-fraction figures the bug produced.
+    assert p["market_value"] != pytest.approx(50.0 * nav_ref)
+    assert p["unrealized_pnl"] != pytest.approx(50.0 * nav_ref * (110.0 / 100.0 - 1.0))

@@ -193,3 +193,38 @@ def test_true_unit_us_option_short_profits_when_mark_falls() -> None:
     reported = out["AAPL260117P00150000"]["unrealized_pnl"]
     assert reported == pytest.approx((2.50 - 4.00) * -3.0 * 100.0)  # +$450
     assert reported > 0.0, "a short option whose mark fell must show a profit"
+
+
+def test_true_unit_equity_det_equity_uses_share_formula_not_nav_fraction() -> None:
+    """ar118 REGRESSION (weekly retro): a deterministic-equity EQUITY position is
+    unit_kind='true_unit' (real signed SHARES, ADR-0086), NOT a NAV-fraction. The
+    weekly headline must value it with the SHARE formula (mult=1, no ×100), NOT the
+    NAV-fraction form the old `true_unit = asset_class=='us_option'` heuristic forced.
+
+    50 shares of AAPL @ avg=$100, mark=$110, nav_ref=$100k:
+      CORRECT (share):       unrealized = (110-100)*50            = +$500
+      WRONG (old, NAV-frac): unrealized = 50*100_000*(110/100-1)  = +$500,000  (1000×)
+    DETERMINISTIC_EQUITY=1 is LIVE, so this row class is real on the production book.
+
+    The 5-tuple state.db read shape is (symbol, qty, avg, asset_class, unit_kind).
+    """
+    mod = _load_weekly_retro_module()
+
+    nav = 100_000.0
+    # us_option ×100 multiplier must NOT apply to a true-unit EQUITY row.
+    positions = [("AAPL", 50.0, 100.0, "equity", "true_unit")]
+    marks = {"AAPL": 110.0}
+
+    # nav_ref present, but a true-unit row must NOT use it (share formula, not NAV-frac).
+    out = mod.compute_unrealized_pnl(positions, marks, nav_ref=nav)
+    assert "AAPL" in out, "a true-unit equity row must be valued, not dropped"
+    reported = out["AAPL"]["unrealized_pnl"]
+
+    assert reported == pytest.approx((110.0 - 100.0) * 50.0), (
+        f"ar118: true-unit equity unrealized must be (mark-avg)*shares=+$500, not the "
+        f"NAV-fraction +$500,000 nor the option ×100 form; got {reported}"
+    )
+    # Explicitly NOT the phantom NAV-fraction figure the bug produced.
+    assert reported != pytest.approx(50.0 * nav * (110.0 / 100.0 - 1.0))
+    # And NOT the ×100 option form either (mult must be 1 for equity).
+    assert reported != pytest.approx((110.0 - 100.0) * 50.0 * 100.0)
