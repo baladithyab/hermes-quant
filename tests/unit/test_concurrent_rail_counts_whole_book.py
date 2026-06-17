@@ -70,23 +70,33 @@ def _three_reactor_open_book(path: Path) -> None:
     )
 
 
-def test_default_filter_undercounts_whole_book(tmp_path: Path) -> None:
-    """Documents the bug AND proves the 'paper' default is untouched.
+def test_default_filter_is_paper_book_family(tmp_path: Path) -> None:
+    """ar97 UPDATE: the default 'paper' filter is now the paper-BOOK FAMILY.
 
-    With the paper-only default filter, the rail sees ONE position (BA) where the
-    true open equity book is THREE (BA + T + AAPL). reactor_filter=None sees all 3.
+    cs16 (the original premise of this test) moved the D9 rail to reactor_filter=None
+    so it counts the WHOLE book — that fix is intact (see test_d9_rail_counts_all_
+    reactor_names). ar97 ADDITIONALLY corrected the DEFAULT 'paper' filter itself: it
+    now matches the paper-default book FAMILY {paper, deterministic-equity} (both write
+    account_id=paper-default), not the bare literal "paper". So the default sees BA
+    (paper) + AAPL (deterministic-equity) = the true paper-default book; the SEPARATE
+    alpaca_paper shadow partition (T, account_id=alpaca-paper) stays excluded. This
+    closes the latent undercount for any caller relying on the default, while
+    reactor_filter=None still counts the entire cross-account book.
     """
     p = tmp_path / "executions.jsonl"
     _three_reactor_open_book(p)
 
-    # Default filter (reactor_filter="paper") — the buggy view the rail used.
+    # Default filter (reactor_filter="paper") — ar97: the paper-default book FAMILY
+    # {paper, deterministic-equity}. BA (paper) + AAPL (det-equity); alpaca_paper (T)
+    # is a separate shadow partition and stays excluded.
     paper_only = reconstruct_portfolio_state(p)
-    assert set(paper_only.positions) == {"BA"}, (
-        "default reactor_filter='paper' must still see ONLY the paper slice "
-        "(proves portfolio/state.py:40 default is unchanged)"
+    assert set(paper_only.positions) == {"BA", "AAPL"}, (
+        "ar97: default reactor_filter='paper' is the paper-BOOK FAMILY "
+        "{paper, deterministic-equity}; alpaca_paper stays excluded"
     )
+    assert "T" not in paper_only.positions, "alpaca_paper shadow must NOT enter the paper-book view"
 
-    # Whole equity book — what the safety rail MUST count.
+    # Whole equity book — what the safety rail MUST count (reactor_filter=None).
     whole_book = reconstruct_portfolio_state(p, reactor_filter=None)
     assert set(whole_book.positions) == {"BA", "T", "AAPL"}, (
         "reactor_filter=None must count the WHOLE open equity book across all "
