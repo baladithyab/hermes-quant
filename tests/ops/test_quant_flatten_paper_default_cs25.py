@@ -89,23 +89,26 @@ def test_canonical_enumeration_includes_det_equity_missed_by_paper_slice(tmp_pat
     bus = _write_bus(tmp_path, _MIXED_BOOK)
     mod = _load_script()
 
-    # The OLD path the script used: reactor_filter='paper' (default).
-    old_paper_slice = set(reconstruct_portfolio_state(bus).positions)
-    assert old_paper_slice == {"BA"}, (
-        "guard: the narrow paper slice should see ONLY the 'paper' open (BA)"
+    # ar97 UPDATE: the default reactor_filter='paper' is now the paper-BOOK FAMILY
+    # {paper, deterministic-equity} (both account_id=paper-default), so the default view
+    # ALREADY includes AAPL (det-equity) + BA (paper); the separate alpaca-paper shadow
+    # (T) stays excluded. (Pre-ar97 this default undercounted to {BA} only — the exact
+    # bug cs25's canonical_open_positions worked around; ar97 fixed it at the source, so
+    # the workaround and the source default now AGREE on the paper-default book.)
+    default_paper_book = set(reconstruct_portfolio_state(bus).positions)
+    assert default_paper_book == {"BA", "AAPL"}, (
+        "ar97: default reactor_filter='paper' is the paper-book family "
+        f"{{paper, deterministic-equity}}; got {sorted(default_paper_book)}"
     )
+    assert "T" not in default_paper_book, "alpaca_paper shadow must stay out of the paper-book view"
 
-    # The fixed enumeration the script now uses.
+    # The canonical enumeration the script uses (reactor_filter=None — the WHOLE book).
     flattened = set(mod.canonical_open_positions(bus))
 
-    # GREEN: AAPL (deterministic-equity, paper-default) is now enumerated for flatten;
-    # the old paper-only slice would have left it OPEN.
+    # AAPL (deterministic-equity, paper-default) MUST be enumerated for flatten.
     assert "AAPL" in flattened, (
         "deterministic-equity paper-default position MUST be flattened (cs16/cs25): "
         f"got {sorted(flattened)}"
-    )
-    assert "AAPL" not in old_paper_slice, (
-        "RED witness: the pre-cs25 paper-only enumeration MISSED the det-equity open"
     )
     assert "BA" in flattened
 

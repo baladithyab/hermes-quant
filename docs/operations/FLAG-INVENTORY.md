@@ -26,12 +26,12 @@
 | `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/autonomous.py:634` |
 | `HERMES_QUANT_DETERMINISTIC_EQUITY` | `0` | `hermes_quant/react/dispatch.py:80` |
 | `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1087` |
-| `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1230` |
-| `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1309` |
+| `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1245` |
+| `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1324` |
 | `HERMES_QUANT_EVIDENCE_DIR` | `` | `hermes_quant/evidence/store.py:60` |
 | `HERMES_QUANT_FUNDAMENTALS_ENABLED` | `0` | `hermes_quant/advisor.py:395` |
 | `HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG` | `1` | `hermes_quant/data/fundamentals_provider.py:146` |
-| `HERMES_QUANT_GRAPH_MINING` | `0` | `hermes_quant/catalyst/graph_mining.py:157` |
+| `HERMES_QUANT_GRAPH_MINING` | `0` | `hermes_quant/catalyst/graph_mining.py:158` |
 | `HERMES_QUANT_GROUNDING_ENFORCE` | `0` | `hermes_quant/grounding/enforcement.py:156` |
 | `HERMES_QUANT_HOME` | `` | `hermes_quant/daemon/tick_lock.py:117` |
 | `HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD` | `0.85` | `hermes_quant/research/hypothesis_novelty.py:57` |
@@ -48,12 +48,12 @@
 | `HERMES_QUANT_MONTHLY_META_RETRO` | `0` | `hermes_quant/memory/meta_retro.py:70` |
 | `HERMES_QUANT_MULTILEG_REACTOR` | `0` | `hermes_quant/react/mleg_fill.py:116` |
 | `HERMES_QUANT_OPEN_GUARD` | `1` | `hermes_quant/risk/open_guard.py:304` |
-| `HERMES_QUANT_OPTIONS_GATE` | `0` | `hermes_quant/risk/options_gate.py:503` |
+| `HERMES_QUANT_OPTIONS_GATE` | `0` | `hermes_quant/risk/options_gate.py:529` |
 | `HERMES_QUANT_OPTIONS_LIVE_CHAIN` | `0` | `hermes_quant/options/data.py:427` |
 | `HERMES_QUANT_OVERNIGHT_DRIFT` | `0` | `hermes_quant/advisor.py:430` |
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:255` |
 | `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:523` |
-| `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1298` |
+| `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1313` |
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:206` |
 | `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:1379` |
@@ -66,7 +66,7 @@
 | `HERMES_QUANT_RESEARCH_LOOP` | `0` | `hermes_quant/research/research_loop.py:88` |
 | `HERMES_QUANT_RESEARCH_RISK_TIER_BLOCK` | `0` | `hermes_quant/research/risk_tier.py:221` |
 | `HERMES_QUANT_RUN_BACKTEST` | `0` | `hermes_quant/cli/ablate.py:273` |
-| `HERMES_QUANT_SATURATION` | `0` | `hermes_quant/analysts/semantic.py:140` |
+| `HERMES_QUANT_SATURATION` | `0` | `hermes_quant/analysts/semantic.py:141` |
 | `HERMES_QUANT_SEMANTIC_ENABLED` | `1` | `hermes_quant/advisor.py:412` |
 | `HERMES_QUANT_SHADOW_RULE_MINING` | `0` | `hermes_quant/shadow/rule_mining.py:162` |
 | `HERMES_QUANT_SIGNED_EQUITY` | `0` | `hermes_quant/state/portfolio_state.py:214` |
@@ -76,5 +76,5 @@
 | `HERMES_QUANT_TICK_LOCK_TIMEOUT_S` | `` | `hermes_quant/daemon/tick_lock.py:88` |
 | `HERMES_QUANT_TRADER_LLM` | `0` | `hermes_quant/agents/trader.py:504` |
 | `HERMES_QUANT_TREND_VELOCITY` | `0` | `hermes_quant/catalyst/synthesize.py:199` |
-| `HERMES_QUANT_WATCHLIST_CAP_TRIM` | `0` | `hermes_quant/playbook/watchlist_evolution.py:167` |
+| `HERMES_QUANT_WATCHLIST_CAP_TRIM` | `0` | `hermes_quant/playbook/watchlist_evolution.py:169` |
 | `HERMES_QUANT_WEEKLY_RETRO` | `1` | `hermes_quant/aggregators/llm_committee.py:350` |
