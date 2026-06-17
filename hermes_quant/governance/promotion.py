@@ -204,6 +204,34 @@ class PromotionDecision(BaseModel):
 # Metric collection from audit log
 # ---------------------------------------------------------------------------
 
+# risk/gate.py Rule 1 emits a `gate_rejection` whose reason encodes the realized
+# drawdown magnitude: `drawdown_circuit_breaker_{drawdown_pct:.4f}` (gate.py:544).
+# This is the ONLY producer that puts a real paper drawdown on the governance
+# audit log: NO live producer emits `rolling_30d_max_drawdown_pct` into a
+# `promotion_event` payload (weekly_retro.emit_promotion_readiness emits only
+# readiness/belief counts). Without deriving the drawdown from the circuit-breaker
+# reason, `_collect_metrics` would leave `rolling_30d_max_drawdown_pct` at its 0.0
+# default and the `> max_rolling_30d_drawdown_pct` block at evaluate() would be
+# VACUOUS — a strategy that tripped a real 30% drawdown breaker in the window would
+# NOT be blocked from paper→live promotion (latent fail-OPEN, same class as the
+# never-written `immutable_breach` flag). We parse the magnitude out of the reason
+# the breaker actually emits so a silenced/halted drawdown is OBSERVABLE here.
+_DRAWDOWN_BREAKER_PREFIX: str = "drawdown_circuit_breaker_"
+
+
+def _drawdown_from_breaker_reason(reason: Any) -> float | None:
+    """Parse the realized drawdown fraction out of a `drawdown_circuit_breaker_*`
+    `gate_rejection` reason. Returns the float magnitude, or None if the reason is
+    not a drawdown breaker / is unparseable (never raises). Mirrors the way ar77
+    derives immutable breaches from the breaker reason rather than a flag no
+    producer writes."""
+    if not isinstance(reason, str) or not reason.startswith(_DRAWDOWN_BREAKER_PREFIX):
+        return None
+    try:
+        return abs(float(reason[len(_DRAWDOWN_BREAKER_PREFIX):]))
+    except (TypeError, ValueError):
+        return None
+
 
 def _collect_metrics(asof: datetime) -> dict[str, Any]:
     """Walk the audit log and compute the inputs to `PromotionDecision`."""
@@ -268,6 +296,17 @@ def _collect_metrics(asof: datetime) -> dict[str, Any]:
                 or _reason_is_immutable_breach(reason)
             ):
                 immutable_breach_count += 1
+
+        # Realized drawdown from the drawdown circuit breaker (gate.py Rule 1).
+        # The breaker's `gate_rejection` reason encodes the magnitude
+        # (`drawdown_circuit_breaker_{pct}`) — the ONLY producer that surfaces a
+        # real paper drawdown on the governance audit log. Deriving it here makes
+        # the silenced/halted drawdown OBSERVABLE to the gate's drawdown block;
+        # without it that block reads the 0.0 default and never fires (fail-OPEN).
+        if evt.kind == "gate_rejection" and evt_asof >= window_30d_start:
+            breaker_dd = _drawdown_from_breaker_reason(evt.payload.get("reason"))
+            if breaker_dd is not None:
+                rolling_30d_max_drawdown_pct = max(rolling_30d_max_drawdown_pct, breaker_dd)
 
         # Calibrator drift snapshots emitted as promotion_event
         if evt.kind == "promotion_event" and evt_asof >= window_30d_start:
