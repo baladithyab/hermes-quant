@@ -13,6 +13,9 @@ _REQUIRED = [
     "HERMES_QUANT_PER_POSITION_STOP",
     "HERMES_QUANT_DELTA_NORMALIZER",
     "HERMES_QUANT_ACCOUNT_LOCK",
+    # d83b: the ADR-0097 slippage-haircut rail is now REQUIRED (was only
+    # recommended) so GATE-0 cannot stamp t0 with the haircut rail disarmed.
+    "HERMES_QUANT_SLIPPAGE_HAIRCUT",
 ]
 
 
@@ -63,3 +66,39 @@ def test_dry_run_writes_nothing(tmp_path, monkeypatch):
     rc = H.main(["--home", str(tmp_path), "--dry-run"])
     assert rc == 0
     assert not (tmp_path / "quant" / "clean_window_start.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# d83b — the ADR-0097 slippage-haircut rail must be REQUIRED, not recommended.
+# --------------------------------------------------------------------------- #
+def test_slippage_haircut_is_required_not_recommended():
+    """The haircut rail moved into _REQUIRED_ARMED so GATE-0 refuses without it.
+    RED before d83b: it lived in _RECOMMENDED (warn-only, non-blocking)."""
+    assert "HERMES_QUANT_SLIPPAGE_HAIRCUT" in H._REQUIRED_ARMED, (
+        "SLIPPAGE_HAIRCUT must be a REQUIRED-armed rail (the run-card claims "
+        "live-realistic evidence; a disarmed haircut makes that claim dishonest)"
+    )
+    assert "HERMES_QUANT_SLIPPAGE_HAIRCUT" not in H._RECOMMENDED, (
+        "SLIPPAGE_HAIRCUT must no longer be merely recommended"
+    )
+
+
+def test_refuses_when_only_haircut_disarmed(tmp_path, monkeypatch):
+    """All the OTHER rails armed, but the haircut rail disarmed -> GATE-0 REFUSES.
+    RED before d83b: with the haircut only recommended, this returned 0 (stamped)."""
+    for f in _REQUIRED:
+        monkeypatch.setenv(f, "1")
+    monkeypatch.delenv("HERMES_QUANT_SLIPPAGE_HAIRCUT", raising=False)  # the only disarmed rail
+    rc = H.main(["--home", str(tmp_path)])
+    assert rc == 2, "GATE-0 must refuse when the required haircut rail is disarmed"
+    assert not (tmp_path / "quant" / "clean_window_start.json").exists()
+
+
+def test_force_overrides_disarmed_haircut(tmp_path, monkeypatch):
+    """--force still stamps (records the disarmed window honestly)."""
+    for f in _REQUIRED:
+        monkeypatch.setenv(f, "1")
+    monkeypatch.delenv("HERMES_QUANT_SLIPPAGE_HAIRCUT", raising=False)
+    rc = H.main(["--home", str(tmp_path), "--force"])
+    assert rc == 0
+    assert (tmp_path / "quant" / "clean_window_start.json").exists()

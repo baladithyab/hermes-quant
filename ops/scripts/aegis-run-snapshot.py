@@ -39,6 +39,13 @@ from pathlib import Path
 # The flags whose ON/OFF state defines whether the safety rails are armed for this run.
 # The run-card records what was actually set in the process env at run start, so a
 # later review can tell whether a window ran armed or disarmed.
+#
+# d83b: SLIPPAGE_HAIRCUT is tracked here so the run-card's rail_drift detection
+# covers it. The clean-window evidence is live-realistic only while the ADR-0097
+# haircut stays armed (compute_gate_metrics applies it behind that flag); a mid-
+# window disarm of the haircut silently reverts to paper-optimistic evidence, which
+# must surface as drift — not stay invisible while the record still calls itself
+# honest/forward-only.
 _RAIL_FLAGS = [
     "HERMES_QUANT_PORTFOLIO_CAPS",
     "HERMES_QUANT_PAPER_SLIPPAGE_MODEL",
@@ -48,6 +55,7 @@ _RAIL_FLAGS = [
     "HERMES_QUANT_POST_LOSS_COOLDOWN",
     "HERMES_QUANT_DELTA_NORMALIZER",
     "HERMES_QUANT_ACCOUNT_LOCK",
+    "HERMES_QUANT_SLIPPAGE_HAIRCUT",
     "HERMES_QUANT_REFLECTION",
 ]
 

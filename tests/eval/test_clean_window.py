@@ -674,3 +674,151 @@ class TestBootstrapCI:
         """N=1: Sharpe is NaN; bootstrap CI is also NaN."""
         metrics = compute_gate_metrics([_make_trip(1, 0.01)], t0=_T0)
         assert math.isnan(metrics.sharpe_95ci_lower)
+
+
+# ---------------------------------------------------------------------------
+# b61c — ADR-0097 slippage-haircut wired into clean-window evidence.
+#
+# THE DEFECT: compute_gate_metrics computed sharpe/win-rate/etc on RAW paper
+# realized_return; the dishonest-evidence fail-open is that a paper-OPTIMISTIC
+# window clears a promotion gate that LIVE would not. ADR-0097 requires a
+# haircut-TOWARD-SILENCE adjusted ('live_realistic') series, behind the
+# HERMES_QUANT_SLIPPAGE_HAIRCUT flag, read at call time. Default-OFF =>
+# byte-identical RAW metrics (no behaviour change when the flag is unset).
+# ---------------------------------------------------------------------------
+
+
+class TestSlippageHaircutOff:
+    """Flag OFF (default) => the adjusted series IS the raw series: byte-identical."""
+
+    def test_default_matches_legacy_metrics_exactly(self):
+        """With apply_haircut=False (the default), every metric equals the
+        pre-b61c raw computation. Inputs are picked so a broken (always-haircut)
+        impl would DIVERGE: 20 all-winning equity trips -> haircut would lower
+        the mean and the Sharpe."""
+        trips = _win_trips(20, win_ret=0.01)
+        raw = compute_gate_metrics(trips, t0=_T0)
+        default = compute_gate_metrics(trips, t0=_T0)  # apply_haircut defaults False
+        assert default.win_rate == raw.win_rate
+        assert default.sharpe == raw.sharpe
+        assert default.profit_factor == raw.profit_factor
+        assert default.max_drawdown == raw.max_drawdown
+
+    def test_explicit_false_is_raw(self):
+        trips = _win_trips(20, win_ret=0.01)
+        m = compute_gate_metrics(trips, t0=_T0, apply_haircut=False)
+        # All-win sample, raw: every trip is a win -> win_rate 1.0.
+        assert m.win_rate == pytest.approx(1.0)
+
+
+class TestSlippageHaircutOn:
+    """Flag ON => the adjusted ('live_realistic') series is haircut TOWARD silence:
+    the per-trip return is moved toward zero/loss by the modeled live-vs-paper
+    penalty, NEVER improved. So an all-winning window yields LOWER sharpe / lower
+    mean adjusted return than the raw series."""
+
+    def test_haircut_lowers_mean_and_sharpe(self, tmp_path):
+        """RED before b61c: a window of 20 all-winning EQUITY trips at +0.01
+        each. With the haircut ON, the equity prior (0.0025) is subtracted from
+        each trip -> adjusted return 0.0075 < 0.01. Lower mean => lower Sharpe."""
+        trips = _win_trips(20, win_ret=0.01)
+        raw = compute_gate_metrics(trips, t0=_T0, apply_haircut=False)
+        adj = compute_gate_metrics(
+            trips, t0=_T0, apply_haircut=True, shadow_log=tmp_path / "absent.jsonl"
+        )
+        # The haircut moves the return toward zero (a cost): adjusted Sharpe < raw.
+        assert adj.sharpe < raw.sharpe, (
+            f"haircut must LOWER Sharpe; raw={raw.sharpe} adj={adj.sharpe}"
+        )
+        assert math.isfinite(adj.sharpe)
+
+    def test_haircut_can_flip_thin_winner_to_loss(self, tmp_path):
+        """A +0.001 (10 bps) equity winner is SMALLER than the 25-bps equity
+        prior -> haircut adjusts it to NEGATIVE -> it stops counting as a win.
+        RED before b61c (raw counts it as a win)."""
+        trips = [_make_trip(i + 1, 0.001) for i in range(20)]
+        raw = compute_gate_metrics(trips, t0=_T0, apply_haircut=False)
+        adj = compute_gate_metrics(
+            trips, t0=_T0, apply_haircut=True, shadow_log=tmp_path / "absent.jsonl"
+        )
+        assert raw.win_rate == pytest.approx(1.0)
+        # equity prior 0.0025 > 0.001 -> every adjusted return < 0 -> win_rate 0.
+        assert adj.win_rate < raw.win_rate
+        assert adj.win_rate == pytest.approx(0.0)
+
+    def test_haircut_never_improves_a_return(self, tmp_path):
+        """The penalty is ALWAYS a cost. A losing trip gets WORSE (more negative),
+        never better. A broken impl that ADDED the penalty would shrink the drawdown."""
+        trips = [_make_trip(i + 1, -0.01) for i in range(20)]
+        raw = compute_gate_metrics(trips, t0=_T0, apply_haircut=False)
+        adj = compute_gate_metrics(
+            trips, t0=_T0, apply_haircut=True, shadow_log=tmp_path / "absent.jsonl"
+        )
+        # All losers: each loss is bigger with the haircut -> drawdown at least as deep.
+        assert abs(adj.max_drawdown) >= abs(raw.max_drawdown) - 1e-12
+
+    def test_options_trip_uses_option_prior(self, tmp_path):
+        """An options trip (is_options=True) is haircut with the larger us_option
+        prior (0.0080), not the equity prior. A +0.005 (50 bps) options winner is
+        below the 80-bps option prior -> adjusted negative."""
+        trips = [_make_trip(i + 1, 0.005, is_options=True) for i in range(20)]
+        adj = compute_gate_metrics(
+            trips, t0=_T0, apply_haircut=True, shadow_log=tmp_path / "absent.jsonl"
+        )
+        # us_option prior 0.0080 > 0.005 -> all become losers.
+        assert adj.win_rate == pytest.approx(0.0), (
+            f"options winner below the option prior must flip to a loss; win_rate={adj.win_rate}"
+        )
+
+
+class TestSlippageHaircutFlagAtCallTime:
+    """The flag is read AT CALL TIME (per posture). The caller passes
+    apply_haircut from hermes_quant.risk.slippage_haircut.haircut_enabled()."""
+
+    def test_flag_read_via_module(self, tmp_path, monkeypatch):
+        from hermes_quant.risk.slippage_haircut import haircut_enabled
+
+        trips = _win_trips(20, win_ret=0.01)
+        monkeypatch.delenv("HERMES_QUANT_SLIPPAGE_HAIRCUT", raising=False)
+        off = compute_gate_metrics(
+            trips, t0=_T0, apply_haircut=haircut_enabled(),
+            shadow_log=tmp_path / "absent.jsonl",
+        )
+        monkeypatch.setenv("HERMES_QUANT_SLIPPAGE_HAIRCUT", "1")
+        on = compute_gate_metrics(
+            trips, t0=_T0, apply_haircut=haircut_enabled(),
+            shadow_log=tmp_path / "absent.jsonl",
+        )
+        assert on.sharpe < off.sharpe
+
+
+class TestSlippageHaircutNonFinitePenalty:
+    """Finite-guard: a non-finite penalty must NOT inflate the adjusted return.
+    estimate_live_penalty is contractually finite, but the clean_window seam must
+    still fail toward the conservative raw-minus-floor if a penalty is non-finite."""
+
+    def test_non_finite_penalty_does_not_improve_return(self, tmp_path, monkeypatch):
+        """Monkeypatch estimate_live_penalty to return a NaN penalty_frac. The
+        adjusted window must NOT vanish (a naive raw-minus-NaN -> NaN return would
+        be EXCLUDED by the finite-guard -> the trip disappears and the surviving
+        winners INFLATE the metrics = a free pass) AND the adjusted Sharpe must be
+        no better than the conservative raw."""
+        import hermes_quant.eval.clean_window as cw
+        from hermes_quant.risk.slippage_haircut import PenaltyEstimate
+
+        def _bad_penalty(*a, **k):
+            return PenaltyEstimate(
+                penalty_frac=float("nan"), basis="prior", n_samples=0, detail="bad"
+            )
+
+        monkeypatch.setattr(cw, "estimate_live_penalty", _bad_penalty)
+        trips = _win_trips(20, win_ret=0.01)
+        raw = compute_gate_metrics(trips, t0=_T0, apply_haircut=False)
+        adj = compute_gate_metrics(
+            trips, t0=_T0, apply_haircut=True, shadow_log=tmp_path / "absent.jsonl"
+        )
+        assert adj.n == raw.n == 20, f"trips must not vanish; raw.n={raw.n} adj.n={adj.n}"
+        assert adj.sharpe <= raw.sharpe + 1e-12, (
+            f"a non-finite penalty must NOT inflate the adjusted return; "
+            f"raw={raw.sharpe} adj={adj.sharpe}"
+        )

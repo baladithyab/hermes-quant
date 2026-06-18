@@ -30,18 +30,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # The flags that MUST be armed for a clean window to be meaningful (ADR-0099 GATE-0 +
-# the safety-rails runbook). PER_POSITION_STOP + TAKE_PROFIT_SWEEP + the slippage
-# haircut are the ones this session added; the rest are the pre-existing rails.
+# the safety-rails runbook). PER_POSITION_STOP + the slippage haircut are the ones this
+# session added; the rest are the pre-existing rails.
+#
+# d83b: SLIPPAGE_HAIRCUT is REQUIRED (was merely recommended). The clean-window
+# evidence is supposed to be live-realistic (ADR-0097): compute_gate_metrics now
+# applies the haircut behind this flag, and the GATE-1/2/3 promotion unlock reads
+# that evidence. A clean window measured with the haircut DISARMED produces
+# paper-optimistic evidence that LIVE would not reproduce — a dishonest-evidence
+# fail-open — so GATE-0 must REFUSE to stamp t0 unless it is armed (or --force).
 _REQUIRED_ARMED = [
     "HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE",
     "HERMES_QUANT_PER_POSITION_STOP",
     "HERMES_QUANT_DELTA_NORMALIZER",
     "HERMES_QUANT_ACCOUNT_LOCK",
+    "HERMES_QUANT_SLIPPAGE_HAIRCUT",
 ]
 # Recommended-but-not-blocking (warn if absent).
 _RECOMMENDED = [
     "HERMES_QUANT_TAKE_PROFIT_SWEEP",
-    "HERMES_QUANT_SLIPPAGE_HAIRCUT",
     "HERMES_QUANT_POST_LOSS_COOLDOWN",
     "HERMES_QUANT_PAPER_SLIPPAGE_MODEL",
 ]

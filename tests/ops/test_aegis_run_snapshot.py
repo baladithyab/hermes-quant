@@ -123,6 +123,32 @@ def test_run_card_no_drift_when_env_matches_window(tmp_path, monkeypatch):
     assert "rail_drift" not in card
 
 
+# --------------------------------------------------------------------------- #
+# d83b — the ADR-0097 slippage-haircut rail must be tracked in _RAIL_FLAGS so
+# the run-card's drift detection covers a mid-window disarm of the haircut.
+# --------------------------------------------------------------------------- #
+def test_slippage_haircut_tracked_in_rail_flags():
+    """RED before d83b: _RAIL_FLAGS omitted SLIPPAGE_HAIRCUT, so a run-card review
+    could not detect drift/disarm of the haircut rail while the snapshot still
+    called the record honest/forward-only."""
+    assert "HERMES_QUANT_SLIPPAGE_HAIRCUT" in H._RAIL_FLAGS, (
+        "the haircut rail must be tracked so its drift/disarm is detectable"
+    )
+
+
+def test_run_card_detects_haircut_rail_drift(tmp_path, monkeypatch):
+    """A haircut rail armed at t0 but DISARMED live -> rail_drift names it.
+    RED before d83b: SLIPPAGE_HAIRCUT was not in _RAIL_FLAGS, so the drift dict
+    (built only over _RAIL_FLAGS) never reported a haircut disarm."""
+    home = tmp_path / "quant"
+    _write_anchor(home, {"HERMES_QUANT_SLIPPAGE_HAIRCUT": "1"})
+    monkeypatch.delenv("HERMES_QUANT_SLIPPAGE_HAIRCUT", raising=False)  # disarmed live!
+    card = H.write_run_card(tmp_path / "run", home=home)
+    assert "rail_drift" in card
+    assert "HERMES_QUANT_SLIPPAGE_HAIRCUT" in card["rail_drift"]
+    assert card["rail_drift"]["HERMES_QUANT_SLIPPAGE_HAIRCUT"] == {"window": "1", "live": None}
+
+
 def test_main_appends_perf_line(tmp_path):
     home = tmp_path / "quant"
     home.mkdir()

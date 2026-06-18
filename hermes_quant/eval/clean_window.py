@@ -54,6 +54,17 @@ from hermes_quant.evaluation.validation import (
     _to_array,
 )
 
+# ADR-0097 slippage haircut: the conservative live-vs-paper execution penalty.
+# Imported at module level so the b61c haircut seam (compute_gate_metrics's
+# apply_haircut path) reuses the canonical estimator AND so tests can monkeypatch
+# ``clean_window.estimate_live_penalty``. DEFAULT-OFF: only consulted when the
+# caller passes apply_haircut=True (wired from HERMES_QUANT_SLIPPAGE_HAIRCUT).
+from hermes_quant.risk.slippage_haircut import (
+    SHADOW_DIVERGENCE_PATH,
+    _DEFAULT_PRIOR,
+    estimate_live_penalty,
+)
+
 # ---------------------------------------------------------------------------
 # Wilson lower bound (closed-form, no scipy).
 # Reuse the implementation from rule_mining but duplicate the tiny helper here
@@ -271,6 +282,68 @@ class GateMetrics:
 
 
 # ---------------------------------------------------------------------------
+# b61c — ADR-0097 haircut-adjusted ('live_realistic') return series
+# ---------------------------------------------------------------------------
+def _trip_asset_class(rt: RoundTrip) -> str:
+    """The asset_class key for the per-trip live-execution penalty.
+
+    RoundTrip carries only ``is_options`` (the harness contract). Options trips
+    are priced with the larger ``us_option`` prior; everything else is treated as
+    ``equity`` (the conservative single-name default). This is intentionally
+    coarse — the penalty is a CONSERVATIVE prior, not a precise per-instrument cost.
+    """
+    return "us_option" if rt.is_options else "equity"
+
+
+def _haircut_adjusted_returns(
+    filtered: list[RoundTrip],
+    *,
+    shadow_log: Path,
+    warnings: list[str],
+) -> list[float]:
+    """Return the ADR-0097 'live_realistic' adjusted return for each filtered trip.
+
+    adjusted = raw_realized_return - penalty, where ``penalty`` is the conservative
+    per-asset-class live-vs-paper cost from ``estimate_live_penalty`` (estimated ONCE
+    per asset_class and reused). The penalty is ALWAYS a positive cost, so the
+    adjustment moves the return TOWARD zero/loss and NEVER improves it
+    (haircut-toward-silence).
+
+    FAIL-CLOSED finite-guard: a non-finite penalty (NaN/inf — which should never
+    come out of the contractually-finite estimator, but might if it is patched /
+    drifts) must NOT become a free pass. It falls back to the conservative
+    ``_DEFAULT_PRIOR`` floor (a positive cost), so the adjusted return is
+    raw-minus-floor — never raw-unchanged-or-better.
+    """
+    # Estimate the penalty once per asset_class (mixed-class series reuse).
+    penalty_by_ac: dict[str, float] = {}
+    for rt in filtered:
+        ac = _trip_asset_class(rt)
+        if ac in penalty_by_ac:
+            continue
+        est = estimate_live_penalty(ac, shadow_log=shadow_log)
+        pen = est.penalty_frac
+        if not math.isfinite(pen):
+            # A non-finite penalty must not improve the return: clamp to the
+            # conservative positive floor (never 0). This is the ar08 NaN-defeats-
+            # every-guard family applied to the haircut input.
+            warnings.append(
+                f"Non-finite live-execution penalty for asset_class={ac!r} "
+                f"(penalty_frac={pen!r}); using conservative floor {_DEFAULT_PRIOR}."
+            )
+            pen = _DEFAULT_PRIOR
+        # The penalty is a one-way COST: take its magnitude so a (defensive)
+        # negative value can never improve a return.
+        penalty_by_ac[ac] = abs(pen)
+
+    adjusted: list[float] = []
+    for rt in filtered:
+        cost = penalty_by_ac[_trip_asset_class(rt)]
+        adjusted.append(rt.realized_return - cost)
+    return adjusted
+
+
+# ---------------------------------------------------------------------------
 # compute_gate_metrics
 # ---------------------------------------------------------------------------
 def compute_gate_metrics(
@@ -281,6 +354,8 @@ def compute_gate_metrics(
     bars_per_year: float = 252.0,
     n_resamples: int = _N_RESAMPLES,
     seed: int = _BOOTSTRAP_SEED,
+    apply_haircut: bool = False,
+    shadow_log: Path | None = None,
 ) -> GateMetrics:
     """Compute the ADR-0099 gate metrics over post-t0 settled round-trips.
 
@@ -290,6 +365,19 @@ def compute_gate_metrics(
     Finite-guard: non-finite realized_return is treated as missing and excluded.
     Thin/empty samples return a GateMetrics with all metrics NaN; every gate
     will then fail-CLOSED because NaN is not >= any threshold.
+
+    b61c (ADR-0097 dishonest-evidence fail-open): by DEFAULT the metrics are
+    computed on the RAW paper ``realized_return`` series — but Alpaca PAPER fills
+    optimistically, so a paper-optimistic window can clear a promotion gate that
+    LIVE would not. When ``apply_haircut=True`` (the caller wires this from
+    ``HERMES_QUANT_SLIPPAGE_HAIRCUT`` via ``slippage_haircut.haircut_enabled()``),
+    each trip's return is replaced by a 'live_realistic' adjusted return =
+    ``raw_return - penalty`` where the per-asset-class penalty is the conservative
+    ``estimate_live_penalty`` cost. The penalty is ALWAYS a positive cost, so the
+    adjustment moves the return TOWARD zero/loss, NEVER improves it (haircut-toward-
+    silence). A non-finite penalty fails toward the conservative ``_DEFAULT_PRIOR``
+    floor (never 0 — a NaN penalty must not become a free pass). ``apply_haircut=False``
+    is BYTE-IDENTICAL to the pre-b61c raw computation.
 
     Args:
         round_trips: List of RoundTrip objects (may include pre-t0 entries —
@@ -303,6 +391,12 @@ def compute_gate_metrics(
         bars_per_year: Annualization factor for Sharpe (default 252 daily).
         n_resamples: Bootstrap resample count (default 9999).
         seed: RNG seed for reproducibility (default 42).
+        apply_haircut: When True, compute metrics on the ADR-0097 haircut-adjusted
+                       ('live_realistic') return series instead of the raw paper
+                       series. Default False => byte-identical raw metrics.
+        shadow_log: Override the shadow-divergence log path the per-asset-class
+                    ``estimate_live_penalty`` reads (testing). Only used when
+                    apply_haircut=True; defaults to the canonical SHADOW path.
 
     Returns:
         GateMetrics with all fields populated (NaN when undetermined).
@@ -353,7 +447,14 @@ def compute_gate_metrics(
     # Sort chronologically (required for drawdown + consecutive-loss calculations)
     filtered.sort(key=lambda rt: rt.asof_exit)
 
-    returns = np.array([rt.realized_return for rt in filtered], dtype=float)
+    # --- b61c: build the metric return series (raw, or ADR-0097 haircut-adjusted) ---
+    if apply_haircut:
+        adjusted = _haircut_adjusted_returns(
+            filtered, shadow_log=shadow_log or SHADOW_DIVERGENCE_PATH, warnings=metrics.warnings
+        )
+        returns = np.array(adjusted, dtype=float)
+    else:
+        returns = np.array([rt.realized_return for rt in filtered], dtype=float)
 
     # --- N_options ---
     metrics.n_options = sum(1 for rt in filtered if rt.is_options)
