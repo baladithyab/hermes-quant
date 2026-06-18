@@ -58,7 +58,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
-StrategyKind = Literal["covered_call", "cash_secured_put", "wheel", "bull_put_spread"]
+StrategyKind = Literal["covered_call", "cash_secured_put", "wheel", "bull_put_spread", "bear_call_spread"]
 
 # ADR-0098 Step 2: the first defined-risk credit vertical (bull put spread).
 # Flag guards the selection seam; the producer itself is always importable (pure).
@@ -236,6 +236,45 @@ def _pick_long_put(
         )
     # Highest qualifying strike = narrowest valid width (income-maximizing, still defined-risk).
     return max(candidates, key=lambda s: (float(parse_occ(s.symbol).strike), s.dte, s.symbol))
+
+
+def _pick_long_call(
+    snaps: list[OptionSnapshot],
+    *,
+    short: OptionSnapshot,
+    min_width_pct: float = 0.01,
+) -> OptionSnapshot:
+    """Pick the further-OTM (higher-strike) call that protects the short call.
+
+    Requirements:
+      * Same expiry (same DTE window, already filtered by _eligible_snapshots).
+      * Strike STRICTLY GREATER THAN the short strike (so width = long_K - short_K > 0).
+      * ``min_width_pct`` of the short strike (floor a degenerate near-zero spread).
+    Picks the LOWEST eligible strike above the short strike (narrowest spread that
+    is still a meaningful width). Ties broken by the existing deterministic ordering
+    (dte, strike, symbol). Raises RecipeBuildError when no eligible long call exists.
+    """
+    from hermes_quant.options.occ import parse_occ
+
+    short_strike = float(parse_occ(short.symbol).strike)
+    short_expiry = parse_occ(short.symbol).expiry
+    min_width = short_strike * min_width_pct
+
+    candidates = [
+        s for s in snaps
+        if (
+            parse_occ(s.symbol).expiry == short_expiry
+            and float(parse_occ(s.symbol).strike) > short_strike
+            and (float(parse_occ(s.symbol).strike) - short_strike) >= min_width
+        )
+    ]
+    if not candidates:
+        raise RecipeBuildError(
+            f"no eligible long-call strike above short {short_strike:.2f} "
+            f"(min_width={min_width:.2f}) for a bear-call-spread protection leg"
+        )
+    # Lowest qualifying strike = narrowest valid width (income-maximizing, still defined-risk).
+    return min(candidates, key=lambda s: (float(parse_occ(s.symbol).strike), s.dte, s.symbol))
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +655,198 @@ def build_bull_put_spread_proposal(
         breakeven_underlying=(Decimal(str(short_strike - max(net_credit, 0.0))),),
         rationale=(
             f"bull_put_spread on {symbol.upper()} @ short K={short_strike} / "
+            f"long K={long_strike} dte={min_dte} "
+            f"|delta|~{abs(short.greeks.delta or 0.0):.2f}; "
+            f"width={width:.2f} net_credit={net_credit:.4f}/share "
+            f"max_loss={max_loss_per_contract:.2f}/contract; "
+            f"gate bucket {gate_result.bucket.value}, {contracts} contract(s)"
+        ),
+        source_recipe_id=source_recipe_id,
+    )
+    return MultiLegBuildResult(
+        admitted=True,
+        proposal=proposal,
+        bucket=gate_result.bucket,
+        reason=None,
+        contracts=contracts,
+    )
+
+
+def build_bear_call_spread_proposal(
+    *,
+    symbol: str,
+    asof: datetime,
+    chain: OptionChain | None = None,
+    reader: ChainSnapshotReader | None = None,
+    nav: float,
+    options_buying_power: float,
+    total_bpr: float = 0.0,
+    portfolio_net_greeks=None,  # noqa: ANN001 — NetGreeks; default zero below
+    open_strategies_on_underlying: int = 0,
+    cfg: OptionsRiskConfig | None = None,
+    target_delta: float = _DEFAULT_TARGET_DELTA,
+    dte_min: int = _DEFAULT_DTE_MIN,
+    dte_max: int = _DEFAULT_DTE_MAX,
+    source_recipe_id: str = "options.recipes.build_bear_call_spread_proposal",
+    proposal_id: str | None = None,
+    event_risk: Mapping | None = None,
+) -> MultiLegBuildResult:
+    """Build + gate (NOT persist) a BEAR CALL SPREAD (ADR-0098 Step 3).
+
+    A bear call spread = SELL 1 OTM call (short, ~0.20-0.30 delta) + BUY 1 further-OTM
+    call (long protection leg, position_intent='buy_to_open') at a HIGHER strike on the
+    SAME expiry. The long leg caps the loss at (long_K - short_K - net_credit)*100 per
+    contract, making max_loss FINITE and DEFINED.
+
+    This is the call-side mirror of the bull put spread (ADR-0098 Step 2). Together they
+    form both wings of an iron condor.
+
+    DEFAULT-OFF: this function is always callable (for tests), but the CALLER in the
+    strategy-selection table gates entry via HERMES_QUANT_VERTICAL_SPREADS=1 (see
+    structure_select.py). The gate itself (options_gate) further requires
+    HERMES_QUANT_OPTIONS_GATE=1. Without the latter, this raises OptionsGateDisabled.
+
+    Returns a MultiLegBuildResult with:
+      * admitted=True, proposal=<minted via from_gate_result> on gate ADMIT.
+      * admitted=False, proposal=None on gate REJECT or non-finite inputs.
+    """
+    from hermes_quant.options.data import NetGreeks
+
+    cfg = cfg or OptionsRiskConfig()
+    portfolio_net_greeks = portfolio_net_greeks or NetGreeks.zero()
+
+    if chain is None:
+        if reader is None:
+            reader = ChainSnapshotReader()
+        chain = reader.replay_chain(symbol, asof)
+
+    spot = float(chain.underlying_spot)
+    if spot <= 0:
+        raise RecipeBuildError(f"non-positive underlying spot for {symbol}: {spot}")
+
+    # Select OTM calls in the DTE window.
+    snaps = _eligible_snapshots(chain, right="C", dte_min=dte_min, dte_max=dte_max)
+
+    # Short leg: ~0.20-0.30 delta OTM call (income workhorse; same selection logic as CC).
+    short = _pick_by_target_delta(snaps, target_delta=target_delta)
+    short_leg = _snapshot_to_short_leg(short)
+    short_strike = float(parse_strike(short.symbol))
+    min_dte = short.dte
+    short_mid = _finite_mid(short.mid)
+
+    # Long leg: further-OTM (higher-strike) call on the same expiry — the protection.
+    # _pick_long_call reuses the same `snaps` list (already DTE-filtered + right="C").
+    long = _pick_long_call(snaps, short=short)
+    long_leg = _snapshot_to_long_leg(long)
+    long_strike = float(parse_strike(long.symbol))
+    long_mid = _finite_mid(long.mid)
+
+    # Spread economics. Non-finite mid must fail-CLOSED (never flow into gate math).
+    # _finite_mid already coerces NaN/inf -> 0.0 for each leg. Same logic as BPS.
+    width = long_strike - short_strike  # USD per share; always > 0 by construction
+    net_credit = short_mid - long_mid   # per share (not yet x100)
+    if not math.isfinite(width) or width <= 0:
+        raise RecipeBuildError(
+            f"bear_call_spread: non-positive width={width:.4f} "
+            f"(short={short_strike}, long={long_strike})"
+        )
+
+    # max_loss = (width - net_credit) * 100 per contract. MUST be finite + positive.
+    max_loss_per_contract = (width - max(net_credit, 0.0)) * 100
+    if not math.isfinite(max_loss_per_contract) or max_loss_per_contract <= 0:
+        logger.info(
+            "options.recipes: %s bear_call_spread non-finite or zero max_loss=%s; "
+            "rejecting before gate",
+            symbol,
+            max_loss_per_contract,
+        )
+        from hermes_quant.risk.options_gate import StructureBucket
+        return MultiLegBuildResult(
+            admitted=False,
+            proposal=None,
+            bucket=StructureBucket.DEFINED_RISK,
+            reason="bear_call_spread_max_loss_not_finite_or_nonpositive",
+            contracts=0,
+        )
+
+    premium_received = max(net_credit, 0.0) * 100.0   # per contract (credit spread)
+    premium_paid = max(-net_credit, 0.0) * 100.0      # 0 for a net-credit spread
+
+    legs = [short_leg, long_leg]
+
+    # ADR-0084 O8 carrier (DEFAULT-OFF, additive — same pattern as BPS).
+    if os.environ.get(_EVENT_RISK_FLAG, "0") == "1":
+        gate_event_risk: Mapping | None = event_risk
+        gate_decision_asof: datetime | None = asof
+    else:
+        gate_event_risk = None
+        gate_decision_asof = None
+
+    gate_result = options_gate(
+        legs,
+        strategy_kind="bear_call_spread",
+        underlying=symbol.upper(),
+        spot=spot,
+        nav=nav,
+        held_shares=0,
+        options_buying_power=options_buying_power,
+        premium_received=premium_received,
+        portfolio_net_greeks=portfolio_net_greeks,
+        total_bpr=total_bpr,
+        cfg=cfg,
+        composite_intent=None,
+        strike=short_strike,
+        width=width,
+        net_credit=max(net_credit, 0.0),
+        net_debit=max(-net_credit, 0.0),
+        premium_paid=premium_paid,
+        basis_per_share=None,
+        min_dte=min_dte,
+        open_strategies_on_underlying=open_strategies_on_underlying,
+        event_risk=gate_event_risk,
+        decision_asof=gate_decision_asof,
+    )
+
+    if not gate_result.admitted:
+        logger.info(
+            "options.recipes: %s bear_call_spread gate-rejected: %s",
+            symbol,
+            gate_result.reason,
+        )
+        return MultiLegBuildResult(
+            admitted=False,
+            proposal=None,
+            bucket=gate_result.bucket,
+            reason=gate_result.reason,
+            contracts=gate_result.contracts,
+        )
+
+    contracts = max(int(gate_result.contracts), 1)
+
+    # Net price: credit received (short_mid - long_mid) per share * 100 * contracts.
+    # Stored as NEGATIVE Decimal (credit received convention, matching BPS/CC/CSP).
+    net_credit_per_contract = Decimal(str(short_mid)) * 100 - Decimal(str(long_mid)) * 100
+    net_debit_credit = (-net_credit_per_contract * Decimal(contracts)).quantize(
+        Decimal("0.01")
+    )
+
+    if proposal_id is None:
+        proposal_id = _mint_proposal_id(symbol, asof)
+
+    proposal = MultiLegProposal.from_gate_result(
+        gate_result=gate_result,
+        proposal_id=proposal_id,
+        asof=asof,
+        strategy_kind="bear_call_spread",
+        underlying=symbol.upper(),
+        option_legs=(short_leg, long_leg),
+        stock_leg=None,
+        outer_qty=contracts,
+        net_debit_credit=net_debit_credit,
+        max_gain=Decimal(str(round(premium_received * contracts, 2))),
+        breakeven_underlying=(Decimal(str(short_strike + max(net_credit, 0.0))),),
+        rationale=(
+            f"bear_call_spread on {symbol.upper()} @ short K={short_strike} / "
             f"long K={long_strike} dte={min_dte} "
             f"|delta|~{abs(short.greeks.delta or 0.0):.2f}; "
             f"width={width:.2f} net_credit={net_credit:.4f}/share "

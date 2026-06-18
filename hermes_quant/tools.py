@@ -365,12 +365,12 @@ def _json_safe_float(value: Any) -> float | str:
 # ---------------------------------------------------------------------------
 
 
-_MULTI_LEG_STRATEGIES = {"covered_call", "cash_secured_put", "wheel", "bull_put_spread"}
+_MULTI_LEG_STRATEGIES = {"covered_call", "cash_secured_put", "wheel", "bull_put_spread", "bear_call_spread"}
 
-# ADR-0098 Step 2 (bull_put_spread): defined-risk credit vertical strategies.
-# Gated by HERMES_QUANT_VERTICAL_SPREADS=1 in the selection seam; the producer
-# and tools path accept them when HERMES_QUANT_OPTIONS_GATE=1 (the universal gate).
-_VERTICAL_SPREAD_STRATEGIES = {"bull_put_spread"}
+# ADR-0098 Steps 2-3 (bull_put_spread / bear_call_spread): defined-risk credit vertical
+# strategies. Gated by HERMES_QUANT_VERTICAL_SPREADS=1 in the selection seam; the
+# producer and tools path accept them when HERMES_QUANT_OPTIONS_GATE=1 (the universal gate).
+_VERTICAL_SPREAD_STRATEGIES = {"bull_put_spread", "bear_call_spread"}
 
 
 def _maybe_propose_multi_leg(symbol: str, args: dict) -> str | None:
@@ -475,13 +475,22 @@ def _maybe_propose_multi_leg(symbol: str, args: dict) -> str | None:
 
     store = get_default_store()
     try:
-        if strategy_kind == "bull_put_spread":
-            # ADR-0098 Step 2: route to the dedicated defined-risk credit vertical
-            # producer instead of the CC/CSP/wheel build_and_persist path. The
-            # producer already requires HERMES_QUANT_OPTIONS_GATE=1 (via options_gate).
+        if strategy_kind in ("bull_put_spread", "bear_call_spread"):
+            # ADR-0098 Steps 2-3: route to the dedicated defined-risk credit vertical
+            # producers instead of the CC/CSP/wheel build_and_persist path. The
+            # producers already require HERMES_QUANT_OPTIONS_GATE=1 (via options_gate).
             # We build + persist manually here (same pattern as build_and_persist_multi_leg).
-            from hermes_quant.options.recipes import _default_advisor_result, _result_to_gate
-            bps_result = build_bull_put_spread_proposal(
+            from hermes_quant.options.recipes import (
+                _default_advisor_result,
+                _result_to_gate,
+                build_bear_call_spread_proposal,
+            )
+            _build_fn = (
+                build_bull_put_spread_proposal
+                if strategy_kind == "bull_put_spread"
+                else build_bear_call_spread_proposal
+            )
+            bps_result = _build_fn(
                 symbol=symbol,
                 asof=asof,
                 nav=nav,

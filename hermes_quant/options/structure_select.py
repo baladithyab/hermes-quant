@@ -11,7 +11,7 @@ no network, no I/O). It maps
 
 where ``StrategyKind`` is *exactly* the producer's buildable set
 (``options/recipes.py`` ``StrategyKind`` ≡ ``tools._MULTI_LEG_STRATEGIES`` =
-``{covered_call, cash_secured_put, wheel, bull_put_spread}``) and ``None`` means
+``{covered_call, cash_secured_put, wheel, bull_put_spread, bear_call_spread}``) and ``None`` means
 **abstain** (silence-by-default → today's equity path).
 
 What this module is NOT (the rails, ADR-0082 §"Rails preserved"):
@@ -22,8 +22,8 @@ What this module is NOT (the rails, ADR-0082 §"Rails preserved"):
     there. The table only narrows the *candidate* ``StrategyKind``; the gate decides
     what (if anything) trades.
   * NOT naked-capable — it only ever emits gate-admissible, collateral-secured /
-    defined-risk-income buckets (CC / CSP / wheel / bull_put_spread). Anything
-    outside that set (condors, calendars, straddles, naked shorts) is **not
+    defined-risk-income buckets (CC / CSP / wheel / bull_put_spread / bear_call_spread).
+    Anything outside that set (condors, calendars, straddles, naked shorts) is **not
     producible** by the existing producers and therefore resolves to ``None``
     (abstain), never to a structure the producer cannot honestly build.
   * NOT default-on — the selection seam is behind ``HERMES_QUANT_STRUCTURE_SELECT=1``.
@@ -222,6 +222,14 @@ _STRUCTURE_TABLE: dict[tuple[Direction, str, IVRegime], str] = {
     # gate can be eval-toggled without editing the table.
     (Direction.BULLISH, "defined_risk_credit", IVRegime.MID): "bull_put_spread",
     (Direction.BULLISH, "defined_risk_credit", IVRegime.HIGH): "bull_put_spread",
+    # Bearish defined-risk credit: bear call spread — collect credit for a bearish
+    # view while capping max loss via the long call protection leg. Only MID/HIGH IV
+    # (thin premium at LOW IV makes the spread uneconomical). The call-side mirror of
+    # the bull put spread; together they form both iron-condor wings (ADR-0098 Step 3).
+    # NEUTRAL defined-risk-credit rows are intentionally ABSENT until a producer for
+    # iron condors (the neutral defined-risk-credit structure) exists.
+    (Direction.BEARISH, "defined_risk_credit", IVRegime.MID): "bear_call_spread",
+    (Direction.BEARISH, "defined_risk_credit", IVRegime.HIGH): "bear_call_spread",
     # DEFINED_RISK_DEBIT / LONG_PREMIUM are intentionally ABSENT for every
     # (stance, regime) because no producer for them exists yet; they resolve to
     # None (abstain) until a producer exists.
