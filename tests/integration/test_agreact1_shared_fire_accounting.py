@@ -46,12 +46,18 @@ class _Prop:
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("meta,fill,expect_nofill", [
     ({}, 0.05, False),                                  # a real fill
-    ({"silenced": True}, 0.0, True),                    # PaperReactor cap-clip
-    ({"no_fill": True}, 0.0, True),                     # DeterministicEquity no-fill
-    ({"bp_rejected": True}, 0.0, True),                 # BP refusal
-    ({"unfilled_timeout": True}, 0.0, True),            # broker timeout
     ({}, 0.0, True),                                    # zero fill (no capital moved)
     ({}, None, True),                                   # None fill (cannot report -> no-fill)
+    # wave4-review FIX (was vacuous): each METADATA leg must be exercised with a NON-zero
+    # fill so the realized==0.0 leg cannot mask it. A reactor that signals a silence/reject
+    # via metadata but reports a stale/partial NON-zero fill_size_pct (partial-then-reject)
+    # MUST still be caught as a no-fill — the safety-critical phantom-fire guard. RED-proven:
+    # deleting the four metadata legs makes EACH of these fail (the realized leg sees 0.05/-0.03).
+    ({"silenced": True}, 0.05, True),                   # PaperReactor cap-clip, stale fill
+    ({"no_fill": True}, 0.05, True),                    # DeterministicEquity no-fill, stale fill
+    ({"bp_rejected": True}, 0.05, True),                # BP refusal, stale fill
+    ({"unfilled_timeout": True}, 0.05, True),           # broker timeout, stale fill
+    ({"silenced": True}, -0.03, True),                  # metadata wins even on a non-zero short
 ])
 def test_reactor_record_nofill_union(meta, fill, expect_nofill):
     rec = _record(reactor_metadata=meta, fill_size_pct=fill)
