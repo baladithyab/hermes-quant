@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**78 flags** (resolvable default).
+**80 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -31,6 +31,7 @@
 | `HERMES_QUANT_ESTIMATES_ANALYST` | `0` | `hermes_quant/analysts/estimates.py:81` |
 | `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1334` |
 | `HERMES_QUANT_EVIDENCE_DIR` | `` | `hermes_quant/evidence/store.py:60` |
+| `HERMES_QUANT_FRED_MACRO` | `0` | `hermes_quant/data/fred_macro.py:146` |
 | `HERMES_QUANT_FUNDAMENTALS_ENABLED` | `0` | `hermes_quant/advisor.py:395` |
 | `HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG` | `1` | `hermes_quant/data/fundamentals_provider.py:146` |
 | `HERMES_QUANT_GRAPH_MINING` | `0` | `hermes_quant/catalyst/graph_mining.py:158` |
@@ -39,6 +40,7 @@
 | `HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD` | `0.85` | `hermes_quant/research/hypothesis_novelty.py:57` |
 | `HERMES_QUANT_IC_DEDUP_AT_INGEST` | `` | `hermes_quant/factors/alpha_zoo.py:333` |
 | `HERMES_QUANT_IC_DEDUP_THRESHOLD` | `0.99` | `hermes_quant/factors/ic_dedup.py:75` |
+| `HERMES_QUANT_INSIDER_ANALYST` | `0` | `hermes_quant/analysts/insider.py:98` |
 | `HERMES_QUANT_INSIDER_ENABLED` | `0` | `hermes_quant/evidence/adapters/form4.py:93` |
 | `HERMES_QUANT_JOURNAL_PATH` | `` | `hermes_quant/journal/writer.py:33` |
 | `HERMES_QUANT_KNOWLEDGE_CUTOFF` | `` | `hermes_quant/eval/stockbench.py:47` |
@@ -49,7 +51,7 @@
 | `HERMES_QUANT_MEMORY_SPLIT` | `0` | `hermes_quant/aggregators/llm_committee.py:333` |
 | `HERMES_QUANT_MONTHLY_META_RETRO` | `0` | `hermes_quant/memory/meta_retro.py:70` |
 | `HERMES_QUANT_MULTILEG_REACTOR` | `0` | `hermes_quant/react/mleg_fill.py:116` |
-| `HERMES_QUANT_OPENBB` | `0` | `hermes_quant/data/openbb_fundamentals.py:139` |
+| `HERMES_QUANT_OPENBB` | `0` | `hermes_quant/catalyst/openbb_news.py:56` |
 | `HERMES_QUANT_OPEN_GUARD` | `1` | `hermes_quant/risk/open_guard.py:304` |
 | `HERMES_QUANT_OPTIONS_GATE` | `0` | `hermes_quant/risk/options_gate.py:529` |
 | `HERMES_QUANT_OPTIONS_LIVE_CHAIN` | `0` | `hermes_quant/options/data.py:427` |
