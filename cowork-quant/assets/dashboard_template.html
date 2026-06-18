@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<!--
+  cowork-quant dashboard template (B-07).
+
+  SELF-CONTAINED: inline CSS + JS only. No external resources, no fetch,
+  no CDN. The /dashboard command replaces the placeholder on the
+  `const DATA` line below with a single JSON object, then writes the
+  result to <workspace>/quant-state/dashboard.html.
+
+  DATA schema (every field the JS reads; all fields optional unless noted —
+  missing/null sections render as "no data yet"):
+
+  {
+    "generated_at": "2026-06-10T14:00:00+00:00",  // ISO UTC; used as "now" for ages
+    "risk_profile": "standard",                    // from status.risk_profile
+    "nav": 100000.0,                               // status.portfolio.nav
+    "peak_nav": 101000.0,                          // status.portfolio.peak_nav
+    "drawdown_pct": 0.0099,                        // fraction 0..1; if omitted, computed as (peak_nav-nav)/peak_nav
+    "halted": false,                               // status.portfolio.halted (REQUIRED boolean)
+    "halt_reason": null,                           // status.portfolio.halt_reason
+    "halt_until": null,                            // ISO string or null
+    "ledger_integrity": {"ok": true, "detail": "ok"},  // status.ledger_integrity
+    "marks": [                                     // chronological `mark` events from ledger.jsonl
+      {"ts": "2026-06-09T20:00:00+00:00", "nav": 100250.0}
+    ],
+    "positions": [                                 // status.portfolio.positions
+      {"asset": "AAPL", "position_pct": 0.10, "avg_price": 201.50,
+       "opened_at": "2026-06-08T15:30:00+00:00"}
+    ],
+    "pending_proposals": [                         // status.pending_proposals (flattened)
+      {"proposal_id": "abc123def4567890", "asset": "MSFT", "direction": 1,
+       "target_position_pct": 0.05, "created_at": "2026-06-10T13:00:00+00:00",
+       "gate_reason": "edge 32bps clears costs; 2-analyst agreement"}
+    ],
+    "settles": [                                   // `settle` events from ledger.jsonl
+      {"ts": "2026-06-09T20:01:00+00:00", "asset": "NVDA", "horizon": "5d",
+       "entry_price": 120.0, "exit_price": 124.8, "realized_return": 0.04,
+       "direction_correct": true}
+    ],
+    "calibration": {                               // status.calibration, per analyst
+      "trend-follower": {"n": 14, "ece": 0.082}    // ece may be null
+    },
+    "hypotheses": {                                // `hyp summary` output, or null
+      "overall": {"mean_brier": 0.21, "count": 6}  // mean_brier null when nothing resolved
+    },
+    "regime": {"label": "risk-on", "evidence": "..."},  // regime CLI read, or null
+    "events": [                                    // `events --window-days 7` output
+      {"kind": "fomc", "impact": "high", "scheduled_for": "2026-06-17T18:00:00+00:00"}
+    ]
+  }
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>quant-state dashboard</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --panel: #ffffff;
+    --ink: #1a1a1a;
+    --muted: #6b7280;
+    --border: #e2e2e2;
+    --pos: #16803c;
+    --neg: #c0312b;
+    --halt-bg: #c0312b;
+    --halt-ink: #ffffff;
+    --badge-ok-bg: #e3f4e8;
+    --badge-ok-ink: #16803c;
+    --badge-bad-bg: #fbe4e3;
+    --badge-bad-ink: #c0312b;
+    --spark: #3b6fb5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131417;
+      --panel: #1c1e22;
+      --ink: #e6e6e6;
+      --muted: #9aa1ab;
+      --border: #2e3137;
+      --pos: #4cc473;
+      --neg: #f0655e;
+      --halt-bg: #8f1f1a;
+      --halt-ink: #ffe9e8;
+      --badge-ok-bg: #173524;
+      --badge-ok-ink: #4cc473;
+      --badge-bad-bg: #3c1715;
+      --badge-bad-ink: #f0655e;
+      --spark: #6fa3e0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: var(--bg); color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .num { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-variant-numeric: tabular-nums; }
+  .pos { color: var(--pos); }
+  .neg { color: var(--neg); }
+  .muted { color: var(--muted); }
+  .banner {
+    background: var(--halt-bg); color: var(--halt-ink);
+    border-radius: 8px; padding: 12px 16px; margin: 0 0 16px;
+    font-weight: 700;
+  }
+  .banner .sub { font-weight: 400; opacity: 0.9; }
+  header.top {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px;
+    margin-bottom: 4px;
+  }
+  .badge {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600;
+  }
+  .badge.ok { background: var(--badge-ok-bg); color: var(--badge-ok-ink); }
+  .badge.bad { background: var(--badge-bad-bg); color: var(--badge-bad-ink); }
+  .kpis { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+  .kpi {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 16px; min-width: 150px;
+  }
+  .kpi .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .kpi .value { font-size: 20px; font-weight: 650; }
+  section.card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px; margin: 0 0 14px;
+  }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--border); }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  td.r, th.r { text-align: right; }
+  .empty { color: var(--muted); font-style: italic; padding: 4px 0; }
+  .footline { margin-top: 8px; font-size: 13px; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 18px; }
+  svg.spark { display: block; width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="integrity-banner"></div>
+  <div id="halt-banner"></div>
+
+  <header class="top">
+    <h1>quant-state dashboard</h1>
+    <span id="integrity-badge"></span>
+    <span id="profile" class="muted"></span>
+  </header>
+  <div id="generated" class="muted" style="font-size:12px;"></div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <section class="card">
+    <h2>NAV over marks</h2>
+    <div id="sparkline"></div>
+  </section>
+
+  <section class="card">
+    <h2>Open positions</h2>
+    <div id="positions"></div>
+  </section>
+
+  <section class="card">
+    <h2>Pending proposals</h2>
+    <div id="proposals"></div>
+  </section>
+
+  <section class="card">
+    <h2>Settled outcomes</h2>
+    <div id="settles"></div>
+  </section>
+
+  <section class="card">
+    <h2>Calibration</h2>
+    <div id="calibration"></div>
+  </section>
+
+  <section class="card">
+    <h2>Regime &amp; upcoming events</h2>
+    <div id="regime"></div>
+  </section>
+
+  <footer>
+    Paper trading only. Rendered from the quantcore ledger — read-only snapshot;
+    nothing here was written back to state.
+  </footer>
+</div>
+
+<script>
+"use strict";
+const DATA = /*__DATA__*/null;
+
+(function () {
+  var d = (DATA && typeof DATA === "object") ? DATA : {};
+
+  // ---- helpers -------------------------------------------------------------
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+  function isNum(x) { return typeof x === "number" && isFinite(x); }
+  function fmtMoney(x) {
+    if (!isNum(x)) return "—";
+    return x.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  function fmtPct(x, dp) {
+    if (!isNum(x)) return "—";
+    return (x * 100).toFixed(dp == null ? 2 : dp) + "%";
+  }
+  function signClass(x) { return !isNum(x) || x === 0 ? "" : (x > 0 ? "pos" : "neg"); }
+  var nowMs = (function () {
+    var t = d.generated_at ? Date.parse(d.generated_at) : NaN;
+    return isFinite(t) ? t : Date.now();
+  })();
+  function age(iso) {
+    if (!iso) return "—";
+    var t = Date.parse(iso);
+    if (!isFinite(t)) return "—";
+    var s = Math.max(0, (nowMs - t) / 1000);
+    if (s < 3600) return Math.round(s / 60) + "m";
+    if (s < 86400) return (s / 3600).toFixed(1) + "h";
+    return (s / 86400).toFixed(1) + "d";
+  }
+  function empty(el, msg) { el.innerHTML = '<div class="empty">' + esc(msg || "no data yet") + "</div>"; }
+  function arr(x) { return Array.isArray(x) ? x : []; }
+
+  // ---- banners + header ----------------------------------------------------
+  var integ = (d.ledger_integrity && typeof d.ledger_integrity === "object") ? d.ledger_integrity : null;
+  if (integ && integ.ok === false) {
+    $("integrity-banner").innerHTML =
+      '<div class="banner">LEDGER INTEGRITY FAILED — do not trust these numbers. ' +
+      '<span class="sub">' + esc(integ.detail || "") + " — inspect quant-state/ledger.jsonl.</span></div>";
+  }
+  if (d.halted === true) {
+    $("halt-banner").innerHTML =
+      '<div class="banner">TRADING HALTED' +
+      (d.halt_reason ? ' — <span class="sub">' + esc(d.halt_reason) + "</span>" : "") +
+      (d.halt_until ? ' <span class="sub">(until ' + esc(d.halt_until) + ")</span>" : "") +
+      "</div>";
+  }
+  if (integ) {
+    $("integrity-badge").innerHTML = integ.ok
+      ? '<span class="badge ok">ledger ok</span>'
+      : '<span class="badge bad">ledger FAILED</span>';
+  } else {
+    $("integrity-badge").innerHTML = '<span class="badge bad">integrity unknown</span>';
+  }
+  if (d.risk_profile) $("profile").textContent = "profile: " + d.risk_profile;
+  $("generated").textContent = d.generated_at ? "snapshot " + d.generated_at : "snapshot time unknown";
+
+  // ---- KPIs ----------------------------------------------------------------
+  var dd = isNum(d.drawdown_pct)
+    ? d.drawdown_pct
+    : (isNum(d.nav) && isNum(d.peak_nav) && d.peak_nav > 0
+        ? Math.max(0, (d.peak_nav - d.nav) / d.peak_nav) : null);
+  $("kpis").innerHTML =
+    '<div class="kpi"><div class="label">Paper NAV</div>' +
+    '<div class="value num">' + fmtMoney(d.nav) + "</div></div>" +
+    '<div class="kpi"><div class="label">Drawdown from peak</div>' +
+    '<div class="value num ' + (isNum(dd) && dd > 0 ? "neg" : "") + '">' +
+    (isNum(dd) ? "-" + fmtPct(dd) : "—") + "</div></div>" +
+    '<div class="kpi"><div class="label">Peak NAV</div>' +
+    '<div class="value num">' + fmtMoney(d.peak_nav) + "</div></div>";
+
+  // ---- sparkline -----------------------------------------------------------
+  (function () {
+    var el = $("sparkline");
+    var marks = arr(d.marks).filter(function (m) { return m && isNum(Number(m.nav)); });
+    if (marks.length === 0) return empty(el, "no marks yet");
+    var navs = marks.map(function (m) { return Number(m.nav); });
+    if (marks.length === 1) {
+      el.innerHTML = '<span class="num">' + fmtMoney(navs[0]) +
+        '</span> <span class="muted">(single mark — need 2+ for a line)</span>';
+      return;
+    }
+    var w = 640, h = 90, pad = 8;
+    var min = Math.min.apply(null, navs), max = Math.max.apply(null, navs);
+    var span = (max - min) || 1;
+    var pts = navs.map(function (v, i) {
+      var x = pad + i * (w - 2 * pad) / (navs.length - 1);
+      var y = h - pad - ((v - min) / span) * (h - 2 * pad);
+      return x.toFixed(1) + "," + y.toFixed(1);
+    }).join(" ");
+    el.innerHTML =
+      '<svg class="spark" viewBox="0 0 ' + w + " " + h + '" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="NAV sparkline">' +
+      '<polyline points="' + pts + '" fill="none" stroke="var(--spark)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>' +
+      "</svg>" +
+      '<div class="muted num" style="font-size:12px;">' +
+      esc(marks.length) + " marks · min " + fmtMoney(min) + " · max " + fmtMoney(max) +
+      " · last " + fmtMoney(navs[navs.length - 1]) + "</div>";
+  })();
+
+  // ---- positions -----------------------------------------------------------
+  (function () {
+    var el = $("positions");
+    var rows = arr(d.positions);
+    if (rows.length === 0) return empty(el, "flat — no open positions");
+    var html = "<table><tr><th>Asset</th><th class='r'>%NAV</th><th class='r'>Entry</th><th class='r'>Age</th></tr>";
+    rows.forEach(function (p) {
+      if (!p) return;
+      var pct = Number(p.position_pct);
+      html += "<tr><td>" + esc(p.asset) + "</td>" +
+        '<td class="r num ' + signClass(pct) + '">' + (isNum(pct) ? (pct > 0 ? "+" : "") + fmtPct(pct, 1) : "—") + "</td>" +
+        '<td class="r num">' + fmtMoney(Number(p.avg_price)) + "</td>" +
+        '<td class="r num">' + esc(age(p.opened_at)) + "</td></tr>";
+    });
+    el.innerHTML = html + "</table>";
+  })();
+
+  // ---- pending proposals -----------------------------------------------------
+  (function () {
+    var el = $("proposals");
+    var rows = arr(d.pending_proposals);
+    if (rows.length === 0) return empty(el, "queue empty — nothing awaiting approval");
+    var html = "<table><tr><th>ID</th><th>Asset</th><th>Dir</th><th class='r'>Target %NAV</th><th class='r'>Age</th><th>Gate reason</th></tr>";
+    rows.forEach(function (p) {
+      if (!p) return;
+      var dir = Number(p.direction);
+      var tgt = Number(p.target_position_pct);
+      html += '<tr><td class="num">' + esc(String(p.proposal_id || "").slice(0, 8)) + "</td>" +
+        "<td>" + esc(p.asset) + "</td>" +
+        '<td class="' + signClass(dir) + '">' + (dir > 0 ? "long" : dir < 0 ? "short" : "—") + "</td>" +
+        '<td class="r num ' + signClass(tgt) + '">' + (isNum(tgt) ? (tgt > 0 ? "+" : "") + fmtPct(tgt, 1) : "—") + "</td>" +
+        '<td class="r num">' + esc(age(p.created_at)) + "</td>" +
+        '<td class="muted">' + esc(p.gate_reason) + "</td></tr>";
+    });
+    el.innerHTML = html + "</table>";
+  })();
+
+  // ---- settles + win rate ----------------------------------------------------
+  (function () {
+    var el = $("settles");
+    var rows = arr(d.settles);
+    if (rows.length === 0) return empty(el, "no settled outcomes yet");
+    var html = "<table><tr><th>Asset</th><th>Horizon</th><th class='r'>Entry → Exit</th><th class='r'>Realized</th><th class='r'>Dir ✓</th></tr>";
+    var wins = 0, n = 0;
+    rows.forEach(function (s) {
+      if (!s) return;
+      n += 1;
+      if (s.direction_correct === true) wins += 1;
+      var rr = Number(s.realized_return);
+      html += "<tr><td>" + esc(s.asset) + "</td>" +
+        '<td class="num">' + esc(s.horizon) + "</td>" +
+        '<td class="r num">' + fmtMoney(Number(s.entry_price)) + " → " + fmtMoney(Number(s.exit_price)) + "</td>" +
+        '<td class="r num ' + signClass(rr) + '">' + (isNum(rr) ? (rr > 0 ? "+" : "") + fmtPct(rr) : "—") + "</td>" +
+        '<td class="r">' + (s.direction_correct === true ? '<span class="pos">✓</span>' : '<span class="neg">✗</span>') + "</td></tr>";
+    });
+    html += "</table>";
+    if (n > 0) {
+      html += '<div class="footline">Direction win rate: <span class="num">' +
+        wins + "/" + n + " (" + fmtPct(wins / n, 1) + ")</span>" +
+        (n < 20 ? ' <span class="muted">— small n (&lt;20 settles); not statistically meaningful yet</span>' : "") +
+        "</div>";
+    }
+    el.innerHTML = html;
+  })();
+
+  // ---- calibration + Brier ---------------------------------------------------
+  (function () {
+    var el = $("calibration");
+    var cal = (d.calibration && typeof d.calibration === "object") ? d.calibration : {};
+    var analysts = Object.keys(cal);
+    var html = "";
+    if (analysts.length === 0) {
+      html += '<div class="empty">no calibration data yet</div>';
+    } else {
+      html += "<table><tr><th>Analyst</th><th class='r'>n</th><th class='r'>ECE</th></tr>";
+      analysts.sort().forEach(function (a) {
+        var c = cal[a] || {};
+        html += "<tr><td>" + esc(a) + "</td>" +
+          '<td class="r num">' + (isNum(Number(c.n)) ? esc(c.n) : "—") + "</td>" +
+          '<td class="r num">' + (isNum(Number(c.ece)) ? Number(c.ece).toFixed(4) : "—") + "</td></tr>";
+      });
+      html += "</table>";
+    }
+    var hyp = d.hypotheses;
+    var overall = hyp && hyp.overall ? hyp.overall : null;
+    if (overall && isNum(Number(overall.mean_brier))) {
+      html += '<div class="footline">Overall Brier (hypothesis forecasts): <span class="num">' +
+        Number(overall.mean_brier).toFixed(3) + "</span>" +
+        ' <span class="muted">over ' + esc(overall.count != null ? overall.count : "?") +
+        " resolved forecast(s)</span></div>";
+    } else if (overall) {
+      html += '<div class="footline muted">No resolved hypothesis forecasts yet — Brier unavailable.</div>';
+    }
+    el.innerHTML = html;
+  })();
+
+  // ---- regime + events ---------------------------------------------------------
+  (function () {
+    var el = $("regime");
+    var html = "";
+    var r = d.regime;
+    if (r && r.label) {
+      html += '<div>Regime: <strong>' + esc(r.label) + "</strong>" +
+        (r.evidence ? ' <span class="muted">— ' +
+          esc(typeof r.evidence === "string" ? r.evidence : JSON.stringify(r.evidence)) + "</span>" : "") +
+        "</div>";
+    } else {
+      html += '<div class="muted">no regime read in this snapshot</div>';
+    }
+    var evs = arr(d.events);
+    if (evs.length > 0) {
+      html += '<ul style="margin:8px 0 0; padding-left:18px;">';
+      evs.forEach(function (e) {
+        if (!e) return;
+        html += "<li><strong>" + esc(e.kind) + "</strong>" +
+          (e.impact ? ' <span class="muted">(' + esc(e.impact) + " impact)</span>" : "") +
+          (e.scheduled_for ? ' — <span class="num">' + esc(e.scheduled_for) + "</span>" : "") +
+          "</li>";
+      });
+      html += "</ul>";
+    } else {
+      html += '<div class="muted" style="margin-top:4px;">no upcoming events in window</div>';
+    }
+    el.innerHTML = html;
+  })();
+})();
+</script>
+</body>
+</html>
