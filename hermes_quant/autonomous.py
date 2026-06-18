@@ -2341,9 +2341,29 @@ def tick(
             # per symbol per tick). Abstains (returns None) at every missing precondition.
             # Byte-identical when the flag is unset (the helper returns None on the first
             # guard, never touching the equity path). Best-effort inside the helper.
+            # bf76: the EXECUTABLE GATE-2 evidence guard. When HERMES_QUANT_OPTIONS_EVIDENCE_GATE
+            # is ON, options origination ALSO requires the persisted clean-window unlock marker
+            # (read_options_unlocked = GATE-2 cleared: N>=50 over >=60d). FAIL-CLOSED: an absent/
+            # unreadable marker => LOCKED, so arming the options flags ALONE does NOT unlock
+            # origination — the evidence gate must have actually cleared. Default-OFF for THIS
+            # guard flag => byte-identical (the guard is not consulted; the inner flags are the
+            # only gate, as today). Account-wide state, so checked once here (not per-symbol).
+            _options_evidence_ok = True
+            if os.environ.get("HERMES_QUANT_OPTIONS_EVIDENCE_GATE", "0") == "1":
+                try:
+                    from hermes_quant.eval.clean_window import read_options_unlocked
+
+                    _options_evidence_ok = read_options_unlocked()
+                except Exception as _ev_exc:  # noqa: BLE001 — fail-CLOSED: any error => locked
+                    logger.warning(
+                        "autonomous: options evidence-gate read failed (%s) — LOCKING options",
+                        _ev_exc,
+                    )
+                    _options_evidence_ok = False
             if (
                 not dry_run
                 and os.environ.get("HERMES_QUANT_AUTONOMOUS_OPTIONS", "0") == "1"
+                and _options_evidence_ok  # bf76: GATE-2 evidence guard (default-OFF => always True)
                 # agreact1: the §D9 max_per_tick_opens cap binds options origination too —
                 # check it BEFORE firing (the equity path checks the same cap below). Without
                 # this, an options play could fire past the per-tick cap because the hook runs

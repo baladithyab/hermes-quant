@@ -133,6 +133,34 @@ def _home_path(home: str | Path | None) -> Path:
     return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
 
 
+_OPTIONS_UNLOCK_FILE = "quant/options_unlock.json"
+
+
+def read_options_unlocked(home: str | Path | None = None) -> bool:
+    """bf76: read the persisted GATE-2 options-origination UNLOCK marker.
+
+    This is the EXECUTABLE live guard the autonomous tick consults before originating
+    an options play: it returns True ONLY when an evidence-gate verdict has been
+    written declaring GATE-2 cleared (N>=50 settled round-trips over >=60 calendar days
+    with the full metric suite — ADR-0099 §C). The verdict is produced by the eval cron
+    (which runs compute_gate_metrics + evaluate_gate over the settled book — too heavy to
+    recompute every tick) and persisted to ``quant/options_unlock.json`` as
+    ``{"gate2_cleared": true, "evaluated_at": "<iso>", ...}``.
+
+    FAIL-CLOSED: an absent / unreadable / malformed marker, or gate2_cleared != true,
+    returns False (LOCKED). So arming the options flags ALONE never unlocks origination —
+    the clean-window evidence gate must have actually cleared. Until the marker-writer cron
+    exists the marker is absent => options origination stays LOCKED behind the evidence
+    gate (the conservative, honest direction).
+    """
+    path = _home_path(home) / _OPTIONS_UNLOCK_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError, json.JSONDecodeError, OSError):
+        return False
+    return data.get("gate2_cleared") is True
+
+
 def read_clean_window_start(home: str | Path | None = None) -> datetime | None:
     """Read the GATE-0 t0 anchor from ``~/.hermes/quant/clean_window_start.json``.
 

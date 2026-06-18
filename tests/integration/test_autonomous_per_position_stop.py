@@ -774,3 +774,50 @@ def test_78b3_frame_iv_rank_used_without_direct_fallback(isolate_config, isolate
               advisor_recommend=lambda **kw: _ar)
     assert captured["iv"] == 72.0, f"the hook must pass the FRAME's iv_rank (72.0); got {captured['iv']}"
     assert direct_calls["n"] == 0, "the direct compute_iv_rank_asof fallback must NOT be called when the frame supplies iv_rank"
+
+
+def test_bf76_evidence_gate_locks_options_without_unlock_marker(isolate_config, isolate_quant_home, monkeypatch):
+    """bf76: with HERMES_QUANT_OPTIONS_EVIDENCE_GATE=1 and NO unlock marker, options
+    origination is LOCKED (the helper is never called) even though AUTONOMOUS_OPTIONS is on.
+    RED-proof: before bf76 the inner flags alone unlocked origination."""
+    _set_mode_autonomous(isolate_config)
+    monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_EVIDENCE_GATE", "1")
+    # No options_unlock.json marker exists in isolate_quant_home => read_options_unlocked False.
+    calls = {"orig": 0}
+    import hermes_quant.autonomous as auto_mod
+    monkeypatch.setattr(auto_mod, "_originate_mleg_proposal", lambda *a, **k: calls.__setitem__("orig", calls["orig"] + 1) or None)
+    _ar = {
+        "as_of": "2026-06-18T20:00:00Z", "decision_price": 100.0, "signal_id": "s",
+        "aggregated_signal": {"confidence": 0.85, "direction": 1, "magnitude": 0.05},
+        "risk_gate": {"pass": True, "kelly_fraction": 0.05, "reason": "ok", "gated_reason": None},
+        "analyst_views": [{"analyst": "A0", "metadata": {"atr_relative": 0.05}}], "lessons": [],
+    }
+    auto.tick(dry_run=False,
+              symbols=[WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d", options_eligible=True)],
+              advisor_recommend=lambda **kw: _ar)
+    assert calls["orig"] == 0, (
+        "evidence-gate ON + no unlock marker must LOCK options origination "
+        "(the helper must not be called); the inner flags alone must not unlock"
+    )
+
+
+def test_bf76_evidence_gate_off_is_byte_identical(isolate_config, isolate_quant_home, monkeypatch):
+    """bf76 default-OFF: with HERMES_QUANT_OPTIONS_EVIDENCE_GATE unset, the guard is NOT
+    consulted — origination proceeds on the inner flags alone (byte-identical to pre-bf76)."""
+    _set_mode_autonomous(isolate_config)
+    monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
+    monkeypatch.delenv("HERMES_QUANT_OPTIONS_EVIDENCE_GATE", raising=False)
+    calls = {"orig": 0}
+    import hermes_quant.autonomous as auto_mod
+    monkeypatch.setattr(auto_mod, "_originate_mleg_proposal", lambda *a, **k: calls.__setitem__("orig", calls["orig"] + 1) or None)
+    _ar = {
+        "as_of": "2026-06-18T20:00:00Z", "decision_price": 100.0, "signal_id": "s",
+        "aggregated_signal": {"confidence": 0.85, "direction": 1, "magnitude": 0.05},
+        "risk_gate": {"pass": True, "kelly_fraction": 0.05, "reason": "ok", "gated_reason": None},
+        "analyst_views": [{"analyst": "A0", "metadata": {"atr_relative": 0.05}}], "lessons": [],
+    }
+    auto.tick(dry_run=False,
+              symbols=[WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d", options_eligible=True)],
+              advisor_recommend=lambda **kw: _ar)
+    assert calls["orig"] == 1, "evidence-gate OFF: origination must proceed on the inner flags (byte-identical)"

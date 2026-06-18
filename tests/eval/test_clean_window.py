@@ -871,3 +871,36 @@ class TestSlippageHaircutNonFinitePenalty:
         assert adj.n == raw.n == 20, f"trips must not vanish; raw.n={raw.n} adj.n={adj.n}"
         assert math.isfinite(adj.sharpe), "floored series must yield a finite Sharpe, not NaN"
         assert adj.win_rate == pytest.approx(1.0), "raw-minus-floor stays a positive win here"
+
+
+# --------------------------------------------------------------------------- #
+# bf76: read_options_unlocked — the executable GATE-2 options-origination guard.
+# --------------------------------------------------------------------------- #
+def test_read_options_unlocked_absent_is_locked(tmp_path):
+    """No marker => LOCKED (fail-closed): arming options flags alone never unlocks."""
+    from hermes_quant.eval.clean_window import read_options_unlocked
+    assert read_options_unlocked(home=tmp_path) is False
+
+
+def test_read_options_unlocked_true_marker(tmp_path):
+    from hermes_quant.eval.clean_window import read_options_unlocked
+    (tmp_path / "quant").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "quant" / "options_unlock.json").write_text(
+        '{"gate2_cleared": true, "evaluated_at": "2026-06-18T00:00:00Z"}'
+    )
+    assert read_options_unlocked(home=tmp_path) is True
+
+
+def test_read_options_unlocked_false_marker_is_locked(tmp_path):
+    from hermes_quant.eval.clean_window import read_options_unlocked
+    (tmp_path / "quant").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "quant" / "options_unlock.json").write_text('{"gate2_cleared": false}')
+    assert read_options_unlocked(home=tmp_path) is False
+
+
+def test_read_options_unlocked_malformed_is_locked(tmp_path):
+    """A corrupt marker => LOCKED (fail-closed, never fail-open to unlocked)."""
+    from hermes_quant.eval.clean_window import read_options_unlocked
+    (tmp_path / "quant").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "quant" / "options_unlock.json").write_text("{not valid json")
+    assert read_options_unlocked(home=tmp_path) is False

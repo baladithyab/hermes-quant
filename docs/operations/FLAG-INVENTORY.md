@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**84 flags** (resolvable default).
+**85 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -56,9 +56,10 @@
 | `HERMES_QUANT_MULTILEG_REACTOR` | `0` | `hermes_quant/react/mleg_fill.py:116` |
 | `HERMES_QUANT_OPENBB` | `0` | `hermes_quant/catalyst/openbb_news.py:56` |
 | `HERMES_QUANT_OPEN_GUARD` | `1` | `hermes_quant/risk/open_guard.py:304` |
+| `HERMES_QUANT_OPTIONS_EVIDENCE_GATE` | `0` | `hermes_quant/autonomous.py:2352` |
 | `HERMES_QUANT_OPTIONS_GATE` | `0` | `hermes_quant/risk/options_gate.py:529` |
 | `HERMES_QUANT_OPTIONS_LIVE_CHAIN` | `0` | `hermes_quant/options/data.py:427` |
-| `HERMES_QUANT_OPTIONS_PERCEIVE` | `0` | `hermes_quant/autonomous.py:2368` |
+| `HERMES_QUANT_OPTIONS_PERCEIVE` | `0` | `hermes_quant/autonomous.py:2388` |
 | `HERMES_QUANT_OVERNIGHT_DRIFT` | `0` | `hermes_quant/advisor.py:430` |
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:255` |
 | `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:523` |
