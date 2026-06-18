@@ -296,6 +296,97 @@ def test_core_risk_config_falls_back_when_live_config_missing():
     assert isinstance(core, CoreRiskConfig)
 
 
+# ---------------------------------------------------------------------------
+# cut/01f0 (ADR-0097): the DEFAULT-OFF slippage haircut wired through the SHELL.
+# The pure core reads no env and imports no estimator — the shell reads
+# HERMES_QUANT_SLIPPAGE_GATE and pre-computes the penalty.
+# ---------------------------------------------------------------------------
+
+
+def test_slippage_gate_flag_default_off():
+    """The HERMES_QUANT_SLIPPAGE_GATE flag defaults to OFF (byte-identical)."""
+    import os
+
+    from hermes_quant.pdr_core_adapter import slippage_gate_enabled
+
+    old = os.environ.pop("HERMES_QUANT_SLIPPAGE_GATE", None)
+    try:
+        assert slippage_gate_enabled() is False
+    finally:
+        if old is not None:
+            os.environ["HERMES_QUANT_SLIPPAGE_GATE"] = old
+
+
+def test_slippage_gate_flag_on(monkeypatch):
+    from hermes_quant.pdr_core_adapter import slippage_gate_enabled
+
+    monkeypatch.setenv("HERMES_QUANT_SLIPPAGE_GATE", "1")
+    assert slippage_gate_enabled() is True
+    monkeypatch.setenv("HERMES_QUANT_SLIPPAGE_GATE", "0")
+    assert slippage_gate_enabled() is False
+
+
+def test_core_risk_config_carries_slippage_fields_default_off():
+    """Without the slippage kwargs the config is byte-identical: gate off, 0.0."""
+    from hermes_quant.pdr_core_adapter import core_risk_config_from
+    from hermes_quant.risk.gate import RiskConfig as LiveRiskConfig
+
+    core = core_risk_config_from(LiveRiskConfig(), event_risk_enabled=False)
+    assert core.slippage_gate_enabled is False
+    assert core.slippage_penalty_frac == 0.0
+
+
+def test_core_risk_config_carries_slippage_fields_when_passed():
+    from hermes_quant.pdr_core_adapter import core_risk_config_from
+    from hermes_quant.risk.gate import RiskConfig as LiveRiskConfig
+
+    core = core_risk_config_from(
+        LiveRiskConfig(),
+        event_risk_enabled=False,
+        slippage_gate_enabled=True,
+        slippage_penalty_frac=0.0025,
+    )
+    assert core.slippage_gate_enabled is True
+    assert core.slippage_penalty_frac == 0.0025
+
+    # also when live_config is None
+    none_core = core_risk_config_from(
+        None,
+        event_risk_enabled=False,
+        slippage_gate_enabled=True,
+        slippage_penalty_frac=0.008,
+    )
+    assert none_core.slippage_gate_enabled is True
+    assert none_core.slippage_penalty_frac == 0.008
+
+
+def test_slippage_penalty_helper_returns_positive_prior_for_equity():
+    """The shell pre-compute delegates to the canonical estimator and returns a
+    POSITIVE conservative penalty (fail-closed: never 0.0)."""
+    from hermes_quant.pdr_core_adapter import _slippage_penalty_frac_for
+
+    pen = _slippage_penalty_frac_for("equity")
+    assert pen > 0.0
+    import math
+
+    assert math.isfinite(pen)
+
+
+def test_slippage_penalty_helper_fails_closed_on_estimator_error(monkeypatch):
+    """If the estimator raises or returns non-finite, the helper falls back to the
+    conservative _DEFAULT_PRIOR floor (positive), never 0.0 (a free pass)."""
+    import hermes_quant.risk.slippage_haircut as sh
+    from hermes_quant.pdr_core_adapter import _slippage_penalty_frac_for
+
+    def _boom(*a, **k):
+        raise RuntimeError("shadow log unreadable")
+
+    monkeypatch.setattr(sh, "estimate_live_penalty", _boom)
+    pen = _slippage_penalty_frac_for("equity")
+    assert pen == sh._DEFAULT_PRIOR
+    assert pen > 0.0
+
+
 def test_run_shadow_gate_agreement_returns_no_divergence(caplog):
     """When the live action and the core verdict agree, the report has no
     divergence and nothing is logged at WARNING."""

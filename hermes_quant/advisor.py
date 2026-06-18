@@ -1439,6 +1439,30 @@ def recommend(
     market = _bootstrap_market_state(symbol, asset_class, last_bar_ts_utc)
     halt_state: HaltState = _EmptyHaltState()  # type: ignore[assignment]
 
+    # 01f0 LIVE cutover (ADR-0097): when HERMES_QUANT_SLIPPAGE_GATE=1, pre-compute the
+    # conservative live-vs-paper penalty for this symbol's asset_class (the shell owns the
+    # estimator; the pure gate only consumes the float) and thread it into the LIVE gate's
+    # RiskConfig so the Rule-5 cost gate + Rule-6 sizer haircut the edge toward silence.
+    # This makes the haircut AUTHORITATIVE on the live decision path (b61c wired it into
+    # clean_window EVIDENCE only; the shadow-gate wiring did not touch the live action).
+    # Default-OFF / estimator-error => slippage_gate_enabled stays False or penalty floors
+    # conservatively (never 0.0-on-error) => byte-identical. Best-effort: never abort the gate.
+    try:
+        from hermes_quant.pdr_core_adapter import (
+            _slippage_penalty_frac_for,
+            slippage_gate_enabled,
+        )
+
+        if slippage_gate_enabled() and risk_gate is not None and risk_gate.config is not None:
+            import dataclasses as _dc
+
+            _pen = _slippage_penalty_frac_for(asset_class)
+            risk_gate.config = _dc.replace(
+                risk_gate.config, slippage_gate_enabled=True, slippage_penalty_frac=_pen
+            )
+    except Exception as _slip_exc:  # noqa: BLE001 — fail-closed: a wiring error must not haircut-bypass
+        logger.warning("advisor: slippage-gate wiring failed (%s) — gate runs without haircut", _slip_exc)
+
     try:
         action = risk_gate.gate(agg_signal, market, portfolio, halt_state)
     except Exception as exc:  # noqa: BLE001

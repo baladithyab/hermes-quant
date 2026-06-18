@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**86 flags** (resolvable default).
+**87 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -30,7 +30,7 @@
 | `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1243` |
 | `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1384` |
 | `HERMES_QUANT_ESTIMATES_ANALYST` | `0` | `hermes_quant/advisor.py:494` |
-| `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1473` |
+| `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1497` |
 | `HERMES_QUANT_EVIDENCE_DIR` | `` | `hermes_quant/evidence/store.py:60` |
 | `HERMES_QUANT_FRED_MACRO` | `0` | `hermes_quant/data/fred_macro.py:146` |
 | `HERMES_QUANT_FUNDAMENTALS_ENABLED` | `0` | `hermes_quant/advisor.py:476` |
@@ -64,7 +64,7 @@
 | `HERMES_QUANT_OVERNIGHT_DRIFT` | `0` | `hermes_quant/advisor.py:544` |
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:255` |
 | `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:523` |
-| `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1462` |
+| `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1486` |
 | `HERMES_QUANT_PER_POSITION_STOP` | `0` | `hermes_quant/autonomous.py:2080` |
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:206` |
@@ -84,6 +84,7 @@
 | `HERMES_QUANT_SEMANTIC_ENABLED` | `1` | `hermes_quant/advisor.py:526` |
 | `HERMES_QUANT_SHADOW_RULE_MINING` | `0` | `hermes_quant/shadow/rule_mining.py:162` |
 | `HERMES_QUANT_SIGNED_EQUITY` | `0` | `hermes_quant/state/portfolio_state.py:214` |
+| `HERMES_QUANT_SLIPPAGE_GATE` | `0` | `hermes_quant/pdr_core_adapter.py:75` |
 | `HERMES_QUANT_SLIPPAGE_HAIRCUT` | `0` | `hermes_quant/risk/slippage_haircut.py:70` |
 | `HERMES_QUANT_STACKING` | `0` | `hermes_quant/aggregators/bma.py:277` |
 | `HERMES_QUANT_STRUCTURE_SELECT` | `0` | `hermes_quant/options/structure_select.py:133` |

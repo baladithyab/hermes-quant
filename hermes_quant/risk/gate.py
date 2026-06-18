@@ -365,6 +365,23 @@ class RiskConfig:
         autonomous loop enforces that invariant before reaching the gate.
     """
 
+    slippage_gate_enabled: bool = False
+    """01f0 (ADR-0097): when True, the LIVE decision gate haircuts the expected
+    signed edge toward silence by ``slippage_penalty_frac`` BEFORE the Rule-5
+    cost gate + Rule-6 sizer, so a thin edge that only clears the cost gate on
+    optimistic paper fills is SILENCED. Default False => byte-identical (edge is
+    never haircut). The haircut may ONLY shrink |edge| (sign preserved); a
+    non-finite penalty/edge fails to 0.0 (silence). Mirrors the pdr_core leaf
+    ``_slippage_haircut_edge`` (single source of truth). Eval-gated:
+    HERMES_QUANT_SLIPPAGE_GATE wires this from the shell."""
+
+    slippage_penalty_frac: float = 0.0
+    """01f0: the PRE-COMPUTED one-way live-vs-paper penalty (NAV-fraction return,
+    same units as the Kelly edge), supplied by the shell via
+    ``slippage_haircut.estimate_live_penalty``. 0.0 => no haircut. Only consulted
+    when ``slippage_gate_enabled`` is True. Fail-closed: the shell floors it to
+    the conservative prior on any estimator error, never 0.0-on-error."""
+
     def __post_init__(self) -> None:
         """ar124: fail-CLOSED validation of the money-critical thresholds.
 
@@ -815,6 +832,19 @@ class DefaultRiskGate:
         ):
             self._n_silenced_cost_gate += 1
             return self._silence(signal, reason="non_finite_risk_input")
+        # 01f0 (ADR-0097): haircut the signed edge toward silence by the conservative
+        # live-vs-paper execution penalty BEFORE the cost gate + sizer, so a thin edge
+        # that only clears the cost gate on optimistic paper fills is SILENCED on the
+        # LIVE decision path (b61c wired the haircut into clean_window EVIDENCE only; the
+        # live admission gate still used raw edge — the orphan this closes). The pure leaf
+        # _slippage_haircut_edge (single source of truth, shared with pdr_core) can ONLY
+        # shrink |edge| (sign preserved); a non-finite penalty/edge -> 0.0 (silence). The
+        # penalty is pre-computed by the shell into config.slippage_penalty_frac. Default-OFF
+        # (slippage_gate_enabled=False) => edge untouched => byte-identical.
+        if self.config.slippage_gate_enabled:
+            from hermes_quant.pdr_core.gate import _slippage_haircut_edge
+
+            edge = _slippage_haircut_edge(edge, self.config.slippage_penalty_frac)
         # PAPER-MODE-ONLY override (per docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md):
         # when `paper_zero_costs=True`, the threshold is forced to 0.0
         # INSTEAD of computing `cost_multiple × round_trip_cost` from

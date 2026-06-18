@@ -40,6 +40,8 @@ core boundary intact (dropping it would be a money-safety regression).
 from __future__ import annotations
 
 import logging
+import math
+import os
 from typing import Any
 
 from hermes_quant.pdr_core.gate import DefaultRiskGate as CoreDefaultRiskGate
@@ -58,6 +60,56 @@ from hermes_quant.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+# cut/01f0 (ADR-0097): the operator flag the SHELL reads to wire the slippage
+# haircut into the LIVE decision gate (Rule-5 cost gate + Rule-6 sizer). The pure
+# core (pdr_core/gate.py) reads NO env — it consumes the pre-computed penalty as a
+# RiskConfig field. This env read lives in the shell so the FLAG-INVENTORY scanner
+# (which walks hermes_quant/) sees it. DEFAULT-OFF => byte-identical raw-edge path.
+SLIPPAGE_GATE_FLAG = "HERMES_QUANT_SLIPPAGE_GATE"
+
+
+def slippage_gate_enabled() -> bool:
+    """True iff the operator opted into the ADR-0097 decision-gate slippage
+    haircut. The shell gates on this; default-OFF (byte-identical raw edge)."""
+    return os.environ.get(SLIPPAGE_GATE_FLAG, "0") == "1"
+
+
+def _slippage_penalty_frac_for(asset_class: str) -> float:
+    """Pre-compute the conservative live-vs-paper execution penalty (NAV-fraction)
+    for ``asset_class`` so the PURE core need not import the estimator.
+
+    Delegates to ``hermes_quant.risk.slippage_haircut.estimate_live_penalty`` (the
+    canonical ADR-0097 estimator, also used by the clean_window evidence seam b61c).
+    FAIL-CLOSED: any failure or a non-finite estimate falls back to the conservative
+    ``_DEFAULT_PRIOR`` floor — never 0.0, so a thin edge is still haircut toward
+    silence even when the estimator misbehaves (the ar08 finite-guard family)."""
+    # Lazy import: the estimator is shell-only; importing it here (not in pdr_core)
+    # keeps the purity gate green.
+    from hermes_quant.risk.slippage_haircut import _DEFAULT_PRIOR, estimate_live_penalty
+
+    try:
+        est = estimate_live_penalty(asset_class)
+        pen = float(est.penalty_frac)
+    except Exception as exc:  # noqa: BLE001 — fail-closed to the conservative floor
+        logger.warning(
+            "slippage penalty estimate failed for asset_class=%r: %s; "
+            "using conservative floor %s",
+            asset_class,
+            exc,
+            _DEFAULT_PRIOR,
+        )
+        return float(_DEFAULT_PRIOR)
+    if not math.isfinite(pen) or pen < 0.0:
+        logger.warning(
+            "non-finite/negative slippage penalty %r for asset_class=%r; "
+            "using conservative floor %s",
+            pen,
+            asset_class,
+            _DEFAULT_PRIOR,
+        )
+        return float(_DEFAULT_PRIOR)
+    return pen
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +173,13 @@ def core_portfolio_from(p: Portfolio) -> CorePortfolio:
     )
 
 
-def core_risk_config_from(live_config: Any, *, event_risk_enabled: bool) -> CoreRiskConfig:
+def core_risk_config_from(
+    live_config: Any,
+    *,
+    event_risk_enabled: bool,
+    slippage_gate_enabled: bool = False,
+    slippage_penalty_frac: float = 0.0,
+) -> CoreRiskConfig:
     """Build a core RiskConfig MIRRORED from the live gate's ``.config``.
 
     The live ``risk.gate.RiskConfig`` shares every field below; the core gate
@@ -130,11 +188,22 @@ def core_risk_config_from(live_config: Any, *, event_risk_enabled: bool) -> Core
     that env ONCE (call-time) and passes it here so the shadow snapshots the same
     instant as the live gate.
 
+    cut/01f0 (ADR-0097): the core gate ALSO has ``slippage_gate_enabled`` +
+    ``slippage_penalty_frac`` (the DEFAULT-OFF decision-gate haircut). The pure
+    core reads NO env and does NOT import the estimator, so the SHELL reads the
+    ``HERMES_QUANT_SLIPPAGE_GATE`` flag and PRE-COMPUTES the conservative penalty
+    here, passing both in. Defaults (False / 0.0) keep the config byte-identical
+    when the operator hasn't opted in.
+
     If ``live_config`` is None (or any field is missing), fall back to the core
     default for that field — the resulting divergence is logged but harmless.
     """
     if live_config is None:
-        return CoreRiskConfig(event_risk_enabled=event_risk_enabled)
+        return CoreRiskConfig(
+            event_risk_enabled=event_risk_enabled,
+            slippage_gate_enabled=slippage_gate_enabled,
+            slippage_penalty_frac=slippage_penalty_frac,
+        )
     default = CoreRiskConfig()
 
     def _g(name: str) -> Any:
@@ -152,6 +221,8 @@ def core_risk_config_from(live_config: Any, *, event_risk_enabled: bool) -> Core
         event_risk_window_days=_g("event_risk_window_days"),
         paper_zero_costs=_g("paper_zero_costs"),
         event_risk_enabled=event_risk_enabled,
+        slippage_gate_enabled=slippage_gate_enabled,
+        slippage_penalty_frac=slippage_penalty_frac,
     )
 
 
@@ -254,7 +325,20 @@ def run_shadow_gate(
     a shadow failure must NEVER affect the live decision.
     """
     try:
-        core_cfg = core_risk_config_from(live_config, event_risk_enabled=event_risk_enabled)
+        # cut/01f0 (ADR-0097): read the DEFAULT-OFF slippage-gate flag ONCE and
+        # pre-compute the conservative per-asset-class penalty so the pure core
+        # consumes a plain float (no estimator import in pdr_core). Default-OFF =>
+        # penalty unused / 0.0 => byte-identical raw-edge core path.
+        slip_enabled = slippage_gate_enabled()
+        slip_penalty = (
+            _slippage_penalty_frac_for(agg_signal.asset_class) if slip_enabled else 0.0
+        )
+        core_cfg = core_risk_config_from(
+            live_config,
+            event_risk_enabled=event_risk_enabled,
+            slippage_gate_enabled=slip_enabled,
+            slippage_penalty_frac=slip_penalty,
+        )
         # Fresh per call — matches the advisor, which builds a fresh live gate
         # per call and never records a loss (cooldowns empty).
         core_gate = CoreDefaultRiskGate(core_cfg)

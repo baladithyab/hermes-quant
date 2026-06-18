@@ -101,6 +101,38 @@ def _is_finite_number(value: Any) -> bool:
         return False
 
 
+def _slippage_haircut_edge(edge: float, penalty_frac: Any) -> float:
+    """Shrink ``|edge|`` toward silence by the conservative live-execution penalty.
+
+    cut/01f0 (ADR-0097), the host-blind pure leaf. ``edge`` is the signed expected
+    log return (a NAV-fraction); ``penalty_frac`` is the PRE-COMPUTED one-way
+    live-vs-paper penalty (same units, passed IN from the shell — the estimator is
+    NOT imported into the pure core). The penalty is ALWAYS a positive COST: its
+    MAGNITUDE is subtracted from ``|edge|``, preserving sign, clamped at 0.
+
+    HAIRCUT-TOWARD-SILENCE invariant: the result's magnitude is ``<= |edge|`` and
+    its sign is unchanged — it can ONLY shrink edge, NEVER amplify it. FAIL-CLOSED
+    (the ar08 finite-guard family): a non-finite ``edge`` OR a non-finite
+    ``penalty_frac`` drives the edge to ``0.0`` (full silence), the conservative
+    floor — a NaN/inf penalty must NEVER become a free pass that leaves edge intact.
+
+    Pure; never raises.
+    """
+    if not _is_finite_number(edge):
+        return 0.0
+    pen = penalty_frac
+    if not _is_finite_number(pen):
+        # Unknown penalty => most conservative outcome: zero the edge (silence).
+        return 0.0
+    pen = abs(float(pen))
+    e = float(edge)
+    sign = 1.0 if e >= 0.0 else -1.0
+    shrunk = abs(e) - pen
+    if shrunk <= 0.0:
+        return 0.0
+    return sign * shrunk
+
+
 def _ts_to_datetime(ts: Any) -> datetime:
     """Coerce pd.Timestamp or datetime to a tz-aware UTC datetime."""
     if isinstance(ts, pd.Timestamp):
@@ -273,6 +305,30 @@ class RiskConfig:
     NAV-fraction² number) the basket step haircuts toward. Read ONLY when
     ``portfolio_variance_sizing_enabled`` is True; default-off keeps behavior
     identical."""
+
+    slippage_gate_enabled: bool = False
+    """cut/01f0 (ADR-0097): when True, the Rule-5 cost gate + Rule-6 sizer
+    consume a SLIPPAGE-HAIRCUT expected edge instead of the raw edge — the
+    conservative live-vs-paper execution penalty (``slippage_penalty_frac``,
+    pre-computed by the shell) is subtracted from ``|edge|`` toward silence
+    BEFORE the cost gate, so a thin edge that only clears the cost gate on
+    optimistic paper fills is SILENCED. Default False = BYTE-IDENTICAL to the
+    raw-edge path (the gate sees the unmodified edge). The shell flips this from
+    ``HERMES_QUANT_SLIPPAGE_GATE`` (default-OFF, eval-gated) and computes the
+    penalty via ``hermes_quant.risk.slippage_haircut.estimate_live_penalty`` —
+    that estimator is NOT imported into the pure core (PURITY: stdlib+pandas).
+    HAIRCUT-TOWARD-SILENCE: the step can ONLY SHRINK ``|edge|`` (never grows it);
+    a non-finite penalty fails toward the conservative floor (drives edge to 0 =
+    silence), never improves edge."""
+
+    slippage_penalty_frac: float = 0.0
+    """cut/01f0 (ADR-0097): the PRE-COMPUTED one-way live-execution penalty as a
+    NAV-fraction return (same units as ``edge``), passed IN by the shell so the
+    pure core need not import the estimator. Read ONLY when
+    ``slippage_gate_enabled`` is True; default ``0.0`` keeps behavior identical
+    even if the flag were flipped without a penalty. ALWAYS treated as a positive
+    COST (its magnitude is subtracted from ``|edge|``); a non-finite value fails
+    toward silence (edge -> 0), never a free pass (the ar08 finite-guard family)."""
 
     @classmethod
     def conservative(cls) -> RiskConfig:
@@ -530,6 +586,18 @@ class DefaultRiskGate:
         ):
             self._n_silenced_cost_gate += 1
             return self._silence(signal, reason="non_finite_risk_input")
+        # cut/01f0 (ADR-0097) SLIPPAGE HAIRCUT (DEFAULT-OFF). When enabled, shrink
+        # |edge| toward silence by the PRE-COMPUTED conservative live-vs-paper
+        # execution penalty (passed IN by the shell — the estimator is NOT imported
+        # into the pure core) BEFORE the cost gate + sizer, so a thin edge that only
+        # clears the cost gate on optimistic paper fills is SILENCED. The step can
+        # ONLY shrink |edge| (never amplify); a non-finite penalty fails toward the
+        # conservative floor (edge -> 0 = silence). Default-off => edge unchanged
+        # (BYTE-IDENTICAL to the raw-edge path). Both the cost gate and the Kelly
+        # sizer below consume this haircut edge (synthesis-v2 §P0-A: same edge for
+        # gate AND sizer).
+        if self.config.slippage_gate_enabled:
+            edge = _slippage_haircut_edge(edge, self.config.slippage_penalty_frac)
         # PAPER-MODE-ONLY override: when paper_zero_costs=True, threshold is 0.0
         # INSTEAD of cost_multiple × round_trip_cost. The edge-sign alignment
         # guard below is NEVER bypassed.
