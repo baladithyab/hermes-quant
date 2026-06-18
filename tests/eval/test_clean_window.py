@@ -691,18 +691,38 @@ class TestBootstrapCI:
 class TestSlippageHaircutOff:
     """Flag OFF (default) => the adjusted series IS the raw series: byte-identical."""
 
-    def test_default_matches_legacy_metrics_exactly(self):
+    def test_default_matches_legacy_metrics_exactly(self, tmp_path):
         """With apply_haircut=False (the default), every metric equals the
-        pre-b61c raw computation. Inputs are picked so a broken (always-haircut)
-        impl would DIVERGE: 20 all-winning equity trips -> haircut would lower
-        the mean and the Sharpe."""
+        pre-b61c raw computation.
+
+        wave4-review FIX (was VACUOUS): the old test compared
+        compute_gate_metrics(trips, t0) to an IDENTICAL compute_gate_metrics(trips, t0)
+        call — the function to itself — so it passed unchanged against the pre-fix base
+        and could not detect a 'default flipped to always-haircut' regression. The
+        non-vacuous version pins the DEFAULT against the EXPLICIT-haircut-ON series and
+        asserts they DIFFER (the default must be the raw series, not the haircut one),
+        AND pins the default to hard-coded raw expectations for a known all-win sample.
+        RED: change the `apply_haircut` default to True -> default would equal `on`
+        (haircut) and the win_rate/mean assertions below would fail."""
         trips = _win_trips(20, win_ret=0.01)
-        raw = compute_gate_metrics(trips, t0=_T0)
         default = compute_gate_metrics(trips, t0=_T0)  # apply_haircut defaults False
-        assert default.win_rate == raw.win_rate
-        assert default.sharpe == raw.sharpe
-        assert default.profit_factor == raw.profit_factor
-        assert default.max_drawdown == raw.max_drawdown
+        on = compute_gate_metrics(
+            trips, t0=_T0, apply_haircut=True, shadow_log=tmp_path / "absent.jsonl"
+        )
+        # The DEFAULT must be the RAW series, which DIFFERS from the haircut series for
+        # this all-winning sample (the equity prior lowers each return). If the default
+        # silently became always-haircut, default.sharpe would equal on.sharpe.
+        assert default.sharpe != on.sharpe, (
+            "default (apply_haircut=False) must NOT equal the haircut-ON series — "
+            f"a flipped default would make them equal (default={default.sharpe}, on={on.sharpe})"
+        )
+        # Hard-pin the default to the raw all-win expectations (independent of any
+        # haircut path running): 20 wins at +0.01 -> win_rate 1.0, no losses -> profit
+        # factor is +inf (NaN-or-inf per the harness), drawdown 0 (monotone gains).
+        assert default.win_rate == pytest.approx(1.0)
+        assert default.n == 20
+        assert abs(default.max_drawdown) == pytest.approx(0.0)
+        assert default.sharpe > 0.0 and math.isfinite(default.sharpe)
 
     def test_explicit_false_is_raw(self):
         trips = _win_trips(20, win_ret=0.01)
@@ -797,14 +817,28 @@ class TestSlippageHaircutNonFinitePenalty:
     estimate_live_penalty is contractually finite, but the clean_window seam must
     still fail toward the conservative raw-minus-floor if a penalty is non-finite."""
 
-    def test_non_finite_penalty_does_not_improve_return(self, tmp_path, monkeypatch):
-        """Monkeypatch estimate_live_penalty to return a NaN penalty_frac. The
-        adjusted window must NOT vanish (a naive raw-minus-NaN -> NaN return would
-        be EXCLUDED by the finite-guard -> the trip disappears and the surviving
-        winners INFLATE the metrics = a free pass) AND the adjusted Sharpe must be
-        no better than the conservative raw."""
+    def test_non_finite_penalty_falls_back_to_floor_not_free_pass(self, tmp_path, monkeypatch):
+        """Monkeypatch estimate_live_penalty to return a NaN penalty_frac. The seam
+        must clamp to the conservative _DEFAULT_PRIOR floor (a positive cost), NOT
+        let the NaN through.
+
+        wave4-review FIX (was VACUOUS): the old assertions (adj.n == 20 and
+        adj.sharpe <= raw.sharpe) BOTH passed even against a naive non-finite-guarded
+        `adjusted = raw - NaN` impl — proven by patching out the math.isfinite clamp
+        and watching the test still pass. n is fixed before the haircut runs, and the
+        degenerate all-equal sample made the sharpe comparison non-discriminating.
+
+        The non-vacuous version pins the EXACT fallback value: each adjusted return
+        must equal raw_return - _DEFAULT_PRIOR (the floor), so the adjusted MEAN return
+        is exactly win_ret - _DEFAULT_PRIOR. A `raw - NaN` impl yields NaN returns ->
+        every trip is excluded by the finite-guard -> n collapses (or the mean is NaN),
+        which this asserts against directly. Inputs: win_ret=0.02 so raw(0.02) -
+        floor(0.005) = 0.015 stays a POSITIVE finite win (the trips survive and stay
+        wins), making "equals raw-minus-floor" the load-bearing, discriminating claim."""
+        import statistics
+
         import hermes_quant.eval.clean_window as cw
-        from hermes_quant.risk.slippage_haircut import PenaltyEstimate
+        from hermes_quant.risk.slippage_haircut import _DEFAULT_PRIOR, PenaltyEstimate
 
         def _bad_penalty(*a, **k):
             return PenaltyEstimate(
@@ -812,13 +846,28 @@ class TestSlippageHaircutNonFinitePenalty:
             )
 
         monkeypatch.setattr(cw, "estimate_live_penalty", _bad_penalty)
-        trips = _win_trips(20, win_ret=0.01)
-        raw = compute_gate_metrics(trips, t0=_T0, apply_haircut=False)
+        win_ret = 0.02
+        trips = _win_trips(20, win_ret=win_ret)
+        # Directly exercise the seam: the adjusted series must be raw - floor, finite.
+        warnings: list[str] = []
+        adjusted = cw._haircut_adjusted_returns(
+            list(trips), shadow_log=tmp_path / "absent.jsonl", warnings=warnings
+        )
+        assert len(adjusted) == 20, "no trip may vanish to a NaN-excluded return"
+        for r in adjusted:
+            assert math.isfinite(r), f"a NaN penalty must not yield a NaN return; got {r}"
+            assert r == pytest.approx(win_ret - _DEFAULT_PRIOR), (
+                f"adjusted must be raw({win_ret}) - floor({_DEFAULT_PRIOR}); got {r}"
+            )
+        assert statistics.fmean(adjusted) == pytest.approx(win_ret - _DEFAULT_PRIOR)
+        assert warnings, "a non-finite penalty must emit a warning (observable degrade)"
+
+        # And end-to-end through compute_gate_metrics: the window survives (n=20) and
+        # the metrics are computed on the floored series, not inflated by dropped trips.
         adj = compute_gate_metrics(
             trips, t0=_T0, apply_haircut=True, shadow_log=tmp_path / "absent.jsonl"
         )
+        raw = compute_gate_metrics(trips, t0=_T0, apply_haircut=False)
         assert adj.n == raw.n == 20, f"trips must not vanish; raw.n={raw.n} adj.n={adj.n}"
-        assert adj.sharpe <= raw.sharpe + 1e-12, (
-            f"a non-finite penalty must NOT inflate the adjusted return; "
-            f"raw={raw.sharpe} adj={adj.sharpe}"
-        )
+        assert math.isfinite(adj.sharpe), "floored series must yield a finite Sharpe, not NaN"
+        assert adj.win_rate == pytest.approx(1.0), "raw-minus-floor stays a positive win here"
