@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**81 flags** (resolvable default).
+**82 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -65,6 +65,7 @@
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:206` |
 | `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:2132` |
+| `HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING` | `0` | `hermes_quant/pdr_core/portfolio_sizing.py:70` |
 | `HERMES_QUANT_POST_LOSS_COOLDOWN` | `0` | `hermes_quant/autonomous.py:784` |
 | `HERMES_QUANT_PREWARM_WORKERS` | `` | `hermes_quant/playbook/scorers.py:816` |
 | `HERMES_QUANT_RAIL_LOCK_TIMEOUT_S` | `` | `hermes_quant/autonomous.py:87` |

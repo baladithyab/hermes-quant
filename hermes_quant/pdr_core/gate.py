@@ -257,6 +257,23 @@ class RiskConfig:
     0.0 (skipping the ``cost_multiple × round_trip_cost`` check) while preserving
     the edge-sign alignment guard. Default False (live behavior unchanged)."""
 
+    portfolio_variance_sizing_enabled: bool = False
+    """aegis-ag01 (ADR-0096 Gate 1): when True,
+    :meth:`DefaultRiskGate.apply_portfolio_variance_sizing` runs the
+    correlation-aware POSITION-level haircut (``hermes_quant.pdr_core.portfolio_sizing``)
+    so a basket's PORTFOLIO VARIANCE ``w^T Σ w`` stays within
+    ``portfolio_variance_cap`` — not merely each |w_i| within the per-name cap.
+    Default False = BYTE-IDENTICAL to 83bf280 (the basket method is a pass-through;
+    the per-signal Rule-0..7 path is UNTOUCHED). The shell flips this from the env
+    flag ``HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING`` (default-OFF + eval-gated). The
+    step can ONLY shrink (haircut-toward-silence) — never sizes up."""
+
+    portfolio_variance_cap: float = 0.02
+    """aegis-ag01: the aggregate PORTFOLIO VARIANCE budget ``w^T Σ w`` (a
+    NAV-fraction² number) the basket step haircuts toward. Read ONLY when
+    ``portfolio_variance_sizing_enabled`` is True; default-off keeps behavior
+    identical."""
+
     @classmethod
     def conservative(cls) -> RiskConfig:
         return cls(
@@ -575,6 +592,58 @@ class DefaultRiskGate:
         )
         self._audit_approval(signal, decision)
         return decision
+
+    def apply_portfolio_variance_sizing(
+        self,
+        targets: list[tuple[str, float]],
+        cov: Any,
+    ) -> list[tuple[str, float]]:
+        """aegis-ag01 (ADR-0096 Gate 1): correlation-aware POSITION-level haircut.
+
+        The per-signal :meth:`gate` sizes ONE name at a time and Rule 6.5 clips
+        each |w_i| to the per-name cap — it has NO covariance view, so five
+        correlated names at the per-name cap form a ~100% beta bet wearing a
+        "diversified" mask. This BASKET method closes that gap: it haircuts the
+        whole basket so the PORTFOLIO VARIANCE ``w^T Σ w`` stays within
+        ``config.portfolio_variance_cap`` — not merely each |w_i| within a cap.
+
+        DEFAULT-OFF (byte-identical to 83bf280): with
+        ``config.portfolio_variance_sizing_enabled`` False (the default) this is a
+        PASS-THROUGH — it returns ``targets`` UNCHANGED. The shell flips the flag
+        from ``HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING`` (default-OFF, eval-gated).
+        The per-signal Rule-0..7 path is UNTOUCHED.
+
+        HAIRCUT-TOWARD-SILENCE: when enabled the step applies a single global
+        scale ``λ ∈ [0, 1]`` (de-levering correlated names TOGETHER) and can ONLY
+        shrink — it NEVER increases any |target|. FAIL-CLOSED: a non-finite Σ or
+        target falls back to the conservative per-name behavior (never sizes up).
+
+        Args:
+            targets: ordered ``(asset, signed_target_pct)`` pairs — the per-name
+                quarter-Kelly outputs (each already clipped to the per-name cap).
+            cov: ``(N, N)`` covariance over the SAME N assets, in the SAME order
+                (use ``portfolio_sizing.shrink_covariance`` to produce a shrunk
+                estimate). Typed ``Any`` so the gate's eager imports stay
+                pandas-only; numpy is imported lazily inside the step.
+
+        Returns:
+            Ordered ``(asset, haircut_target_pct)`` pairs (input order/identity
+            preserved). When the flag is OFF, the exact input list is returned.
+        """
+        if not self.config.portfolio_variance_sizing_enabled:
+            return targets
+        # Lazy import: keeps gate.py's eager import surface pandas-only and the
+        # numpy dependency confined to the (default-OFF) enabled path.
+        from hermes_quant.pdr_core.portfolio_sizing import (
+            PortfolioVarianceConfig,
+            portfolio_variance_haircut,
+        )
+
+        names = [a for a, _ in targets]
+        sizes = [w for _, w in targets]
+        cfg = PortfolioVarianceConfig(variance_cap=self.config.portfolio_variance_cap)
+        haircut = portfolio_variance_haircut(sizes, cov, config=cfg)
+        return list(zip(names, haircut, strict=True))
 
     def record_loss(
         self,
