@@ -1130,3 +1130,215 @@ def test_covered_call_cumulative_assignment_cap_counts_stock_basis() -> None:
     assert res.admitted is False, "cumulative-over-cap CC must be REJECTED"
     assert res.reason == "cumulative_assignment_risk_cap"
     assert res.contracts == 0
+
+
+# ---------------------------------------------------------------------------
+# DEFINED_RISK options-buying-power floor (8c66)
+#
+# A defined-risk credit/debit spread/condor DOES consume margin — the max_loss
+# (credit: width-net_credit; debit: premium paid) IS the collateral the broker
+# reserves. The pre-fix DEFINED_RISK admission (O1) checked ONLY "max_loss finite
+# AND <= max_position_pct*nav" with NO options-buying-power floor; only the CSP
+# path checked BP. So a vertical/condor passed the NAV caps against ZERO real
+# broker options BP. The autonomous originate path (autonomous.py:2360) passes
+# options_buying_power=0.0 (a placeholder until a real options-BP read is wired),
+# so an ARMED autonomous spread would admit against fabricated/zero BP — a
+# fail-open. Mirror the CSP BP-floor idiom: admit a defined-risk structure iff
+# options_buying_power covers its buying-power reduction (bpr / required margin),
+# else silence (fail-CLOSED).
+# ---------------------------------------------------------------------------
+
+
+def test_defined_risk_zero_buying_power_silenced_was_admitted() -> None:
+    """RED: a debit vertical (DEFINED_RISK) with options_buying_power=0.0 — the
+    EXACT autonomous originate scenario (autonomous.py:2360 passes 0.0) — was
+    ADMITTED pre-fix (the O1 block never checked BP) and MUST now be SILENCED.
+
+    Construction mirrors test_debit_vertical_defined_risk_admitted (which uses the
+    default options_buying_power=500_000.0 and still admits), changing ONLY the BP
+    to 0.0 to isolate the missing floor:
+      net_debit=2.0 -> max_loss = bpr (required margin) = 2.0*100*1 = 200.0
+      max_loss 200 <= max_position_pct*nav (0.10*1M=100_000) PASSES the NAV cap.
+      options_buying_power=0.0 < bpr=200 -> NEW floor REJECTS (fail-closed).
+    Pre-fix value: res.admitted == True (no BP floor) — the fail-open this fixes.
+    """
+    legs = [
+        _long_call("NVDA260612C00140000", delta=0.30),
+        _short_call("NVDA260612C00150000", delta=0.18),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            strike=150.0,
+            width=10.0,
+            net_debit=2.0,
+            premium_paid=2.0 * 100,
+            options_buying_power=0.0,  # << the autonomous placeholder; was admitted
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, (
+        "a defined-risk spread with ZERO options buying power must be SILENCED — "
+        "admitting it against fabricated/zero BP is a fail-open"
+    )
+    assert res.bucket == StructureBucket.DEFINED_RISK
+    assert res.reason == "insufficient_options_buying_power"
+    assert res.contracts == 0
+
+
+def test_defined_risk_buying_power_below_bpr_silenced() -> None:
+    """RED: a credit vertical whose required margin (bpr) EXCEEDS the available
+    options buying power MUST be SILENCED — positive-but-insufficient BP is still a
+    naked/over-leveraged admission.
+
+    Construction (every value pins the boundary):
+      credit vertical: width=10.0, net_credit=3.0
+      -> max_loss = bpr (required margin) = (width-net_credit)*100*1 = 700.0
+      max_loss 700 <= 0.10*1M=100_000 PASSES the NAV cap.
+      options_buying_power=500.0 (>0, so the <=0 leg does NOT fire) but < bpr=700
+      -> the bpr floor REJECTS.
+    Pre-fix: admitted == True (no BP floor at all).
+    """
+    legs = [
+        _short_call("NVDA260612C00150000", delta=0.18),
+        _long_call("NVDA260612C00160000", delta=0.10),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            strike=150.0,
+            width=10.0,
+            net_credit=3.0,
+            options_buying_power=500.0,  # >0 but < bpr=700 (required margin)
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, (
+        "a defined-risk spread whose required margin exceeds the available options "
+        "buying power must be SILENCED (fail-closed)"
+    )
+    assert res.bucket == StructureBucket.DEFINED_RISK
+    assert res.reason == "insufficient_options_buying_power"
+    assert res.contracts == 0
+
+
+def test_defined_risk_sufficient_buying_power_still_admits() -> None:
+    """A defined-risk debit vertical with buying power >= its required margin
+    (bpr) still admits — the floor is purely additive; it never blocks a properly
+    margined structure. Mirrors test_debit_vertical_defined_risk_admitted.
+
+      net_debit=2.0 -> bpr = 200.0 ; options_buying_power=10_000 >= 200 -> ADMIT.
+    """
+    legs = [
+        _long_call("NVDA260612C00140000", delta=0.30),
+        _short_call("NVDA260612C00150000", delta=0.18),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            strike=150.0,
+            width=10.0,
+            net_debit=2.0,
+            premium_paid=2.0 * 100,
+            options_buying_power=10_000.0,  # >> bpr=200
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is True
+    assert res.bucket == StructureBucket.DEFINED_RISK
+    assert res.max_loss == pytest.approx(200.0)
+
+
+def test_defined_risk_nan_buying_power_does_not_admit() -> None:
+    """A NaN options_buying_power on a defined-risk spread must NOT admit. NOTE
+    (wave4-review): this pins the ENTRY finite-guard (`nonfinite_market_input`),
+    NOT the new defined-risk floor — a NaN BP is rejected at entry before the floor
+    runs. Kept as a defense-in-depth assertion; the floor's OWN finite behavior is
+    pinned by test_defined_risk_nonfinite_bpr_does_not_admit below."""
+    legs = [
+        _long_call("NVDA260612C00140000", delta=0.30),
+        _short_call("NVDA260612C00150000", delta=0.18),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            strike=150.0,
+            width=10.0,
+            net_debit=2.0,
+            premium_paid=2.0 * 100,
+            options_buying_power=float("nan"),
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, "NaN options buying power must fail closed"
+    assert res.reason == "nonfinite_market_input"  # the entry guard, not the floor
+    assert res.contracts == 0
+
+
+def test_defined_risk_nonfinite_bpr_does_not_admit() -> None:
+    """wave4-review (8c66 vacuous-test fix): pin the floor's OWN bpr finite-guard.
+    A NON-finite required margin (bpr) — driven by a non-finite width/net_credit
+    that is NOT entry-guarded — must REJECT (nan >= x is always False, so without
+    the `not math.isfinite(bpr)` clause the floor would silently ADMIT). Here the
+    BP is FINITE (so the entry guard + the <=0 / <bpr legs do not fire); only the
+    `not math.isfinite(bpr)` clause can reject. RED-proof: drop that clause and a
+    non-finite-bpr spread admits."""
+    # A CREDIT vertical: _bpr = (width - net_credit)*100*c, so a non-finite width
+    # makes bpr non-finite (the debit branch returns premium_paid, which stays finite —
+    # so a credit structure is the right vehicle to exercise the bpr finite-guard).
+    legs = [
+        _short_call("NVDA260612C00150000", delta=0.18),
+        _long_call("NVDA260612C00160000", delta=0.10),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            strike=150.0,
+            width=float("inf"),       # non-finite width -> bpr=(inf-net_credit)*100 = inf
+            net_credit=3.0,
+            options_buying_power=1_000_000.0,  # FINITE + huge: only the bpr-finite clause can reject
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, "a non-finite required margin (bpr) must fail closed"
+    assert res.contracts == 0
+
+
+def test_defined_risk_buying_power_covers_one_lot_not_admitted_size() -> None:
+    """wave4-review (8c66 AT-SIZE fix): the structural-size BP floor (1 unit) is not
+    enough — _size_contracts admits MORE lots and bpr scales linearly. A spread whose
+    1-lot bpr is covered but whose AT-SIZE bpr is not must be SILENCED at size.
+
+    Construction (mirrors the CSP at-size test):
+      credit vertical width=10, net_credit=3 -> bpr/lot = (10-3)*100 = 700
+      nav=80_000 -> kelly_target = 80_000*0.25*0.10 = 2_000; contracts = floor sizing > 1
+      options_buying_power chosen to cover 1 lot (700) but NOT the admitted N lots.
+    Pre-fix (structural-only floor): admitted at N lots needing N*700 BP that is absent."""
+    legs = [
+        _short_call("NVDA260612C00150000", delta=0.18),
+        _long_call("NVDA260612C00160000", delta=0.10),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            nav=80_000.0,
+            strike=150.0,
+            width=10.0,
+            net_credit=3.0,
+            options_buying_power=900.0,  # covers 1 lot (700) but not 2 (1400)
+            total_bpr=0.0,
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, (
+        "a defined-risk spread admitted at >1 lot whose AT-SIZE required margin exceeds "
+        "options buying power must be SILENCED (the structural 1-lot floor is insufficient)"
+    )
+    assert res.reason == "defined_risk_insufficient_options_buying_power_at_size"
+    assert res.contracts == 0

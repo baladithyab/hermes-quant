@@ -714,6 +714,29 @@ def options_gate(
                 bucket, "max_loss_exceeds_position_cap", net_greeks=candidate_net,
                 bpr_estimate=bpr, max_loss=max_loss,
             )
+        # 8c66: options-buying-power floor for defined-risk structures. A credit/
+        # debit spread/condor DOES consume margin — the broker reserves the
+        # max_loss (credit: width-net_credit; debit: premium paid; == `bpr` here)
+        # as collateral. The pre-fix O1 block validated ONLY the NAV-based caps
+        # above; only the CSP path checked options_buying_power. So a defined-risk
+        # structure passed every NAV cap against ZERO real broker options BP. The
+        # autonomous originate path passes options_buying_power=0.0 (a placeholder
+        # until a live options-BP read is wired), so an ARMED autonomous spread
+        # would admit against fabricated/zero BP — a fail-OPEN. Mirror the CSP
+        # BP-floor idiom (_classify_structure: admit iff options_buying_power >=
+        # required, else NAKED/silence): a defined-risk structure may only admit
+        # when the available options BP covers its buying-power reduction (`bpr`,
+        # the required margin). Fail CLOSED (silence). options_buying_power is
+        # already finite-guarded at entry (nonfinite_market_input); finite-guard
+        # `bpr` too (derived from width/net_credit/premium_paid, which are NOT all
+        # entry-guarded) so a non-finite required margin can never slip past the
+        # `>=` comparison (NaN >= x is always False; we want a non-finite bpr to
+        # REJECT, not silently admit).
+        if not math.isfinite(bpr) or options_buying_power <= 0 or options_buying_power < bpr:
+            return OptionsGateResult.silence(
+                bucket, "insufficient_options_buying_power", net_greeks=candidate_net,
+                bpr_estimate=bpr, max_loss=max_loss,
+            )
 
     # Short-leg delta caps (ADR-0027 D4 per-strategy hard rule).
     delta_reason = _short_delta_violation(legs, cfg)
@@ -987,6 +1010,22 @@ def options_gate(
                 return OptionsGateResult.silence(
                     bucket, "csp_collateral_at_size", net_greeks=candidate_net,
                     bpr_estimate=bpr, max_loss=max_loss,
+                )
+        if bucket == StructureBucket.DEFINED_RISK:
+            # 8c66 AT-SIZE fix (review-caught): the structural-size defined-risk BP floor
+            # (the O1 block above) validated options_buying_power >= bpr at
+            # structural_contracts (=1 unit). But `_size_contracts` admits MORE lots and
+            # bpr (the reserved margin) scales LINEARLY — so a spread whose 1-lot bpr is
+            # covered (e.g. BP=1000, 1-lot bpr=700) was admitted at N lots needing N*bpr
+            # (35 lots -> $24,500) of options BP that does not exist. The O1 floor was NOT
+            # re-run at the admitted size (only O6 BPR-buffer + CSP collateral were). Mirror
+            # the CSP at-size collateral re-check: the available options BP must cover the
+            # full at-size required margin. Finite-guard bpr (NaN >= x is always False, so a
+            # non-finite required margin must REJECT, not slip past). Fail-CLOSED (silence).
+            if not math.isfinite(bpr) or options_buying_power <= 0 or options_buying_power < bpr:
+                return OptionsGateResult.silence(
+                    bucket, "defined_risk_insufficient_options_buying_power_at_size",
+                    net_greeks=candidate_net, bpr_estimate=bpr, max_loss=max_loss,
                 )
 
     # ---- Cumulative assignment-cash cap (ADR-0027 D2/D4 HARD rule). ----
