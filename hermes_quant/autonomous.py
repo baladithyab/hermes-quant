@@ -1410,6 +1410,25 @@ def _run_per_position_stop_sweep(
     tp_enabled = os.environ.get("HERMES_QUANT_TAKE_PROFIT_SWEEP", "0") == "1"
     tp_pct = float(_read_safety_rails().get("per_position_take_profit_pct", 0.16))
 
+    # AG-EQ-3 (HERMES_QUANT_WATCH_REGISTRY, default-OFF): when ON, record each open play +
+    # ratchet its peak gain across ticks into the durable WatchRegistry. This is PURE STATE
+    # tracking — it does NOT change which positions the sweep exits (the tranche/trailing
+    # ACTION that consumes this state is a separate flag/increment). Byte-identical when the
+    # flag is absent (watch_reg stays None). Best-effort: a registry error never blocks the
+    # sweep's stop/TP rails (silence-by-default on the observability layer).
+    watch_reg = None
+    if os.environ.get("HERMES_QUANT_WATCH_REGISTRY", "0") == "1":
+        try:
+            from hermes_quant.risk.watch_registry import WatchRegistry
+
+            watch_reg = WatchRegistry(
+                db_path=QUANT_HOME / "watch_registry.db",
+                mirror_path=QUANT_HOME / "watch_registry.json",
+            )
+        except Exception as _wr_exc:  # noqa: BLE001 - registry is observability, never block the rails
+            logger.warning("autonomous: WatchRegistry init failed (continuing without it): %s", _wr_exc)
+            watch_reg = None
+
     stopped: set[str] = set()
     for symbol, held in open_book.items():
         try:
@@ -1430,6 +1449,14 @@ def _run_per_position_stop_sweep(
                 mark_price=float(mark),
                 threshold_pct=stop_pct,
             )
+            # AG-EQ-3: record the play (idempotent) + ratchet its peak gain. PURE state;
+            # the gain is exactly -loss_pct (the same sign-correct primitive). Best-effort.
+            if watch_reg is not None and decision.loss_pct is not None:
+                try:
+                    watch_reg.record_open(symbol, entry_price=float(entry_price), stop_pct=abs(stop_pct))
+                    watch_reg.update_peak(symbol, -float(decision.loss_pct))  # gain = -loss
+                except Exception as _wr_exc:  # noqa: BLE001 - never block the rails
+                    logger.warning("autonomous: WatchRegistry update failed for %s: %s", symbol, _wr_exc)
             # Determine the exit reason: STOP takes precedence over TP (a position cannot be
             # both past its loss stop and its gain target; the stop is the safety rail). TP
             # only when the flag is ON and the stop did NOT fire.
@@ -1498,6 +1525,12 @@ def _run_per_position_stop_sweep(
             stopped.add(symbol)
             result.fires += 1
             result.decisions.append(sym_decision)
+            # AG-EQ-3: the play is fully closed -> drop it from the registry (best-effort).
+            if watch_reg is not None:
+                try:
+                    watch_reg.drop(symbol)
+                except Exception as _wr_exc:  # noqa: BLE001 - never block the rails
+                    logger.warning("autonomous: WatchRegistry drop failed for %s: %s", symbol, _wr_exc)
             if exit_kind == "stop":
                 _emit_per_position_stop_audit(
                     symbol=symbol,

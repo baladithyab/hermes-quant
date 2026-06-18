@@ -382,3 +382,56 @@ def test_stop_takes_precedence_over_take_profit(
     result = auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
     assert any(d.gate == "PER_POSITION_STOP_FIRED" for d in result.decisions)
     assert not any("TAKE_PROFIT" in d.gate for d in result.decisions)
+
+
+# --------------------------------------------------------------------------- #
+# AG-EQ-3 watch-registry state tracking (HERMES_QUANT_WATCH_REGISTRY, default-OFF).
+# --------------------------------------------------------------------------- #
+def test_watch_registry_records_and_ratchets_peak_when_on(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    """When the flag is ON, the sweep records the open play + ratchets its peak gain
+    across the tick — pure state, no exit-behavior change."""
+    _set_mode_autonomous(isolate_config)
+    _seed_open_losing_position(isolate_quant_home)  # ASTS entry 118.17, +0.20 held
+    monkeypatch.setenv("HERMES_QUANT_PER_POSITION_STOP", "1")
+    monkeypatch.setenv("HERMES_QUANT_WATCH_REGISTRY", "1")
+    monkeypatch.delenv("HERMES_QUANT_TAKE_PROFIT_SWEEP", raising=False)
+    # Mark ABOVE entry -> a winner (+~10%); no stop fires, so the play stays open and
+    # the registry should record it + set its peak.
+    monkeypatch.setattr(
+        "hermes_quant.perception.build_perception_frame_live",
+        lambda *a, **k: _MarkFrame(130.0),  # ~+10% from 118.17
+    )
+    monkeypatch.setattr("hermes_quant.autonomous._react", lambda *a, **k: ("x", 0.0))
+    auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
+
+    from hermes_quant.risk.watch_registry import WatchRegistry
+
+    reg = WatchRegistry(
+        db_path=isolate_quant_home / "watch_registry.db",
+        mirror_path=isolate_quant_home / "watch_registry.json",
+    )
+    pos = reg.get("ASTS")
+    assert pos is not None, "an open play must be recorded in the registry when the flag is ON"
+    assert pos.entry_price == pytest.approx(118.17, abs=0.5)
+    assert pos.peak_gain_pct > 0.05, f"peak gain must be ratcheted (~+10%); got {pos.peak_gain_pct}"
+
+
+def test_watch_registry_inert_when_flag_off(
+    isolate_config, isolate_quant_home, monkeypatch
+):
+    """Flag OFF: no registry db is created (byte-identical state tracking)."""
+    _set_mode_autonomous(isolate_config)
+    _seed_open_losing_position(isolate_quant_home)
+    monkeypatch.setenv("HERMES_QUANT_PER_POSITION_STOP", "1")
+    monkeypatch.delenv("HERMES_QUANT_WATCH_REGISTRY", raising=False)  # OFF
+    monkeypatch.setattr(
+        "hermes_quant.perception.build_perception_frame_live",
+        lambda *a, **k: _MarkFrame(130.0),
+    )
+    monkeypatch.setattr("hermes_quant.autonomous._react", lambda *a, **k: ("x", 0.0))
+    auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
+    assert not (isolate_quant_home / "watch_registry.db").exists(), (
+        "flag OFF: the registry must never be created (byte-identical)"
+    )
