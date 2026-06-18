@@ -58,14 +58,33 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
-StrategyKind = Literal["covered_call", "cash_secured_put", "wheel", "bull_put_spread", "bear_call_spread"]
+StrategyKind = Literal[
+    "covered_call",
+    "cash_secured_put",
+    "wheel",
+    "bull_put_spread",
+    "bear_call_spread",
+    "iron_condor",  # ADR-0098 Step 5: 4-leg NEUTRAL defined-risk credit structure
+]
 
 # ADR-0098 Step 2: the first defined-risk credit vertical (bull put spread).
 # Flag guards the selection seam; the producer itself is always importable (pure).
 _VERTICAL_SPREADS_FLAG = "HERMES_QUANT_VERTICAL_SPREADS"
 
+# ADR-0098 Step 5: the iron condor (short bull-put spread + short bear-call spread on
+# the SAME underlying/expiry; NEUTRAL + DEFINED_RISK_CREDIT, for HIGH-IV regimes — the
+# highest risk-adjusted admissible neutral structure per Wysocki & Slepaczuk 2024).
+# DEFAULT-OFF: the structure_select row only exists when this flag is set; the producer
+# itself is always importable (pure) but the SELECTION seam abstains when unset, so the
+# path is byte-identical with the flag absent.
+_IRON_CONDOR_FLAG = "HERMES_QUANT_IRON_CONDOR"
+
 # Default leg-selection knobs (deterministic; no optimization, no LLM).
 _DEFAULT_TARGET_DELTA = 0.30  # |delta| target for the short leg (income workhorse)
+# Iron-condor wing offsets: the short legs sit ~0.30 |delta| OTM (income workhorse,
+# same as the verticals' short leg); the long protective WINGS sit further OTM at a
+# smaller |delta| (~0.15) so each side is defined-risk with a finite, bounded width.
+_DEFAULT_WING_TARGET_DELTA = 0.15
 _DEFAULT_DTE_MIN = 25
 _DEFAULT_DTE_MAX = 45
 
@@ -337,13 +356,19 @@ def build_multi_leg_proposal(
     CALLER seam by HERMES_QUANT_VERTICAL_SPREADS), so a flag-OFF caller still abstains
     => byte-identical.
     """
-    if strategy_kind in ("bull_put_spread", "bear_call_spread"):
-        _spread_builder = (
-            build_bull_put_spread_proposal
-            if strategy_kind == "bull_put_spread"
-            else build_bear_call_spread_proposal
-        )
-        # Forward only the kwargs the spread builders accept (they do NOT take
+    # ADR-0098 Step 5: the iron_condor is a 4-leg structure that the CC/CSP/wheel
+    # fall-through cannot build (it knows only right="C"/"P" single-side). Dispatch
+    # to its dedicated builder alongside the verticals so the AUTONOMOUS path routes
+    # correctly. Its CALLER seam is gated by HERMES_QUANT_IRON_CONDOR (no
+    # structure_select row exists when the flag is unset) and the gate by
+    # HERMES_QUANT_OPTIONS_GATE, so a flag-OFF caller still abstains => byte-identical.
+    if strategy_kind in ("bull_put_spread", "bear_call_spread", "iron_condor"):
+        _spread_builder = {
+            "bull_put_spread": build_bull_put_spread_proposal,
+            "bear_call_spread": build_bear_call_spread_proposal,
+            "iron_condor": build_iron_condor_proposal,
+        }[strategy_kind]
+        # Forward only the kwargs these builders accept (they do NOT take
         # held_shares / open_assignment_cash / composite_intent — those are
         # CC/CSP-specific). source_recipe_id is left to each builder's own default.
         return _spread_builder(
@@ -887,6 +912,291 @@ def build_bear_call_spread_proposal(
             f"long K={long_strike} dte={min_dte} "
             f"|delta|~{abs(short.greeks.delta or 0.0):.2f}; "
             f"width={width:.2f} net_credit={net_credit:.4f}/share "
+            f"max_loss={max_loss_per_contract:.2f}/contract; "
+            f"gate bucket {gate_result.bucket.value}, {contracts} contract(s)"
+        ),
+        source_recipe_id=source_recipe_id,
+    )
+    return MultiLegBuildResult(
+        admitted=True,
+        proposal=proposal,
+        bucket=gate_result.bucket,
+        reason=None,
+        contracts=contracts,
+    )
+
+
+def build_iron_condor_proposal(
+    *,
+    symbol: str,
+    asof: datetime,
+    chain: OptionChain | None = None,
+    reader: ChainSnapshotReader | None = None,
+    nav: float,
+    options_buying_power: float,
+    total_bpr: float = 0.0,
+    portfolio_net_greeks=None,  # noqa: ANN001 — NetGreeks; default zero below
+    open_strategies_on_underlying: int = 0,
+    cfg: OptionsRiskConfig | None = None,
+    target_delta: float = _DEFAULT_TARGET_DELTA,
+    dte_min: int = _DEFAULT_DTE_MIN,
+    dte_max: int = _DEFAULT_DTE_MAX,
+    source_recipe_id: str = "options.recipes.build_iron_condor_proposal",
+    proposal_id: str | None = None,
+    event_risk: Mapping | None = None,
+) -> MultiLegBuildResult:
+    """Build + gate (NOT persist) an IRON CONDOR (ADR-0098 Step 5).
+
+    An iron condor = a SHORT BULL-PUT spread (SELL ~0.30-delta OTM put + BUY a
+    further-OTM lower-strike protective put) BELOW spot, PLUS a SHORT BEAR-CALL
+    spread (SELL ~0.30-delta OTM call + BUY a further-OTM higher-strike protective
+    call) ABOVE spot — all four legs on the SAME underlying and SAME expiry. It is
+    NEUTRAL + DEFINED_RISK_CREDIT: the operator collects credit on BOTH sides and
+    profits if the underlying expires between the short strikes. This is literally
+    ``build_bull_put_spread_proposal`` + ``build_bear_call_spread_proposal`` composed
+    into one structure (Wysocki & Slepaczuk 2024: the highest risk-adjusted
+    admissible neutral structure for HIGH-IV regimes).
+
+    DEFINED RISK (the whole point): the two wings can NEVER both lose — the
+    underlying can only breach ONE short strike at expiry — so
+
+        max_loss = max(put_width, call_width) * 100 - total_net_credit * 100   (per condor)
+
+    which is FINITE and bounded. The two long protective wings are MANDATORY: a
+    missing wing would leave that side a NAKED short (undefined risk) — we REJECT
+    (never mint) rather than build a naked leg. The 4-leg structure is run through
+    ``options_gate`` (which classifies it DEFINED_RISK because each short is covered
+    by a same-right, same-or-later-expiry long, and caps the max_loss within the
+    position envelope).
+
+    DEFAULT-OFF: this function is always callable (for tests), but the CALLER in the
+    strategy-selection table only EXISTS when ``HERMES_QUANT_IRON_CONDOR=1`` (see
+    structure_select.py). The gate itself (options_gate) further requires
+    ``HERMES_QUANT_OPTIONS_GATE=1``; without it this raises ``OptionsGateDisabled``.
+
+    Returns a MultiLegBuildResult with:
+      * admitted=True, proposal=<minted via from_gate_result> on gate ADMIT.
+      * admitted=False, proposal=None on gate REJECT or non-finite inputs.
+    """
+    from hermes_quant.options.data import NetGreeks
+    from hermes_quant.options.occ import parse_occ
+
+    cfg = cfg or OptionsRiskConfig()
+    portfolio_net_greeks = portfolio_net_greeks or NetGreeks.zero()
+
+    if chain is None:
+        if reader is None:
+            reader = ChainSnapshotReader()
+        chain = reader.replay_chain(symbol, asof)
+
+    spot = float(chain.underlying_spot)
+    if spot <= 0:
+        raise RecipeBuildError(f"non-positive underlying spot for {symbol}: {spot}")
+
+    # --- PUT side (short bull-put spread, BELOW spot). ---
+    # Reuse the verticals' exact selection machinery: short ~0.30-delta OTM put +
+    # the narrowest valid further-OTM (lower-strike) protective put on the same
+    # expiry. _eligible_snapshots already filters NaN/inf mids (math.isfinite) and
+    # missing deltas, so a non-finite wing mid is ABSTAINED here (it never enters the
+    # candidate list) — never coerced to free protection.
+    put_snaps = _eligible_snapshots(chain, right="P", dte_min=dte_min, dte_max=dte_max)
+    short_put = _pick_by_target_delta(put_snaps, target_delta=target_delta)
+    short_put_expiry = parse_occ(short_put.symbol).expiry
+    long_put = _pick_long_put(put_snaps, short=short_put)
+
+    # --- CALL side (short bear-call spread, ABOVE spot) on the SAME expiry. ---
+    # Constrain the call legs to the SAME expiry as the put short so all four legs
+    # share one expiration (the defining property of an iron condor; a calendar
+    # mismatch would not be a condor and the gate's same-or-later-expiry cover test
+    # could mis-classify). Fail-closed: no same-expiry call => RecipeBuildError.
+    call_snaps_all = _eligible_snapshots(chain, right="C", dte_min=dte_min, dte_max=dte_max)
+    call_snaps = [s for s in call_snaps_all if parse_occ(s.symbol).expiry == short_put_expiry]
+    if not call_snaps:
+        raise RecipeBuildError(
+            f"iron_condor: no eligible call legs on the put expiry {short_put_expiry} "
+            f"for {symbol} — cannot form a same-expiry condor"
+        )
+    short_call = _pick_by_target_delta(call_snaps, target_delta=target_delta)
+    long_call = _pick_long_call(call_snaps, short=short_call)
+
+    short_put_leg = _snapshot_to_short_leg(short_put)
+    long_put_leg = _snapshot_to_long_leg(long_put)
+    short_call_leg = _snapshot_to_short_leg(short_call)
+    long_call_leg = _snapshot_to_long_leg(long_call)
+
+    short_put_strike = float(parse_strike(short_put.symbol))
+    long_put_strike = float(parse_strike(long_put.symbol))
+    short_call_strike = float(parse_strike(short_call.symbol))
+    long_call_strike = float(parse_strike(long_call.symbol))
+
+    # NO-NAKED assertion (defense-in-depth): both protective wings MUST be present.
+    # _pick_long_put / _pick_long_call already raise RecipeBuildError when no
+    # qualifying wing exists, so reaching here means both wings were found; we assert
+    # the leg list explicitly so a future refactor can never silently drop a wing and
+    # mint a naked-short side (the gate would also reject a missing-wing structure as
+    # NAKED, but we fail-closed BEFORE the gate to never even attempt it).
+    option_legs = (short_put_leg, long_put_leg, short_call_leg, long_call_leg)
+    longs = [leg for leg in option_legs if leg.side == "buy"]
+    shorts = [leg for leg in option_legs if leg.side == "sell"]
+    if len(longs) != 2 or len(shorts) != 2:
+        raise RecipeBuildError(
+            f"iron_condor: expected exactly 2 short + 2 long legs (no naked side); "
+            f"got {len(shorts)} short, {len(longs)} long"
+        )
+
+    short_put_mid = _finite_mid(short_put.mid)
+    long_put_mid = _finite_mid(long_put.mid)
+    short_call_mid = _finite_mid(short_call.mid)
+    long_call_mid = _finite_mid(long_call.mid)
+
+    # --- Condor economics (per share, not yet x100). ---
+    put_width = short_put_strike - long_put_strike   # > 0 by _pick_long_put
+    call_width = long_call_strike - short_call_strike  # > 0 by _pick_long_call
+    put_credit = short_put_mid - long_put_mid
+    call_credit = short_call_mid - long_call_mid
+    total_net_credit = put_credit + call_credit       # per share
+
+    # The two wings can NEVER both lose: only the breached side realizes its width,
+    # so max_loss is governed by the WIDER wing minus the TOTAL credit collected.
+    max_width = max(put_width, call_width)
+
+    if not math.isfinite(put_width) or put_width <= 0:
+        raise RecipeBuildError(
+            f"iron_condor: non-positive put_width={put_width:.4f} "
+            f"(short={short_put_strike}, long={long_put_strike})"
+        )
+    if not math.isfinite(call_width) or call_width <= 0:
+        raise RecipeBuildError(
+            f"iron_condor: non-positive call_width={call_width:.4f} "
+            f"(short={short_call_strike}, long={long_call_strike})"
+        )
+
+    # max_loss = (max_width - total_net_credit) * 100 per condor. MUST be finite +
+    # positive (a non-positive net credit, or a non-finite credit, means the
+    # structure is uneconomical / fabricated). Fail CLOSED: never mint with a
+    # fabricated or non-finite max_loss. The gate re-derives this same closed form
+    # (max_width as `width`, total_net_credit as `net_credit`) and enforces the cap.
+    max_loss_per_contract = (max_width - max(total_net_credit, 0.0)) * 100
+    if (
+        not math.isfinite(total_net_credit)
+        or total_net_credit <= 0
+        or not math.isfinite(max_loss_per_contract)
+        or max_loss_per_contract <= 0
+    ):
+        logger.info(
+            "options.recipes: %s iron_condor non-finite/non-positive credit=%s or "
+            "max_loss=%s; rejecting before gate",
+            symbol,
+            total_net_credit,
+            max_loss_per_contract,
+        )
+        from hermes_quant.risk.options_gate import StructureBucket
+        return MultiLegBuildResult(
+            admitted=False,
+            proposal=None,
+            bucket=StructureBucket.DEFINED_RISK,
+            reason="iron_condor_credit_or_max_loss_not_finite_or_nonpositive",
+            contracts=0,
+        )
+
+    premium_received = total_net_credit * 100.0   # per condor (credit collected)
+    # The gate's `strike` (pin-risk / moneyness) anchor: use the short PUT strike
+    # (the lower breach boundary). Both shorts are OTM by construction; either is a
+    # valid anchor for the min-DTE / pin-risk envelope which keys on moneyness.
+    gate_strike = short_put_strike
+    min_dte = min(short_put.dte, short_call.dte)
+
+    # ADR-0084 O8 carrier (DEFAULT-OFF, additive — same pattern as the verticals). A
+    # net-credit condor is theta-COLLECTING / vega-SHORT, so O8 is a no-op for it
+    # even when enabled; we still forward the asof for the gate's fail-closed
+    # decision_asof contract when the master flag is on.
+    if os.environ.get(_EVENT_RISK_FLAG, "0") == "1":
+        gate_event_risk: Mapping | None = event_risk
+        gate_decision_asof: datetime | None = asof
+    else:
+        gate_event_risk = None
+        gate_decision_asof = None
+
+    legs = list(option_legs)
+    gate_result = options_gate(
+        legs,
+        strategy_kind="iron_condor",
+        underlying=symbol.upper(),
+        spot=spot,
+        nav=nav,
+        held_shares=0,
+        options_buying_power=options_buying_power,
+        premium_received=premium_received,
+        portfolio_net_greeks=portfolio_net_greeks,
+        total_bpr=total_bpr,
+        cfg=cfg,
+        composite_intent=None,
+        strike=gate_strike,
+        width=max_width,
+        net_credit=max(total_net_credit, 0.0),
+        net_debit=0.0,  # a condor is a net-credit structure by construction
+        premium_paid=0.0,
+        basis_per_share=None,
+        min_dte=min_dte,
+        open_strategies_on_underlying=open_strategies_on_underlying,
+        event_risk=gate_event_risk,
+        decision_asof=gate_decision_asof,
+    )
+
+    if not gate_result.admitted:
+        logger.info(
+            "options.recipes: %s iron_condor gate-rejected: %s",
+            symbol,
+            gate_result.reason,
+        )
+        return MultiLegBuildResult(
+            admitted=False,
+            proposal=None,
+            bucket=gate_result.bucket,
+            reason=gate_result.reason,
+            contracts=gate_result.contracts,
+        )
+
+    contracts = max(int(gate_result.contracts), 1)
+
+    # Net price: TOTAL credit received (put_credit + call_credit) per share * 100 *
+    # contracts. Stored as NEGATIVE Decimal (credit-received convention, matching
+    # CC/CSP/BPS/BCS). Sum the four legs' Decimal premiums by side so the rounding is
+    # done once on the aggregate.
+    net_credit_per_contract = (
+        (Decimal(str(short_put_mid)) + Decimal(str(short_call_mid))) * 100
+        - (Decimal(str(long_put_mid)) + Decimal(str(long_call_mid))) * 100
+    )
+    net_debit_credit = (-net_credit_per_contract * Decimal(contracts)).quantize(
+        Decimal("0.01")
+    )
+
+    if proposal_id is None:
+        proposal_id = _mint_proposal_id(symbol, asof)
+
+    # Two breakevens (the condor profits BETWEEN them): the short put strike minus the
+    # total credit (lower breakeven) and the short call strike plus the total credit
+    # (upper breakeven).
+    lower_be = Decimal(str(short_put_strike - max(total_net_credit, 0.0)))
+    upper_be = Decimal(str(short_call_strike + max(total_net_credit, 0.0)))
+
+    proposal = MultiLegProposal.from_gate_result(
+        gate_result=gate_result,
+        proposal_id=proposal_id,
+        asof=asof,
+        strategy_kind="iron_condor",
+        underlying=symbol.upper(),
+        option_legs=option_legs,
+        stock_leg=None,
+        outer_qty=contracts,
+        net_debit_credit=net_debit_credit,
+        max_gain=Decimal(str(round(premium_received * contracts, 2))),
+        breakeven_underlying=(lower_be, upper_be),
+        rationale=(
+            f"iron_condor on {symbol.upper()} @ put {long_put_strike}/{short_put_strike} "
+            f"+ call {short_call_strike}/{long_call_strike} dte={min_dte}; "
+            f"put_width={put_width:.2f} call_width={call_width:.2f} "
+            f"net_credit={total_net_credit:.4f}/share "
             f"max_loss={max_loss_per_contract:.2f}/contract; "
             f"gate bucket {gate_result.bucket.value}, {contracts} contract(s)"
         ),

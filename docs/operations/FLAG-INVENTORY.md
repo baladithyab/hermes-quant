@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**80 flags** (resolvable default).
+**81 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -42,6 +42,7 @@
 | `HERMES_QUANT_IC_DEDUP_THRESHOLD` | `0.99` | `hermes_quant/factors/ic_dedup.py:75` |
 | `HERMES_QUANT_INSIDER_ANALYST` | `0` | `hermes_quant/analysts/insider.py:98` |
 | `HERMES_QUANT_INSIDER_ENABLED` | `0` | `hermes_quant/evidence/adapters/form4.py:93` |
+| `HERMES_QUANT_IRON_CONDOR` | `0` | `hermes_quant/options/structure_select.py:155` |
 | `HERMES_QUANT_JOURNAL_PATH` | `` | `hermes_quant/journal/writer.py:33` |
 | `HERMES_QUANT_KNOWLEDGE_CUTOFF` | `` | `hermes_quant/eval/stockbench.py:47` |
 | `HERMES_QUANT_LLM_BUDGET` | `0` | `hermes_quant/agents/llm_budget.py:176` |
@@ -80,14 +81,14 @@
 | `HERMES_QUANT_SIGNED_EQUITY` | `0` | `hermes_quant/state/portfolio_state.py:214` |
 | `HERMES_QUANT_SLIPPAGE_HAIRCUT` | `0` | `hermes_quant/risk/slippage_haircut.py:70` |
 | `HERMES_QUANT_STACKING` | `0` | `hermes_quant/aggregators/bma.py:277` |
-| `HERMES_QUANT_STRUCTURE_SELECT` | `0` | `hermes_quant/options/structure_select.py:119` |
+| `HERMES_QUANT_STRUCTURE_SELECT` | `0` | `hermes_quant/options/structure_select.py:133` |
 | `HERMES_QUANT_TAKE_PROFIT_SWEEP` | `0` | `hermes_quant/autonomous.py:1625` |
 | `HERMES_QUANT_TICK_LOCK` | `1` | `hermes_quant/react/paper.py:261` |
 | `HERMES_QUANT_TICK_LOCK_TIMEOUT_S` | `` | `hermes_quant/daemon/tick_lock.py:88` |
 | `HERMES_QUANT_TP_TRANCHE` | `0` | `hermes_quant/autonomous.py:1634` |
 | `HERMES_QUANT_TRADER_LLM` | `0` | `hermes_quant/agents/trader.py:504` |
 | `HERMES_QUANT_TREND_VELOCITY` | `0` | `hermes_quant/catalyst/synthesize.py:211` |
-| `HERMES_QUANT_VERTICAL_SPREADS` | `0` | `hermes_quant/options/structure_select.py:129` |
+| `HERMES_QUANT_VERTICAL_SPREADS` | `0` | `hermes_quant/options/structure_select.py:143` |
 | `HERMES_QUANT_WATCHLIST_CAP_TRIM` | `0` | `hermes_quant/playbook/watchlist_evolution.py:169` |
 | `HERMES_QUANT_WATCH_REGISTRY` | `0` | `hermes_quant/autonomous.py:1643` |
 | `HERMES_QUANT_WEEKLY_RETRO` | `1` | `hermes_quant/aggregators/llm_committee.py:350` |

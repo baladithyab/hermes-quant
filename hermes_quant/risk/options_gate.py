@@ -585,6 +585,24 @@ def options_gate(
     shorts = _short_option_legs(legs)
     structural_contracts = sum(leg.ratio_qty for leg in shorts) or 1
 
+    # ADR-0098 Step 5 (iron condor): an iron condor is a SINGLE defined-risk credit
+    # UNIT built from a short put-spread + a short call-spread on the same
+    # underlying/expiry. It carries TWO short legs (one put, one call), so the
+    # generic `sum(short ratio_qty)` would read it as TWO structural contracts and
+    # (a) DOUBLE the closed-form max_loss / BPR (the two wings can NEVER both lose —
+    # only the breached side realizes its width) and (b) DOUBLE the aggregated greek
+    # footprint. Both are wrong for the one-unit condor. A balanced condor's unit
+    # count is the shared per-side ratio_qty (both wings scale together), which is
+    # `sum(short ratio_qty) // number_of_short_legs`. Fail-closed: an UNBALANCED
+    # short-leg count (not exactly 2, or an odd ratio sum) falls back to the generic
+    # sum (conservative over-count), never silently under-counts. This keeps the
+    # `_max_loss` / `_bpr` closed forms (which expect the MAX wing width + the TOTAL
+    # net credit at the unit count) correct for the condor.
+    if strategy_kind == "iron_condor" and len(shorts) == 2:
+        _ratio_sum = sum(leg.ratio_qty for leg in shorts)
+        if _ratio_sum % 2 == 0:
+            structural_contracts = (_ratio_sum // 2) or 1
+
     # Aggregate candidate net greeks first (fail-closed on missing greeks).
     # This MUST come before any per-position check (ADR-0027 D6). Scale by the
     # proposed order quantity (structural_contracts) so a multi-contract order is

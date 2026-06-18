@@ -11,8 +11,8 @@ no network, no I/O). It maps
 
 where ``StrategyKind`` is *exactly* the producer's buildable set
 (``options/recipes.py`` ``StrategyKind`` ≡ ``tools._MULTI_LEG_STRATEGIES`` =
-``{covered_call, cash_secured_put, wheel, bull_put_spread, bear_call_spread}``) and ``None`` means
-**abstain** (silence-by-default → today's equity path).
+``{covered_call, cash_secured_put, wheel, bull_put_spread, bear_call_spread, iron_condor}``)
+and ``None`` means **abstain** (silence-by-default → today's equity path).
 
 What this module is NOT (the rails, ADR-0082 §"Rails preserved"):
 
@@ -22,10 +22,13 @@ What this module is NOT (the rails, ADR-0082 §"Rails preserved"):
     there. The table only narrows the *candidate* ``StrategyKind``; the gate decides
     what (if anything) trades.
   * NOT naked-capable — it only ever emits gate-admissible, collateral-secured /
-    defined-risk-income buckets (CC / CSP / wheel / bull_put_spread / bear_call_spread).
-    Anything outside that set (condors, calendars, straddles, naked shorts) is **not
-    producible** by the existing producers and therefore resolves to ``None``
-    (abstain), never to a structure the producer cannot honestly build.
+    defined-risk buckets (CC / CSP / wheel / bull_put_spread / bear_call_spread /
+    iron_condor). The iron condor (ADR-0098 Step 5) is the NEUTRAL defined-risk credit
+    structure: all four legs are defined-risk (two short legs, each capped by its own
+    long protective wing), so its max_loss is finite and bounded. Anything still
+    outside the producible set (calendars, straddles, naked shorts) is **not
+    producible** and therefore resolves to ``None`` (abstain), never to a structure the
+    producer cannot honestly build.
   * NOT default-on — the selection seam is behind ``HERMES_QUANT_STRUCTURE_SELECT=1``.
     When the flag is OFF (or ``structure_intent`` is absent / ``NONE``, or there is no
     table match, or the intent is a non-producible one), ``select_structure`` returns
@@ -57,11 +60,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "Direction",
+    "IRON_CONDOR_FLAG",
     "IVRegime",
     "STRUCTURE_SELECT_FLAG",
     "VERTICAL_SPREADS_FLAG",
     "classify_iv_regime",
     "direction_from_rating",
+    "iron_condor_enabled",
     "select_structure",
     "select_structure_for_plan",
     "structure_select_enabled",
@@ -78,6 +83,15 @@ STRUCTURE_SELECT_FLAG = "HERMES_QUANT_STRUCTURE_SELECT"
 # today — only CC/CSP/wheel selectable via the PREMIUM_CAPTURE rows). Only a literal
 # "1" enables it (same fail-closed convention as every other money-path flag).
 VERTICAL_SPREADS_FLAG = "HERMES_QUANT_VERTICAL_SPREADS"
+
+# ADR-0098 Step 5: flag that gates the NEUTRAL iron-condor row. DEFAULT-OFF and
+# INDEPENDENT of VERTICAL_SPREADS_FLAG (the condor is a distinct 4-leg structure; the
+# operator may enable single-side verticals without enabling neutral condors, or vice
+# versa). When absent, the (NEUTRAL, defined_risk_credit, HIGH) row simply DOES NOT
+# EXIST in the effective table — select_structure returns None for that triple, so the
+# path is byte-identical to today. Only a literal "1" enables it (same fail-closed
+# convention as every money-path flag).
+IRON_CONDOR_FLAG = "HERMES_QUANT_IRON_CONDOR"
 
 # IV-rank classification cut points (percent points, 0..100). ADR-0082 STARTING
 # POINTS; eval-gated. Half-open so every finite IV-rank lands in exactly one regime:
@@ -127,6 +141,18 @@ def vertical_spreads_enabled() -> bool:
     rows for defined_risk_credit are masked at read time). A literal ``"1"`` is the
     ONLY enabling value — fail-closed, same convention as every money-path flag."""
     return os.environ.get(VERTICAL_SPREADS_FLAG, "0") == "1"
+
+
+def iron_condor_enabled() -> bool:
+    """True iff the NEUTRAL iron-condor row is enabled (``=1``). Default-OFF.
+
+    ADR-0098 Step 5: gates the single (NEUTRAL, defined_risk_credit, HIGH) row.
+    When OFF, ``select_structure`` NEVER returns ``'iron_condor'`` (the row is
+    masked at read time — the SELECTION is suppressed to None, byte-identical to
+    today). INDEPENDENT of ``vertical_spreads_enabled`` (a distinct 4-leg structure).
+    A literal ``"1"`` is the ONLY enabling value — fail-closed, same convention as
+    every money-path flag."""
+    return os.environ.get(IRON_CONDOR_FLAG, "0") == "1"
 
 
 def classify_iv_regime(iv_rank: float) -> IVRegime | None:
@@ -226,10 +252,19 @@ _STRUCTURE_TABLE: dict[tuple[Direction, str, IVRegime], str] = {
     # view while capping max loss via the long call protection leg. Only MID/HIGH IV
     # (thin premium at LOW IV makes the spread uneconomical). The call-side mirror of
     # the bull put spread; together they form both iron-condor wings (ADR-0098 Step 3).
-    # NEUTRAL defined-risk-credit rows are intentionally ABSENT until a producer for
-    # iron condors (the neutral defined-risk-credit structure) exists.
     (Direction.BEARISH, "defined_risk_credit", IVRegime.MID): "bear_call_spread",
     (Direction.BEARISH, "defined_risk_credit", IVRegime.HIGH): "bear_call_spread",
+    # --- NEUTRAL DEFINED_RISK_CREDIT: ADR-0098 Step 5 (iron_condor). ---
+    # Neutral defined-risk credit: the iron condor — a short bull-put spread + a short
+    # bear-call spread on the same underlying/expiry. The highest risk-adjusted
+    # admissible NEUTRAL structure for HIGH-IV regimes (Wysocki & Slepaczuk 2024):
+    # rich premium funds both wings and the wide profit zone is most likely held when
+    # IV is elevated. HIGH IV ONLY — at MID IV the credit is too thin for a four-leg
+    # structure to clear its breakevens, so MID/LOW NEUTRAL rows are intentionally
+    # ABSENT (abstain). This row is MASKED by select_structure when
+    # HERMES_QUANT_IRON_CONDOR != "1" (the flag gate lives in select_structure, not the
+    # table literal — single source of truth, eval-toggleable without editing the table).
+    (Direction.NEUTRAL, "defined_risk_credit", IVRegime.HIGH): "iron_condor",
     # DEFINED_RISK_DEBIT / LONG_PREMIUM are intentionally ABSENT for every
     # (stance, regime) because no producer for them exists yet; they resolve to
     # None (abstain) until a producer exists.
@@ -277,15 +312,23 @@ def select_structure(
 
     result = _STRUCTURE_TABLE.get((direction, structure_intent.value, regime))
 
-    # ADR-0098 Step 2: mask defined_risk_credit table results when the vertical
-    # spreads flag is OFF (default). This preserves byte-identity: the only change
-    # relative to today is that a DEFINED_RISK_CREDIT intent now maps to
-    # 'bull_put_spread' in the table, but the selection is suppressed to None
-    # (abstain -> equity path) until the operator sets HERMES_QUANT_VERTICAL_SPREADS=1.
+    # ADR-0098 Step 2 / Step 5: mask defined_risk_credit table results behind their
+    # OWN flag (default-OFF). This preserves byte-identity: a DEFINED_RISK_CREDIT
+    # intent maps to a concrete kind in the table, but the selection is suppressed to
+    # None (abstain -> equity path) until the operator sets the matching flag. The
+    # masking is keyed on the RESULT kind, not the intent, because the single
+    # defined_risk_credit intent now resolves to THREE different structures behind TWO
+    # INDEPENDENT flags:
+    #   * bull_put_spread / bear_call_spread (the single-side verticals, Step 2/3) ->
+    #     HERMES_QUANT_VERTICAL_SPREADS
+    #   * iron_condor (the neutral 4-leg condor, Step 5) -> HERMES_QUANT_IRON_CONDOR
     # A PREMIUM_CAPTURE / DEFINED_RISK_DEBIT / LONG_PREMIUM result is unaffected.
     if result is not None and structure_intent.value == "defined_risk_credit":
-        if not vertical_spreads_enabled():
-            return None  # flag OFF -> abstain (byte-identical to today).
+        if result == "iron_condor":
+            if not iron_condor_enabled():
+                return None  # iron-condor flag OFF -> abstain (byte-identical).
+        elif not vertical_spreads_enabled():
+            return None  # vertical-spreads flag OFF -> abstain (byte-identical).
 
     return result
 
