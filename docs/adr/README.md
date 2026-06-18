@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-97 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
+98 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
 
 Status vocabulary: proposed | accepted | rejected | deprecated | superseded by ADR-NNNN. A compound status (e.g. "Part A accepted; Part B proposed") is the ADR's own — see the file.
 
@@ -96,10 +96,11 @@ Status vocabulary: proposed | accepted | rejected | deprecated | superseded by A
 | [ADR-0090](ADR-0090-sizing-aware-portfolio-backtest-mode.md) | Sizing-aware multi-name portfolio backtest mode for trustworthy flag verdicts | Proposed (2026-06-08) — design + rationale pinned; build DEFERRED to operator greenlight (substantial new harness mode) | 2026-06-08 |
 | [ADR-0091](ADR-0091-reactors-emit-traded-delta.md) | Resolve the fill-size delta-vs-target accounting defect (carry-forward fold, not producer rewrite) | accepted | 2026-06-10 |
 | [ADR-0092](ADR-0092-shared-pdr-core-two-integration-shells.md) | Extract a shared host-agnostic PDR core; hermes-quant and cowork-quant become thin integration shells over it | proposed | 2026-06-12 |
-| [ADR-0093](ADR-0093-host-neutral-product-name.md) | Adopt a host-neutral product name for the shared PDR core; "hermes-quant" is demoted to a shell name | accepted (2026-06-17) — codename "Aegis" chosen (operator write-in); name-only, no code move | 2026-06-17 |
+| [ADR-0093](ADR-0093-host-neutral-product-name.md) | Adopt a host-neutral product name for the shared PDR core; "hermes-quant" is demoted to a shell name | proposed | 2026-06-17 |
 | [ADR-0094](ADR-0094-deliberation-adapters.md) | Pluggable deliberation adapters — full host delegation when embedded, bounded by a provider-blind boundary | proposed | 2026-06-17 |
 | [ADR-0095](ADR-0095-single-contract-source-of-truth.md) | One canonical contract — collapse the duplicated AnalystView / Proposal / Fill definitions | proposed | 2026-06-17 |
 | [ADR-0096](ADR-0096-pre-autonomous-decision-quality-gates.md) | Pre-autonomous decision-quality gates — correlation sizing, human-filter honesty, calibration warm-up, regime uncertainty | proposed | 2026-06-17 |
 | [ADR-0097](ADR-0097-paper-vs-live-slippage-haircut.md) | Paper-vs-live slippage haircut — make the paper track record live-realistic before it gates capital | proposed | 2026-06-17 |
 | [ADR-0098](ADR-0098-options-strategy-taxonomy-and-two-level-multileg.md) | AEGIS strategy taxonomy (admissible structures) + the 2-level multi-leg model | proposed | 2026-06-17 |
 | [ADR-0099](ADR-0099-tpsl-strategy-and-clean-window-gates.md) | TP/SL strategy (tranche/trailing/greeks), stock-options parity, and the clean-window gates | proposed | 2026-06-17 |
+| [ADR-0100](ADR-0100-openbb-perception-provider-and-source-parity.md) | OpenBB as a host-blind Perception provider + TradingAgents source parity | proposed | 2026-06-17 |
