@@ -326,7 +326,44 @@ def build_multi_leg_proposal(
     producer is inert without the flag), and mints the proposal via ``from_gate_result``
     ONLY when the gate admits. On a gate reject, ``proposal`` is None and the verdict is
     returned for the caller to log/persist-for-audit.
+
+    DISPATCH (ADR-0098): the CC/CSP/wheel fall-through below only knows right="C"/"P",
+    so a ``bull_put_spread`` / ``bear_call_spread`` would be MIS-BUILT as a covered call
+    (right defaults to "C" for anything != cash_secured_put — wrong legs, wrong
+    max_loss, wrong strategy_kind). Those defined-risk credit verticals have dedicated
+    builders; delegate to them at the top so the AUTONOMOUS path
+    (build_and_persist_multi_leg) routes correctly, matching the TOOL path's dispatch.
+    The spread builders are themselves gated by HERMES_QUANT_OPTIONS_GATE (and their
+    CALLER seam by HERMES_QUANT_VERTICAL_SPREADS), so a flag-OFF caller still abstains
+    => byte-identical.
     """
+    if strategy_kind in ("bull_put_spread", "bear_call_spread"):
+        _spread_builder = (
+            build_bull_put_spread_proposal
+            if strategy_kind == "bull_put_spread"
+            else build_bear_call_spread_proposal
+        )
+        # Forward only the kwargs the spread builders accept (they do NOT take
+        # held_shares / open_assignment_cash / composite_intent — those are
+        # CC/CSP-specific). source_recipe_id is left to each builder's own default.
+        return _spread_builder(
+            symbol=symbol,
+            asof=asof,
+            chain=chain,
+            reader=reader,
+            nav=nav,
+            options_buying_power=options_buying_power,
+            total_bpr=total_bpr,
+            portfolio_net_greeks=portfolio_net_greeks,
+            open_strategies_on_underlying=open_strategies_on_underlying,
+            cfg=cfg,
+            target_delta=target_delta,
+            dte_min=dte_min,
+            dte_max=dte_max,
+            proposal_id=proposal_id,
+            event_risk=event_risk,
+        )
+
     from hermes_quant.options.data import NetGreeks
 
     cfg = cfg or OptionsRiskConfig()
