@@ -30,7 +30,7 @@ catches this failure mode. That is why it was built.
 > (`~/.hermes/scripts/quant-autonomous-tick-armed.sh`), NOT `~/.hermes/.env`. The
 > wrapper currently exports `HERMES_QUANT_REFLECTION=1`, `HERMES_QUANT_PORTFOLIO_CAPS=1`,
 > `HERMES_QUANT_PAPER_SLIPPAGE_MODEL=v0.2`, `HERMES_QUANT_DETERMINISTIC_EQUITY=1`.
-> It does NOT export the four protective flags below. Arming them means adding the
+> It does NOT export the protective flags below. Arming them means adding the
 > `export` lines to that wrapper (or `~/.hermes/.env` if you prefer a global default).
 
 ## The ordered arming sequence (DO IN THIS ORDER)
@@ -61,7 +61,7 @@ python3 ops/scripts/quant-reset-paper-book.py \
     --state-db ~/.hermes/quant/state.db --bus ~/.hermes/quant/executions.jsonl --apply --yes
 ```
 
-### Step 2 — arm the four protective flags
+### Step 2 — arm the protective flags
 
 Add these to `~/.hermes/scripts/quant-autonomous-tick-armed.sh` (alongside the
 existing `export` lines):
@@ -74,6 +74,10 @@ export HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1
 # P1 — the new per-position unrealized-loss stop (8% position-level default = 1.6% NAV).
 #      The ONLY rail that catches a single open position bleeding (the ASTS failure mode).
 export HERMES_QUANT_PER_POSITION_STOP=1
+
+# P1 — take-profit sweep. Required with PER_POSITION_STOP for an AG-EQ-1 clean
+#      window because the evidence claim is SL+TP, not stop-loss-only.
+export HERMES_QUANT_TAKE_PROFIT_SWEEP=1
 
 # P1 — the absolute-target normalizer fold (ADR-0091 Option E). MUST come AFTER the
 #      Step-1 reset: flipping it against a flag-OFF-built state.db is HARD-REFUSED

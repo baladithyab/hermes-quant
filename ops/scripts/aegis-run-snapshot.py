@@ -33,7 +33,7 @@ import json
 import math
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # The flags whose ON/OFF state defines whether the safety rails are armed for this run.
@@ -52,23 +52,29 @@ from pathlib import Path
 # but if it is armed at GATE-0 t0 and silently disarmed mid-window, that shifts the
 # position-sizing behaviour the window's evidence was recorded under — a drift the
 # operator must see on the run-card, not have it stay invisible.
+#
+# f359: SLIPPAGE_GATE is the live-decision ADR-0097 haircut rail. Track it
+# separately from SLIPPAGE_HAIRCUT (the evidence-series haircut) so a window can
+# prove both decision admission and evidence marking were armed or explicitly off.
 _RAIL_FLAGS = [
     "HERMES_QUANT_PORTFOLIO_CAPS",
     "HERMES_QUANT_PAPER_SLIPPAGE_MODEL",
     "HERMES_QUANT_DETERMINISTIC_EQUITY",
     "HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE",
     "HERMES_QUANT_PER_POSITION_STOP",
+    "HERMES_QUANT_TAKE_PROFIT_SWEEP",
     "HERMES_QUANT_POST_LOSS_COOLDOWN",
     "HERMES_QUANT_DELTA_NORMALIZER",
     "HERMES_QUANT_ACCOUNT_LOCK",
     "HERMES_QUANT_SLIPPAGE_HAIRCUT",
+    "HERMES_QUANT_SLIPPAGE_GATE",
     "HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING",
     "HERMES_QUANT_REFLECTION",
 ]
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _runs_root(home: Path) -> Path:
@@ -126,7 +132,9 @@ def compute_snapshot(home: Path, bus: Path) -> dict:
         for (acct, _ac, asset), lots in open_lots.items():
             if acct != "paper-default":
                 continue
-            net = sum(l["qty"] if l["side"] == "buy" else -l["qty"] for l in lots)
+            net = sum(
+                lot["qty"] if lot["side"] == "buy" else -lot["qty"] for lot in lots
+            )
             if abs(net) > 1e-9:
                 open_book[asset] = round(net, 4)
         snap["open_positions"] = open_book
@@ -183,7 +191,7 @@ def _anchor_t0(home: Path) -> datetime | None:
     except (TypeError, ValueError):
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt
 
 
@@ -245,9 +253,35 @@ def write_run_card(run_dir: Path, home: Path | None = None) -> dict:
         card["window_armed_flags"] = None
         card["armed_source"] = "live_env (NO GATE-0 anchor found — window not anchored)"
 
+    pooling = _pooling_diagnostics()
+    if pooling is not None:
+        card["hierarchical_pooling"] = pooling
+
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run-card.json").write_text(json.dumps(card, indent=2) + "\n", encoding="utf-8")
     return card
+
+
+def _pooling_diagnostics() -> dict | None:
+    """Return ag03 pooling diagnostics for the actual AEGIS run-card.
+
+    The generic run-card helper can render this when a caller passes diagnostics,
+    but this script is the operator-facing AEGIS snapshot path. Keep it default-OFF
+    and non-fatal: if the rail is off, emit nothing; if status read fails, record a
+    small error block instead of crashing the snapshot.
+    """
+    if os.environ.get("HERMES_QUANT_HIERARCHICAL_POOLING", "0") != "1":
+        return None
+    try:
+        from hermes_quant.aggregators.bma import BMAAggregator
+
+        status = BMAAggregator().status()
+        pooling = status.get("hierarchical_pooling")
+        if isinstance(pooling, dict):
+            return pooling
+        return {"error": "hierarchical_pooling_status_missing"}
+    except Exception as exc:  # noqa: BLE001 - run-card visibility must not crash
+        return {"error": str(exc)[:200]}
 
 
 def human_summary(snap: dict) -> str:

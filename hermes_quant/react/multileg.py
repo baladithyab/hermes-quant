@@ -259,24 +259,29 @@ class MultiLegPaperReactor:
         # over-cap family is SILENCED (no-fill parent), mirroring the equity path's
         # full-silence outcome. With the flag unset this is a bit-identical no-op:
         # the family fills exactly as before (no import, no state read).
-        cap_silence = self._portfolio_cap_silence(
-            proposal,
-            leg_fills=leg_fills,
-            multi_leg_id=multi_leg_id,
-            client_order_id=client_order_id,
-            asof_decision=asof_decision,
-            asof_execution=now,
-            fill_size_pct=fill_size_pct,
-            approver_user_id=approver_user_id,
-            play_tag=play_tag,
-        )
-        if cap_silence is not None:
-            logger.info(
-                "multileg-react: %s SILENCED by portfolio gross cap "
-                "(PORTFOLIO_CAPS=1); nothing written",
-                multi_leg_id,
+        # A cover_unwind_failed family has already moved the equity cover at the
+        # broker. It must be journaled and reconciled even if later cap checks would
+        # reject opening a fresh family; treating it as silence would hide real
+        # capital movement. Normal fully-filled families still run the cap gate.
+        if parent_status != "cover_unwind_failed":
+            cap_silence = self._portfolio_cap_silence(
+                proposal,
+                leg_fills=leg_fills,
+                multi_leg_id=multi_leg_id,
+                client_order_id=client_order_id,
+                asof_decision=asof_decision,
+                asof_execution=now,
+                fill_size_pct=fill_size_pct,
+                approver_user_id=approver_user_id,
+                play_tag=play_tag,
             )
-            return cap_silence
+            if cap_silence is not None:
+                logger.info(
+                    "multileg-react: %s SILENCED by portfolio gross cap "
+                    "(PORTFOLIO_CAPS=1); nothing written",
+                    multi_leg_id,
+                )
+                return cap_silence
 
         # ── Step 7: build records — Shape (B) (research §3.4). ──────────────────
         parent, children = self._build_records(
@@ -696,12 +701,15 @@ class MultiLegPaperReactor:
             )
             self._guard_result(opt_res, proposal)
         except Exception as exc:  # noqa: BLE001 — short failed AFTER cover filled
-            self._unwind_equity_cover(
+            unwound = self._unwind_equity_cover(
                 backend,
                 proposal,
                 cover_fill=eq_res,
                 client_order_id=client_order_id,
             )
+            if not unwound:
+                fills.append(_fillresult_to_legfill(eq_res))
+                return fills, "cover_unwind_failed", 0.0
             raise self._as_fill_rejected(exc, proposal) from exc
 
         # Both legs filled. Preserve the option-then-equity ``fills`` order the
@@ -719,18 +727,17 @@ class MultiLegPaperReactor:
         *,
         cover_fill: FillResult,
         client_order_id: str,
-    ) -> None:
+    ) -> bool:
         """Best-effort unwind of an already-FILLED equity cover after the short option
         leg failed (e572). Submits the OPPOSITE-signed equity order so the cover does
         not stand alone. Failure to unwind is surfaced LOUDLY (a stranded long stock is
-        defined risk, NOT a naked short — the cardinal invariant still holds — but an
-        operator must know the book carries an un-paired equity leg). Never raises:
-        the caller already fails-closed to a no-fill record; this is the unwind attempt
-        on top of that.
+        defined risk, NOT a naked short — the cardinal invariant still holds — but the
+        caller must journal the un-paired equity leg rather than hiding it behind an
+        audit-only no-fill parent.
         """
         signed_qty = float(getattr(cover_fill, "filled_qty", 0.0) or 0.0)
         if signed_qty == 0.0:
-            return  # cover never moved a position — nothing to unwind
+            return True  # cover never moved a position — nothing to unwind
         basis = (
             float(proposal.stock_leg.basis_per_share)
             if proposal.stock_leg is not None and proposal.stock_leg.basis_per_share
@@ -751,6 +758,7 @@ class MultiLegPaperReactor:
                 proposal.underlying,
                 signed_qty,
             )
+            return True
         except Exception as exc:  # noqa: BLE001 — unwind is best-effort; surface loudly
             logger.error(
                 "multileg-react: %s short option failed after cover filled AND the "
@@ -762,6 +770,7 @@ class MultiLegPaperReactor:
                 signed_qty,
                 proposal.underlying,
             )
+            return False
 
     @staticmethod
     def _guard_result(res: FillResult, proposal: Any) -> None:
@@ -867,6 +876,27 @@ class MultiLegPaperReactor:
             "rho": ng.rho,
         }
         leg_symbols = [f.symbol for f in leg_fills if _is_option(f)]
+        parent_meta = {
+            "multi_leg_id": multi_leg_id,
+            "strategy_kind": proposal.strategy_kind,
+            "outer_qty": proposal.outer_qty,
+            "net_greeks": net_greeks_dict,
+            "client_order_id": client_order_id,
+            "broker_order_id": broker_order_id,
+            "leg_symbols": leg_symbols,
+            "parent_status": parent_status,
+            "risk_gate_bucket": proposal.risk_gate_bucket,
+            "paper": True,
+            "role": "parent",
+        }
+        if parent_status == "cover_unwind_failed":
+            parent_meta.update(
+                {
+                    "partial_fill": True,
+                    "cover_unwind_failed": True,
+                    "requires_manual_reconcile": True,
+                }
+            )
         parent = ExecutionRecord(
             proposal_id=proposal.proposal_id,
             signal_id=None,
@@ -882,19 +912,7 @@ class MultiLegPaperReactor:
             reactor_name=self.name,
             human_in_the_loop=True,
             approver_user_id=approver_user_id,
-            reactor_metadata={
-                "multi_leg_id": multi_leg_id,
-                "strategy_kind": proposal.strategy_kind,
-                "outer_qty": proposal.outer_qty,
-                "net_greeks": net_greeks_dict,
-                "client_order_id": client_order_id,
-                "broker_order_id": broker_order_id,
-                "leg_symbols": leg_symbols,
-                "parent_status": parent_status,
-                "risk_gate_bucket": proposal.risk_gate_bucket,
-                "paper": True,
-                "role": "parent",
-            },
+            reactor_metadata=parent_meta,
             bar_ts=None,
             play_tag=play_tag,
         )

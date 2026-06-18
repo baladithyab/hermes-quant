@@ -64,6 +64,7 @@ OPENBB_ENABLE_FLAG = "HERMES_QUANT_OPENBB"
 # FMP (Financial Modeling Prep) is the concrete 2nd-tier OHLCV source the
 # seed names. OpenBB routes the historical call to it via provider='fmp'.
 _DEFAULT_PROVIDER = "fmp"
+_LATEST_ONLY_OPTIONS_CHAIN_PROVIDERS = frozenset({"cboe", "yfinance"})
 
 # TradingAgents parity (ob00): a newest-bar more than this many days behind
 # the asof horizon is a staleness signal. WARN, never fabricate.
@@ -299,6 +300,41 @@ class OpenBBProvider:
             "openbb equity.price.quote is a latest-only endpoint with no asof "
             "honesty — HARD-REJECTED (ADR-0100 no-lookahead rail). Use fetch_bars "
             "(historical) for point-in-time-safe OHLCV."
+        )
+
+    def fetch_options_chain(
+        self,
+        asset: str,
+        *,
+        as_of: pd.Timestamp | None = None,
+        provider: str = "cboe",
+    ) -> Any:
+        """HARD-REJECT unsafe OpenBB options-chain endpoints.
+
+        ADR-0100 explicitly distinguishes asof-capable historical chain sources
+        from latest-only chain sources. OpenBB's CBOE/yfinance chain routes are
+        latest-only snapshots, so this boundary rejects them before any SDK call
+        can leak current chain state into replay/eval. A future asof-capable
+        implementation must be added as a dated provider path that writes or reads
+        recorded snapshots.
+        """
+        provider_key = str(provider or "").strip().lower()
+        if as_of is None:
+            raise DataProviderError(
+                "openbb options chain read requires an explicit as_of; an asof-less "
+                "chain read is latest-only semantics and is HARD-REJECTED (ADR-0100)."
+            )
+        if provider_key in _LATEST_ONLY_OPTIONS_CHAIN_PROVIDERS:
+            raise DataProviderError(
+                f"openbb derivatives.options.chains via provider={provider_key!r} is "
+                "latest-only with no asof honesty; use recorded ChainSnapshotReader "
+                "data or an explicitly dated historical chain provider instead. "
+                "ADR-0100 forbids latest-only options-chain reads in replay/backtest contexts."
+            )
+        raise DataProviderError(
+            "OpenBB asof-capable options-chain ingestion is not wired yet; use the "
+            "recorded ChainSnapshotReader path until a dated provider boundary is "
+            "implemented and tested."
         )
 
     # ------------------------------------------------------------------

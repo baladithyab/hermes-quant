@@ -84,6 +84,7 @@ class _FakeObb:
     def __init__(self, hist_df: pd.DataFrame):
         self.historical_calls: list[dict] = []
         self.quote_calls: list[dict] = []
+        self.chain_calls: list[dict] = []
         provider = self
 
         class _Price:
@@ -95,7 +96,13 @@ class _FakeObb:
                 provider.quote_calls.append(kwargs)
                 return {"price": 999.0}  # latest-only snapshot — must never escape
 
+        class _Options:
+            def chains(self, **kwargs: Any) -> Any:
+                provider.chain_calls.append(kwargs)
+                return {"chain": "latest-only"}  # must never escape
+
         self.equity = SimpleNamespace(price=_Price())
+        self.derivatives = SimpleNamespace(options=_Options())
 
 
 def _provider(hist_df: pd.DataFrame) -> OpenBBProvider:
@@ -291,6 +298,33 @@ def test_latest_only_quote_hard_rejected():
         "AAPL", "1d", pd.Timestamp("2026-05-01"), pd.Timestamp("2026-06-30")
     )
     assert prov._obb.quote_calls == []  # quote never reached via fetch_bars
+
+
+@pytest.mark.parametrize("provider", ["cboe", "yfinance", "CBOE"])
+def test_latest_only_options_chain_hard_rejected(provider):
+    """d2ef: CBOE/yfinance options chains are latest-only and must not be touched."""
+    df = _historical_frame(["2026-05-27", "2026-05-28", "2026-05-29"])
+    prov = _provider(df)
+
+    with pytest.raises(DataProviderError) as ei:
+        prov.fetch_options_chain("AAPL", as_of=pd.Timestamp("2026-05-29"), provider=provider)
+
+    msg = str(ei.value).lower()
+    assert "latest-only" in msg
+    assert "options-chain" in msg or "options chain" in msg
+    assert prov._obb.chain_calls == []
+
+
+def test_options_chain_without_asof_hard_rejected():
+    """An asof-less chain read is latest-only semantics, even before provider choice."""
+    df = _historical_frame(["2026-05-27", "2026-05-28", "2026-05-29"])
+    prov = _provider(df)
+
+    with pytest.raises(DataProviderError) as ei:
+        prov.fetch_options_chain("AAPL", provider="intrinio")
+
+    assert "latest-only" in str(ei.value).lower()
+    assert prov._obb.chain_calls == []
 
 
 # ===========================================================================

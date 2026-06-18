@@ -5,12 +5,11 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import pytest
-
 _SCRIPT = Path(__file__).resolve().parents[2] / "ops" / "scripts" / "aegis-gate0-start.py"
 _REQUIRED = [
     "HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE",
     "HERMES_QUANT_PER_POSITION_STOP",
+    "HERMES_QUANT_TAKE_PROFIT_SWEEP",
     "HERMES_QUANT_DELTA_NORMALIZER",
     "HERMES_QUANT_ACCOUNT_LOCK",
     # d83b: the ADR-0097 slippage-haircut rail is now REQUIRED (was only
@@ -102,3 +101,22 @@ def test_force_overrides_disarmed_haircut(tmp_path, monkeypatch):
     rc = H.main(["--home", str(tmp_path), "--force"])
     assert rc == 0
     assert (tmp_path / "quant" / "clean_window_start.json").exists()
+
+
+def test_take_profit_sweep_is_required_not_recommended():
+    """2ab1: A clean AG-EQ-1 evidence window must prove SL and TP together.
+
+    RED after the verify-pass refutation: TAKE_PROFIT_SWEEP was only warn-only, so
+    Gate-0 could stamp a "clean" window without the live take-profit exit rail.
+    """
+    assert "HERMES_QUANT_TAKE_PROFIT_SWEEP" in H._REQUIRED_ARMED
+    assert "HERMES_QUANT_TAKE_PROFIT_SWEEP" not in H._RECOMMENDED
+
+
+def test_refuses_when_only_take_profit_disarmed(tmp_path, monkeypatch):
+    for f in _REQUIRED:
+        monkeypatch.setenv(f, "1")
+    monkeypatch.delenv("HERMES_QUANT_TAKE_PROFIT_SWEEP", raising=False)
+    rc = H.main(["--home", str(tmp_path)])
+    assert rc == 2, "GATE-0 must refuse when the required TP rail is disarmed"
+    assert not (tmp_path / "quant" / "clean_window_start.json").exists()

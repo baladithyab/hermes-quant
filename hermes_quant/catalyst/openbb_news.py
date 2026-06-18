@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from hermes_quant.catalyst.ingest import CatalystItem, dedupe_items
@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 # Reuse ob1's OpenBB vendor flag (default-OFF). A quoted-literal default so the
 # flag-inventory scanner counts it.
 OPENBB_ENABLE_FLAG = "HERMES_QUANT_OPENBB"
+NEWS_LOOKBACK_DAYS = 30
 
 
 def _openbb_flag_enabled() -> bool:
@@ -86,8 +87,31 @@ def _parse_published(s: Any) -> datetime | None:
     if dt is None:
         return None
     if dt.tzinfo is None:  # naive -> assume UTC (made explicit)
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _asof_utc(as_of: datetime | None) -> datetime:
+    """Normalize an explicit decision timestamp for OpenBB news reads.
+
+    ADR-0100 requires OpenBB reads to be asof-pinned. A missing ``as_of`` is
+    latest-only semantics, so it is rejected at the boundary instead of silently
+    asking the vendor for "now".
+    """
+    if as_of is None:
+        raise DataProviderError(
+            "OpenBBNews.fetch requires an explicit as_of; an asof-less news read "
+            "is latest-only semantics and is HARD-REJECTED (ADR-0100)."
+        )
+    cutoff = as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=UTC)
+    return cutoff.astimezone(UTC)
+
+
+def _news_window_kwargs(as_of: datetime) -> dict[str, str]:
+    """Return the outbound OpenBB date window for a replay-safe news query."""
+    end = as_of.date()
+    start = (as_of - timedelta(days=NEWS_LOOKBACK_DAYS)).date()
+    return {"start_date": start.isoformat(), "end_date": end.isoformat()}
 
 
 class OpenBBNews:
@@ -155,12 +179,14 @@ class OpenBBNews:
                 (the public ``ingest_openbb_news`` wrapper catches these so a
                 dead feed is non-fatal).
         """
+        cutoff = _asof_utc(as_of)
+        window = _news_window_kwargs(cutoff)
         if symbol:
-            resp = self.obb.news.company(symbol=symbol)
+            resp = self.obb.news.company(symbol=symbol, **window)
         else:
-            resp = self.obb.news.world()
+            resp = self.obb.news.world(**window)
         rows = self._to_rows(resp)
-        return self._map_items(rows, query=query, as_of=as_of)
+        return self._map_items(rows, query=query, as_of=cutoff)
 
     @staticmethod
     def _to_rows(resp: Any) -> list[dict]:
@@ -195,8 +221,8 @@ class OpenBBNews:
         """Map OpenBB news rows to CatalystItems with the as_of no-lookahead window."""
         cutoff = None
         if as_of is not None:
-            cutoff = as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=timezone.utc)
-            cutoff = cutoff.astimezone(timezone.utc)
+            cutoff = as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=UTC)
+            cutoff = cutoff.astimezone(UTC)
 
         items: list[CatalystItem] = []
         for r in rows:

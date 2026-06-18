@@ -58,6 +58,7 @@ ADD these export lines next to the existing ones (DELTA_NORMALIZER MUST come aft
 Step-2 reset — flipping it against a non-reset book is hard-refused by a phantom-sell guard):
   export HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1
   export HERMES_QUANT_PER_POSITION_STOP=1
+  export HERMES_QUANT_TAKE_PROFIT_SWEEP=1
   export HERMES_QUANT_POST_LOSS_COOLDOWN=1
   export HERMES_QUANT_DELTA_NORMALIZER=1
   export HERMES_QUANT_ACCOUNT_LOCK=1
@@ -66,8 +67,8 @@ Also confirm ~/.hermes/config.yaml has under quant.autonomous:
   require_stop_loss: true
 
 STEP 4 — write the run-card (records that the rails are now armed). Run it WITH the armed
-env so the card captures the flags; it must print the 5 flags as armed, NOT "NONE":
-  source ~/.hermes/scripts/quant-autonomous-tick-armed.sh 2>/dev/null  # or export the 5 flags inline
+env so the card captures the flags; it must print the 6 flags as armed, NOT "NONE":
+  source ~/.hermes/scripts/quant-autonomous-tick-armed.sh 2>/dev/null  # or export the 6 flags inline
   ~/.hermes/hermes-agent/venv/bin/python3 ops/scripts/aegis-run-snapshot.py \
       --run-id <RUN_ID> --write-run-card
 
@@ -141,7 +142,7 @@ CONSTRAINTS: HITL only (rail #4 — no order execution); free text never drives 
 
 ## After the window — how to read it (the review checklist)
 
-1. **Was it armed?** `run-card.json` must show the 5 flags set. A window run disarmed is
+1. **Was it armed?** `run-card.json` must show the 6 required flags set. A window run disarmed is
    not a valid test (it measures the old, unsafe behavior).
 2. **Is the book clean?** First post-reset snapshot should show a flat/near-flat book —
    no AAPL +14.15 zombie, no carried loss history.

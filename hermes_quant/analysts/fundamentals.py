@@ -32,6 +32,7 @@ ties return None (silence-by-default).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -158,6 +159,7 @@ class FundamentalsAnalyst:
         *,
         horizon: str = "1M",
         provider: FundamentalsProvider | None = None,
+        openbb_provider: Any | None = None,
         cache_root: Path | None = None,
     ):
         self.horizon = horizon
@@ -165,6 +167,7 @@ class FundamentalsAnalyst:
             cache_root=cache_root
             or (Path.home() / ".hermes" / "quant" / "cache" / "fundamentals")
         )
+        self._openbb_provider = openbb_provider
         self.calibrator = ColdStartCalibrator()
         if isinstance(self.calibrator, ColdStartCalibrator):
             # ADR-0065 v0.6.1-fix-H3: surface cold-start collapse risk.
@@ -239,14 +242,14 @@ class FundamentalsAnalyst:
         try:
             snapshot = self.provider.read_latest(ticker, as_of=asof)
         except FileNotFoundError:
-            return None
+            return self._fetch_openbb_fundamentals(ticker, asof)
         except Exception as exc:  # noqa: BLE001
             logger.debug(
                 "fundamentals: provider.read_latest failed for %s: %s", ticker, exc
             )
-            return None
+            return self._fetch_openbb_fundamentals(ticker, asof)
         if snapshot is None:
-            return None
+            return self._fetch_openbb_fundamentals(ticker, asof)
         # Non-equity quote_type post-check (cs45/cs47). The symbol heuristics
         # above only catch '/' (crypto) and '=X' (fx); a plain ticker with NO
         # asset_class classifies 'equity' and the snapshot is fetched. The
@@ -289,13 +292,13 @@ class FundamentalsAnalyst:
             # so a genuinely-current datum (age in [0, HARD_LIMIT]) is admitted
             # byte-identically.
             if not (0 <= datum_age_days <= self._STALENESS_DATUM_DAYS_HARD_LIMIT):
-                return None
+                return self._fetch_openbb_fundamentals(ticker, asof)
             return snapshot
         # Fallback: no fiscal basis — cron-liveness gate on fetched_at.
         try:
             fetched_at = pd.Timestamp(snapshot["fetched_at"])
         except (KeyError, ValueError, TypeError):
-            return None
+            return self._fetch_openbb_fundamentals(ticker, asof)
         if fetched_at.tzinfo is None:
             fetched_at = fetched_at.tz_localize("UTC")
         age_days = (asof - fetched_at).days
@@ -316,8 +319,71 @@ class FundamentalsAnalyst:
         # last unbounded sibling gate, closing the future-timestamp/staleness
         # family across both freshness axes (datum + cron-liveness).
         if not (0 <= age_days <= self._STALENESS_FETCHED_AT_DAYS_HARD_LIMIT):
-            return None
+            return self._fetch_openbb_fundamentals(ticker, asof)
         return snapshot
+
+    def _fetch_openbb_fundamentals(
+        self, ticker: str, asof: pd.Timestamp
+    ) -> pd.Series | None:
+        """Optional ADR-0100 OpenBB fallback for the cache-backed fundamentals read.
+
+        Default-OFF: unless ``HERMES_QUANT_OPENBB=1`` or a test seam was injected,
+        no OpenBB class is imported and the legacy cache path stays byte-identical.
+        """
+        if (
+            self._openbb_provider is None
+            and os.environ.get("HERMES_QUANT_OPENBB", "0") != "1"
+        ):
+            return None
+        try:
+            provider = self._openbb_provider
+            if provider is None:
+                from hermes_quant.data.openbb_fundamentals import OpenBBFundamentals
+
+                provider = OpenBBFundamentals()
+                self._openbb_provider = provider
+            rows = provider.read_fundamentals(ticker, as_of=asof)
+        except Exception as exc:  # noqa: BLE001 - fallback must never crash the analyst
+            logger.debug("fundamentals: OpenBB fallback failed for %s: %s", ticker, exc)
+            return None
+        if rows is None or len(rows) == 0:
+            return None
+        try:
+            df = rows.copy()
+            df = df.sort_values(["filing_date", "period_ending"]).reset_index(
+                drop=True
+            )
+            row = df.iloc[-1].copy()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "fundamentals: OpenBB fallback normalization failed for %s: %s",
+                ticker,
+                exc,
+            )
+            return None
+
+        def _utc_ts(value: Any) -> pd.Timestamp:
+            ts = pd.Timestamp(value)
+            if ts is pd.NaT or pd.isna(ts):
+                return pd.NaT
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            return ts
+
+        # Shape adapter: preserve the analyst's existing fiscal-basis staleness
+        # gates by mapping OpenBB's period_ending/filing_date columns into the
+        # cache provider's period_end/report_date names.
+        row["period_end"] = _utc_ts(row.get("period_ending"))
+        row["report_date"] = _utc_ts(row.get("filing_date"))
+        row["as_of_date"] = asof.normalize()
+        row["fetched_at"] = asof
+        row["source"] = "openbb"
+        qt = row.get("quote_type")
+        if isinstance(qt, str) and qt.upper() in NON_EQUITY_QUOTE_TYPES:
+            return None
+        return row
 
     @staticmethod
     def _datum_basis(snapshot: pd.Series) -> pd.Timestamp | None:

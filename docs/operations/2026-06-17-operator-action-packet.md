@@ -55,6 +55,7 @@ Summary sequence:
    ```bash
    export HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1   # P0 — arms the real-equity drawdown breaker
    export HERMES_QUANT_PER_POSITION_STOP=1           # P1 — the new 8% per-position stop
+   export HERMES_QUANT_TAKE_PROFIT_SWEEP=1           # P1 — required TP exit rail for a clean AG-EQ-1 window
    export HERMES_QUANT_DELTA_NORMALIZER=1            # P1 — MUST follow step 2 (phantom-sell guard)
    export HERMES_QUANT_POST_LOSS_COOLDOWN=1          # P1 — Rule 4 re-entry cooldown now live
    export HERMES_QUANT_ACCOUNT_LOCK=1                # P2 — closes the cross-symbol cap race

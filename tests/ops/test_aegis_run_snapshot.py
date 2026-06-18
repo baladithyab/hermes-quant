@@ -6,8 +6,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 _SCRIPT = Path(__file__).resolve().parents[2] / "ops" / "scripts" / "aegis-run-snapshot.py"
 
 
@@ -149,6 +147,23 @@ def test_run_card_detects_haircut_rail_drift(tmp_path, monkeypatch):
     assert card["rail_drift"]["HERMES_QUANT_SLIPPAGE_HAIRCUT"] == {"window": "1", "live": None}
 
 
+def test_slippage_gate_tracked_in_rail_flags():
+    """f359: the live decision-gate ADR-0097 rail must be drift-visible too."""
+    assert "HERMES_QUANT_SLIPPAGE_GATE" in H._RAIL_FLAGS, (
+        "the live slippage-gate rail must be tracked so its drift/disarm is detectable"
+    )
+
+
+def test_run_card_detects_slippage_gate_rail_drift(tmp_path, monkeypatch):
+    home = tmp_path / "quant"
+    _write_anchor(home, {"HERMES_QUANT_SLIPPAGE_GATE": "1"})
+    monkeypatch.delenv("HERMES_QUANT_SLIPPAGE_GATE", raising=False)
+    card = H.write_run_card(tmp_path / "run", home=home)
+    assert "rail_drift" in card
+    assert "HERMES_QUANT_SLIPPAGE_GATE" in card["rail_drift"]
+    assert card["rail_drift"]["HERMES_QUANT_SLIPPAGE_GATE"] == {"window": "1", "live": None}
+
+
 # --------------------------------------------------------------------------- #
 # 821d — the ag01 PORTFOLIO_VARIANCE_SIZING rail must be tracked in _RAIL_FLAGS
 # so the run-card's window-vs-live drift detection covers a mid-window disarm of
@@ -193,6 +208,75 @@ def test_gate0_start_lists_variance_sizing():
     # Recommended, not required (ag01 is not yet an armed rail).
     assert "HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING" not in g0._REQUIRED_ARMED, (
         "ag01 must NOT be a required-armed rail yet (no runtime/money-gate change)"
+    )
+
+
+def test_gate0_start_lists_slippage_gate():
+    """f359: Gate-0 must snapshot the live decision slippage rail at t0."""
+    spec = importlib.util.spec_from_file_location(
+        "aegis_gate0_start_f359",
+        Path(__file__).resolve().parents[2] / "ops" / "scripts" / "aegis-gate0-start.py",
+    )
+    g0 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(g0)
+    assert "HERMES_QUANT_SLIPPAGE_GATE" in g0._SNAPSHOT_FLAGS, (
+        "gate0-start must snapshot the live slippage-gate flag at t0"
+    )
+    assert "HERMES_QUANT_SLIPPAGE_GATE" not in g0._REQUIRED_ARMED, (
+        "SLIPPAGE_GATE remains eval-gated/default-OFF; snapshot it without requiring it"
+    )
+
+
+def test_take_profit_sweep_tracked_in_rail_flags():
+    """2ab1: TP is part of the equity evidence rail and must be drift-visible."""
+    assert "HERMES_QUANT_TAKE_PROFIT_SWEEP" in H._RAIL_FLAGS
+
+
+def test_run_card_detects_take_profit_rail_drift(tmp_path, monkeypatch):
+    home = tmp_path / "quant"
+    _write_anchor(home, {"HERMES_QUANT_TAKE_PROFIT_SWEEP": "1"})
+    monkeypatch.delenv("HERMES_QUANT_TAKE_PROFIT_SWEEP", raising=False)
+    card = H.write_run_card(tmp_path / "run", home=home)
+    assert "HERMES_QUANT_TAKE_PROFIT_SWEEP" in card["rail_drift"]
+    assert card["rail_drift"]["HERMES_QUANT_TAKE_PROFIT_SWEEP"] == {
+        "window": "1",
+        "live": None,
+    }
+
+
+def test_gate0_start_requires_take_profit_sweep():
+    spec = importlib.util.spec_from_file_location(
+        "aegis_gate0_start_2ab1",
+        Path(__file__).resolve().parents[2] / "ops" / "scripts" / "aegis-gate0-start.py",
+    )
+    g0 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(g0)
+    assert "HERMES_QUANT_TAKE_PROFIT_SWEEP" in g0._REQUIRED_ARMED
+    assert "HERMES_QUANT_TAKE_PROFIT_SWEEP" not in g0._RECOMMENDED
+
+
+def test_pooling_diagnostics_default_off_absent(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_QUANT_HIERARCHICAL_POOLING", raising=False)
+    card = H.write_run_card(tmp_path / "run", home=tmp_path / "no_quant_here")
+    assert "hierarchical_pooling" not in card
+
+
+def test_pooling_diagnostics_on_included(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_QUANT_HIERARCHICAL_POOLING", "1")
+    monkeypatch.setattr(
+        H,
+        "_pooling_diagnostics",
+        lambda: {
+            "headline_in_warmup": True,
+            "n_cells": 1,
+            "cells": {"kronos|volatile": {"effective_n": 3.0, "warmup": True}},
+        },
+    )
+    card = H.write_run_card(tmp_path / "run", home=tmp_path / "no_quant_here")
+    assert card["hierarchical_pooling"]["headline_in_warmup"] is True
+    assert (
+        card["hierarchical_pooling"]["cells"]["kronos|volatile"]["effective_n"]
+        == 3.0
     )
 
 
@@ -274,7 +358,8 @@ def test_snapshot_options_evidence_green_at_30_over_30_days(tmp_path):
     lines = []
     for i in range(31):
         # close dates spread one per day from 2026-06-05 onward
-        from datetime import datetime as _dt, timedelta as _td
+        from datetime import datetime as _dt
+        from datetime import timedelta as _td
         close = _dt(2026, 6, 5, 15, 35, 36) + _td(days=i)
         openn = close - _td(days=1)
         entry = {

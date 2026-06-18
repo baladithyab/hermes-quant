@@ -125,12 +125,13 @@ a live decision.
 - TradingAgents' own honesty mechanism (date-pinned online/offline cache + a >10-day staleness guard)
   validates the asof-pin approach — adopt the same staleness guard at the AEGIS boundary.
 
-### Consumer cutovers (c7a9 + 2f33, 2026-06-18)
+### Consumer cutovers (c7a9 + 2f33 + 104f, 2026-06-18)
 
-The `ob1` provider + `ob2`/`ob3` analysts existed but were never WIRED into the live
+The `ob1` provider + `ob2`/`ob3` analysts/providers existed but were never WIRED into the live
 advisor path (provider chain registered the openbb vendor in `vendor_routing.VENDOR_LIST`
 but `advisor._get_default_provider` returned a bare `YFinanceProvider`; the estimates/insider
-analysts were not in `advisor._build_default_analysts`). Two default-OFF cutovers close that gap:
+analysts were not in `advisor._build_default_analysts`; fundamentals still only read the yfinance
+cache; OpenBBNews was not called by the catalyst ingest cron). Default-OFF cutovers close that gap:
 
 - **c7a9 — OHLCV live tier.** A NEW flag `HERMES_QUANT_OPENBB_LIVE` (distinct from
   `HERMES_QUANT_OPENBB`, which gates the SDK/provider itself) makes
@@ -150,3 +151,22 @@ analysts were not in `advisor._build_default_analysts`). Two default-OFF cutover
   window), so they stay out of `tests/test_no_lookahead.py`'s bar-temporal enumeration —
   same category as `HermesSemanticAnalyst`.
   Each analyst remains eval-gated before it influences a live decision.
+- **2f33b — FundamentalsAnalyst OpenBB fallback.** `FundamentalsAnalyst` stays yfinance-cache
+  primary, but cache miss / stale / provider-failure paths can now fall through to
+  `OpenBBFundamentals.read_fundamentals(ticker, as_of=...)`. The fallback is default-OFF
+  unless `HERMES_QUANT_OPENBB=1` or an injected provider seam is supplied in tests, and it
+  adapts OpenBB's `period_ending`/`filing_date` columns into the existing
+  `period_end`/`report_date` staleness gates before scoring.
+- **4430 — OpenBB news outbound window pinning.** `OpenBBNews.fetch()` now requires an
+  explicit `as_of` and sends `start_date`/`end_date` to `obb.news.company/world` before
+  applying the existing row-level `published_at <= as_of` post-filter. A missing `as_of`
+  is latest-only semantics and hard-rejected.
+- **104f — OpenBBNews live ingest.** `ops/scripts/quant-catalyst-ingest.py` now calls
+  `ingest_openbb_news("openbb_world", as_of=<UTC now>)` when `HERMES_QUANT_OPENBB=1` and
+  merges those items into the existing classify -> propagate -> synthesize packet path.
+  The producer is non-fatal: failure contributes zero items and, in `--json` mode, records
+  a bounded `openbb_error`.
+- **d2ef — options-chain latest-only boundary.** `OpenBBProvider.fetch_options_chain()`
+  rejects `provider='cboe'` / `provider='yfinance'` before any SDK call because those
+  routes are latest-only snapshots. The only acceptable future implementation is a dated
+  provider boundary feeding the recorded `ChainSnapshotReader` path.

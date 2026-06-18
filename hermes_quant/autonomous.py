@@ -1393,7 +1393,7 @@ def _maybe_take_tranche(
     gain_pct: float,
     watch_reg,  # noqa: ANN001 - WatchRegistry; avoid the import at module top
     paper_zero_costs: bool,
-    result: "TickResult",
+    result: TickResult,
 ) -> bool:
     """Evaluate + execute a tranche/trailing PARTIAL exit (tp1/tp2). Returns True iff a
     tranche action FIRED (a partial exit was attempted) — the caller then skips the
@@ -1497,14 +1497,14 @@ def _maybe_take_tranche(
 def _originate_mleg_proposal(
     *,
     symbol: str,
-    asof: "datetime",
+    asof: datetime,
     advisor_result: dict[str, Any],
     nav: float,
     options_buying_power: float,
     iv_rank: float | None,
     structure_intent: Any = None,
     paper_zero_costs: bool = False,
-    result: "TickResult",
+    result: TickResult,
 ) -> str | None:
     """Originate an OPTIONS (multi-leg) play for a symbol (agdec1/agreact1). Returns the
     execution_id of a filled mleg proposal, or None (abstain) at any missing precondition.
@@ -1528,11 +1528,6 @@ def _originate_mleg_proposal(
     if os.environ.get("HERMES_QUANT_AUTONOMOUS_OPTIONS", "0") != "1":
         return None
     try:
-        from hermes_quant.options.recipes import build_and_persist_multi_leg
-        from hermes_quant.options.structure_select import select_structure_for_plan
-        from hermes_quant.proposals import get_default_store
-        from hermes_quant.react.dispatch import select_reactor
-
         # 1) Distil the structure (deterministic table; abstains -> None on any gap).
         # d9d7: select_structure_for_plan -> direction_from_rating reads rating.signed_intensity,
         # a @property on the PortfolioRating StrEnum. The live advisor_result has NO top-level
@@ -1543,6 +1538,10 @@ def _originate_mleg_proposal(
         # SIGN (the table only keys on sign): +dir -> OVERWEIGHT, -dir -> UNDERWEIGHT, 0 -> HOLD.
         # The LLM never picks legs; this is a deterministic sign distillation, gate stays final.
         from hermes_quant.agents.research_debate.schemas import PortfolioRating
+        from hermes_quant.options.recipes import build_and_persist_multi_leg
+        from hermes_quant.options.structure_select import select_structure_for_plan
+        from hermes_quant.proposals import get_default_store
+        from hermes_quant.react.dispatch import select_reactor
 
         _agg = advisor_result.get("aggregated_signal") or {}
         try:
@@ -1630,7 +1629,7 @@ def _run_per_position_stop_sweep(
     open_book: dict[str, float],
     stop_pct: float,
     paper_zero_costs: bool,
-    result: "TickResult",
+    result: TickResult,
 ) -> set[str]:
     """Force-exit each open position whose unrealized loss breaches the stop threshold.
 
@@ -2796,7 +2795,10 @@ def _reactor_record_is_nofill(record: Any) -> bool:
     if is_mleg_parent:
         outer_qty = rmeta.get("outer_qty")
         parent_status = rmeta.get("parent_status")
-        status_nofill = parent_status is not None and parent_status != "filled"
+        partial_fill = rmeta.get("partial_fill") is True
+        status_nofill = (
+            parent_status is not None and parent_status != "filled" and not partial_fill
+        )
         qty_nofill = isinstance(outer_qty, (int, float)) and outer_qty <= 0
         return bool(explicit_nofill or status_nofill or qty_nofill)
 

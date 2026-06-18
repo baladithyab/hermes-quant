@@ -19,6 +19,7 @@ left without its filled equity cover.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -291,6 +292,22 @@ class _ShortFailsAfterCoverBackend:
         raise AssertionError("CC is a single-leg-option structure; mleg not used")
 
 
+class _ShortFailsUnwindFailsBackend(_ShortFailsAfterCoverBackend):
+    """Cover fills, short submit fails, and the compensating cover unwind fails."""
+
+    def submit_equity(self, *, symbol, signed_qty, decision_price, client_order_id) -> FillResult:
+        if client_order_id.endswith("-eq-unwind"):
+            self.calls.append("equity_unwind_FAIL")
+            self.unwind_signed_qty = float(signed_qty)
+            raise RuntimeError("simulated unwind reject")
+        return super().submit_equity(
+            symbol=symbol,
+            signed_qty=signed_qty,
+            decision_price=decision_price,
+            client_order_id=client_order_id,
+        )
+
+
 def test_cc_short_fails_after_cover_unwinds_cover(
     enabled, state_db, tmp_path, monkeypatch
 ) -> None:
@@ -320,6 +337,50 @@ def test_cc_short_fails_after_cover_unwinds_cover(
     assert parent.fill_size_pct == 0.0
     assert not bus.exists()
     assert state_db.get_positions("paper-default") == {}
+
+
+def test_cc_short_fails_and_unwind_fails_journals_standing_cover(
+    enabled, state_db, tmp_path, monkeypatch
+) -> None:
+    """If the cover moved and the compensating unwind fails, the bus must show it.
+
+    RED after the first e572 fix: the reactor logged an error, then returned an
+    audit-only no-fill parent and wrote no child, hiding the real long-stock cover.
+    """
+    bus = tmp_path / "executions.jsonl"
+    backend = _ShortFailsUnwindFailsBackend()
+
+    import hermes_quant.react.multileg as mleg_mod
+    from hermes_quant.autonomous import _reactor_record_is_nofill
+
+    monkeypatch.setattr(mleg_mod, "select_backend", lambda *a, **k: backend)
+
+    reactor = MultiLegPaperReactor(executions_path=bus)
+    parent = reactor.execute(_cc(), fill_size_pct=0.05)
+
+    assert backend.calls == ["equity_cover", "option_FAIL", "equity_unwind_FAIL"]
+    assert backend.short_filled is False
+    assert backend.unwind_signed_qty == -backend.cover_signed_qty
+
+    meta = parent.reactor_metadata or {}
+    assert meta["parent_status"] == "cover_unwind_failed"
+    assert meta["partial_fill"] is True
+    assert meta["cover_unwind_failed"] is True
+    assert meta.get("no_fill") is not True
+    assert _reactor_record_is_nofill(parent) is False
+
+    rows = [json.loads(line) for line in bus.read_text().splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["reactor_metadata"]["role"] == "parent"
+    assert rows[0]["reactor_metadata"]["cover_unwind_failed"] is True
+    assert rows[1]["asset_class"] == "equity"
+    assert rows[1]["asset"] == "NVDA"
+    assert rows[1]["reactor_metadata"]["quantity"] == backend.cover_signed_qty
+    assert not any(row["asset_class"] == "us_option" for row in rows)
+
+    positions = state_db.get_positions("paper-default")
+    assert positions[("equity", "NVDA")].quantity == backend.cover_signed_qty
+    assert ("us_option", "NVDA260626C00160000") not in positions
 
 
 # --------------------------------------------------------------------------- #

@@ -28,7 +28,6 @@ from hermes_quant.protocol import (
     RealizedOutcome,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -783,6 +782,103 @@ def test_provider_read_failure_returns_none_with_health_log(
     # FileNotFoundError is caught inside _fetch_fundamentals; the outer
     # try/except never fires, so error_count must remain 0.
     assert analyst.health()["error_count"] == 0
+
+
+class _OpenBBFundamentalsStub:
+    def __init__(self, frame: pd.DataFrame):
+        self.frame = frame
+        self.calls: list[tuple[str, pd.Timestamp]] = []
+
+    def read_fundamentals(
+        self, ticker: str, *, as_of: pd.Timestamp | None = None
+    ) -> pd.DataFrame:
+        assert as_of is not None
+        self.calls.append((ticker, as_of))
+        return self.frame.copy()
+
+
+def _openbb_fundamentals_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "period_ending": pd.to_datetime(["2025-12-31", "2026-03-31"]),
+            "filing_date": pd.to_datetime(["2026-02-15", "2026-05-10"]),
+            "pe_trailing": [18.0, 17.0],
+            "pe_forward": [16.0, 15.0],
+            "debt_to_equity": [0.4, 0.3],
+            "free_cash_flow": [9.0e10, 9.8e10],
+            "revenue_ttm": [4.1e11, 4.2e11],
+            "eps_trailing": [6.6, 6.7],
+            "eps_forward": [7.1, 7.2],
+            "revenue_yoy": [0.16, 0.18],
+            "fcf_yoy": [0.21, 0.22],
+            "sector": ["Technology", "Technology"],
+            "currency": ["USD", "USD"],
+            "quote_type": ["EQUITY", "EQUITY"],
+        }
+    )
+
+
+def test_openbb_fundamentals_fallback_on_cache_miss(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2f33: FundamentalsAnalyst must be able to consume the OpenBB provider path.
+
+    RED before the consumer cutover: OpenBBFundamentals existed, but the analyst
+    never called it, so arming OpenBB left fundamentals cache misses dark.
+    """
+    asof = pd.Timestamp("2026-05-15T16:00:00", tz="UTC")
+    openbb = _OpenBBFundamentalsStub(_openbb_fundamentals_frame())
+    analyst = FundamentalsAnalyst(provider=provider, openbb_provider=openbb)
+    monkeypatch.setattr(
+        provider,
+        "read_latest",
+        lambda *_a, **_k: (_ for _ in ()).throw(FileNotFoundError("cache miss")),
+    )
+
+    snap = analyst._fetch_fundamentals("AAPL", asof)
+
+    assert snap is not None
+    assert openbb.calls == [("AAPL", asof)]
+    assert snap["source"] == "openbb"
+    assert snap["period_end"] == pd.Timestamp("2026-03-31", tz="UTC")
+    assert snap["report_date"] == pd.Timestamp("2026-05-10", tz="UTC")
+
+
+def test_openbb_fundamentals_default_off_without_injected_provider(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unset HERMES_QUANT_OPENBB preserves the old cache-miss abstain path."""
+    asof = pd.Timestamp("2026-05-15T16:00:00", tz="UTC")
+    analyst = FundamentalsAnalyst(provider=provider)
+    monkeypatch.delenv("HERMES_QUANT_OPENBB", raising=False)
+    monkeypatch.setattr(
+        provider,
+        "read_latest",
+        lambda *_a, **_k: (_ for _ in ()).throw(FileNotFoundError("cache miss")),
+    )
+
+    assert analyst._fetch_fundamentals("AAPL", asof) is None
+
+
+def test_openbb_fundamentals_fallback_on_stale_cache(
+    provider: FundamentalsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asof = pd.Timestamp("2026-05-15T16:00:00", tz="UTC")
+    stale = pd.Series(
+        _row(
+            fetched_at=asof - pd.Timedelta(days=250),
+            period_end=asof - pd.Timedelta(days=250),
+        )
+    )
+    openbb = _OpenBBFundamentalsStub(_openbb_fundamentals_frame())
+    analyst = FundamentalsAnalyst(provider=provider, openbb_provider=openbb)
+    monkeypatch.setattr(provider, "read_latest", lambda *_a, **_k: stale)
+
+    snap = analyst._fetch_fundamentals("AAPL", asof)
+
+    assert snap is not None
+    assert snap["source"] == "openbb"
+    assert openbb.calls == [("AAPL", asof)]
 
 
 # ---------------------------------------------------------------------------

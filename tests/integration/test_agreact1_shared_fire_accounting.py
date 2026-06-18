@@ -155,6 +155,23 @@ def test_mleg_parent_genuine_nofill_signals(meta):
     assert auto._reactor_record_is_nofill(rec) is True
 
 
+def test_mleg_parent_cover_unwind_failed_partial_is_not_nofill():
+    """e572-extension: a covered-call whose cover FILLED but whose short option failed AND
+    whose unwind ALSO failed leaves a STANDING equity cover at the broker — the reactor emits
+    a parent_status='cover_unwind_failed' + partial_fill=True family. That partial MOVED the
+    book, so the shared no-fill guard must treat it as a REAL fill (accounted + journaled +
+    reconciled), NOT a silence — else the standing equity leg vanishes behind a no-fill parent.
+
+    RED-proof: without the `and not partial_fill` clause, parent_status != 'filled' would mark
+    this as a no-fill and the un-paired equity cover would be dropped from the accounting."""
+    rec = _mleg_parent(parent_status="cover_unwind_failed", partial_fill=True,
+                       cover_unwind_failed=True, requires_manual_reconcile=True, outer_qty=1)
+    assert auto._reactor_record_is_nofill(rec) is False, (
+        "a cover_unwind_failed partial_fill family moved the book (standing equity cover) — "
+        "it must be a REAL fill needing accounting, not a no-fill that hides the position"
+    )
+
+
 def test_apply_fire_accounting_mleg_real_fill_journals(monkeypatch):
     """End-to-end through the shared tail: a real mleg parent fill (0.0 fraction) journals
     + returns (pid, 0.0) — NOT None. Before 0aa6 it returned None (mis-counted no-fill)."""

@@ -18,7 +18,7 @@ exports, or inline) so the run-card honestly records what was armed.
 
 SAFETY: this writes one small JSON file under ~/.hermes/quant/. It mutates no money
 state. It will OVERWRITE a prior anchor (a reset is an explicit operator action).
-It REFUSES to stamp t0 unless the four protective flags are armed in the env, UNLESS
+It REFUSES to stamp t0 unless the required protective flags are armed in the env, UNLESS
 --force is passed (so an honest run-card can't silently record a disarmed window).
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # The flags that MUST be armed for a clean window to be meaningful (ADR-0099 GATE-0 +
@@ -42,6 +42,7 @@ from pathlib import Path
 _REQUIRED_ARMED = [
     "HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE",
     "HERMES_QUANT_PER_POSITION_STOP",
+    "HERMES_QUANT_TAKE_PROFIT_SWEEP",
     "HERMES_QUANT_DELTA_NORMALIZER",
     "HERMES_QUANT_ACCOUNT_LOCK",
     "HERMES_QUANT_SLIPPAGE_HAIRCUT",
@@ -53,10 +54,14 @@ _REQUIRED_ARMED = [
 # listed so its t0 state is captured in the run-card snapshot, which anchors the
 # window-vs-live drift detection in aegis-run-snapshot.py (mirrors the d83b
 # SLIPPAGE_HAIRCUT precedent, kept at recommended rather than required).
+#
+# f359: SLIPPAGE_GATE is the live-decision ADR-0097 haircut rail. It remains
+# eval-gated/default-OFF, but its state must be captured with the window so a
+# review can tell whether the live decision haircut was armed or drifted.
 _RECOMMENDED = [
-    "HERMES_QUANT_TAKE_PROFIT_SWEEP",
     "HERMES_QUANT_POST_LOSS_COOLDOWN",
     "HERMES_QUANT_PAPER_SLIPPAGE_MODEL",
+    "HERMES_QUANT_SLIPPAGE_GATE",
     "HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING",
 ]
 # The full snapshot recorded in the run-card (everything that shapes the window).
@@ -114,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     # Reuse the canonical writer so the JSON shape matches read_clean_window_start.
     from hermes_quant.eval.clean_window import write_clean_window_start
 
-    t0 = datetime.now(tz=timezone.utc)
+    t0 = datetime.now(tz=UTC)
     path = write_clean_window_start(home, t0, armed_flags=snapshot)
     print(f"\nGATE-0 anchor written: {path}")
     print(f"  t0 = {t0.isoformat()}  (all round-trips BEFORE this are discarded)")

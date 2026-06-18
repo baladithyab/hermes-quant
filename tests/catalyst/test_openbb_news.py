@@ -25,14 +25,14 @@ Covers (per the ob4 seed):
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
-from types import SimpleNamespace
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from hermes_quant.catalyst.ingest import CatalystItem
 from hermes_quant.catalyst.openbb_news import (
+    NEWS_LOOKBACK_DAYS,
     OPENBB_ENABLE_FLAG,
     OpenBBNews,
     ingest_openbb_news,
@@ -98,7 +98,7 @@ def test_news_published_after_asof_dropped():
     ]
     news = _news(rows)
     items = news.fetch("rocket lab", symbol="RKLB",
-                       as_of=datetime(2026, 6, 15, tzinfo=timezone.utc))
+                       as_of=datetime(2026, 6, 15, tzinfo=UTC))
 
     titles = {it.title for it in items}
     assert "FUTURE leak headline" not in titles
@@ -114,9 +114,9 @@ def test_news_published_at_asof_kept():
     ]
     news = _news(rows)
     items = news.fetch("q", symbol="RKLB",
-                       as_of=datetime(2026, 6, 15, tzinfo=timezone.utc))
+                       as_of=datetime(2026, 6, 15, tzinfo=UTC))
     assert len(items) == 1
-    assert items[0].published_at == datetime(2026, 6, 15, tzinfo=timezone.utc)
+    assert items[0].published_at == datetime(2026, 6, 15, tzinfo=UTC)
 
 
 def test_news_unparseable_timestamp_dropped():
@@ -128,7 +128,7 @@ def test_news_unparseable_timestamp_dropped():
         {"title": "good", "date": "2026-06-10T12:00:00Z", "url": "http://x/3", "source": "Reuters"},
     ]
     news = _news(rows)
-    items = news.fetch("q", as_of=datetime(2026, 6, 15, tzinfo=timezone.utc))
+    items = news.fetch("q", as_of=datetime(2026, 6, 15, tzinfo=UTC))
     assert {it.title for it in items} == {"good"}
 
 
@@ -138,12 +138,55 @@ def test_news_company_vs_world_routing():
     fake = _FakeNewsObb(rows)
     news = OpenBBNews(obb=fake, require_flag=False)
 
-    news.fetch("q", symbol="RKLB", as_of=datetime(2026, 6, 15, tzinfo=timezone.utc))
+    news.fetch("q", symbol="RKLB", as_of=datetime(2026, 6, 15, tzinfo=UTC))
     assert fake.company_calls and fake.company_calls[0]["symbol"] == "RKLB"
     assert not fake.world_calls
 
-    news.fetch("q", as_of=datetime(2026, 6, 15, tzinfo=timezone.utc))
+    news.fetch("q", as_of=datetime(2026, 6, 15, tzinfo=UTC))
     assert fake.world_calls
+
+
+def test_news_outbound_call_is_asof_window_pinned():
+    """4430: OpenBB news calls include start_date/end_date, not just post-filtering."""
+    rows = [{"title": "x", "date": "2026-06-10T00:00:00Z", "url": "u", "source": "s"}]
+    fake = _FakeNewsObb(rows)
+    news = OpenBBNews(obb=fake, require_flag=False)
+
+    asof = datetime(2026, 6, 15, 18, 30, tzinfo=UTC)
+    news.fetch("q", symbol="RKLB", as_of=asof)
+
+    assert fake.company_calls == [
+        {
+            "symbol": "RKLB",
+            "start_date": "2026-05-16",
+            "end_date": "2026-06-15",
+        }
+    ]
+    assert NEWS_LOOKBACK_DAYS == 30
+
+
+def test_news_world_call_is_asof_window_pinned():
+    rows = [{"title": "x", "date": "2026-06-10T00:00:00Z", "url": "u", "source": "s"}]
+    fake = _FakeNewsObb(rows)
+    news = OpenBBNews(obb=fake, require_flag=False)
+
+    news.fetch("q", as_of=datetime(2026, 6, 15, tzinfo=UTC))
+
+    assert fake.world_calls == [{"start_date": "2026-05-16", "end_date": "2026-06-15"}]
+
+
+def test_news_asof_less_read_hard_rejected():
+    """4430: no as_of means latest-only semantics and must not touch OpenBB."""
+    rows = [{"title": "x", "date": "2026-06-10T00:00:00Z", "url": "u", "source": "s"}]
+    fake = _FakeNewsObb(rows)
+    news = OpenBBNews(obb=fake, require_flag=False)
+
+    with pytest.raises(DataProviderError) as ei:
+        news.fetch("q")
+
+    assert "latest-only" in str(ei.value).lower()
+    assert fake.company_calls == []
+    assert fake.world_calls == []
 
 
 # ===========================================================================
@@ -167,7 +210,7 @@ def test_default_off_does_not_import_openbb(monkeypatch):
 
     news = OpenBBNews()  # require_flag defaults True
     with pytest.raises(DataProviderError) as ei:
-        news.fetch("q", as_of=datetime(2026, 6, 15, tzinfo=timezone.utc))
+        news.fetch("q", as_of=datetime(2026, 6, 15, tzinfo=UTC))
     msg = str(ei.value)
     assert "disabled" in msg.lower()
     assert OPENBB_ENABLE_FLAG in msg
@@ -190,7 +233,7 @@ def test_ingest_wrapper_non_fatal_when_flag_off(monkeypatch):
     monkeypatch.setitem(sys.modules, "openbb", _Poison())
 
     items, latency = ingest_openbb_news(
-        "q", as_of=datetime(2026, 6, 15, tzinfo=timezone.utc)
+        "q", as_of=datetime(2026, 6, 15, tzinfo=UTC)
     )
     assert items == []
     assert latency >= 0.0
@@ -203,7 +246,7 @@ def test_pipeline_unchanged_over_empty_openbb_feed():
     aliases = {"rocket lab": "rocket lab"}
     rss_item = CatalystItem(
         title="Rocket Lab plunges on launch failure",
-        published_at=datetime(2026, 6, 10, 12, tzinfo=timezone.utc),
+        published_at=datetime(2026, 6, 10, 12, tzinfo=UTC),
         source="GoogleNews",
         link="http://rss/1",
         query="rss",
@@ -213,7 +256,7 @@ def test_pipeline_unchanged_over_empty_openbb_feed():
 
     # Empty OpenBB feed merged in -> identical packets.
     empty_openbb, _ = ingest_openbb_news(
-        "rocket lab", as_of=datetime(2026, 6, 15, tzinfo=timezone.utc),
+        "rocket lab", as_of=datetime(2026, 6, 15, tzinfo=UTC),
         obb=_FakeNewsObb([]), require_flag=False,
     )
     merged = synthesize_packets([rss_item, *empty_openbb], graph=graph, aliases=aliases)
@@ -245,7 +288,7 @@ def test_openbb_news_feeds_synthesize_like_rss():
     # OpenBBNews path.
     obb_items, _ = ingest_openbb_news(
         "rocket lab", symbol="RKLB",
-        as_of=datetime(2026, 6, 15, tzinfo=timezone.utc),
+        as_of=datetime(2026, 6, 15, tzinfo=UTC),
         obb=_FakeNewsObb(rows), require_flag=False,
     )
     assert len(obb_items) == 1
@@ -254,7 +297,7 @@ def test_openbb_news_feeds_synthesize_like_rss():
     # Equivalent hand-built RSS item.
     rss_item = CatalystItem(
         title="Rocket Lab plunges on launch failure",
-        published_at=datetime(2026, 6, 10, 12, tzinfo=timezone.utc),
+        published_at=datetime(2026, 6, 10, 12, tzinfo=UTC),
         source="Reuters", link="http://obb/1", query="rss",
     )
     rss_packets = synthesize_packets([rss_item], graph=graph, aliases=aliases)
