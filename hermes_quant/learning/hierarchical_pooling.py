@@ -328,6 +328,61 @@ class HierarchicalPooler:
             )["pooled_skill"]
         )
 
+    # ------------------------------------------------------------------
+    # Persistence (d97e): snapshot the cells + per-analyst epoch map so the
+    # effective-n / warm-up band survives a cron-mode process restart instead
+    # of silently resetting to cold. The serialization layer lives in
+    # ``hermes_quant.learning.pooling_store``; this is the pure in-memory
+    # round-trip the store reads/writes. ONLY the accumulation state is
+    # persisted — the hyperparameters (prior, shrinkage_k, warmup_n) belong to
+    # the constructing aggregator, not to the snapshot.
+    # ------------------------------------------------------------------
+
+    def cells_state(self) -> list[dict]:
+        """Return the per-(analyst, regime, epoch) cells as plain dicts.
+
+        Deterministic order (sorted by key) so the persisted artifact is stable.
+        """
+        out: list[dict] = []
+        for (analyst, regime, epoch) in sorted(self._cells):
+            cell = self._cells[(analyst, regime, epoch)]
+            out.append(
+                {
+                    "analyst": analyst,
+                    "regime": regime,
+                    "epoch": epoch,
+                    "alpha": float(cell.alpha),
+                    "beta": float(cell.beta),
+                }
+            )
+        return out
+
+    def epoch_state(self) -> dict[str, str]:
+        """Return the per-analyst active-epoch map (copy)."""
+        return dict(self._epoch_of)
+
+    def load_state(
+        self,
+        *,
+        cells: list[PoolingCell] | None = None,
+        epoch_of: dict[str, str] | None = None,
+    ) -> None:
+        """Replace the in-memory accumulation state from a persisted snapshot.
+
+        ``cells`` is a list of already-validated :class:`PoolingCell` (the store
+        is responsible for rejecting poisoned rows); ``epoch_of`` is the
+        per-analyst active-epoch map so a subsequent model change still re-enters
+        warm-up against a fresh cell rather than inheriting a prior model's
+        record. Idempotent-on-empty: passing no cells / no map is a no-op
+        (cold-start), so a missing artifact leaves a fresh pooler untouched.
+        """
+        if cells is not None:
+            self._cells = {
+                (c.analyst, c.regime, c.epoch): c for c in cells
+            }
+        if epoch_of is not None:
+            self._epoch_of = dict(epoch_of)
+
 
 def uniform_skill_target(global_prior_mean: float, n_active_analysts: int) -> float:
     """The near-uniform skill target a warm-up cell is pulled toward.

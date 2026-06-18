@@ -196,6 +196,108 @@ def test_gate0_start_lists_variance_sizing():
     )
 
 
+# --------------------------------------------------------------------------- #
+# dbcd — AG-OPT-EV-1: the snapshot must SURFACE the ADR-0029 options-evidence gate
+# (N_options>=30 over >=30 calendar days). READ-ONLY/additive; changes no live gate.
+# --------------------------------------------------------------------------- #
+def _seed_option_bus(bus: Path, n: int, *, t0_day: int = 4):
+    """n settled us_option round-trips, one entry+exit pair per day after 2026-06-{t0_day}.
+
+    Each pair opens day D and closes day D+1 at a WIN (premium decayed: 2.0 -> 1.0 on a
+    short, realized_return > 0). Distinct assets so FIFO does not cross-match.
+    """
+    lines = []
+    for i in range(n):
+        day = t0_day + i
+        entry = {
+            "proposal_id": f"e{i}", "asset": f"OPT{i}", "asset_class": "us_option",
+            "reactor_name": "paper", "account_id": "paper-default",
+            "fill_size_pct": -0.05, "fill_price": 2.0,  # short premium (credit)
+            "asof_execution": f"2026-06-{day:02d}T15:35:36Z", "signal_id": "s",
+        }
+        exit_ = dict(entry)
+        exit_.update({
+            "proposal_id": f"x{i}", "fill_size_pct": 0.05, "fill_price": 1.0,
+            "asof_execution": f"2026-06-{day + 1:02d}T15:35:36Z",
+        })
+        lines.append(json.dumps(entry))
+        lines.append(json.dumps(exit_))
+    bus.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _seed_gate0_anchor(home: Path, t0: str = "2026-06-01T00:00:00+00:00"):
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "clean_window_start.json").write_text(
+        json.dumps({"t0": t0, "armed_flags": {}}), encoding="utf-8"
+    )
+
+
+def test_snapshot_surfaces_options_evidence_red_below_30(tmp_path):
+    """N_options < 30 => the snapshot reports the AG-OPT-EV-1 gate as RED, not-yet-evidenced.
+
+    RED before dbcd: compute_snapshot did not emit an ``options_evidence`` section at all
+    (the gate was process prose, not code), so KeyError on snap['options_evidence']."""
+    home = tmp_path / "quant"
+    home.mkdir()
+    bus = home / "executions.jsonl"
+    _seed_gate0_anchor(home)
+    _seed_option_bus(bus, 5)
+    snap = H.compute_snapshot(home, bus)
+    oe = snap["options_evidence"]
+    assert oe["n_options"] == 5
+    assert oe["n_threshold_met"] is False
+    assert oe["verdict"] == "RED"
+
+
+def test_snapshot_options_evidence_excludes_equity(tmp_path):
+    """The equity round-trip (the original _seed_bus) is NOT counted as an options outcome."""
+    home = tmp_path / "quant"
+    home.mkdir()
+    bus = home / "executions.jsonl"
+    _seed_gate0_anchor(home)
+    _seed_bus(bus)  # one EQUITY round-trip
+    snap = H.compute_snapshot(home, bus)
+    assert snap["n_settled_roundtrips"] == 1  # the equity trip still counts overall
+    assert snap["options_evidence"]["n_options"] == 0  # but NOT as options evidence
+    assert snap["options_evidence"]["verdict"] == "RED"
+
+
+def test_snapshot_options_evidence_green_at_30_over_30_days(tmp_path):
+    """>=30 options outcomes spanning >=30 calendar days => GREEN.
+
+    RED before dbcd: no options_evidence section existed."""
+    home = tmp_path / "quant"
+    home.mkdir()
+    bus = home / "executions.jsonl"
+    _seed_gate0_anchor(home)
+    # 31 daily option round-trips closing 2026-06-05 .. 2026-07-05 => >=30d span, N=31.
+    lines = []
+    for i in range(31):
+        # close dates spread one per day from 2026-06-05 onward
+        from datetime import datetime as _dt, timedelta as _td
+        close = _dt(2026, 6, 5, 15, 35, 36) + _td(days=i)
+        openn = close - _td(days=1)
+        entry = {
+            "proposal_id": f"e{i}", "asset": f"OPT{i}", "asset_class": "us_option",
+            "reactor_name": "paper", "account_id": "paper-default",
+            "fill_size_pct": -0.05, "fill_price": 2.0,
+            "asof_execution": openn.strftime("%Y-%m-%dT%H:%M:%SZ"), "signal_id": "s",
+        }
+        exit_ = dict(entry)
+        exit_.update({
+            "proposal_id": f"x{i}", "fill_size_pct": 0.05, "fill_price": 1.0,
+            "asof_execution": close.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        lines.append(json.dumps(entry))
+        lines.append(json.dumps(exit_))
+    bus.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    snap = H.compute_snapshot(home, bus)
+    oe = snap["options_evidence"]
+    assert oe["n_options"] == 31, oe
+    assert oe["calendar_days"] >= 30.0, oe
+    assert oe["verdict"] == "GREEN", oe
+
+
 def test_main_appends_perf_line(tmp_path):
     home = tmp_path / "quant"
     home.mkdir()

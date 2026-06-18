@@ -124,3 +124,29 @@ a live decision.
   direct non-OpenBB providers (StockTwits, Polymarket, AV-sentiment). Each default-OFF + asof-pinned + eval-gated.
 - TradingAgents' own honesty mechanism (date-pinned online/offline cache + a >10-day staleness guard)
   validates the asof-pin approach — adopt the same staleness guard at the AEGIS boundary.
+
+### Consumer cutovers (c7a9 + 2f33, 2026-06-18)
+
+The `ob1` provider + `ob2`/`ob3` analysts existed but were never WIRED into the live
+advisor path (provider chain registered the openbb vendor in `vendor_routing.VENDOR_LIST`
+but `advisor._get_default_provider` returned a bare `YFinanceProvider`; the estimates/insider
+analysts were not in `advisor._build_default_analysts`). Two default-OFF cutovers close that gap:
+
+- **c7a9 — OHLCV live tier.** A NEW flag `HERMES_QUANT_OPENBB_LIVE` (distinct from
+  `HERMES_QUANT_OPENBB`, which gates the SDK/provider itself) makes
+  `advisor._get_default_provider` return a `_ChainedProvider([yfinance, openbb])` for
+  equity/etf when set — yfinance PRIMARY, openbb a SILENT no-op FALLBACK consulted only when
+  yfinance fails (it still requires `HERMES_QUANT_OPENBB` to actually fetch). DEFAULT-OFF =>
+  a bare `YFinanceProvider` (byte-identical live path). The `as_of` cutoff threads into
+  `fetch_with_chain` unchanged, so the no-lookahead rail holds across both tiers.
+- **2f33 — EstimatesAnalyst / InsiderAnalyst committee registration (option a).**
+  Both analysts are now registered in `advisor._build_default_analysts` AND the canonical
+  `advisor.recommend()` inline roster, each gated on BOTH its per-analyst flag
+  (`HERMES_QUANT_ESTIMATES_ANALYST` / `HERMES_QUANT_INSIDER_ANALYST`) AND
+  `HERMES_QUANT_OPENBB`. With those flags off the analysts are never constructed (roster
+  byte-identical), satisfying the analysts' "intentionally not registered while default-OFF"
+  note: the two-flag registration gate IS the operator's enable switch. Their no-lookahead
+  fence is the source provider's `data.date`/`filing_date <= asof` post-filter (not the bar
+  window), so they stay out of `tests/test_no_lookahead.py`'s bar-temporal enumeration —
+  same category as `HermesSemanticAnalyst`.
+  Each analyst remains eval-gated before it influences a live decision.

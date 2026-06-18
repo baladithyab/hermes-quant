@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,19 @@ RUN_SUMMARY_KEYS = (
     "source",
     "mode",
 )
+
+
+def _hierarchical_pooling_enabled() -> bool:
+    """True iff HERMES_QUANT_HIERARCHICAL_POOLING=1 (read at CALL TIME).
+
+    d97e: gates the ag03 pooling warm-up block in the run card. When unset/!="1"
+    the run card is byte-identical to the pre-d97e card — the block is omitted
+    from JSON and Markdown even if a caller passes ``pooling_diagnostics``. This
+    reuses the EXISTING flag that gates the BMA pooler (bma.py); it is the
+    canonical first read for the flag inventory scan (bma.py:293 sorts first), so
+    this read does NOT add a flag-inventory row.
+    """
+    return os.environ.get("HERMES_QUANT_HIERARCHICAL_POOLING", "0") == "1"
 
 
 def default_quant_home() -> Path:
@@ -55,6 +69,7 @@ def write_run_card(
     evidence_ids: Sequence[str] | None = None,
     flow_name: str | None = None,
     governance_audit_log_offset: int | None = None,
+    pooling_diagnostics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write JSON and Markdown run cards for a research or backtest run.
 
@@ -70,6 +85,14 @@ def write_run_card(
         evidence_ids: Evidence Store ids referenced by this run.
         flow_name: Trading Flow Contract name when this run is flow-bound.
         governance_audit_log_offset: Governance audit log offset for audit walkback.
+        pooling_diagnostics: ag03 hierarchical-pooling status (effective-n per
+            cell, warm-up flags, ``headline_in_warmup``) as produced by
+            ``BMAAggregator.status()["hierarchical_pooling"]`` (d97e). Surfaced
+            into the card so a cron-mode operator can SEE whether the headline
+            weighting is still warming up. Included ONLY when the default-OFF
+            HERMES_QUANT_HIERARCHICAL_POOLING flag is set; when the flag is off
+            the card is byte-identical to today (the block is omitted even if a
+            value is passed).
 
     Returns:
         The run card payload written to ``run_card.json``.
@@ -104,6 +127,12 @@ def write_run_card(
     }
     if "validation" in metrics:
         card["validation"] = metrics["validation"]
+
+    # d97e: surface the ag03 hierarchical-pooling warm-up band ONLY when the
+    # default-OFF flag is set AND a caller supplied diagnostics. With the flag
+    # off the card is byte-identical to the pre-d97e card (no key, no MD section).
+    if pooling_diagnostics is not None and _hierarchical_pooling_enabled():
+        card["hierarchical_pooling"] = _normalize_pooling(pooling_diagnostics)
 
     json_path = run_dir / "run_card.json"
     md_path = run_dir / "run_card.md"
@@ -151,6 +180,24 @@ def _file_hash(path: Path) -> str:
 
 def _run_summary(config: Mapping[str, Any]) -> dict[str, Any]:
     return {key: config.get(key) for key in RUN_SUMMARY_KEYS if key in config}
+
+
+def _normalize_pooling(diagnostics: Mapping[str, Any]) -> dict[str, Any]:
+    """Deep-copy the pooling diagnostics into plain JSON-safe dicts.
+
+    Mappings are converted to plain ``dict`` so the in-memory card equals the
+    JSON-loaded card (the round-trip assert) regardless of the concrete Mapping
+    type the caller passed.
+    """
+
+    def _coerce(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(k): _coerce(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_coerce(v) for v in value]
+        return value
+
+    return {str(k): _coerce(v) for k, v in diagnostics.items()}
 
 
 def _scalar_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
@@ -243,6 +290,9 @@ def _render_markdown(card: Mapping[str, Any]) -> str:
     else:
         lines.append("- Not present.")
 
+    if "hierarchical_pooling" in card:
+        lines.extend(_render_pooling(card["hierarchical_pooling"]))
+
     warnings = card.get("warnings", [])
     if warnings:
         lines.extend(["", "## Warnings"])
@@ -259,3 +309,32 @@ def _render_markdown(card: Mapping[str, Any]) -> str:
         lines.append("- None found.")
 
     return "\n".join(lines) + "\n"
+
+
+def _render_pooling(pooling: Mapping[str, Any]) -> list[str]:
+    """Render the ag03 hierarchical-pooling warm-up band (d97e).
+
+    The load-bearing operator signal is ``headline_in_warmup`` and the per-cell
+    ``effective_n`` — so an operator can see at a glance that a near-1.0-looking
+    cell is actually a thin warm-up cell and the headline weighting is not yet a
+    confident track record.
+    """
+    lines: list[str] = ["", "## Hierarchical Pooling (ag03)"]
+    lines.append(f"- headline_in_warmup: {pooling.get('headline_in_warmup')}")
+    lines.append(f"- n_cells: {pooling.get('n_cells')}")
+    lines.append(f"- n_warmup_cells: {pooling.get('n_warmup_cells')}")
+    lines.append(f"- warmup_n_threshold: {pooling.get('warmup_n_threshold')}")
+    cells = pooling.get("cells")
+    if isinstance(cells, Mapping) and cells:
+        lines.append("- cells:")
+        for label, diag in cells.items():
+            if isinstance(diag, Mapping):
+                eff = diag.get("effective_n")
+                warm = diag.get("warmup")
+                pooled = diag.get("pooled_skill")
+                lines.append(
+                    f"  - `{label}`: effective_n={eff}, warmup={warm}, pooled_skill={pooled}"
+                )
+            else:
+                lines.append(f"  - `{label}`: {diag}")
+    return lines

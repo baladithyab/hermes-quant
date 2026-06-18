@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**85 flags** (resolvable default).
+**86 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -16,7 +16,7 @@
 | `HERMES_QUANT_ALPACA_PAPER` | `0` | `hermes_quant/react/backend.py:152` |
 | `HERMES_QUANT_ALPACA_SHADOW` | `0` | `hermes_quant/react/alpaca_shadow.py:40` |
 | `HERMES_QUANT_ANALYSTS_USE_REGIME` | `0` | `hermes_quant/regime/regime_aware_confidence.py:26` |
-| `HERMES_QUANT_ANALYST_ADMISSION` | `0` | `hermes_quant/advisor.py:450` |
+| `HERMES_QUANT_ANALYST_ADMISSION` | `0` | `hermes_quant/advisor.py:564` |
 | `HERMES_QUANT_AUTONOMOUS_OPTIONS` | `0` | `hermes_quant/autonomous.py:1528` |
 | `HERMES_QUANT_BORROW_COST` | `0` | `hermes_quant/admissibility/borrow_pnl.py:34` |
 | `HERMES_QUANT_BROKER_BACKEND` | `` | `hermes_quant/react/backend.py:149` |
@@ -27,13 +27,13 @@
 | `HERMES_QUANT_DATA_FALLBACK` | `0` | `hermes_quant/data/chain.py:39` |
 | `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/autonomous.py:718` |
 | `HERMES_QUANT_DETERMINISTIC_EQUITY` | `0` | `hermes_quant/react/dispatch.py:80` |
-| `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1191` |
-| `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1245` |
-| `HERMES_QUANT_ESTIMATES_ANALYST` | `0` | `hermes_quant/analysts/estimates.py:81` |
-| `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1334` |
+| `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1243` |
+| `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1384` |
+| `HERMES_QUANT_ESTIMATES_ANALYST` | `0` | `hermes_quant/advisor.py:494` |
+| `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1473` |
 | `HERMES_QUANT_EVIDENCE_DIR` | `` | `hermes_quant/evidence/store.py:60` |
 | `HERMES_QUANT_FRED_MACRO` | `0` | `hermes_quant/data/fred_macro.py:146` |
-| `HERMES_QUANT_FUNDAMENTALS_ENABLED` | `0` | `hermes_quant/advisor.py:395` |
+| `HERMES_QUANT_FUNDAMENTALS_ENABLED` | `0` | `hermes_quant/advisor.py:476` |
 | `HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG` | `1` | `hermes_quant/data/fundamentals_provider.py:146` |
 | `HERMES_QUANT_GRAPH_MINING` | `0` | `hermes_quant/catalyst/graph_mining.py:158` |
 | `HERMES_QUANT_GROUNDING_ENFORCE` | `0` | `hermes_quant/grounding/enforcement.py:156` |
@@ -42,7 +42,7 @@
 | `HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD` | `0.85` | `hermes_quant/research/hypothesis_novelty.py:57` |
 | `HERMES_QUANT_IC_DEDUP_AT_INGEST` | `` | `hermes_quant/factors/alpha_zoo.py:333` |
 | `HERMES_QUANT_IC_DEDUP_THRESHOLD` | `0.99` | `hermes_quant/factors/ic_dedup.py:75` |
-| `HERMES_QUANT_INSIDER_ANALYST` | `0` | `hermes_quant/analysts/insider.py:98` |
+| `HERMES_QUANT_INSIDER_ANALYST` | `0` | `hermes_quant/advisor.py:507` |
 | `HERMES_QUANT_INSIDER_ENABLED` | `0` | `hermes_quant/evidence/adapters/form4.py:93` |
 | `HERMES_QUANT_IRON_CONDOR` | `0` | `hermes_quant/options/structure_select.py:155` |
 | `HERMES_QUANT_JOURNAL_PATH` | `` | `hermes_quant/journal/writer.py:33` |
@@ -54,16 +54,17 @@
 | `HERMES_QUANT_MEMORY_SPLIT` | `0` | `hermes_quant/aggregators/llm_committee.py:333` |
 | `HERMES_QUANT_MONTHLY_META_RETRO` | `0` | `hermes_quant/memory/meta_retro.py:70` |
 | `HERMES_QUANT_MULTILEG_REACTOR` | `0` | `hermes_quant/react/mleg_fill.py:116` |
-| `HERMES_QUANT_OPENBB` | `0` | `hermes_quant/catalyst/openbb_news.py:56` |
+| `HERMES_QUANT_OPENBB` | `0` | `hermes_quant/advisor.py:495` |
+| `HERMES_QUANT_OPENBB_LIVE` | `0` | `hermes_quant/advisor.py:330` |
 | `HERMES_QUANT_OPEN_GUARD` | `1` | `hermes_quant/risk/open_guard.py:304` |
 | `HERMES_QUANT_OPTIONS_EVIDENCE_GATE` | `0` | `hermes_quant/autonomous.py:2352` |
 | `HERMES_QUANT_OPTIONS_GATE` | `0` | `hermes_quant/risk/options_gate.py:529` |
 | `HERMES_QUANT_OPTIONS_LIVE_CHAIN` | `0` | `hermes_quant/options/data.py:427` |
 | `HERMES_QUANT_OPTIONS_PERCEIVE` | `0` | `hermes_quant/autonomous.py:2388` |
-| `HERMES_QUANT_OVERNIGHT_DRIFT` | `0` | `hermes_quant/advisor.py:430` |
+| `HERMES_QUANT_OVERNIGHT_DRIFT` | `0` | `hermes_quant/advisor.py:544` |
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:255` |
 | `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:523` |
-| `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1323` |
+| `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1462` |
 | `HERMES_QUANT_PER_POSITION_STOP` | `0` | `hermes_quant/autonomous.py:2080` |
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:206` |
@@ -80,7 +81,7 @@
 | `HERMES_QUANT_RESEARCH_RISK_TIER_BLOCK` | `0` | `hermes_quant/research/risk_tier.py:221` |
 | `HERMES_QUANT_RUN_BACKTEST` | `0` | `hermes_quant/cli/ablate.py:273` |
 | `HERMES_QUANT_SATURATION` | `0` | `hermes_quant/analysts/semantic.py:141` |
-| `HERMES_QUANT_SEMANTIC_ENABLED` | `1` | `hermes_quant/advisor.py:412` |
+| `HERMES_QUANT_SEMANTIC_ENABLED` | `1` | `hermes_quant/advisor.py:526` |
 | `HERMES_QUANT_SHADOW_RULE_MINING` | `0` | `hermes_quant/shadow/rule_mining.py:162` |
 | `HERMES_QUANT_SIGNED_EQUITY` | `0` | `hermes_quant/state/portfolio_state.py:214` |
 | `HERMES_QUANT_SLIPPAGE_HAIRCUT` | `0` | `hermes_quant/risk/slippage_haircut.py:70` |

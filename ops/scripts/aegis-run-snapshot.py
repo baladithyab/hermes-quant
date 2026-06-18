@@ -131,10 +131,60 @@ def compute_snapshot(home: Path, bus: Path) -> dict:
                 open_book[asset] = round(net, 4)
         snap["open_positions"] = open_book
         snap["n_open"] = len(open_book)
+
+        # --- AG-OPT-EV-1: the ADR-0029 evidence-before-options gate, EXECUTABLE ---
+        # READ-ONLY / ADDITIVE: a structured record of "have we accumulated the
+        # documented options evidence yet" (N_options>=30 settled multi-leg outcomes
+        # over >=30 calendar days). Changes no live gate decision; surfaced for the
+        # operator. Anchored to the GATE-0 t0 so pre-window options are discarded.
+        # SettledRoundTrip duck-types the (asof_exit, realized_return, asset_class)
+        # contract, so the paper round-trips feed compute_options_evidence directly.
+        try:
+            from hermes_quant.eval.clean_window import compute_options_evidence
+
+            t0 = _anchor_t0(home)
+            opt_ev = compute_options_evidence(paper_rts, t0=t0)
+            snap["options_evidence"] = {
+                "n_options": opt_ev.n_options,
+                "win_rate": (round(opt_ev.win_rate, 4)
+                             if math.isfinite(opt_ev.win_rate) else None),
+                "premium_capture_pct": (round(opt_ev.premium_capture_pct, 2)
+                                        if math.isfinite(opt_ev.premium_capture_pct) else None),
+                "assignment_count": opt_ev.assignment_count,
+                "gate_reject_rate": (round(opt_ev.gate_reject_rate, 4)
+                                     if math.isfinite(opt_ev.gate_reject_rate) else None),
+                "calendar_days": (round(opt_ev.calendar_days, 2)
+                                  if math.isfinite(opt_ev.calendar_days) else None),
+                "n_threshold_met": opt_ev.n_threshold_met,
+                "verdict": "GREEN" if opt_ev.is_green else "RED",
+            }
+        except Exception as exc:  # noqa: BLE001 — evidence section must never crash the run
+            snap["options_evidence_error"] = str(exc)[:200]
     except Exception as exc:  # noqa: BLE001
         snap["settlement_error"] = str(exc)[:200]
 
     return snap
+
+
+def _anchor_t0(home: Path) -> datetime | None:
+    """The GATE-0 t0 datetime from the clean-window anchor (UTC-aware), or None.
+
+    None => GATE-0 not run => options-evidence is fail-CLOSED RED. Distinct from
+    ``_read_anchor`` (which returns the raw dict): this parses the ``t0`` string.
+    """
+    anchor = _read_anchor(home)
+    if not anchor:
+        return None
+    t0_str = anchor.get("t0")
+    if not t0_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(t0_str))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _read_anchor(home: Path) -> dict | None:
@@ -211,12 +261,26 @@ def human_summary(snap: dict) -> str:
     nopen = snap.get("n_open", "?")
     book = snap.get("open_positions", {})
     book_s = ", ".join(f"{k} {v:+.2f}" for k, v in book.items()) or "flat"
-    return (
-        f"AEGIS paper snapshot {snap.get('asof', '')[:19]}Z\n"
-        f"  realized P&L: {rp_s}  | settled round-trips: {n}  | win-rate: {wr_s}\n"
-        f"  open positions ({nopen}): {book_s}\n"
-        f"  (realized basis = the canonical kill-switch path; honest forward-only record)"
+    lines = [
+        f"AEGIS paper snapshot {snap.get('asof', '')[:19]}Z",
+        f"  realized P&L: {rp_s}  | settled round-trips: {n}  | win-rate: {wr_s}",
+        f"  open positions ({nopen}): {book_s}",
+    ]
+    # AG-OPT-EV-1 options-evidence line (ADR-0029): only render when the gate ran.
+    oe = snap.get("options_evidence")
+    if isinstance(oe, dict):
+        wr_o = oe.get("win_rate")
+        wr_o_s = f"{wr_o * 100:.0f}%" if isinstance(wr_o, (int, float)) else "n/a"
+        lines.append(
+            f"  AG-OPT-EV-1 (ADR-0029): {oe.get('verdict', 'RED')} — "
+            f"N_options={oe.get('n_options', 0)}/30  | "
+            f"window={oe.get('calendar_days', 'n/a')}d  | win-rate {wr_o_s}  | "
+            f"assignments={oe.get('assignment_count', 0)}"
+        )
+    lines.append(
+        "  (realized basis = the canonical kill-switch path; honest forward-only record)"
     )
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:

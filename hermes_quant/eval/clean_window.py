@@ -114,6 +114,23 @@ _G3_SHARPE_CI_LOWER: float = 1.0  # bootstrap sharpe_95ci_lower  # EVAL-GATE-PEN
 _G3_DRAWDOWN_MAX: float = 0.01  # EVAL-GATE-PENDING
 _G3_NO_KS_DAYS: int = 14  # no kill-switch fires in last 14d  # EVAL-GATE-PENDING
 
+# AG-OPT-EV-1 thresholds (ADR-0029 evidence-before-options-live checkpoint).
+# The documented "evidence window" gate (handoff 2026-06-17-aegis-options-epic-handoff
+# line 36 + ADR-0029 §D7): a 30-CALENDAR-DAY paper options window with N_options>=30
+# SETTLED multi-leg outcomes, with win-rate / premium-capture / assignment / gate-reject
+# all MEASURED. This sits BEFORE GATE-3 (the N_options>=100 options-LIVE gate): it is the
+# checkpoint that authorizes accumulating the larger sample, not options-live itself.
+_AGOPTEV_MIN_N_OPTIONS: int = 30  # EVAL-GATE-PENDING
+_AGOPTEV_MIN_DAYS: int = 30  # calendar days  # EVAL-GATE-PENDING
+
+# The asset_class values that mark a SETTLED options outcome. Per the daemon
+# settlement loop, the family-PARENT rollup carries asset_class=="multi_leg" and is
+# SKIPPED by join_exit_fills; the per-leg CHILDREN carry "us_option" (or "equity" for
+# the equity leg of a covered call). We count "multi_leg" too so a caller that feeds
+# raw parent rollups (not the join_exit_fills children) is still counted, not silently
+# dropped. The asof-honest source of truth is the per-leg "us_option" child.
+_OPTIONS_ASSET_CLASSES: frozenset[str] = frozenset({"multi_leg", "us_option", "option"})
+
 # Bootstrap config (matches evaluation/validation.py defaults)
 _N_RESAMPLES: int = 9999
 _CONFIDENCE_LEVEL: float = 0.95
@@ -733,3 +750,253 @@ def evaluate_gate(
 
     # Should be unreachable given the guard at the top, but be explicit.
     return False  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
+# AG-OPT-EV-1 — the ADR-0029 evidence-before-options gate, made EXECUTABLE.
+# ---------------------------------------------------------------------------
+@dataclass
+class OptionsEvidenceTrip:
+    """A settled options outcome view for the AG-OPT-EV-1 evidence check.
+
+    Distinct from :class:`RoundTrip` (the GATE-0..3 harness view) because the
+    evidence gate measures options-specific facts the GATE harness does not:
+    premium-capture and assignment. Callers may build these from settled
+    outcomes, OR pass any object that exposes ``asof_exit`` / ``realized_return``
+    / ``asset_class`` (e.g. a daemon ``SettledRoundTrip``) — the harness
+    duck-types those three fields and reads the options-specific fields only
+    when present (``getattr`` with a neutral default).
+    """
+
+    asof_exit: datetime
+    """UTC-aware (or naive-UTC) datetime of the closing outcome."""
+
+    realized_return: float
+    """Holding-period return on the matched quantity, net of prorated fees.
+    Non-finite is treated as missing and excluded (a NaN must not become a win).
+    """
+
+    asset_class: str = "us_option"
+    """The outcome's asset_class. Only ``us_option`` / ``multi_leg`` / ``option``
+    count as options outcomes; everything else (equity, crypto) is excluded.
+    """
+
+    premium_capture_frac: float | None = None
+    """For a credit structure: fraction of the entry premium captured at exit
+    (0.50 == closed at 50%-of-max-premium, the theta-capture standard). None
+    means NOT measured for this outcome — it is excluded from the mean, NOT
+    treated as zero (absence != a 0% capture)."""
+
+    was_assignment: bool = False
+    """True if this outcome was an assignment (short leg assigned). Counted into
+    ``assignment_count`` so the operator sees the assignment frequency the ADR-0029
+    evidence window is meant to surface."""
+
+
+@dataclass
+class OptionsEvidence:
+    """Structured result of :func:`compute_options_evidence` (AG-OPT-EV-1).
+
+    READ-ONLY metric: nothing on the live path consumes ``is_green``; it is a
+    record-of-evidence surfaced on the run-card / aegis-run-snapshot. NaN means
+    a metric is NOT measured (no data), never silently 0.
+    """
+
+    n_options: int = 0
+    """SETTLED options outcomes after the t0 filter + finite-return guard."""
+
+    win_rate: float = float("nan")
+    """Fraction of options outcomes with realized_return > 0."""
+
+    premium_capture_pct: float = float("nan")
+    """Mean per-outcome premium-capture, in PERCENT, over the outcomes that
+    carry a premium_capture_frac. NaN when none carry it (not measured)."""
+
+    assignment_count: int = 0
+    """Number of options outcomes flagged was_assignment=True."""
+
+    gate_reject_rate: float = float("nan")
+    """rejects / (rejects + admitted), from the optional gate_eval/reject counts.
+    NaN when the caller supplies no counts (not measured)."""
+
+    calendar_days: float = float("nan")
+    """Calendar days from first to last options exit in the sample."""
+
+    n_threshold_met: bool = False
+    """True iff n_options >= 30 (the documented sample-size threshold)."""
+
+    is_green: bool = False
+    """GREEN iff n_options >= 30 AND calendar_days >= 30 (the documented window).
+    Fail-CLOSED: absent t0 / thin / short window => RED. win-rate / premium-capture
+    / assignment / gate-reject are MEASURED + reported but carry no hard numeric
+    floor in the documented gate, so they do not flip GREEN->RED on their own."""
+
+    warnings: list[str] = field(default_factory=list)
+
+
+def compute_options_evidence(
+    round_trips: list[Any],
+    *,
+    t0: datetime | None,
+    gate_eval_count: int | None = None,
+    gate_reject_count: int | None = None,
+) -> OptionsEvidence:
+    """Compute the ADR-0029 AG-OPT-EV-1 options-evidence metrics (EXECUTABLE).
+
+    The ADR-0029 evidence-before-options-live contract — previously only process
+    prose — made executable. Counts the SETTLED options outcomes in the clean
+    window and renders a GREEN/RED on the documented threshold: ``N_options >= 30``
+    settled multi-leg outcomes spanning ``>= 30`` calendar days, with win-rate /
+    premium-capture / assignment / gate-reject all MEASURED.
+
+    READ-ONLY / ADDITIVE: this is a pure metric harness like
+    :func:`compute_gate_metrics`. It returns a structured :class:`OptionsEvidence`
+    and changes NO live gate decision — nothing on the money path consumes
+    ``is_green``; it is surfaced on the run-card for the operator.
+
+    Fail-CLOSED:
+      * ``t0 is None`` (GATE-0 not run) => empty, RED, all metrics NaN.
+      * an outcome with ``asof_exit < t0`` is PRE-GATE-0 => DISCARDED (poisoned data).
+      * a non-finite ``realized_return`` is MISSING => excluded (a NaN is not a win).
+      * a non-options ``asset_class`` (equity, crypto) is excluded entirely.
+      * an unmeasured premium_capture / gate-reject is NaN, never silently 0.
+
+    Args:
+        round_trips: settled outcomes. Each may be an :class:`OptionsEvidenceTrip`
+                     OR any object exposing ``asof_exit`` / ``realized_return`` /
+                     ``asset_class`` (e.g. a daemon ``SettledRoundTrip``). The
+                     options-specific fields (``premium_capture_frac``,
+                     ``was_assignment``) are read via getattr with a neutral default.
+        t0: the GATE-0 anchor (UTC-aware; naive treated as UTC). None => RED.
+        gate_eval_count: optional total options admissibility evaluations in the
+                         window (admitted + rejected). Needed for gate_reject_rate.
+        gate_reject_count: optional count of those evaluations that were REJECTED
+                           by the ADR-0027 options risk gate.
+
+    Returns:
+        OptionsEvidence with all fields populated (NaN/0 when undetermined).
+    """
+    ev = OptionsEvidence()
+
+    if t0 is None:
+        ev.warnings.append(
+            "t0 is None: GATE-0 anchor absent; options-evidence RED (fail-CLOSED)."
+        )
+        return ev
+
+    if t0.tzinfo is None:
+        t0 = t0.replace(tzinfo=timezone.utc)
+
+    # --- gate-reject rate (independent of the round-trip filter — rejects never
+    #     settle, so they are not in round_trips). NaN when not supplied. ---
+    if gate_eval_count is not None and gate_reject_count is not None:
+        try:
+            ev.gate_reject_rate = (
+                float(gate_reject_count) / float(gate_eval_count)
+                if gate_eval_count > 0
+                else float("nan")
+            )
+        except (TypeError, ValueError, ZeroDivisionError):
+            ev.gate_reject_rate = float("nan")
+            ev.warnings.append("gate eval/reject counts unparseable; gate_reject_rate=NaN.")
+
+    # --- Filter: post-t0, finite-return, options-only outcomes ---
+    filtered: list[Any] = []
+    for rt in round_trips:
+        asset_class = getattr(rt, "asset_class", None)
+        if asset_class not in _OPTIONS_ASSET_CLASSES:
+            continue  # not an options outcome (equity/crypto) — excluded entirely
+        asof = getattr(rt, "asof_exit", None)
+        if asof is None:
+            continue
+        # Normalize asof to a comparable UTC-aware datetime (pandas Timestamp is a
+        # datetime subclass; a naive value is localized to UTC).
+        if getattr(asof, "tzinfo", None) is None:
+            try:
+                asof = asof.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+        if asof < t0:
+            continue  # PRE-GATE-0 — poisoned data, discarded
+        rr = getattr(rt, "realized_return", float("nan"))
+        try:
+            rr_f = float(rr)
+        except (TypeError, ValueError):
+            ev.warnings.append(
+                f"Options outcome with asof_exit={asof!s} has unparseable "
+                f"realized_return={rr!r}; excluded."
+            )
+            continue
+        if not math.isfinite(rr_f):
+            ev.warnings.append(
+                f"Options outcome with asof_exit={asof!s} has non-finite "
+                f"realized_return={rr_f!r}; excluded (a NaN is not a win)."
+            )
+            continue
+        filtered.append(rt)
+
+    n = len(filtered)
+    ev.n_options = n
+    if n == 0:
+        ev.warnings.append(
+            f"No finite options outcomes after t0={t0.isoformat()}; "
+            "options-evidence RED (fail-CLOSED)."
+        )
+        return ev
+
+    # Sort chronologically for the calendar-span calculation.
+    filtered.sort(key=lambda rt: getattr(rt, "asof_exit"))
+
+    # --- win_rate ---
+    wins = sum(1 for rt in filtered if float(getattr(rt, "realized_return")) > 0)
+    ev.win_rate = wins / n
+
+    # --- premium_capture_pct: mean of the PRESENT fracs (absence != 0%) ---
+    captures: list[float] = []
+    for rt in filtered:
+        cap = getattr(rt, "premium_capture_frac", None)
+        if cap is None:
+            continue
+        try:
+            cap_f = float(cap)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(cap_f):
+            captures.append(cap_f)
+    if captures:
+        ev.premium_capture_pct = 100.0 * sum(captures) / len(captures)
+    # else: stays NaN (not measured)
+
+    # --- assignment_count ---
+    ev.assignment_count = sum(
+        1 for rt in filtered if bool(getattr(rt, "was_assignment", False))
+    )
+
+    # --- calendar_days (first to last options exit) ---
+    first_exit = getattr(filtered[0], "asof_exit")
+    last_exit = getattr(filtered[-1], "asof_exit")
+    if getattr(first_exit, "tzinfo", None) is None:
+        first_exit = first_exit.replace(tzinfo=timezone.utc)
+    if getattr(last_exit, "tzinfo", None) is None:
+        last_exit = last_exit.replace(tzinfo=timezone.utc)
+    ev.calendar_days = (last_exit - first_exit).total_seconds() / 86400.0
+
+    # --- verdict: N>=30 AND >=30 calendar days (the documented window) ---
+    ev.n_threshold_met = n >= _AGOPTEV_MIN_N_OPTIONS
+    ev.is_green = (
+        ev.n_threshold_met
+        and math.isfinite(ev.calendar_days)
+        and ev.calendar_days >= _AGOPTEV_MIN_DAYS
+    )
+    if not ev.is_green:
+        if not ev.n_threshold_met:
+            ev.warnings.append(
+                f"N_options={n} < {_AGOPTEV_MIN_N_OPTIONS}: not-yet-evidenced (RED)."
+            )
+        elif not (math.isfinite(ev.calendar_days) and ev.calendar_days >= _AGOPTEV_MIN_DAYS):
+            ev.warnings.append(
+                f"window calendar_days={ev.calendar_days:.1f} < {_AGOPTEV_MIN_DAYS}: "
+                "options window too short (RED)."
+            )
+
+    return ev

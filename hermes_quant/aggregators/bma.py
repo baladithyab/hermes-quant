@@ -375,6 +375,8 @@ class BMAAggregator:
         regime_detector=None,
         posterior_store_path: Path | None = None,
         posterior_recipe_key: str | None = None,
+        pooler_store_path: Path | None = None,
+        pooler_recipe_key: str | None = None,
         loss_lesson_provider=None,
     ):
         self.prior_alpha = prior_alpha
@@ -469,6 +471,18 @@ class BMAAggregator:
             prior_beta=self.prior_beta,
             warmup_n=float(self.n_min_observations),
         )
+
+        # d97e: durable ag03 pooler state (gated by the EXISTING default-OFF
+        # HERMES_QUANT_HIERARCHICAL_POOLING flag). When the flag is set, hydrate
+        # the per-(analyst, regime, epoch) cells + per-analyst epoch map so the
+        # effective-n / warm-up band survives a cron-mode process restart instead
+        # of silently resetting to cold. When the flag is off, this is a no-op and
+        # the pooler stays empty — byte-identical to the pre-d97e (and pre-ag03)
+        # path. A missing/corrupt artifact degrades to cold-start, never raises.
+        self.pooler_store_path = pooler_store_path
+        self.pooler_recipe_key = pooler_recipe_key
+        if _hierarchical_pooling_enabled():
+            self._load_persisted_pooler()
 
     @staticmethod
     def _load_calibrator(path: Path):
@@ -599,6 +613,44 @@ class BMAAggregator:
             )
         except Exception as exc:  # noqa: BLE001 — persistence must not abort settlement
             logger.warning("BMA: posterior save failed (%s); continuing", exc)
+
+    def _load_persisted_pooler(self) -> None:
+        """d97e: hydrate self._pooler from the persisted ag03 snapshot (fail-safe).
+
+        Restores the per-(analyst, regime, epoch) correctness cells AND the
+        per-analyst active-epoch map so the effective-n / warm-up band survives a
+        process restart and a subsequent model change still re-enters warm-up
+        against a fresh cell. A missing/corrupt artifact leaves the pooler empty
+        (cold-start), never an exception.
+        """
+        from hermes_quant.learning.pooling_store import load_pooler_state
+
+        try:
+            load_pooler_state(
+                self._pooler,
+                path=self.pooler_store_path,
+                recipe_key=self.pooler_recipe_key,
+            )
+        except Exception as exc:  # noqa: BLE001 — bad cache must not crash init
+            logger.warning("BMA: pooler load failed (%s); cold-start", exc)
+
+    def _save_persisted_pooler(self, asof: pd.Timestamp) -> None:
+        """d97e: atomically persist the current ag03 pooler state (fail-safe).
+
+        Called from update() only when the pooling flag is on. A write failure is
+        logged but never propagates — a bad disk must not abort settlement.
+        """
+        from hermes_quant.learning.pooling_store import save_pooler_state
+
+        try:
+            save_pooler_state(
+                self._pooler,
+                path=self.pooler_store_path,
+                asof=asof,
+                recipe_key=self.pooler_recipe_key,
+            )
+        except Exception as exc:  # noqa: BLE001 — persistence must not abort settlement
+            logger.warning("BMA: pooler save failed (%s); continuing", exc)
 
     def _weight_for(
         self, analyst_name: str, decision_asof: pd.Timestamp | None = None
@@ -1442,6 +1494,14 @@ class BMAAggregator:
         # with the settlement asof. Save is fail-safe (logged, never raises).
         if _posterior_persist_enabled():
             self._save_persisted_posteriors(decision_asof)
+
+        # d97e: persist the ag03 pooler state (DEFAULT-OFF, gated by the SAME
+        # HERMES_QUANT_HIERARCHICAL_POOLING flag the cells are consulted under) so
+        # the effective-n / warm-up band survives a cron-mode restart. Stamp the
+        # settlement asof; fail-safe (logged, never raises). Byte-identical with
+        # the flag off — no save, no file.
+        if _hierarchical_pooling_enabled():
+            self._save_persisted_pooler(decision_asof)
 
     def status(self) -> dict:
         status = {

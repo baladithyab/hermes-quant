@@ -314,17 +314,98 @@ def _action_to_gate_dict(action: Action | None, signal: AggregatedSignal) -> dic
 # Lazy provider construction
 # ---------------------------------------------------------------------------
 
+# c7a9 (ADR-0100): live OHLCV consumer-cutover flag. DEFAULT-OFF. Distinct from
+# HERMES_QUANT_OPENBB (which gates the OpenBB SDK/provider itself): this flag
+# decides whether the LIVE advisor fetch path (_get_default_provider, consumed by
+# recommend + recommend_multi_horizon) consults the openbb tier as a 2nd/fallback
+# OHLCV source BEHIND yfinance. With it unset the provider is a bare
+# YFinanceProvider — byte-identical to the pre-cutover live path. Quoted-literal
+# default so the flag-inventory scanner counts it. Read at call time so an
+# operator .env / cron flip takes effect without re-import.
+OPENBB_LIVE_FLAG = "HERMES_QUANT_OPENBB_LIVE"
+
+
+def _openbb_live_enabled() -> bool:
+    """Whether the openbb OHLCV fallback tier is wired into the live fetch path."""
+    return os.environ.get(OPENBB_LIVE_FLAG, "0") not in ("", "0", "false", "False")
+
+
+class _ChainedProvider:
+    """A DataProvider-shaped wrapper that fans ``fetch_bars`` through an ordered
+    fallback chain via :func:`hermes_quant.data.base.fetch_with_chain`.
+
+    c7a9 (ADR-0100): used ONLY when ``HERMES_QUANT_OPENBB_LIVE`` is set, so the
+    default live path stays a bare ``YFinanceProvider`` (byte-identical). The
+    chain is ``[yfinance, openbb]`` — yfinance PRIMARY, openbb a SILENT no-op
+    fallback tier (its own ``HERMES_QUANT_OPENBB`` gate raises DataProviderError
+    at fetch time when off, which ``fetch_with_chain`` treats as a transient
+    fall-through). yfinance success short-circuits the chain, so openbb is only
+    ever consulted when the primary genuinely fails.
+
+    No-lookahead: the ``as_of`` cutoff is threaded into ``fetch_with_chain``
+    UNCHANGED, so every tier filters ``timestamp <= as_of`` exactly as the
+    single-provider path does (the chain defaults the cutoff to ``end`` when
+    ``as_of`` is omitted — never loosens visibility).
+    """
+
+    name = "yfinance+openbb"
+    # Mirror the primary provider's declared surface so any consumer that
+    # introspects asset_classes/timeframes sees the same contract as yfinance.
+    asset_classes = ["equity", "etf"]
+    timeframes = ["1m", "5m", "15m", "30m", "1h", "1d"]
+
+    def __init__(self, providers: list):
+        # Stored so tests can inject deterministic in-memory tiers; production
+        # builds the real [yfinance, openbb] pair below.
+        self._providers = providers
+
+    def fetch_bars(
+        self,
+        asset: str,
+        timeframe: str,
+        start,
+        end,
+        *,
+        use_cache: bool = True,
+        as_of=None,
+    ):
+        from hermes_quant.data.base import fetch_with_chain
+
+        return fetch_with_chain(
+            self._providers,
+            asset,
+            timeframe,
+            start,
+            end,
+            use_cache=use_cache,
+            as_of=as_of,
+        )
+
 
 def _get_default_provider(asset_class: str):
     """Return a DataProvider for the asset class.
 
     v0.1.2: only yfinance for equity/etf is wired. Crypto/fx will arrive
     when ccxt provider lands (ADR-0005).
+
+    c7a9 (ADR-0100): when ``HERMES_QUANT_OPENBB_LIVE`` is set, equity/etf returns
+    a chained provider ``[yfinance, openbb]`` (yfinance primary, openbb fallback)
+    instead of a bare ``YFinanceProvider``. DEFAULT-OFF -> byte-identical bare
+    yfinance.
     """
     if asset_class in ("equity", "etf"):
         from hermes_quant.data.yfinance_provider import YFinanceProvider
 
-        return YFinanceProvider()
+        if not _openbb_live_enabled():
+            return YFinanceProvider()
+        # Flag ON: yfinance PRIMARY, openbb FALLBACK. OpenBBProvider construction
+        # never imports the openbb SDK (lazy, flag-gated at its `obb` property),
+        # so building it here is import-safe even when openbb is absent / the
+        # vendor flag is off — it simply contributes no bars (raises at fetch
+        # time, treated by the chain as a transient fall-through).
+        from hermes_quant.data.openbb_provider import OpenBBProvider
+
+        return _ChainedProvider([YFinanceProvider(), OpenBBProvider()])
     raise NotImplementedError(
         f"asset_class={asset_class!r} not supported in v0.1.2 advisor "
         f"(crypto/fx require ccxt provider — ADR-0005)"
@@ -397,6 +478,39 @@ def _build_default_analysts() -> list[Any]:
             from hermes_quant.analysts.fundamentals import FundamentalsAnalyst
 
             analysts.append(FundamentalsAnalyst())
+        except ImportError:
+            pass
+    # 2f33 (ADR-0100 ob2): OpenBB forward-estimates analyst — DEFAULT-OFF behind
+    # BOTH HERMES_QUANT_ESTIMATES_ANALYST and HERMES_QUANT_OPENBB (the analyst's
+    # own `analyze` enforces both gates and abstains to None WITHOUT touching the
+    # provider when either is unset). We gate the *registration* on the same two
+    # flags so a build with them off never even constructs the analyst — the
+    # strongest byte-identical guarantee (mirrors FundamentalsAnalyst above; the
+    # estimates docstring's "intentionally not registered while default-OFF" note
+    # is satisfied because the gate keeps it out of the roster until an operator
+    # flips both flags). Gates read at call time so a .env / cron flip takes
+    # effect immediately.
+    if (
+        os.environ.get("HERMES_QUANT_ESTIMATES_ANALYST", "0") == "1"
+        and os.environ.get("HERMES_QUANT_OPENBB", "0") == "1"
+    ):
+        try:
+            from hermes_quant.analysts.estimates import EstimatesAnalyst
+
+            analysts.append(EstimatesAnalyst())
+        except ImportError:
+            pass
+    # 2f33 (ADR-0100 ob3): OpenBB insider + 13-F ownership analyst — DEFAULT-OFF
+    # behind BOTH HERMES_QUANT_INSIDER_ANALYST and HERMES_QUANT_OPENBB (same
+    # two-flag contract as estimates above). Registration gated on both flags.
+    if (
+        os.environ.get("HERMES_QUANT_INSIDER_ANALYST", "0") == "1"
+        and os.environ.get("HERMES_QUANT_OPENBB", "0") == "1"
+    ):
+        try:
+            from hermes_quant.analysts.insider import InsiderAnalyst
+
+            analysts.append(InsiderAnalyst())
         except ImportError:
             pass
     # ADR-0074: Catalyst Sense semantic analyst — default ON; set
@@ -1096,6 +1210,31 @@ def recommend(
                 from hermes_quant.analysts.fundamentals import FundamentalsAnalyst
 
                 analysts.append(FundamentalsAnalyst())
+            except ImportError:
+                pass
+        # 2f33 (ADR-0100 ob2/ob3): OpenBB estimates + insider analysts — DEFAULT-OFF
+        # behind their per-analyst flag AND HERMES_QUANT_OPENBB. Mirrored from
+        # _build_default_analysts() so the canonical recommend() surface (operator
+        # tool calls + flag ablations through recommend()) exercises the flags too,
+        # not just the recommend_multi_horizon()/backtest helper path.
+        if (
+            os.environ.get("HERMES_QUANT_ESTIMATES_ANALYST", "0") == "1"
+            and os.environ.get("HERMES_QUANT_OPENBB", "0") == "1"
+        ):
+            try:
+                from hermes_quant.analysts.estimates import EstimatesAnalyst
+
+                analysts.append(EstimatesAnalyst())
+            except ImportError:
+                pass
+        if (
+            os.environ.get("HERMES_QUANT_INSIDER_ANALYST", "0") == "1"
+            and os.environ.get("HERMES_QUANT_OPENBB", "0") == "1"
+        ):
+            try:
+                from hermes_quant.analysts.insider import InsiderAnalyst
+
+                analysts.append(InsiderAnalyst())
             except ImportError:
                 pass
         # ADR-0074: Catalyst Sense semantic analyst — default ON; set
