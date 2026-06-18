@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**77 flags** (resolvable default).
+**78 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -28,6 +28,7 @@
 | `HERMES_QUANT_DETERMINISTIC_EQUITY` | `0` | `hermes_quant/react/dispatch.py:80` |
 | `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1087` |
 | `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1245` |
+| `HERMES_QUANT_ESTIMATES_ANALYST` | `0` | `hermes_quant/analysts/estimates.py:81` |
 | `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1334` |
 | `HERMES_QUANT_EVIDENCE_DIR` | `` | `hermes_quant/evidence/store.py:60` |
 | `HERMES_QUANT_FUNDAMENTALS_ENABLED` | `0` | `hermes_quant/advisor.py:395` |
@@ -48,11 +49,11 @@
 | `HERMES_QUANT_MEMORY_SPLIT` | `0` | `hermes_quant/aggregators/llm_committee.py:333` |
 | `HERMES_QUANT_MONTHLY_META_RETRO` | `0` | `hermes_quant/memory/meta_retro.py:70` |
 | `HERMES_QUANT_MULTILEG_REACTOR` | `0` | `hermes_quant/react/mleg_fill.py:116` |
-| `HERMES_QUANT_OPENBB` | `0` | `hermes_quant/data/openbb_provider.py:141` |
+| `HERMES_QUANT_OPENBB` | `0` | `hermes_quant/data/openbb_fundamentals.py:139` |
 | `HERMES_QUANT_OPEN_GUARD` | `1` | `hermes_quant/risk/open_guard.py:304` |
 | `HERMES_QUANT_OPTIONS_GATE` | `0` | `hermes_quant/risk/options_gate.py:529` |
 | `HERMES_QUANT_OPTIONS_LIVE_CHAIN` | `0` | `hermes_quant/options/data.py:427` |
-| `HERMES_QUANT_OPTIONS_PERCEIVE` | `0` | `hermes_quant/options/iv_rank.py:61` |
+| `HERMES_QUANT_OPTIONS_PERCEIVE` | `0` | `hermes_quant/autonomous.py:2322` |
 | `HERMES_QUANT_OVERNIGHT_DRIFT` | `0` | `hermes_quant/advisor.py:430` |
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:255` |
 | `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:523` |
