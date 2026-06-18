@@ -149,6 +149,53 @@ def test_run_card_detects_haircut_rail_drift(tmp_path, monkeypatch):
     assert card["rail_drift"]["HERMES_QUANT_SLIPPAGE_HAIRCUT"] == {"window": "1", "live": None}
 
 
+# --------------------------------------------------------------------------- #
+# 821d — the ag01 PORTFOLIO_VARIANCE_SIZING rail must be tracked in _RAIL_FLAGS
+# so the run-card's window-vs-live drift detection covers a mid-window disarm of
+# it (mirrors the d83b SLIPPAGE_HAIRCUT precedent). ag01 is not yet a required
+# armed rail, but its drift must still be VISIBLE on a run-card.
+# --------------------------------------------------------------------------- #
+def test_variance_sizing_tracked_in_rail_flags():
+    """RED before 821d: _RAIL_FLAGS omitted PORTFOLIO_VARIANCE_SIZING, so a
+    run-card review could not detect drift/disarm of the ag01 rail."""
+    assert "HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING" in H._RAIL_FLAGS, (
+        "the ag01 variance-sizing rail must be tracked so its drift/disarm is detectable"
+    )
+
+
+def test_run_card_detects_variance_sizing_rail_drift(tmp_path, monkeypatch):
+    """An ag01 rail armed at t0 but DISARMED live -> rail_drift names it.
+    RED before 821d: PORTFOLIO_VARIANCE_SIZING was not in _RAIL_FLAGS, so the
+    drift dict (built only over _RAIL_FLAGS) never reported its disarm."""
+    home = tmp_path / "quant"
+    _write_anchor(home, {"HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING": "1"})
+    monkeypatch.delenv("HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING", raising=False)  # disarmed live!
+    card = H.write_run_card(tmp_path / "run", home=home)
+    assert "rail_drift" in card
+    assert "HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING" in card["rail_drift"]
+    assert card["rail_drift"]["HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING"] == {"window": "1", "live": None}
+
+
+def test_gate0_start_lists_variance_sizing():
+    """The gate0-start run-card snapshot must list the ag01 rail too (recommended,
+    not required — ag01 is not yet an armed rail). RED before 821d: it was absent
+    from both _RECOMMENDED and _SNAPSHOT_FLAGS, so a GATE-0 run-card never recorded
+    the ag01 flag state at t0 and downstream drift could not be anchored."""
+    spec = importlib.util.spec_from_file_location(
+        "aegis_gate0_start",
+        Path(__file__).resolve().parents[2] / "ops" / "scripts" / "aegis-gate0-start.py",
+    )
+    g0 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(g0)
+    assert "HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING" in g0._SNAPSHOT_FLAGS, (
+        "gate0-start must snapshot the ag01 variance-sizing flag at t0"
+    )
+    # Recommended, not required (ag01 is not yet an armed rail).
+    assert "HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING" not in g0._REQUIRED_ARMED, (
+        "ag01 must NOT be a required-armed rail yet (no runtime/money-gate change)"
+    )
+
+
 def test_main_appends_perf_line(tmp_path):
     home = tmp_path / "quant"
     home.mkdir()

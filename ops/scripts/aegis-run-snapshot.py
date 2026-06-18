@@ -46,6 +46,12 @@ from pathlib import Path
 # window disarm of the haircut silently reverts to paper-optimistic evidence, which
 # must surface as drift — not stay invisible while the record still calls itself
 # honest/forward-only.
+#
+# 821d: PORTFOLIO_VARIANCE_SIZING (ag01) is tracked here too so the run-card's
+# window-vs-live drift detection covers it. ag01 is not yet a required armed rail,
+# but if it is armed at GATE-0 t0 and silently disarmed mid-window, that shifts the
+# position-sizing behaviour the window's evidence was recorded under — a drift the
+# operator must see on the run-card, not have it stay invisible.
 _RAIL_FLAGS = [
     "HERMES_QUANT_PORTFOLIO_CAPS",
     "HERMES_QUANT_PAPER_SLIPPAGE_MODEL",
@@ -56,6 +62,7 @@ _RAIL_FLAGS = [
     "HERMES_QUANT_DELTA_NORMALIZER",
     "HERMES_QUANT_ACCOUNT_LOCK",
     "HERMES_QUANT_SLIPPAGE_HAIRCUT",
+    "HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING",
     "HERMES_QUANT_REFLECTION",
 ]
 

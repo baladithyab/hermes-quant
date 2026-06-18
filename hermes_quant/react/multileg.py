@@ -626,40 +626,142 @@ class MultiLegPaperReactor:
             return leg_fills, parent.status, net_fill
 
         # Single option leg (CC short call / CSP short put).
+        #
+        # e572 (P1) — NO-ORPHAN ATOMICITY. A covered structure (``stock_leg`` present)
+        # pairs a SHORT option with an EQUITY cover. The OLD ordering submitted +
+        # FILLED the short option FIRST, then the equity cover. An equity-leg failure
+        # AFTER the short filled stranded a NAKED SHORT (undefined risk) at the broker
+        # while the reactor wrote a clean no-fill parent (the system blind to the
+        # naked short). The cardinal invariant: a filled short option must NEVER be
+        # left without its cover.
+        #
+        # FIX (cover-first; option (a) in the seed): submit the EQUITY cover FIRST and
+        # only submit the short option after the cover is confirmed filled. A cover
+        # failure then leaves NOTHING (the short is never submitted); a short failure
+        # after the cover filled leaves only a long stock position (defined risk) which
+        # we UNWIND so nothing stands, then fail-CLOSED to a no-fill record. The
+        # backends submit equity and option as SEPARATE orders (no single atomic
+        # multi-leg order exists for a stock+option CC on either backend — Alpaca's
+        # MLEG is options-only, the deterministic sim has no combo primitive), so
+        # cover-first ordering + unwind is the safest atomicity the backends support.
         option_leg = proposal.option_legs[0]
+
+        # No-cover single leg (CSP short put — cash-secured, no equity cover): the
+        # option is the whole structure, so there is no cover to order before it.
+        # Byte-identical to the pre-e572 single-option path.
+        if proposal.stock_leg is None:
+            try:
+                opt_res: FillResult = backend.submit_option_single(
+                    option_leg,
+                    qty=proposal.outer_qty,
+                    limit_price=net_price,
+                    client_order_id=client_order_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — any backend failure -> no-fill
+                raise self._as_fill_rejected(exc, proposal) from exc
+            self._guard_result(opt_res, proposal)
+            fills.append(_fillresult_to_legfill(opt_res))
+            net_fill = sum(f.filled_avg_price * _leg_sign(f) for f in fills if _is_option(f))
+            return fills, "filled", net_fill if net_fill else net_price
+
+        # Covered structure (CC / collar): COVER-FIRST. Submit the equity cover, then
+        # the short option. A naked short is now structurally impossible.
+        basis = (
+            float(proposal.stock_leg.basis_per_share)
+            if proposal.stock_leg.basis_per_share
+            else 0.0
+        )
         try:
-            opt_res: FillResult = backend.submit_option_single(
+            eq_res: FillResult = backend.submit_equity(
+                symbol=proposal.underlying,
+                signed_qty=float(proposal.stock_leg.qty),
+                decision_price=basis,
+                client_order_id=client_order_id + "-eq",
+            )
+        except Exception as exc:  # noqa: BLE001 — cover failed -> short never submitted
+            # Cover failed BEFORE the short option was ever submitted: no naked short
+            # can exist. Fail-closed to a no-fill record.
+            raise self._as_fill_rejected(exc, proposal) from exc
+        self._guard_result(eq_res, proposal)
+
+        # Cover is confirmed filled. Now submit the short option. If THIS fails, the
+        # cover is a STANDING long stock position (defined risk, not naked) — unwind
+        # it so nothing stands, then fail-closed to a no-fill record.
+        try:
+            opt_res = backend.submit_option_single(
                 option_leg,
                 qty=proposal.outer_qty,
                 limit_price=net_price,
                 client_order_id=client_order_id,
             )
-        except Exception as exc:  # noqa: BLE001 — any backend failure -> no-fill
-            raise self._as_fill_rejected(exc, proposal) from exc
-        self._guard_result(opt_res, proposal)
-        fills.append(_fillresult_to_legfill(opt_res))
-
-        # Covered-call equity leg: a SEPARATE equity order (research §1.3).
-        if proposal.stock_leg is not None:
-            basis = (
-                float(proposal.stock_leg.basis_per_share)
-                if proposal.stock_leg.basis_per_share
-                else 0.0
+            self._guard_result(opt_res, proposal)
+        except Exception as exc:  # noqa: BLE001 — short failed AFTER cover filled
+            self._unwind_equity_cover(
+                backend,
+                proposal,
+                cover_fill=eq_res,
+                client_order_id=client_order_id,
             )
-            try:
-                eq_res: FillResult = backend.submit_equity(
-                    symbol=proposal.underlying,
-                    signed_qty=float(proposal.stock_leg.qty),
-                    decision_price=basis,
-                    client_order_id=client_order_id + "-eq",
-                )
-            except Exception as exc:  # noqa: BLE001 — any backend failure -> no-fill
-                raise self._as_fill_rejected(exc, proposal) from exc
-            self._guard_result(eq_res, proposal)
-            fills.append(_fillresult_to_legfill(eq_res))
+            raise self._as_fill_rejected(exc, proposal) from exc
 
+        # Both legs filled. Preserve the option-then-equity ``fills`` order the
+        # pre-e572 path produced so record-building / reconciliation output is
+        # byte-identical on the happy path.
+        fills.append(_fillresult_to_legfill(opt_res))
+        fills.append(_fillresult_to_legfill(eq_res))
         net_fill = sum(f.filled_avg_price * _leg_sign(f) for f in fills if _is_option(f))
         return fills, "filled", net_fill if net_fill else net_price
+
+    def _unwind_equity_cover(
+        self,
+        backend: BrokerBackend,
+        proposal: Any,
+        *,
+        cover_fill: FillResult,
+        client_order_id: str,
+    ) -> None:
+        """Best-effort unwind of an already-FILLED equity cover after the short option
+        leg failed (e572). Submits the OPPOSITE-signed equity order so the cover does
+        not stand alone. Failure to unwind is surfaced LOUDLY (a stranded long stock is
+        defined risk, NOT a naked short — the cardinal invariant still holds — but an
+        operator must know the book carries an un-paired equity leg). Never raises:
+        the caller already fails-closed to a no-fill record; this is the unwind attempt
+        on top of that.
+        """
+        signed_qty = float(getattr(cover_fill, "filled_qty", 0.0) or 0.0)
+        if signed_qty == 0.0:
+            return  # cover never moved a position — nothing to unwind
+        basis = (
+            float(proposal.stock_leg.basis_per_share)
+            if proposal.stock_leg is not None and proposal.stock_leg.basis_per_share
+            else 0.0
+        )
+        try:
+            unwind = backend.submit_equity(
+                symbol=proposal.underlying,
+                signed_qty=-signed_qty,  # close the cover (opposite sign)
+                decision_price=basis,
+                client_order_id=client_order_id + "-eq-unwind",
+            )
+            self._guard_result(unwind, proposal)
+            logger.warning(
+                "multileg-react: %s short option failed after cover filled; "
+                "UNWOUND the %s equity cover (%+g sh) — no naked short, nothing stands",
+                proposal.proposal_id,
+                proposal.underlying,
+                signed_qty,
+            )
+        except Exception as exc:  # noqa: BLE001 — unwind is best-effort; surface loudly
+            logger.error(
+                "multileg-react: %s short option failed after cover filled AND the "
+                "cover unwind FAILED (%s): the book carries a STANDING %+g-share %s "
+                "equity leg with no short (DEFINED risk, not naked) — operator must "
+                "reconcile manually",
+                proposal.proposal_id,
+                exc,
+                signed_qty,
+                proposal.underlying,
+            )
 
     @staticmethod
     def _guard_result(res: FillResult, proposal: Any) -> None:

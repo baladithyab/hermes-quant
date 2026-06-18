@@ -47,10 +47,17 @@ _REQUIRED_ARMED = [
     "HERMES_QUANT_SLIPPAGE_HAIRCUT",
 ]
 # Recommended-but-not-blocking (warn if absent).
+#
+# 821d: PORTFOLIO_VARIANCE_SIZING (ag01) is RECOMMENDED (not required) — it is not
+# yet a required armed rail, so GATE-0 must NOT refuse t0 when it is off. But it is
+# listed so its t0 state is captured in the run-card snapshot, which anchors the
+# window-vs-live drift detection in aegis-run-snapshot.py (mirrors the d83b
+# SLIPPAGE_HAIRCUT precedent, kept at recommended rather than required).
 _RECOMMENDED = [
     "HERMES_QUANT_TAKE_PROFIT_SWEEP",
     "HERMES_QUANT_POST_LOSS_COOLDOWN",
     "HERMES_QUANT_PAPER_SLIPPAGE_MODEL",
+    "HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING",
 ]
 # The full snapshot recorded in the run-card (everything that shapes the window).
 _SNAPSHOT_FLAGS = _REQUIRED_ARMED + _RECOMMENDED + [
