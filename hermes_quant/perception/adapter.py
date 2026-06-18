@@ -59,6 +59,14 @@ def frame_to_context(
     # ignore unknown keys (protocol.py:16); this is the bull/bear/judge READ surface.
     if frame.event_risk is not None:
         extras["event_risk"] = frame.event_risk
+    # agperc2: surface the as-of IV-rank so the decision/structure_select layer reads
+    # it from ctx.extras (closes the loop to autonomous._originate_mleg_proposal, which
+    # reads structure_intent + iv_rank). None when OFF / not-eligible / abstain, so the
+    # default extras key-set is preserved (byte-identical). Analysts ignore unknown keys
+    # (protocol.py:16). The OptionChain rides on frame.options_chain (an OBJECT, not an
+    # extras scalar) — the originator reads it off the frame, not ctx.extras.
+    if frame.iv_rank is not None:
+        extras["iv_rank"] = frame.iv_rank
     return MarketContext(
         asset=frame.symbol,
         timeframe=timeframe,

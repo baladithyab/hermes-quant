@@ -53,6 +53,7 @@ def build_perception_frame(
     lookback_bars: int,
     decision_asof: datetime | None = None,  # wall-clock now for live; explicit for backtests (ADR-0068/0074)
     base_extras: Mapping[str, Any] | None = None,
+    options_eligible: bool = False,  # agperc2: per-symbol opt-in (WatchlistEntry.options_eligible)
 ) -> PerceptionFrame | None:
     """Build the single ``PerceptionFrame`` for ``symbol`` at ``asof_ts``.
 
@@ -346,6 +347,78 @@ def build_perception_frame(
                 exc,
             )
 
+    # ---- Step 5e: agperc2 options PERCEIVE (HERMES_QUANT_OPTIONS_PERCEIVE) — default-OFF ----
+    # BOTH the flag AND the per-symbol options_eligible opt-in are REQUIRED. Either
+    # absent -> step 5e is SKIPPED -> options_chain/iv_rank stay None -> the adapter
+    # writes NOTHING -> byte-identical default path (flag-OFF / not-eligible safety).
+    # The flag is read at CALL time (mirrors Step 5/5b/5c/5d/6b) via the agperc1
+    # canonical helper so the fail-closed "only the literal '1' is ON" convention is
+    # not re-implemented here.
+    #
+    # RR13: a missing / thin recorded chain must NOT abort frame building. The chain
+    # replay and the IV-rank are sourced INDEPENDENTLY in their own try/except — a
+    # ChainQualityError on the CURRENT day's chain (which replay_chain raises) must
+    # not zero out an IV-rank that ranks the visible PRIOR history (which abstains on
+    # its own, returning None, never raising). Either degrades to None + a WARNING
+    # (visible because this branch is only reached when ENABLED + eligible).
+    #
+    # NO-LOOKAHEAD (cardinal): both replay_chain and compute_iv_rank_asof apply the
+    # SAME fetched_at<=asof / asof<=asof filter at data.py:360 against last_bar_ts_utc
+    # (the bar-asof replay anchor == frame.asof), so the chain + IV-rank reflect ONLY
+    # rows visible at asof. A future-dated row never contributes.
+    frame_options_chain: Any | None = None
+    frame_iv_rank: float | None = None
+    if options_eligible:
+        from hermes_quant.options.iv_rank import options_perceive_enabled
+
+        if options_perceive_enabled():
+            from hermes_quant.options.data import (
+                ChainQualityError,
+                ChainSnapshotReader,
+            )
+            from hermes_quant.options.iv_rank import compute_iv_rank_asof
+
+            reader = ChainSnapshotReader()
+            # asof anchor = the bar-asof replay anchor (frame.asof). compute_iv_rank_asof
+            # takes a datetime; last_bar_ts_utc is a tz-aware pandas Timestamp (a datetime
+            # subclass) so it passes straight through to the same no-look-ahead filter.
+            try:
+                frame_options_chain = reader.replay_chain(symbol, last_bar_ts_utc)
+            except ChainQualityError as exc:
+                # The EXPECTED degenerate case (no parquet for the day / <2 visible
+                # contracts after the look-ahead filter): degrade to None, never abort.
+                logger.warning(
+                    "build_perception_frame(%s): options chain unavailable "
+                    "(feature ENABLED + eligible): %s",
+                    symbol,
+                    exc,
+                )
+                frame_options_chain = None
+            except Exception as exc:  # noqa: BLE001 — never block frame build on options
+                logger.warning(
+                    "build_perception_frame(%s): options chain replay failed "
+                    "(feature ENABLED + eligible): %s",
+                    symbol,
+                    exc,
+                )
+                frame_options_chain = None
+
+            # IV-rank is sourced INDEPENDENTLY: it ranks the trailing history and
+            # already fail-closes to None internally (agperc1), so the current-day
+            # chain being thin/absent does not prevent ranking the prior window.
+            try:
+                frame_iv_rank = compute_iv_rank_asof(
+                    symbol, last_bar_ts_utc, reader=reader
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive; compute already abstains
+                logger.warning(
+                    "build_perception_frame(%s): iv-rank source failed "
+                    "(feature ENABLED + eligible): %s",
+                    symbol,
+                    exc,
+                )
+                frame_iv_rank = None
+
     # ---- Step 6: last_close (advisor.py:877) ----
     last_close = float(bars["close"].iloc[-1])
 
@@ -361,6 +434,8 @@ def build_perception_frame(
         convergence=frame_convergence,
         saturation=frame_saturation,
         event_risk=frame_event_risk,
+        options_chain=frame_options_chain,
+        iv_rank=frame_iv_rank,
         provenance=(),
         extras=frame_extras,
     )
@@ -375,6 +450,7 @@ def build_perception_frame_live(
     decision_asof: datetime | None = None,
     provider: Any = None,
     base_extras: Mapping[str, Any] | None = None,
+    options_eligible: bool = False,  # agperc2: per-symbol opt-in (default-False -> byte-identical)
 ) -> PerceptionFrame | None:
     """Resolve the live-path inputs (provider / asof / lookback) the SAME way the
     advisor's ``None`` branch does, then call :func:`build_perception_frame`.
@@ -411,6 +487,7 @@ def build_perception_frame_live(
             lookback_bars=lb,
             decision_asof=decision_asof,
             base_extras=base_extras,
+            options_eligible=options_eligible,
         )
     except Exception as exc:  # noqa: BLE001 — never block a tick on frame building
         logger.debug("build_perception_frame_live(%s): %s", symbol, exc)
