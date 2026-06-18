@@ -1494,6 +1494,110 @@ def _maybe_take_tranche(
     return True
 
 
+def _originate_mleg_proposal(
+    *,
+    symbol: str,
+    asof: "datetime",
+    advisor_result: dict[str, Any],
+    nav: float,
+    options_buying_power: float,
+    iv_rank: float | None,
+    structure_intent: Any = None,
+    paper_zero_costs: bool = False,
+    result: "TickResult",
+) -> str | None:
+    """Originate an OPTIONS (multi-leg) play for a symbol (agdec1/agreact1). Returns the
+    execution_id of a filled mleg proposal, or None (abstain) at any missing precondition.
+
+    DEFAULT-OFF + FAIL-CLOSED chain — abstains (None, no side effect) unless ALL hold:
+      * HERMES_QUANT_AUTONOMOUS_OPTIONS=1 (the master autonomous-origination flag), AND
+      * structure_select_for_plan returns a producible StrategyKind (itself gated by
+        HERMES_QUANT_STRUCTURE_SELECT + needs a non-None structure_intent + a usable
+        iv_rank/regime — so this is INERT until the perception layer sources an as-of IV
+        rank; abstaining on iv_rank=None is honest, not a bug), AND
+      * the producer admits (build_and_persist_multi_leg runs the options_gate, itself
+        gated by HERMES_QUANT_OPTIONS_GATE; a rejected/ungated structure persists nothing
+        that can fill), AND
+      * the routed reactor fills (MultiLegPaperReactor self-gates on
+        HERMES_QUANT_MULTILEG_REACTOR; raises/no-fills otherwise).
+    Every layer is independently default-OFF, so with HERMES_QUANT_AUTONOMOUS_OPTIONS unset
+    the tick is BYTE-IDENTICAL (this function is never entered). Best-effort: any error is
+    a logged abstain, never a tick-abort. The deterministic gate stays final; the LLM never
+    picks legs (structure_select is a table); no naked/undefined-risk (ADR-0098 producer set).
+    """
+    if os.environ.get("HERMES_QUANT_AUTONOMOUS_OPTIONS", "0") != "1":
+        return None
+    try:
+        from hermes_quant.options.recipes import build_and_persist_multi_leg
+        from hermes_quant.options.structure_select import select_structure_for_plan
+        from hermes_quant.proposals import get_default_store
+        from hermes_quant.react.dispatch import select_reactor
+
+        # 1) Distil the structure (deterministic table; abstains -> None on any gap).
+        # A minimal plan-shaped object duck-typed to .recommendation / .structure_intent.
+        class _Plan:
+            recommendation = advisor_result.get("recommendation") or advisor_result.get(
+                "aggregated_signal", {}
+            )
+            pass
+        plan = _Plan()
+        plan.structure_intent = structure_intent  # type: ignore[attr-defined]
+        strategy_kind = select_structure_for_plan(plan, iv_rank=iv_rank)
+        if strategy_kind is None:
+            return None  # abstain -> the equity path stands (byte-identical to today)
+
+        # 2) Build + gate + persist (options_gate runs inside; rejects persist nothing fillable).
+        store = get_default_store()
+        build_result, persisted = build_and_persist_multi_leg(
+            store=store,
+            symbol=symbol,
+            asof=asof,
+            strategy_kind=strategy_kind,
+            nav=float(nav),
+            options_buying_power=float(options_buying_power),
+            advisor_result=advisor_result,
+        )
+        if persisted is None:
+            # Gate rejected the structure (inadmissible/over-cap/non-finite) -> abstain.
+            result.decisions.append(SymbolDecision(
+                symbol=symbol, asset_class="us_option", timeframe="1d",
+                gate="AUTONOMOUS_OPTIONS_GATE_REJECT",
+                details={"strategy_kind": str(strategy_kind),
+                         "reason": getattr(build_result, "reason", "gate_reject")}))
+            return None
+
+        # 3) Route through the ONE dispatch chokepoint (select_reactor); the multileg reactor
+        # self-gates on HERMES_QUANT_MULTILEG_REACTOR (raises MultiLegReactorDisabled if off).
+        mleg = getattr(persisted, "multi_leg_proposal", None) or persisted
+        reactor = select_reactor(mleg)
+        if paper_zero_costs and getattr(reactor, "name", None) not in ("paper", "multileg-paper"):
+            return None  # fail-closed: paper_zero_costs requires a paper reactor
+        record = reactor.execute(mleg, fill_size_pct=0.0, approver_user_id="autonomous",
+                                 play_tag="autonomous_options")
+        _rmeta = getattr(record, "reactor_metadata", None) or {}
+        if (_rmeta.get("no_fill") or _rmeta.get("silenced")
+                or getattr(record, "fill_size_pct", None) in (None, 0.0)):
+            result.silences += 1
+            result.decisions.append(SymbolDecision(
+                symbol=symbol, asset_class="us_option", timeframe="1d",
+                gate="AUTONOMOUS_OPTIONS_NO_FILL",
+                details={"strategy_kind": str(strategy_kind)}))
+            return None
+        execution_id = getattr(record, "proposal_id", None) or getattr(persisted, "proposal_id", "")
+        result.fires += 1
+        result.decisions.append(SymbolDecision(
+            symbol=symbol, asset_class="us_option", timeframe="1d",
+            gate="AUTONOMOUS_OPTIONS_FIRED", execution_id=execution_id,
+            details={"strategy_kind": str(strategy_kind), "iv_rank": iv_rank}))
+        logger.info("autonomous: ORIGINATED options play %s on %s via %s",
+                    strategy_kind, symbol, execution_id)
+        return execution_id
+    except Exception as exc:  # noqa: BLE001 - origination must never abort the tick
+        logger.warning("autonomous: options origination failed for %s (abstain): %s",
+                        symbol, exc, exc_info=True)
+        return None
+
+
 def _run_per_position_stop_sweep(
     *,
     open_book: dict[str, float],
@@ -2194,6 +2298,36 @@ def tick(
                 )
                 result.errors += 1
                 continue
+
+            # agdec1/agreact1 (HERMES_QUANT_AUTONOMOUS_OPTIONS, default-OFF): attempt an
+            # OPTIONS origination for this symbol BEFORE the equity path. If it fires a
+            # multi-leg play, skip the equity decision for this symbol this tick (one play
+            # per symbol per tick). Abstains (returns None) at every missing precondition —
+            # most importantly iv_rank is None here today (the perception layer does not yet
+            # source an as-of IV rank; that is the OpenBB/agperc work), so this is INERT but
+            # WIRED. Byte-identical when the flag is unset (the helper returns None on the
+            # first guard, never touching the equity path). Best-effort inside the helper.
+            if not dry_run and os.environ.get("HERMES_QUANT_AUTONOMOUS_OPTIONS", "0") == "1":
+                _nav_for_opts = _account_nav_mtm()
+                if _nav_for_opts is None:
+                    from hermes_quant.state.portfolio_state import _default_initial_cash
+                    _nav_for_opts = _default_initial_cash()
+                _opts_exec = _originate_mleg_proposal(
+                    symbol=entry.symbol,
+                    asof=datetime.now(tz=UTC),
+                    advisor_result=advisor_result,
+                    nav=float(_nav_for_opts),
+                    # No live options-BP source in the tick yet -> 0.0 makes the options_gate's
+                    # BP check fail-closed (abstain) until a real options-BP read is wired
+                    # (the operator's Alpaca options BP, a future increment). Honest + safe.
+                    options_buying_power=0.0,
+                    iv_rank=None,  # TODO(agperc): source an as-of IV rank; None -> abstain today
+                    structure_intent=advisor_result.get("structure_intent"),
+                    paper_zero_costs=bool(rails.get("paper_zero_costs", False)),
+                    result=result,
+                )
+                if _opts_exec is not None:
+                    continue  # an options play fired for this symbol; skip the equity path
 
             # Pull lessons for salience check (already in advisor_result, but
             # surface separately for the gate)

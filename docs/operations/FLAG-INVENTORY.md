@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**74 flags** (resolvable default).
+**75 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -17,6 +17,7 @@
 | `HERMES_QUANT_ALPACA_SHADOW` | `0` | `hermes_quant/react/alpaca_shadow.py:40` |
 | `HERMES_QUANT_ANALYSTS_USE_REGIME` | `0` | `hermes_quant/regime/regime_aware_confidence.py:26` |
 | `HERMES_QUANT_ANALYST_ADMISSION` | `0` | `hermes_quant/advisor.py:450` |
+| `HERMES_QUANT_AUTONOMOUS_OPTIONS` | `0` | `hermes_quant/autonomous.py:1528` |
 | `HERMES_QUANT_BORROW_COST` | `0` | `hermes_quant/admissibility/borrow_pnl.py:34` |
 | `HERMES_QUANT_BROKER_BACKEND` | `` | `hermes_quant/react/backend.py:149` |
 | `HERMES_QUANT_CALENDAR_ENABLED` | `0` | `hermes_quant/catalyst/wiring.py:108` |
@@ -54,10 +55,10 @@
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:255` |
 | `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:523` |
 | `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1323` |
-| `HERMES_QUANT_PER_POSITION_STOP` | `0` | `hermes_quant/autonomous.py:1935` |
+| `HERMES_QUANT_PER_POSITION_STOP` | `0` | `hermes_quant/autonomous.py:2053` |
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:206` |
-| `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:2014` |
+| `HERMES_QUANT_PORTFOLIO_CAPS` | `` | `hermes_quant/autonomous.py:2132` |
 | `HERMES_QUANT_POST_LOSS_COOLDOWN` | `0` | `hermes_quant/autonomous.py:784` |
 | `HERMES_QUANT_PREWARM_WORKERS` | `` | `hermes_quant/playbook/scorers.py:816` |
 | `HERMES_QUANT_RAIL_LOCK_TIMEOUT_S` | `` | `hermes_quant/autonomous.py:87` |
@@ -75,13 +76,13 @@
 | `HERMES_QUANT_SLIPPAGE_HAIRCUT` | `0` | `hermes_quant/risk/slippage_haircut.py:70` |
 | `HERMES_QUANT_STACKING` | `0` | `hermes_quant/aggregators/bma.py:277` |
 | `HERMES_QUANT_STRUCTURE_SELECT` | `0` | `hermes_quant/options/structure_select.py:119` |
-| `HERMES_QUANT_TAKE_PROFIT_SWEEP` | `0` | `hermes_quant/autonomous.py:1512` |
+| `HERMES_QUANT_TAKE_PROFIT_SWEEP` | `0` | `hermes_quant/autonomous.py:1625` |
 | `HERMES_QUANT_TICK_LOCK` | `1` | `hermes_quant/react/paper.py:261` |
 | `HERMES_QUANT_TICK_LOCK_TIMEOUT_S` | `` | `hermes_quant/daemon/tick_lock.py:88` |
-| `HERMES_QUANT_TP_TRANCHE` | `0` | `hermes_quant/autonomous.py:1521` |
+| `HERMES_QUANT_TP_TRANCHE` | `0` | `hermes_quant/autonomous.py:1634` |
 | `HERMES_QUANT_TRADER_LLM` | `0` | `hermes_quant/agents/trader.py:504` |
 | `HERMES_QUANT_TREND_VELOCITY` | `0` | `hermes_quant/catalyst/synthesize.py:211` |
 | `HERMES_QUANT_VERTICAL_SPREADS` | `0` | `hermes_quant/options/structure_select.py:129` |
 | `HERMES_QUANT_WATCHLIST_CAP_TRIM` | `0` | `hermes_quant/playbook/watchlist_evolution.py:169` |
-| `HERMES_QUANT_WATCH_REGISTRY` | `0` | `hermes_quant/autonomous.py:1530` |
+| `HERMES_QUANT_WATCH_REGISTRY` | `0` | `hermes_quant/autonomous.py:1643` |
 | `HERMES_QUANT_WEEKLY_RETRO` | `1` | `hermes_quant/aggregators/llm_committee.py:350` |

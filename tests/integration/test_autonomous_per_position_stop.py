@@ -557,3 +557,60 @@ def test_nan_mark_in_tranche_path_holds_not_errors(isolate_config, isolate_quant
     assert calls == [], "a NaN mark must HOLD (no exit fired)"
     assert result.errors == 0, "a NaN mark is a clean HOLD, must NOT increment result.errors"
     assert not any("ERROR" in d.gate for d in result.decisions), "no spurious *_ERROR gate on a NaN-mark HOLD"
+
+
+# --------------------------------------------------------------------------- #
+# agdec1/agreact1: options origination wiring (HERMES_QUANT_AUTONOMOUS_OPTIONS, default-OFF).
+# --------------------------------------------------------------------------- #
+def test_originate_mleg_abstains_when_flag_off():
+    """Flag OFF -> the helper abstains immediately (None, no side effect, byte-identical)."""
+    from datetime import datetime, timezone
+    from hermes_quant.autonomous import TickResult, _originate_mleg_proposal
+    import os
+    os.environ.pop("HERMES_QUANT_AUTONOMOUS_OPTIONS", None)
+    r = TickResult(asof="x", mode="autonomous", dry_run=False, watchlist_size=0)
+    out = _originate_mleg_proposal(
+        symbol="AAPL", asof=datetime.now(timezone.utc), advisor_result={}, nav=100000.0,
+        options_buying_power=50000.0, iv_rank=60.0, structure_intent=None, result=r,
+    )
+    assert out is None and r.fires == 0 and r.decisions == []
+
+
+def test_originate_mleg_abstains_on_none_iv_rank_when_flag_on(monkeypatch):
+    """Flag ON but iv_rank None (today's reality — no perception IV source) -> abstain at
+    structure_select. This is the INERT-but-WIRED state: honest, no origination yet."""
+    from datetime import datetime, timezone
+    from hermes_quant.autonomous import TickResult, _originate_mleg_proposal
+    monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
+    r = TickResult(asof="x", mode="autonomous", dry_run=False, watchlist_size=0)
+    out = _originate_mleg_proposal(
+        symbol="AAPL", asof=datetime.now(timezone.utc), advisor_result={"recommendation": "buy"},
+        nav=100000.0, options_buying_power=50000.0, iv_rank=None, structure_intent=None, result=r,
+    )
+    assert out is None  # iv_rank None / structure_select abstains -> equity path stands
+
+
+def test_tick_byte_identical_when_autonomous_options_off(isolate_config, isolate_quant_home, monkeypatch):
+    """The tick must NOT call origination when the flag is off (the equity path is untouched)."""
+    _set_mode_autonomous(isolate_config)
+    monkeypatch.delenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", raising=False)
+    calls = {"orig": 0}
+    import hermes_quant.autonomous as auto_mod
+    real = auto_mod._originate_mleg_proposal
+    def spy(*a, **k):
+        calls["orig"] += 1
+        return real(*a, **k)
+    monkeypatch.setattr(auto_mod, "_originate_mleg_proposal", spy)
+    # A canonical valid advisor_result (a real recommend never returns None for a watched
+    # symbol; the equity path itself does advisor_result.get(...), so None is not a legal
+    # input). Mirrors tests/integration/test_autonomous_e2e._make_advisor_result.
+    _ar = {
+        "as_of": "2026-06-17T20:00:00Z", "decision_price": 100.0, "signal_id": "sig_test",
+        "aggregated_signal": {"confidence": 0.85, "direction": 1, "magnitude": 0.05},
+        "risk_gate": {"pass": True, "kelly_fraction": 0.05, "reason": "ok", "gated_reason": None},
+        "analyst_views": [{"analyst": "A0", "metadata": {"atr_relative": 0.05}}],
+        "lessons": [],
+    }
+    auto.tick(dry_run=False, symbols=[WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d")],
+              advisor_recommend=lambda **kw: _ar)
+    assert calls["orig"] == 0, "flag OFF: _originate_mleg_proposal must NEVER be called"
