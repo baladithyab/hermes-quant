@@ -2284,10 +2284,19 @@ def tick(
                 if _inject_frame:
                     from hermes_quant.perception import build_perception_frame_live
 
+                    # 78b3: thread the per-symbol options_eligible opt-in into the live
+                    # frame builder so Perceive populates options_chain + iv_rank in step 5e
+                    # (BOTH HERMES_QUANT_OPTIONS_PERCEIVE and entry.options_eligible required,
+                    # checked inside the builder). This unifies P->D: the decision layer reads
+                    # iv_rank from the FRAME instead of a separate compute_iv_rank_asof call.
+                    # Default-OFF / not-eligible -> options_eligible=False -> step 5e skipped ->
+                    # frame.iv_rank stays None -> byte-identical.
+                    _options_eligible = bool(getattr(entry, "options_eligible", False))
                     _frame = build_perception_frame_live(
                         entry.symbol,
                         asset_class=entry.asset_class,
                         timeframe=entry.timeframe,
+                        options_eligible=_options_eligible,
                     )
                 _durable_equity_account = (
                     ("paper-default", entry.asset_class, _durable_nav)
@@ -2345,16 +2354,18 @@ def tick(
                 if _nav_for_opts is None:
                     from hermes_quant.state.portfolio_state import _default_initial_cash
                     _nav_for_opts = _default_initial_cash()
-                # agperc activation: source the as-of IV rank from the agperc1 seam when the
-                # PERCEIVE flag is on AND this watchlist entry is options_eligible (the SAME
-                # gate agperc2's builder step 5e uses). compute_iv_rank_asof is fail-closed
-                # (returns None — never raises — on missing/<30-point/corrupt history), so a
-                # None iv_rank still makes _originate_mleg_proposal abstain (structure_select
-                # needs a usable rank). PERCEIVE flag off / entry not eligible => iv_rank stays
-                # None => byte-identical to the pre-agperc INERT state.
-                _iv_rank: float | None = None
+                # 78b3: source the as-of IV rank from the PerceptionFrame (Perceive step 5e)
+                # — the unified P->D path — when the frame carries it. The frame builder above
+                # ran step 5e iff HERMES_QUANT_OPTIONS_PERCEIVE=1 AND entry.options_eligible, so
+                # _frame.iv_rank is the perceived rank (None otherwise). Fall back to a direct
+                # compute_iv_rank_asof ONLY when the flag+eligible hold but the frame is absent
+                # (e.g. _inject_frame off / frame build returned None) — same fail-closed seam
+                # (returns None on missing/<30-point/corrupt history -> the helper abstains).
+                # PERCEIVE off / not eligible => iv_rank stays None => byte-identical INERT state.
+                _iv_rank: float | None = getattr(_frame, "iv_rank", None)
                 if (
-                    os.environ.get("HERMES_QUANT_OPTIONS_PERCEIVE", "0") == "1"
+                    _iv_rank is None
+                    and os.environ.get("HERMES_QUANT_OPTIONS_PERCEIVE", "0") == "1"
                     and getattr(entry, "options_eligible", False)
                 ):
                     try:

@@ -735,3 +735,42 @@ def test_agreact1_options_fire_consumes_concurrency_slot(isolate_config, isolate
     )
     opts_fired = [d for d in result.decisions if d.gate == "AUTONOMOUS_OPTIONS_FIRED"]
     assert len(opts_fired) == 1 and opts_fired[0].symbol == "AAA"
+
+
+def test_78b3_frame_iv_rank_used_without_direct_fallback(isolate_config, isolate_quant_home, monkeypatch):
+    """78b3: when the PerceptionFrame carries iv_rank (Perceive step 5e), the options hook
+    USES it and does NOT call the direct compute_iv_rank_asof fallback (unified P->D).
+    RED-proof: before 78b3 the hook ignored the frame and always called the direct seam."""
+    _set_mode_autonomous(isolate_config)
+    monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_PERCEIVE", "1")
+
+    # A frame that carries a perceived iv_rank.
+    class _Frame:
+        last_close = 100.0
+        iv_rank = 72.0
+    import hermes_quant.perception as _perc
+    monkeypatch.setattr(_perc, "build_perception_frame_live", lambda *a, **k: _Frame())
+
+    direct_calls = {"n": 0}
+    captured = {"iv": None}
+    import hermes_quant.options.iv_rank as ivr
+    monkeypatch.setattr(ivr, "compute_iv_rank_asof", lambda *a, **k: direct_calls.__setitem__("n", direct_calls["n"] + 1) or 11.0)
+    import hermes_quant.autonomous as auto_mod
+    real_orig = auto_mod._originate_mleg_proposal
+    def _spy(*a, **k):
+        captured["iv"] = k.get("iv_rank")
+        return None  # abstain after capture
+    monkeypatch.setattr(auto_mod, "_originate_mleg_proposal", _spy)
+
+    _ar = {
+        "as_of": "2026-06-18T20:00:00Z", "decision_price": 100.0, "signal_id": "s",
+        "aggregated_signal": {"confidence": 0.85, "direction": 1, "magnitude": 0.05},
+        "risk_gate": {"pass": True, "kelly_fraction": 0.05, "reason": "ok", "gated_reason": None},
+        "analyst_views": [{"analyst": "A0", "metadata": {"atr_relative": 0.05}}], "lessons": [],
+    }
+    auto.tick(dry_run=False,
+              symbols=[WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d", options_eligible=True)],
+              advisor_recommend=lambda **kw: _ar)
+    assert captured["iv"] == 72.0, f"the hook must pass the FRAME's iv_rank (72.0); got {captured['iv']}"
+    assert direct_calls["n"] == 0, "the direct compute_iv_rank_asof fallback must NOT be called when the frame supplies iv_rank"
