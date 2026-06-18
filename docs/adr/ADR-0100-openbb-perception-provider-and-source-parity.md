@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted (2026-06-18, eval-gate-pending) — OpenBB perception provider + source parity shipped DEFAULT-OFF (HERMES_QUANT_OPENBB/OPENBB_LIVE); latest-only hard-rejected
 date: 2026-06-17
 deciders: [codeseys]
 consulted: [deep-work-loop session 2026-06-17 (OpenBB + TradingAgents source research wf_e0a5b0b9, source-grounded)]

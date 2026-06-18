@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted (2026-06-18, eval-gate-pending) — TP/SL + clean-window gates shipped DEFAULT-OFF; GATE-0..3 thresholds confirm across >=2 clean windows before arming
 date: 2026-06-17
 deciders: [codeseys]
 consulted: [deep-work-loop session 2026-06-17 (AEGIS strategy research wf_0f064078, academic-first)]

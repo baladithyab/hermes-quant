@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted (2026-06-18, eval-gate-pending) — code shipped DEFAULT-OFF (HERMES_QUANT_SLIPPAGE_HAIRCUT/SLIPPAGE_GATE); thresholds confirm across >=2 clean windows before arming
 date: 2026-06-17
 deciders: [codeseys]
 consulted: [deep-work-loop session 2026-06-17 (AEGIS P/D/R options architecture + operator slippage-risk requirement)]

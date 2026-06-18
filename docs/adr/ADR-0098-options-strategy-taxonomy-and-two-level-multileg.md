@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted (2026-06-18, eval-gate-pending) — taxonomy + 2-level multi-leg shipped DEFAULT-OFF; admissible-structure producers gated, constants eval-gate-pending
 date: 2026-06-17
 deciders: [codeseys]
 consulted: [deep-work-loop session 2026-06-17 (AEGIS strategy research wf_0f064078, 5 agents/552K tokens, academic-first)]
