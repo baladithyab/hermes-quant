@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**75 flags** (resolvable default).
+**76 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -48,6 +48,7 @@
 | `HERMES_QUANT_MEMORY_SPLIT` | `0` | `hermes_quant/aggregators/llm_committee.py:333` |
 | `HERMES_QUANT_MONTHLY_META_RETRO` | `0` | `hermes_quant/memory/meta_retro.py:70` |
 | `HERMES_QUANT_MULTILEG_REACTOR` | `0` | `hermes_quant/react/mleg_fill.py:116` |
+| `HERMES_QUANT_OPENBB` | `0` | `hermes_quant/data/openbb_provider.py:141` |
 | `HERMES_QUANT_OPEN_GUARD` | `1` | `hermes_quant/risk/open_guard.py:304` |
 | `HERMES_QUANT_OPTIONS_GATE` | `0` | `hermes_quant/risk/options_gate.py:529` |
 | `HERMES_QUANT_OPTIONS_LIVE_CHAIN` | `0` | `hermes_quant/options/data.py:427` |

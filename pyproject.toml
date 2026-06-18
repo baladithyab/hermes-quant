@@ -48,6 +48,10 @@ alpaca = ["alpaca-py>=0.30"]
 # transitive base dep; this extra is symbolic (mirrors the empty `options`
 # extra) so consumers can opt-in explicitly.
 alphavantage = ["requests>=2.31"]
+# OpenBB perception provider (aegis-ob1, ADR-0100). 2nd OHLCV tier behind
+# yfinance; DEFAULT-OFF (HERMES_QUANT_OPENBB). Heavy/optional — the SDK is
+# lazy-imported only when the flag is on, so the base install never pulls it.
+openbb = ["openbb>=4.3"]
 # Kronos foundation-model analyst (heavy: torch + HF)
 kronos = [
     "torch>=2.0",
@@ -125,6 +129,7 @@ deliberative_committee = "hermes_quant.aggregators.deliberative:DeliberativeComm
 
 [project.entry-points."hermes_quant.data_providers"]
 yfinance = "hermes_quant.data.yfinance_provider:YFinanceProvider"
+openbb = "hermes_quant.data.openbb_provider:OpenBBProvider"
 ccxt = "hermes_quant.data.ccxt_provider:CcxtProvider"
 alphavantage = "hermes_quant.data.alphavantage_provider:AlphaVantageProvider"
 # NOTE (B22, R-B22): the `alpaca` data-provider entry point was removed —

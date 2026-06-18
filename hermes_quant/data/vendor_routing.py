@@ -80,6 +80,31 @@ def _get_ccxt() -> Any:
     return _CCXT
 
 
+# ADR-0100 (aegis-ob1): OpenBB joins as the 2nd OHLCV tier behind yfinance.
+# DEFAULT-OFF (HERMES_QUANT_OPENBB). Lazy construction is REQUIRED here so
+# `import vendor_routing` stays side-effect-free on a venv lacking openbb:
+# OpenBBProvider.__init__ does NOT import openbb (the SDK is lazy-imported
+# only inside its `obb` property, gated on the flag), so constructing the
+# singleton is cheap and import-safe even with the flag off / openbb absent.
+_OPENBB: Any = None
+
+
+def _get_openbb() -> Any:
+    """Lazily instantiate the OpenBBProvider singleton.
+
+    Lazy construction keeps ``import vendor_routing`` cheap. OpenBBProvider
+    never imports the ``openbb`` SDK at construction (only inside its ``obb``
+    property, flag-gated), so this is safe even when ``HERMES_QUANT_OPENBB``
+    is unset and ``openbb`` is not installed.
+    """
+    global _OPENBB
+    if _OPENBB is None:
+        from hermes_quant.data.openbb_provider import OpenBBProvider
+
+        _OPENBB = OpenBBProvider()
+    return _OPENBB
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table: method_name -> {vendor_name -> callable}.
 #
@@ -105,9 +130,21 @@ def _ccxt_fetch_bars(*args: Any, **kwargs: Any) -> Any:
     return _get_ccxt().fetch_bars(*args, **kwargs)
 
 
+def _openbb_fetch_bars(*args: Any, **kwargs: Any) -> Any:
+    # ADR-0100 (aegis-ob1): OpenBBProvider.fetch_bars exposes the canonical
+    # signature `(asset, timeframe, start, end, *, use_cache, as_of)` — same
+    # call shape as yfinance. DEFAULT-OFF: with HERMES_QUANT_OPENBB unset the
+    # call raises DataProviderError (flag off) at fetch time, which
+    # fetch_with_chain treats as a transient fall-through, so openbb is a
+    # silent no-op tier until the operator flips the flag.
+    return _get_openbb().fetch_bars(*args, **kwargs)
+
+
 VENDOR_METHODS: dict[str, dict[str, Callable[..., Any]]] = {
     "fetch_bars": {
         "yfinance": _yfinance_fetch_bars,
+        # ADR-0100 (aegis-ob1): openbb is the 2nd OHLCV tier behind yfinance.
+        "openbb": _openbb_fetch_bars,
         # B22 (R-B22, 2026-05-31): ccxt re-added. CcxtProvider.fetch_bars now
         # exposes the canonical signature
         # `(asset, timeframe, start, end, *, use_cache, as_of)` — identical to
@@ -132,9 +169,12 @@ TOOLS_CATEGORIES: dict[str, list[str]] = {
 }
 
 
-VENDOR_LIST: list[str] = ["yfinance", "ccxt"]
+VENDOR_LIST: list[str] = ["yfinance", "openbb", "ccxt"]
 # B22 (R-B22, 2026-05-31): "ccxt" re-added now that CcxtProvider.fetch_bars
 # conforms to the canonical DataProvider Protocol signature (see note above).
+# ADR-0100 (aegis-ob1, 2026-06-17): "openbb" inserted as the 2nd OHLCV tier
+# (behind yfinance, ahead of ccxt). DEFAULT-OFF (HERMES_QUANT_OPENBB) — a
+# silent no-op fall-through tier until the operator flips the flag.
 
 
 def route_to_vendor(method: str, vendor: str) -> Callable[..., Any]:
