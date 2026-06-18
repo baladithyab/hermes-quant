@@ -661,3 +661,77 @@ def test_options_perceive_on_and_eligible_calls_iv_rank(isolate_config, isolate_
               symbols=[WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d", options_eligible=True)],
               advisor_recommend=lambda **kw: _ar)
     assert calls["iv"] == 1, "OPTIONS_PERCEIVE on + options_eligible: compute_iv_rank_asof must be called once"
+
+
+def test_agreact1_options_fire_consumes_concurrency_slot(isolate_config, isolate_quant_home, monkeypatch):
+    """agreact1 caller-accounting: a FIRED options play must consume a fires_this_tick slot
+    (and add to open_symbols) exactly like an equity fire, so the §D9 max_per_tick_opens cap
+    binds options plays. With max_per_tick_opens=1, an options fire on the FIRST symbol must
+    block the SECOND symbol's equity fire this tick.
+
+    RED-proof: before the caller-side fires_this_tick++ on the options branch, the options
+    play was invisible to the cap -> the 2nd symbol would ALSO fire (cap not enforced)."""
+    _set_mode_autonomous(isolate_config)  # max_per_tick_opens=1
+    monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
+
+    from hermes_quant.react.base import ExecutionRecord
+
+    def _filled_record(prop, **kw):
+        pid = getattr(prop, "proposal_id", "prop_mleg")
+        return ExecutionRecord(
+            proposal_id=pid, signal_id=None, asset="AAA", asset_class="us_option",
+            timeframe="1d", asof_decision="2026-06-18T00:00:00Z",
+            asof_execution="2026-06-18T00:00:00Z", target_position_pct=0.05,
+            decision_price=1.0, fill_price=1.0, fill_size_pct=0.05,
+            reactor_name="multileg-paper", human_in_the_loop=False, reactor_metadata={},
+        )
+
+    class _Mleg:
+        proposal_id = "prop_mleg"
+        multi_leg_proposal = None
+    class _Persisted:
+        proposal_id = "prop_mleg"
+        multi_leg_proposal = _Mleg()
+    class _FillingReactor:
+        name = "multileg-paper"
+        def execute(self, prop, **kw):
+            return _filled_record(prop, **kw)
+
+    # Drive the helper past structure_select + producer + reactor to an actual fill.
+    monkeypatch.setattr("hermes_quant.options.structure_select.select_structure_for_plan",
+                        lambda plan, **kw: "bull_put_spread")
+    monkeypatch.setattr("hermes_quant.options.recipes.build_and_persist_multi_leg",
+                        lambda **kw: (object(), _Persisted()))
+    monkeypatch.setattr("hermes_quant.react.dispatch.select_reactor",
+                        lambda prop: _FillingReactor())
+    monkeypatch.setattr("hermes_quant.journal.writer.append_human_override",
+                        lambda *a, **k: None)
+
+    # Count equity reacts (the 2nd symbol must NOT get one if the cap is enforced).
+    equity_calls = []
+    monkeypatch.setattr("hermes_quant.autonomous._react",
+                        lambda advisor_result, entry, size, **kw: equity_calls.append(entry.symbol) or ("eq", size))
+
+    _ar = {
+        "as_of": "2026-06-18T20:00:00Z", "decision_price": 100.0, "signal_id": "s",
+        "aggregated_signal": {"confidence": 0.85, "direction": 1, "magnitude": 0.05},
+        "risk_gate": {"pass": True, "kelly_fraction": 0.05, "reason": "ok", "gated_reason": None},
+        "analyst_views": [{"analyst": "A0", "metadata": {"atr_relative": 0.05}}],
+        "lessons": [],
+    }
+    result = auto.tick(
+        dry_run=False,
+        symbols=[
+            WatchlistEntry(symbol="AAA", asset_class="equity", timeframe="1d"),
+            WatchlistEntry(symbol="BBB", asset_class="equity", timeframe="1d"),
+        ],
+        advisor_recommend=lambda **kw: _ar,
+    )
+    # AAA fired an options play (consuming the single per-tick slot). BBB must be capped:
+    # the equity _react must NOT have been called for it (the options fire ate the slot).
+    assert "BBB" not in equity_calls, (
+        "agreact1: the options fire on AAA must consume the max_per_tick_opens=1 slot so "
+        f"BBB's equity fire is capped; equity _react was called for {equity_calls}"
+    )
+    opts_fired = [d for d in result.decisions if d.gate == "AUTONOMOUS_OPTIONS_FIRED"]
+    assert len(opts_fired) == 1 and opts_fired[0].symbol == "AAA"

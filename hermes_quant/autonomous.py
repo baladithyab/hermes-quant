@@ -1574,16 +1574,24 @@ def _originate_mleg_proposal(
             return None  # fail-closed: paper_zero_costs requires a paper reactor
         record = reactor.execute(mleg, fill_size_pct=0.0, approver_user_id="autonomous",
                                  play_tag="autonomous_options")
-        _rmeta = getattr(record, "reactor_metadata", None) or {}
-        if (_rmeta.get("no_fill") or _rmeta.get("silenced")
-                or getattr(record, "fill_size_pct", None) in (None, 0.0)):
+        # agreact1: route the executed record through the SHARED accounting tail so the
+        # options path inherits the SAME ar38 phantom-fire guard + the UNIFORM
+        # append_human_override journal write the equity fire uses (instead of a divergent
+        # inline no-fill copy that drifts from the canonical guard). A no-fill returns None
+        # (recorded as a silence below); a real fill journals + yields the realized size.
+        fired = _apply_fire_accounting(
+            record, mleg, symbol=symbol, journal_reason="autonomous_options_fire"
+        )
+        if fired is None:
             result.silences += 1
             result.decisions.append(SymbolDecision(
                 symbol=symbol, asset_class="us_option", timeframe="1d",
                 gate="AUTONOMOUS_OPTIONS_NO_FILL",
                 details={"strategy_kind": str(strategy_kind)}))
             return None
-        execution_id = getattr(record, "proposal_id", None) or getattr(persisted, "proposal_id", "")
+        execution_id, _realized = fired
+        if not execution_id:  # the record carried no usable id — fall back to the persisted one
+            execution_id = str(getattr(persisted, "proposal_id", "") or "")
         result.fires += 1
         result.decisions.append(SymbolDecision(
             symbol=symbol, asset_class="us_option", timeframe="1d",
@@ -2305,7 +2313,15 @@ def tick(
             # per symbol per tick). Abstains (returns None) at every missing precondition.
             # Byte-identical when the flag is unset (the helper returns None on the first
             # guard, never touching the equity path). Best-effort inside the helper.
-            if not dry_run and os.environ.get("HERMES_QUANT_AUTONOMOUS_OPTIONS", "0") == "1":
+            if (
+                not dry_run
+                and os.environ.get("HERMES_QUANT_AUTONOMOUS_OPTIONS", "0") == "1"
+                # agreact1: the §D9 max_per_tick_opens cap binds options origination too —
+                # check it BEFORE firing (the equity path checks the same cap below). Without
+                # this, an options play could fire past the per-tick cap because the hook runs
+                # before the equity cap gate. fires_this_tick counts equity AND options fires.
+                and fires_this_tick < rails["max_per_tick_opens"]
+            ):
                 _nav_for_opts = _account_nav_mtm()
                 if _nav_for_opts is None:
                     from hermes_quant.state.portfolio_state import _default_initial_cash
@@ -2348,6 +2364,14 @@ def tick(
                     result=result,
                 )
                 if _opts_exec is not None:
+                    # agreact1: a fired options play consumes a concurrency slot exactly
+                    # like an equity fire — charge the SAME tick accounting the equity
+                    # branch does (fires_this_tick for the per-tick/concurrency cap +
+                    # open_symbols_at_tick_start so a later pick sees the slot consumed)
+                    # so the §D9 max_per_tick_opens / max-concurrent rails bind options
+                    # plays too (previously an options fire was invisible to these caps).
+                    fires_this_tick += 1
+                    open_symbols_at_tick_start.add(entry.symbol)
                     continue  # an options play fired for this symbol; skip the equity path
 
             # Pull lessons for salience check (already in advisor_result, but
@@ -2677,6 +2701,91 @@ def tick(
     return result
 
 
+def _reactor_record_is_nofill(record: Any) -> bool:
+    """ar38/cs02/ar16/ar27 phantom-fire guard — the ONE place that decides a reactor
+    record is a NO-FILL / SILENCE / REJECT (no capital moved, nothing durable on the bus).
+
+    A reactor may RETURN (not raise) such a record: PaperReactor on a non-finite/<=0 price
+    or a cap clip-to-zero (silenced=True, fill_size_pct=0.0); DeterministicEquityReactor on
+    a BP refusal / backend error (no_fill / bp_rejected, fill_size_pct=0.0);
+    MultiLegPaperReactor on a gate-reject / unfilled leg. Treating any of these as a fire
+    counts a PHANTOM fire (consumed slot + phantom headroom that silences later real
+    signals). This is the UNION of every reactor's no-fill signal so the equity AND the
+    options origination paths share ONE detection (agreact1 — kills the divergent inline
+    copy the options helper used to carry). A None realized size is a no-fill (conservative:
+    a record that cannot report a fill size never counts as a fire).
+    """
+    rmeta = getattr(record, "reactor_metadata", None) or {}
+    realized = getattr(record, "fill_size_pct", None)
+    return bool(
+        rmeta.get("silenced") is True
+        or rmeta.get("no_fill") is True
+        or rmeta.get("bp_rejected") is True
+        or rmeta.get("unfilled_timeout") is True
+        or realized is None
+        or realized == 0.0
+    )
+
+
+def _apply_fire_accounting(
+    record: Any,
+    proposal: Any,
+    *,
+    symbol: str,
+    journal_reason: str,
+) -> tuple[str, float | None] | None:
+    """Shared post-execution accounting tail for an autonomous fire (agreact1).
+
+    Both the equity path (``_react``) and the options-origination path
+    (``_originate_mleg_proposal``) call this AFTER ``reactor.execute()`` so they share
+    the SAME safety-critical tail instead of carrying divergent copies:
+      1. the ar38 phantom-fire guard (``_reactor_record_is_nofill``) — return None on a
+         no-fill so the caller counts NO fire + mutates NO state;
+      2. the UNIFORM ``append_human_override(kind='approve')`` journal write (the audit
+         trail is identical across HITL, equity-autonomous, and options-autonomous);
+      3. the ar80 return shape ``(execution_id, realized_post_clip_fill_size_pct)`` so the
+         caller charges ACTUAL consumption into the running headroom.
+
+    Returns ``None`` on a no-fill/silence (the caller treats it as a silence), else
+    ``(proposal_id, realized_size)``. ``realized_size`` is the reactor's post-clip
+    ``record.fill_size_pct`` (a second tighter ADR-0087 clip may have shrunk it), or None
+    if the record carries no usable float (caller falls back to the requested size —
+    conservative, never under-charges headroom).
+    """
+    if _reactor_record_is_nofill(record):
+        rmeta = getattr(record, "reactor_metadata", None) or {}
+        logger.info(
+            "autonomous: reactor returned a NO-FILL/SILENCE for %s (reason=%s); NOT "
+            "counting a fire, NOT mutating portfolio state (phantom-fire guard)",
+            symbol,
+            rmeta.get("silence_reason")
+            or rmeta.get("no_fill_reason")
+            or rmeta.get("broker_status")
+            or "no_fill",
+        )
+        return None
+
+    # Uniform audit trail: an autonomous fire journals as a non-human 'approve' override,
+    # identical across the HITL, equity-autonomous, and options-autonomous seams.
+    try:
+        from hermes_quant.journal.writer import append_human_override
+
+        append_human_override(proposal, kind="approve", reason=journal_reason)
+    except ImportError:
+        logger.debug("autonomous: journal not available; skipping audit entry")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("autonomous: journal append failed: %s", exc, exc_info=True)
+
+    _realized = getattr(record, "fill_size_pct", None)
+    realized_size = float(_realized) if isinstance(_realized, (int, float)) else None
+    pid = (
+        getattr(proposal, "proposal_id", None)
+        or getattr(record, "proposal_id", None)
+        or ""
+    )
+    return str(pid), realized_size
+
+
 def _react(
     advisor_result: dict[str, Any],
     entry: WatchlistEntry,
@@ -2756,58 +2865,15 @@ def _react(
         play_tag="autonomous",  # B13: stamp the autonomous-tick source on the fill
     )
 
-    # ar38: a reactor may RETURN (not raise) a NO-FILL / SILENCE / REJECT record —
-    # PaperReactor on a non-finite/<=0 price or a cap clip-to-zero (silenced=True,
-    # fill_size_pct=0.0), or DeterministicEquityReactor on a BP refusal / backend
-    # error (no_fill=True / bp_rejected=True, fill_size_pct=0.0). It returns-not-raises
-    # precisely because this fire loop calls execute() with no try/except. Previously
-    # the returned record was DISCARDED and _react returned pid unconditionally, so the
-    # loop counted a PHANTOM fire: result.fires++, a consumed per-tick/concurrency slot,
-    # and a phantom portfolio_state.positions[symbol] that then charged headroom against
-    # a position that never existed (clipping/silencing SUBSEQUENT real signals). This is
-    # the autonomous-side gap of the cs02/ar16/ar27 HITL no-fill fixes. Detect the no-fill
-    # and return None so the caller treats it as a silence (no fire-count, no state
-    # mutation, no phantom headroom). Byte-identical when the reactor actually fills.
-    _rmeta = getattr(record, "reactor_metadata", None) or {}
-    _realized = getattr(record, "fill_size_pct", None)
-    _is_nofill = (
-        _rmeta.get("silenced") is True
-        or _rmeta.get("no_fill") is True
-        or _rmeta.get("bp_rejected") is True
-        or _rmeta.get("unfilled_timeout") is True
-        or (_realized is not None and _realized == 0.0)
+    # agreact1: the ar38 phantom-fire guard + the uniform journal write + the ar80 return
+    # shape are now the SHARED _apply_fire_accounting tail (the equity AND options paths
+    # call the same code — no divergent inline copy). Byte-identical to the prior inline
+    # logic: a no-fill returns None (caller counts no fire, mutates no state), a real fill
+    # journals as 'approve' and returns (pid, realized_post_clip_size). The synthesized
+    # equity proposal carries `pid`, so _apply_fire_accounting resolves the same id.
+    return _apply_fire_accounting(
+        record,
+        proposal,
+        symbol=entry.symbol,
+        journal_reason="autonomous_silence_bias_fire",
     )
-    if _is_nofill:
-        logger.info(
-            "autonomous: reactor returned a NO-FILL/SILENCE for %s (reason=%s); NOT "
-            "counting a fire, NOT mutating portfolio state (phantom-fire guard)",
-            entry.symbol,
-            _rmeta.get("silence_reason")
-            or _rmeta.get("no_fill_reason")
-            or _rmeta.get("broker_status")
-            or "no_fill",
-        )
-        return None
-
-    # Append a journal entry tagged with hitl_kind=approve (autonomous
-    # treats itself as a non-human approver — the audit trail is uniform
-    # across HITL and autonomous).
-    try:
-        from hermes_quant.journal.writer import append_human_override
-
-        append_human_override(
-            proposal,
-            kind="approve",
-            reason="autonomous_silence_bias_fire",
-        )
-    except ImportError:
-        logger.debug("autonomous: journal not available; skipping audit entry")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("autonomous: journal append failed: %s", exc, exc_info=True)
-
-    # ar80: return the reactor's REALIZED post-clip fill_size_pct alongside the pid so
-    # the caller charges ACTUAL consumption into the running headroom (the reactor may
-    # have applied a second, tighter ADR-0087 clip against the persisted book). _realized
-    # was captured above; a non-float (None) tells the caller to fall back conservatively.
-    realized_size = float(_realized) if isinstance(_realized, (int, float)) else None
-    return pid, realized_size
