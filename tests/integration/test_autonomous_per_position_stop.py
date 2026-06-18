@@ -614,3 +614,50 @@ def test_tick_byte_identical_when_autonomous_options_off(isolate_config, isolate
     auto.tick(dry_run=False, symbols=[WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d")],
               advisor_recommend=lambda **kw: _ar)
     assert calls["orig"] == 0, "flag OFF: _originate_mleg_proposal must NEVER be called"
+
+
+def test_options_perceive_off_does_not_call_iv_rank(isolate_config, isolate_quant_home, monkeypatch):
+    """agperc activation: with HERMES_QUANT_OPTIONS_PERCEIVE off, the tick must NOT call
+    compute_iv_rank_asof (iv_rank stays None -> origination still abstains, byte-identical
+    to the pre-agperc INERT state). AUTONOMOUS_OPTIONS is ON so the origination block runs."""
+    _set_mode_autonomous(isolate_config)
+    monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
+    monkeypatch.delenv("HERMES_QUANT_OPTIONS_PERCEIVE", raising=False)
+    calls = {"iv": 0}
+    import hermes_quant.options.iv_rank as ivr
+    monkeypatch.setattr(ivr, "compute_iv_rank_asof", lambda *a, **k: (calls.__setitem__("iv", calls["iv"] + 1) or 55.0))
+    _ar = {
+        "as_of": "2026-06-17T20:00:00Z", "decision_price": 100.0, "signal_id": "s",
+        "aggregated_signal": {"confidence": 0.85, "direction": 1, "magnitude": 0.05},
+        "risk_gate": {"pass": True, "kelly_fraction": 0.05, "reason": "ok", "gated_reason": None},
+        "analyst_views": [{"analyst": "A0", "metadata": {"atr_relative": 0.05}}],
+        "lessons": [],
+    }
+    auto.tick(dry_run=False, symbols=[WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d")],
+              advisor_recommend=lambda **kw: _ar)
+    assert calls["iv"] == 0, "OPTIONS_PERCEIVE off: compute_iv_rank_asof must NOT be called"
+
+
+def test_options_perceive_on_and_eligible_calls_iv_rank(isolate_config, isolate_quant_home, monkeypatch):
+    """With OPTIONS_PERCEIVE=1 AND the entry options_eligible=True, the tick sources iv_rank
+    via compute_iv_rank_asof. RED-prove the gate: flipping either condition off -> not called."""
+    _set_mode_autonomous(isolate_config)
+    monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_PERCEIVE", "1")
+    calls = {"iv": 0, "seen_rank": None}
+    import hermes_quant.options.iv_rank as ivr
+    def _fake_iv(*a, **k):
+        calls["iv"] += 1
+        return 62.5
+    monkeypatch.setattr(ivr, "compute_iv_rank_asof", _fake_iv)
+    _ar = {
+        "as_of": "2026-06-17T20:00:00Z", "decision_price": 100.0, "signal_id": "s",
+        "aggregated_signal": {"confidence": 0.85, "direction": 1, "magnitude": 0.05},
+        "risk_gate": {"pass": True, "kelly_fraction": 0.05, "reason": "ok", "gated_reason": None},
+        "analyst_views": [{"analyst": "A0", "metadata": {"atr_relative": 0.05}}],
+        "lessons": [],
+    }
+    auto.tick(dry_run=False,
+              symbols=[WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d", options_eligible=True)],
+              advisor_recommend=lambda **kw: _ar)
+    assert calls["iv"] == 1, "OPTIONS_PERCEIVE on + options_eligible: compute_iv_rank_asof must be called once"

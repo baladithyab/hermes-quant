@@ -2302,16 +2302,37 @@ def tick(
             # agdec1/agreact1 (HERMES_QUANT_AUTONOMOUS_OPTIONS, default-OFF): attempt an
             # OPTIONS origination for this symbol BEFORE the equity path. If it fires a
             # multi-leg play, skip the equity decision for this symbol this tick (one play
-            # per symbol per tick). Abstains (returns None) at every missing precondition —
-            # most importantly iv_rank is None here today (the perception layer does not yet
-            # source an as-of IV rank; that is the OpenBB/agperc work), so this is INERT but
-            # WIRED. Byte-identical when the flag is unset (the helper returns None on the
-            # first guard, never touching the equity path). Best-effort inside the helper.
+            # per symbol per tick). Abstains (returns None) at every missing precondition.
+            # Byte-identical when the flag is unset (the helper returns None on the first
+            # guard, never touching the equity path). Best-effort inside the helper.
             if not dry_run and os.environ.get("HERMES_QUANT_AUTONOMOUS_OPTIONS", "0") == "1":
                 _nav_for_opts = _account_nav_mtm()
                 if _nav_for_opts is None:
                     from hermes_quant.state.portfolio_state import _default_initial_cash
                     _nav_for_opts = _default_initial_cash()
+                # agperc activation: source the as-of IV rank from the agperc1 seam when the
+                # PERCEIVE flag is on AND this watchlist entry is options_eligible (the SAME
+                # gate agperc2's builder step 5e uses). compute_iv_rank_asof is fail-closed
+                # (returns None — never raises — on missing/<30-point/corrupt history), so a
+                # None iv_rank still makes _originate_mleg_proposal abstain (structure_select
+                # needs a usable rank). PERCEIVE flag off / entry not eligible => iv_rank stays
+                # None => byte-identical to the pre-agperc INERT state.
+                _iv_rank: float | None = None
+                if (
+                    os.environ.get("HERMES_QUANT_OPTIONS_PERCEIVE", "0") == "1"
+                    and getattr(entry, "options_eligible", False)
+                ):
+                    try:
+                        from hermes_quant.options.iv_rank import compute_iv_rank_asof
+
+                        _iv_rank = compute_iv_rank_asof(entry.symbol, datetime.now(tz=UTC))
+                    except Exception as _iv_exc:  # noqa: BLE001 — fail-closed: abstain on any error
+                        logger.warning(
+                            "autonomous: iv_rank source failed for %s: %s — abstaining options",
+                            entry.symbol,
+                            _iv_exc,
+                        )
+                        _iv_rank = None
                 _opts_exec = _originate_mleg_proposal(
                     symbol=entry.symbol,
                     asof=datetime.now(tz=UTC),
@@ -2321,7 +2342,7 @@ def tick(
                     # BP check fail-closed (abstain) until a real options-BP read is wired
                     # (the operator's Alpaca options BP, a future increment). Honest + safe.
                     options_buying_power=0.0,
-                    iv_rank=None,  # TODO(agperc): source an as-of IV rank; None -> abstain today
+                    iv_rank=_iv_rank,  # agperc1 seam (None until >=30d recorded IV history exists)
                     structure_intent=advisor_result.get("structure_intent"),
                     paper_zero_costs=bool(rails.get("paper_zero_costs", False)),
                     result=result,
