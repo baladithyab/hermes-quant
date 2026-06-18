@@ -435,3 +435,125 @@ def test_watch_registry_inert_when_flag_off(
     assert not (isolate_quant_home / "watch_registry.db").exists(), (
         "flag OFF: the registry must never be created (byte-identical)"
     )
+
+
+# --------------------------------------------------------------------------- #
+# tp1/tp2 tranche/trailing PARTIAL exit wired into the sweep (HERMES_QUANT_TP_TRANCHE).
+# --------------------------------------------------------------------------- #
+def _prime_registry(qhome, symbol, entry_price, stop_pct, tranches_taken=0, peak=0.0):
+    from hermes_quant.risk.watch_registry import WatchRegistry
+    reg = WatchRegistry(db_path=qhome / "watch_registry.db", mirror_path=qhome / "watch_registry.json")
+    reg.record_open(symbol, entry_price=entry_price, stop_pct=stop_pct)
+    if peak:
+        reg.update_peak(symbol, peak)
+    for _ in range(tranches_taken):
+        reg.mark_tranche(symbol)
+    return reg
+
+
+def test_tranche1_partial_exit_keeps_position_open(isolate_config, isolate_quant_home, monkeypatch):
+    """A +1R winner with 0 tranches taken does a PARTIAL exit (one 0.05 rung), the position
+    stays OPEN (NOT in stopped), and tranches_taken increments."""
+    _set_mode_autonomous(isolate_config)
+    _seed_open_losing_position(isolate_quant_home)  # ASTS +0.20 held, entry 118.17
+    monkeypatch.setenv("HERMES_QUANT_PER_POSITION_STOP", "1")
+    monkeypatch.setenv("HERMES_QUANT_WATCH_REGISTRY", "1")
+    monkeypatch.setenv("HERMES_QUANT_TP_TRANCHE", "1")
+    _prime_registry(isolate_quant_home, "ASTS", 118.17, 0.08)
+    # Mark comfortably past +1R (8% gain): 118.17 * 1.085 ~= 128.5 -> +8.7% >= +1R.
+    monkeypatch.setattr("hermes_quant.perception.build_perception_frame_live",
+                        lambda *a, **k: _MarkFrame(128.5))
+    react_calls = []
+    def fake_react(ar, e, fill, **k):
+        react_calls.append((e.symbol, fill, ar.get("reason")))
+        return ("exec_tr", fill)
+    monkeypatch.setattr("hermes_quant.autonomous._react", fake_react)
+    result = auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
+    # PARTIAL: target = 0.20 - 0.05 = 0.15 (NOT 0.0 flat).
+    assert react_calls, "tranche must fire a partial _react"
+    sym, fill, reason = react_calls[0]
+    assert fill == pytest.approx(0.15, abs=1e-9), f"tranche-1 must reduce 0.20->0.15 (one rung), got {fill}"
+    assert "tranche" in reason
+    # The play is NOT fully closed -> registry still has it, tranches_taken incremented.
+    from hermes_quant.risk.watch_registry import WatchRegistry
+    reg = WatchRegistry(db_path=isolate_quant_home / "watch_registry.db",
+                        mirror_path=isolate_quant_home / "watch_registry.json")
+    pos = reg.get("ASTS")
+    assert pos is not None and pos.tranches_taken == 1
+    # And it is NOT in the watchlist-loop exemption (stays managed) — surfaced as TRANCHE_FIRED.
+    assert any(d.gate == "PER_POSITION_TRANCHE_FIRED" for d in result.decisions)
+
+
+def test_tranche_inert_when_flag_off(isolate_config, isolate_quant_home, monkeypatch):
+    """TP_TRANCHE off -> the full all-at-once TP path runs (flatten to 0.0), not a partial."""
+    _set_mode_autonomous(isolate_config)
+    _seed_open_losing_position(isolate_quant_home)
+    monkeypatch.setenv("HERMES_QUANT_PER_POSITION_STOP", "1")
+    monkeypatch.setenv("HERMES_QUANT_WATCH_REGISTRY", "1")
+    monkeypatch.setenv("HERMES_QUANT_TAKE_PROFIT_SWEEP", "1")
+    monkeypatch.delenv("HERMES_QUANT_TP_TRANCHE", raising=False)  # OFF
+    _prime_registry(isolate_quant_home, "ASTS", 118.17, 0.08)
+    monkeypatch.setattr("hermes_quant.perception.build_perception_frame_live",
+                        lambda *a, **k: _MarkFrame(150.0))  # big winner -> full TP
+    react_calls = []
+    monkeypatch.setattr("hermes_quant.autonomous._react",
+                        lambda ar, e, fill, **k: react_calls.append(fill) or ("x", fill))
+    auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
+    assert react_calls and react_calls[0] == pytest.approx(0.0, abs=1e-9), (
+        "tranche OFF: TP must FULL-flatten to 0.0, not a partial"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# wave3-wiring-review fixes: tranche no-fill / raise must NOT re-fire or bypass TP; NaN mark.
+# --------------------------------------------------------------------------- #
+def test_tranche_nofill_falls_through_to_full_tp_backstop(isolate_config, isolate_quant_home, monkeypatch):
+    """DEFECT-1: when the tranche _react NO-FILLS, the full-TP backstop must still run this
+    tick (return False, don't `continue`) — otherwise a position past +2R never exits and
+    tranche-1 re-fires every tick. Here the position is a big winner (past +2R AND past the
+    16% full-TP); the tranche reactor no-fills; the full-TP must then full-flatten it."""
+    _set_mode_autonomous(isolate_config)
+    _seed_open_losing_position(isolate_quant_home)
+    monkeypatch.setenv("HERMES_QUANT_PER_POSITION_STOP", "1")
+    monkeypatch.setenv("HERMES_QUANT_WATCH_REGISTRY", "1")
+    monkeypatch.setenv("HERMES_QUANT_TP_TRANCHE", "1")
+    monkeypatch.setenv("HERMES_QUANT_TAKE_PROFIT_SWEEP", "1")  # the backstop
+    _prime_registry(isolate_quant_home, "ASTS", 118.17, 0.08)
+    monkeypatch.setattr("hermes_quant.perception.build_perception_frame_live",
+                        lambda *a, **k: _MarkFrame(160.0))  # ~+35% -> past +2R and +TP
+    calls = []
+    def fake_react(ar, e, fill, **k):
+        calls.append((fill, ar.get("reason")))
+        # tranche attempt NO-FILLS (None); the full-TP backstop fill succeeds.
+        if "tranche" in ar.get("reason", ""):
+            return None
+        return ("exec_tp", fill)
+    monkeypatch.setattr("hermes_quant.autonomous._react", fake_react)
+    result = auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
+    # The full-TP backstop must have FLATTENED (0.0) after the tranche no-fill.
+    reasons = [r for _, r in calls]
+    assert any("tranche" in r for r in reasons), "tranche attempt should have been made"
+    assert any(r == "autonomous_per_position_take_profit" for r in reasons), (
+        "DEFECT-1: full-TP backstop must run after a tranche no-fill (not be bypassed by continue)"
+    )
+    assert any(f == pytest.approx(0.0, abs=1e-9) for f, _ in calls), "TP backstop must full-flatten"
+
+
+def test_nan_mark_in_tranche_path_holds_not_errors(isolate_config, isolate_quant_home, monkeypatch):
+    """DEFECT-2: a NaN mark (passes the `is None` guard) must HOLD cleanly, NOT raise a
+    TypeError mis-labeled as PER_POSITION_STOP_ERROR / spurious result.errors++."""
+    _set_mode_autonomous(isolate_config)
+    _seed_open_losing_position(isolate_quant_home)
+    monkeypatch.setenv("HERMES_QUANT_PER_POSITION_STOP", "1")
+    monkeypatch.setenv("HERMES_QUANT_WATCH_REGISTRY", "1")
+    monkeypatch.setenv("HERMES_QUANT_TP_TRANCHE", "1")
+    _prime_registry(isolate_quant_home, "ASTS", 118.17, 0.08)
+    monkeypatch.setattr("hermes_quant.perception.build_perception_frame_live",
+                        lambda *a, **k: _MarkFrame(float("nan")))  # NaN mark
+    calls = []
+    monkeypatch.setattr("hermes_quant.autonomous._react",
+                        lambda ar, e, fill, **k: calls.append(fill) or ("x", fill))
+    result = auto.tick(dry_run=False, symbols=[], advisor_recommend=lambda **kw: None)
+    assert calls == [], "a NaN mark must HOLD (no exit fired)"
+    assert result.errors == 0, "a NaN mark is a clean HOLD, must NOT increment result.errors"
+    assert not any("ERROR" in d.gate for d in result.decisions), "no spurious *_ERROR gate on a NaN-mark HOLD"

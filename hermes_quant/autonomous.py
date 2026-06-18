@@ -1383,6 +1383,117 @@ def _establishing_avg_entry_price(symbol: str) -> float | None:
         return None
 
 
+def _maybe_take_tranche(
+    *,
+    symbol: str,
+    held: float,
+    entry_price: float,
+    mark: float,
+    stop_pct: float,
+    gain_pct: float,
+    watch_reg,  # noqa: ANN001 - WatchRegistry; avoid the import at module top
+    paper_zero_costs: bool,
+    result: "TickResult",
+) -> bool:
+    """Evaluate + execute a tranche/trailing PARTIAL exit (tp1/tp2). Returns True iff a
+    tranche action FIRED (a partial exit was attempted) — the caller then skips the
+    full-TP path for this symbol. Returns False when no tranche action applies (the caller
+    falls through to the all-at-once TP backstop).
+
+    A tranche step does a PARTIAL exit: the new absolute post-fill target is
+    ``held - signed_rung`` (one 0.05 NAV-fraction rung toward zero, sign-preserving), NOT
+    the flat 0.0 a full stop/TP uses. The position stays OPEN (lighter), so it NEVER joins
+    the sweep's ``stopped`` set — it keeps its concurrency slot and remains managed. The
+    registry's tranches_taken is incremented so the next tick does not re-fire tranche-1.
+    Best-effort + silence-by-default: any error HOLDS (returns False).
+    """
+    from hermes_quant.risk.exit_strategy import TRANCHE_RUNG, evaluate_tranche
+
+    try:
+        state = watch_reg.get(symbol)
+    except Exception:  # noqa: BLE001
+        return False
+    tranches_taken = int(getattr(state, "tranches_taken", 0)) if state is not None else 0
+    peak = getattr(state, "peak_gain_pct", None) if state is not None else None
+
+    td = evaluate_tranche(
+        symbol=symbol,
+        gain_pct=gain_pct,
+        held_fraction=held,
+        tranches_taken=tranches_taken,
+        stop_pct=stop_pct,
+        peak_gain_pct=peak,
+    )
+    if td.action == "hold":
+        return False
+
+    # Compute the PARTIAL post-fill target. exit_fraction is a positive NAV-fraction to
+    # close NOW; the new absolute target moves `held` toward 0 by that amount (sign-aware).
+    sign = 1.0 if held > 0 else -1.0
+    close_amt = min(abs(td.exit_fraction), abs(held))
+    new_target = sign * (abs(held) - close_amt)  # tranche_2/trail_exit close the residual -> 0.0
+    if abs(new_target) < (TRANCHE_RUNG / 2):
+        new_target = 0.0  # closing the whole residual
+
+    entry = WatchlistEntry(symbol=symbol, asset_class="equity", timeframe="1d")
+    advisor_result = {
+        "decision_price": float(mark),
+        "as_of": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reason": f"autonomous_tranche_{td.action}",
+    }
+    try:
+        react_out = _react(advisor_result, entry, float(new_target), paper_zero_costs=paper_zero_costs)
+    except Exception as exc:  # noqa: BLE001 - one symbol's failure must not abort the sweep
+        logger.warning("autonomous: tranche _react failed for %s: %s", symbol, exc, exc_info=True)
+        result.errors += 1
+        result.decisions.append(SymbolDecision(
+            symbol=symbol, asset_class="equity", timeframe="1d",
+            gate="PER_POSITION_TRANCHE_ERROR", error=f"tranche_react_error: {exc}"))
+        # wave3-wiring-review DEFECT-1 FIX: a RAISE means NO trade executed -> return False
+        # so the caller still runs the full-TP backstop THIS tick (returning True silenced
+        # the TP safety floor for a position past +2R — a fail-open). And tranches_taken is
+        # NOT advanced (nothing committed), so the re-fire guard is the backstop closing it.
+        return False
+    sym_decision = SymbolDecision(
+        symbol=symbol, asset_class="equity", timeframe="1d",
+        gate="PER_POSITION_TRANCHE_FIRED",
+        details={
+            "tranche_action": td.action, "exit_fraction": close_amt,
+            "new_target_pct": new_target, "gain_pct": gain_pct,
+            "tranches_taken_before": tranches_taken, "reason": td.reason,
+        },
+    )
+    if react_out is None:
+        sym_decision.gate = "PER_POSITION_TRANCHE_NO_FILL"
+        sym_decision.details["no_fill"] = True
+        result.silences += 1
+        result.decisions.append(sym_decision)
+        # wave3-wiring-review DEFECT-1 FIX: a NO-FILL means nothing was executed and
+        # tranches_taken is NOT advanced -> returning True would (a) re-fire tranche-1 every
+        # tick (the reactor keeps not-filling at the same gain) AND (b) bypass the full-TP
+        # backstop. Return False so the backstop runs (it will full-flatten a position past
+        # its TP target, ending the loop). The position is unchanged; no double-action risk.
+        return False
+    execution_id, _realized = react_out
+    sym_decision.execution_id = execution_id
+    result.fires += 1
+    result.decisions.append(sym_decision)
+    # Record the tranche on the registry so the next tick advances (tranche_1 -> tranche_2).
+    # A full-residual close (new_target == 0) drops the play; a partial marks the tranche.
+    try:
+        if new_target == 0.0:
+            watch_reg.drop(symbol)
+        else:
+            watch_reg.mark_tranche(symbol)
+    except Exception as exc:  # noqa: BLE001 - never block the rail
+        logger.warning("autonomous: tranche registry update failed for %s: %s", symbol, exc)
+    logger.info(
+        "autonomous: PER-POSITION TRANCHE %s on %s (gain %.2f%%): close %.4f -> target %.4f via %s",
+        td.action, symbol, gain_pct * 100, close_amt, new_target, execution_id,
+    )
+    return True
+
+
 def _run_per_position_stop_sweep(
     *,
     open_book: dict[str, float],
@@ -1409,6 +1520,14 @@ def _run_per_position_stop_sweep(
     # one sign-correct primitive, so they can never disagree on direction.
     tp_enabled = os.environ.get("HERMES_QUANT_TAKE_PROFIT_SWEEP", "0") == "1"
     tp_pct = float(_read_safety_rails().get("per_position_take_profit_pct", 0.16))
+
+    # tp1/tp2 (HERMES_QUANT_TP_TRANCHE, default-OFF): scale-out + trailing. Requires the
+    # WatchRegistry (it needs tranches_taken + peak_gain_pct across ticks); if the registry
+    # is unavailable the tranche path is inert (falls back to full TP). When ON, a winning
+    # position takes a PARTIAL exit (one 0.05 rung at +1R, residual at +2R or on the trailing
+    # stop) instead of a full flatten — a partial NEVER enters `stopped` (the position is
+    # still open, keeps its slot). Byte-identical when the flag is absent.
+    tranche_enabled = os.environ.get("HERMES_QUANT_TP_TRANCHE", "0") == "1"
 
     # AG-EQ-3 (HERMES_QUANT_WATCH_REGISTRY, default-OFF): when ON, record each open play +
     # ratchet its peak gain across ticks into the durable WatchRegistry. This is PURE STATE
@@ -1464,6 +1583,32 @@ def _run_per_position_stop_sweep(
             tp_decision = None
             if decision.should_stop:
                 exit_kind = "stop"
+            elif tranche_enabled and watch_reg is not None and decision.loss_pct is not None:
+                # tp1/tp2 PARTIAL scale-out + trailing. The stop did NOT fire (not a loser
+                # past its stop). The `decision.loss_pct is not None` guard is wave3-wiring-
+                # review DEFECT-2 FIX: a NaN/non-computable mark makes loss_pct None;
+                # -float(None) would raise TypeError (mis-labeled PER_POSITION_STOP_ERROR +
+                # spurious result.errors++). A None loss_pct -> skip the tranche path; the
+                # full-TP check below also guards None, so the net is a clean HOLD (the mark
+                # is already past the `if mark is None: continue` guard but NaN slips that).
+                # Consult evaluate_tranche with the registry's cross-tick state; a tranche/
+                # trail action does a PARTIAL exit handled inline (does NOT join `stopped`).
+                if _maybe_take_tranche(
+                    symbol=symbol, held=float(held), entry_price=float(entry_price),
+                    mark=float(mark), stop_pct=stop_pct, gain_pct=-float(decision.loss_pct),
+                    watch_reg=watch_reg, paper_zero_costs=paper_zero_costs, result=result,
+                ):
+                    continue  # a partial tranche/trail exit fired (or recorded); next symbol
+                # No tranche action -> fall through to the full-TP check below (the
+                # all-at-once TP is still the backstop for a position past +2R that the
+                # tranche logic chose not to fully close, e.g. tranches_taken==0 below +1R).
+                if tp_enabled:
+                    tp_decision = evaluate_take_profit(
+                        symbol=symbol, held_fraction=float(held), entry_price=float(entry_price),
+                        mark_price=float(mark), threshold_pct=tp_pct,
+                    )
+                    if tp_decision.should_take:
+                        exit_kind = "take_profit"
             elif tp_enabled:
                 tp_decision = evaluate_take_profit(
                     symbol=symbol,
