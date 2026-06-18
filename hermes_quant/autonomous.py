@@ -1534,12 +1534,31 @@ def _originate_mleg_proposal(
         from hermes_quant.react.dispatch import select_reactor
 
         # 1) Distil the structure (deterministic table; abstains -> None on any gap).
-        # A minimal plan-shaped object duck-typed to .recommendation / .structure_intent.
+        # d9d7: select_structure_for_plan -> direction_from_rating reads rating.signed_intensity,
+        # a @property on the PortfolioRating StrEnum. The live advisor_result has NO top-level
+        # "recommendation" key and its "aggregated_signal" is a plain DICT (int direction /
+        # float magnitude) with no .signed_intensity — feeding that dict raised AttributeError
+        # that the outer except swallowed into the equity fallback, so options NEVER originated
+        # on the real advisor path. Build a real PortfolioRating from the aggregated signal's
+        # SIGN (the table only keys on sign): +dir -> OVERWEIGHT, -dir -> UNDERWEIGHT, 0 -> HOLD.
+        # The LLM never picks legs; this is a deterministic sign distillation, gate stays final.
+        from hermes_quant.agents.research_debate.schemas import PortfolioRating
+
+        _agg = advisor_result.get("aggregated_signal") or {}
+        try:
+            _dir = int(_agg.get("direction", 0))
+        except (TypeError, ValueError):
+            _dir = 0
+        if _dir > 0:
+            _rating = PortfolioRating.OVERWEIGHT
+        elif _dir < 0:
+            _rating = PortfolioRating.UNDERWEIGHT
+        else:
+            _rating = PortfolioRating.HOLD
+
         class _Plan:
-            recommendation = advisor_result.get("recommendation") or advisor_result.get(
-                "aggregated_signal", {}
-            )
-            pass
+            recommendation = _rating
+
         plan = _Plan()
         plan.structure_intent = structure_intent  # type: ignore[attr-defined]
         strategy_kind = select_structure_for_plan(plan, iv_rank=iv_rank)

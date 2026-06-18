@@ -170,3 +170,42 @@ def test_apply_fire_accounting_mleg_real_fill_journals(monkeypatch):
     assert pid == "prop_x"
     assert realized == pytest.approx(0.0)  # the parent's fraction IS 0.0 (sized by contracts)
     assert calls == [("approve", "autonomous_options_fire")], "a real mleg fill must journal once"
+
+
+# --------------------------------------------------------------------------- #
+# d9d7: the real advisor_result (aggregated_signal DICT) must distil to a PortfolioRating
+# with .signed_intensity before structure_select — not be passed as a raw dict (which
+# raised AttributeError -> swallowed -> options never originated on the real advisor path).
+# --------------------------------------------------------------------------- #
+def test_d9d7_origination_feeds_typed_rating_not_dict(monkeypatch):
+    """RED-proof for d9d7: with the real advisor_result shape (aggregated_signal dict,
+    direction=+1) and the options flag on, _originate_mleg_proposal must call
+    select_structure_for_plan with a plan whose .recommendation exposes .signed_intensity
+    (a PortfolioRating), NOT a bare dict. Before the fix it passed the dict -> AttributeError
+    -> abstain. We capture the plan the selector receives."""
+    monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
+    captured = {}
+
+    def _capture_select(plan, **kw):
+        captured["recommendation"] = getattr(plan, "recommendation", None)
+        captured["signed_intensity"] = getattr(captured["recommendation"], "signed_intensity", "MISSING")
+        return None  # abstain after capture (we only assert the rating shape reached the selector)
+
+    monkeypatch.setattr("hermes_quant.options.structure_select.select_structure_for_plan", _capture_select)
+
+    advisor_result = {
+        "as_of": "2026-06-18T20:00:00Z",
+        "aggregated_signal": {"direction": 1, "magnitude": 0.05, "confidence": 0.8},
+    }
+    out = auto._originate_mleg_proposal(
+        symbol="AAA", asof=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        advisor_result=advisor_result, nav=100000.0, options_buying_power=50000.0,
+        iv_rank=60.0, structure_intent="premium_capture",
+        result=auto.TickResult(asof="x", mode="autonomous", dry_run=False, watchlist_size=0),
+    )
+    # The selector must have been REACHED with a typed rating (not crashed on a dict).
+    assert "signed_intensity" in captured, "select_structure_for_plan was never reached (abstained early)"
+    assert captured["signed_intensity"] == 1, (
+        "d9d7: plan.recommendation must be a PortfolioRating with signed_intensity (OVERWEIGHT=+1 "
+        f"for direction=+1), not a raw dict; got signed_intensity={captured['signed_intensity']!r}"
+    )
