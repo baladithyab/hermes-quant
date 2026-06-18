@@ -2712,19 +2712,46 @@ def _reactor_record_is_nofill(record: Any) -> bool:
     counts a PHANTOM fire (consumed slot + phantom headroom that silences later real
     signals). This is the UNION of every reactor's no-fill signal so the equity AND the
     options origination paths share ONE detection (agreact1 — kills the divergent inline
-    copy the options helper used to carry). A None realized size is a no-fill (conservative:
-    a record that cannot report a fill size never counts as a fire).
+    copy the options helper used to carry).
+
+    UNITS HAZARD (0aa6): the EQUITY reactors size by NAV-FRACTION, so fill_size_pct==0.0
+    means "no capital moved" = a no-fill. But a MULTI-LEG parent record sizes by CONTRACTS
+    (``outer_qty``); ``_originate_mleg_proposal`` calls execute(fill_size_pct=0.0) and the
+    parent record copies that 0.0 even on a REAL fill (multileg.py — target/fill_size_pct
+    mirror the passed value; the real fill is in ``outer_qty`` + ``parent_status='filled'``
+    + the moved legs). So fill_size_pct==0.0 must NOT, by itself, mark a multi-leg parent as
+    a no-fill — that mis-counted a genuine options fill as a silence, skipping the journal +
+    concurrency accounting while the legs moved the book. For a multi-leg parent we key the
+    no-fill ONLY on the explicit reject signals (silenced/no_fill/unfilled_timeout) + a
+    non-'filled' parent_status / non-positive outer_qty; fill_size_pct is ignored. A None
+    realized size is still a no-fill for the equity path (conservative).
     """
     rmeta = getattr(record, "reactor_metadata", None) or {}
     realized = getattr(record, "fill_size_pct", None)
-    return bool(
+
+    explicit_nofill = bool(
         rmeta.get("silenced") is True
         or rmeta.get("no_fill") is True
         or rmeta.get("bp_rejected") is True
         or rmeta.get("unfilled_timeout") is True
-        or realized is None
-        or realized == 0.0
     )
+
+    # A multi-leg PARENT sizes by contracts, not NAV-fraction — fill_size_pct==0.0 is
+    # NOT a no-fill signal there (0aa6). Detect the parent and key off the contract-units
+    # signals instead.
+    is_mleg_parent = (
+        getattr(record, "asset_class", None) == "multi_leg"
+        or rmeta.get("role") == "parent"
+    )
+    if is_mleg_parent:
+        outer_qty = rmeta.get("outer_qty")
+        parent_status = rmeta.get("parent_status")
+        status_nofill = parent_status is not None and parent_status != "filled"
+        qty_nofill = isinstance(outer_qty, (int, float)) and outer_qty <= 0
+        return bool(explicit_nofill or status_nofill or qty_nofill)
+
+    # Equity / single-name path: fill_size_pct is the NAV-fraction — 0.0 or None = no-fill.
+    return bool(explicit_nofill or realized is None or realized == 0.0)
 
 
 def _apply_fire_accounting(
