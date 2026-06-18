@@ -49,6 +49,11 @@ class WatchlistEntry:
     symbol: str
     asset_class: str
     timeframe: str
+    # agperc1: opt-in flag — only options_eligible symbols are candidates for the
+    # PERCEIVE-layer options origination (IV-rank sourcing -> structure selection).
+    # ADD-ONLY, default False so every existing entry round-trips byte-identical and
+    # no symbol becomes an options candidate without an explicit watchlist opt-in.
+    options_eligible: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -131,6 +136,9 @@ def list_watchlist(path: Path | None = None) -> list[WatchlistEntry]:
                 symbol=str(symbol),
                 asset_class=str(asset_class),
                 timeframe=str(timeframe),
+                # agperc1: thread the opt-in through the dict loader so a watchlist.json
+                # entry can set it; default False keeps every existing entry byte-identical.
+                options_eligible=bool(entry.get("options_eligible", False)),
             )
         )
     return out
