@@ -47,7 +47,7 @@ class _Prop:
 @pytest.mark.parametrize("meta,fill,expect_nofill", [
     ({}, 0.05, False),                                  # a real fill
     ({}, 0.0, True),                                    # zero fill (no capital moved)
-    ({}, None, True),                                   # None fill (cannot report -> no-fill)
+    ({}, None, False),                                  # None fill (no record fill size) -> FIRES (byte-identical to pre-agreact1 _react; a real reactor never returns None)
     # wave4-review FIX (was vacuous): each METADATA leg must be exercised with a NON-zero
     # fill so the realized==0.0 leg cannot mask it. A reactor that signals a silence/reject
     # via metadata but reports a stale/partial NON-zero fill_size_pct (partial-then-reject)

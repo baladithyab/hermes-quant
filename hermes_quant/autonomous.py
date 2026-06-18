@@ -2802,8 +2802,15 @@ def _reactor_record_is_nofill(record: Any) -> bool:
         qty_nofill = isinstance(outer_qty, (int, float)) and outer_qty <= 0
         return bool(explicit_nofill or status_nofill or qty_nofill)
 
-    # Equity / single-name path: fill_size_pct is the NAV-fraction — 0.0 or None = no-fill.
-    return bool(explicit_nofill or realized is None or realized == 0.0)
+    # Equity / single-name path: fill_size_pct is the NAV-fraction. A 0.0 fill = no capital
+    # moved = no-fill. A None realized is NOT a no-fill here — it is byte-identical to the
+    # pre-agreact1 _react, which keyed only on `(_realized is not None and _realized == 0.0)`
+    # and FIRED on a None (a record that carries no usable fill_size_pct -> the caller's ar80
+    # fallback charges the requested size conservatively). A real reactor always returns a
+    # float fill_size_pct, so this only differs for a stub/None record, and the equity path
+    # must preserve the original fire-on-None semantics (regression caught by the
+    # select_reactor_inc2 / paper_zero_costs_guard / admissibility-units suites).
+    return bool(explicit_nofill or (realized is not None and realized == 0.0))
 
 
 def _apply_fire_accounting(
