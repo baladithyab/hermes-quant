@@ -270,3 +270,103 @@ def test_options_eligible_roundtrips_through_dict_loader(tmp_path: Path) -> None
     assert entries["AAPL"].options_eligible is False
     # NVDA opted in -> threaded through as True.
     assert entries["NVDA"].options_eligible is True
+
+
+# ---------------------------------------------------------------------------
+# wave4-review DEFECT fix: FAIL-CLOSED-to-None on corrupt / malformed parquet.
+# The module docstring promises compute_iv_rank_asof "NEVER raises". The review
+# RED-proved it DID raise (ArrowInvalid on a corrupt file; KeyError on a parquet
+# missing 'fetched_at'). These pin the abstain contract.
+# ---------------------------------------------------------------------------
+
+
+def test_corrupt_parquet_in_window_abstains_not_raises(tmp_path: Path) -> None:
+    """A corrupt (non-parquet) file for one day in the window must ABSTAIN that day
+    (return None overall via <30 points), NEVER raise ArrowInvalid.
+
+    RED proof: before the fix, pq.read_table on a corrupt file raised
+    pyarrow.lib.ArrowInvalid and propagated out of compute_iv_rank_asof.
+    """
+    reader = ChainSnapshotReader(chains_dir=tmp_path)
+    asof = datetime(2026, 6, 12, 20, 0, tzinfo=UTC)
+    # 40 clean days of history...
+    _write_iv_history(reader, "NVDA", asof, [0.30] * 40)
+    # ...then corrupt ONE day's parquet in the window (overwrite with garbage bytes).
+    corrupt_day = asof - timedelta(days=5)
+    corrupt_path = reader._path_for("NVDA", corrupt_day.date())
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_bytes(b"this is not a parquet file \x00\x01\x02")
+    # Must NOT raise — the corrupt day abstains, the rest still rank.
+    rank = compute_iv_rank_asof("NVDA", asof, reader=reader)
+    assert rank is not None, "39 clean days should still rank (corrupt day abstained, not fatal)"
+    assert 0.0 <= rank <= 100.0
+
+
+def test_parquet_missing_required_column_abstains_not_raises(tmp_path: Path) -> None:
+    """A parquet missing the 'fetched_at' column must ABSTAIN that day, NEVER KeyError.
+
+    RED proof: before the fix, df[df["fetched_at"] <= asof] raised KeyError 'fetched_at'.
+    """
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    reader = ChainSnapshotReader(chains_dir=tmp_path)
+    asof = datetime(2026, 6, 12, 20, 0, tzinfo=UTC)
+    _write_iv_history(reader, "NVDA", asof, [0.30] * 40)
+    # Overwrite one day with a parquet that LACKS 'fetched_at' (and 'asof').
+    bad_day = asof - timedelta(days=3)
+    bad_path = reader._path_for("NVDA", bad_day.date())
+    bad_path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame([{"contract_symbol": "X", "iv": 0.99}])  # no fetched_at / asof
+    pq.write_table(pa.Table.from_pandas(df), bad_path)
+    rank = compute_iv_rank_asof("NVDA", asof, reader=reader)
+    assert rank is not None, "the missing-column day must abstain, not crash the whole rank"
+    assert 0.0 <= rank <= 100.0
+
+
+def test_future_asof_row_excluded_covers_asof_filter(tmp_path: Path) -> None:
+    """Covers the asof<=asof no-look-ahead line (the review found it UNTESTED — removing
+    it left every test green because the existing no-lookahead test only poisons fetched_at).
+
+    A current-day row stamped with a FUTURE decision-asof (but a past fetched_at) must be
+    EXCLUDED by the asof<=asof filter. Discriminating design: the current LOW IV sits at
+    the BOTTOM of the history, so the rank is LOW; if the future-asof HIGH rows leaked in,
+    the current-day median would jump ABOVE all history -> rank 100.0. The two outcomes
+    differ, so removing the asof<=asof line is RED-proven.
+    """
+    reader = ChainSnapshotReader(chains_dir=tmp_path)
+    asof = datetime(2026, 6, 12, 20, 0, tzinfo=UTC)
+    future_asof = asof + timedelta(days=2)
+    # 39 history days with rising IVs 0.40..0.78 (all ABOVE the current 0.10).
+    for k in range(1, 40):
+        day = asof - timedelta(days=k)
+        iv = round(0.40 + 0.01 * k, 2)  # 0.41 .. 0.79
+        path = reader._path_for("NVDA", day.date())
+        _write_day_parquet(
+            path,
+            [
+                _row(f"NVDA260612C001{k:02d}000", asof=day, fetched_at=day, iv=iv),
+                _row(f"NVDA260612C002{k:02d}000", asof=day, fetched_at=day, iv=iv),
+            ],
+        )
+    # Current day: two legit 0.10 rows (the MIN) + two FUTURE-asof 0.99 rows (fetched_at past).
+    current_path = reader._path_for("NVDA", asof.date())
+    _write_day_parquet(
+        current_path,
+        [
+            _row("NVDA260612C00300000", asof=asof, fetched_at=asof, iv=0.10),
+            _row("NVDA260612C00301000", asof=asof, fetched_at=asof, iv=0.10),
+            _row("NVDA260612C00900000", asof=future_asof, fetched_at=asof, iv=0.99),
+            _row("NVDA260612C00901000", asof=future_asof, fetched_at=asof, iv=0.99),
+        ],
+    )
+    rank = compute_iv_rank_asof("NVDA", asof, reader=reader)
+    # Filter ON: future-asof 0.99 rows dropped -> current repr = median([0.10,0.10]) = 0.10,
+    # which is the MINIMUM -> only itself is <= itself among 40 day-points -> rank = 100*1/40
+    # = 2.5. If the asof filter were removed, current repr = median([0.10,0.10,0.99,0.99]) =
+    # 0.545 > most history -> rank would be far higher. 2.5 is the discriminating value.
+    assert rank == pytest.approx(2.5), (
+        f"current LOW IV must rank near the bottom (2.5); got {rank}. A removed asof<=asof "
+        "filter would leak the future-asof 0.99 rows and inflate the current repr/rank."
+    )

@@ -31,12 +31,15 @@ and the caller can gate on it without re-implementing the fail-closed convention
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import statistics
 from datetime import date, datetime, timedelta
 
 from .data import ChainQualityError, ChainSnapshotReader
+
+logger = logging.getLogger(__name__)
 
 # Minimum trailing day-points required to rank honestly. Below this the sample is
 # too thin to be a meaningful percentile; abstain (return None) rather than emit a
@@ -90,11 +93,34 @@ def _representative_iv_for_day(
     path = reader._path_for(underlying, day)
     if not path.exists():
         return None
-    df = pq.read_table(path).to_pandas()
-    # Same belt-and-suspenders no-look-ahead filter as data.py:360.
+    # FAIL-CLOSED (review DEFECT fix): a corrupt/unreadable parquet, or one missing an
+    # expected column, must ABSTAIN (return None) — NEVER raise. This helper is on the
+    # PERCEIVE money-path; a single bad day's stored chain must not crash the tick nor
+    # break compute_iv_rank_asof's documented "never raises" contract. Read defensively
+    # and guard EVERY required column before indexing it.
+    try:
+        df = pq.read_table(path).to_pandas()
+    except Exception:  # noqa: BLE001 — ArrowInvalid (corrupt file) / OSError / etc.
+        logger.warning(
+            "iv_rank: unreadable chain parquet for %s %s — abstaining this day",
+            underlying, day,
+        )
+        return None
+    # A malformed parquet may lack the no-look-ahead / iv columns. Guard presence BEFORE
+    # indexing so a missing 'fetched_at'/'asof'/'iv' column abstains instead of KeyError.
+    required = {"fetched_at", "asof", "iv"}
+    if not required.issubset(set(df.columns)):
+        logger.warning(
+            "iv_rank: chain parquet for %s %s missing columns %s — abstaining this day",
+            underlying, day, sorted(required - set(df.columns)),
+        )
+        return None
+    # Same belt-and-suspenders no-look-ahead filter as data.py:360. The asof<=asof filter
+    # is defense-in-depth against a recorder that ever stamps a row's own decision asof in
+    # the future relative to the query asof (mirrors replay_chain's dual filter).
     df = df[df["fetched_at"] <= asof]
     df = df[df["asof"] <= asof]
-    if len(df) == 0 or "iv" not in df.columns:
+    if len(df) == 0:
         return None
     ivs = [iv for iv in (_finite_iv(v) for v in df["iv"].tolist()) if iv is not None]
     if not ivs:

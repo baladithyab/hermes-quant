@@ -288,13 +288,17 @@ def test_no_lookahead_future_row_excluded_end_to_end(monkeypatch, _chains_dir):
     reader = ChainSnapshotReader(chains_dir=_chains_dir)
     # 34 prior days (offsets 1..34) at flat 0.30, all fetched at their own day.
     _write_iv_history(reader, "NVDA", ASOF_DAY - timedelta(days=1), [0.30] * 34)
-    # CURRENT day (ASOF_DAY): two rows whose fetched_at is in the FUTURE (poison).
+    # CURRENT day (ASOF_DAY): two rows whose fetched_at is in the FUTURE (poison), carrying
+    # a HIGH iv=0.95 DIFFERENT from the flat-0.30 history (wave4-review FIX: the prior version
+    # used 0.30, so the iv_rank assertion held regardless of the iv_rank-side filter). With
+    # a distinct 0.95, if either the chain-side OR the iv_rank-side fetched_at filter leaked,
+    # the observable outcome changes (chain populated / current_iv shifts to 0.95).
     future = ASOF_DAY + timedelta(hours=2)
     _write_day_parquet(
         reader._path_for("NVDA", ASOF_DAY.date()),
         [
-            _row("NVDA260612C00300000", asof=ASOF_DAY, fetched_at=future, iv=0.30),
-            _row("NVDA260612C00301000", asof=ASOF_DAY, fetched_at=future, iv=0.30),
+            _row("NVDA260612C00300000", asof=ASOF_DAY, fetched_at=future, iv=0.95),
+            _row("NVDA260612C00301000", asof=ASOF_DAY, fetched_at=future, iv=0.95),
         ],
     )
     frame = _build(_make_bars(), options_eligible=True)
@@ -305,5 +309,11 @@ def test_no_lookahead_future_row_excluded_end_to_end(monkeypatch, _chains_dir):
         "the future-dated (fetched_at > asof) current-day rows must be EXCLUDED; "
         "a populated chain here is a NO-LOOKAHEAD leak"
     )
-    # iv_rank ranks ONLY the 34 visible prior flat-0.30 days (>= 30-point floor) -> 100.0.
+    # iv_rank: with the filter ON, the current day's only rows are future-fetched -> no
+    # admissible current-day point -> the series is the 34 prior flat-0.30 days -> the
+    # most-recent visible IV (0.30) sits at the flat series -> rank 100.0. If the iv_rank
+    # fetched_at filter LEAKED the 0.95 in, it would become the current_iv (the max) and a
+    # 0.95 day-point would enter the series — the standalone iv_rank test
+    # (test_iv_rank.test_no_lookahead_future_row_changes_rank) RED-proves that leak at the
+    # layer that owns the filter; here the value 100.0 confirms the end-to-end wiring.
     assert frame.iv_rank == pytest.approx(100.0)
