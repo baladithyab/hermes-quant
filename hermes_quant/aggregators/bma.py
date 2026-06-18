@@ -277,6 +277,22 @@ def _stacking_enabled() -> bool:
     return os.environ.get("HERMES_QUANT_STACKING", "0") == "1"
 
 
+def _hierarchical_pooling_enabled() -> bool:
+    """True iff HERMES_QUANT_HIERARCHICAL_POOLING=1 (read at CALL TIME).
+
+    aegis-ag03 / ADR-0096 Gate 3 (DEFAULT-OFF). When unset/!="1", the per-
+    (analyst × regime) skill weight is the flat posterior proxy multiplied by the
+    regime table exactly as before — byte-identical to the pre-ag03 BMA. When set,
+    the (analyst, regime) skill estimate is HIERARCHICALLY PARTIAL-POOLED (cell →
+    analyst → global, shrinkage driven by effective-n) and thin/empty cells are
+    LABELLED as warm-up + pulled toward UNIFORM rather than presented as a
+    confident track record. The pooling counts are ALWAYS accumulated in update()
+    (cheap, additive) but consulted ONLY when this flag is on, so flipping it on
+    does not require a settlement replay — exactly the B50 ``history`` discipline.
+    """
+    return os.environ.get("HERMES_QUANT_HIERARCHICAL_POOLING", "0") == "1"
+
+
 def _posterior_persist_enabled() -> bool:
     """True iff HERMES_QUANT_L2_POSTERIOR_PERSIST=1 (read at CALL TIME).
 
@@ -437,6 +453,22 @@ class BMAAggregator:
         # AggregatedSignal.metadata under 'regime_state' and
         # 'regime_weight_multipliers'.
         self.regime_detector = regime_detector
+
+        # aegis-ag03 / ADR-0096 Gate 3: hierarchical partial-pooling pooler.
+        # ALWAYS constructed (cheap, additive); per-(analyst, regime, epoch)
+        # correctness cells are accumulated UNCONDITIONALLY in update() so
+        # flipping HERMES_QUANT_HIERARCHICAL_POOLING on never requires a
+        # settlement replay — but the cells are CONSULTED only when the flag is
+        # on, so the OFF path is byte-identical to the pre-ag03 BMA. The prior
+        # mirrors the BMA Beta prior so the pooled global level == the existing
+        # uniform proxy (0.5 for the canonical 5/5 prior).
+        from hermes_quant.learning.hierarchical_pooling import HierarchicalPooler
+
+        self._pooler = HierarchicalPooler(
+            prior_alpha=self.prior_alpha,
+            prior_beta=self.prior_beta,
+            warmup_n=float(self.n_min_observations),
+        )
 
     @staticmethod
     def _load_calibrator(path: Path):
@@ -718,6 +750,26 @@ class BMAAggregator:
             seen.add(lesson.lesson_id)
         return len(seen)
 
+    @staticmethod
+    def _view_model_id(view) -> str | None:
+        """aegis-ag03: extract an optional model-id / provenance tag from a view.
+
+        Reads ``metadata['model_id']`` (or ``metadata['provenance']`` as a
+        fallback) if present. Returns None when the view has no metadata or no
+        provenance key — the pooler then runs in a single epoch (graceful
+        degradation). This is the seam that ADR-0094 deliberation_provenance
+        (cowork-owned) will eventually populate so a model change opens a fresh
+        warm-up epoch; until then the key is simply absent.
+        """
+        meta = getattr(view, "metadata", None)
+        if not meta:
+            return None
+        for key in ("model_id", "provenance"):
+            val = meta.get(key)
+            if val is not None:
+                return str(val)
+        return None
+
     def _horizon_weight(self, horizon: str) -> float:
         """Per-ADR-0036 horizon weight multiplier.
 
@@ -919,6 +971,58 @@ class BMAAggregator:
                 _regime_adjusted = {}
         else:
             _regime_adjusted = {}
+
+        # aegis-ag03 / ADR-0096 Gate 3: hierarchical partial pooling (DEFAULT-OFF,
+        # flag read at CALL TIME). When the flag is unset this block is SKIPPED
+        # entirely and the per-(analyst × regime) weight is the flat posterior
+        # proxy × regime multiplier exactly as above — byte-identical to pre-ag03.
+        #
+        # When set, the per-(analyst, regime) skill estimate becomes the
+        # hierarchically POOLED skill: a thin/empty cell shrinks toward the
+        # analyst-then-global level (so a 2/2-correct cell does NOT read ~1.0), and
+        # a cell still in WARM-UP (effective-n below n_min_observations) is pulled
+        # toward UNIFORM (equal across analysts) rather than toward a noisy point
+        # estimate. The pooled skill REPLACES the flat (analyst, regime) weight as
+        # the base weight in the loop below; the horizon weight and stacking
+        # discount still multiply on top, exactly as for the flat path.
+        #
+        # The cell is keyed by the resolved regime label and an OPTIONAL model-id /
+        # provenance tag carried on the view metadata ('model_id' or 'provenance').
+        # When absent the pooler degrades to a single epoch (no crash); when a
+        # model-id changes, the analyst re-enters warm-up (handled inside the
+        # pooler). The epoch-reset-on-model-change depends on ADR-0094
+        # deliberation_provenance (cowork-owned) for a real provenance key — until
+        # that lands the key is simply absent and the single-epoch path runs.
+        pooling_diagnostics: dict | None = None
+        if _hierarchical_pooling_enabled():
+            # Resolve the regime label for cell keying. With no regime detector (or
+            # an unknown/empty regime) the cell still keys on a stable label so the
+            # pooling runs in a single "regime" bucket rather than crashing.
+            regime_label = regime_state_value or "unknown"
+            n_active = len({v.analyst for v in views})
+            pooled_map: dict[str, float] = {}
+            pooling_diagnostics = {}
+            for v in views:
+                model_id = self._view_model_id(v)
+                # Register the cell so status() surfaces this active (analyst,
+                # regime) as a cold/warm-up cell even before it has settled —
+                # honest "unproven" rather than silently absent.
+                self._pooler.touch_cell(v.analyst, regime_label, model_id=model_id)
+                diag = self._pooler.cell_diagnostics(
+                    v.analyst,
+                    regime_label,
+                    model_id=model_id,
+                    n_active_analysts=n_active,
+                )
+                pooled_map[v.analyst] = float(diag["pooled_skill"])
+                pooling_diagnostics[f"{v.analyst}|{regime_label}"] = diag
+            # The pooled skill is the BASE (analyst, regime) weight from here on.
+            _regime_adjusted = pooled_map
+            logger.debug(
+                "BMA: hierarchical pooling regime=%s pooled=%s",
+                regime_label,
+                pooled_map,
+            )
 
         # B50 cross-correlation stacking (DEFAULT-OFF, flag read at CALL TIME).
         # When the flag is unset this stays None and the weights loop below is
@@ -1193,6 +1297,20 @@ class BMAAggregator:
             metadata["stacking_redundancy_factors"] = redundancy_factors
             metadata["stacking_used"] = stacking_used
 
+        # aegis-ag03 audit field — injected ONLY when hierarchical pooling is on,
+        # so the OFF-path metadata dict is byte-identical to the pre-ag03 BMA. The
+        # pooled (analyst, regime) skills are already reflected in
+        # metadata["weights"]; this surfaces the EFFECTIVE-N + pooled skill +
+        # warm-up flag per cell so the warm-up band is explicit, never silent
+        # (the G3 eval criterion). Any cell flagged warm-up is also rolled up into
+        # a top-level honest flag so a consumer that ignores the per-cell detail
+        # still sees that the headline weighting is in a warm-up band.
+        if pooling_diagnostics is not None:
+            metadata["hierarchical_pooling"] = pooling_diagnostics
+            metadata["hierarchical_pooling_warmup"] = any(
+                d["warmup"] for d in pooling_diagnostics.values()
+            )
+
         # f254 audit field — injected ONLY when per-analyst calibration is on, so
         # the OFF-path metadata dict is byte-identical. Records the per-analyst
         # calibrated confidence that fed the vote (vs the merged global path).
@@ -1301,13 +1419,32 @@ class BMAAggregator:
                 stats.decay_samples.append((observable_asof, bool(correct)))
                 stats.last_observable_asof = observable_asof
 
+            # aegis-ag03: fold this settled correctness into the per-(analyst,
+            # regime, epoch) pooling cell. ALWAYS accumulated (cheap, additive,
+            # mutates no Beta posterior and changes no return value), consulted
+            # ONLY when HERMES_QUANT_HIERARCHICAL_POOLING=1 — exactly the B50
+            # ``history`` discipline, so update() stays byte-identical with the
+            # flag off. The regime label is read from the SETTLED signal's
+            # metadata (the regime that was live at the decision); absent/None
+            # degrades to "unknown" so the cell still keys cleanly. The model-id
+            # is the optional provenance tag on the view (single epoch when
+            # absent).
+            settled_meta = getattr(outcome.aggregated_signal, "metadata", None) or {}
+            regime_label = settled_meta.get("regime_state") or "unknown"
+            self._pooler.observe(
+                view.analyst,
+                str(regime_label),
+                bool(correct),
+                model_id=self._view_model_id(view),
+            )
+
         # c96e: persist the evolved posteriors (DEFAULT-OFF). Stamp the snapshot
         # with the settlement asof. Save is fail-safe (logged, never raises).
         if _posterior_persist_enabled():
             self._save_persisted_posteriors(decision_asof)
 
     def status(self) -> dict:
-        return {
+        status = {
             "name": self.name,
             "n_aggregated": self._n_aggregated,
             "last_aggregated_at": (
@@ -1323,4 +1460,49 @@ class BMAAggregator:
                 for name, s in self._stats.items()
             },
             "calibrator_status": self.calibrator.status(),
+        }
+        # aegis-ag03 / ADR-0096 Gate 3: surface effective-n + pooled skill +
+        # warm-up flag per (analyst, regime, epoch) cell. The G3 eval criterion is
+        # that status SHOWS effective-n + pooled weights + flags the warm-up band.
+        # Injected ONLY when HERMES_QUANT_HIERARCHICAL_POOLING=1 so the OFF-path
+        # status dict is byte-identical to the pre-ag03 BMA. The honest summary
+        # makes the warm-up band loud, not silent: any cell below the warm-up
+        # threshold is counted, and the headline weighting is labelled warm-up if
+        # ANY active cell is.
+        if _hierarchical_pooling_enabled():
+            status["hierarchical_pooling"] = self._pooling_status()
+        return status
+
+    def _pooling_status(self) -> dict:
+        """aegis-ag03: per-(analyst, regime, epoch) pooled diagnostics for status().
+
+        Surfaces, per cell: effective_n, flat_estimate, analyst_level,
+        global_prior, pooled_skill, warmup, uniform_target, epoch. Plus a top-
+        level honest rollup: how many cells are in the warm-up band and whether
+        the headline weighting is therefore still warming up. effective-n is the
+        load-bearing honesty field — it lets an operator see that a near-1.0
+        looking cell is actually a thin 2/2 noise cell.
+        """
+        cells: dict[str, dict] = {}
+        n_warmup = 0
+        for (analyst, regime, epoch), cell in self._pooler._cells.items():
+            # Pass the cell's OWN epoch LITERALLY (review-fix): round-tripping an empty
+            # epoch through model_id=(epoch or None) re-resolves to the analyst's LATEST
+            # model-id and would misreport a pre-provenance cell's effective_n.
+            diag = self._pooler.cell_diagnostics(
+                analyst, regime, epoch=epoch
+            )
+            label = f"{analyst}|{regime}|{epoch}" if epoch else f"{analyst}|{regime}"
+            cells[label] = diag
+            if diag["warmup"]:
+                n_warmup += 1
+        return {
+            "cells": cells,
+            "n_cells": len(cells),
+            "n_warmup_cells": n_warmup,
+            "warmup_n_threshold": float(self._pooler.warmup_n),
+            "shrinkage_k": float(self._pooler.shrinkage_k),
+            # Honest headline: the weighting is still in a warm-up band while ANY
+            # active cell is below threshold (not a confident track record).
+            "headline_in_warmup": n_warmup > 0,
         }

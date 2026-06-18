@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**82 flags** (resolvable default).
+**83 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -26,7 +26,7 @@
 | `HERMES_QUANT_DATA_FALLBACK` | `0` | `hermes_quant/data/chain.py:39` |
 | `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/autonomous.py:718` |
 | `HERMES_QUANT_DETERMINISTIC_EQUITY` | `0` | `hermes_quant/react/dispatch.py:80` |
-| `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1087` |
+| `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1191` |
 | `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1245` |
 | `HERMES_QUANT_ESTIMATES_ANALYST` | `0` | `hermes_quant/analysts/estimates.py:81` |
 | `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1334` |
@@ -36,6 +36,7 @@
 | `HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG` | `1` | `hermes_quant/data/fundamentals_provider.py:146` |
 | `HERMES_QUANT_GRAPH_MINING` | `0` | `hermes_quant/catalyst/graph_mining.py:158` |
 | `HERMES_QUANT_GROUNDING_ENFORCE` | `0` | `hermes_quant/grounding/enforcement.py:156` |
+| `HERMES_QUANT_HIERARCHICAL_POOLING` | `0` | `hermes_quant/aggregators/bma.py:293` |
 | `HERMES_QUANT_HOME` | `` | `hermes_quant/daemon/tick_lock.py:117` |
 | `HERMES_QUANT_HYPOTHESIS_NOVELTY_THRESHOLD` | `0.85` | `hermes_quant/research/hypothesis_novelty.py:57` |
 | `HERMES_QUANT_IC_DEDUP_AT_INGEST` | `` | `hermes_quant/factors/alpha_zoo.py:333` |
