@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**83 flags** (resolvable default).
+**84 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -22,6 +22,7 @@
 | `HERMES_QUANT_BROKER_BACKEND` | `` | `hermes_quant/react/backend.py:149` |
 | `HERMES_QUANT_CALENDAR_ENABLED` | `0` | `hermes_quant/catalyst/wiring.py:108` |
 | `HERMES_QUANT_CATALYST_ONBOARDING` | `0` | `hermes_quant/catalyst/onboarding.py:101` |
+| `HERMES_QUANT_COMPOSITE_LEG_OPS` | `0` | `hermes_quant/options/leg_ops.py:82` |
 | `HERMES_QUANT_CONVERGENCE` | `0` | `hermes_quant/catalyst/synthesize.py:124` |
 | `HERMES_QUANT_DATA_FALLBACK` | `0` | `hermes_quant/data/chain.py:39` |
 | `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/autonomous.py:718` |
