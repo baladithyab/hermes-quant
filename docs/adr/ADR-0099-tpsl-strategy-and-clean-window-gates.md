@@ -19,9 +19,9 @@ supersedes: null
 **Cites:** [ADR-0098](ADR-0098-options-strategy-taxonomy-and-two-level-multileg.md) (the
 structures + 2-level model these exits operate on), [ADR-0097](ADR-0097-paper-vs-live-slippage-haircut.md)
 (live-realistic cost the edge metric nets out), [ADR-0029](ADR-0029-multi-leg-paper-reactor.md)
-(the N>=100 options evidence gate), [ADR-0125](ADR-0125 — promotion gate) (the sharpe_95ci
+(the N>=100 options evidence gate), [ADR-0031](ADR-0031-governance-plane-consolidation.md) (the sharpe_95ci
 floor these gates feed), [ADR-0096](ADR-0096-pre-autonomous-decision-quality-gates.md)
-(the decision-quality gates this composes with), [ADR-0034](ADR-0034 — run-card) (the waiver record).
+(the decision-quality gates this composes with), [ADR-0034](ADR-0034-run-cards.md) (the waiver record).
 
 ---
 

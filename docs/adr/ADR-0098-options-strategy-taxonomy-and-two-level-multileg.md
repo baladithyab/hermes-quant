@@ -16,7 +16,7 @@ supersedes: null
 > ladder, and (3) the 2-level data model that makes a composite play and its legs coexist
 > and be managed at either level. Default-OFF + eval-gated per increment.
 
-**Cites:** [ADR-0027](ADR-0027-options-gate.md) (the options gate that sizes/admits — the
+**Cites:** [ADR-0027](ADR-0027-options-aware-risk-gate.md) (the options gate that sizes/admits — the
 collateral/defined-risk rules this taxonomy obeys), [ADR-0029](ADR-0029-multi-leg-paper-reactor.md)
 (the multi-leg reactor + the evidence-before-live gate + MultiLegProposal.max_loss),
 [ADR-0082](ADR-0082-deterministic-structure-selection-layer.md) (the deterministic
@@ -56,7 +56,7 @@ below. Raw output: `docs/research/2026-06-17-aegis-strategy-research-raw.json`.
 
 ## Decision Outcome — Part A: the admissible structure set
 
-**15 admissible structures** (the 25-variant taxonomy minus naked/undefined-risk):
+**20 admissible structures** (16 defined-risk + 4 collateral-secured — the 25-variant taxonomy minus naked/undefined-risk):
 
 *Defined-risk (Group 1):* Long Call, Long Put, Long Straddle, Long Strangle, Bull Call
 Spread, Bear Put Spread, Bull Put Spread, Bear Call Spread, Iron Condor, Iron Butterfly,
