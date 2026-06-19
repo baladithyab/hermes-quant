@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**91 flags** (resolvable default).
+**92 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -89,6 +89,7 @@
 | `HERMES_QUANT_SIGNED_EQUITY` | `0` | `hermes_quant/state/portfolio_state.py:216` |
 | `HERMES_QUANT_SLIPPAGE_GATE` | `0` | `hermes_quant/pdr_core_adapter.py:75` |
 | `HERMES_QUANT_SLIPPAGE_HAIRCUT` | `0` | `hermes_quant/risk/slippage_haircut.py:72` |
+| `HERMES_QUANT_SOCIAL_REACH` | `0` | `hermes_quant/catalyst/social.py:381` |
 | `HERMES_QUANT_STACKING` | `0` | `hermes_quant/aggregators/bma.py:280` |
 | `HERMES_QUANT_STRUCTURE_SELECT` | `0` | `hermes_quant/options/structure_select.py:133` |
 | `HERMES_QUANT_TAKE_PROFIT_SWEEP` | `0` | `hermes_quant/autonomous.py:2759` |
