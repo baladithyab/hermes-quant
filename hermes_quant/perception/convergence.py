@@ -24,6 +24,8 @@ _FAMILY_REDDIT = "reddit"
 _FAMILY_TRENDS = "google_trends"
 _FAMILY_NEWS = "news_rss"
 _FAMILY_WEB = "web_traffic"
+_FAMILY_TWITTER = "twitter"          # aegis-ob5: Agent-Reach Twitter/X cashtag stream
+_FAMILY_STOCKTWITS = "stocktwits"    # aegis-ob5: Agent-Reach StockTwits symbol stream
 _FAMILY_UNKNOWN = "unknown"  # never counts
 
 CONVERGENCE_MIN_FAMILIES = 2  # the >=2 independent-origin bar (the taxonomy home)
@@ -35,6 +37,12 @@ _FAMILY_ORIGIN = {
     _FAMILY_TRENDS: "google",        # Google-owned
     _FAMILY_NEWS: "news_rss",        # syndicated news (collapsed within family already)
     _FAMILY_WEB: "web_traffic",      # B08 placeholder; set to "google" if a Google web-traffic feed lands
+    # aegis-ob5: Twitter/X and StockTwits are INDEPENDENT social origins — distinct
+    # from reddit, from each other, and from any Google/news origin. This is the
+    # load-bearing perception enhancement: reddit + twitter + stocktwits can now
+    # form the >=CONVERGENCE_MIN_FAMILIES independent origins convergence requires.
+    _FAMILY_TWITTER: "twitter",
+    _FAMILY_STOCKTWITS: "stocktwits",
 }
 
 # press-wire / aggregator publisher substrings that are NOT independent reporting
@@ -50,9 +58,11 @@ _SHARED_UPSTREAM = (
 def source_family(source: str) -> str:
     """Normalize a raw CatalystItem.source string to a source FAMILY.
 
-    reddit/  -> reddit; google_trends -> google_trends; anything from the
-    GN-RSS ingester (a bare publisher name) -> news_rss; recognized non-feed
-    sources (sign-eval, phase0-label) -> unknown (never counts).
+    reddit/  -> reddit; google_trends -> google_trends; twitter/ -> twitter;
+    stocktwits/ -> stocktwits (aegis-ob5 Agent-Reach social origins, each
+    INDEPENDENT); anything from the GN-RSS ingester (a bare publisher name) ->
+    news_rss; recognized non-feed sources (sign-eval, phase0-label) -> unknown
+    (never counts).
     """
     s = (source or "").strip().lower()
     if not s:
@@ -61,6 +71,10 @@ def source_family(source: str) -> str:
         return _FAMILY_REDDIT
     if s.startswith("google_trends"):
         return _FAMILY_TRENDS
+    if s.startswith("twitter/"):  # aegis-ob5: Agent-Reach Twitter/X cashtag stream
+        return _FAMILY_TWITTER
+    if s.startswith("stocktwits/"):  # aegis-ob5: Agent-Reach StockTwits symbol stream
+        return _FAMILY_STOCKTWITS
     if s.startswith("web_traffic/") or s.startswith("similarweb"):
         return _FAMILY_WEB
     # non-feed / synthetic harness sources prove nothing about real convergence

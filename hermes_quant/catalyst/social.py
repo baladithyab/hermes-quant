@@ -32,7 +32,10 @@ This is what keeps any social-driven backtest lookahead-honest (ADR-0074 D74.4).
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -47,6 +50,7 @@ logger = logging.getLogger(__name__)
 _UA = "python:hermes-quant.catalyst-social:v0.1 (research; by /u/hermes-quant)"
 _REDDIT_TIMEOUT = 15.0
 _TRENDS_TIMEOUT = 15.0
+_REACH_TIMEOUT = 20.0
 
 
 # --------------------------------------------------------------------------- #
@@ -339,3 +343,272 @@ def _filter_by_recency(
         if pub >= cutoff:
             kept.append(it)
     return kept
+
+
+# =========================================================================== #
+# aegis-ob5 — Agent-Reach social-sentiment/velocity PERCEPTION provider
+# =========================================================================== #
+# Twitter/X (cashtag) and StockTwits (symbol) producers backed by the operator-
+# installed agent-reach CLI (the `twitter` / `stocktwits` subcommands). Each
+# mirrors ``ingest_reddit`` exactly: an injectable-fetcher producer that returns
+# (items, latency_seconds), NEVER raises (a dead/absent CLI -> ([], latency)),
+# and anchors each item's ``published_at`` on the post's REAL ``created_at``
+# (tz-aware UTC). A post with no parseable timestamp is SKIPPED — never
+# fabricated to now(). The emitted ``source`` tags ("twitter/<cashtag>",
+# "stocktwits/<symbol>") are what PDR-3's source_family keys on to count these as
+# DISTINCT independent origins (perception/convergence.py).
+#
+# LIVE-DATA money rails honored here:
+#   * default-OFF: the live catalyst run only CALLS these behind
+#     HERMES_QUANT_SOCIAL_REACH=1 (read at call time). Unset => byte-identical
+#     (the ingesters are never invoked; nothing emits a twitter/stocktwits source).
+#   * no-lookahead: published_at = the post's real created_at, tz-aware UTC; an
+#     unparseable/future-looking timestamp is dropped downstream by
+#     velocity_source's <= asof cut + the lookahead_gate. We NEVER stamp now().
+#   * silence-by-default / fail-soft: the agent-reach CLI is operator-installed;
+#     if it is absent the default fetcher raises FileNotFoundError, which the
+#     producer catches -> ([], latency). A dead CLI never blocks the run.
+
+
+def _social_reach_on() -> bool:
+    """DEFAULT-OFF Agent-Reach gate, read at call time.
+
+    OFF (unset or anything but "1") => the live catalyst path never invokes the
+    twitter/stocktwits ingesters, so the run is byte-identical to the news/reddit
+    path. This is a LIVE-DATA money-path provider; it stays dark until an operator
+    explicitly arms HERMES_QUANT_SOCIAL_REACH=1.
+    """
+    return os.environ.get("HERMES_QUANT_SOCIAL_REACH", "0") == "1"
+
+
+def _reach_cli(argv: list[str], timeout: float) -> bytes:
+    """Default fetcher: shell out to the operator-installed agent-reach CLI.
+
+    ``argv`` is the fully-formed command vector (e.g. ``["twitter", "search",
+    "$AAPL", "-n", "50", "--json"]``). Returns the CLI's stdout bytes. Raises on a
+    missing binary (FileNotFoundError) or a non-zero exit / timeout — the CALLER
+    (``ingest_twitter`` / ``ingest_stocktwits``) catches every exception and
+    returns ([], latency), so a missing or failing CLI never blocks the run. We
+    never run a shell (``shell=False``); ``argv`` is a list, no string interpolation.
+    """
+    proc = subprocess.run(  # noqa: S603 — fixed argv, shell=False, operator-installed CLI
+        argv,
+        capture_output=True,
+        timeout=timeout,
+        check=True,
+    )
+    return proc.stdout
+
+
+def _norm_cashtag(s: str) -> str:
+    """Normalize a cashtag/symbol to a bare upper-case ticker ('$AAPL'->'AAPL')."""
+    return (s or "").strip().lstrip("$").upper()
+
+
+def _parse_reach_created_at(value: object) -> datetime | None:
+    """Parse an agent-reach post timestamp to tz-aware UTC. None on failure.
+
+    Accepts the ISO-8601 forms the Twitter/StockTwits APIs emit
+    ("2026-06-17T15:30:00Z" / "...+00:00") via ``_parse_atom_dt`` (fromisoformat,
+    handles the trailing 'Z'), and a numeric Unix epoch (int/float or a numeric
+    string) as a fallback. Anything unparseable returns None so the caller SKIPS
+    the post rather than fabricating a now() asof — the no-lookahead anchor.
+    """
+    if value is None:
+        return None
+    # numeric epoch (seconds) — some CLIs emit created_at as a unix timestamp.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(float(value), tz=UTC)
+        except (ValueError, OverflowError, OSError):
+            return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # ISO-8601 first (handles 'Z' suffix via _parse_atom_dt's fromisoformat path).
+    dt = _parse_atom_dt(s)
+    if dt is not None:
+        return dt
+    # numeric string epoch fallback ("1750000000").
+    try:
+        epoch = float(s)
+    except ValueError:
+        return None
+    try:
+        return datetime.fromtimestamp(epoch, tz=UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _reach_records(raw: bytes, *, keys: tuple[str, ...]) -> list[dict]:
+    """Extract the list-of-post dicts from an agent-reach JSON payload.
+
+    Tolerant of several shapes: a bare top-level list, or a dict carrying the
+    posts under one of ``keys`` ("results"/"data"/"messages"/"posts"/"tweets").
+    Returns [] on any decode error or unrecognized shape (silence-by-default —
+    the caller never raises).
+    """
+    try:
+        doc = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return []
+    if isinstance(doc, list):
+        return [r for r in doc if isinstance(r, dict)]
+    if isinstance(doc, dict):
+        for k in keys:
+            v = doc.get(k)
+            if isinstance(v, list):
+                return [r for r in v if isinstance(r, dict)]
+    return []
+
+
+def _reach_text(rec: dict) -> str:
+    """Pull the post body from any of the common field names."""
+    for k in ("text", "body", "title", "content", "message"):
+        v = rec.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _reach_link(rec: dict) -> str:
+    for k in ("url", "link", "permalink", "href"):
+        v = rec.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def ingest_twitter(
+    cashtag: str,
+    *,
+    limit: int = 50,
+    timeout: float = _REACH_TIMEOUT,
+    fetcher=None,
+    dedupe: bool = True,
+) -> tuple[list[CatalystItem], float]:
+    """Ingest recent Twitter/X posts for a cashtag via the agent-reach CLI.
+
+    ``cashtag`` is a ticker ('AAPL' or '$AAPL'). ``fetcher`` is injectable
+    (``fetcher(argv, timeout) -> bytes``) for offline tests; the default shells
+    out to ``twitter search "$<TAG>" -n <limit> --json``. Returns
+    (items, latency_seconds). NEVER raises — a missing/dead CLI returns
+    ([], latency) (silence-by-default).
+
+    Each emitted CatalystItem has source ``"twitter/<TAG>"`` and published_at =
+    the post's REAL ``created_at`` (tz-aware UTC). A post with a missing/
+    unparseable created_at is SKIPPED — never fabricated to now() (no-lookahead
+    anchor; the same rule as ``ingest_reddit``).
+    """
+    tag = _norm_cashtag(cashtag)
+    argv = ["twitter", "search", f"${tag}", "-n", str(int(limit)), "--json"]
+    fetch = fetcher or _reach_cli
+    t0 = time.monotonic()
+    try:
+        raw = fetch(argv, timeout)
+    except Exception as e:  # noqa: BLE001 — absent/dead CLI is non-fatal
+        logger.warning("catalyst.social: twitter agent-reach failed for $%s: %s", tag, e)
+        return [], time.monotonic() - t0
+    latency = time.monotonic() - t0
+    src = f"twitter/{tag}"
+    items: list[CatalystItem] = []
+    for rec in _reach_records(raw, keys=("results", "tweets", "data", "posts")):
+        title = _reach_text(rec)
+        pub = _parse_reach_created_at(rec.get("created_at") or rec.get("created"))
+        if not title or pub is None:
+            continue  # no body, or no parseable timestamp to anchor packet.asof
+        items.append(CatalystItem(
+            title=title,
+            published_at=pub,
+            source=src,
+            link=_reach_link(rec),
+            query=f"twitter:${tag}",
+        ))
+    if dedupe:
+        items = dedupe_items(items)
+    return items, latency
+
+
+def ingest_stocktwits(
+    symbol: str,
+    *,
+    limit: int = 50,
+    timeout: float = _REACH_TIMEOUT,
+    fetcher=None,
+    dedupe: bool = True,
+) -> tuple[list[CatalystItem], float]:
+    """Ingest recent StockTwits messages for a symbol via the agent-reach CLI.
+
+    Mirrors ``ingest_twitter`` exactly. ``fetcher`` default shells out to
+    ``stocktwits symbol <SYM> -n <limit> --json``. source = ``"stocktwits/<SYM>"``;
+    published_at = the message's REAL ``created_at`` (tz-aware UTC); a message with
+    no parseable timestamp is SKIPPED (never now()). NEVER raises.
+    """
+    sym = _norm_cashtag(symbol)
+    argv = ["stocktwits", "symbol", sym, "-n", str(int(limit)), "--json"]
+    fetch = fetcher or _reach_cli
+    t0 = time.monotonic()
+    try:
+        raw = fetch(argv, timeout)
+    except Exception as e:  # noqa: BLE001 — absent/dead CLI is non-fatal
+        logger.warning("catalyst.social: stocktwits agent-reach failed for %s: %s", sym, e)
+        return [], time.monotonic() - t0
+    latency = time.monotonic() - t0
+    src = f"stocktwits/{sym}"
+    items: list[CatalystItem] = []
+    for rec in _reach_records(raw, keys=("messages", "results", "data", "posts")):
+        title = _reach_text(rec)
+        pub = _parse_reach_created_at(rec.get("created_at") or rec.get("created"))
+        if not title or pub is None:
+            continue
+        items.append(CatalystItem(
+            title=title,
+            published_at=pub,
+            source=src,
+            link=_reach_link(rec),
+            query=f"stocktwits:{sym}",
+        ))
+    if dedupe:
+        items = dedupe_items(items)
+    return items, latency
+
+
+def ingest_social_reach(
+    symbols,
+    *,
+    limit: int = 50,
+    timeout: float = _REACH_TIMEOUT,
+    fetcher=None,
+    max_age_days: float | None = None,
+    now: datetime | None = None,
+) -> list[CatalystItem]:
+    """Orchestrate the Agent-Reach social producers across a symbol set.
+
+    DEFAULT-OFF: returns ``[]`` immediately unless HERMES_QUANT_SOCIAL_REACH=1
+    (read at call time via ``_social_reach_on``). With the flag OFF the
+    twitter/stocktwits ingesters are NEVER invoked — the live catalyst run is
+    byte-identical to the news/reddit path. ON => pulls Twitter + StockTwits per
+    symbol, concatenates, applies the same recency gate as ``ingest_social``
+    (asof honesty: filters by each item's real published_at, never shifts one),
+    and cross-source dedupes. Never raises (each producer fails soft to []).
+
+    The producers run ``shell=False`` with a fixed argv vector (no string
+    interpolation) — see ``_reach_cli``.
+    """
+    if not _social_reach_on():
+        return []
+    all_items: list[CatalystItem] = []
+    for raw_sym in symbols or ():
+        sym = _norm_cashtag(raw_sym)
+        if not sym:
+            continue
+        tw, lat_tw = ingest_twitter(sym, limit=limit, timeout=timeout, fetcher=fetcher, dedupe=True)
+        st, lat_st = ingest_stocktwits(sym, limit=limit, timeout=timeout, fetcher=fetcher, dedupe=True)
+        logger.info(
+            "catalyst.social: agent-reach %s -> %d twitter (%.2fs) + %d stocktwits (%.2fs)",
+            sym, len(tw), lat_tw, len(st), lat_st,
+        )
+        all_items.extend(tw)
+        all_items.extend(st)
+    all_items = _filter_by_recency(all_items, max_age_days=max_age_days, now=now)
+    return dedupe_items(all_items)
