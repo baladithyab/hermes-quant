@@ -139,3 +139,69 @@ A full-tier hyperresearch pass confirmed Option D and specified six mechanisms A
 6. **Package as MONOREPO-with-path-dependency**, each shell pinning a core version for rollback, breaking changes landed atomically across core + both shells — NOT separately-published-and-pinned. The "shared shackle" costs are multi-team/multi-repo costs largely absent for a single operator; the monorepo's atomic cross-cut change is the operation performed most when a money-contract evolves, and it *declines* the coordinated two-shell migration this ADR's "Negative" consequence feared. Keep the core MINIMAL (ledger + gate + contracts + fold) so it stays the security-protocol exception, not a utility SDK. Revisit only if a second author/org takes a shell.
 
 Empirical backbone for the rails (2025-2026): *Profit Mirage* (GPT-4o memorizes 85%+ of historical market QA; agents lose 55.68% Sharpe out-of-window) and *DeepFund / Time Travel is Cheating* (under leakage-free LIVE eval even DeepSeek-V3 / Claude-3.7-Sonnet net trading losses) — the evidence for no-look-ahead and LLM-as-evidence-not-authority. *MetaTrader / offline-policy-not-trustworthy* validates rejecting RL-on-portfolio-value (the charter's DO_NOT_BUILD).
+
+---
+
+## Implementation-progress addendum — 2026-06-19 (ph2 guard + ph3 home-decoupling)
+
+> **Status reconciliation (read before re-surveying).** A 2026-06-19 execution
+> session found the prior hand-off's "verified current state" had itself gone
+> stale behind the +26 options/watchlist commits on
+> `docs/rearchitecture-shared-pdr-core`. The actual on-branch reality at
+> `028c6f1`, verified against the tree (not the prose):
+
+**Phase 2 — break the core's host imports (DONE; guard hardened).**
+- The two named leaks (`hermes_quant.risk`, `hermes_quant.protocol`) were
+  **already broken** before this session: `pdr_core/*.py` source has ZERO
+  external `hermes_quant.*` imports (only `hermes_quant.pdr_core.*` siblings +
+  provenance comments). The shared type aliases were already re-derived locally
+  in `contracts.py`. `pdr_core` is no longer Increment-1-orphaned — it is
+  consumed by 11 shell modules (advisor, autonomous, risk/gate, react/base,
+  analysts, …).
+- The purity guard (`tests/pdr_core/test_contract_purity.py`) existed but
+  forbade only an ENUMERATED list (daemon/react/governance/…) that OMITTED
+  `risk` and `protocol`. Added **Gate 1c**: an ABSOLUTE static-AST invariant —
+  every `hermes_quant.*` import in pdr_core source must target
+  `hermes_quant.pdr_core.*`. This is the invariant that actually tracks
+  "extractable by a mechanical `git mv`" (the runtime pull of
+  `hermes_quant.protocol` into `sys.modules` is an artifact of the parent
+  package `__init__` running first, NOT a core-source leak; it vanishes on
+  extraction, so the guard is source-level by design).
+
+**Phase 3 — de-couple the home/context (DONE).**
+- Root cause of the operator's reproduced "tick ignores `HERMES_HOME`": the
+  ~59 `QUANT_HOME = Path.home()/".hermes"/"quant"` constants were bound at
+  IMPORT time, so a later env override never reached them; and home resolution
+  was inconsistent (some honored `HERMES_QUANT_HOME`, one honored `HERMES_HOME`,
+  most honored nothing).
+- New **`hermes_quant/home.py`** — the single call-time resolver
+  (`quant_home()` / `hermes_home()`), precedence: threaded arg >
+  `HERMES_QUANT_HOME` > `HERMES_HOME` > `~/.hermes/quant`. Parity contract: no
+  arg + no env == byte-identical to the legacy literal.
+- ~67 home-coupling sites across ~58 modules routed through the resolver
+  (whole-line constants + fragment forms + the two pre-existing lazy resolvers
+  in `tick_lock.py` / `runs/run_card.py`, which now delegate and thereby gain
+  `HERMES_HOME` support). Legacy `QUANT_HOME` symbols kept as MODULE GLOBALS
+  (init'd via the resolver) so the existing test monkeypatch surface is intact.
+- Acceptance proven: `tests/integration/test_autonomous_home_isolation_adr0092.py`
+  (subprocess; the test the operator's smoke-test could not make pass) + a live
+  `tick(dry_run=True)` against an injected `HERMES_QUANT_HOME` leaves the live
+  home untouched. The operator-decision (2026-06-19) chose the threaded-param
+  shape over a context object.
+- Commits: `42b6f13` (ph2 guard + ph3a foundation + autonomous wiring),
+  `58ff9ad` (ph3b 50 sites), `4aafaf3` (ph3 pass-2 fragments + watchlist
+  hermes_home). All local; no push.
+
+**Known PRE-EXISTING reds on the branch base `028c6f1`** (verified by stash +
+clean-HEAD re-run; NOT introduced by ph2/ph3, flagged for separate triage):
+`test_all_layers_inherit_cap::test_autonomous_layer_fires_through_paper_reactor_execute`,
+two `test_autonomous_admissibility_units` cases,
+two `test_quant_playbook_tick` cases,
+`test_profile_scan_cron::test_inventory_not_stale_after_w6_edits`.
+
+**Still open:** Phase 4 (shell reintegration — largely already on the public
+surface; scope TBD), Phase 5 acceptance — ADR-0091 gate is CLEAR (`accepted`),
+but this ADR stays `proposed` pending the full-sweep green (the pre-existing
+reds above must be triaged first) and **ADR-0093's core codename is still
+PENDING the operator's pick** (Quorum / Keel / Escapement / Fulcrum), which
+blocks 0093 acceptance.
