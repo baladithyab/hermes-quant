@@ -43,7 +43,14 @@ if _USE_PYDANTIC:
         entry_id: str
         asof_decision: datetime
         symbol: str
-        asset_class: Literal["crypto", "equity", "etf", "fx", "futures"]
+        # jw1: include the option classes the system actually trades. The autonomous
+        # options origination + the iter-5 close/monitor rails fire MultiLegProposals
+        # whose audit entry must journal as 'multi_leg' (composite parent) or
+        # 'option'/'us_option' (single-leg) — previously rejected by this stale narrow
+        # Literal, silently dropping the ADR-0029 evidence trail on every options fire.
+        asset_class: Literal[
+            "crypto", "equity", "etf", "fx", "futures", "option", "us_option", "multi_leg"
+        ]
         direction: Literal[-1, 0, 1]
         confidence: float = Field(ge=0.0, le=1.0)
         target_position_pct: float

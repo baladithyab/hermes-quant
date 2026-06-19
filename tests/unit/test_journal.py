@@ -445,6 +445,40 @@ def test_append_human_override_approve(tmp_path, monkeypatch):
     assert "approved-pending-settlement" in journal.read_text()
 
 
+def test_append_human_override_tolerates_multileg_proposal_jw1(tmp_path):
+    """jw1: a MultiLegProposal has no asset_class/symbol (carries `underlying`).
+    Before the fix, append_human_override raised AttributeError -> swallowed by the
+    autonomous BLE001 -> EVERY options fire silently lost its audit entry (the
+    ADR-0029 evidence trail). RED-proof: revert the two getattr lines in writer.py
+    and this raises AttributeError instead of journaling.
+    """
+    journal = tmp_path / "journal.md"
+
+    class _MultiLegProposalStub:
+        # Mirrors the MultiLegProposal attribute surface the journal writer touches:
+        # proposal_id + underlying + advisor_result, but NO asset_class / symbol.
+        proposal_id = "ml_20260618T230000_AAPL_cc01"
+        underlying = "AAPL"
+        approver_user_id = None
+        advisor_result = {
+            "as_of": "2026-06-18T22:55:00Z",
+            "decision_price": 1.50,
+            "aggregated_signal": {"direction": 1, "confidence": 0.7},
+            "risk_gate": {"kelly_fraction": 0.05, "pass": True},
+            "analyst_views": [],
+        }
+
+    entry = append_human_override(
+        _MultiLegProposalStub(), kind="approve", reason="autonomous_options_fire", path=journal
+    )
+    # The audit entry is written (no swallowed AttributeError) with the multi_leg
+    # provenance derived from `underlying`.
+    assert entry.hitl_kind == "approve"
+    assert entry.asset_class == "multi_leg"
+    assert entry.symbol == "AAPL"
+    assert entry.entry_id == "ml_20260618T230000_AAPL_cc01"
+
+
 def test_append_human_override_reject_persists_reason(tmp_path):
     journal = tmp_path / "journal.md"
     from hermes_quant.proposals import Proposal

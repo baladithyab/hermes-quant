@@ -212,7 +212,14 @@ def append_human_override(
     ]
 
     decision_price = float(advisor_result.get("decision_price") or 0.0)
-    benchmark_symbol = _benchmark_for(proposal.asset_class)
+    # jw1: tolerate a MultiLegProposal (asset_class/symbol absent; carries `underlying`).
+    # An equity Proposal has both fields, so this is byte-identical for it; a multi-leg
+    # close/origination journals as asset_class='multi_leg', symbol=underlying instead of
+    # raising AttributeError into the swallowing BLE001 (which silently dropped the audit
+    # entry on EVERY autonomous options fire — the ADR-0029 evidence trail).
+    _asset_class = getattr(proposal, "asset_class", None) or "multi_leg"
+    _symbol = getattr(proposal, "symbol", None) or getattr(proposal, "underlying", "") or ""
+    benchmark_symbol = _benchmark_for(_asset_class)
 
     entry = SettlementEntry(
         entry_id=proposal.proposal_id,
@@ -224,8 +231,8 @@ def append_human_override(
             or _parse_iso_safe(advisor_result.get("as_of"))
             or _utc_now()
         ),
-        symbol=proposal.symbol,
-        asset_class=proposal.asset_class,
+        symbol=_symbol,
+        asset_class=_asset_class,
         direction=int(sig.get("direction", 0)),
         confidence=float(sig.get("confidence", 0.0)),
         target_position_pct=float(rg.get("kelly_fraction", 0.0)),
