@@ -2591,6 +2591,129 @@ def _maybe_decompose_on_close(
         return None
 
 
+# ---------------------------------------------------------------------------
+# aegis-ag01b: route the candidate basket through the portfolio-variance gate (REBUILD).
+# ---------------------------------------------------------------------------
+# ag01 landed the pdr_core math (shrink_covariance + portfolio_variance_haircut) and the
+# default-OFF gate hook (DefaultRiskGate.apply_portfolio_variance_sizing). The prior build
+# left _apply_portfolio_variance_sizing_to_basket ORPHANED (zero callers). ag01b (iter-5)
+# builds the host-side caller AND wires it into tick(): assemble the candidate basket of
+# per-name quarter-Kelly targets THIS tick, build a returns matrix + SHRUNK covariance over
+# those names, route the targets through the gate's BASKET method BEFORE the fire — closing
+# the gap where five correlated names each at the per-name cap form a ~100% beta bet.
+#
+# Byte-identical when HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING off (source-default '0'): the
+# helper returns the targets UNCHANGED without building any covariance (the returns_provider
+# is NEVER called), and the tick's two-pass assembly is skipped (single-pass, byte-identical).
+# FAIL-CLOSED on the ON path: a missing / failing returns source / a degenerate covariance /
+# any error returns the per-name targets UNCHANGED — never sizes up (a missing covariance
+# fails toward LESS leverage).
+
+
+def _apply_portfolio_variance_sizing_to_basket(
+    targets: list[tuple[str, float]],
+    *,
+    returns_provider: Callable[[list[str]], Any] | None,
+) -> list[tuple[str, float]]:
+    """De-lever a candidate basket via DefaultRiskGate.apply_portfolio_variance_sizing.
+
+    REUSES the verified de-lever math from commit 5ef538b. ``targets`` are the per-name
+    quarter-Kelly outputs (each already clipped to the per-name cap upstream); order/identity
+    is preserved. ``returns_provider`` maps ``names -> (n_obs, n_names)`` returns matrix over
+    the SAME names in the SAME order, or None. Only invoked when the flag is ON. Flag OFF =>
+    the EXACT input list (byte-identical). A None provider / a provider that raises / a
+    degenerate matrix => fail-CLOSED pass-through (targets unchanged). |out_i| <= |in_i| always.
+    """
+    from hermes_quant.pdr_core.portfolio_sizing import portfolio_variance_enabled_from_env
+
+    if not portfolio_variance_enabled_from_env():
+        return targets
+    if not targets:
+        return targets
+    if returns_provider is None:
+        return targets  # fail-CLOSED: no covariance source -> never size up
+
+    try:
+        import numpy as np
+
+        from hermes_quant.pdr_core.gate import DefaultRiskGate, RiskConfig
+        from hermes_quant.pdr_core.portfolio_sizing import (
+            PortfolioVarianceConfig,
+            shrink_covariance,
+        )
+
+        names = [n for n, _ in targets]
+        returns = returns_provider(names)
+        r = np.asarray(returns, dtype=float)
+        # A degenerate / wrong-shape returns matrix -> fail-CLOSED pass-through.
+        if r.ndim != 2 or r.shape[1] != len(names) or r.shape[0] < 2:
+            return targets
+
+        cfg = PortfolioVarianceConfig()
+        cov = shrink_covariance(r, config=cfg)
+        gate = DefaultRiskGate(
+            RiskConfig(
+                portfolio_variance_sizing_enabled=True,
+                portfolio_variance_cap=cfg.variance_cap,
+            )
+        )
+        return gate.apply_portfolio_variance_sizing(targets, cov)
+    except Exception as exc:  # noqa: BLE001 - fail-CLOSED: a sizing error never sizes up / aborts
+        logger.warning(
+            "autonomous: portfolio-variance basket sizing failed (pass-through, never size up): %s",
+            exc, exc_info=True,
+        )
+        return targets
+
+
+def _build_tick_returns_provider(
+    *, timeframe: str = "1d", lookback: int = 60
+) -> Callable[[list[str]], Any]:
+    """Return a returns_provider that fetches per-name close history (the REAL tick basket
+    source) and builds an aligned ``(n_obs, n_names)`` simple-returns matrix.
+
+    Pulls each name's daily closes via the default equity provider's ``fetch_bars`` (the
+    SAME canonical fetch path the perception builder uses), computes simple returns, and
+    aligns all names to the SHORTEST common length (the most recent ``min_len-1`` returns)
+    so the matrix is rectangular. FAIL-CLOSED: a name with <2 closes / a fetch error / an
+    empty alignment makes the returns matrix degenerate (the basket helper then passes the
+    targets through UNCHANGED — never sizes up). The provider is injected (a seam) so tests
+    supply a deterministic returns matrix; production uses this live fetch.
+    """
+    def _provider(names: list[str]) -> Any:
+        import numpy as np
+        import pandas as pd
+
+        from hermes_quant.advisor import _get_default_provider
+
+        provider = _get_default_provider("equity")
+        end = pd.Timestamp.now(tz="UTC")
+        start = end - pd.Timedelta(days=max(lookback * 2, 30))
+        series: list[np.ndarray] = []
+        for name in names:
+            try:
+                bars = provider.fetch_bars(name, timeframe, start, end, as_of=end)
+                closes = np.asarray(bars["close"].to_numpy(), dtype=float)
+            except Exception:  # noqa: BLE001 - a fetch failure makes this name's column empty -> degenerate
+                series.append(np.array([], dtype=float))
+                continue
+            closes = closes[np.isfinite(closes)]
+            if closes.size < 2:
+                series.append(np.array([], dtype=float))
+                continue
+            rets = np.diff(closes) / closes[:-1]
+            series.append(rets[np.isfinite(rets)])
+        # Align to the shortest common length (most-recent tail). Any empty column =>
+        # min_len 0 => a degenerate (n_obs<2) matrix => the helper passes targets through.
+        if not series or min(s.size for s in series) < 2:
+            return np.empty((0, len(names)), dtype=float)
+        min_len = min(s.size for s in series)
+        cols = [s[-min_len:] for s in series]
+        return np.column_stack(cols)
+
+    return _provider
+
+
 def _options_monitor_enabled() -> bool:
     """True iff HERMES_QUANT_OPTIONS_MONITOR=1 (NEW, source-default OFF; read at call time)."""
     return os.environ.get("HERMES_QUANT_OPTIONS_MONITOR", "0") == "1"
@@ -3430,6 +3553,22 @@ def tick(
                     open_symbols_at_tick_start.discard(_sym)
                     open_positions_at_tick_start = max(0, open_positions_at_tick_start - 1)
 
+        # aegis-ag01b: tick-scoped candidate basket for the portfolio-variance de-lever.
+        # DEFAULT-OFF (HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING, source-default '0'): the
+        # flag-OFF path never builds this basket / never calls the returns provider, so the
+        # watchlist loop is single-pass byte-identical. When ON, each fire-eligible name's
+        # quarter-Kelly is appended; the basket is routed through
+        # _apply_portfolio_variance_sizing_to_basket (shrunk covariance over the names'
+        # live returns) so a correlated basket is de-levered TOGETHER BEFORE the fire. The
+        # returns source is the REAL per-name fetch_bars path (injected as a seam for tests).
+        _variance_sizing_on = (
+            os.environ.get("HERMES_QUANT_PORTFOLIO_VARIANCE_SIZING", "0") == "1"
+        )
+        _variance_basket: list[tuple[str, float]] = []
+        _variance_returns_provider = (
+            _build_tick_returns_provider() if _variance_sizing_on else None
+        )
+
         for entry in watchlist:
             if entry.symbol in _stopped_symbols:
                 # Force-exited by the stop sweep this tick; do not re-evaluate it now.
@@ -3688,6 +3827,33 @@ def tick(
                     kelly = 0.0
                 sig = (advisor_result or {}).get("aggregated_signal") or {}
 
+                # aegis-ag01b: portfolio-variance basket de-lever (DEFAULT-OFF). When ON,
+                # the candidate basket of fire-eligible per-name quarter-Kelly targets is
+                # routed through DefaultRiskGate.apply_portfolio_variance_sizing (shrunk
+                # covariance over the names' live returns) BEFORE the ladder snap / fire, so
+                # a correlated basket is de-levered TOGETHER. Greedy + order-dependent like
+                # the ADR-0071 portfolio clip: this name's kelly is scaled by the basket λ
+                # given the already-committed names + itself; |out| <= |in| always (a
+                # de-lever can only shrink). Flag OFF => byte-identical (no basket built, no
+                # returns provider call, kelly unchanged). FAIL-CLOSED: a missing/failing
+                # returns source returns the targets UNCHANGED (never sizes up).
+                variance_sizing_meta: dict[str, float] | None = None
+                if _variance_sizing_on and kelly != 0.0:
+                    _tentative = [*_variance_basket, (entry.symbol, kelly)]
+                    _haircut = _apply_portfolio_variance_sizing_to_basket(
+                        _tentative, returns_provider=_variance_returns_provider
+                    )
+                    # The current name is the LAST entry; apply its de-levered size.
+                    _haircut_map = dict(_haircut)
+                    _new_kelly = float(_haircut_map.get(entry.symbol, kelly))
+                    if math.isfinite(_new_kelly) and abs(_new_kelly) <= abs(kelly):
+                        if _new_kelly != kelly:
+                            variance_sizing_meta = {
+                                "kelly_before": kelly,
+                                "kelly_after": _new_kelly,
+                            }
+                        kelly = _new_kelly
+
                 # Stop-loss backstop (ADR-0016 §D9 defense-in-depth; deep-review
                 # 2026-06-07). Last line against a stopless full-size fire. Opt-in
                 # via rails["require_stop_loss"] (default False = legacy byte-
@@ -3824,6 +3990,8 @@ def tick(
                     decision.action["portfolio_clip"] = portfolio_clip_meta
                 if stopless_meta is not None:
                     decision.action["stopless_backstop"] = stopless_meta
+                if variance_sizing_meta is not None:
+                    decision.action["portfolio_variance_sizing"] = variance_sizing_meta
 
                 if not dry_run:
                     try:
@@ -3878,6 +4046,12 @@ def tick(
                             # PortfolioState is frozen — the dict is the inner mutable
                             # container that we update without reconstructing the wrapper.
                             portfolio_state.positions[entry.symbol] = charged
+                        # aegis-ag01b: COMMIT this fired name to the tick basket so the
+                        # NEXT correlated pick sees it in the covariance de-lever (the
+                        # marginal-name greedy semantics). Flag OFF => _variance_sizing_on
+                        # False => the basket stays empty (byte-identical).
+                        if _variance_sizing_on:
+                            _variance_basket.append((entry.symbol, kelly))
                     except FillSizeInvariantError as exc:
                         logger.warning(
                             "autonomous: fill-size invariant rejected %s: %s",
