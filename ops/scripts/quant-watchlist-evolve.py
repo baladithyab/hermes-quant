@@ -184,17 +184,19 @@ def _resolve_profile_watchlist_path() -> Path:
     Mirrors ``profile_scan.DEFAULT_PROFILE_WATCHLIST_PATH`` (the NEW path —
     never ``play-fit.json``). We resolve it HERE so the cron OWNS the path it
     asked the builder to write, and can surface the TRUE destination in the
-    breadcrumb instead of guessing. Falls back to the same literal default if
-    the W3 module isn't importable yet (older install / in-flight refactor).
-    """
-    try:
-        from hermes_quant.playbook.profile_scan import (  # type: ignore
-            DEFAULT_PROFILE_WATCHLIST_PATH,
-        )
+    breadcrumb instead of guessing.
 
-        return Path(DEFAULT_PROFILE_WATCHLIST_PATH)
-    except (ImportError, AttributeError):
-        return Path.home() / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
+    rt06-fix (test-isolation): resolve from ``Path.home()`` at CALL time rather
+    than importing ``profile_scan.DEFAULT_PROFILE_WATCHLIST_PATH``. That constant
+    is frozen at the W3 module's IMPORT time, so a later ``Path.home`` redirect
+    (the standard test-isolation idiom, and any future home reconfiguration) would
+    not take effect and the cron would surface a stale real-home path. Computing
+    the same literal here is byte-identical in production (home is stable) AND
+    honors a redirected home — closing an import-order test-isolation leak that
+    made test_on_calls_build_profile_watchlist fail only when a sibling test
+    imported profile_scan first.
+    """
+    return Path.home() / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
 
 
 def _run_profile_scan(universe_path: Path) -> dict | None:
