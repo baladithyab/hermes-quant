@@ -2114,6 +2114,37 @@ def _run_options_position_stop_sweep(
                 continue  # non-computable -> HOLD
             if loss_pct < abs(stop_pct):
                 continue  # not past the stop
+            # ml01b: when HERMES_QUANT_COMPOSITE_LEG_OPS=1, route the close as a LIVE
+            # DECOMPOSE (the breach invalidates the combo thesis) so the composite
+            # transitions open -> decomposed via the REAL ml00b store and the leg-close
+            # fires through the shared MLEG dispatch tail. Flag OFF => returns None =>
+            # the full-close path below runs (byte-identical to the agmon1 commit).
+            _decomp_state = _maybe_decompose_on_close(
+                store=store, row=row, reason="autonomous_options_per_position_stop"
+            )
+            if _decomp_state == "decomposed":
+                closed.add(mlid)
+                result.fires += 1
+                result.decisions.append(SymbolDecision(
+                    symbol=underlying or str(mlid),
+                    asset_class="multi_leg",
+                    timeframe="",
+                    gate="OPTIONS_PER_POSITION_STOP_DECOMPOSED",
+                    details={
+                        "multi_leg_id": mlid,
+                        "strategy_kind": getattr(row, "strategy_kind", None),
+                        "loss_pct": loss_pct,
+                        "threshold_pct": abs(stop_pct),
+                        "leg_op": "decompose",
+                        "state": _decomp_state,
+                    },
+                ))
+                logger.info(
+                    "autonomous: OPTIONS PER-POSITION STOP decomposed composite %s (%s) "
+                    "loss %.2f%% >= %.2f%% (leg-ops live)",
+                    mlid, underlying, loss_pct * 100, abs(stop_pct) * 100,
+                )
+                continue
             # Breach -> fire a close through the shared options dispatch tail.
             fired = _fire_options_close(row, reason="autonomous_options_per_position_stop")
             sym_decision = SymbolDecision(
@@ -2318,6 +2349,246 @@ def _run_options_position_tp_sweep(
             result.decisions.append(sym_decision)
             continue
     return closed
+
+
+# ---------------------------------------------------------------------------
+# aegis-ml01b: wire the LIVE executor for the ml01 leg-op apply_* drivers (REBUILD).
+# ---------------------------------------------------------------------------
+# ml01 landed the DECISION layer (decompose / convert + the apply_* drivers that
+# take INJECTED executor callables). The prior build left _apply_convert_live /
+# _apply_decompose_live with ZERO callers (orphaned + _apply_convert_live untested).
+# ml01b (iter-5) builds the LIVE executor in the host AND wires a REAL trigger: when
+# the options stop sweep would close a composite AND HERMES_QUANT_COMPOSITE_LEG_OPS=1,
+# the close routes through _apply_decompose_live so the composite transitions LIVE
+# (open -> decomposed via the REAL ml00b store) and the leg-close order fires through
+# the shared MLEG dispatch tail — instead of the leg-op decision being computed + discarded.
+#
+# Byte-identical when HERMES_QUANT_COMPOSITE_LEG_OPS off: leg_ops_enabled() False =>
+# apply_decompose / apply_convert short-circuit (no store transition) AND the live
+# executor-firing gate is OFF => no reactor call. The composite stays managed-whole and
+# the agmon1 full-close path runs exactly as in the agmon1 commit.
+
+
+def _legs_as_option_objects(legs: Any) -> list[Any]:
+    """Reconstruct OptionLeg objects from the ml00b store's leg DICTS.
+
+    The composite row stores legs as ``{symbol, side, position_intent}`` dicts; the
+    leg-op executor + the no-naked guard operate on OptionLeg objects. A leg that
+    cannot be reconstructed (no symbol) is DROPPED (the caller fail-CLOSEs on an
+    empty/short leg-set). Returns the OptionLeg list in row order."""
+    from hermes_quant.options.data import OptionLeg
+
+    out: list[Any] = []
+    for leg in legs or ():
+        sym = _leg_field(leg, "symbol")
+        side = _leg_field(leg, "side")
+        intent = _leg_field(leg, "position_intent")
+        if not sym or not isinstance(sym, str):
+            continue
+        # A valid OptionLeg needs a side + position_intent; fall back conservatively.
+        side = side if side in ("buy", "sell") else "buy"
+        intent = intent if intent in (
+            "buy_to_open", "buy_to_close", "sell_to_open", "sell_to_close"
+        ) else ("buy_to_open" if side == "buy" else "sell_to_open")
+        try:
+            out.append(OptionLeg(symbol=sym, side=side, position_intent=intent))
+        except Exception:  # noqa: BLE001 - an unparseable OCC is dropped (fail-closed)
+            continue
+    return out
+
+
+def _build_live_leg_mleg_executor(
+    *, underlying: str, play_tag: str
+) -> Callable[[list[Any]], None]:
+    """Return a LIVE executor that fires a leg-set as an MLEG order through the reactor.
+
+    REUSES the verified executor from commit f5c3dfe. The returned callable takes a
+    list of OptionLegs (the add-leg list for a convert, or the leg(s) being broken out
+    for a decompose) and routes them through the ONE dispatch chokepoint
+    (``react.dispatch.select_reactor``) so the broker MLEG order actually executes.
+    Routing failures PROPAGATE (apply_convert's H4 add-before-remove atomicity REQUIRES
+    the add executor to RAISE on a broker reject so the remove half never runs and no
+    naked leg is stranded). The leg-set is wrapped in a close MultiLegProposal minted
+    via the blessed gate seam so it routes to the multi-leg reactor (self-gating on
+    HERMES_QUANT_MULTILEG_REACTOR — no-fills / raises when off).
+    """
+    from decimal import Decimal
+
+    from hermes_quant.options.data import NetGreeks
+    from hermes_quant.options.multileg import MultiLegProposal
+    from hermes_quant.react.dispatch import select_reactor
+    from hermes_quant.risk.options_gate import OptionsGateResult, StructureBucket
+
+    def _executor(legs: list[Any]) -> None:
+        if not legs:
+            return
+        gate_result = OptionsGateResult(
+            admitted=True,
+            bucket=StructureBucket.DEFINED_RISK,
+            reason=None,
+            net_greeks=NetGreeks.zero(),
+            bpr_estimate=0.0,
+            max_loss=None,
+            contracts=1,
+            warnings=(play_tag,),
+        )
+        order = MultiLegProposal.from_gate_result(
+            gate_result=gate_result,
+            proposal_id=f"legop_{underlying}_{play_tag}",
+            asof=datetime.now(UTC),
+            strategy_kind="leg_op",
+            underlying=underlying,
+            option_legs=tuple(legs),
+            stock_leg=None,
+            outer_qty=1,
+            net_debit_credit=Decimal("0"),
+            max_gain=None,
+            breakeven_underlying=(),
+            rationale=play_tag,
+            source_recipe_id=play_tag,
+        )
+        reactor = select_reactor(order)
+        reactor.execute(order, fill_size_pct=0.0, approver_user_id="autonomous", play_tag=play_tag)
+
+    return _executor
+
+
+def _composite_state(store: Any, multi_leg_id: str) -> str:
+    """Best-effort current state of a composite (or "" if absent / unreadable)."""
+    try:
+        row = store.get(multi_leg_id)
+        return row.state if row is not None else ""
+    except Exception:  # noqa: BLE001 - a read failure is a benign "" (caller treats as no-op)
+        return ""
+
+
+def _apply_decompose_live(
+    *,
+    store: Any,
+    multi_leg_id: str,
+    underlying: str,
+    decision: dict[str, Any],
+    legs_remaining_after: int,
+    legs_to_close: list[Any] | None = None,
+) -> str:
+    """Route a decompose decision through apply_decompose with the LIVE executor wired.
+
+    REUSES commit f5c3dfe. apply_decompose drives the composite_plays store transition
+    (H1 no-orphan: open -> partial when some legs remain, -> decomposed when none). The
+    leg-close ORDER is fired by the LIVE executor against ``legs_to_close`` (OptionLeg
+    objects). apply_decompose short-circuits when HERMES_QUANT_COMPOSITE_LEG_OPS is off
+    (byte-identical: no transition, no executor call). Returns the composite's state
+    after the (possible) transition. A broker reject leaves the composite managed-whole
+    (no transition driven) — fail-CLOSED, never strand a half-decomposed structure.
+    """
+    from hermes_quant.options.leg_ops import apply_decompose, leg_ops_enabled
+
+    if leg_ops_enabled() and decision.get("decompose") and legs_to_close:
+        try:
+            executor = _build_live_leg_mleg_executor(
+                underlying=underlying, play_tag="autonomous_leg_decompose"
+            )
+            executor(legs_to_close)
+        except Exception as exc:  # noqa: BLE001 - a broker reject leaves the composite managed-whole
+            logger.warning(
+                "autonomous: live decompose leg-close failed for %s (composite left whole): %s",
+                multi_leg_id, exc,
+            )
+            return _composite_state(store, multi_leg_id)
+
+    return apply_decompose(
+        store=store,
+        multi_leg_id=multi_leg_id,
+        decision=decision,
+        legs_remaining_after=legs_remaining_after,
+    )
+
+
+def _apply_convert_live(
+    *,
+    store: Any,
+    multi_leg_id: str,
+    underlying: str,
+    decision: dict[str, Any],
+    current_legs: list[Any],
+) -> str:
+    """Route a convert decision through apply_convert with the LIVE add/remove executors.
+
+    REUSES commit f5c3dfe. apply_convert enforces the H4 atomicity contract (ADD half
+    FIRST; a failed add raises ConvertExecutionError and leaves the composite UNCHANGED
+    so no naked leg is stranded). Byte-identical when the flag is off (apply_convert
+    short-circuits). Returns the composite's state after the convert.
+    """
+    from hermes_quant.options.leg_ops import apply_convert
+
+    add_executor = _build_live_leg_mleg_executor(
+        underlying=underlying, play_tag="autonomous_leg_convert_add"
+    )
+    remove_executor = _build_live_leg_mleg_executor(
+        underlying=underlying, play_tag="autonomous_leg_convert_remove"
+    )
+    return apply_convert(
+        store=store,
+        multi_leg_id=multi_leg_id,
+        decision=decision,
+        current_legs=current_legs,
+        add_executor=add_executor,
+        remove_executor=remove_executor,
+    )
+
+
+def _maybe_decompose_on_close(
+    *, store: Any, row: Any, reason: str
+) -> str | None:
+    """ml01b REAL TRIGGER: when the options sweep is about to CLOSE a composite AND
+    HERMES_QUANT_COMPOSITE_LEG_OPS=1, route the close as a DECOMPOSE through
+    _apply_decompose_live so the composite transitions LIVE (open -> decomposed via the
+    ml00b store) and the leg-close fires through the shared MLEG dispatch tail.
+
+    Returns the post-transition composite state (e.g. "decomposed") when the leg-op path
+    drove a transition, else None (the caller falls back to the full-close path). Flag
+    OFF => returns None immediately (byte-identical: the agmon1 full-close path runs).
+
+    This is the wire that turns the orphaned _apply_decompose_live into a LIVE driver:
+    a stop/TP breach on a composite is the natural "this structure is no longer wanted
+    as a combo" trigger, so the whole structure decomposes (every leg independent)."""
+    from hermes_quant.options.leg_ops import decompose_decision, leg_ops_enabled
+
+    if not leg_ops_enabled():
+        return None
+    try:
+        mlid = str(getattr(row, "multi_leg_id", "") or "")
+        underlying = str(getattr(row, "underlying", "") or "")
+        legs = _legs_as_option_objects(getattr(row, "option_legs", None))
+        if not mlid or not legs:
+            return None
+        # A stop/TP breach invalidates the composite thesis -> decompose ALL legs (the
+        # structure is no longer wanted as a combo). decompose_decision is deterministic
+        # and self-gates on the flag (returns no_action when off — but we already gated).
+        decision = decompose_decision(
+            legs=legs, leg_signals=[], thesis_invalidated=True
+        )
+        if not decision.get("decompose"):
+            return None
+        state = _apply_decompose_live(
+            store=store,
+            multi_leg_id=mlid,
+            underlying=underlying,
+            decision=decision,
+            legs_remaining_after=0,  # thesis invalidated -> ALL legs independent
+            legs_to_close=legs,
+        )
+        logger.info(
+            "autonomous: ml01b LIVE decompose on composite %s (%s) -> state=%s (reason=%s)",
+            mlid, underlying, state, reason,
+        )
+        return state
+    except Exception as exc:  # noqa: BLE001 - a leg-op failure falls back to the full close (never aborts)
+        logger.warning(
+            "autonomous: ml01b live decompose failed for %s (falling back to full close): %s",
+            getattr(row, "multi_leg_id", "?"), exc,
+        )
+        return None
 
 
 def _options_monitor_enabled() -> bool:
