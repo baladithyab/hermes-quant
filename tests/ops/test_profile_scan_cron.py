@@ -151,29 +151,41 @@ def test_off_runs_evolve_and_never_calls_profile_scan(cron, monkeypatch, tmp_pat
 # ---------------------------------------------------------------------------
 
 
-def test_on_calls_build_profile_watchlist_and_skips_evolve(cron, monkeypatch, tmp_path):
+def test_on_calls_build_profile_watchlist_and_skips_evolve(cron, monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("HERMES_QUANT_PROFILE_SCAN", "1")
     universe_path = _neuter_io(cron, monkeypatch, tmp_path)
 
     captured = {}
+    out = tmp_path / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
 
-    def _fake_build(universe_path, asof, *, fetch=True, max_watchlist=50, listing_table=None):
+    def _fake_build(universe_path, asof, *, fetch=True, max_watchlist=50,
+                    listing_table=None, out_path=None, force_pit=None):
         captured["universe_path"] = Path(universe_path)
         captured["asof"] = asof
         captured["fetch"] = fetch
-        # Mirror profile_scan's emitted shape (one watchlist, no play buckets).
-        out = tmp_path / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
+        captured["out_path"] = out_path
+        # Mirror profile_scan.build_profile_watchlist's REAL emitted contract:
+        # {"asof", "active":[row,...], "max_watchlist", "n_scanned", "n_eligible"}.
+        # There is NO "n_active" / "out_path" key — the cron must derive the
+        # active count from len(active) and surface the path it requested.
+        target = Path(out_path) if out_path is not None else out
+        target.parent.mkdir(parents=True, exist_ok=True)
+        result = {
             "asof": asof,
             "active": [
-                {"symbol": "AAPL", "asset_class": "equity", "options_eligible": True,
+                {"symbol": "AAPL", "asset_class": "us_equity", "options_eligible": True,
                  "shortable": True, "horizon_set": ["1D", "7D", "14D", "30D"],
-                 "fit_score": 0.91},
+                 "fit_score": 0.91, "asof": asof},
+                {"symbol": "MSFT", "asset_class": "us_equity", "options_eligible": True,
+                 "shortable": True, "horizon_set": ["1D", "7D", "14D", "30D"],
+                 "fit_score": 0.88, "asof": asof},
             ],
+            "max_watchlist": max_watchlist,
+            "n_scanned": 2,
+            "n_eligible": 2,
         }
-        out.write_text(json.dumps(payload))
-        return {"out_path": str(out), "n_active": 1, "asof": asof}
+        target.write_text(json.dumps(result))
+        return result
 
     def _boom_evolve(**kw):
         raise AssertionError("ON path must NOT run the 5-bucket evolve_watchlist")
@@ -189,6 +201,8 @@ def test_on_calls_build_profile_watchlist_and_skips_evolve(cron, monkeypatch, tm
     assert captured["universe_path"] == universe_path
     # asof is threaded from the universe artifact (no datetime.now leakage).
     assert captured["asof"] == "2026-06-18T10:15:55+00:00"
+    # The cron passes the resolved target path it requested (not a guess).
+    assert captured["out_path"] == out
     # profile-fit.json was emitted (the autonomous-consumed single watchlist).
     pf = tmp_path / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
     assert pf.exists()
@@ -198,10 +212,20 @@ def test_on_calls_build_profile_watchlist_and_skips_evolve(cron, monkeypatch, tm
     # Crucially: the new path NEVER touches play-fit.json's evolve.
     assert not (tmp_path / ".hermes" / "quant" / "watchlist" / "play-fit.json").exists()
 
+    # Breadcrumb truth: against the REAL contract the cron derives the active
+    # count from len(active) (2 here) and prints the path it actually requested.
+    # The pre-fix cron read summary["n_active"] (absent -> 0) so it printed
+    # nothing; this asserts the breadcrumb is now both EMITTED and CORRECT.
+    captured_out = capsys.readouterr().out
+    assert "profile-fit scan" in captured_out
+    assert "2 active" in captured_out
+    assert str(out) in captured_out
 
-def test_on_does_not_clobber_play_fit_json(cron, monkeypatch, tmp_path):
+
+def test_on_does_not_clobber_play_fit_json(cron, monkeypatch, tmp_path, capsys):
     """The new profile-fit.json path is a NEW file; play-fit.json (5-bucket) is
-    left exactly as it was — the OFF default still owns play-fit.json."""
+    left exactly as it was — the OFF default still owns play-fit.json. An EMPTY
+    active list stays silent-by-default (no breadcrumb)."""
     monkeypatch.setenv("HERMES_QUANT_PROFILE_SCAN", "1")
     _neuter_io(cron, monkeypatch, tmp_path)
     wl = tmp_path / ".hermes" / "quant" / "watchlist"
@@ -210,8 +234,16 @@ def test_on_does_not_clobber_play_fit_json(cron, monkeypatch, tmp_path):
     play_fit.write_text('{"sentinel": "untouched 5-bucket state"}')
 
     def _fake_build(universe_path, asof, **k):
+        # REAL contract, empty watchlist (silence-by-default): NO "n_active",
+        # NO "out_path" — just the asof + an empty active list + counts.
         (wl / "profile-fit.json").write_text('{"asof": "x", "active": []}')
-        return {"out_path": str(wl / "profile-fit.json"), "n_active": 0, "asof": asof}
+        return {
+            "asof": asof,
+            "active": [],
+            "max_watchlist": 50,
+            "n_scanned": 0,
+            "n_eligible": 0,
+        }
 
     monkeypatch.setattr(cron, "_build_profile_watchlist", _fake_build, raising=False)
     monkeypatch.setattr(cron, "evolve_watchlist",
@@ -221,6 +253,8 @@ def test_on_does_not_clobber_play_fit_json(cron, monkeypatch, tmp_path):
     cron.main()
     # play-fit.json is byte-identical to what we wrote (untouched).
     assert json.loads(play_fit.read_text()) == {"sentinel": "untouched 5-bucket state"}
+    # Empty active list -> silence-by-default: NO breadcrumb on stdout.
+    assert capsys.readouterr().out == ""
 
 
 # ---------------------------------------------------------------------------

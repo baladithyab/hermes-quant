@@ -178,15 +178,41 @@ def _read_universe_asof(universe_path: Path) -> str | None:
     return str(asof) if asof else None
 
 
+def _resolve_profile_watchlist_path() -> Path:
+    """The single profile-fit.json target this cron requests from the W3 core.
+
+    Mirrors ``profile_scan.DEFAULT_PROFILE_WATCHLIST_PATH`` (the NEW path —
+    never ``play-fit.json``). We resolve it HERE so the cron OWNS the path it
+    asked the builder to write, and can surface the TRUE destination in the
+    breadcrumb instead of guessing. Falls back to the same literal default if
+    the W3 module isn't importable yet (older install / in-flight refactor).
+    """
+    try:
+        from hermes_quant.playbook.profile_scan import (  # type: ignore
+            DEFAULT_PROFILE_WATCHLIST_PATH,
+        )
+
+        return Path(DEFAULT_PROFILE_WATCHLIST_PATH)
+    except (ImportError, AttributeError):
+        return Path.home() / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
+
+
 def _run_profile_scan(universe_path: Path) -> dict | None:
     """ON-path: build the single profile-fit watchlist via the W3 core.
 
     Lazily imports ``build_profile_watchlist`` from
     ``hermes_quant.playbook.profile_scan`` and calls it with the universe path
-    + the artifact's asof. Returns the build summary dict, or None when the
-    universe is missing / the core isn't available (silence-by-default — never
-    crash the cron). Writes the single profile-fit.json (the autonomous-consumed
+    + the artifact's asof + the resolved out_path THIS cron requests. Returns
+    the build summary dict (with the requested ``out_path`` attached so the
+    caller can surface the true destination), or None when the universe is
+    missing / the core isn't available (silence-by-default — never crash the
+    cron). Writes the single profile-fit.json (the autonomous-consumed
     watchlist); does NOT touch play-fit.json.
+
+    The W3 ``build_profile_watchlist`` contract returns
+    ``{"asof", "active":[...], "max_watchlist", "n_scanned", "n_eligible"}`` —
+    there is NO ``n_active`` and NO ``out_path`` key. The caller derives the
+    active count from ``len(active)`` and reads the path WE requested here.
     """
     global _build_profile_watchlist
 
@@ -212,7 +238,13 @@ def _run_profile_scan(universe_path: Path) -> dict | None:
             return None
         _build_profile_watchlist = builder
 
-    return builder(universe_path, asof)
+    out_path = _resolve_profile_watchlist_path()
+    summary = builder(universe_path, asof, out_path=out_path)
+    # Attach the path WE requested so the caller's breadcrumb prints the true
+    # destination, not a guess. (The W3 contract itself carries no out_path.)
+    if isinstance(summary, dict):
+        summary["out_path"] = str(out_path)
+    return summary
 
 
 def main() -> int:
@@ -351,7 +383,10 @@ def main() -> int:
             # nothing. Exit 0 (silence-by-default); the OFF default still owns
             # play-fit.json so nothing was corrupted.
             return 0
-        n_active = summary.get("n_active", 0)
+        # Read the REAL build_profile_watchlist contract: the active count is
+        # len(active) (there is no "n_active" key), and the destination is the
+        # path _run_profile_scan requested + attached (not a hardcoded guess).
+        n_active = len(summary.get("active") or [])
         out_path = summary.get("out_path", "~/.hermes/quant/watchlist/profile-fit.json")
         # Silence-by-default: only print on a non-empty watchlist.
         if n_active:
