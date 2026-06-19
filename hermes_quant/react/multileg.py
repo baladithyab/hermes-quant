@@ -563,7 +563,10 @@ class MultiLegPaperReactor:
             fill_price=0.0,
             fill_size_pct=0.0,
             reactor_name=self.name,
-            human_in_the_loop=True,
+            # aegis-agdec2: provenance is consistent across the family — a silenced
+            # parent of an autonomously-originated play is still autonomous-origin
+            # (HITL derived from play_tag, not hardcoded True). Audit-only record.
+            human_in_the_loop=_hitl_from_play_tag(play_tag),
             approver_user_id=approver_user_id,
             reactor_metadata={
                 "multi_leg_id": multi_leg_id,
@@ -897,6 +900,9 @@ class MultiLegPaperReactor:
                     "requires_manual_reconcile": True,
                 }
             )
+        # aegis-agdec2: HITL is the family-level provenance of the ORIGIN, derived
+        # ONCE from play_tag and stamped identically on the parent + every child.
+        human_in_the_loop = _hitl_from_play_tag(play_tag)
         parent = ExecutionRecord(
             proposal_id=proposal.proposal_id,
             signal_id=None,
@@ -910,7 +916,7 @@ class MultiLegPaperReactor:
             fill_price=net_fill,
             fill_size_pct=fill_size_pct,
             reactor_name=self.name,
-            human_in_the_loop=True,
+            human_in_the_loop=human_in_the_loop,
             approver_user_id=approver_user_id,
             reactor_metadata=parent_meta,
             bar_ts=None,
@@ -936,7 +942,7 @@ class MultiLegPaperReactor:
                         fill_price=f.filled_avg_price,
                         fill_size_pct=_signed_frac(f, fill_size_pct),
                         reactor_name=self.name,
-                        human_in_the_loop=True,
+                        human_in_the_loop=human_in_the_loop,
                         approver_user_id=approver_user_id,
                         reactor_metadata={
                             "multi_leg_id": multi_leg_id,
@@ -970,7 +976,7 @@ class MultiLegPaperReactor:
                         fill_price=f.filled_avg_price,
                         fill_size_pct=fill_size_pct,
                         reactor_name=self.name,
-                        human_in_the_loop=True,
+                        human_in_the_loop=human_in_the_loop,
                         approver_user_id=approver_user_id,
                         reactor_metadata={
                             "multi_leg_id": multi_leg_id,
@@ -1021,6 +1027,8 @@ class MultiLegPaperReactor:
         """No-fill parent audit record on a broker reject/expire. NOT appended to the
         bus (mirror PaperReactor._admissibility_reject) — never fabricate a fill, and
         leave no position-mutating family on the bus for a rejected order."""
+        # aegis-agdec2: provenance of the no-fill audit record follows the origin too.
+        human_in_the_loop = _hitl_from_play_tag(play_tag)
         return ExecutionRecord(
             proposal_id=proposal.proposal_id,
             signal_id=None,
@@ -1034,7 +1042,7 @@ class MultiLegPaperReactor:
             fill_price=0.0,
             fill_size_pct=0.0,
             reactor_name=self.name,
-            human_in_the_loop=True,
+            human_in_the_loop=human_in_the_loop,
             approver_user_id=approver_user_id,
             reactor_metadata={
                 "multi_leg_id": multi_leg_id,
@@ -1147,6 +1155,25 @@ def _iso_utc(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# aegis-agdec2: the autonomous origination paths that are NOT human-in-the-loop.
+# The autonomous options path stamps "autonomous_options" (autonomous.py), the
+# autonomous equity path stamps "autonomous" — BOTH must read as HITL=False or an
+# autonomously-originated family is mislabeled a human override in the audit trail.
+_AUTONOMOUS_PLAY_TAGS = frozenset({"autonomous", "autonomous_options"})
+
+
+def _hitl_from_play_tag(play_tag: str | None) -> bool:
+    """Derive human_in_the_loop from the play_tag origin (aegis-agdec2 crit 4).
+
+    An autonomously-originated multi-leg play is NOT human-in-the-loop; every other
+    origin (advisor/playbook) — and any None/absent/unknown tag — is treated as
+    HITL=True (fail-safe: an unknown origin needs human oversight, conservative).
+    This keeps non-autonomous callers byte-identical to the prior hardcoded-True
+    behavior while correcting the provenance of autonomous fires.
+    """
+    return play_tag not in _AUTONOMOUS_PLAY_TAGS
 
 
 def _is_option(f: LegFill) -> bool:
