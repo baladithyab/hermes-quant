@@ -118,6 +118,15 @@ def autonomous_env(monkeypatch, tmp_path):
     # under test. Matches this module's "no ~/.hermes writes" isolation contract — the
     # rail was wired live AFTER these tests were authored, so the fixture had a gap.
     monkeypatch.setattr(auto, "QUANT_HOME", tmp_path)
+    # Isolate from the operator's live ~/.hermes/config.yaml. _read_safety_rails()
+    # reads it, and an operator who enables quant.autonomous.require_stop_loss=true
+    # would activate the stop-loss backstop (3863-3896), which size-DOWNS this test's
+    # stopless -0.20 short to stopless_max_size_pct=0.05 — making the size assertions
+    # fail on that machine while passing in clean CI. A unit test must not depend on
+    # the developer's live config; force all safety rails to their code defaults
+    # (require_stop_loss=False = byte-identical legacy behavior). Same class of
+    # live-wiring gap as the concurrent-cap isolation above.
+    monkeypatch.setattr(auto, "_read_config", lambda: {})
     return monkeypatch
 
 
