@@ -162,6 +162,13 @@ def test_autonomous_start_with_cron_writes_config_and_calls_subprocess(
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    # ADR-0092 home-decouple (4aafaf3): get_config_path() now resolves via
+    # hermes_home(), which honors HERMES_HOME BEFORE Path.home(). Under a CI home
+    # that exports HERMES_HOME the monkeypatched Path.home() no longer controls the
+    # config path, so pin HERMES_HOME to the same fake home the assertions expect.
+    monkeypatch.setenv("HERMES_HOME", str(fake_home / ".hermes"))
+    monkeypatch.delenv("HERMES_QUANT_HOME", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
 
     with mock.patch("shutil.which", return_value="/usr/bin/hermes"):
         with mock.patch("subprocess.run") as mock_run:
@@ -203,6 +210,12 @@ def test_autonomous_start_handles_cron_failure_gracefully(
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    # ADR-0092 home-decouple (4aafaf3): get_config_path() now resolves via
+    # hermes_home(), which honors HERMES_HOME BEFORE Path.home() — pin it to the
+    # same fake home the assertions expect (see the sibling test above).
+    monkeypatch.setenv("HERMES_HOME", str(fake_home / ".hermes"))
+    monkeypatch.delenv("HERMES_QUANT_HOME", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
 
     with mock.patch("shutil.which", return_value=None):  # no hermes
         rc = _autonomous_start(

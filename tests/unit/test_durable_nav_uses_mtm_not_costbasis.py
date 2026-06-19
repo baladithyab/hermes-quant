@@ -223,6 +223,13 @@ def test_tick_uses_account_nav_mtm_when_flag_on(monkeypatch):
     monkeypatch.setenv("HERMES_QUANT_SEMANTIC_ENABLED", "0")
     import hermes_quant.autonomous as auto
 
+    # Pin autonomous mode — the tick's mode-gate returns early on a config-less /
+    # cold home (CI), where _read_pdr_mode() correctly defaults to "advise". This is
+    # the established idiom for autonomous tick tests; omitting it made this test
+    # silently ride the live ~/.hermes/config.yaml leak that the ADR-0092
+    # home-decouple (4aafaf3) closed.
+    monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
+
     called = {"nav_mtm": False, "nav_usd_direct": False}
 
     # Patch _account_nav_mtm to record the call and return a sentinel.

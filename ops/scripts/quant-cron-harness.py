@@ -200,6 +200,15 @@ def build_command(job: Job, *, armed: bool) -> tuple[list[str] | None, str]:
     """
     if job.is_prompt_driven:
         return None, "prompt/agent-driven (no script) — needs the hermes-agent runtime; skipped by the harness"
+
+    # An armed (-armed.sh) wrapper in OBSERVE mode is skipped regardless of whether the
+    # file is present — the skip is a posture decision, not a file lookup. Checking this
+    # BEFORE the existence check keeps the observe-skip note stable when the deployed
+    # AND repo copies are both absent (CI / a fresh HERMES_HOME with no scripts/ dir),
+    # where the harness would otherwise mis-report "script not found".
+    if job.is_armed_wrapper and not armed:
+        return None, "armed wrapper — observe mode skips it (pass --armed to fire the paper path)"
+
     script_path = SCRIPTS_DIR / job.script
     if not script_path.exists():
         # Fall back to the repo's ops/scripts copy if the deployed one is absent.
@@ -210,8 +219,7 @@ def build_command(job: Job, *, armed: bool) -> tuple[list[str] | None, str]:
             return None, f"script not found ({job.script})"
 
     if job.is_armed_wrapper:
-        if not armed:
-            return None, "armed wrapper — observe mode skips it (pass --armed to fire the paper path)"
+        # armed=True reaches here only when the wrapper file actually exists.
         return ["bash", str(script_path)], "ARMED wrapper — will fire the paper path"
 
     # Plain .py / .sh script.

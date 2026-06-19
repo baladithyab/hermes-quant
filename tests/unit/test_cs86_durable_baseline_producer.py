@@ -293,6 +293,13 @@ def test_tick_forwards_durable_equity_account_when_flag_on(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
     import hermes_quant.autonomous as auto
 
+    # Pin autonomous mode (the tick's mode-gate would otherwise return early on a
+    # config-less / cold home where _read_pdr_mode() correctly defaults to "advise").
+    # This is the established idiom for every other autonomous tick test
+    # (test_autonomous_admissibility_units.py / test_autonomous_tick_direction_bias.py);
+    # omitting it made these tests silently ride the live ~/.hermes/config.yaml leak,
+    # which the ADR-0092 home-decouple (4aafaf3) closed.
+    monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: 123_456.0)
 
     seen = {}
@@ -321,6 +328,10 @@ def test_tick_passes_none_when_flag_off(monkeypatch):
     call shape, no NAV resolved for the durable path."""
     monkeypatch.delenv(FLAG, raising=False)
     import hermes_quant.autonomous as auto
+
+    # Pin autonomous mode (see the flag-ON sibling above) — the mode-gate would
+    # otherwise short-circuit the tick on a config-less / cold home.
+    monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
 
     seen = {"called": False, "value": "sentinel"}
 
