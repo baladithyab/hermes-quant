@@ -61,6 +61,50 @@ def test_promotion_gate_blocks_when_outcomes_below_adr29_threshold(
     assert any("paper_outcomes_count=99" in r for r in decision.blocked_by)
 
 
+def test_ar41_nan_sharpe_metric_blocks_not_bypasses(audit_path: Path) -> None:
+    """ar41: a NON-FINITE candidate sharpe_95ci_lower must BLOCK promotion (fail-closed),
+    not vacuously pass the floor. Pre-fix `nan < min` was False so the gate did not block —
+    the exact fail-open the module docstring warns about, guarded only on the threshold side."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    # A LATER snapshot (latest-wins) with a degenerate-bootstrap NaN sharpe.
+    audit_log.append(
+        GovernanceEvent(
+            kind="promotion_event",
+            asof=NOW - timedelta(hours=1),
+            source="weekly_retro",
+            payload={"sharpe_95ci_lower": float("nan")},
+        )
+    )
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is False, "ar41: a NaN sharpe metric vacuously passed the floor"
+    assert any("sharpe_95ci_lower" in r and "non-finite" in r for r in decision.blocked_by)
+
+
+def test_ar41_nonfinite_drawdown_drift_metric_blocks_at_comparison(audit_path: Path) -> None:
+    """ar41 defense-in-depth: even though the drawdown/drift max() reducer happens to
+    swallow a NaN audit snapshot (max(0.0, nan)==0.0), the comparison-site finite-guard
+    must BLOCK if a non-finite drawdown/drift metric ever reaches evaluate() by any route.
+    Verified by passing a constructed metrics dict straight into the block logic via a
+    monkeypatched _collect_metrics so the guard — not the reducer — is what is exercised."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    base = promotion._collect_metrics(NOW) if hasattr(promotion, "_collect_metrics") else None
+    if base is None:
+        # _collect_metrics is internal; fall back to driving evaluate() and asserting the
+        # sharpe vector (the confirmed-reachable one) — already covered above. Skip cleanly.
+        import pytest as _pytest
+        _pytest.skip("_collect_metrics not exposed; sharpe vector covers the reachable path")
+    for bad in ("rolling_30d_max_drawdown_pct", "calibrator_drift_max"):
+        m = dict(base)
+        m[bad] = float("nan")
+        # Re-run the block logic with the poisoned metric.
+        # (evaluate() reads metrics via _collect_metrics; monkeypatch it to return m.)
+        import unittest.mock as _mock
+        with _mock.patch.object(promotion, "_collect_metrics", return_value=m):
+            decision = promotion.evaluate(NOW)
+        assert decision.promoted is False, f"ar41: a non-finite {bad} vacuously passed"
+        assert any("non-finite" in r for r in decision.blocked_by)
+
+
 def test_promotion_gate_blocks_when_calibrator_drift_gt_5pct(
     audit_path: Path,
 ) -> None:
@@ -93,6 +137,99 @@ def test_promotion_gate_blocks_when_immutable_breach_count_nonzero(
     decision = promotion.evaluate(NOW)
     assert decision.promoted is False
     assert any("immutable_breaches_in_window" in r for r in decision.blocked_by)
+
+
+def test_promotion_gate_blocks_on_immutable_reason_without_legacy_flag(
+    audit_path: Path,
+) -> None:
+    """ADR-0031:204 contract — the breach is detected from the gate_rejection
+    *reason* referencing an IMMUTABLE_INVARIANTS rule, NOT from a payload flag
+    that no producer ever writes.
+
+    Regression for the latent fail-OPEN: risk/gate.py emits gate_rejection with
+    reason='net_delta_cap' / 'drawdown_circuit_breaker_*' / 'daily_loss_circuit_breaker_*'
+    and NEVER sets payload['immutable_breach']. With the old flag-only detector
+    immutable_breaches_in_window was structurally always 0, so a real
+    immutable-rule breach in the 30d window could NOT disqualify a paper→live
+    promotion. This event matches ADR-0031:204 verbatim (reason='net_delta_cap',
+    no immutable_breach flag)."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    audit_log.append(
+        GovernanceEvent(
+            kind="gate_rejection",
+            asof=NOW - timedelta(days=10),
+            source="risk_gate",
+            # NOTE: no 'immutable_breach' key — exactly what risk/gate.py emits.
+            payload={"reason": "net_delta_cap"},
+        )
+    )
+    metrics = promotion._collect_metrics(NOW)
+    assert metrics["immutable_breaches_in_window"] >= 1, (
+        "reason-based immutable-breach detection did not count a real "
+        "gate_rejection(reason='net_delta_cap') in the 30d window"
+    )
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is False
+    assert any("immutable_breaches_in_window" in r for r in decision.blocked_by)
+
+
+def test_promotion_gate_blocks_on_circuit_breaker_reason(
+    audit_path: Path,
+) -> None:
+    """A drawdown circuit-breaker rejection (reason='drawdown_circuit_breaker_0.1500',
+    the exact string risk/gate.py:544 emits) is an immutable MAX_DRAWDOWN_PCT
+    breach and must block promotion."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    audit_log.append(
+        GovernanceEvent(
+            kind="gate_rejection",
+            asof=NOW - timedelta(days=3),
+            source="risk_gate",
+            payload={"reason": "drawdown_circuit_breaker_0.1500"},
+        )
+    )
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is False
+    assert any("immutable_breaches_in_window" in r for r in decision.blocked_by)
+
+
+def test_promotion_gate_ignores_non_immutable_rejection_reason(
+    audit_path: Path,
+) -> None:
+    """A routine silence (reason='cost_gate_below_threshold', a discretionary
+    gate decision, NOT an immutable-rule breach) must NOT be counted as an
+    immutable breach — otherwise every cost-gate silence would fail-CLOSE the
+    promotion gate spuriously. This pins the predicate to immutable rules only."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    audit_log.append(
+        GovernanceEvent(
+            kind="gate_rejection",
+            asof=NOW - timedelta(days=2),
+            source="risk_gate",
+            payload={"reason": "cost_gate_below_threshold"},
+        )
+    )
+    metrics = promotion._collect_metrics(NOW)
+    assert metrics["immutable_breaches_in_window"] == 0
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is True, f"blocked_by={decision.blocked_by}"
+
+
+def test_promotion_gate_immutable_breach_respects_30d_window(
+    audit_path: Path,
+) -> None:
+    """A reason-based immutable breach OUTSIDE the 30d window must not count."""
+    _seed_passing_run(NOW, n_outcomes=100)
+    audit_log.append(
+        GovernanceEvent(
+            kind="gate_rejection",
+            asof=NOW - timedelta(days=45),  # outside 30d window
+            source="risk_gate",
+            payload={"reason": "net_delta_cap"},
+        )
+    )
+    metrics = promotion._collect_metrics(NOW)
+    assert metrics["immutable_breaches_in_window"] == 0
 
 
 def test_promotion_gate_blocks_when_killswitch_in_14d_window(
@@ -151,6 +288,73 @@ def test_promotion_gate_passes_when_all_thresholds_pass(audit_path: Path) -> Non
     assert decision.paper_outcomes_count >= 100
     assert decision.no_killswitch_in_trailing_14d is True
     assert decision.weekly_retro_promotion_readiness is True
+
+
+def test_promotion_gate_blocks_when_sharpe_ci_degrades_within_window(
+    audit_path: Path,
+) -> None:
+    """A degrading sharpe_95ci_lower window must BLOCK (archaeology finding):
+    the gate is `metrics['sharpe_95ci_lower'] < min` so the reducer must reflect the
+    CURRENT (latest) snapshot, not the window's single best moment. A run that was
+    once healthy (1.5) but has since degraded below the 1.0 floor (0.2 then 0.1) must
+    NOT be promotable. A max() reducer would pick 1.5 and wrongly pass — the fail-open."""
+    for i in range(100):
+        audit_log.append(
+            GovernanceEvent(
+                kind="fill",
+                asof=NOW - timedelta(days=15),
+                source="paper_reactor",
+                payload={"broker": "paper", "realized_pnl": 1.0},
+            )
+        )
+    # Three in-window snapshots, sharpe degrading 1.5 -> 0.2 -> 0.1 (latest is worst).
+    for days_ago, sharpe in ((5, 1.5), (3, 0.2), (1, 0.1)):
+        audit_log.append(
+            GovernanceEvent(
+                kind="promotion_event",
+                asof=NOW - timedelta(days=days_ago),
+                source="weekly_retro",
+                payload={
+                    "calibrator_drift": 0.01,
+                    "sharpe_95ci_lower": sharpe,
+                    "rolling_30d_max_drawdown_pct": 0.005,
+                    "weekly_retro_promotion_readiness": True,
+                },
+            )
+        )
+    decision = promotion.evaluate(NOW)
+    assert decision.promoted is False, (
+        "a sharpe_95ci_lower that degraded to 0.1 (< 1.0 floor) must block promotion; "
+        "a max() reducer would pick the stale 1.5 and fail OPEN"
+    )
+    assert any("sharpe_95ci_lower" in r for r in decision.blocked_by), decision.blocked_by
+
+
+def test_promotion_gate_sharpe_uses_latest_not_max_when_improving(
+    audit_path: Path,
+) -> None:
+    """Symmetric guard: when the LATEST snapshot is healthy (improved 0.2 -> 1.5),
+    the latest-reducer must use 1.5 and PASS the sharpe leg — confirming the fix uses
+    the most-recent snapshot, not min() (which would wrongly pick 0.2 and block)."""
+    _seed_passing_run(NOW, n_outcomes=100)  # includes a 1.25 snapshot at day-1
+    # An EARLIER, worse snapshot that must NOT drag the latest down.
+    audit_log.append(
+        GovernanceEvent(
+            kind="promotion_event",
+            asof=NOW - timedelta(days=10),
+            source="weekly_retro",
+            payload={
+                "calibrator_drift": 0.01,
+                "sharpe_95ci_lower": 0.2,
+                "rolling_30d_max_drawdown_pct": 0.005,
+                "weekly_retro_promotion_readiness": True,
+            },
+        )
+    )
+    decision = promotion.evaluate(NOW)
+    # The latest in-window sharpe snapshot is 1.25 (day-1) >= 1.0 -> the sharpe leg
+    # must NOT be a blocker (the stale 0.2 at day-10 must not block).
+    assert not any("sharpe_95ci_lower" in r for r in decision.blocked_by), decision.blocked_by
 
 
 def test_promotion_gate_emits_audit_event(audit_path: Path) -> None:

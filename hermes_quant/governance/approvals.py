@@ -8,12 +8,14 @@ the daemon. Including from a retro proposal.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import secrets
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -21,11 +23,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from hermes_quant.governance import audit_log
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 logger = logging.getLogger(__name__)
 
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 GOVERNANCE_HOME = QUANT_HOME / "governance"
 TOKEN_STORE_PATH = GOVERNANCE_HOME / "approval_tokens.jsonl"
 
@@ -80,6 +83,33 @@ _write_lock = threading.Lock()
 
 def _store_path() -> Path:
     return TOKEN_STORE_PATH
+
+
+@contextmanager
+def _flocked() -> Iterator[None]:
+    """Hold an OS-level exclusive lock on the token store's `.lock` sidecar.
+
+    ADR-0031 D3 one-shot single-owner: the token store is a money-gate
+    authority store (tokens authorize kill_switch_clear, promotion, proposal
+    fires). The process-local `_write_lock` only serializes a single append
+    within one process — it does NOT prevent two SEPARATE processes (operator
+    CLI + daemon, or two CLI invocations) from interleaving a read+check+append
+    and double-spending the same one-shot token. This flock makes the whole
+    check-then-act cross-process atomic. Released (and fd closed) on exit even
+    on error. POSIX flock; the daemon + CLI are both POSIX, which is sufficient.
+    """
+    path = _store_path()
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _append_row(row: dict[str, Any]) -> None:
@@ -230,27 +260,35 @@ def consume_token(token_id: str) -> None:
     """Mark a token as consumed (one-shot). Subsequent require_human_token
     calls referencing the same target return NoApprovalError.
     """
-    consumed = _consumed_ids()
-    if token_id in consumed:
-        raise NoApprovalError(f"token {token_id!r} already consumed")
+    # ADR-0031 D3 one-shot single-owner: the read+check+append below is a
+    # cross-process-atomic critical section. Holding the flock for the WHOLE
+    # check-then-act (not just the append) is what prevents two processes from
+    # both reading an unconsumed snapshot and both appending a `consumed` row
+    # — i.e. double-spending a one-shot kill_switch_clear / promotion token.
+    # `_consumed_ids()` is recomputed INSIDE the lock so a snapshot captured by
+    # a racing process before it acquired the lock cannot pass the guard.
+    with _flocked():
+        consumed = _consumed_ids()
+        if token_id in consumed:
+            raise NoApprovalError(f"token {token_id!r} already consumed")
 
-    # Verify the token exists somewhere as a grant
-    found = False
-    for row in _iter_rows():
-        if row.get("row_type") == "grant" and row.get("token_id") == token_id:
-            found = True
-            break
-    if not found:
-        raise NoApprovalError(f"unknown token: {token_id!r}")
+        # Verify the token exists somewhere as a grant
+        found = False
+        for row in _iter_rows():
+            if row.get("row_type") == "grant" and row.get("token_id") == token_id:
+                found = True
+                break
+        if not found:
+            raise NoApprovalError(f"unknown token: {token_id!r}")
 
-    now = datetime.now(UTC)
-    _append_row(
-        {
-            "row_type": "consumed",
-            "token_id": token_id,
-            "consumed_at": now.isoformat(),
-        }
-    )
+        now = datetime.now(UTC)
+        _append_row(
+            {
+                "row_type": "consumed",
+                "token_id": token_id,
+                "consumed_at": now.isoformat(),
+            }
+        )
 
     audit_log.append(
         audit_log.GovernanceEvent(

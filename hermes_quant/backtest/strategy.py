@@ -694,6 +694,38 @@ class AdvisorStrategy:
                     )
                 except Exception as exc:  # noqa: BLE001 — settlement must not abort the run
                     logger.warning("AdvisorStrategy: aggregator.update raised: %s", exc)
+
+                # cr12 wire-up: feed a realized loss into the SAME risk gate the
+                # next decide() consults, so Rule 4's post-loss cooldown can fire.
+                # DefaultRiskGate.record_loss() was an orphan (built+tested, zero
+                # production callers); without this call the cooldown state Rule 4
+                # reads is never populated and the rule is dead. Keyed on the SAME
+                # tuple _gate() uses: ('advisor-synthetic', self._asset_class,
+                # symbol) — see _synthetic_portfolio.account_id. asof-honest:
+                # loss_at = observable_asof (the bar the loss became observable, not
+                # a future peek). ONLY the realized<0 branch reaches this (mirrors
+                # the existing sign branch in direction_correct above), so the
+                # no-loss path is byte-identical to pre-wire behavior. hasattr-guards
+                # a custom injected gate that lacks record_loss; try/except mirrors
+                # the loop's must-not-abort-the-run contract.
+                if realized < 0 and hasattr(self._risk_gate, "record_loss"):
+                    # tz-normalize to UTC so the stored last_loss_at compares
+                    # cleanly against portfolio.asof in Rule 4 (the _gate path
+                    # tz_localizes portfolio.asof to UTC; the engine's lookback
+                    # index is tz-naive). Mismatched tz would raise inside Rule 4
+                    # and silence every subsequent decision — a behavior change.
+                    loss_at = pd.Timestamp(observable_asof)
+                    if loss_at.tzinfo is None:
+                        loss_at = loss_at.tz_localize("UTC")
+                    try:
+                        self._risk_gate.record_loss(
+                            account_id="advisor-synthetic",
+                            asset_class=self._asset_class,
+                            asset=symbol,
+                            loss_at=loss_at,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — settlement must not abort the run
+                        logger.warning("AdvisorStrategy: record_loss raised: %s", exc)
             self._pending[symbol] = still_pending
 
     def _record_pending(self, symbol: str, asof: pd.Timestamp, signal) -> None:

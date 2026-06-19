@@ -18,7 +18,6 @@ Design constraints (see ADR-0049):
 from __future__ import annotations
 
 import logging
-import math
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -28,6 +27,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.shadow.rules import ShadowDecision, ShadowRule
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Default paths
 # ---------------------------------------------------------------------------
 
-_SHADOW_HOME = Path.home() / ".hermes" / "quant" / "shadow"
+_SHADOW_HOME = _resolve_quant_home() / "shadow"
 
 # ---------------------------------------------------------------------------
 # SQLite schema
@@ -221,14 +221,16 @@ class ShadowAccount:
 
         event_id = audit_event.get("event_id", _utc_now_iso())
 
-        # Idempotency: skip if this event_id already processed
-        with self._lock, self._conn() as conn:
-            existing = conn.execute(
-                "SELECT event_id FROM shadow_fills WHERE event_id = ?", (event_id,)
-            ).fetchone()
-            if existing is not None:
-                return decision  # already applied
-
+        # ar24: idempotency is enforced INSIDE the write transaction below (the
+        # dedup INSERT OR IGNORE + a cur.rowcount==0 -> ROLLBACK guard), NOT via a
+        # separate pre-check SELECT. The old split-transaction pre-check was a TOCTOU:
+        # it ran in its OWN transaction, so two concurrent callers (two shadow-runner
+        # crons / threads — the RLock is process-local) whose pre-checks BOTH ran before
+        # the first committed each saw no fill row and proceeded; the in-tx INSERT OR
+        # IGNORE then no-op'd the duplicate fill LEDGER row, but cash + position were
+        # applied UNCONDITIONALLY a second time (double-spend on the eval ledger). This
+        # mirrors the canonical pattern in state.portfolio_state.apply_execution
+        # (dedup INSERT first, ROLLBACK on rowcount==0).
         sign = 1 if decision.action == "buy" else -1
 
         # Cost model: slippage (directional) + cost_bps (non-directional drag).
@@ -245,6 +247,30 @@ class ShadowAccount:
         with self._lock, self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # ar24: claim the event_id FIRST, inside this transaction. INSERT OR
+                # IGNORE no-ops if a prior commit already recorded this fill; a
+                # rowcount of 0 means a concurrent (or repeated) caller already
+                # applied it, so ROLLBACK and return WITHOUT re-applying cash/position.
+                # This is the authoritative dedup — there is no separate pre-check.
+                dedup_cur = conn.execute(
+                    "INSERT OR IGNORE INTO shadow_fills "
+                    "(event_id, ticker, action, size_fraction, fill_price, cost_bps, asof) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        event_id,
+                        ticker,
+                        decision.action,
+                        decision.size_fraction,
+                        fill_price,
+                        self.cost_model_bps,
+                        _utc_now_iso(),
+                    ),
+                )
+                if dedup_cur.rowcount == 0:
+                    # Already applied (duplicate event_id) — do NOT re-apply cash/position.
+                    conn.execute("ROLLBACK")
+                    return decision
+
                 cash_row = conn.execute(
                     "SELECT balance FROM shadow_cash WHERE id = 1"
                 ).fetchone()
@@ -274,21 +300,7 @@ class ShadowAccount:
                 cost_dollars = abs(shares) * fill_price * cost_fraction
                 new_cash = current_cash - (shares * fill_price) - cost_dollars
 
-                # Persist fill
-                conn.execute(
-                    "INSERT OR IGNORE INTO shadow_fills "
-                    "(event_id, ticker, action, size_fraction, fill_price, cost_bps, asof) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        event_id,
-                        ticker,
-                        decision.action,
-                        decision.size_fraction,
-                        fill_price,
-                        self.cost_model_bps,
-                        _utc_now_iso(),
-                    ),
-                )
+                # (Fill row already claimed at the top of this transaction — ar24.)
 
                 # Persist position
                 if abs(new_qty) < 1e-12:
@@ -320,13 +332,25 @@ class ShadowAccount:
     # mark_to_market
     # ------------------------------------------------------------------
 
-    def mark_to_market(self, prices: dict[str, float]) -> dict[str, Any]:
+    def mark_to_market(
+        self,
+        prices: dict[str, float],
+        *,
+        asof: date | datetime | None = None,
+    ) -> dict[str, Any]:
         """Mark the portfolio to current prices and persist a P&L snapshot.
 
         Parameters
         ----------
         prices:
             Current prices keyed by ticker.
+        asof:
+            Optional session timestamp to stamp the ``shadow_pnl_history`` row
+            with.  Defaults to wall-clock now.  Historical replays MUST pass the
+            replay session date here, otherwise the row is dated to today and
+            falls outside the session window in
+            :meth:`ShadowAccountRunner.compare_to_real`, silently reporting the
+            rule's P&L as ``$0.00`` (see ADR-0049 / shadow-replay-daily.py).
 
         Returns
         -------
@@ -361,7 +385,7 @@ class ShadowAccount:
             pnl_today = equity_total - prior_equity
             pnl_total = equity_total - self.initial_cash
 
-            asof_str = _utc_now_iso()
+            asof_str = asof.isoformat() if asof is not None else _utc_now_iso()
             conn.execute(
                 "INSERT OR REPLACE INTO shadow_pnl_history "
                 "(asof, equity_total, cash, positions_value, pnl_today, pnl_total) "
@@ -446,13 +470,27 @@ def _update_position(
     Uses FIFO-compatible weighted-average entry price.
     """
     new_qty = old_qty + delta_qty
+    # Full close
     if abs(new_qty) < 1e-12:
         return 0.0, 0.0
-    if math.copysign(1, old_qty) == math.copysign(1, delta_qty) or old_qty == 0.0:
+
+    # Same direction: use product sign rather than math.copysign, which
+    # returns +1 for a +0.0/-0.0 delta and would misclassify a flat/zero
+    # delta. Mirrors canonical state.portfolio_state._update_position.
+    same_direction = (old_qty == 0.0) or (old_qty * delta_qty > 0)
+
+    if same_direction:
         # Adding to or initiating a position: weighted average
         total_cost = old_qty * old_avg + delta_qty * fill_price
         new_avg = total_cost / new_qty
+    elif (old_qty * new_qty) < 0:
+        # Direction flip: the opposing fill fully reversed the old lot and
+        # overshot. The surviving lot is a NEW position opened in the
+        # opposite direction at fill_price — it MUST NOT keep the old
+        # side's basis (that corrupts the shadow eval ledger, ADR-0049).
+        new_avg = fill_price
     else:
-        # Reducing a position: avg doesn't change
+        # Partial close (old and residual same sign): residual-lot rule —
+        # avg_entry_price of the surviving lot is unchanged.
         new_avg = old_avg
     return new_qty, new_avg

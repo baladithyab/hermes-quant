@@ -1,0 +1,308 @@
+{
+  "summary": "Research TradingAgents data sources + OpenBB provider coverage, compare vs AEGIS Perceive today, design OpenBB as a host-blind perception provider (Sonnet, academic+source-grounded)",
+  "agentCount": 3,
+  "logs": [
+    "aegis-data-sources-research: TradingAgents sources + OpenBB coverage -> gap analysis -> integration design"
+  ],
+  "result": {
+    "tradingagents": {
+      "data_sources": [
+        {
+          "source": "Yahoo Finance — OHLCV / Price",
+          "provider": "yfinance (Python library, yfinance.Ticker.history())",
+          "data_type": "price",
+          "auth": "No API key required; free tier; rate-limited (429) — framework retries with exponential backoff via yf_retry()",
+          "lookahead_note": "As-of-honest. get_YFin_data_online() takes explicit start_date/end_date params and returns only rows in that range. load_ohlcv() (used by technical indicators) downloads 5 years to today, caches per-symbol to ~/.tradingagents/cache/, then filters all rows > curr_date before returning to the agent — backtests never see future prices. A staleness guard (_assert_ohlcv_not_stale) rejects any frame whose latest row is >10 calendar days before curr_date."
+        },
+        {
+          "source": "Yahoo Finance — Fundamentals (overview, balance sheet, cashflow, income statement)",
+          "provider": "yfinance (yf.Ticker.info, .balance_sheet, .cashflow, .financials)",
+          "data_type": "fundamentals",
+          "auth": "No API key required; free tier",
+          "lookahead_note": "Partially as-of-honest. yfinance returns the latest available filing. The Alpha Vantage fundamentals path adds a _filter_reports_by_date() pass that drops any annualReport/quarterlyReport whose fiscalDateEnding > curr_date; the yfinance path does not apply the same filter, so it may expose more recent filings in a backtest context. The framework uses yfinance as the default vendor for fundamentals."
+        },
+        {
+          "source": "Yahoo Finance — Ticker News",
+          "provider": "yfinance (yf.Ticker.get_news()) via yfinance_news.py",
+          "data_type": "news",
+          "auth": "No API key required; free tier",
+          "lookahead_note": "As-of-honest. get_news_yfinance() filters each article's pub_date against [start_date, end_date]. Undated articles are excluded unless end_date is within 1 day of today (live run only). Prevents look-ahead bias per issues #992/#1007."
+        },
+        {
+          "source": "Yahoo Finance — Global/Macro News",
+          "provider": "yfinance Search API via yfinance_news.get_global_news_yfinance()",
+          "data_type": "news",
+          "auth": "No API key required; free tier",
+          "lookahead_note": "Parameterized by curr_date + look_back_days (default 7). Applies the same pub_date window filter as ticker news. The global_news_queries list in default_config is the search corpus (5 macro query strings by default)."
+        },
+        {
+          "source": "Alpha Vantage — OHLCV (TIME_SERIES_DAILY_ADJUSTED)",
+          "provider": "Alpha Vantage REST API via alpha_vantage_stock.py",
+          "data_type": "price",
+          "auth": "Requires ALPHA_VANTAGE_API_KEY env var; free tier available (25 req/day); premium for higher volume",
+          "lookahead_note": "As-of-honest. alpha_vantage_stock.get_stock() calls _filter_csv_by_date_range() to slice the returned CSV to [start_date, end_date] before returning. Uses 'compact' (latest 100 days) vs 'full' output based on whether start_date is within 100 days of today."
+        },
+        {
+          "source": "Alpha Vantage — Technical Indicators (SMA, EMA, MACD, RSI, Bollinger Bands, ATR, VWMA)",
+          "provider": "Alpha Vantage REST API via alpha_vantage_indicator.py",
+          "data_type": "technical",
+          "auth": "Requires ALPHA_VANTAGE_API_KEY env var; same free tier as above",
+          "lookahead_note": "As-of-honest. The function accepts curr_date and look_back_days and filters the response to that window. Supports: close_50_sma, close_200_sma, close_10_ema, macd, macds, macdh, rsi, boll, boll_ub, boll_lb, atr, vwma."
+        },
+        {
+          "source": "Alpha Vantage — News Sentiment (NEWS_SENTIMENT endpoint)",
+          "provider": "Alpha Vantage REST API via alpha_vantage_news.py",
+          "data_type": "news",
+          "auth": "Requires ALPHA_VANTAGE_API_KEY; free tier limited",
+          "lookahead_note": "As-of-honest. Accepts time_from/time_to formatted as YYYYMMDDThhmm from start_date/end_date params. Returns news with sentiment scores for the specified window only."
+        },
+        {
+          "source": "Alpha Vantage — Insider Transactions (INSIDER_TRANSACTIONS endpoint)",
+          "provider": "Alpha Vantage REST API via alpha_vantage_news.py",
+          "data_type": "insider",
+          "auth": "Requires ALPHA_VANTAGE_API_KEY; premium endpoint",
+          "lookahead_note": "Latest-only — the AV INSIDER_TRANSACTIONS endpoint returns the most recent available data without a date filter param. The yfinance insider path (yf.Ticker.insider_transactions) is also available as an alternative vendor and is similarly latest-only."
+        },
+        {
+          "source": "Alpha Vantage — Fundamentals (OVERVIEW, BALANCE_SHEET, CASH_FLOW, INCOME_STATEMENT)",
+          "provider": "Alpha Vantage REST API via alpha_vantage_fundamentals.py",
+          "data_type": "fundamentals",
+          "auth": "Requires ALPHA_VANTAGE_API_KEY; free tier limited to ~5 req/min",
+          "lookahead_note": "As-of-honest with date filter. _filter_reports_by_date() strips annualReports and quarterlyReports whose fiscalDateEnding > curr_date. This is the stricter of the two fundamentals vendors for backtest correctness."
+        },
+        {
+          "source": "StockStats — Technical Indicators (computed from yfinance OHLCV)",
+          "provider": "stockstats Python library (wrap(DataFrame)) via stockstats_utils.py + y_finance.py",
+          "data_type": "technical",
+          "auth": "No API key; computed locally from cached yfinance data",
+          "lookahead_note": "As-of-honest because the underlying OHLCV is already curr_date-filtered by load_ohlcv() before stockstats wraps it. The same 13 indicators as Alpha Vantage (50/200 SMA, 10 EMA, MACD/Signal/Histogram, RSI, Bollinger Middle/Upper/Lower, ATR, VWMA, MFI) are calculated on this filtered frame."
+        },
+        {
+          "source": "Reddit — wallstreetbets / stocks / investing subreddits",
+          "provider": "Reddit public Atom/RSS search feed (reddit.com/r/{sub}/search.rss) via reddit.py",
+          "data_type": "social",
+          "auth": "No API key; public RSS endpoint. JSON search API (/search.json) is kept as dead code because Reddit's WAF returns 403 for non-OAuth clients. Identifies via custom User-Agent per Reddit etiquette.",
+          "lookahead_note": "Latest-only — RSS feed returns posts from the last 7 days (?t=week). No historical date-pinning is possible via the public feed. Not suitable for backtests; used for live sentiment only. Post scores/comment counts unavailable on RSS path (marked source='rss' to signal absence)."
+        },
+        {
+          "source": "StockTwits — cashtag message stream",
+          "provider": "StockTwits public REST API (api.stocktwits.com/api/2/streams/symbol/{ticker}.json) via stocktwits.py",
+          "data_type": "social",
+          "auth": "No API key required; public endpoint. No OAuth needed. Identifies via custom User-Agent.",
+          "lookahead_note": "Latest-only — returns the most recent messages in the stream, not a date-pinned window. Each message includes a user-labeled Bullish/Bearish sentiment field, timestamp, and body. Not suitable for backtests."
+        },
+        {
+          "source": "FRED (Federal Reserve Economic Data) — macro series",
+          "provider": "St. Louis Fed REST API (api.stlouisfed.org/fred) via fred.py",
+          "data_type": "macro",
+          "auth": "Requires FRED_API_KEY env var; free API key at fred.stlouisfed.org/docs/api/api_key.html. Raises FredNotConfiguredError (a VendorNotConfiguredError) when unset — routing layer treats as unavailable.",
+          "lookahead_note": "As-of-honest with lookback window. get_macro_data() accepts curr_date + look_back_days (default 365 days). Curated aliases map to FRED series IDs: FEDFUNDS, DGS2/10/30, T10Y2Y (yield curve), CPIAUCSL, CPILFESL, PCEPI/PCEPILFE, GDPC1, UNRATE, PAYEMS, ICSA, M2SL, VIXCLS, DTWEXBGS, UMCSENT, HOUST, RSAFS. Raw FRED series IDs are accepted for series not in the alias table."
+        },
+        {
+          "source": "Polymarket — prediction markets",
+          "provider": "Polymarket Gamma API (gamma-api.polymarket.com) via polymarket.py",
+          "data_type": "macro",
+          "auth": "No API key; no auth; fully public. Uses requests.get with 30s timeout.",
+          "lookahead_note": "Forward-looking by design — returns only open markets that resolve in the future (_is_forward_looking() filters out closed markets and markets with endDate < now). Provides market-implied probabilities (outcomePrices) for event topics (Fed rate cuts, recessions, elections, geopolitical events). Not for backtests."
+        }
+      ],
+      "analyst_roster": "\"Fundamentals Analyst (fundamentals_analyst.py): Tools = get_fundamentals, get_balance_sheet, get_cashflow, get_income_statement — routed to yfinance (default) or Alpha Vantage per data_vendors config. Calls LLM with bind_tools(); produces fundamentals_report.\n\nSentiment Analyst (sentiment_analyst.py, formerly social_media_analyst): Pre-fetches three sources directly into the prompt before LLM invocation — NO tool-calling. Sources: (1) Yahoo Finance ticker news via get_news [yfinance/alpha_vantage], (2) StockTwits cashtag stream via fetch_stocktwits_messages [public API, no key], (3) Reddit Atom RSS via fetch_reddit_posts [r/wallstreetbets + r/stocks + r/investing, no key]. Uses structured-output (SentimentReport schema) with free-text fallback. Produces sentiment_report.\n\nNews Analyst (news_analyst.py): Tools = get_news (ticker-specific, yfinance/AV), get_global_news (yfinance/AV), get_macro_indicators (FRED), get_prediction_markets (Polymarket). Grounds macro commentary in actual FRED series rather than headlines alone. Produces news_report.\n\nMarket/Technical Analyst (market_analyst.py): Tools = get_stock_data (OHLCV, yfinance/AV), get_indicators (StockStats computed from cached yfinance OHLCV, or Alpha Vantage indicator endpoints — 13 indicators: 50/200 SMA, 10 EMA, MACD+Signal+Histogram, RSI, Bollinger Middle/Upper/Lower, ATR, VWMA, MFI), get_verified_market_snapshot (canonical OHLCV snapshot used as source of truth for price claims). Produces market_report.\n\nBull Researcher (bull_researcher.py): No external data tools — reads the four analyst reports (market_report, sentiment_report, news_report, fundamentals_report) directly from graph state and constructs a bullish investment argument. Engages in structured debate against Bear Researcher (max_debate_rounds rounds, default 1).\n\nBear Researcher (bear_researcher.py): Mirror of Bull Researcher — same state inputs, constructs bearish counterarguments. Debate history accumulated in investment_debate_state.\n\nTrader (trader/trader.py + research_manager.py): Receives all four analyst reports plus the bull/bear debate history. research_manager (structured-output) synthesizes analyst outputs into a recommendation package; trader composes the final TRANSACTION PROPOSAL (BUY/HOLD/SELL + sizing).\n\nRisk Management Team (risk_mgmt/aggressive_debator.py, conservative_debator.py, neutral_debator.py): Three debating risk agents assess the trader's proposal against market volatility, liquidity, and portfolio risk. Debate runs for max_risk_discuss_rounds rounds (default 1). No external data tools — works from state reports.\n\nPortfolio Manager (managers/portfolio_manager.py): Final structured-output node. Receives the risk debate outcome and either APPROVES (order sent to simulated exchange) or REJECTS the transaction proposal. Uses structured output for deterministic BUY/HOLD/SELL decisions.\"",
+      "summary": "\"TradingAgents dataflow layer lives entirely in tradingagents/dataflows/. The entry point is interface.py which defines a vendor-routing layer (route_to_vendor) that dispatches each logical method call (get_stock_data, get_indicators, get_fundamentals, get_balance_sheet, get_cashflow, get_income_statement, get_news, get_global_news, get_insider_transactions, get_macro_indicators, get_prediction_markets) to an ordered vendor chain configured in DEFAULT_CONFIG['data_vendors']. Vendor defaults: core_stock_apis=yfinance, technical_indicators=yfinance, fundamental_data=yfinance, news_data=yfinance, macro_data=fred, prediction_markets=polymarket. Alpha Vantage is the available alternative for stock/fundamentals/news/technical categories.\n\nONLINE vs OFFLINE / date-pinning: TradingAgents does NOT have a named online/offline mode switch. Instead, as-of-honesty is enforced per-provider: (1) OHLCV via stockstats path uses load_ohlcv() which downloads 5 years to today, caches to ~/.tradingagents/cache/per-symbol CSV, then hard-filters all rows after curr_date before serving to any indicator computation — this is the offline/cached+date-pinned path used by backtests. (2) Online path (get_YFin_data_online) fetches live from yfinance with explicit start_date/end_date params and applies a staleness guard rejecting frames whose latest row is >10 days before curr_date. (3) Alpha Vantage fundamentals apply _filter_reports_by_date() to exclude fiscal periods ending after curr_date. (4) Alpha Vantage news uses time_from/time_to to pin the query window. (5) yfinance news applies pub_date window filtering with look-ahead safety for undated articles. (6) Social sources (Reddit RSS, StockTwits) are latest-only with no date-pinning — they are live-run only and not backtest-safe. (7) FRED accepts curr_date+look_back_days for a trailing window. (8) Polymarket is forward-looking by definition. The vendor routing layer surfaces a canonical NO_DATA_AVAILABLE sentinel (never raises to the LLM) when all configured vendors fail or return stale data, preventing LLM hallucination of prices.\"",
+      "sources": [
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/README.md",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/interface.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/y_finance.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/yfinance_news.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/stockstats_utils.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/alpha_vantage.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/alpha_vantage_common.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/alpha_vantage_fundamentals.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/alpha_vantage_news.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/alpha_vantage_indicator.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/alpha_vantage_stock.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/reddit.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/stocktwits.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/fred.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/dataflows/polymarket.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/default_config.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/agents/analysts/fundamentals_analyst.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/agents/analysts/sentiment_analyst.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/agents/analysts/news_analyst.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/agents/analysts/market_analyst.py",
+        "https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/agents/researchers/bull_researcher.py"
+      ]
+    },
+    "openbb": {
+      "coverage": [
+        {
+          "data_type": "equities price (historical OHLCV)",
+          "openbb_path": "obb.equity.price.historical",
+          "default_provider": "yfinance (no key, free) | fmp (key, free tier 250 calls/day) | intrinio (paid)",
+          "asof_capable": "YES — standard model EquityHistoricalQueryParams has start_date/end_date; both yfinance and fmp providers pass them through to the underlying call. Caller sets end_date=asof and the provider returns only bars up to that date. The as_of leaf-filter in AEGIS data/base.py already enforces this idiom."
+        },
+        {
+          "data_type": "equities price (latest quote)",
+          "openbb_path": "obb.equity.price.quote",
+          "default_provider": "fmp (key) | yfinance (no key)",
+          "asof_capable": "NO — EquityQuote returns the live/latest quote; no date parameter. Latest-only. MUST be rejected or guarded at the AEGIS PERCEPTION boundary; never feed to backtests."
+        },
+        {
+          "data_type": "fundamentals (balance sheet, income, cash flow, ratios, key metrics)",
+          "openbb_path": "obb.equity.fundamental.balance | .income | .cash | .ratios | .metrics",
+          "default_provider": "yfinance (no key, returns all historical periods as list) | fmp (key) | intrinio (key)",
+          "asof_capable": "PARTIALLY — the standard query model (BalanceSheetQueryParams) has no date range filter, only a limit count. The returned data rows each have period_ending. A caller can post-filter rows where period_ending <= asof. The provider does not do the cutoff for you — AEGIS must enforce it. Forward-looking leak risk: yfinance .balance_sheet returns the most recent N filings in one call; caller must drop rows filed after asof."
+        },
+        {
+          "data_type": "company news",
+          "openbb_path": "obb.news.company (CompanyNews)",
+          "default_provider": "fmp (key) | benzinga (key) | tiingo (key) | yfinance (no key, limited)",
+          "asof_capable": "YES — CompanyNewsQueryParams has start_date and end_date. Set end_date=asof to bound publication dates. Provider honesty varies: fmp respects the date window; yfinance returns most-recent N articles and may not honor the window on the free scrape path. Guard by filtering returned article.date <= asof."
+        },
+        {
+          "data_type": "world news",
+          "openbb_path": "obb.news.world (WorldNews)",
+          "default_provider": "fmp (key) | benzinga (key) | biztoc (key) | tiingo (key)",
+          "asof_capable": "YES — WorldNewsQueryParams has start_date and end_date; the standard validator defaults start_date to 2 weeks ago and end_date to today, so callers must explicitly pass end_date=asof. All listed providers respect the date window."
+        },
+        {
+          "data_type": "options chains (live snapshot)",
+          "openbb_path": "obb.derivatives.options.chains",
+          "default_provider": "cboe (no key, live only) | yfinance (no key, live only) | intrinio (key, EOD historical via date param) | tradier (key)",
+          "asof_capable": "PROVIDER-DEPENDENT — the standard OptionsChainsQueryParams has ONLY symbol, no date param. cboe and yfinance return the live chain: latest-only, NO asof pinning. Intrinio adds a provider-specific extra_param date (EOD snapshot for a specific date) that allows historical pinning. For AEGIS backtesting, only intrinio with date=asof is safe; cboe/yfinance are strictly live-use and must be rejected at the AEGIS boundary in any non-live context."
+        },
+        {
+          "data_type": "analyst estimates (forward consensus)",
+          "openbb_path": "obb.equity.estimates.historical (AnalystEstimates)",
+          "default_provider": "fmp (key required) | intrinio (key required)",
+          "asof_capable": "PARTIAL with manual guard — AnalystEstimatesQueryParams has no date filter in the standard model; FMP returns all historical estimate periods for the symbol. Each row has a date field (the estimate period date). AEGIS must post-filter rows where data.date <= asof to avoid lookahead. The FMP stable/analyst-estimates endpoint does not accept a cutoff date natively."
+        },
+        {
+          "data_type": "analyst price targets and consensus",
+          "openbb_path": "obb.equity.estimates.price_target | .consensus",
+          "default_provider": "benzinga (key, price_target) | fmp (key, consensus) | yfinance (no key, consensus only)",
+          "asof_capable": "PARTIAL — price_target (benzinga) has start_date/end_date via extra_params; consensus (fmp/yfinance) has no date filter and returns the current consensus. yfinance consensus is latest-only. For backtesting, use price_target with end_date=asof only."
+        },
+        {
+          "data_type": "insider trading",
+          "openbb_path": "obb.equity.ownership.insider_trading (InsiderTrading)",
+          "default_provider": "fmp (key) | intrinio (key) | sec (no key, via openbb-sec)",
+          "asof_capable": "PARTIAL with manual guard — InsiderTradingQueryParams has no date filter: only symbol and limit. Returned rows have filing_date and transaction_date. AEGIS must post-filter on filing_date <= asof to avoid lookahead on future filings. This is a genuine lookahead hazard: without the filter, a batch of filings that span asof will include post-asof entries."
+        },
+        {
+          "data_type": "institutional holdings (13-F)",
+          "openbb_path": "obb.equity.ownership.institutional (InstitutionalOwnership)",
+          "default_provider": "fmp (key) | sec (no key)",
+          "asof_capable": "PARTIAL — InstitutionalOwnershipQueryParams has no date in the standard model. FMP adds provider-specific year and quarter params; caller can set year/quarter to a period that ends before asof. The sec provider (openbb-sec) has a date param for 13-F queries. Post-filter returned rows on data.date <= asof is mandatory for any non-live use."
+        },
+        {
+          "data_type": "macro / economy (CPI, GDP, economic calendar, FRED series)",
+          "openbb_path": "obb.economy.calendar | obb.economy.indicators | obb.economy.gdp.*",
+          "default_provider": "fmp (key, calendar) | fred (key, indicators) | oecd (no key) | nasdaq (no key) | imf (no key)",
+          "asof_capable": "YES — EconomicCalendarQueryParams has start_date and end_date. The FRED, OECD, IMF series endpoints also accept start_date/end_date. Setting end_date=asof pins the macro series. Note: future-scheduled events in the calendar (the 'expected' field) are forward-looking by definition; only actual/revised values that were available at asof are safe. oecd and imf are free; fred requires a free API key."
+        },
+        {
+          "data_type": "crypto historical OHLCV",
+          "openbb_path": "obb.crypto.price.historical (CryptoHistorical)",
+          "default_provider": "yfinance (no key, free) | fmp (key) | coinbase (key, via openbb-crypto)",
+          "asof_capable": "YES — CryptoHistoricalQueryParams has start_date and end_date. Same asof-pinning idiom as equity historical."
+        },
+        {
+          "data_type": "ETF historical OHLCV",
+          "openbb_path": "obb.etf.historical (EtfHistorical)",
+          "default_provider": "yfinance (no key, free) | fmp (key)",
+          "asof_capable": "YES — EtfHistoricalQueryParams has start_date and end_date. Same as equity historical; yfinance passes start/end to the yf.download call."
+        }
+      ],
+      "asof_honesty": "\"As-of honest\" means the OpenBB endpoint accepts start_date/end_date (or an equivalent date/year/quarter param) and the underlying provider only returns data that existed at or before end_date=asof.\n\nSAFE to pin (start_date/end_date present and respected):\n- obb.equity.price.historical — both yfinance and fmp pass start/end through; yfinance transform_query fills end_date=today if omitted, so explicit end_date=asof is required.\n- obb.news.company / obb.news.world — start_date/end_date in standard model; WorldNews validator defaults to today so caller must pass end_date explicitly.\n- obb.crypto.price.historical — same as equity historical.\n- obb.etf.historical — same as equity historical.\n- obb.economy.calendar / obb.economy.indicators / FRED series — start_date/end_date present; safe with end_date=asof.\n- obb.derivatives.options.chains via intrinio with date=asof extra_param — the ONLY asof-capable options chain source.\n\nLATEST-ONLY (no date filter, must be REJECTED or AEGIS-boundary-guarded in any non-live context):\n- obb.equity.price.quote — live quote only, no date param. Hard reject for backtests.\n- obb.derivatives.options.chains via cboe or yfinance — live chain snapshot. No historical date param. Hard reject for backtests.\n- obb.equity.estimates.consensus via yfinance — latest consensus rating only.\n\nPARTIAL / MANUAL GUARD REQUIRED (query returns multi-period data but no date cutoff in the standard params; returned rows have a date field that AEGIS must post-filter to <= asof):\n- obb.equity.fundamental.balance | .income | .cash | .ratios | .metrics — returns all historical filing periods; post-filter period_ending <= asof.\n- obb.equity.estimates.historical (AnalystEstimates via fmp) — returns all historical estimate periods; post-filter data.date <= asof.\n- obb.equity.ownership.insider_trading — returns most-recent N transactions; post-filter filing_date <= asof.\n- obb.equity.ownership.institutional (fmp without year/quarter) — returns latest; use fmp's year/quarter extra_params to pin or post-filter data.date <= asof.\n\nCRITICAL PROVIDER-DRIFT RISK: yfinance is an unofficial scrape of Yahoo Finance. Even for historical endpoints, Yahoo can at any time return a snapshot that silently includes a 'latest' bar beyond the requested end_date. The leaf as_of filter in AEGIS data/base.fetch_with_chain is the backstop that enforces timestamp <= asof regardless of what the provider returns. Any OpenBBProvider wrapper for AEGIS MUST apply this leaf filter on every returned row.",
+      "auth_cost": "OpenBB uses a per-provider API-key credential model, not a platform-wide PAT. Credentials are stored in ~/.openbb_platform/user_settings.json under a credentials object where each key is the provider name plus the field name (e.g. fmp_api_key, fred_api_key, intrinio_api_key). The Credentials model is dynamically constructed at runtime by CredentialsLoader by scanning installed provider extensions; each provider registers its required credential names. Env-var overrides are supported: the alias field on each credential is the uppercased key name (FMP_API_KEY, FRED_API_KEY, etc.), so existing .env injection works.\n\nFREE providers (no key required):\n- yfinance — no credentials field in the Provider registration. Covers equity historical, ETF historical, crypto historical, options chains (live only), fundamentals (balance/income/cash/key_metrics), equity profile, equity screener, company news (limited), estimates consensus.\n- cboe — credentials=None. Covers options chains (live only) and equity search.\n- oecd — no key. Covers macro indicators, GDP.\n- imf — no key. Covers macro/economic data.\n- bls — no key. US labor statistics.\n- federal_reserve, government_us, cftc — no key. US government data.\n- sec — no key. 13-F filings, company filings, insider trading (SEC EDGAR).\n- econdb — no key. Economic series.\n\nPAID / KEY-REQUIRED providers relevant to AEGIS:\n- fmp (FMP_API_KEY) — free tier exists (250 calls/day, limited endpoints) but investor-grade endpoints (analyst estimates, insider trading with full history, institutional ownership, earnings calendar) require a paid plan ($14/mo starter). FMP is bundled in the default openbb install.\n- fred (FRED_API_KEY) — free key, requires registration at fred.stlouisfed.org. 120 calls/minute free tier. Critical for macro (CPI, treasury yields, SOFR, economic series).\n- intrinio (INTRINIO_API_KEY) — paid ($50+/mo). Provides options chains with historical date pinning (the only standard asof-capable options source in OpenBB), plus high-quality earnings, historical attributes, insider data.\n- benzinga (BENZINGA_API_KEY) — paid. News and price targets.\n- tiingo (TIINGO_API_KEY) — freemium. Additional news, trailing dividend yield.\n- tradier (TRADIER_API_KEY) — paid. Options chains with live + some historical.\n- alpha_vantage (API_ALPHAVANTAGE_KEY) — freemium (25 calls/day free). AEGIS already has an alphavantage_provider.\n\nBOTTOM LINE FOR AEGIS: yfinance covers the broadest set for free (equity/ETF/crypto historical, fundamentals, options live chain). For any asof-capable options chain in backtests, intrinio is the only OpenBB-standard path (paid). FRED is free-with-key for macro. FMP free tier is too rate-limited for production tick loops. The marginal cost of adding OpenBB is the provider API keys that AEGIS already has or needs — not OpenBB itself, which is open-source AGPL-3.0.",
+      "integration_shape": "CONSUMPTION MODEL:\nOpenBB Platform v4.7.2 is consumed as a Python package: `pip install openbb` (or `pip install openbb[all]`). The entry point is `from openbb import obb`. All data calls follow `output = obb.<namespace>.<endpoint>(params...)` and return an OBBject. Data is extracted via `output.to_dataframe()`, `output.results` (list of Pydantic model instances), or `output.to_dict()`.\n\nPROVIDER SELECTION:\nEvery call accepts an optional `provider=` kwarg naming the backend. Without it, the first registered provider that supports the endpoint is used. The `obb.coverage` command lists all available endpoints and their providers.\n\nCREDENTIAL WIRING:\n`obb.account.login(pat=\"...\")` connects to OpenBB Hub (cloud sync of settings); locally, `obb.user.credentials.fmp_api_key = \"...\"` sets in-memory, or the user_settings.json file is loaded at startup. Env-var overrides (FMP_API_KEY, FRED_API_KEY, etc.) are read via CredentialsLoader using the alias field. This is COMPATIBLE with AEGIS's .env convention: the existing env-var injection pattern works without modification.\n\nSTANDARDIZED VS PROVIDER-SPECIFIC FIELDS:\nEach endpoint has a standard model (e.g. EquityHistoricalData) with a fixed set of fields (date, open, high, low, close, volume, vwap). Provider-specific extras appear as additional fields on the provider subclass (e.g. FMPEquityHistoricalData adds change, change_percent). `output.to_dataframe()` returns all fields merged. When building an AEGIS wrapper, use only the standard fields for the canonical OHLCV frame to stay provider-agnostic.\n\nHOW IT SLOTS BEHIND hermes_quant/data/:\nThe existing provider base (data/base.py) defines a DataProvider Protocol with `fetch_bars(asset, timeframe, start, end, *, use_cache, as_of)` returning a DataFrame with columns [timestamp, open, high, low, close, volume]. An OpenBBProvider class would:\n1. Accept `namespace` and `provider` at construction (e.g. namespace=\"equity.price.historical\", provider=\"yfinance\").\n2. In fetch_bars: call `obb.<namespace>(symbol=asset, start_date=start.date(), end_date=end.date(), provider=self._provider)`, convert OBBject to DataFrame, rename `date`->`timestamp`, ensure UTC, then call `validate_bars()`.\n3. Set `as_of` post-filter: `df = df[df['timestamp'] <= as_of]` before returning (the leaf no-lookahead guard that AEGIS base already enforces via fetch_with_chain).\n4. Translate openbb EmptyDataError -> DataQualityError; HTTP/connection errors -> DataProviderError; rate-limit (429) -> RateLimitError.\n5. Register as a drop-in alternative in vendor_routing.py under the existing chain pattern.\n\nThe OpenBB provider would NOT replace the existing yfinance_provider (which already handles the yfinance call directly). It would be an additive provider that enables new data types (fundamentals, news, macro, institutional, estimates) that the current providers do not cover, implemented as specialized fetchers (not a OHLCV fetcher) since those endpoints return non-bar data.\n\nFor non-bar data (news, fundamentals, estimates), the return type would NOT go through fetch_bars; instead a new method `fetch_snapshot(symbol, data_type, asof)` or separate provider classes per data type would be added. The existing base.py validate_bars path is OHLCV-only and does not apply to non-bar data fetchers.",
+      "risks": "\"1. LOOKAHEAD LEAK — HIGHEST RISK: Several endpoints (options chains via cboe/yfinance, equity quote, estimates consensus) are latest-only and have no date parameter. If an OpenBBProvider wrapper forwards these to an AEGIS analyst during backtesting, it injects future data. The mitigation is: (a) hard-reject these endpoints at the AEGIS boundary in non-live mode, (b) apply the leaf timestamp <= asof filter unconditionally on ALL returned data regardless of provider claims.\n\n2. PROVIDER SILENT-DRIFT: yfinance is an unofficial Yahoo Finance scrape. Yahoo has changed their API silently multiple times (e.g. the 2022 crumb/cookie change that broke most clients). OpenBB pins yfinance>=1.4.0 which tracks these changes, but a Yahoo-side change can silently return wrong data (e.g. adjusted vs unadjusted confusion) or quietly include a bar beyond end_date. The AEGIS as_of leaf filter is the backstop; but silent misalignment in OHLC values (e.g. split-adjustment) would not be caught by the timestamp filter alone.\n\n3. RATE LIMITS: yfinance has no official rate limit but Yahoo throttles aggressively on bursts. The existing yfinance_provider already handles this with backoff. OpenBB's yfinance wrapper does the same. FMP free tier is 250 calls/day — insufficient for production tick loops covering >10 symbols. Any production use needs a paid FMP plan or a yfinance fallback.\n\n4. HEAVY DEPENDENCY FOOTPRINT: `pip install openbb` pulls 30 sub-packages as core (benzinga, bls, cftc, commodity, congress_gov, core, crypto, currency, derivatives, econdb, economy, equity, etf, federal_reserve, fixedincome, fmp, fred, government_us, imf, index, intrinio, news, oecd, platform_api, regulators, sec, tiingo, tradingeconomics, us_eia, yfinance) plus their transitive deps (fastapi, uvicorn, aiohttp, pydantic, pandas, requests, pyjwt, websockets, python-dotenv, uuid7). This is a large install with potential version conflicts against AEGIS's existing stack (especially pydantic and pandas version pinning). The `openbb-core` package pins pydantic>=2.12.3 and pandas>=1.5.3; check against AEGIS constraints before adding.\n\n5. VERSION PINNING RISK: openbb-core pins fastapi==0.136.3 (exact pin, not range), pydantic>=2.12.3. If AEGIS depends on different fastapi or pydantic versions, there will be a conflict. The sub-package structure (separate PyPI packages for each provider) means updates to one provider can bump the minimum openbb-core version and trigger cascading updates. Pin openbb to a specific minor version in requirements.\n\n6. LICENSING: OpenBB is AGPL-3.0. The AGPL viral clause requires that any software distributed over a network that incorporates or links AGPL code also be released under AGPL (or a compatible license). For an internal quant system not distributed publicly, this is not a practical concern, but it is a constraint to note if AEGIS ever becomes a hosted/SaaS product.\n\n7. PROVIDER CREDENTIAL EXPOSURE: API keys are stored in ~/.openbb_platform/user_settings.json by default. In a containerized AEGIS deployment, this file path needs to be mapped to the credential store (e.g. mounted secret). The env-var override (FMP_API_KEY etc.) is the safer deployment pattern.\"",
+      "summary": "OpenBB Platform 4.7.2 is a Python SDK (`from openbb import obb`) that unifies 30+ data providers behind a common `obb.<namespace>.<endpoint>(symbol, start_date, end_date, provider=...)` interface returning OBBject → DataFrame. For AEGIS, the critical verdict on each data type is:\n\nSAFE TO ASOF-PIN (have start_date/end_date in the standard query model): equity historical OHLCV (yfinance free, fmp paid), ETF historical (yfinance free), crypto historical (yfinance free), company/world news (fmp/benzinga, key required for full history), economic calendar and macro series (fmp/fred/oecd), options chains only via intrinio with date extra_param (paid).\n\nREQUIRES MANUAL ASOF GUARD (returns multi-period data without a date cutoff; caller must post-filter rows where the data date <= asof): fundamentals (balance/income/cash/ratios via yfinance free or fmp), analyst estimates (fmp paid), insider trading (fmp/sec), institutional holdings (fmp paid; or use year/quarter extra_params).\n\nMUST BE REJECTED AT AEGIS BOUNDARY IN NON-LIVE MODE (latest-only, no date param): equity live quote (obb.equity.price.quote), options chains via cboe or yfinance (live snapshot, no historical pinning), estimates consensus via yfinance.\n\nThe integration shape is a new OpenBBProvider class per data type implementing the existing hermes_quant/data/ Protocol: call obb.*, extract to DataFrame, apply column rename + UTC normalization + leaf timestamp<=asof filter, then pass through validate_bars (for OHLCV) or a new validate_snapshot (for non-bar data). The yfinance provider needs no key; FMP needs a key with a paid plan for production rate limits; intrinio is required only for asof-capable options chains. The main risks are: (1) lookahead leak from latest-only endpoints if not guarded, (2) the AGPL-3.0 license, (3) the heavy install footprint with an exact-pinned fastapi and pydantic>=2.12.3 that must be reconciled with AEGIS constraints, and (4) yfinance informal scrape drift.",
+      "sources": [
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/extensions/equity/openbb_equity/price/price_router.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/extensions/equity/openbb_equity/fundamental/fundamental_router.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/extensions/equity/openbb_equity/estimates/estimates_router.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/extensions/equity/openbb_equity/ownership/ownership_router.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/extensions/derivatives/openbb_derivatives/options/options_router.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/extensions/news/openbb_news/news_router.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/extensions/economy/openbb_economy/economy_router.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/extensions/etf/openbb_etf/etf_router.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/equity_historical.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/company_news.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/options_chains.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/analyst_estimates.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/insider_trading.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/institutional_ownership.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/world_news.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/crypto_historical.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/etf_historical.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/economic_calendar.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/provider/standard_models/balance_sheet.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/providers/yfinance/openbb_yfinance/models/equity_historical.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/providers/yfinance/openbb_yfinance/models/options_chains.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/providers/fmp/openbb_fmp/models/equity_historical.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/providers/fmp/openbb_fmp/models/analyst_estimates.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/providers/fmp/openbb_fmp/models/institutional_ownership.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/providers/fmp/openbb_fmp/models/insider_trading.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/providers/intrinio/openbb_intrinio/models/options_chains.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/providers/cboe/openbb_cboe/models/options_chains.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/app/model/credentials.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/core/openbb_core/app/model/user_settings.py",
+        "https://github.com/OpenBB-finance/OpenBB/blob/main/openbb_platform/providers/yfinance/pyproject.toml",
+        "https://pypi.org/pypi/openbb/json (version 4.7.2, 50 deps listed)",
+        "https://pypi.org/pypi/openbb-core/json (version 1.6.13, core framework deps)",
+        "/mnt/e/CS/github/hermes-quant/hermes_quant/data/base.py (AEGIS provider base + as_of enforcement pattern)",
+        "/mnt/e/CS/github/hermes-quant/hermes_quant/data/yfinance_provider.py (existing AEGIS yfinance provider interface)"
+      ]
+    },
+    "gap": {
+      "have": [
+        "price/OHLCV — yfinance_provider.py covers equity/ETF historical OHLCV with as_of-pinned fetch_with_chain + leaf timestamp<=asof filter; ccxt_provider covers crypto OHLCV; alphavantage_provider is a free-tier fallback — maps to TradingAgents yfinance/AV/StockStats price path",
+        "technical indicators — classical_ta.py computes the same indicator family (SMA 50/200, EMA 10/13/26, MACD+Signal+Histogram, RSI, Bollinger Bands, ATR, VWMA, MFI) off the locally-fetched OHLCV, exactly as TradingAgents StockStats/AV indicator path; all as-of-honest because the underlying OHLCV is already filtered before indicator computation",
+        "fundamentals (balance sheet, income, cash flow, key metrics, sector benchmarks) — fundamentals_provider.py fetches yfinance .info/.balance_sheet/.income_stmt/.cashflow and caches to parquet; FundamentalsAnalyst applies a reporting-lag-adjusted as_of gate (report_date/period_end ≤ asof) that is STRICTER than TradingAgents' yfinance path (no date filter) and matches TradingAgents' Alpha Vantage _filter_reports_by_date() path",
+        "company/ticker news ingestion — catalyst/ingest.py pulls Google News RSS per-ticker, catalyst/classify.py classifies items, catalyst/propagation.py/propagation_graph.py propagates; semantic analyst consumes pre-built SemanticPackets from these sources — covers the same 'ticker news' function as TradingAgents get_news (yfinance/AV)",
+        "global/macro news via Google News RSS — catalyst/ingest.py accepts arbitrary query strings including macro queries; the wiring layer (catalyst/wiring.py) issues macro-topic queries — equivalent to TradingAgents get_global_news_yfinance()",
+        "social signal (Reddit) — catalyst/social.py pulls public Reddit Atom RSS (/r/wallstreetbets + /r/stocks + /r/investing new.rss + search.rss), emits CatalystItems with real published_at anchors; same three subreddits as TradingAgents reddit.py; same limitation: no date-pinning on the live feed (latest-only, not backtest-safe)",
+        "Google Trends — catalyst/social.py ingests the public Google Trends RSS 2.0 feed for rising-interest signals, producing synthetic CatalystItems timestamped at the trend's pubDate; TradingAgents has no Google Trends integration",
+        "macro calendar (FOMC, BLS, earnings) — catalyst/calendar.py ingests BLS iCal (no key), FRED releases/dates API (keyed, optional), yfinance earnings calendar per symbol; covers TradingAgents FRED macro path for SCHEDULED event dates; FRED_API_KEY optional/silent-when-absent same as TradingAgents FredNotConfiguredError pattern",
+        "insider transactions (SEC EDGAR Form-4) — evidence/adapters/form4.py fetches EDGAR acceptance-datetime-anchored Form-4 filings with a no-lookahead filing_date guard; this is MORE asof-honest than TradingAgents' Alpha Vantage INSIDER_TRANSACTIONS (latest-only) or yfinance insider path (transaction-date anchor only, no filing date)"
+      ],
+      "missing_from_tradingagents": [
+        {
+          "source": "Alpha Vantage NEWS_SENTIMENT endpoint — per-article scored news sentiment (relevance_score, ticker_sentiment_score, ticker_sentiment_label for each article) with time_from/time_to date window",
+          "why_valuable": "TradingAgents' sentiment analyst pre-fetches AV NEWS_SENTIMENT scores directly into the prompt alongside Reddit/StockTwits as a THIRD scored signal per symbol. AEGIS catalyst/classify.py classifies Google News RSS headlines with an LLM (or rule-based) classifier but does not consume pre-scored per-article sentiment with numeric confidence; the AV endpoint delivers machine-readable bullish/bearish/neutral labels + relevance scores that would let AEGIS skip the classify step for the AV-covered news universe and provide a cross-validated sentiment score against the LLM classifier output.",
+          "size": "small"
+        },
+        {
+          "source": "StockTwits cashtag message stream — public REST API, per-message Bullish/Bearish labels with user-volunteered sentiment, message body, no API key",
+          "why_valuable": "TradingAgents sentiment analyst fetches StockTwits alongside Reddit as a SECOND social signal. AEGIS catalyst/social.py has Reddit + Google Trends but NOT StockTwits. StockTwits provides a distinct population (retail traders using the $ cashtag convention) with explicit user-labeled sentiment — a different signal from Reddit's unstructured post text. Latest-only (no date-pinning), so live-run only, same as TradingAgents' usage. Adding StockTwits is a small stdlib-only add (public API, no OAuth, similar to the existing Reddit RSS fetcher).",
+          "size": "small"
+        },
+        {
+          "source": "FRED economic series data (FEDFUNDS, DGS2/10/30, T10Y2Y yield curve, CPI, PCE, GDP, UNRATE, PAYEMS, ICSA, M2SL, VIXCLS, DTWEXBGS, UMCSENT, HOUST, RSAFS) — as-of-honest trailing-window macro series",
+          "why_valuable": "TradingAgents' news analyst has a dedicated FRED tool (get_macro_indicators) that grounds macro commentary in actual series values rather than news headlines. AEGIS catalyst/calendar.py calls FRED only for release DATES/schedule (the calendar feed), not for the actual series VALUES (e.g. the current FEDFUNDS rate, the yield curve slope, CPI level). An AEGIS macro analyst would consume the actual quantitative FRED series to produce a macro-regime AnalystView, extending beyond the binary 'event scheduled/not' signal the calendar currently provides. FRED is free with a key (120 req/min). TradingAgents' curated 16-alias table (FEDFUNDS through RSAFS) is the exact series set to replicate.",
+          "size": "medium"
+        },
+        {
+          "source": "Polymarket prediction market probabilities — market-implied event probabilities (Fed rate cuts, recession, elections, geopolitical) via public Gamma API, no auth",
+          "why_valuable": "TradingAgents' news analyst has a dedicated get_prediction_markets tool that provides forward-looking market-consensus event probabilities as a macro overlay. AEGIS has no prediction market source. Forward-looking by design (open markets only), so not backtest-safe — but valuable for live-run macro context and catalyst probability estimates (e.g. probability-of-rate-cut adjusting the macro-regime tilt in the semantic analyst). Entirely free, no API key, stdlib-compatible (requests.get).",
+          "size": "small"
+        },
+        {
+          "source": "Alpha Vantage structured fundamentals (OVERVIEW, BALANCE_SHEET, CASH_FLOW, INCOME_STATEMENT) with _filter_reports_by_date() — the stricter AV date-filtered fundamentals path",
+          "why_valuable": "AEGIS fundamentals_provider.py uses yfinance exclusively. TradingAgents implements a SECOND fundamentals vendor (Alpha Vantage) with _filter_reports_by_date() applied server-side to fiscalDateEnding. AEGIS already uses alphavantage_provider.py for OHLCV but has NOT wired AV as a fundamentals fallback. Adding AV as a vendor_routing fallback for the fundamentals category would provide redundancy when yfinance returns stale/missing data and would close the lookahead risk on the yfinance fundamentals path (yfinance does not filter by fiscalDateEnding; AEGIS enforces this via reporting_lag_filter in fundamentals_provider but an AV provider would have the filter at the source level).",
+          "size": "medium"
+        }
+      ],
+      "openbb_would_add": [
+        "Analyst forward estimates with as-of guard — obb.equity.estimates.historical (fmp/intrinio) provides consensus EPS/revenue estimates per fiscal period with a data.date field for post-filtering to ≤ asof; neither AEGIS nor TradingAgents has a true I/B/E/S consensus estimate feed (TradingAgents' eps_surprise sub-signal in fundamentals_analyst.py uses a forward/trailing EPS proxy and explicitly documents 'v0.7 will swap in true actual-vs-consensus from AV/FMP'; the fundamentals analyst docstring names this as the planned upgrade path)",
+        "Analyst price targets and consensus — obb.equity.estimates.price_target (benzinga) with start_date/end_date window and obb.equity.estimates.consensus (fmp) give a structured buy/sell/hold count + mean target price; neither system has this; it would provide a concrete external-analyst view signal for the FundamentalsAnalyst's earnings_outlook sub-signal upgrade path",
+        "Institutional ownership (13-F) — obb.equity.ownership.institutional (fmp/sec) surfaces quarterly 13-F holder counts, top-holder concentration, institutional_holders_count, and total_shares; neither AEGIS nor TradingAgents has this; large-holder concentration and institutional-ownership changes are leading sentiment signals orthogonal to the existing analyst set",
+        "Multi-provider OHLCV redundancy (fmp as second equity provider) — obb.equity.price.historical via fmp gives a second independent OHLCV source with clean start_date/end_date; AEGIS currently chains yfinance → alphavantage (compact, last 100 bars only) → ccxt (crypto); fmp would fill the gap between yfinance (latest, unofficial scrape) and AV (25 req/day free); guards against Yahoo silent-drift events that currently have no cross-check; both AEGIS and TradingAgents are single-vendor-dependent on yfinance for equity bars",
+        "As-of-capable historical options chains (intrinio date extra_param) — obb.derivatives.options.chains via intrinio with date=asof is the only standard OpenBB path that returns a historical EOD options chain snapshot pinned to a specific date; AEGIS data/chain.py and TradingAgents have no historical options chain source (only live snapshots); this unlocks backtesting of options-aware strategies (implied volatility regime, put/call skew as-of a decision date) without lookahead",
+        "Broad macro series via obb.economy.indicators (fred/oecd/imf) beyond the release-calendar FRED usage AEGIS already has — actual series values (not just scheduled dates) for CPI, yield curve, SOFR, unemployment rate, retail sales as a quantitative macro-regime input to a new MacroAnalyst producing an AnalystView; multiple free providers (oecd/imf/econdb) reduce key dependency vs TradingAgents' single FRED path"
+      ],
+      "summary": "INTEGRATION DESIGN: OpenBB enters AEGIS as a host-blind PERCEPTION PROVIDER behind hermes_quant/data/base.py. A new hermes_quant/data/openbb_provider.py implements the existing DataProvider Protocol (fetch_bars for OHLCV; a new fetch_snapshot(symbol, data_type, asof) for non-bar types). Default-OFF behind HERMES_QUANT_OPENBB env flag. Every call is asof-PINNED: OHLCV endpoints pass end_date=asof explicitly; non-bar endpoints post-filter returned rows on data.date/period_ending/filing_date ≤ asof unconditionally (the leaf no-lookahead guard that base.py's fetch_with_chain already enforces for OHLCV is replicated for each non-bar type). Latest-only endpoints (obb.equity.price.quote, obb.derivatives.options.chains via cboe/yfinance, obb.equity.estimates.consensus via yfinance) are hard-rejected at the boundary in any non-live context with an explicit guard in openbb_provider.py. The vendor_routing.py dispatch table gains an 'openbb' vendor entry for fetch_bars (fmp as the second equity OHLCV tier behind yfinance, closing the yfinance-scrape reliability gap). Non-bar data types (fundamentals, estimates, insider, institutional, macro series, news) are wired as separate OpenBBFundamentalsProvider / OpenBBEstimatesProvider / OpenBBInsiderProvider / OpenBBMacroProvider / OpenBBNewsProvider classes, each implementing fetch_snapshot() and registered in vendor_routing.py under their own category (fundamentals, estimates, insider, institutional_holdings, macro_series, company_news). These feed the EXISTING analysts: OpenBBFundamentalsProvider becomes a second fundamentals vendor behind the existing yfinance parquet path in FundamentalsAnalyst (adding AV/fmp filter-at-source redundancy); OpenBBNewsProvider feeds catalyst/ingest.py as an alternative news source for the existing classify→propagate→synthesize pipeline; OpenBBInsiderProvider feeds evidence/adapters as an alternative to the existing EDGAR form4 adapter (OpenBB sec provider covers the same EDGAR source; fmp/intrinio add paid alternatives). New analysts enabled by OpenBB data that produce the existing AnalystView contract: an InsiderAnalyst (consuming OpenBBInsiderProvider, filing_date ≤ asof post-filter, emitting a direction signal from net buy/sell concentration), an AnalystEstimatesAnalyst (consuming OpenBBEstimatesProvider fmp, data.date ≤ asof post-filter, emitting a direction from consensus revision direction + price target upside/downside), and a MacroAnalyst (consuming OpenBBMacroProvider fred/oecd for quantitative series values, extending beyond the calendar/event-date signal AEGIS already has). The TradingAgents-parity sources that AEGIS is missing come through OpenBB where available: AV news sentiment via obb.news.company (fmp/tiingo as asof-windowed alternatives), StockTwits as a direct stdlib add (public API, not available via OpenBB), FRED macro series values via obb.economy.indicators. All new analysts are default-OFF and eval-gated before promotion, consistent with the hermes-quant posture. The pdr_core stays source-blind throughout: it sees only AnalystView[] regardless of whether the view came from yfinance, OpenBB-fmp, OpenBB-sec, or a new estimates feed."
+    }
+  }
+}

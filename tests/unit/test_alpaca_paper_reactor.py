@@ -72,6 +72,11 @@ class _FakeClient:
     ``cancel_order_by_id`` records the cancel and (optionally) sets a
     ``post_cancel_order`` that subsequent get_order_by_id calls return — modeling
     a cancel that raced a realized partial.
+
+    ``post_cancel_get_raises`` (optional): if set, the FIRST get_order_by_id after
+    a cancel raises this exception — modeling a transient broker/network error on
+    the post-cancel re-read (settlement UNKNOWN). Combined with ``cancel_raises``
+    this models an UNCONFIRMED cancel followed by an UNKNOWN settlement.
     """
 
     def __init__(
@@ -84,6 +89,7 @@ class _FakeClient:
         poll_sequence: list[_FakeOrder] | None = None,
         post_cancel_order: _FakeOrder | None = None,
         cancel_raises: Exception | None = None,
+        post_cancel_get_raises: Exception | None = None,
     ) -> None:
         self._equity = equity
         self._submit_result = submit_result
@@ -92,10 +98,12 @@ class _FakeClient:
         self._poll_sequence = list(poll_sequence) if poll_sequence else None
         self._post_cancel_order = post_cancel_order
         self._cancel_raises = cancel_raises
+        self._post_cancel_get_raises = post_cancel_get_raises
         self.submitted: list[Any] = []
         self.poll_calls = 0
         self.cancel_calls: list[str] = []
         self._cancelled = False
+        self._post_cancel_get_fired = False
 
     def get_account(self) -> _FakeAccount:
         return _FakeAccount(self._equity)
@@ -109,6 +117,14 @@ class _FakeClient:
 
     def get_order_by_id(self, order_id: str) -> _FakeOrder:
         self.poll_calls += 1
+        # A transient error on the post-cancel re-read (settlement UNKNOWN).
+        if (
+            self._cancelled
+            and self._post_cancel_get_raises is not None
+            and not self._post_cancel_get_fired
+        ):
+            self._post_cancel_get_fired = True
+            raise self._post_cancel_get_raises
         # After a cancel, return the post-cancel snapshot if one was configured.
         if self._cancelled and self._post_cancel_order is not None:
             return self._post_cancel_order
@@ -300,6 +316,66 @@ def test_timeout_cancel_races_partial_fill_records_it(tmp_path):
     assert rec.fill_price == 100.0
 
 
+def test_timeout_unconfirmed_cancel_then_reread_raises_fails_closed(tmp_path):
+    """Settlement UNKNOWN must NOT collapse to a clean 0.0 no-fill.
+
+    On poll-budget timeout cancel_and_settle is invoked for a still-WORKING DAY
+    order. If (1) cancel_order_by_id raises a transient broker/network error (the
+    cancel is UNCONFIRMED) AND (2) the post-cancel get_order_by_id raises the SAME
+    transient condition, the order may STILL be working at the broker and may yet
+    fill — creating a real LIVE position. The book MUST NOT record a clean
+    fill_size_pct=0.0 / unfilled_timeout no-fill (which never reconciles state.db
+    and is treated terminally by every consumer), orphaning that position
+    PERMANENTLY. It must fail CLOSED — matching the active-poll re-read which
+    RAISES AlpacaSubmitError on the byte-identical broker condition.
+    """
+    order = _FakeOrder(order_id="ord-unknown", status="accepted")
+    client = _FakeClient(
+        equity=98_000.0,
+        submit_result=order,
+        poll_order=order,
+        cancel_raises=Exception("503 service unavailable (cancel)"),
+        post_cancel_get_raises=Exception("503 service unavailable (re-read)"),
+    )
+    reactor = _reactor(client, tmp_path, poll_timeout_s=0.05, poll_interval_s=0.0)
+
+    with pytest.raises(AlpacaSubmitError) as ei:
+        reactor.execute(_proposal(), fill_size_pct=0.20)
+    # The error surfaces the UNKNOWN settlement, not a fabricated no-fill.
+    msg = str(ei.value).lower()
+    assert "ord-unknown" in msg
+    assert "settle" in msg or "unknown" in msg or "working" in msg
+
+    # NOTHING was written to the bus — a 0.0 no-fill record would orphan a
+    # possibly-live position the book never tracked.
+    lines = [ln for ln in reactor.executions_path.read_text().splitlines() if ln.strip()]
+    assert lines == []
+
+
+def test_timeout_confirmed_cancel_then_reread_raises_degrades_to_no_fill(tmp_path):
+    """When the cancel SUCCEEDS (the working order is provably gone) but the
+    post-cancel re-read raises transiently, there is no working order left to
+    orphan, so degrading to a clean unfilled_timeout no-fill is safe. This keeps
+    the fail-closed change narrow — it only fires when the order MIGHT still be
+    working (cancel unconfirmed)."""
+    order = _FakeOrder(order_id="ord-gone", status="accepted")
+    client = _FakeClient(
+        equity=98_000.0,
+        submit_result=order,
+        poll_order=order,
+        # cancel_raises is None -> the cancel is CONFIRMED.
+        post_cancel_get_raises=Exception("503 service unavailable (re-read)"),
+    )
+    reactor = _reactor(client, tmp_path, poll_timeout_s=0.05, poll_interval_s=0.0)
+
+    rec = reactor.execute(_proposal(), fill_size_pct=0.20)
+
+    assert rec.fill_size_pct == 0.0
+    assert rec.fill_price == 0.0
+    assert rec.reactor_metadata["unfilled_timeout"] is True
+    assert client.cancel_calls == ["ord-gone"]
+
+
 def test_done_for_day_with_partial_is_recorded_not_discarded(tmp_path):
     """P3-B: done_for_day (a terminal-close status) can carry a realized partial —
     record it rather than raising as a pure reject and discarding the fill."""
@@ -372,6 +448,51 @@ def test_terminal_reject_status_raises(tmp_path):
     with pytest.raises(AlpacaSubmitError) as ei:
         reactor.execute(_proposal(), fill_size_pct=0.20)
     assert "rejected" in str(ei.value).lower()
+
+
+# --------------------------------------------------------------------------- #
+# Non-finite NAV guard (ar32/ar49 family, on the NAV numerator)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "bad_equity",
+    [
+        __import__("decimal").Decimal("NaN"),  # Alpaca returns Decimals
+        "inf",  # transient string equity
+        "1e400",  # overflows to +inf via float()
+        "nan",
+        float("inf"),
+        float("nan"),
+    ],
+)
+def test_non_finite_equity_fails_closed(tmp_path, bad_equity):
+    """A non-finite broker equity (NaN/inf) must FAIL CLOSED in
+    _fetch_account_equity rather than sizing an order off a bad NAV.
+
+    ``to_float`` catches only (TypeError, ValueError), so float(Decimal('NaN')),
+    float('inf'), float('1e400') all SUCCEED and return nan/inf. The ``equity<=0``
+    guard does NOT catch them (nan<=0 is False, inf<=0 is False), and the
+    downstream ``round(notional,2) < 1.0`` zero-notional guard also misses them
+    (nan<1.0 is False, +inf<1.0 is False) — so a NaN/inf-notional order would
+    otherwise reach client.submit_order. The guard must be finite-aware."""
+    order = _FakeOrder(status="filled", filled_avg_price=100.0, filled_qty=1.0)
+    client = _FakeClient(equity=bad_equity, submit_result=order)
+    reactor = _reactor(client, tmp_path)
+
+    # 1. _fetch_account_equity must RAISE (not return nan/inf).
+    with pytest.raises(AlpacaSubmitError) as ei:
+        reactor._fetch_account_equity(client)
+    assert "equity" in str(ei.value).lower()
+
+    # 2. The full execute() path must also fail closed and NEVER submit an order.
+    with pytest.raises(AlpacaSubmitError):
+        reactor.execute(_proposal(), fill_size_pct=0.20)
+    assert client.submitted == []  # no NaN/inf-notional order reached the broker
+
+    # 3. No fabricated/garbage fill written to the bus.
+    lines = [ln for ln in reactor.executions_path.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -580,3 +701,82 @@ def test_missing_creds_fails_closed(tmp_path, monkeypatch):
     reactor = AlpacaPaperReactor(executions_path=tmp_path / "executions.jsonl")
     with pytest.raises(AlpacaSubmitError):
         reactor.execute(_proposal(), fill_size_pct=0.20)
+
+
+# --------------------------------------------------------------------------- #
+# 10. Non-finite / <=0 decision_price -> fail-closed silence (precondition parity
+#     with PaperReactor / DeterministicEquityReactor). A proposal that reaches
+#     execute() with no advisor decision_price AND no analyst_views.last_close
+#     makes _extract_decision_price return the 0.0 sentinel; the reactor must NOT
+#     submit a broker order off a corrupt entry-basis and must NOT record/reconcile
+#     a 0.0/NaN decision_price verbatim.
+# --------------------------------------------------------------------------- #
+
+
+def _proposal_missing_price(*, symbol: str = "AAPL") -> Proposal:
+    """A proposal whose advisor_result has no decision_price and empty views.
+
+    ``_extract_decision_price`` falls all the way through to the 0.0 sentinel.
+    """
+    return Proposal(
+        proposal_id=f"prop_2026-06-05T00:00:00_{symbol}_nodp",
+        state="pending",
+        symbol=symbol,
+        asset_class="equity",
+        timeframe="1d",
+        created_at="2026-06-05T00:00:00Z",
+        expires_at="2026-06-05T01:00:00Z",
+        advisor_result={
+            "as_of": "2026-06-05T00:00:00Z",
+            "signal_id": "sig-nodp",
+            "analyst_views": [],  # no last_close fallback
+            # NOTE: no "decision_price" key -> 0.0 sentinel from the extractor.
+        },
+    )
+
+
+def test_zero_decision_price_fails_closed_no_submit(tmp_path):
+    # The extractor would return 0.0 for this proposal.
+    assert AlpacaPaperReactor._extract_decision_price(_proposal_missing_price()) == 0.0
+
+    # Configure a fake that WOULD fill if the submit path were reached, so the
+    # test proves the guard short-circuits BEFORE any broker order.
+    order = _FakeOrder(status="filled", filled_avg_price=101.0, filled_qty=194.0)
+    client = _FakeClient(equity=98_000.0, submit_result=order)
+    reactor = _reactor(client, tmp_path)
+
+    rec = reactor.execute(_proposal_missing_price(), fill_size_pct=0.20)
+
+    # Fail-closed silence/no-fill record: zero fill, no fabricated price.
+    assert rec.fill_size_pct == 0.0
+    assert rec.fill_price == 0.0
+    assert rec.reactor_name == "alpaca_paper"
+    assert rec.reactor_metadata.get("silence_reason") == "zero_decision_price"
+
+    # The broker submit path was NEVER reached (no order submitted, no poll).
+    assert client.submitted == []
+    assert client.poll_calls == 0
+
+
+def test_zero_decision_price_not_reconciled_to_state(tmp_path, monkeypatch):
+    # apply_execution must NOT be called for the fail-closed silence record (an
+    # unfilled silence moves no position -> never poison state.db cost-basis).
+    order = _FakeOrder(status="filled", filled_avg_price=101.0, filled_qty=194.0)
+    client = _FakeClient(equity=98_000.0, submit_result=order)
+    reactor = _reactor(client, tmp_path)
+
+    calls: list[Any] = []
+
+    class _SpyState:
+        def apply_execution(self, record_dict: Any) -> None:
+            calls.append(record_dict)
+
+    monkeypatch.setattr(
+        "hermes_quant.state.portfolio_state.get_portfolio_state",
+        lambda: _SpyState(),
+    )
+
+    rec = reactor.execute(_proposal_missing_price(), fill_size_pct=0.20)
+
+    assert rec.fill_size_pct == 0.0
+    assert calls == []  # never reconciled

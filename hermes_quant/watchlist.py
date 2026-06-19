@@ -30,6 +30,8 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from hermes_quant.home import hermes_home as _hermes_home
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,12 +45,32 @@ _DEFAULT_TF_BY_ASSET_CLASS = {
 _VALID_ASSET_CLASSES = {"crypto", "equity", "etf", "fx"}
 _VALID_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
 
+# W4: the canonical multi-horizon rung labels (the horizon_model / W2 contract).
+# Kept as a local default so this module COMPOSES with W2's playbook.horizons
+# without hard-importing it — the cron integration can pass
+# ``known_rungs=horizons.HORIZONS.keys()`` verbatim into the adapter so the two
+# stay a single source of truth. 0D membership in a ticker's set is itself
+# flag-gated upstream (HERMES_QUANT_ZERO_DTE); the LABEL is always valid here.
+_CANONICAL_HORIZON_RUNGS = frozenset({"0D", "1D", "7D", "14D", "30D"})
+
 
 @dataclass(frozen=True)
 class WatchlistEntry:
     symbol: str
     asset_class: str
     timeframe: str
+    # agperc1: opt-in flag — only options_eligible symbols are candidates for the
+    # PERCEIVE-layer options origination (IV-rank sourcing -> structure selection).
+    # ADD-ONLY, default False so every existing entry round-trips byte-identical and
+    # no symbol becomes an options candidate without an explicit watchlist opt-in.
+    options_eligible: bool = False
+    # W4: the multi-horizon rung set (e.g. ["1D", "7D", "14D", "30D"]) attached to
+    # a profile-fit ticker so the decision layer can pick WHICH rung trades per
+    # tick. ADD-ONLY, default None -> every existing entry round-trips
+    # byte-identical (the operator-watchlist add path never sets it, so the dict
+    # carries `horizon_set: null`, exactly the agperc1 options_eligible contract).
+    # The watchlist entry NEVER names a strategy — only profile-fit + horizons.
+    horizon_set: list[str] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -68,8 +90,8 @@ def get_config_path() -> Path:
     """
     profile = os.environ.get("HERMES_PROFILE", "")
     if profile:
-        return Path.home() / ".hermes" / "profiles" / profile / "config.yaml"
-    return Path.home() / ".hermes" / "config.yaml"
+        return _hermes_home() / "profiles" / profile / "config.yaml"
+    return _hermes_home() / "config.yaml"
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +153,13 @@ def list_watchlist(path: Path | None = None) -> list[WatchlistEntry]:
                 symbol=str(symbol),
                 asset_class=str(asset_class),
                 timeframe=str(timeframe),
+                # agperc1: thread the opt-in through the dict loader so a watchlist.json
+                # entry can set it; default False keeps every existing entry byte-identical.
+                options_eligible=bool(entry.get("options_eligible", False)),
+                # W4: thread the multi-horizon rung set through the loader. Default
+                # None (key absent) keeps every existing entry byte-identical; a row
+                # that carries horizon_set loads it back verbatim as a list of labels.
+                horizon_set=_coerce_horizon_set(entry.get("horizon_set")),
             )
         )
     return out
@@ -238,6 +267,107 @@ def clear_watchlist(path: Path | None = None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# W4 — horizon_set coercion + profile-fit.json materialization adapter
+# ---------------------------------------------------------------------------
+
+
+def _coerce_horizon_set(raw: object) -> list[str] | None:
+    """Coerce a loaded ``horizon_set`` value into ``list[str] | None``.
+
+    ADD-ONLY / byte-identical: a missing key (``None``) stays ``None`` so every
+    pre-W4 entry round-trips unchanged. A list is materialized as a list of
+    string labels. Anything else (a scalar, a malformed value) collapses to
+    ``None`` (silence-by-default — a malformed horizon never crashes the loader,
+    matching ``list_watchlist``'s defensive dict handling).
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        return [str(x) for x in raw]
+    return None
+
+
+def materialize_profile_fit_entries(
+    payload: dict,
+    *,
+    known_rungs: set[str] | frozenset[str] | None = None,
+) -> list[WatchlistEntry]:
+    """Materialize a profile-fit watchlist payload into ``WatchlistEntry`` rows.
+
+    The profile-fit watchlist (the single watchlist the W3 ``profile_scan``
+    emits to ``~/.hermes/quant/watchlist/profile-fit.json``) carries ``active``
+    rows each shaped ``{symbol, asset_class, options_eligible, shortable,
+    horizon_set, fit_score, asof}`` — ONE list, no per-play bucketing. This
+    adapter is the seam the autonomous tick consumes: it turns those rows into
+    config-watchlist ``WatchlistEntry`` objects carrying
+    ``symbol / asset_class / timeframe / options_eligible / horizon_set``.
+
+    The materialized entry NEVER names a strategy — it carries only profile-fit
+    state and the multi-horizon rung set; the decision layer (``structure_select``
+    + the gate) picks WHICH structure and WHICH rung trades per tick.
+
+    Defensive, mirroring ``list_watchlist``:
+    - rows missing ``symbol`` or ``asset_class`` are dropped, not crashed on;
+    - ``timeframe`` defaults from the asset_class map (the watchlist never
+      pre-picks a timeframe-as-strategy here);
+    - silence-by-default on an empty / absent ``active`` list -> ``[]``.
+
+    Validation (money-software fail-closed): every label in a row's
+    ``horizon_set`` MUST be a known rung. ``known_rungs`` defaults to the
+    canonical W2 set (``0D/1D/7D/14D/30D``) but is injectable so the caller can
+    pass ``horizons.HORIZONS.keys()`` verbatim and keep a single source of
+    truth. An unknown label raises ``ValueError`` so it can never silently flow
+    to the decision layer's DTE resolver.
+
+    rt05: ``asset_class`` is likewise validated fail-CLOSED against
+    ``_VALID_ASSET_CLASSES``. The producer (``profile_scan``) emits the
+    canonical ``"equity"``, but the Alpaca universe FILTER token ``"us_equity"``
+    (or any other non-canonical class) must NEVER silently materialize — it
+    would break the autonomous/advisor tick's asset-class routing, which keys on
+    the canonical classes. An unknown class raises ``ValueError`` here (defense
+    in depth at the W3->W4 seam), mirroring the horizon-rung guard and
+    ``add_to_watchlist``'s own asset_class check.
+    """
+    rungs = frozenset(known_rungs) if known_rungs is not None else _CANONICAL_HORIZON_RUNGS
+    rows = payload.get("active") or []
+    out: list[WatchlistEntry] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = row.get("symbol")
+        asset_class = row.get("asset_class")
+        if not symbol or not asset_class:
+            continue
+        asset_class = str(asset_class)
+        if asset_class not in _VALID_ASSET_CLASSES:
+            raise ValueError(
+                f"profile-fit row {symbol!r} has unknown asset_class "
+                f"{asset_class!r}; valid classes are {sorted(_VALID_ASSET_CLASSES)} "
+                "(the universe filter token, e.g. 'us_equity', must be normalized "
+                "to the canonical class before materialization)"
+            )
+        timeframe = row.get("timeframe") or _DEFAULT_TF_BY_ASSET_CLASS.get(asset_class, "1d")
+        horizon_set = _coerce_horizon_set(row.get("horizon_set"))
+        if horizon_set is not None:
+            unknown = [label for label in horizon_set if label not in rungs]
+            if unknown:
+                raise ValueError(
+                    f"profile-fit row {symbol!r} has unknown horizon rung(s) "
+                    f"{unknown!r}; known rungs are {sorted(rungs)}"
+                )
+        out.append(
+            WatchlistEntry(
+                symbol=str(symbol),
+                asset_class=asset_class,
+                timeframe=str(timeframe),
+                options_eligible=bool(row.get("options_eligible", False)),
+                horizon_set=horizon_set,
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Internal — YAML load/save with atomic-rename
 # ---------------------------------------------------------------------------
 
@@ -283,3 +413,21 @@ def _save_config(path: Path, cfg: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    # ar87 (atomic-write-durability family): fsync the PARENT DIR so the rename
+    # itself survives a crash. The watchlist config is the persisted tradeable
+    # universe (admit/evict from evolve_watchlist); a lost rename reverts an
+    # admit/evict on reboot. fsyncing only the file fd flushes DATA, not the
+    # directory entry the rename creates. Best-effort: warn, never mask the write.
+    try:
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError as e:  # pragma: no cover - platform/fs dependent
+        logger.warning(
+            "watchlist: parent-dir fsync failed for %s; the config rename may not "
+            "survive a crash: %s",
+            path.parent,
+            e,
+        )

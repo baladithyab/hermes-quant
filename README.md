@@ -12,7 +12,7 @@
    ┌────────────┐   │  ┌────────────────────┐  │   ┌──────────────────┐
    │ data       │──▶│  │ analyst pool       │  │   │ signal bus       │
    │ providers  │   │  │  - kronos / kairos │  │   │  signals.jsonl   │
-   │ yfinance   │   │  │  - classical TA    │──┼──▶│  ticks.db        │──▶ freqtrade
+   │ yfinance   │   │  │  - classical TA    │──┼──▶│  executions.jsonl│──▶ freqtrade
    │ ccxt       │   │  │  - microstructure  │  │   │                  │    (or your
    │ alpaca     │   │  └─────────┬──────────┘  │   │                  │     consumer)
    └────────────┘   │            ▼             │   │                  │
@@ -44,7 +44,7 @@
 A trading framework where multiple independent analysts emit views, an aggregator combines them, and a risk gate decides whether to act. Built around three principles:
 
 1. **Multi-analyst by design.** Pluggable analyst modules that emit a uniform `AnalystView` (direction, magnitude, confidence, horizon). v0.1.0 ships classical TA, microstructure-lite, [Kronos foundation model](https://github.com/shiyu-coder/Kronos), and the Kairos BTC fine-tune. Add your own.
-2. **Sidecar architecture.** A long-running daemon emits signals on a JSONL bus. [freqtrade](https://www.freqtrade.io/) (v0.1) or NautilusTrader (v0.2) reads the bus and executes. We don't reinvent order management; we focus on signal intelligence.
+2. **Scheduled-tick architecture.** The live spine is scheduled cron ticks that call `advisor.recommend` and the paper reactors directly (the original long-lived `daemon/main.py` signal-bus → freqtrade sidecar was vestigial and was removed; the shared `daemon/` utilities — `signal_bus`, `halt_state`, `settlement_loop`, `discovery`, `portfolio_loader` — remain). We don't reinvent order management; we focus on signal intelligence.
 3. **Silence by default.** Aggregator emits zero on disagreement; risk gate enforces hard rules the aggregator can't bypass; circuit breakers flatten on drawdown. Designed to lose money slowly, not catastrophically.
 
 ## What this is NOT (yet)
@@ -56,9 +56,9 @@ A trading framework where multiple independent analysts emit views, an aggregato
 
 ## Status
 
-- ✅ Architecture (8 ADRs, [docs/adr/](docs/adr/))
-- ✅ Research (3 lenses, [docs/research/](docs/research/))
-- 🚧 v0.1.0 implementation (in progress as of 2026-05-12)
+- ✅ Architecture (90 ADRs, [docs/adr/](docs/adr/))
+- ✅ Research (66 research notes, [docs/research/](docs/research/))
+- 🚧 v0.6.4 implementation (alpha; paper-trade live by default — no real money)
 - 📋 v0.2 — Alpaca equities via NautilusTrader, RL aggregator (graduation-gated)
 - 📋 v0.3 — Options, news-LLM analyst via OpenRouter scatter
 

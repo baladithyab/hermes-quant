@@ -131,6 +131,124 @@ def _read_universe_symbols(universe_path: Path) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Profile-fit scanner seam (W6) — DEFAULT-OFF behind HERMES_QUANT_PROFILE_SCAN.
+#
+# When the flag is unset (the default), this whole block is dead: main() runs
+# the EXISTING 5-bucket evolve_watchlist path over play-fit.json byte-identical
+# and build_profile_watchlist (W3) is never imported. When the flag is "1", the
+# cron calls build_profile_watchlist with the universe path + the universe
+# artifact's asof, which emits a SINGLE profile-fit.json (the autonomous-
+# consumed watchlist) and the 5-bucket evolve is skipped.
+#
+# The flag CONSTANT-of-record lives in hermes_quant/playbook/profile_scan.py
+# (W3); the inventory scanner picks it up there. This cron only *reads* it to
+# decide which path to take — the read is fail-closed (== "1") to match the
+# project flag idiom.
+# ---------------------------------------------------------------------------
+_PROFILE_SCAN_FLAG = "HERMES_QUANT_PROFILE_SCAN"
+
+# Exposed at module scope as a test/injection seam. None until the first ON-path
+# call lazily imports the real W3 core. Defensive — mirrors the prewarm /
+# catalyst import idiom above so the cron never crashes if hermes_quant doesn't
+# yet ship profile_scan (in-flight library refactor / older install).
+_build_profile_watchlist = None  # type: ignore[assignment]
+
+
+def _profile_scan_enabled() -> bool:
+    """True only when HERMES_QUANT_PROFILE_SCAN == "1" (fail-closed default-OFF)."""
+    return os.environ.get(_PROFILE_SCAN_FLAG, "0") == "1"
+
+
+def _read_universe_asof(universe_path: Path) -> str | None:
+    """Return the universe artifact's asof string (no-lookahead anchor), or None.
+
+    The profile-fit scanner is asof-pinned: the watchlist is built as-of the
+    universe artifact's own stamp, NOT datetime.now — so a replay/backtest
+    universe yields an as-of-honest watchlist. Returns None if the file is
+    missing/unparseable; the caller treats None as "skip" (silence-by-default).
+    """
+    if not universe_path.exists():
+        return None
+    try:
+        payload = json.loads(universe_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    asof = payload.get("asof")
+    return str(asof) if asof else None
+
+
+def _resolve_profile_watchlist_path() -> Path:
+    """The single profile-fit.json target this cron requests from the W3 core.
+
+    Mirrors ``profile_scan.DEFAULT_PROFILE_WATCHLIST_PATH`` (the NEW path —
+    never ``play-fit.json``). We resolve it HERE so the cron OWNS the path it
+    asked the builder to write, and can surface the TRUE destination in the
+    breadcrumb instead of guessing.
+
+    rt06-fix (test-isolation): resolve from ``Path.home()`` at CALL time rather
+    than importing ``profile_scan.DEFAULT_PROFILE_WATCHLIST_PATH``. That constant
+    is frozen at the W3 module's IMPORT time, so a later ``Path.home`` redirect
+    (the standard test-isolation idiom, and any future home reconfiguration) would
+    not take effect and the cron would surface a stale real-home path. Computing
+    the same literal here is byte-identical in production (home is stable) AND
+    honors a redirected home — closing an import-order test-isolation leak that
+    made test_on_calls_build_profile_watchlist fail only when a sibling test
+    imported profile_scan first.
+    """
+    return Path.home() / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
+
+
+def _run_profile_scan(universe_path: Path) -> dict | None:
+    """ON-path: build the single profile-fit watchlist via the W3 core.
+
+    Lazily imports ``build_profile_watchlist`` from
+    ``hermes_quant.playbook.profile_scan`` and calls it with the universe path
+    + the artifact's asof + the resolved out_path THIS cron requests. Returns
+    the build summary dict (with the requested ``out_path`` attached so the
+    caller can surface the true destination), or None when the universe is
+    missing / the core isn't available (silence-by-default — never crash the
+    cron). Writes the single profile-fit.json (the autonomous-consumed
+    watchlist); does NOT touch play-fit.json.
+
+    The W3 ``build_profile_watchlist`` contract returns
+    ``{"asof", "active":[...], "max_watchlist", "n_scanned", "n_eligible"}`` —
+    there is NO ``n_active`` and NO ``out_path`` key. The caller derives the
+    active count from ``len(active)`` and reads the path WE requested here.
+    """
+    global _build_profile_watchlist
+
+    asof = _read_universe_asof(universe_path)
+    if asof is None:
+        # No asof anchor → no no-lookahead-honest scan possible. Stay silent.
+        return None
+
+    builder = _build_profile_watchlist
+    if builder is None:
+        try:
+            from hermes_quant.playbook.profile_scan import (  # type: ignore
+                build_profile_watchlist as builder,
+            )
+        except (ImportError, AttributeError) as exc:
+            # W3 core not present in this install — silence-by-default, fall
+            # through to nothing (the OFF default still owns play-fit.json).
+            print(
+                f"WARNING: HERMES_QUANT_PROFILE_SCAN=1 but build_profile_watchlist "
+                f"is unavailable ({type(exc).__name__}: {exc}); skipping profile scan",
+                file=sys.stderr,
+            )
+            return None
+        _build_profile_watchlist = builder
+
+    out_path = _resolve_profile_watchlist_path()
+    summary = builder(universe_path, asof, out_path=out_path)
+    # Attach the path WE requested so the caller's breadcrumb prints the true
+    # destination, not a guess. (The W3 contract itself carries no out_path.)
+    if isinstance(summary, dict):
+        summary["out_path"] = str(out_path)
+    return summary
+
+
 def main() -> int:
     # Full Alpaca liquid universe — ~500 symbols by default. The library
     # prewarm + 600s cron timeout absorbs the wall time; do NOT silently
@@ -252,6 +370,33 @@ def main() -> int:
                 file=sys.stderr,
             )
     _check_budget("after_prewarm")
+
+    # W6 profile-fit scanner branch — DEFAULT-OFF (HERMES_QUANT_PROFILE_SCAN).
+    # When ON, the cron emits the SINGLE profile-fit.json via the W3 core and
+    # SKIPS the 5-bucket catalyst-onboard + evolve_watchlist path entirely. The
+    # prewarm above already warmed the snapshot cache build_profile_watchlist
+    # reuses. When OFF (the default) this block is a no-op and main() falls
+    # through to the existing 5-bucket path byte-identical.
+    if _profile_scan_enabled():
+        summary = _run_profile_scan(universe_path)
+        _check_budget("after_profile_scan")
+        if summary is None:
+            # Universe missing / W3 core unavailable — stayed silent, did
+            # nothing. Exit 0 (silence-by-default); the OFF default still owns
+            # play-fit.json so nothing was corrupted.
+            return 0
+        # Read the REAL build_profile_watchlist contract: the active count is
+        # len(active) (there is no "n_active" key), and the destination is the
+        # path _run_profile_scan requested + attached (not a hardcoded guess).
+        n_active = len(summary.get("active") or [])
+        out_path = summary.get("out_path", "~/.hermes/quant/watchlist/profile-fit.json")
+        # Silence-by-default: only print on a non-empty watchlist.
+        if n_active:
+            print(
+                f"🎯 **profile-fit scan** — {n_active} active "
+                f"(asof={summary.get('asof')}) → {out_path}"
+            )
+        return 0
 
     # ADR-0075 catalyst onboarding (Seam A). DEFAULT-OFF: catalyst_admissions
     # returns [] unless BOTH HERMES_QUANT_CATALYST_ONBOARDING=1 AND

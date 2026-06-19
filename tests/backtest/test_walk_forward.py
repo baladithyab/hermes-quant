@@ -452,6 +452,134 @@ class TestLookaheadGuard:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# MARK-TO-MARKET TEST
+# Regression for the held-position MTM defect: the engine must reprice open
+# positions against each bar's close so total_return reflects unrealised PnL,
+# not just realised-PnL/cost-drag.  Without MTM a buy-and-hold-shaped strategy
+# scores ~ -83% alpha against its own buy-and-hold benchmark.
+# ---------------------------------------------------------------------------
+
+
+class _BuyOnceStrategy:
+    """Test-only strategy: BUY 100% of NAV on the first active bar, then HOLD.
+
+    Economically identical to buy-and-hold for a single symbol.  Used to prove
+    the engine marks the held long to market.
+    """
+
+    def __init__(self, symbol: str):
+        self._symbol = symbol
+        self._bought = False
+
+    def decide(self, asof, lookback_data) -> list[Decision]:
+        if self._bought:
+            return [Decision(self._symbol, "HOLD", 0.0, 0.5, "hold")]
+        self._bought = True
+        return [Decision(self._symbol, "BUY", 1.0, 0.9, "buy once")]
+
+
+def _make_doubling_ohlcv(n_days: int = 10, start: str = "2024-01-02") -> pd.DataFrame:
+    """Single-symbol close series linearly doubling 100 -> 200 over n_days bars."""
+    dates = pd.bdate_range(start=start, periods=n_days)
+    closes = np.linspace(100.0, 200.0, n_days)
+    opens = closes.copy()
+    highs = closes.copy()
+    lows = closes.copy()
+    volumes = np.full(n_days, 1_000_000.0)
+    return pd.DataFrame(
+        {"open": opens, "high": highs, "low": lows, "close": closes, "volume": volumes},
+        index=dates,
+    )
+
+
+class TestMarkToMarket:
+    """The engine must mark open positions to market each bar (held-position MTM)."""
+
+    def test_buy_and_hold_doubling_series_returns_full_double(self):
+        """A BuyOnce(1.0) long on a 100->200 doubling series ~doubles NAV.
+
+        RED before fix: nav_series is flat after the single buy, so
+        total_return ≈ -0.001 (pure slippage) instead of ≈ +1.0.
+        """
+        ohlcv = _make_doubling_ohlcv(n_days=10)
+        dates = ohlcv.index
+        cfg = WalkForwardConfig(
+            train_start=dates[0],
+            train_end=dates[0],
+            holdout_start=dates[0],
+            holdout_end=dates[-1],
+            step_days=1,
+            lookback_days=30,
+            initial_nav=100_000.0,
+        )
+        engine = WalkForwardEngine(cfg)
+        result = engine.run(_BuyOnceStrategy("SYN"), ["SYN"], ohlcv, cost_model=LIQUID_EQUITY)
+
+        # The long ~doubled; costs are a thin one-time drag.  Allow a modest
+        # band for slippage/commission on the single entry.
+        assert result.total_return > 0.90, (
+            f"held long doubled but total_return={result.total_return} "
+            "— positions are not marked to market"
+        )
+
+    def test_buy_and_hold_has_near_zero_alpha_vs_benchmark(self):
+        """A strategy that is economically buy-and-hold has ~0 alpha (not -83%).
+
+        RED before fix: the benchmark MTMs first-vs-last close (+0.833) while
+        the strategy's flat NAV shows -0.001, so alpha ≈ -0.834 — the smoking-gun
+        asymmetry where a buy-and-hold-shaped effect is scored as catastrophic.
+        """
+        ohlcv = _make_doubling_ohlcv(n_days=10)
+        dates = ohlcv.index
+        cfg = WalkForwardConfig(
+            train_start=dates[0],
+            train_end=dates[0],
+            holdout_start=dates[0],
+            holdout_end=dates[-1],
+            step_days=1,
+            lookback_days=30,
+            initial_nav=100_000.0,
+        )
+        engine = WalkForwardEngine(cfg)
+        result = engine.run(_BuyOnceStrategy("SYN"), ["SYN"], ohlcv, cost_model=LIQUID_EQUITY)
+
+        # Strategy IS the benchmark (full-allocation long held to the end);
+        # alpha should be a thin negative cost band, not catastrophic.
+        assert result.alpha_vs_benchmark > -0.05, (
+            f"economically buy-and-hold strategy shows alpha={result.alpha_vs_benchmark} "
+            "vs its own benchmark — held position is not marked to market"
+        )
+
+    def test_nav_series_moves_while_holding(self):
+        """The NAV series must change bar-to-bar while a position is held.
+
+        RED before fix: nav_series is flat (range ≈ trade cost only) after the
+        single buy because positions are never repriced.
+        """
+        ohlcv = _make_doubling_ohlcv(n_days=10)
+        dates = ohlcv.index
+        cfg = WalkForwardConfig(
+            train_start=dates[0],
+            train_end=dates[0],
+            holdout_start=dates[0],
+            holdout_end=dates[-1],
+            step_days=1,
+            lookback_days=30,
+            initial_nav=100_000.0,
+        )
+        engine = WalkForwardEngine(cfg)
+        result = engine.run(_BuyOnceStrategy("SYN"), ["SYN"], ohlcv, cost_model=LIQUID_EQUITY)
+
+        nav_range = max(result.nav_series) - min(result.nav_series)
+        # A held long on a 100->200 series must move NAV by tens of thousands,
+        # not by the ~$100 trade cost.
+        assert nav_range > 10_000.0, (
+            f"NAV series range={nav_range} is trade-cost-sized — held position "
+            "is not marked to market each bar"
+        )
+
+
 class TestCostModelEffect:
     def test_higher_cost_reduces_nav(self, ohlcv_90, walk_forward_config_90):
         """Running with ILLIQUID cost model produces lower or equal final NAV."""

@@ -314,6 +314,80 @@ def test_mleg_apportions_unpriced_net_by_ratio(
     assert r.filled_qty == pytest.approx(2.0)
 
 
+def _reconstruct_net_per_struct(r: FillResult) -> float:
+    """Per-structure net = Sum(sign * per_contract_price * ratio_qty).
+
+    ``filled_qty`` carries ``sign * ratio_qty * outer_qty``, so the per-structure
+    ratio is ``abs(filled_qty) / outer_qty``. The per-leg signed price
+    contributions MUST sum to the gate-approved ``net_limit_price`` so the cash /
+    per-leg-basis / equity_total booked downstream reconstruct the family the gate
+    sized — not a sign-collapsed phantom.
+    """
+    outer = r.filled_qty or 1.0
+    return sum(
+        (1.0 if lf.filled_qty > 0 else -1.0)
+        * lf.filled_avg_price
+        * (abs(lf.filled_qty) / outer)
+        for lf in r.legs
+    )
+
+
+def test_mleg_unpriced_opposite_side_legs_reconstruct_net(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ar50 RED: two UNPRICED opposite-side legs (buy + sell) whose per-leg signed
+    # price contributions must reconstruct the net debit. The old abs(residual)/
+    # outer_qty discarded the residual sign -> both legs got the same magnitude
+    # price -> long(+) and short(-) contributions cancelled to 0.00, NOT the net.
+    _install_account(monkeypatch, balance_usd=100_000.0)
+    legs = (
+        _leg(_OCC_LONG, "buy", intent="buy_to_open", ratio_qty=1, fill_price=None),
+        _leg(_OCC_CALL, "sell", intent="sell_to_open", ratio_qty=1, fill_price=None),
+    )
+    r = DeterministicBackend().submit_option_mleg(
+        legs, outer_qty=1, net_limit_price=4.00, client_order_id="mlegrecon"
+    )
+    # The defect: per-leg signed contributions sum to 0.00, not 4.00.
+    assert _reconstruct_net_per_struct(r) == pytest.approx(4.00)
+
+
+def test_mleg_unpriced_net_credit_reconstructs_signed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ar50 RED: a net-CREDIT structure (net_limit_price < 0) with unpriced
+    # opposite-side legs. The signed residual must carry through so the credit is
+    # reconstructed; abs(residual) booked a debit-magnitude on the wrong sign.
+    _install_account(monkeypatch, balance_usd=100_000.0)
+    legs = (
+        _leg(_OCC_CALL, "sell", intent="sell_to_open", ratio_qty=1, fill_price=None),
+        _leg(_OCC_LONG, "buy", intent="buy_to_open", ratio_qty=1, fill_price=None),
+    )
+    r = DeterministicBackend().submit_option_mleg(
+        legs, outer_qty=1, net_limit_price=-3.00, client_order_id="mlegcreditrecon"
+    )
+    assert r.net_fill_price == pytest.approx(-3.00)
+    assert _reconstruct_net_per_struct(r) == pytest.approx(-3.00)
+
+
+def test_mleg_unpriced_mixed_with_priced_leg_reconstructs_net(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ar50 RED: one PRICED short leg + one UNPRICED long leg, outer_qty > 1. Both
+    # the residual sign AND the per-structure scaling (priced_sum carries an
+    # outer_qty factor that net_limit_price does not) must be handled so the
+    # per-leg signed contributions reconstruct net_limit_price exactly.
+    _install_account(monkeypatch, balance_usd=100_000.0)
+    legs = (
+        _leg(_OCC_LONG, "buy", intent="buy_to_open", ratio_qty=1, fill_price=None),
+        _leg(_OCC_CALL, "sell", intent="sell_to_open", ratio_qty=1, fill_price=2.00),
+    )
+    # net debit 3.00 = (unpriced long) - 2.00 (priced short) -> long resid = 5.00.
+    r = DeterministicBackend().submit_option_mleg(
+        legs, outer_qty=3, net_limit_price=3.00, client_order_id="mlegmixed"
+    )
+    assert _reconstruct_net_per_struct(r) == pytest.approx(3.00)
+
+
 def test_mleg_net_debit_rejected_when_exceeds_bp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

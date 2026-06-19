@@ -27,7 +27,7 @@ paper — NEVER originate from an LLM/MCP tool call; they flow only through prop
 1. **Deploy the REPO_ONLY_NEW scripts** (16 built this drive, none yet live) to ~/.hermes/scripts/ via
    `cp` (safe — nothing to clobber), then `python ops/deploy/quant-deploy-audit.py` and confirm each
    shows SAME before registering its cron.
-2. **Reconcile the 8 DRIFT scripts** — THREE-WAY reconcile per DEPLOY-SYNC.md §49, NEVER a blind cp.
+2. **Reconcile the 8 DRIFT scripts** — THREE-WAY reconcile per DEPLOY-SYNC.md "Reconciliation procedure", NEVER a blind cp.
    CRITICAL: the deployed playbook-weekly.py / playbook-quarterly.py carry the Wave-1d equity-halt-filter
    safety fix that is NOT in repo — preserve it. playbook-tick/hourly-tick/universe-scan have richer
    deployed emit formatters — preserve them. Merge the repo's PerceptionFrame/B04/ADR-0075/corrupt-row
@@ -38,14 +38,18 @@ paper — NEVER originate from an LLM/MCP tool call; they flow only through prop
 4. **Enable the Alpaca MCP (READ-ONLY pin)** in ~/.hermes/config.yaml mcp_servers via the
    mcp/optional-mcps/alpaca/manifest.yaml shape: `command: uvx, args: [alpaca-mcp-server]`, env from
    ~/.hermes/secrets/alpaca.env, **ALPACA_PAPER_TRADE=true** (paper account — non-negotiable).
-   **PIN `ALPACA_TOOLSETS` to the read-only allowlist** — `stock-data,crypto-data,options-data,assets,
-   corporate-actions,news` — so the server exposes ONLY data tools (live-probe-verified: 34 tools, zero
-   `place_*`/`cancel_*`/`close_*`/`replace`/`exercise`). Note: the `account` toolset is EXCLUDED because
-   it leaks the account-mutating `update_account_config` (seed 0fc0); re-adding `account` is a documented
-   operator trade-off (gains buying-power reads, re-introduces that one write tool). This is the ONLY safe
-   boundary — the MCP has no internal HITL hook and the host auto-exposes every tool to the chat LLM.
-   config.yaml + .env are tool-guarded, so the actual write is operator-gated (staged block + cred-bridge
-   one-liner in the run report). Confirm reload + verify the tool surface has NO order tools.
+   **PIN `ALPACA_TOOLSETS` to the no-order-authority allowlist** —
+   `account,stock-data,crypto-data,options-data,assets,corporate-actions,news` — so the server exposes
+   data tools PLUS account/buying-power reads, but NO `trading` toolset (zero `place_*`/`cancel_*`/`close_*`/
+   `replace`/`exercise`). Note (seed 0fc0, operator decision 2026-06-01 — canonical): the `account` toolset
+   IS INCLUDED (gains buying-power / position reads). It ships ONE settings-write tool,
+   `update_account_config`, which is NOT an order tool and moves no capital while `ALPACA_PAPER_TRADE=true`;
+   its presence is an EXPECTED, operator-accepted trade-off, not a leak. Excluding the `trading` toolset is
+   the safe boundary — the MCP has no internal HITL hook and the host auto-exposes every tool to the chat
+   LLM. config.yaml + .env are tool-guarded, so the actual enable is operator-gated (staged block +
+   cred-bridge one-liner in the run report). Confirm reload + verify the tool surface has NO ORDER tools
+   (`update_account_config` is expected; only `place_*`/`close_*`/`cancel_*`/`replace`/`exercise` are STOPs).
+   RE-EVALUATE the `account`-included trade-off before ever flipping to a live account.
 
 ## RAILS ARIA MUST HONOR (non-negotiable — these override the mission)
 - **Paper only**: ALPACA_PAPER_TRADE=true. Never enable live-money trading.

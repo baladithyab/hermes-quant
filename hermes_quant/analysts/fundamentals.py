@@ -32,6 +32,7 @@ ties return None (silence-by-default).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -41,6 +42,9 @@ import pandas as pd
 
 from hermes_quant.calibrators import ColdStartCalibrator
 from hermes_quant.data.fundamentals_provider import FundamentalsProvider
+from hermes_quant.home import quant_home as _resolve_quant_home
+from hermes_quant.pdr_core import is_option_asset_class
+from hermes_quant.playbook.scorers import NON_EQUITY_QUOTE_TYPES
 from hermes_quant.protocol import (
     AnalystView,
     CalibratorNotReady,
@@ -117,20 +121,54 @@ class FundamentalsAnalyst:
 
     # Composite gates
     _MIN_SURVIVING_SUBSIGNALS = 3
-    _STALENESS_DAYS_HARD_LIMIT = 7  # per-signal abstain if older
+
+    # Staleness gates (ADR-0064 §D5; cs40).
+    #
+    # Two distinct freshness concerns, two distinct gates:
+    #
+    #   (1) DATUM staleness — is the underlying fundamental too OLD to be
+    #       relevant? Fundamentals are quarterly, so a datum is measured
+    #       against its fiscal-period basis (report_date preferred, else
+    #       period_end), NOT against when the cron happened to cache it. A
+    #       quarterly datum is legitimately ~1 quarter old between filings,
+    #       and stays the freshest-available datum until the next quarter is
+    #       filed (one quarter ≈ 91d) plus the reporting lag (~45d) before
+    #       that next quarter is even knowable. The cadence-aware hard limit
+    #       (~2 quarters) admits the freshest-available quarter in every
+    #       legitimate case while still rejecting a snapshot older than ~half
+    #       a fiscal year. This replaces the old 7d fetched_at gate on the
+    #       datum-recency axis: post-cs12 the provider's reporting-lag filter
+    #       already guarantees a returned row was PUBLIC by as_of, so keying
+    #       datum-recency off fetched_at (a 7d cron-cadence value) wrongly
+    #       darkened the analyst on any backtest cache not re-snapshotted
+    #       daily — the lag (visible at period_end+45d) and the 7d
+    #       fetched_at gate (fetched_at ~30d+ old by then) cancelled.
+    #
+    #   (2) CRON-LIVENESS — only the FALLBACK when a row carries NO fiscal
+    #       basis (old-schema / pre-B34 parquets backfilled with NaT). There
+    #       the original §D5 7d fetched_at gate stands: if the cron stopped
+    #       writing fresh rows for >7d the cache is going stale, abstain.
+    #       This preserves the original live behavior for basis-less rows and
+    #       loosens nothing for them.
+    _STALENESS_DATUM_DAYS_HARD_LIMIT = 190  # ~2 quarters; datum-recency axis
+    _STALENESS_FETCHED_AT_DAYS_HARD_LIMIT = 7  # cron-liveness fallback (no basis)
+    # Back-compat alias (some callers/tests reference the original name).
+    _STALENESS_DAYS_HARD_LIMIT = _STALENESS_FETCHED_AT_DAYS_HARD_LIMIT
 
     def __init__(
         self,
         *,
         horizon: str = "1M",
         provider: FundamentalsProvider | None = None,
+        openbb_provider: Any | None = None,
         cache_root: Path | None = None,
     ):
         self.horizon = horizon
         self.provider = provider or FundamentalsProvider(
             cache_root=cache_root
-            or (Path.home() / ".hermes" / "quant" / "cache" / "fundamentals")
+            or (_resolve_quant_home() / "cache" / "fundamentals")
         )
+        self._openbb_provider = openbb_provider
         self.calibrator = ColdStartCalibrator()
         if isinstance(self.calibrator, ColdStartCalibrator):
             # ADR-0065 v0.6.1-fix-H3: surface cold-start collapse risk.
@@ -157,7 +195,7 @@ class FundamentalsAnalyst:
           1. Empty / non-string asset → 'unknown'.
           2. asset_class explicitly given:
              - 'equity' / 'etf' / 'crypto' / 'fx' → trust upstream.
-             - 'option'                          → 'unknown' (deferred).
+             - option FAMILY ('option' / 'us_option') → 'unknown' (deferred).
           3. '/' in asset                          → 'crypto'.
           4. asset endswith '=X'                   → 'fx'.
           5. else                                  → 'equity'.
@@ -168,10 +206,17 @@ class FundamentalsAnalyst:
         if not isinstance(asset, str) or not asset.strip():
             return "unknown"
         if asset_class is not None:
+            # Option FAMILY first: the live host stamps 'us_option' (react.multileg),
+            # 'option' is the generic/legacy token. Recognize the FAMILY via
+            # pdr_core.is_option_asset_class — a bare `== "option"` would miss the
+            # live 'us_option' stamp and fall through to the symbol heuristics, which
+            # classify an OCC-21 option symbol (no '/', no '=X') as 'equity' and let
+            # analyze() fetch/score fundamentals for a contract symbol as a stock
+            # (ac1's contract-layer divergence, here in the analyst).
+            if is_option_asset_class(asset_class):
+                return "unknown"
             if asset_class in ("equity", "etf", "crypto", "fx"):
                 return asset_class  # type: ignore[return-value]
-            if asset_class == "option":
-                return "unknown"
             # Unknown asset_class string → fall through to heuristics.
         if "/" in asset:
             return "crypto"
@@ -192,37 +237,182 @@ class FundamentalsAnalyst:
           - no parquet file (cache miss; cron will populate)
           - parquet is empty
           - latest row is older than _STALENESS_DAYS_HARD_LIMIT days
-          - quote_type is 'ETF' (post-fetch ETF detection)
+          - quote_type is in NON_EQUITY_QUOTE_TYPES (post-fetch non-equity
+            detection: ETF / MUTUALFUND / INDEX / CURRENCY / CRYPTOCURRENCY)
         """
         try:
             snapshot = self.provider.read_latest(ticker, as_of=asof)
         except FileNotFoundError:
-            return None
+            return self._fetch_openbb_fundamentals(ticker, asof)
         except Exception as exc:  # noqa: BLE001
             logger.debug(
                 "fundamentals: provider.read_latest failed for %s: %s", ticker, exc
             )
-            return None
+            return self._fetch_openbb_fundamentals(ticker, asof)
         if snapshot is None:
-            return None
-        # ETF post-check (yfinance may label something an ETF that the
-        # heuristic gate above missed).
+            return self._fetch_openbb_fundamentals(ticker, asof)
+        # Non-equity quote_type post-check (cs45/cs47). The symbol heuristics
+        # above only catch '/' (crypto) and '=X' (fx); a plain ticker with NO
+        # asset_class classifies 'equity' and the snapshot is fetched. The
+        # provider then writes ANY yfinance quoteType verbatim, so a MUTUALFUND
+        # / INDEX / CURRENCY / CRYPTOCURRENCY (or ETF) snapshot would otherwise
+        # be scored with equity-specific fundamentals (P/E, D/E, FCF, …) as if
+        # it were a stock — a category error feeding an ADR-0004 gate input.
+        # Abstain on the FULL canonical non-equity set, single-sourced from the
+        # provider-side scorers.NON_EQUITY_QUOTE_TYPES (the set scorers.py uses
+        # to skip equity-only earnings lookups) rather than a third inlined copy.
         qt = snapshot.get("quote_type")
-        if isinstance(qt, str) and qt.upper() == "ETF":
+        if isinstance(qt, str) and qt.upper() in NON_EQUITY_QUOTE_TYPES:
             return None
-        # Per-row hard staleness (ADR-0064 §D5).
+        if asof.tzinfo is None:
+            asof = asof.tz_localize("UTC")
+        # Per-row hard staleness (ADR-0064 §D5; cs40).
+        #
+        # Prefer the DATUM's fiscal-period basis (report_date, else
+        # period_end) and apply the cadence-aware quarterly limit. The
+        # provider's reporting-lag filter has already proven the row was
+        # PUBLIC by as_of, so the only remaining question is whether the
+        # datum is too OLD to be relevant — a quarterly question, not a
+        # 7-day cron-cadence one. Only when the row carries NEITHER a
+        # report_date NOR a period_end (old-schema / pre-B34 parquets) do we
+        # fall back to the original 7d fetched_at cron-liveness gate.
+        basis = self._datum_basis(snapshot)
+        if basis is not None:
+            datum_age_days = (asof - basis).days
+            # cs77: bound the datum age BELOW as well as above. A future-dated
+            # fiscal basis (corrupt / hand-built / vendor mis-stamped
+            # report_date / period_end > asof) makes datum_age_days NEGATIVE,
+            # and the old upper-only `> HARD_LIMIT` clause read `negative > 190`
+            # as False -> the gate was BYPASSED and a not-yet-knowable datum was
+            # scored as a current one (same fail-OPEN-on-future-timestamp class
+            # as cs42a/cs53/cs67/cs68/cs69/cs75). The NaN-safe bounded membership
+            # test mirrors cs75 (`if not (0 <= age_days <= HARD)`) and cs67
+            # (`0 <= age_h < ttl`): a future basis -> negative -> abstain; a
+            # NaT/missing-derived nan age fails the test -> abstain. The
+            # inclusive `<=` preserves the old strictly-greater upper boundary,
+            # so a genuinely-current datum (age in [0, HARD_LIMIT]) is admitted
+            # byte-identically.
+            if not (0 <= datum_age_days <= self._STALENESS_DATUM_DAYS_HARD_LIMIT):
+                return self._fetch_openbb_fundamentals(ticker, asof)
+            return snapshot
+        # Fallback: no fiscal basis — cron-liveness gate on fetched_at.
         try:
             fetched_at = pd.Timestamp(snapshot["fetched_at"])
         except (KeyError, ValueError, TypeError):
-            return None
+            return self._fetch_openbb_fundamentals(ticker, asof)
         if fetched_at.tzinfo is None:
             fetched_at = fetched_at.tz_localize("UTC")
-        if asof.tzinfo is None:
-            asof = asof.tz_localize("UTC")
         age_days = (asof - fetched_at).days
-        if age_days > self._STALENESS_DAYS_HARD_LIMIT:
-            return None
+        # cs78: bound the fetched_at age BELOW as well as above — the symmetric
+        # completion of cs77 on the basis-LESS cron-liveness fallback path. The
+        # old upper-only clause ``if age_days > _STALENESS_FETCHED_AT_DAYS_HARD_LIMIT``
+        # fails OPEN on exactly the two timestamps cs42a/cs53/cs67/cs68/cs75/cs77
+        # all guard against: (a) a FUTURE fetched_at makes age_days NEGATIVE and
+        # ``-10 > 7`` reads False -> gate bypassed -> a not-yet-knowable fetch is
+        # scored as fresh; (b) a NaT/missing-derived ``nan`` age and ``nan > 7``
+        # reads False -> gate bypassed -> an unknowable fetch-time row scored as
+        # fresh. The NaN-safe bounded membership test mirrors cs77 (`if not (0 <=
+        # age_days <= HARD)`) and cs75: a future fetched_at -> negative -> abstain;
+        # a nan age -> abstain. The inclusive `<=` preserves the old strictly-
+        # greater upper boundary, so a genuinely-fresh fetched_at (age in [0, 7])
+        # is admitted byte-identically. Defense-in-depth: cs42a already drops a
+        # future/NaT fetched_at upstream on the as_of-bounded read, so this is the
+        # last unbounded sibling gate, closing the future-timestamp/staleness
+        # family across both freshness axes (datum + cron-liveness).
+        if not (0 <= age_days <= self._STALENESS_FETCHED_AT_DAYS_HARD_LIMIT):
+            return self._fetch_openbb_fundamentals(ticker, asof)
         return snapshot
+
+    def _fetch_openbb_fundamentals(
+        self, ticker: str, asof: pd.Timestamp
+    ) -> pd.Series | None:
+        """Optional ADR-0100 OpenBB fallback for the cache-backed fundamentals read.
+
+        Default-OFF: unless ``HERMES_QUANT_OPENBB=1`` or a test seam was injected,
+        no OpenBB class is imported and the legacy cache path stays byte-identical.
+        """
+        if (
+            self._openbb_provider is None
+            and os.environ.get("HERMES_QUANT_OPENBB", "0") != "1"
+        ):
+            return None
+        try:
+            provider = self._openbb_provider
+            if provider is None:
+                from hermes_quant.data.openbb_fundamentals import OpenBBFundamentals
+
+                provider = OpenBBFundamentals()
+                self._openbb_provider = provider
+            rows = provider.read_fundamentals(ticker, as_of=asof)
+        except Exception as exc:  # noqa: BLE001 - fallback must never crash the analyst
+            logger.debug("fundamentals: OpenBB fallback failed for %s: %s", ticker, exc)
+            return None
+        if rows is None or len(rows) == 0:
+            return None
+        try:
+            df = rows.copy()
+            df = df.sort_values(["filing_date", "period_ending"]).reset_index(
+                drop=True
+            )
+            row = df.iloc[-1].copy()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "fundamentals: OpenBB fallback normalization failed for %s: %s",
+                ticker,
+                exc,
+            )
+            return None
+
+        def _utc_ts(value: Any) -> pd.Timestamp:
+            ts = pd.Timestamp(value)
+            if ts is pd.NaT or pd.isna(ts):
+                return pd.NaT
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            return ts
+
+        # Shape adapter: preserve the analyst's existing fiscal-basis staleness
+        # gates by mapping OpenBB's period_ending/filing_date columns into the
+        # cache provider's period_end/report_date names.
+        row["period_end"] = _utc_ts(row.get("period_ending"))
+        row["report_date"] = _utc_ts(row.get("filing_date"))
+        row["as_of_date"] = asof.normalize()
+        row["fetched_at"] = asof
+        row["source"] = "openbb"
+        qt = row.get("quote_type")
+        if isinstance(qt, str) and qt.upper() in NON_EQUITY_QUOTE_TYPES:
+            return None
+        return row
+
+    @staticmethod
+    def _datum_basis(snapshot: pd.Series) -> pd.Timestamp | None:
+        """Return the datum's fiscal-period basis (UTC), or None.
+
+        report_date preferred (when the filing was published), else
+        period_end (the fiscal period the datum describes). Returns None
+        when both are absent / NaT — the basis-less fallback path. Mirrors
+        the provider's _apply_reporting_lag_filter precedence (report_date
+        → period_end) so the staleness axis is consistent with the
+        knowability axis.
+        """
+        for col in ("report_date", "period_end"):
+            if col not in snapshot.index:
+                continue
+            raw = snapshot.get(col)
+            if raw is None:
+                continue
+            try:
+                ts = pd.Timestamp(raw)
+            except (ValueError, TypeError):
+                continue
+            if ts is pd.NaT or pd.isna(ts):
+                continue
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            return ts
+        return None
 
     # ------------------------------------------------------------------
     # Sub-signal scorers (one per row in §D6 calibration table)

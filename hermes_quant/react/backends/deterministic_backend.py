@@ -34,6 +34,7 @@ read used by every other reactor seam.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from ..backend import (
@@ -133,6 +134,18 @@ class DeterministicBackend:
         BP (beyond a penny-rounding epsilon). A non-positive ``required_usd`` (a
         credit / zero-debit) is always allowed — credit collateral is the gate's job.
         """
+        # ar31: a NON-FINITE required notional must fail CLOSED. nan/inf defeat every
+        # comparison below (`nan <= 0` is False -> skips the credit early-return;
+        # `nan > bp + eps` is False -> skips the insufficiency raise), so a NaN notional
+        # would be ADMITTED past this anti-over-leverage BP rail and book a NaN-priced
+        # fill. This is the LIVE deterministic-equity path (HERMES_QUANT_DETERMINISTIC_
+        # EQUITY=1). A notional we cannot verify is finite is unverifiable against BP, so
+        # refuse it as a backend fault (mirrors the unknown-BP fail-closed below).
+        if not math.isfinite(required_usd):
+            raise BackendUnavailableError(
+                f"deterministic-backend: non-finite required notional ({required_usd!r}) "
+                f"for {what}; refusing the fill (fail-closed - cannot verify buying power)"
+            )
         if required_usd <= 0:
             return
         bp = self.buying_power()
@@ -275,14 +288,23 @@ class DeterministicBackend:
                     )
                 )
         # Apportion the residual net across unpriced legs by ratio_qty so the per-leg
-        # sum reconstructs the gate-approved net (mirrors the PaperBroker math).
+        # SIGNED contributions reconstruct the gate-approved net (mirrors the
+        # PaperBroker math). The residual is a SIGNED per-structure dollar amount:
+        # ``priced_sum`` carries an outer_qty factor that net_limit_price does NOT,
+        # so divide it back out before differencing. The per-contract price for a
+        # leg is ``sgn * residual_net / ratio_total`` so that the leg's signed
+        # contribution ``sgn * per_share * ratio_qty`` sums (over unpriced legs) to
+        # residual_net even when the unpriced legs have MIXED sides (a long+short
+        # pair or a net-credit). The old ``abs(residual)/outer_qty`` discarded the
+        # residual sign AND assumed same-sign legs, so opposite-side legs cancelled
+        # to a phantom net (e.g. a 4.00 debit booked as 0.00 cash + per-leg basis).
         if unpriced:
             ratio_total = sum(leg.ratio_qty for leg in unpriced) or 1
-            residual = (net_limit_price - priced_sum) / ratio_total
+            residual_net = net_limit_price - priced_sum / max(outer_qty, 1)
             for leg in unpriced:
                 sgn = 1.0 if leg.side == "buy" else -1.0
                 signed_qty = sgn * leg.ratio_qty * outer_qty
-                per_share = abs(residual) / max(outer_qty, 1)
+                per_share = sgn * residual_net / ratio_total
                 leg_fills.append(
                     FillResult(
                         symbol=leg.symbol,

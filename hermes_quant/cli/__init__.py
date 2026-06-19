@@ -39,6 +39,8 @@ from __future__ import annotations
 import argparse
 import json
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 PROFILES = ["conservative", "moderate", "aggressive"]
 
 
@@ -388,6 +390,48 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
 
     wl_list = wl_sub.add_parser("list", help="List watchlist entries")
     wl_list.add_argument("--json", action="store_true")
+
+    # Governance HITL: mint a kill_switch_clear approval token (ADR-0031).
+    # ERGONOMIC front-door only — the verb CALLS governance.approvals.grant_token /
+    # kill_switch.clear; it does not change grant_token, VALID_SCOPES, or the
+    # require_human_token gate. --granted-by is REQUIRED (human-authorizes preserved).
+    p_govern = sub.add_parser(
+        "govern",
+        help="Governance HITL: mint a kill_switch_clear approval token (ADR-0031)",
+    )
+    gov_sub = p_govern.add_subparsers(dest="govern_cmd", required=True)
+
+    p_gc = gov_sub.add_parser(
+        "grant-clear",
+        help="Mint a single-use HumanApprovalToken (scope=kill_switch_clear) "
+        "to clear the governance halt",
+    )
+    p_gc.add_argument(
+        "--granted-by",
+        required=True,
+        help="Operator id recorded in the audit log (you are authorizing this clear)",
+    )
+    p_gc.add_argument(
+        "--ttl-min", type=int, default=10, help="Token TTL in minutes (default: 10)"
+    )
+
+    p_ch = gov_sub.add_parser(
+        "clear-halt",
+        help="Mint a kill_switch_clear token AND clear the governance halt in one step",
+    )
+    p_ch.add_argument(
+        "--granted-by",
+        required=True,
+        help="Operator id recorded in the audit log (you are authorizing this clear)",
+    )
+    p_ch.add_argument(
+        "--ttl-min", type=int, default=10, help="Token TTL in minutes (default: 10)"
+    )
+    p_ch.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Required to actually clear the halt (mirrors `autonomous reset --confirm`)",
+    )
 
     # Backtest
     p_bt = sub.add_parser("backtest", help="Run hermes-quant against historical bars (ADR-0020)")
@@ -802,6 +846,9 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if cmd == "autonomous":
         return _dispatch_autonomous(args)
+
+    if cmd == "govern":
+        return _dispatch_govern(args)
 
     if cmd == "backtest":
         return _dispatch_backtest(args)
@@ -1394,9 +1441,7 @@ def _dispatch_backtest(args) -> int:
     out_dir = (
         _Path(args.output_dir).expanduser()
         if args.output_dir
-        else _Path.home()
-        / ".hermes"
-        / "quant"
+        else _resolve_quant_home()
         / "backtests"
         / f"{args.symbol.replace('/', '_')}-{args.timeframe}-{_uuid.uuid4().hex[:8]}"
     )
@@ -1717,7 +1762,12 @@ def _fetch_bars_via_provider(
         symbol=symbol,
         timeframe=timeframe,
         lookback_bars=lookback,
-        cache_root=root if root is not None else _Path.home() / ".hermes" / "quant" / "cache",
+        cache_root=root if root is not None else _resolve_quant_home() / "cache",
+        # NO-LOOKAHEAD (cs38): the cache file accumulates bars up to each prior
+        # fetch's wall-clock; without this anchor a warm HIT would serve bars
+        # that post-date a backtest --end. as_of is derived from --end above
+        # (None => live/up-to-now caller => no prune, byte-identical).
+        cutoff=as_of,
     )
     print(
         "backtest: OHLCV cache "
@@ -1786,6 +1836,73 @@ def _dispatch_autonomous(args) -> int:
         return _dispatch_watchlist(args)
 
     print(f"hermes quant autonomous: unknown subcommand {sub!r}")
+    return 2
+
+
+def _dispatch_govern(args) -> int:
+    """Dispatch `hermes quant govern <subcommand>` (ADR-0031).
+
+    ERGONOMIC front-door to the governance kill-switch-clear token path. The
+    handler only CALLS governance.approvals.grant_token / kill_switch.clear; it
+    does NOT change grant_token, VALID_SCOPES, or the require_human_token gate.
+    --granted-by is argparse-required (human-authorizes preserved; NO auto-grant).
+    The handler resolves NO store path — grant_token writes to the module-constant
+    approvals.TOKEN_STORE_PATH, exactly as the documented one-liner does.
+
+    NOTE: this targets the token-gated GOVERNANCE kill switch (kill_switch.clear,
+    state.json halt flag), which is distinct from `autonomous reset` (the ADR-0016
+    P&L-drawdown switch, no token required). target_ref="state.json" is load-bearing:
+    it is the exact value kill_switch.clear() validates against, so a token minted
+    with any other target_ref would be rejected by the real clear path.
+    """
+    sub = getattr(args, "govern_cmd", None)
+
+    if sub == "grant-clear":
+        from hermes_quant.governance import approvals
+
+        token = approvals.grant_token(
+            "kill_switch_clear",  # scope — VALID_SCOPES member
+            "state.json",  # target_ref — MUST match kill_switch.clear()
+            granted_by=args.granted_by,  # human-authorizes; argparse-required
+            ttl_minutes=args.ttl_min,
+        )
+        print(f"minted kill_switch_clear token: {token.token_id}")
+        print(
+            f"  granted_by={args.granted_by} ttl_min={args.ttl_min} "
+            "target_ref=state.json scope=kill_switch_clear"
+        )
+        print(
+            "  Clear the halt with `hermes quant govern clear-halt "
+            "--granted-by <id> --confirm`,"
+        )
+        print("  or the python one-liner in docs/operations/KILL-SWITCH-RECOVERY.md.")
+        return 0
+
+    if sub == "clear-halt":
+        if not args.confirm:
+            print("hermes quant govern clear-halt: --confirm is required.")
+            print(
+                "This mints + consumes a kill_switch_clear token and clears "
+                "the governance halt."
+            )
+            return 2
+        from hermes_quant.governance import approvals, kill_switch
+
+        token = approvals.grant_token(
+            "kill_switch_clear",
+            "state.json",
+            granted_by=args.granted_by,
+            ttl_minutes=args.ttl_min,
+        )
+        # validates scope + target_ref, consumes the token, flips halt:false
+        kill_switch.clear(token)
+        print(
+            f"minted+consumed token {token.token_id}; "
+            f"governance halt cleared: {not kill_switch.is_halted()}"
+        )
+        return 0
+
+    print(f"hermes quant govern: unknown subcommand {sub!r}")
     return 2
 
 
@@ -1867,7 +1984,6 @@ def _autonomous_start(
     job's output, delivered via the operator's configured cron destination.
     """
     import os as _os
-    from pathlib import Path as _Path
 
     try:
         import yaml as _yaml
@@ -1875,7 +1991,12 @@ def _autonomous_start(
         print("hermes quant autonomous start: pyyaml is required")
         return 2
 
-    cfg_path = _Path.home() / ".hermes" / "config.yaml"
+    # ADR-0013 §D4: write to the SAME profile-aware path the engine + HITL tools
+    # read. Writing the global file unconditionally would land the mode in a
+    # different file than the profile-aware engine reads — a precedence split.
+    from hermes_quant.watchlist import get_config_path
+
+    cfg_path = get_config_path()
     if cfg_path.exists():
         cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     else:
@@ -2031,7 +2152,6 @@ def _create_autonomous_cron_job(*, cadence: str) -> dict:
 def _autonomous_stop() -> int:
     """Set quant.pdr.mode=advise — autonomous tick will refuse to fire."""
     import os as _os
-    from pathlib import Path as _Path
 
     try:
         import yaml as _yaml
@@ -2039,7 +2159,11 @@ def _autonomous_stop() -> int:
         print("hermes quant autonomous stop: pyyaml is required")
         return 2
 
-    cfg_path = _Path.home() / ".hermes" / "config.yaml"
+    # ADR-0013 §D4: write to the active profile-aware config (same path the
+    # engine + HITL tools read), not the global file unconditionally.
+    from hermes_quant.watchlist import get_config_path
+
+    cfg_path = get_config_path()
     if not cfg_path.exists():
         print("(no config.yaml — nothing to stop)")
         return 0
@@ -2233,11 +2357,13 @@ def _pretty_print_recommend(result: dict) -> None:
 
 
 def _show_config() -> None:
-    from pathlib import Path
-
     import yaml
 
-    cfg_path = Path.home() / ".hermes" / "config.yaml"
+    # ADR-0013 §D4: show the active profile-aware config (the one the engine +
+    # HITL tools actually read), so the operator sees the mode that is in force.
+    from hermes_quant.watchlist import get_config_path
+
+    cfg_path = get_config_path()
     if not cfg_path.exists():
         print(f"No config at {cfg_path}. Run `hermes quant setup` first.")
         return

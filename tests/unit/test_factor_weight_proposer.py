@@ -18,13 +18,16 @@ import pytest
 from hermes_quant.factors.weight_proposer import (
     MAX_STEP_PER_CYCLE,
     MIN_OBSERVATIONS,
+    MIN_PROMOTABLE_DSR,
     WEIGHT_CAP,
     WEIGHT_FLOOR,
+    FactorWeightProposal,
     FactorWeightProposalSet,
     append_rejected,
     evaluate_against_holdout,
     load_prior_best_dsr,
     propose_weights,
+    score_holdout,
     write_candidates,
 )
 
@@ -321,6 +324,113 @@ def test_empty_proposal_set_to_dict_roundtrips():
     d = ps.to_dict()
     assert d["proposals"] == []
     assert d["eval_passed"] is False
+
+
+# ---------------------------------------------------------------------------
+# AC-11 — absolute DSR floor: a CONSISTENT-LOSER must NOT pass the eval gate on
+# the first run, even though it strictly beats the -inf checkpoint-fallback baseline.
+#
+# Before the fix, eval_passed = (beats_prior_best AND plateau_stable) with NO
+# absolute floor. A consistently-losing composite has a deeply NEGATIVE Sharpe,
+# whose n_trials=1 DSR underflows to ~0.0 (Φ of an extreme-negative z), yet 0.0 still
+# STRICTLY beats the first-run -inf baseline (load_prior_best_dsr -> -inf when no
+# checkpoint exists). Worse, a CONSISTENT loser is plateau-stable (low cross-fold
+# Sharpe CV, sign-consistent folds), so the robustness check does NOT reject it.
+# Net: a guaranteed money-loser would clear the gate, the cron would write_candidates()
+# (advisory) and save_prior_best_dsr(~0.0) — ratcheting the baseline up to a no-edge level.
+# ---------------------------------------------------------------------------
+def _consistent_loser_holdout(n: int = 240):
+    """A holdout + compute_factor where the long-by-sign position systematically
+    ANTI-predicts the next-bar return — a genuine consistent loser (negative Sharpe,
+    sign-consistent across folds so it is plateau-stable)."""
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(7)
+    rets = rng.normal(0.0, 0.01, n)  # per-bar next-bar returns
+    closes = np.empty(n, dtype=float)
+    closes[0] = 100.0
+    for i in range(1, n):
+        closes[i] = closes[i - 1] * (1.0 + rets[i - 1])
+    bars = pd.DataFrame({"close": closes})
+
+    next_ret = pd.Series(closes).pct_change().shift(-1)
+    # +1 when the next bar falls -> long-by-sign loses on every bar (anti-predictive).
+    factor_vals = (-np.sign(next_ret.fillna(0.0))).to_numpy()
+    factor_vals = factor_vals + rng.normal(0, 1e-6, n)  # tiny noise so std != 0
+
+    def compute_factor(_fid, holdout_bars):
+        return pd.Series(factor_vals[: len(holdout_bars)], index=range(len(holdout_bars)))
+
+    return bars, compute_factor
+
+
+def test_consistent_loser_fails_eval_despite_neg_inf_first_run_baseline():
+    """RED for the missing absolute-DSR floor (weight_proposer.py eval_passed).
+
+    A consistent loser scored through the REAL path (score_holdout) yields a deeply
+    negative Sharpe, dsr ~ 0.0, and plateau_stable=True. With prior_best=-inf
+    (first run), beats_prior_best is True. The gate MUST still reject it because its
+    DSR is below the no-edge midpoint (MIN_PROMOTABLE_DSR)."""
+    bars, compute_factor = _consistent_loser_holdout(240)
+    ps = FactorWeightProposalSet(
+        proposals=[
+            FactorWeightProposal(
+                factor_id="loser",
+                current_weight=0.0,
+                proposed_weight=1.0,
+                verdict_tier="premium",
+                reason="anti-predictive composite",
+            )
+        ]
+    )
+    holdout_dsr, holdout_sharpe, plateau_stable = score_holdout(ps, bars, compute_factor)
+    # Provenance of the corner this test guards: a genuine loser, near-0 DSR, stable plateau.
+    assert holdout_sharpe < 0.0, holdout_sharpe  # a real consistent loser
+    assert holdout_dsr < MIN_PROMOTABLE_DSR  # below the no-edge midpoint
+    assert plateau_stable is True  # a CONSISTENT loser is plateau-stable (the trap)
+
+    out = evaluate_against_holdout(
+        ps,
+        holdout_dsr=holdout_dsr,
+        holdout_sharpe_delta=-1.0,
+        prior_best_dsr=float("-inf"),  # first-run baseline
+        plateau_stable=plateau_stable,
+    )
+    # beats_prior_best is True (any finite dsr beats -inf) but the gate must NOT pass:
+    # the absolute DSR floor rejects a no-edge / losing set regardless of the baseline.
+    assert out.beats_prior_best is True
+    assert out.eval_passed is False
+
+
+def test_absolute_dsr_floor_rejects_no_edge_set_below_floor():
+    """A no-edge set (DSR just below the floor) that beats prior-best AND is
+    plateau-stable still fails: the absolute floor is required."""
+    ps = propose_weights({"f1": _verdict("premium")}, current_weights={"f1": 0.2})
+    out = evaluate_against_holdout(
+        ps,
+        holdout_dsr=MIN_PROMOTABLE_DSR - 0.01,
+        holdout_sharpe_delta=0.0,
+        prior_best_dsr=float("-inf"),
+        plateau_stable=True,
+    )
+    assert out.beats_prior_best is True
+    assert out.plateau_stable is True
+    assert out.eval_passed is False  # below the absolute floor -> rejected
+
+
+def test_at_or_above_floor_with_edge_still_passes():
+    """A genuine edge at/above the floor that beats prior-best and is plateau-stable
+    still passes (the floor does not over-reject real edges)."""
+    ps = propose_weights({"f1": _verdict("premium")}, current_weights={"f1": 0.2})
+    out = evaluate_against_holdout(
+        ps,
+        holdout_dsr=MIN_PROMOTABLE_DSR,  # exactly at the floor (>= is inclusive)
+        holdout_sharpe_delta=0.4,
+        prior_best_dsr=float("-inf"),
+        plateau_stable=True,
+    )
+    assert out.eval_passed is True
 
 
 if __name__ == "__main__":  # pragma: no cover

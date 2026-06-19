@@ -19,6 +19,22 @@
 > Every flag is default-OFF and its off-state is byte-identical to today (verified per wave), so enabling is
 > strictly additive and each flag is independently reversible (`sed -i '/HERMES_QUANT_X=1/d' ~/.hermes/.env`).
 
+> **⚠️ SCHEDULE PRECEDENCE (2026-06-14, seed `9048`): `CRON-REGISTRY.md` wins for cron schedules + deliver.**
+> The `cronjob action='create'` blocks in this doc and the CRON-REGISTRY row table disagree on the W2/W3/W6
+> schedules (and W6 deliver). Neither cron is registered on the host yet, so there is no live value to
+> adjudicate from — and `CRON-REGISTRY.md` is the declared single source of truth for every trading cron.
+> **Register using the CRON-REGISTRY schedule, then make this doc match.** Known deltas to reconcile at
+> registration time (CRON-REGISTRY row → this doc's create block):
+>
+> | Cron | CRON-REGISTRY (authoritative) | This doc (stale) |
+> |---|---|---|
+> | W2 `quant-weekly-retro` (row 19) | `30 13 * * 0` (Sun 16:30 ET), `deliver=local` | `0 6 * * 6` (Sat 06:00 PT) |
+> | W3 `quant-monthly-meta-retro` (row 20) | `0 14 1 * *` (1st 09:00 ET) | `0 6 1 * *` (1st 06:00 PT) |
+> | W6 `quant-research-loop` (row 21) | `0 8 * * 1` (Mon 11:00 ET), `deliver=discord:#hq` | `0 7 * * 6` (Sat), `deliver=local` |
+>
+> The operator confirms the intended cadence at registration; until then the CRON-REGISTRY value is canonical.
+> (W4 `quant-factor-weight-propose` and the graph-mine cron `0 6 * * 0` are consistent across both docs.)
+
 ---
 
 ## Dependency graph (enable in this order)

@@ -62,8 +62,16 @@ this stays in sync with MessageKind.__args__ (catches drift)."""
 Timeframe = Literal["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 """Bar timeframe. Sub-minute timeframes deferred to v0.2."""
 
-AssetClass = Literal["crypto", "equity", "etf", "fx", "option"]
-"""Asset class. 'option' deferred to v0.2 (requires Greeks-aware sizer per ADR-0009 §P2-options)."""
+AssetClass = Literal["crypto", "equity", "etf", "fx", "option", "us_option"]
+"""Asset class. 'option' deferred to v0.2 (requires Greeks-aware sizer per ADR-0009 §P2-options).
+
+'us_option' is the token the live multi-leg reactor (react.multileg) stamps on
+real US equity-option fills, and the token state.portfolio_state gates the ×100
+contract multiplier on. It is a member here so this Literal RECOGNIZES the live
+host stamp and stays byte-for-byte equal to pdr_core.contracts.AssetClass (the
+host-agnostic seam that will own settlement per ADR-0092). The fields below are
+typed `str` (no Literal validation at construction), so adding the member is
+additive — the live money-state behavior is unchanged (ac1)."""
 
 
 # ---------------------------------------------------------------------------

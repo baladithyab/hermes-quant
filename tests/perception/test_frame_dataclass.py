@@ -43,8 +43,9 @@ def test_frame_is_frozen():
 
 def test_frame_field_order_matches_adr_0079():
     """The ADR-0079 §D79.2 fields in order, plus the add-only ``event_risk`` slot
-    (ADR-0084) which sits with the other optional future-score fields, before
-    ``provenance``/``extras`` (add-only versioning; consumers ignore unknown fields)."""
+    (ADR-0084) and the agperc2 ``options_chain`` / ``iv_rank`` slots, all of which
+    sit with the other optional future-score fields, before ``provenance``/``extras``
+    (add-only versioning; consumers ignore unknown fields)."""
     names = [fld.name for fld in dataclasses.fields(PerceptionFrame)]
     assert names == [
         "symbol",
@@ -57,6 +58,8 @@ def test_frame_field_order_matches_adr_0079():
         "convergence",
         "saturation",
         "event_risk",
+        "options_chain",  # agperc2 add-only (HERMES_QUANT_OPTIONS_PERCEIVE + options_eligible)
+        "iv_rank",        # agperc2 add-only (as-of IV-rank [0,100]; None until BOTH ON)
         "provenance",
         "extras",
     ]
@@ -76,6 +79,8 @@ def test_future_score_fields_default_safe():
     assert f.convergence is None
     assert f.saturation is None
     assert f.event_risk is None  # ADR-0084 add-only field defaults None (OFF)
+    assert f.options_chain is None  # agperc2 add-only field defaults None (OFF / not-eligible)
+    assert f.iv_rank is None  # agperc2 add-only field defaults None (abstain)
     assert f.provenance == ()
     assert dict(f.extras) == {}
 

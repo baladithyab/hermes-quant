@@ -214,6 +214,109 @@ def test_net_delta_cap_silences() -> None:
     assert res.reason == "net_delta_cap"
 
 
+def test_nan_spot_silences_not_fail_open(monkeypatch) -> None:
+    # cr02: NaN spot must FAIL CLOSED (silence), not silently pass the gamma /
+    # net-delta caps. `NaN > threshold` is always False, so without an isfinite
+    # guard a NaN spot slips past every spot-scaled cap (the canonical
+    # NaN-fail-open class the equity gate already guards at gate.py:536).
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+    res = options_gate(
+        [
+            StockLeg(underlying="NVDA", qty=100, basis_per_share=100.0),
+            _short_call("NVDA260612C00160000", delta=0.25),
+        ],
+        **_base_kwargs(
+            held_shares=100, strike=160.0, basis_per_share=100.0, min_dte=30,
+            spot=float("nan"),
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "nonfinite_market_input"
+
+
+def test_nan_nav_silences_not_fail_open(monkeypatch) -> None:
+    # cr02: NaN nav must FAIL CLOSED — every cap is `... > cfg.x * nav`, so a
+    # NaN nav makes the RHS NaN and the comparison always False (fail-open).
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+    res = options_gate(
+        [
+            StockLeg(underlying="NVDA", qty=100, basis_per_share=100.0),
+            _short_call("NVDA260612C00160000", delta=0.25),
+        ],
+        **_base_kwargs(
+            held_shares=100, strike=160.0, basis_per_share=100.0, min_dte=30,
+            nav=float("nan"),
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "nonfinite_market_input"
+
+
+def test_nan_total_bpr_silences_not_fail_open(monkeypatch) -> None:
+    # cs06 (cr02 follow-up): the cr02 guard only covered spot/nav. A NaN
+    # total_bpr reaches O6 (`if total_bpr + bpr > cfg.bpr_buffer_pct_nav * nav`),
+    # where `NaN + bpr` is NaN and `NaN > x` is always False -> the BPR-buffer
+    # check FAILS OPEN and ADMITS an under-validated structure. This is the same
+    # NaN-fail-open class cr02 fixed for spot/nav; total_bpr must FAIL CLOSED too.
+    # A CSP that is otherwise admissible (mirrors test_csp_admitted_*) isolates
+    # total_bpr as the only non-finite input.
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=20_000.0,
+            premium_received=250.0,
+            total_bpr=float("nan"),
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "nonfinite_market_input"
+
+
+def test_nan_options_buying_power_silences_not_fail_open(monkeypatch) -> None:
+    # cs06: a NaN options_buying_power flows into the CSP cash-collateral gate
+    # (`options_buying_power >= required`) and the at-size re-check; an
+    # unvalidated non-finite collateral input must FAIL CLOSED at entry rather
+    # than drive the collateral comparisons through NaN.
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=float("nan"),
+            premium_received=250.0,
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "nonfinite_market_input"
+
+
+def test_nan_premium_received_silences_not_fail_open(monkeypatch) -> None:
+    # cs06: recipes.py:225 builds premium_received as `float(short.mid or 0.0)
+    # * 100` — `or 0.0` does NOT catch a NaN mid (NaN is truthy), so a NaN
+    # premium_received reaches the gate and flows into the CSP BPR math
+    # (`strike*100*c - premium_received`), poisoning the O6 buffer comparison.
+    # A non-finite premium must FAIL CLOSED at entry.
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_GATE", "1")
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=20_000.0,
+            premium_received=float("nan"),
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False
+    assert res.reason == "nonfinite_market_input"
+
+
 def test_gamma_cap_silences() -> None:
     big = NetGreeks(gamma=10.0)  # 10 * 150^2 = 225k > 0.05 * 1M = 50k
     res = options_gate(
@@ -419,6 +522,70 @@ def test_gamma_cap_rechecked_at_admitted_size_not_one_lot() -> None:
     # The order sizes to 2 lots, whose true gamma footprint breaches the cap.
     assert res.admitted is False, "cap-breaching 2-lot order must be REJECTED, not admitted"
     assert res.reason == "portfolio_gamma_cap_at_size"
+
+
+def test_net_delta_cap_rechecked_against_true_admitted_cover_not_one_lot() -> None:
+    """REGRESSION (covered-call net-delta at-size): the net-delta cap re-check must
+    aggregate the TRUE admitted structure, i.e. the StockLeg cover scaled to
+    100*contracts shares — NOT the 1-lot StockLeg(qty=100) the production recipe
+    passes at gate time (recipes.py:261 builds qty=100; recipes.py:324 rebuilds
+    qty=100*contracts only AFTER the gate returns).
+
+    `aggregate_net_greeks(legs, order_qty=contracts)` scales the OPTION legs by
+    `contracts` (data.py:295) but leaves StockLeg.qty UNSCALED (data.py:305).
+    Pre-fix, the at-size re-check therefore evaluated the net-delta cap against
+    (100-share cover + N-lot short call) = |100 - 30N| share-deltas, which UNDER-
+    states the true |100N - 30N| = |70N| of the admitted N-lot position. The
+    understatement grows monotonically with N, so a covered call whose TRUE
+    admitted net delta breaches the directional cap slips past the gate (fail-OPEN).
+
+    Construction (the claim scenario, every value pins the boundary):
+      NAV=300k, spot=20, basis=25 -> collateral_per_contract = 25*100 = 2_500
+      kelly_target = 300_000 * 0.25 * 0.10 = 7_500
+        (action_step 0.05*nav=15_000 floors 7_500 to 0 -> falls back to 7_500)
+      contracts = floor(7_500 / 2_500) = 3   (> structural_contracts=1)
+      max_net_delta_pct_nav = 0.005 -> directional cap = 0.005 * 300_000 = $1_500
+
+      short call delta = +0.30 (== cap, NOT > cap, passes the per-leg O-D4 rule).
+      structural (1-lot) net delta = +100 - 30 = +70 -> |70*20| = $1_400 < $1_500
+        (the pre-sizing net-delta check PASSES at 1 lot)
+      BUGGY at-size aggregate (stock UNSCALED) = +100 - 90 = +10
+        -> |10*20| = $200 < $1_500  (pre-fix ADMITS the over-cap 3-lot CC)
+      TRUE  at-size aggregate (stock = 100*3=300 shares) = +300 - 90 = +210
+        -> |210*20| = $4_200 > $1_500  (breaches the cap by ~2.8x)
+
+    Short call carries positive theta (theta-collecting) and small gamma/vega, so
+    the gamma/theta/vega at-size re-checks all pass cleanly; the net-delta-at-size
+    check is demonstrably the binding reject. This path is otherwise uncovered:
+    the existing at-size tests hand-build pre-scaled stock legs (qty=1000) and only
+    exercise gamma/BPR/collateral (which do not depend on stock delta).
+    """
+    delta_cap_cfg = OptionsRiskConfig(max_net_delta_pct_nav=0.005)
+    res = options_gate(
+        # Production recipe leg layout: 1-lot StockLeg cover + short call.
+        [
+            StockLeg(underlying="NVDA", qty=100, basis_per_share=25.0),
+            _short_call("NVDA260612C00022000", delta=0.30),
+        ],
+        **_base_kwargs(
+            cfg=delta_cap_cfg,
+            nav=300_000.0,
+            spot=20.0,
+            held_shares=300,  # covers the admitted 3 lots (structural classify=1 lot)
+            strike=22.0,
+            basis_per_share=25.0,
+            min_dte=30,
+            premium_received=200.0,
+        ),
+    )
+    # The order sizes to 3 lots; the TRUE 3-lot net delta ($4,200) breaches the
+    # $1,500 directional cap. The gate can only REJECT — it must not admit it.
+    assert res.contracts == 0
+    assert res.admitted is False, (
+        "over-the-cap 3-lot covered call must be REJECTED — the at-size net-delta "
+        "re-check must scale the stock cover to the admitted lot count"
+    )
+    assert res.reason == "net_delta_cap_at_size"
 
 
 # ---------------------------------------------------------------------------
@@ -806,3 +973,372 @@ def test_non_greeks_exception_silences_with_distinct_reason_not_mislabeled(caplo
     assert any(
         "unexpected error aggregating" in rec.getMessage() for rec in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# Cumulative assignment-cash cap (ADR-0027 D2 max_assignment_risk_pct_nav,
+# D4 wheel HARD rule: Sum of CSP cash reservations + CC stock basis <=
+# max_assignment_risk_pct_nav). Before this fix the cap was DECLARED on the
+# config (default 0.20) but enforced by NO O-rule: each CSP was admitted
+# individually, so N separate cash-secured puts could reserve cumulative
+# all-CSPs-assign cash far past 20% NAV — the exact tail this cap exists to
+# bound was silently uncapped.
+# ---------------------------------------------------------------------------
+
+
+def test_csp_silenced_when_cumulative_assignment_cash_exceeds_cap() -> None:
+    """RED: a second CSP whose incremental assignment cash pushes the cumulative
+    open CSP collateral past max_assignment_risk_pct_nav*nav MUST silence.
+
+    Construction (every value pins the boundary):
+      nav=1_000_000, cap=0.20 -> max cumulative assignment cash = 200_000
+      strike=100 -> incremental assignment cash = strike*100*contracts
+      kelly_target = 1_000_000 * 0.25 * 0.10 = 25_000
+        (action_step 0.05*nav=50_000 floors to 0 -> falls back to un-stepped 25_000)
+      contracts = floor(25_000 / (strike*100=10_000)) = 2
+      incremental = 100 * 100 * 2 = 20_000
+      open_assignment_cash = 185_000 (already-reserved collateral from prior CSPs)
+        185_000 + 20_000 = 205_000 > 200_000  => MUST REJECT
+    Zero gamma/vega/theta so the greek/BPR/collateral re-checks all pass cleanly;
+    the cumulative-assignment cap is demonstrably the binding reject.
+    """
+    flat_put = OptionLeg(
+        symbol="NVDA260612P00100000",
+        side="sell",
+        position_intent="sell_to_open",
+        greeks_at_decision=OptionGreeksSnapshot(
+            delta=-0.25, gamma=0.0, theta=0.05, vega=0.0, rho=-0.01
+        ),
+    )
+    res = options_gate(
+        [flat_put],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            nav=1_000_000.0,
+            strike=100.0,
+            options_buying_power=1_000_000.0,  # >> 2-lot collateral; isolates the cap
+            premium_received=250.0,
+            total_bpr=0.0,
+            min_dte=30,
+            open_assignment_cash=185_000.0,  # prior CSP reservations near the cap
+        ),
+    )
+    assert res.admitted is False, "cumulative-over-cap CSP must be REJECTED"
+    assert res.reason == "cumulative_assignment_risk_cap"
+    assert res.contracts == 0
+
+
+def test_csp_admitted_when_cumulative_assignment_cash_below_cap() -> None:
+    """Same construction as the reject case, but with open_assignment_cash low
+    enough that cumulative stays under the cap -> still admitted (the new rule is
+    purely additive; it never blocks a within-budget CSP).
+
+      open_assignment_cash = 100_000 ; incremental = 20_000
+      100_000 + 20_000 = 120_000 <= 200_000  => ADMIT
+    """
+    flat_put = OptionLeg(
+        symbol="NVDA260612P00100000",
+        side="sell",
+        position_intent="sell_to_open",
+        greeks_at_decision=OptionGreeksSnapshot(
+            delta=-0.25, gamma=0.0, theta=0.05, vega=0.0, rho=-0.01
+        ),
+    )
+    res = options_gate(
+        [flat_put],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            nav=1_000_000.0,
+            strike=100.0,
+            options_buying_power=1_000_000.0,
+            premium_received=250.0,
+            total_bpr=0.0,
+            min_dte=30,
+            open_assignment_cash=100_000.0,
+        ),
+    )
+    assert res.admitted is True
+    assert res.bucket == StructureBucket.CASH_SECURED_PUT
+    assert res.contracts == 2
+
+
+def test_csp_default_open_assignment_cash_is_byte_identical() -> None:
+    """Non-regression: omitting open_assignment_cash (default 0.0) preserves the
+    pre-fix admit on a single within-budget CSP — the new input defaults to no-op.
+    """
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=20_000.0,
+            premium_received=250.0,
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is True
+    assert res.bucket == StructureBucket.CASH_SECURED_PUT
+
+
+def test_csp_nan_open_assignment_cash_fails_closed() -> None:
+    """A NaN open_assignment_cash must FAIL CLOSED (silence), never admit. A NaN
+    defeats the `>` comparison (nan > x is always False), so a naive cap check
+    would silently admit — the recurring NaN-defeats-gate fail-open family. Mirror
+    the math.isfinite money-input guards."""
+    res = options_gate(
+        [_short_put("NVDA260612P00140000", delta=-0.25)],
+        **_base_kwargs(
+            strategy_kind="cash_secured_put",
+            strike=140.0,
+            options_buying_power=1_000_000.0,
+            premium_received=250.0,
+            min_dte=30,
+            open_assignment_cash=float("nan"),
+        ),
+    )
+    assert res.admitted is False, "NaN open_assignment_cash must fail closed"
+    assert res.reason == "open_assignment_cash_not_finite"
+    assert res.contracts == 0
+
+
+def test_covered_call_cumulative_assignment_cap_counts_stock_basis() -> None:
+    """The cap also bounds CC stock basis (ADR-0027 D4 wheel rule: 'Sum of CSP
+    cash reservations + CC stock basis <= max_assignment_risk_pct_nav'). A CC whose
+    incremental stock basis (basis_per_share*100*contracts) pushes cumulative past
+    the cap must silence.
+
+      nav=1_000_000, cap=0.20 -> 200_000
+      basis_per_share=100 -> incremental = 100*100*contracts
+      kelly_target = 25_000 ; contracts = floor(25_000 / (basis*100=10_000)) = 2
+      incremental = 100*100*2 = 20_000
+      open_assignment_cash = 190_000 -> 190_000 + 20_000 = 210_000 > 200_000 REJECT
+    """
+    res = options_gate(
+        [
+            StockLeg(underlying="NVDA", qty=100, basis_per_share=100.0),
+            _short_call("NVDA260612C00160000", delta=0.25, theta=0.05),
+        ],
+        **_base_kwargs(
+            held_shares=100_000,  # plenty of cover for any admitted size
+            nav=1_000_000.0,
+            strike=160.0,
+            basis_per_share=100.0,
+            min_dte=30,
+            open_assignment_cash=190_000.0,
+        ),
+    )
+    assert res.admitted is False, "cumulative-over-cap CC must be REJECTED"
+    assert res.reason == "cumulative_assignment_risk_cap"
+    assert res.contracts == 0
+
+
+# ---------------------------------------------------------------------------
+# DEFINED_RISK options-buying-power floor (8c66)
+#
+# A defined-risk credit/debit spread/condor DOES consume margin — the max_loss
+# (credit: width-net_credit; debit: premium paid) IS the collateral the broker
+# reserves. The pre-fix DEFINED_RISK admission (O1) checked ONLY "max_loss finite
+# AND <= max_position_pct*nav" with NO options-buying-power floor; only the CSP
+# path checked BP. So a vertical/condor passed the NAV caps against ZERO real
+# broker options BP. The autonomous originate path (autonomous.py:2360) passes
+# options_buying_power=0.0 (a placeholder until a real options-BP read is wired),
+# so an ARMED autonomous spread would admit against fabricated/zero BP — a
+# fail-open. Mirror the CSP BP-floor idiom: admit a defined-risk structure iff
+# options_buying_power covers its buying-power reduction (bpr / required margin),
+# else silence (fail-CLOSED).
+# ---------------------------------------------------------------------------
+
+
+def test_defined_risk_zero_buying_power_silenced_was_admitted() -> None:
+    """RED: a debit vertical (DEFINED_RISK) with options_buying_power=0.0 — the
+    EXACT autonomous originate scenario (autonomous.py:2360 passes 0.0) — was
+    ADMITTED pre-fix (the O1 block never checked BP) and MUST now be SILENCED.
+
+    Construction mirrors test_debit_vertical_defined_risk_admitted (which uses the
+    default options_buying_power=500_000.0 and still admits), changing ONLY the BP
+    to 0.0 to isolate the missing floor:
+      net_debit=2.0 -> max_loss = bpr (required margin) = 2.0*100*1 = 200.0
+      max_loss 200 <= max_position_pct*nav (0.10*1M=100_000) PASSES the NAV cap.
+      options_buying_power=0.0 < bpr=200 -> NEW floor REJECTS (fail-closed).
+    Pre-fix value: res.admitted == True (no BP floor) — the fail-open this fixes.
+    """
+    legs = [
+        _long_call("NVDA260612C00140000", delta=0.30),
+        _short_call("NVDA260612C00150000", delta=0.18),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            strike=150.0,
+            width=10.0,
+            net_debit=2.0,
+            premium_paid=2.0 * 100,
+            options_buying_power=0.0,  # << the autonomous placeholder; was admitted
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, (
+        "a defined-risk spread with ZERO options buying power must be SILENCED — "
+        "admitting it against fabricated/zero BP is a fail-open"
+    )
+    assert res.bucket == StructureBucket.DEFINED_RISK
+    assert res.reason == "insufficient_options_buying_power"
+    assert res.contracts == 0
+
+
+def test_defined_risk_buying_power_below_bpr_silenced() -> None:
+    """RED: a credit vertical whose required margin (bpr) EXCEEDS the available
+    options buying power MUST be SILENCED — positive-but-insufficient BP is still a
+    naked/over-leveraged admission.
+
+    Construction (every value pins the boundary):
+      credit vertical: width=10.0, net_credit=3.0
+      -> max_loss = bpr (required margin) = (width-net_credit)*100*1 = 700.0
+      max_loss 700 <= 0.10*1M=100_000 PASSES the NAV cap.
+      options_buying_power=500.0 (>0, so the <=0 leg does NOT fire) but < bpr=700
+      -> the bpr floor REJECTS.
+    Pre-fix: admitted == True (no BP floor at all).
+    """
+    legs = [
+        _short_call("NVDA260612C00150000", delta=0.18),
+        _long_call("NVDA260612C00160000", delta=0.10),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            strike=150.0,
+            width=10.0,
+            net_credit=3.0,
+            options_buying_power=500.0,  # >0 but < bpr=700 (required margin)
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, (
+        "a defined-risk spread whose required margin exceeds the available options "
+        "buying power must be SILENCED (fail-closed)"
+    )
+    assert res.bucket == StructureBucket.DEFINED_RISK
+    assert res.reason == "insufficient_options_buying_power"
+    assert res.contracts == 0
+
+
+def test_defined_risk_sufficient_buying_power_still_admits() -> None:
+    """A defined-risk debit vertical with buying power >= its required margin
+    (bpr) still admits — the floor is purely additive; it never blocks a properly
+    margined structure. Mirrors test_debit_vertical_defined_risk_admitted.
+
+      net_debit=2.0 -> bpr = 200.0 ; options_buying_power=10_000 >= 200 -> ADMIT.
+    """
+    legs = [
+        _long_call("NVDA260612C00140000", delta=0.30),
+        _short_call("NVDA260612C00150000", delta=0.18),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            strike=150.0,
+            width=10.0,
+            net_debit=2.0,
+            premium_paid=2.0 * 100,
+            options_buying_power=10_000.0,  # >> bpr=200
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is True
+    assert res.bucket == StructureBucket.DEFINED_RISK
+    assert res.max_loss == pytest.approx(200.0)
+
+
+def test_defined_risk_nan_buying_power_does_not_admit() -> None:
+    """A NaN options_buying_power on a defined-risk spread must NOT admit. NOTE
+    (wave4-review): this pins the ENTRY finite-guard (`nonfinite_market_input`),
+    NOT the new defined-risk floor — a NaN BP is rejected at entry before the floor
+    runs. Kept as a defense-in-depth assertion; the floor's OWN finite behavior is
+    pinned by test_defined_risk_nonfinite_bpr_does_not_admit below."""
+    legs = [
+        _long_call("NVDA260612C00140000", delta=0.30),
+        _short_call("NVDA260612C00150000", delta=0.18),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            strike=150.0,
+            width=10.0,
+            net_debit=2.0,
+            premium_paid=2.0 * 100,
+            options_buying_power=float("nan"),
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, "NaN options buying power must fail closed"
+    assert res.reason == "nonfinite_market_input"  # the entry guard, not the floor
+    assert res.contracts == 0
+
+
+def test_defined_risk_nonfinite_bpr_does_not_admit() -> None:
+    """wave4-review (8c66 vacuous-test fix): pin the floor's OWN bpr finite-guard.
+    A NON-finite required margin (bpr) — driven by a non-finite width/net_credit
+    that is NOT entry-guarded — must REJECT (nan >= x is always False, so without
+    the `not math.isfinite(bpr)` clause the floor would silently ADMIT). Here the
+    BP is FINITE (so the entry guard + the <=0 / <bpr legs do not fire); only the
+    `not math.isfinite(bpr)` clause can reject. RED-proof: drop that clause and a
+    non-finite-bpr spread admits."""
+    # A CREDIT vertical: _bpr = (width - net_credit)*100*c, so a non-finite width
+    # makes bpr non-finite (the debit branch returns premium_paid, which stays finite —
+    # so a credit structure is the right vehicle to exercise the bpr finite-guard).
+    legs = [
+        _short_call("NVDA260612C00150000", delta=0.18),
+        _long_call("NVDA260612C00160000", delta=0.10),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            strike=150.0,
+            width=float("inf"),       # non-finite width -> bpr=(inf-net_credit)*100 = inf
+            net_credit=3.0,
+            options_buying_power=1_000_000.0,  # FINITE + huge: only the bpr-finite clause can reject
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, "a non-finite required margin (bpr) must fail closed"
+    assert res.contracts == 0
+
+
+def test_defined_risk_buying_power_covers_one_lot_not_admitted_size() -> None:
+    """wave4-review (8c66 AT-SIZE fix): the structural-size BP floor (1 unit) is not
+    enough — _size_contracts admits MORE lots and bpr scales linearly. A spread whose
+    1-lot bpr is covered but whose AT-SIZE bpr is not must be SILENCED at size.
+
+    Construction (mirrors the CSP at-size test):
+      credit vertical width=10, net_credit=3 -> bpr/lot = (10-3)*100 = 700
+      nav=80_000 -> kelly_target = 80_000*0.25*0.10 = 2_000; contracts = floor sizing > 1
+      options_buying_power chosen to cover 1 lot (700) but NOT the admitted N lots.
+    Pre-fix (structural-only floor): admitted at N lots needing N*700 BP that is absent."""
+    legs = [
+        _short_call("NVDA260612C00150000", delta=0.18),
+        _long_call("NVDA260612C00160000", delta=0.10),
+    ]
+    res = options_gate(
+        legs,
+        **_base_kwargs(
+            strategy_kind="vertical_spread",
+            nav=80_000.0,
+            strike=150.0,
+            width=10.0,
+            net_credit=3.0,
+            options_buying_power=900.0,  # covers 1 lot (700) but not 2 (1400)
+            total_bpr=0.0,
+            min_dte=30,
+        ),
+    )
+    assert res.admitted is False, (
+        "a defined-risk spread admitted at >1 lot whose AT-SIZE required margin exceeds "
+        "options buying power must be SILENCED (the structural 1-lot floor is insufficient)"
+    )
+    assert res.reason == "defined_risk_insufficient_options_buying_power_at_size"
+    assert res.contracts == 0

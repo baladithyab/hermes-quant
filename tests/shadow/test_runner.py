@@ -183,10 +183,60 @@ class TestCompareToReal:
     def test_returns_comparison_report(self, runner: ShadowAccountRunner):
         runner.replay_session(THREE_DAY_EVENTS, PRICES)
         for acct in runner.accounts.values():
-            acct.mark_to_market({"AAPL": 190.0, "TSLA": 255.0})
+            # Stamp the MTM row to the historical session date (mirrors the
+            # harness) — otherwise the wall-clock-now asof falls outside the
+            # session and compare_to_real silently reports every rule as 0.0.
+            acct.mark_to_market({"AAPL": 190.0, "TSLA": 255.0}, asof=date(2025, 6, 12))
 
         report = runner.compare_to_real(real_pnl=50.0, asof=date(2025, 6, 12))
         assert isinstance(report, ShadowComparisonReport)
+        # Non-vacuity: at least one rule that actually traded must report a
+        # non-zero P&L for a historical replay. If the terminal MTM row is
+        # dropped by the <= session_date filter, every rule reads 0.0 and this
+        # assertion fails — the original bug.
+        assert any(abs(p) > 1e-6 for p in report.shadow_pnls.values()), (
+            "all shadow P&Ls are 0.0 — the terminal mark-to-market row was "
+            "dropped from compare_to_real for the historical session"
+        )
+
+
+class TestHistoricalReplayMarkToMarket:
+    """Regression: shadow rule P&L must not be reported as $0.00 for a
+    historical replay where the terminal mark_to_market is stamped to the
+    session date (the documented '--from .. --to ..' usage).
+    """
+
+    def test_terminal_mtm_counted_for_historical_session(self, runner: ShadowAccountRunner):
+        # One Day-1 buy of AAPL @ 180; mark to market at a much higher 220 so
+        # the session has a clearly non-zero (positive) P&L move.
+        events = [
+            _make_event("h1", DAY1, direction="buy", ticker="AAPL", vote_share=0.80,
+                        analysts=["semantic", "sentiment", "classical_ta"], ta_direction="buy"),
+        ]
+        prices: dict[str, dict[date, float]] = {
+            "AAPL": {date(2025, 6, 10): 180.0, date(2025, 6, 15): 220.0},
+        }
+        runner.replay_session(events, prices)
+
+        # Mark to market at end-date prices, stamped to the historical session
+        # end (exactly what scripts/shadow-replay-daily.py does).
+        for acct in runner.accounts.values():
+            acct.mark_to_market({"AAPL": 220.0}, asof=date(2025, 6, 15))
+
+        report = runner.compare_to_real(real_pnl=-1000.0, asof=date(2025, 6, 15))
+
+        # always_follow_advisor went long into a rising market → strictly
+        # positive shadow P&L (and a genuine winner vs the -1000 real P&L).
+        assert report.shadow_pnls["always_follow_advisor"] > 0.0
+        # inverse_consensus shorts the same rising market → it LOSES money and
+        # must NOT be a fictional counterfactual winner.
+        assert report.shadow_pnls["inverse_consensus"] < 0.0
+        assert "inverse_consensus" not in report.counterfactual_winners
+        # biggest_alpha must reflect a real (non-zero-derived) advantage.
+        best_rule, best_alpha = report.biggest_alpha
+        assert best_alpha == pytest.approx(
+            report.shadow_pnls[best_rule] - (-1000.0)
+        )
 
     def test_real_pnl_stored(self, runner: ShadowAccountRunner):
         runner.replay_session(THREE_DAY_EVENTS, PRICES)

@@ -1,6 +1,7 @@
 """hermes_quant.journal.writer — Atomic-rename markdown journal writer.
 
-Per ADR-0010 §Decision §4: write `.tmp` → fsync → rename. Crash-safe.
+Per ADR-0010 §Decision §4: write `.tmp` → fsync file → rename → fsync
+parent dir. Crash-safe.
 Per §8: Pydantic-only mutator surface; markdown is a render derivative.
 
 Locking: a single mutex on the file path so concurrent in-process writes
@@ -21,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 from .models import AnalystComponent, Reflection, SettlementEntry
 from .reader import parse_journal
 from .render import ENTRY_DELIM, JOURNAL_HEADER, render_journal
@@ -31,7 +34,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_JOURNAL_PATH = (
     Path(os.environ.get("HERMES_QUANT_JOURNAL_PATH", ""))
     if os.environ.get("HERMES_QUANT_JOURNAL_PATH")
-    else Path.home() / ".hermes" / "quant" / "journal.md"
+    else _resolve_quant_home() / "journal.md"
 )
 
 
@@ -211,7 +214,14 @@ def append_human_override(
     ]
 
     decision_price = float(advisor_result.get("decision_price") or 0.0)
-    benchmark_symbol = _benchmark_for(proposal.asset_class)
+    # jw1: tolerate a MultiLegProposal (asset_class/symbol absent; carries `underlying`).
+    # An equity Proposal has both fields, so this is byte-identical for it; a multi-leg
+    # close/origination journals as asset_class='multi_leg', symbol=underlying instead of
+    # raising AttributeError into the swallowing BLE001 (which silently dropped the audit
+    # entry on EVERY autonomous options fire — the ADR-0029 evidence trail).
+    _asset_class = getattr(proposal, "asset_class", None) or "multi_leg"
+    _symbol = getattr(proposal, "symbol", None) or getattr(proposal, "underlying", "") or ""
+    benchmark_symbol = _benchmark_for(_asset_class)
 
     entry = SettlementEntry(
         entry_id=proposal.proposal_id,
@@ -223,8 +233,8 @@ def append_human_override(
             or _parse_iso_safe(advisor_result.get("as_of"))
             or _utc_now()
         ),
-        symbol=proposal.symbol,
-        asset_class=proposal.asset_class,
+        symbol=_symbol,
+        asset_class=_asset_class,
         direction=int(sig.get("direction", 0)),
         confidence=float(sig.get("confidence", 0.0)),
         target_position_pct=float(rg.get("kelly_fraction", 0.0)),
@@ -265,7 +275,17 @@ def append_human_override(
 
 
 def _atomic_write(target: Path, content: str) -> None:
-    """Write content to target.tmp, fsync, rename. Crash-safe."""
+    """Write content to target.tmp, fsync file, rename, fsync parent dir.
+
+    Crash-safe. This is the ADR-0010 settlement ledger (module docstring §1-4):
+    settlement_loop derives the always-on ADR-0016 kill-switch realized-P&L
+    basis from these entries, so a lost append/resolve understates the drawdown
+    and the rail fails OPEN. POSIX rename(2) only guarantees the new directory
+    entry survives a crash AFTER the CONTAINING DIRECTORY is itself fsync'd —
+    fsyncing only the file data leaves a window after os.replace in which a
+    power-loss can revert the rename. So we fsync the parent dir too (best
+    effort; mirrors the sibling durable writer governance/kill_switch).
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -274,26 +294,92 @@ def _atomic_write(target: Path, content: str) -> None:
         os.fsync(f.fileno())
     # Atomic rename. On POSIX this is hostile-thread-safe.
     os.replace(tmp, target)
+    # Parent-dir fsync so the rename itself survives a crash.
+    try:
+        dfd = os.open(str(target.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        logger.warning(
+            "journal: parent-dir fsync failed for %s; rename may not be "
+            "crash-durable",
+            target.parent,
+        )
 
 
 def _load_entries_safe(target: Path) -> list[SettlementEntry]:
-    """Read existing entries; tolerate missing or corrupt file."""
+    """Read existing entries; tolerate a missing, empty, or partially-corrupt
+    file WITHOUT discarding the entries that still parse.
+
+    Per ADR-0010 this is the settlement ledger: silently dropping prior
+    PENDING entries is a data-loss defect (ar22). A torn write — an
+    invalid-UTF-8 tail, a truncated mid-entry block, or one mangled meta
+    line — must recover every entry whose META_BEGIN/META_END block is
+    still intact. ``parse_journal`` is already block-by-block tolerant; the
+    only thing that defeats it is ``read_text(encoding="utf-8")`` raising a
+    ``UnicodeDecodeError`` on the bad bytes *before* the parser ever runs.
+
+    So we read bytes and decode with ``errors="replace"``: the corrupt tail
+    becomes replacement chars (which fail to form a valid meta block and are
+    skipped), while the valid entries ahead of it survive. We still keep a
+    ``.bak`` safety copy when bytes were undecodable — but we COPY rather
+    than rename, so the live ledger keeps the recovered entries and the next
+    atomic write rewrites a clean file. Only a hard read error (the bytes
+    themselves are unreadable) falls back to ``[]``.
+    """
     if not target.exists():
         return []
     try:
-        return parse_journal(target.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
+        raw = target.read_bytes()
+    except OSError as exc:
         logger.warning(
-            "journal: parse failed for %s — %s. Starting fresh; backing up "
-            "old file as journal.md.bak",
+            "journal: could not read %s (%s); treating as empty without "
+            "touching the file",
             target,
             exc,
         )
+        return []
+
+    if not raw.strip():
+        return []
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # Torn write: salvage every entry whose block is still valid UTF-8
+        # rather than discarding the whole ledger.
+        logger.warning(
+            "journal: %s has undecodable bytes (%s); recovering parseable "
+            "entries and backing up the corrupt file as %s.bak",
+            target,
+            exc,
+            target.name,
+        )
+        text = raw.decode("utf-8", errors="replace")
         backup = target.with_suffix(target.suffix + ".bak")
         try:
-            target.rename(backup)
+            backup.write_bytes(raw)  # copy, don't rename — keep the live file
         except OSError:
-            logger.warning("journal: backup rename also failed; skipping")
+            logger.warning("journal: backup copy failed; continuing recovery")
+
+    try:
+        return parse_journal(text)
+    except Exception as exc:  # noqa: BLE001 — defensive; parse_journal is tolerant
+        logger.warning(
+            "journal: parse failed for %s — %s. Backing up as %s.bak and "
+            "starting fresh.",
+            target,
+            exc,
+            target.name,
+        )
+        backup = target.with_suffix(target.suffix + ".bak")
+        try:
+            if not backup.exists():
+                backup.write_bytes(raw)
+        except OSError:
+            logger.warning("journal: backup copy also failed; skipping")
         return []
 
 

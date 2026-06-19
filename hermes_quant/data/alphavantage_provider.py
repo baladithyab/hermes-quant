@@ -260,8 +260,17 @@ class AlphaVantageProvider:
             asset: ticker symbol (e.g. 'IBM', 'SPY').
             timeframe: must be '1d' (free tier daily only).
             start, end: UTC range. AV ``compact`` returns the last ~100 daily
-                bars regardless; we filter to ``timestamp <= as_of`` only (no
-                lower-bound prune so the chain gets the full free-tier window).
+                bars regardless of ``start``/``end`` (the params dict never
+                forwards them to the HTTP request — documented AV behavior).
+                We do NOT lower-bound prune (the chain gets the full free-tier
+                window) but we DO upper-bound prune: bars later than the
+                tightest of ``as_of`` and ``end`` are dropped. This closes the
+                no-lookahead leak on the ``fetch_with_chain`` path, which calls
+                ``fetch_bars`` WITHOUT ``as_of`` — without the ``end`` prune the
+                full ~100-bar window up to wall-clock today would be returned
+                regardless of the backtest's requested ``end`` anchor. ``end``
+                is the implicit cutoff when ``as_of`` is absent; ``end=None``
+                (genuine up-to-now request) is the only no-upper-prune case.
             use_cache: accepted for interface symmetry; the provider itself
                 does not cache (a read-through cache is layered above via
                 data.cache, per R-B22 quota-preservation note).
@@ -364,17 +373,48 @@ class AlphaVantageProvider:
         self._last_fetch_at = pd.Timestamp.utcnow()
         self._n_fetches += 1
 
-        # Leaf-level no-lookahead filter (identical handling to yfinance).
-        if as_of is not None:
-            cutoff = as_of
-            if cutoff.tzinfo is None:
-                cutoff = cutoff.tz_localize("UTC")
-            cutoff_naive = cutoff.tz_convert("UTC").tz_localize(None)
+        # Leaf-level no-lookahead upper-bound prune (cs11). AV ignores
+        # start/end on the wire, so the only protection against returning bars
+        # later than the backtest anchor is this post-filter. The cutoff is the
+        # TIGHTEST (earliest) of as_of and end:
+        #   - as_of provided  -> the explicit no-lookahead cutoff (unchanged
+        #     behavior; the canonical advisor/builder path passes as_of==end).
+        #   - end provided     -> the implicit cutoff for callers that omit
+        #     as_of, e.g. fetch_with_chain (data/base.py) which never forwards
+        #     as_of. Without this, the full ~100-bar window up to wall-clock
+        #     today leaked past the requested `end`.
+        # Taking min() means the end-prune only ADDS protection — it can never
+        # return a bar later than as_of, so existing as_of behavior is never
+        # weakened. end=None (genuine up-to-now) is the only no-prune case.
+        cutoff_naive = self._tightest_cutoff(as_of, end)
+        if cutoff_naive is not None:
             validated = validated[validated["timestamp"] <= cutoff_naive].reset_index(
                 drop=True
             )
 
         return validated
+
+    @staticmethod
+    def _tightest_cutoff(
+        as_of: pd.Timestamp | None, end: pd.Timestamp | None
+    ) -> pd.Timestamp | None:
+        """Return the tz-naive-UTC min() of the provided as_of / end cutoffs.
+
+        validate_bars stores timestamps tz-naive UTC, so the cutoff must be
+        normalized to tz-naive UTC for a TypeError-free comparison under pandas
+        2.x. Returns None only when BOTH are None (genuine up-to-now request).
+        """
+        cutoffs: list[pd.Timestamp] = []
+        for raw in (as_of, end):
+            if raw is None:
+                continue
+            ts = pd.Timestamp(raw)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            cutoffs.append(ts.tz_convert("UTC").tz_localize(None))
+        if not cutoffs:
+            return None
+        return min(cutoffs)
 
     def fetch_latest(
         self,

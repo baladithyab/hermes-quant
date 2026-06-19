@@ -7,6 +7,7 @@ The stores are deliberately filesystem-first: JSON artifacts under
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Any, Literal
 import pandas as pd
 
 from hermes_quant.aggregators.deliberative import CommitteeTurn
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.semantic import (
     SemanticPacket,
     parse_semantic_packet,
@@ -22,7 +24,7 @@ from hermes_quant.semantic import (
     validate_semantic_packet,
 )
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 SEMANTIC_PACKET_DIR = QUANT_HOME / "semantic_packets"
 COMMITTEE_TURN_DIR = QUANT_HOME / "committee_turns"
 
@@ -35,10 +37,33 @@ def safe_asset_path(asset: str) -> str:
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
+    """Durably write ``payload`` as JSON to ``path`` via tmp + fsync + rename.
+
+    Crash-safety contract (money-software discipline): the spend ledger and the
+    perception/decision artifacts persisted through this primitive must survive
+    a power-loss/kernel-panic. We therefore flush + fsync the tmp file BEFORE
+    the rename (so the new data is durable) and fsync the parent directory
+    AFTER the rename (so the rename metadata itself survives). Without these,
+    the OS can lose both the tmp page-cache data and the rename in the
+    page-cache-flush window, reverting the file to its prior valid-but-stale
+    contents — for the LLM budget ledger that silently re-opens already-spent
+    budget (fail-open). Mirrors governance/kill_switch, journal/writer,
+    daemon/signal_bus, watchlist, autonomous, playbook/watchlist_evolution.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    tmp.replace(path)
+    data = json.dumps(payload, indent=2, sort_keys=True, default=str)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    # Fsync the parent directory so the rename survives a crash too.
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def write_semantic_packet(

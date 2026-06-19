@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-85 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
+98 ADRs — **generated** index (regenerate with `python ops/scripts/quant-adr-index.py --write`; do not hand-maintain).
 
 Status vocabulary: proposed | accepted | rejected | deprecated | superseded by ADR-NNNN. A compound status (e.g. "Part A accepted; Part B proposed") is the ADR's own — see the file.
 
@@ -91,3 +91,16 @@ Status vocabulary: proposed | accepted | rejected | deprecated | superseded by A
 | [ADR-0085](ADR-0085-ledger-authority-and-state-derivation.md) | executions.jsonl is the authoritative event log; state.db is a derived projection | Accepted (2026-06-01), implemented | 2026-06-01 |
 | [ADR-0086](ADR-0086-ledger-share-quantity-dollar-accounting.md) | Migrate the paper ledger to share-quantity + dollar accounting with mark-to-market equity | proposed | 2026-06-02 |
 | [ADR-0087](ADR-0087-centralize-portfolio-cap-at-reactor-seam.md) | Centralize the portfolio-cap clip at the PaperReactor.execute() seam | proposed | 2026-06-02 |
+| [ADR-0088](ADR-0088-pluggable-broker-backends-and-options-across-reactors.md) | Pluggable broker backends + stock-and-options across both reactors | proposed | 2026-06-05 |
+| [ADR-0089](ADR-0089-overnight-drift-conviction-modulator.md) | OvernightDriftAnalyst — a zero-turnover conviction modulator on hold-through-close daily positions | Proposed (2026-06-08) — IMPLEMENTED + eval-gated; analyst stays DEFAULT-OFF. Single-SPY ablation returned HOLD; multi-name fair re-test (QQQ/ARKK/TSLA/NVDA/GME/COIN) CONFIRMS HOLD decisively (d_sharpe −1.273, worse on every axis even on the research-favored cohort). Re-open now needs signal RE-DESIGN, not a universe change. See Acceptance gate + `docs/research/2026-06-08-multiname-fair-verdict-retest.md`. | 2026-06-08 |
+| [ADR-0090](ADR-0090-sizing-aware-portfolio-backtest-mode.md) | Sizing-aware multi-name portfolio backtest mode for trustworthy flag verdicts | Proposed (2026-06-08) — design + rationale pinned; build DEFERRED to operator greenlight (substantial new harness mode) | 2026-06-08 |
+| [ADR-0091](ADR-0091-reactors-emit-traded-delta.md) | Resolve the fill-size delta-vs-target accounting defect (carry-forward fold, not producer rewrite) | accepted | 2026-06-10 |
+| [ADR-0092](ADR-0092-shared-pdr-core-two-integration-shells.md) | Extract a shared host-agnostic PDR core; hermes-quant and cowork-quant become thin integration shells over it | proposed | 2026-06-12 |
+| [ADR-0093](ADR-0093-host-neutral-product-name.md) | Adopt a host-neutral product name for the shared PDR core; "hermes-quant" is demoted to a shell name | accepted | 2026-06-17 |
+| [ADR-0094](ADR-0094-deliberation-adapters.md) | Pluggable deliberation adapters — full host delegation when embedded, bounded by a provider-blind boundary | proposed | 2026-06-17 |
+| [ADR-0095](ADR-0095-single-contract-source-of-truth.md) | One canonical contract — collapse the duplicated AnalystView / Proposal / Fill definitions | proposed | 2026-06-17 |
+| [ADR-0096](ADR-0096-pre-autonomous-decision-quality-gates.md) | Pre-autonomous decision-quality gates — correlation sizing, human-filter honesty, calibration warm-up, regime uncertainty | proposed | 2026-06-17 |
+| [ADR-0097](ADR-0097-paper-vs-live-slippage-haircut.md) | Paper-vs-live slippage haircut — make the paper track record live-realistic before it gates capital | accepted (eval-gate-pending) | 2026-06-17 |
+| [ADR-0098](ADR-0098-options-strategy-taxonomy-and-two-level-multileg.md) | AEGIS strategy taxonomy (admissible structures) + the 2-level multi-leg model | accepted (eval-gate-pending) | 2026-06-17 |
+| [ADR-0099](ADR-0099-tpsl-strategy-and-clean-window-gates.md) | TP/SL strategy (tranche/trailing/greeks), stock-options parity, and the clean-window gates | accepted (eval-gate-pending) | 2026-06-17 |
+| [ADR-0100](ADR-0100-openbb-perception-provider-and-source-parity.md) | OpenBB as a host-blind Perception provider + TradingAgents source parity | accepted (eval-gate-pending) | 2026-06-17 |

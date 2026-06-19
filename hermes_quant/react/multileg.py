@@ -249,6 +249,40 @@ class MultiLegPaperReactor:
             proposal, leg_fills, fill_size_pct=fill_size_pct, asof_execution=now
         )
 
+        # ── Step 6.5: portfolio gross-exposure cap (cs55; ADR-0087 parity). ─────
+        # DEFAULT-OFF behind HERMES_QUANT_PORTFOLIO_CAPS, like PaperReactor's
+        # _portfolio_cap_clip. The equity reactor caps single-symbol gross; the
+        # multi-leg path had NO aggregate gross-exposure clip, so a family could
+        # open even when PORTFOLIO_CAPS=1 and the book is already at the cap
+        # (cap-policy asymmetry). A multi-leg structure cannot be partially scaled
+        # (you cannot fill half a spread leg without breaking the structure), so an
+        # over-cap family is SILENCED (no-fill parent), mirroring the equity path's
+        # full-silence outcome. With the flag unset this is a bit-identical no-op:
+        # the family fills exactly as before (no import, no state read).
+        # A cover_unwind_failed family has already moved the equity cover at the
+        # broker. It must be journaled and reconciled even if later cap checks would
+        # reject opening a fresh family; treating it as silence would hide real
+        # capital movement. Normal fully-filled families still run the cap gate.
+        if parent_status != "cover_unwind_failed":
+            cap_silence = self._portfolio_cap_silence(
+                proposal,
+                leg_fills=leg_fills,
+                multi_leg_id=multi_leg_id,
+                client_order_id=client_order_id,
+                asof_decision=asof_decision,
+                asof_execution=now,
+                fill_size_pct=fill_size_pct,
+                approver_user_id=approver_user_id,
+                play_tag=play_tag,
+            )
+            if cap_silence is not None:
+                logger.info(
+                    "multileg-react: %s SILENCED by portfolio gross cap "
+                    "(PORTFOLIO_CAPS=1); nothing written",
+                    multi_leg_id,
+                )
+                return cap_silence
+
         # ── Step 7: build records — Shape (B) (research §3.4). ──────────────────
         parent, children = self._build_records(
             proposal,
@@ -334,6 +368,221 @@ class MultiLegPaperReactor:
         return None
 
     # ------------------------------------------------------------------
+    # Portfolio gross-exposure cap (cs55; ADR-0087 parity with PaperReactor)
+    # ------------------------------------------------------------------
+    def _portfolio_cap_silence(
+        self,
+        proposal: Any,
+        *,
+        leg_fills: list[LegFill],
+        multi_leg_id: str,
+        client_order_id: str,
+        asof_decision: str,
+        asof_execution: str,
+        fill_size_pct: float,
+        approver_user_id: str | None,
+        play_tag: str = "advisor",
+    ) -> ExecutionRecord | None:
+        """Aggregate gross-exposure cap for a multi-leg family (cs55).
+
+        DEFAULT-OFF behind ``HERMES_QUANT_PORTFOLIO_CAPS``. With the flag unset this
+        is a bit-identical no-op: returns ``None`` without importing the cap module
+        or reading state (the family fills exactly as before).
+
+        When the flag is ON, this mirrors ``PaperReactor._portfolio_cap_clip``'s
+        gross-exposure control, but for a multi-leg STRUCTURE rather than a single
+        equity symbol. A structure cannot be partially scaled (you cannot fill half
+        a spread leg without breaking the structure), so the only two outcomes are
+        FILL (the whole family fits within remaining gross headroom) or SILENCE (it
+        does not). On silence, returns an audit-only no-fill parent that is NOT
+        appended to the bus and does NOT update PortfolioState — the same shape the
+        broker-reject and admissibility-reject paths already produce.
+
+        Gross-exposure measure (single source of truth with the equity path): the
+        family's gross notional in USD is ``Σ |leg notional|`` over the filled legs
+        (option leg = |premium| × |contracts| × 100; equity leg = |shares| ×
+        |price|), converted to a NAV-fraction via the SAME ``_account_nav_usd()`` the
+        admissibility path uses, then clipped against the current book's gross via
+        ``clip_one_to_remaining_headroom`` (the very primitive PaperReactor calls).
+
+        NOTE (future hoist): when the in-flight ``react/paper.py`` cap lane (cr04/
+        cr05) has merged, the headroom-read + clip logic here and in
+        ``PaperReactor._portfolio_cap_clip`` should be hoisted to a shared helper
+        (single source of truth, mirrors the cs45/cs47 discipline). It is kept
+        self-contained in this module for now to avoid touching paper.py mid-flight.
+        """
+        if os.environ.get("HERMES_QUANT_PORTFOLIO_CAPS") != "1":
+            return None
+
+        # Flag-ON path only: lazy imports so the OFF path stays IO- and import-free.
+        from hermes_quant.risk.portfolio_normalize import (
+            PortfolioCaps,
+            clip_one_to_remaining_headroom,
+        )
+        from hermes_quant.risk.portfolio_normalize import (
+            PortfolioState as RiskPortfolioState,
+        )
+        from hermes_quant.state.portfolio_state import (
+            get_portfolio_state,
+            position_gross_fraction,
+        )
+
+        nav = _account_nav_usd()
+        if nav is None or nav <= 0:
+            # Fail-closed: an unknown NAV means we cannot prove the family fits the
+            # gross cap, so we silence it (never open an uncapped family when the
+            # cap is armed). Mirrors the admissibility fail-closed posture.
+            return self._cap_silence_record(
+                proposal,
+                multi_leg_id=multi_leg_id,
+                client_order_id=client_order_id,
+                asof_decision=asof_decision,
+                asof_execution=asof_execution,
+                fill_size_pct=fill_size_pct,
+                approver_user_id=approver_user_id,
+                silence_reason="portfolio_cap_nav_unknown",
+                play_tag=play_tag,
+            )
+
+        family_gross_pct = _family_gross_notional_usd(leg_fills) / nav
+        if family_gross_pct <= 0.0:
+            # No measurable gross (degenerate / all-zero fill) — nothing to cap.
+            return None
+
+        # Reconstruct the current book's gross from PortfolioState, exactly as
+        # PaperReactor._portfolio_cap_clip does.
+        #
+        # cs65: key the cap pos_map on the FULL canonical position key
+        # (asset_class, symbol), NOT the bare symbol. get_positions returns a
+        # dict keyed on (asset_class, symbol) — the canonical state.db PK — and
+        # the same underlying can carry TWO distinct positions (an equity AND a
+        # us_option on the same ticker). Collapsing both into one bare-symbol
+        # bucket SUMS their signed quantities before RiskPortfolioState takes
+        # abs() for gross, so a long equity + short option (or vice versa) net to
+        # a smaller (even zero) magnitude and under-count the book's true gross —
+        # phantom headroom that wrongly admits an over-cap family. Keying on the
+        # canonical key keeps the two positions distinct so each contributes its
+        # own |gross-fraction| to gross_exposure_pct. (RiskPortfolioState.positions
+        # is a flat dict[str, float] whose keys are opaque — gross sums abs over
+        # .values() — so a per-canonical-key string is sufficient and correct.)
+        #
+        # ar14 units fix (sibling of ar13 in PaperReactor): Position.quantity is
+        # UNIT-AMBIGUOUS. Legacy / single-leg equity stores it as a signed
+        # NAV-fraction (ADR-0041), but the ADR-0086/0088 true-unit path stores
+        # signed SHARES/CONTRACTS. Feeding a raw true-unit quantity (e.g. 100
+        # shares) into RiskPortfolioState reads it as a 10000% NAV-fraction, so
+        # g_room collapses to <=0 and EVERY legitimate subsequent family is
+        # silenced (fail-CLOSED over-count). position_gross_fraction normalizes
+        # each line to a NAV-fraction with the SAME net-liq valuation the
+        # equity_total fold uses; a legacy nav_fraction line is returned verbatim
+        # ⇒ a pure-NAV-fraction book is byte-identical.
+        try:
+            ps = get_portfolio_state()
+            positions = ps.get_positions("paper-default")
+            # Reuse the NAV resolved (and fail-closed-validated) above — it is the
+            # same paper-account NAV the family-gross denominator uses, so the
+            # existing book and the new demand are measured against ONE NAV.
+            pos_map: dict[str, float] = {}
+            for (asset_class, symbol), position in positions.items():
+                pos_map[f"{asset_class}\x1f{symbol}"] = position_gross_fraction(
+                    position, nav=nav
+                )
+        except Exception as exc:  # noqa: BLE001 — fail-closed: unknown book => silence.
+            logger.warning(
+                "multileg-react: cap book read failed (fail-closed silence): %s", exc
+            )
+            return self._cap_silence_record(
+                proposal,
+                multi_leg_id=multi_leg_id,
+                client_order_id=client_order_id,
+                asof_decision=asof_decision,
+                asof_execution=asof_execution,
+                fill_size_pct=fill_size_pct,
+                approver_user_id=approver_user_id,
+                silence_reason="portfolio_cap_book_unknown",
+                play_tag=play_tag,
+            )
+
+        state = RiskPortfolioState(positions=pos_map)
+        caps = PortfolioCaps.standard()
+        # The family is a single new long-side gross demand. We clip it as one pick
+        # under a synthetic key so it does not collide with an existing symbol's
+        # de-risking semantics; net-cap is irrelevant here (gross is the control),
+        # so a positive sign is used uniformly.
+        clipped = clip_one_to_remaining_headroom(
+            asset=f"__mleg__{multi_leg_id}",
+            per_symbol_target_pct=family_gross_pct,
+            state=state,
+            caps=caps,
+        )
+
+        # A structure must fill WHOLE or not at all: anything short of a full-size
+        # fit (not fired, or scaled below 1.0) is silenced.
+        if not clipped.fired or clipped.scale_factor < 1.0 - 1e-9:
+            silence_reason = clipped.silence_reason or "gross_headroom"
+            return self._cap_silence_record(
+                proposal,
+                multi_leg_id=multi_leg_id,
+                client_order_id=client_order_id,
+                asof_decision=asof_decision,
+                asof_execution=asof_execution,
+                fill_size_pct=fill_size_pct,
+                approver_user_id=approver_user_id,
+                silence_reason=f"portfolio_cap_{silence_reason}",
+                play_tag=play_tag,
+            )
+        return None
+
+    def _cap_silence_record(
+        self,
+        proposal: Any,
+        *,
+        multi_leg_id: str,
+        client_order_id: str,
+        asof_decision: str,
+        asof_execution: str,
+        fill_size_pct: float,
+        approver_user_id: str | None,
+        silence_reason: str,
+        play_tag: str = "advisor",
+    ) -> ExecutionRecord:
+        """Audit-only silenced parent on a gross-cap breach. NOT appended to the bus
+        and does NOT update PortfolioState (mirror _write_nofill_parent / the equity
+        path's silence record): never fabricate a fill, leave no position-mutating
+        family on the bus for a capped family."""
+        return ExecutionRecord(
+            proposal_id=proposal.proposal_id,
+            signal_id=None,
+            asset=proposal.underlying,
+            asset_class="multi_leg",
+            timeframe="",
+            asof_decision=asof_decision,
+            asof_execution=asof_execution,
+            target_position_pct=fill_size_pct,
+            decision_price=float(proposal.net_debit_credit),
+            fill_price=0.0,
+            fill_size_pct=0.0,
+            reactor_name=self.name,
+            # aegis-agdec2: provenance is consistent across the family — a silenced
+            # parent of an autonomously-originated play is still autonomous-origin
+            # (HITL derived from play_tag, not hardcoded True). Audit-only record.
+            human_in_the_loop=_hitl_from_play_tag(play_tag),
+            approver_user_id=approver_user_id,
+            reactor_metadata={
+                "multi_leg_id": multi_leg_id,
+                "strategy_kind": proposal.strategy_kind,
+                "client_order_id": client_order_id,
+                "silenced": True,
+                "silence_reason": silence_reason,
+                "no_fill": True,
+                "paper": True,
+                "role": "parent",
+            },
+            bar_ts=None,
+            play_tag=play_tag,
+        )
+
+    # ------------------------------------------------------------------
     # Fill
     # ------------------------------------------------------------------
     def _fill(
@@ -385,40 +634,146 @@ class MultiLegPaperReactor:
             return leg_fills, parent.status, net_fill
 
         # Single option leg (CC short call / CSP short put).
+        #
+        # e572 (P1) — NO-ORPHAN ATOMICITY. A covered structure (``stock_leg`` present)
+        # pairs a SHORT option with an EQUITY cover. The OLD ordering submitted +
+        # FILLED the short option FIRST, then the equity cover. An equity-leg failure
+        # AFTER the short filled stranded a NAKED SHORT (undefined risk) at the broker
+        # while the reactor wrote a clean no-fill parent (the system blind to the
+        # naked short). The cardinal invariant: a filled short option must NEVER be
+        # left without its cover.
+        #
+        # FIX (cover-first; option (a) in the seed): submit the EQUITY cover FIRST and
+        # only submit the short option after the cover is confirmed filled. A cover
+        # failure then leaves NOTHING (the short is never submitted); a short failure
+        # after the cover filled leaves only a long stock position (defined risk) which
+        # we UNWIND so nothing stands, then fail-CLOSED to a no-fill record. The
+        # backends submit equity and option as SEPARATE orders (no single atomic
+        # multi-leg order exists for a stock+option CC on either backend — Alpaca's
+        # MLEG is options-only, the deterministic sim has no combo primitive), so
+        # cover-first ordering + unwind is the safest atomicity the backends support.
         option_leg = proposal.option_legs[0]
+
+        # No-cover single leg (CSP short put — cash-secured, no equity cover): the
+        # option is the whole structure, so there is no cover to order before it.
+        # Byte-identical to the pre-e572 single-option path.
+        if proposal.stock_leg is None:
+            try:
+                opt_res: FillResult = backend.submit_option_single(
+                    option_leg,
+                    qty=proposal.outer_qty,
+                    limit_price=net_price,
+                    client_order_id=client_order_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — any backend failure -> no-fill
+                raise self._as_fill_rejected(exc, proposal) from exc
+            self._guard_result(opt_res, proposal)
+            fills.append(_fillresult_to_legfill(opt_res))
+            net_fill = sum(f.filled_avg_price * _leg_sign(f) for f in fills if _is_option(f))
+            return fills, "filled", net_fill if net_fill else net_price
+
+        # Covered structure (CC / collar): COVER-FIRST. Submit the equity cover, then
+        # the short option. A naked short is now structurally impossible.
+        basis = (
+            float(proposal.stock_leg.basis_per_share)
+            if proposal.stock_leg.basis_per_share
+            else 0.0
+        )
         try:
-            opt_res: FillResult = backend.submit_option_single(
+            eq_res: FillResult = backend.submit_equity(
+                symbol=proposal.underlying,
+                signed_qty=float(proposal.stock_leg.qty),
+                decision_price=basis,
+                client_order_id=client_order_id + "-eq",
+            )
+        except Exception as exc:  # noqa: BLE001 — cover failed -> short never submitted
+            # Cover failed BEFORE the short option was ever submitted: no naked short
+            # can exist. Fail-closed to a no-fill record.
+            raise self._as_fill_rejected(exc, proposal) from exc
+        self._guard_result(eq_res, proposal)
+
+        # Cover is confirmed filled. Now submit the short option. If THIS fails, the
+        # cover is a STANDING long stock position (defined risk, not naked) — unwind
+        # it so nothing stands, then fail-closed to a no-fill record.
+        try:
+            opt_res = backend.submit_option_single(
                 option_leg,
                 qty=proposal.outer_qty,
                 limit_price=net_price,
                 client_order_id=client_order_id,
             )
-        except Exception as exc:  # noqa: BLE001 — any backend failure -> no-fill
-            raise self._as_fill_rejected(exc, proposal) from exc
-        self._guard_result(opt_res, proposal)
-        fills.append(_fillresult_to_legfill(opt_res))
-
-        # Covered-call equity leg: a SEPARATE equity order (research §1.3).
-        if proposal.stock_leg is not None:
-            basis = (
-                float(proposal.stock_leg.basis_per_share)
-                if proposal.stock_leg.basis_per_share
-                else 0.0
+            self._guard_result(opt_res, proposal)
+        except Exception as exc:  # noqa: BLE001 — short failed AFTER cover filled
+            unwound = self._unwind_equity_cover(
+                backend,
+                proposal,
+                cover_fill=eq_res,
+                client_order_id=client_order_id,
             )
-            try:
-                eq_res: FillResult = backend.submit_equity(
-                    symbol=proposal.underlying,
-                    signed_qty=float(proposal.stock_leg.qty),
-                    decision_price=basis,
-                    client_order_id=client_order_id + "-eq",
-                )
-            except Exception as exc:  # noqa: BLE001 — any backend failure -> no-fill
-                raise self._as_fill_rejected(exc, proposal) from exc
-            self._guard_result(eq_res, proposal)
-            fills.append(_fillresult_to_legfill(eq_res))
+            if not unwound:
+                fills.append(_fillresult_to_legfill(eq_res))
+                return fills, "cover_unwind_failed", 0.0
+            raise self._as_fill_rejected(exc, proposal) from exc
 
+        # Both legs filled. Preserve the option-then-equity ``fills`` order the
+        # pre-e572 path produced so record-building / reconciliation output is
+        # byte-identical on the happy path.
+        fills.append(_fillresult_to_legfill(opt_res))
+        fills.append(_fillresult_to_legfill(eq_res))
         net_fill = sum(f.filled_avg_price * _leg_sign(f) for f in fills if _is_option(f))
         return fills, "filled", net_fill if net_fill else net_price
+
+    def _unwind_equity_cover(
+        self,
+        backend: BrokerBackend,
+        proposal: Any,
+        *,
+        cover_fill: FillResult,
+        client_order_id: str,
+    ) -> bool:
+        """Best-effort unwind of an already-FILLED equity cover after the short option
+        leg failed (e572). Submits the OPPOSITE-signed equity order so the cover does
+        not stand alone. Failure to unwind is surfaced LOUDLY (a stranded long stock is
+        defined risk, NOT a naked short — the cardinal invariant still holds — but the
+        caller must journal the un-paired equity leg rather than hiding it behind an
+        audit-only no-fill parent.
+        """
+        signed_qty = float(getattr(cover_fill, "filled_qty", 0.0) or 0.0)
+        if signed_qty == 0.0:
+            return True  # cover never moved a position — nothing to unwind
+        basis = (
+            float(proposal.stock_leg.basis_per_share)
+            if proposal.stock_leg is not None and proposal.stock_leg.basis_per_share
+            else 0.0
+        )
+        try:
+            unwind = backend.submit_equity(
+                symbol=proposal.underlying,
+                signed_qty=-signed_qty,  # close the cover (opposite sign)
+                decision_price=basis,
+                client_order_id=client_order_id + "-eq-unwind",
+            )
+            self._guard_result(unwind, proposal)
+            logger.warning(
+                "multileg-react: %s short option failed after cover filled; "
+                "UNWOUND the %s equity cover (%+g sh) — no naked short, nothing stands",
+                proposal.proposal_id,
+                proposal.underlying,
+                signed_qty,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — unwind is best-effort; surface loudly
+            logger.error(
+                "multileg-react: %s short option failed after cover filled AND the "
+                "cover unwind FAILED (%s): the book carries a STANDING %+g-share %s "
+                "equity leg with no short (DEFINED risk, not naked) — operator must "
+                "reconcile manually",
+                proposal.proposal_id,
+                exc,
+                signed_qty,
+                proposal.underlying,
+            )
+            return False
 
     @staticmethod
     def _guard_result(res: FillResult, proposal: Any) -> None:
@@ -524,6 +879,30 @@ class MultiLegPaperReactor:
             "rho": ng.rho,
         }
         leg_symbols = [f.symbol for f in leg_fills if _is_option(f)]
+        parent_meta = {
+            "multi_leg_id": multi_leg_id,
+            "strategy_kind": proposal.strategy_kind,
+            "outer_qty": proposal.outer_qty,
+            "net_greeks": net_greeks_dict,
+            "client_order_id": client_order_id,
+            "broker_order_id": broker_order_id,
+            "leg_symbols": leg_symbols,
+            "parent_status": parent_status,
+            "risk_gate_bucket": proposal.risk_gate_bucket,
+            "paper": True,
+            "role": "parent",
+        }
+        if parent_status == "cover_unwind_failed":
+            parent_meta.update(
+                {
+                    "partial_fill": True,
+                    "cover_unwind_failed": True,
+                    "requires_manual_reconcile": True,
+                }
+            )
+        # aegis-agdec2: HITL is the family-level provenance of the ORIGIN, derived
+        # ONCE from play_tag and stamped identically on the parent + every child.
+        human_in_the_loop = _hitl_from_play_tag(play_tag)
         parent = ExecutionRecord(
             proposal_id=proposal.proposal_id,
             signal_id=None,
@@ -537,21 +916,9 @@ class MultiLegPaperReactor:
             fill_price=net_fill,
             fill_size_pct=fill_size_pct,
             reactor_name=self.name,
-            human_in_the_loop=True,
+            human_in_the_loop=human_in_the_loop,
             approver_user_id=approver_user_id,
-            reactor_metadata={
-                "multi_leg_id": multi_leg_id,
-                "strategy_kind": proposal.strategy_kind,
-                "outer_qty": proposal.outer_qty,
-                "net_greeks": net_greeks_dict,
-                "client_order_id": client_order_id,
-                "broker_order_id": broker_order_id,
-                "leg_symbols": leg_symbols,
-                "parent_status": parent_status,
-                "risk_gate_bucket": proposal.risk_gate_bucket,
-                "paper": True,
-                "role": "parent",
-            },
+            reactor_metadata=parent_meta,
             bar_ts=None,
             play_tag=play_tag,
         )
@@ -575,7 +942,7 @@ class MultiLegPaperReactor:
                         fill_price=f.filled_avg_price,
                         fill_size_pct=_signed_frac(f, fill_size_pct),
                         reactor_name=self.name,
-                        human_in_the_loop=True,
+                        human_in_the_loop=human_in_the_loop,
                         approver_user_id=approver_user_id,
                         reactor_metadata={
                             "multi_leg_id": multi_leg_id,
@@ -609,7 +976,7 @@ class MultiLegPaperReactor:
                         fill_price=f.filled_avg_price,
                         fill_size_pct=fill_size_pct,
                         reactor_name=self.name,
-                        human_in_the_loop=True,
+                        human_in_the_loop=human_in_the_loop,
                         approver_user_id=approver_user_id,
                         reactor_metadata={
                             "multi_leg_id": multi_leg_id,
@@ -660,6 +1027,8 @@ class MultiLegPaperReactor:
         """No-fill parent audit record on a broker reject/expire. NOT appended to the
         bus (mirror PaperReactor._admissibility_reject) — never fabricate a fill, and
         leave no position-mutating family on the bus for a rejected order."""
+        # aegis-agdec2: provenance of the no-fill audit record follows the origin too.
+        human_in_the_loop = _hitl_from_play_tag(play_tag)
         return ExecutionRecord(
             proposal_id=proposal.proposal_id,
             signal_id=None,
@@ -673,7 +1042,7 @@ class MultiLegPaperReactor:
             fill_price=0.0,
             fill_size_pct=0.0,
             reactor_name=self.name,
-            human_in_the_loop=True,
+            human_in_the_loop=human_in_the_loop,
             approver_user_id=approver_user_id,
             reactor_metadata={
                 "multi_leg_id": multi_leg_id,
@@ -788,6 +1157,25 @@ def _iso_utc(dt: datetime) -> str:
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# aegis-agdec2: the autonomous origination paths that are NOT human-in-the-loop.
+# The autonomous options path stamps "autonomous_options" (autonomous.py), the
+# autonomous equity path stamps "autonomous" — BOTH must read as HITL=False or an
+# autonomously-originated family is mislabeled a human override in the audit trail.
+_AUTONOMOUS_PLAY_TAGS = frozenset({"autonomous", "autonomous_options"})
+
+
+def _hitl_from_play_tag(play_tag: str | None) -> bool:
+    """Derive human_in_the_loop from the play_tag origin (aegis-agdec2 crit 4).
+
+    An autonomously-originated multi-leg play is NOT human-in-the-loop; every other
+    origin (advisor/playbook) — and any None/absent/unknown tag — is treated as
+    HITL=True (fail-safe: an unknown origin needs human oversight, conservative).
+    This keeps non-autonomous callers byte-identical to the prior hardcoded-True
+    behavior while correcting the provenance of autonomous fires.
+    """
+    return play_tag not in _AUTONOMOUS_PLAY_TAGS
+
+
 def _is_option(f: LegFill) -> bool:
     """Heuristic: option legs are OCC-21 (parse succeeds); equity legs are tickers."""
     from hermes_quant.options.occ import OccParseError, parse_occ
@@ -797,6 +1185,25 @@ def _is_option(f: LegFill) -> bool:
         return True
     except OccParseError:
         return False
+
+
+_OPTION_CONTRACT_MULTIPLIER = 100.0  # one equity-option contract controls 100 shares
+
+
+def _family_gross_notional_usd(leg_fills: list[LegFill]) -> float:
+    """Gross notional (USD) of a filled multi-leg family = Σ |leg notional|.
+
+    Option leg: ``|premium| × |contracts| × 100`` (contracts = signed filled_qty).
+    Equity leg: ``|shares| × |price|`` (shares = signed filled_qty). The sum of the
+    absolute per-leg notionals is the family's contribution to gross exposure — the
+    same |notional|-summing semantics the equity path's gross cap enforces, applied
+    across the structure's legs. A zero/degenerate fill contributes 0.
+    """
+    gross = 0.0
+    for f in leg_fills:
+        mult = _OPTION_CONTRACT_MULTIPLIER if _is_option(f) else 1.0
+        gross += abs(f.filled_avg_price) * abs(f.filled_qty) * mult
+    return gross
 
 
 def _fillresult_to_legfill(fr: FillResult) -> LegFill:
@@ -854,6 +1261,17 @@ def _record_to_dict(record: ExecutionRecord) -> dict[str, Any]:
         "reactor_metadata": record.reactor_metadata or {},
         "bar_ts": record.bar_ts,
         "play_tag": record.play_tag,  # B13: source of the fire
+        # ar93: serialize schema_version (mirror paper.py:_record_to_dict). This is
+        # the ADR-0091 Option-E tag FillDeltaNormalizer.is_absolute_target_record()
+        # keys off. Omitting it meant a multi-leg record written with a non-None
+        # schema_version (the documented Option-E "new records stamp the version"
+        # path) would read back as schema_version=None -> is_absolute_target_record
+        # returns True -> the normalizer double-differences the legs -> wrong qty ->
+        # wrong NAV / kill-switch basis. Currently dormant (no producer stamps a
+        # non-None version yet, so both serializers read None and behavior is
+        # byte-identical) — a latent forward-compat defect on the immutable money-log,
+        # closed here so the multileg writer never silently strips the tag.
+        "schema_version": record.schema_version,
     }
 
 

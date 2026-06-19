@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -33,6 +34,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.protocol import HaltRecord
 
 logger = logging.getLogger(__name__)
@@ -40,8 +42,8 @@ logger = logging.getLogger(__name__)
 # Wildcard sentinel — used instead of NULL for ANY-scope halts.
 WILDCARD = "*"
 
-DEFAULT_STATE_DB = Path.home() / ".hermes" / "quant" / "state.db"
-DEFAULT_HALT_JSON_MIRROR = Path.home() / ".hermes" / "quant" / "halt_state.json"
+DEFAULT_STATE_DB = _resolve_quant_home() / "state.db"
+DEFAULT_HALT_JSON_MIRROR = _resolve_quant_home() / "halt_state.json"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS halts (
@@ -68,11 +70,37 @@ def _utc_now_iso() -> str:
 
 
 def _write_atomic_json(path: Path, data: list[dict]) -> None:
-    """Atomic-rename pattern for halt_state.json mirror."""
+    """Crash-durable atomic write of the halt_state.json mirror.
+
+    ar87 (atomic-write-durability family): this mirror is READ AS AUTHORITY by a
+    SEPARATE LIVE PROCESS — the freqtrade crypto strategy reads it (via
+    :func:`read_active_halts_from_mirror`) to avoid SQLite lock contention. A torn
+    or lost write therefore lets a live consumer read STALE halt state and trade an
+    asset that is actually halted (fail-OPEN on a halt rail). The prior
+    ``write_text`` + ``replace`` fsync'd NOTHING — neither the file data nor the
+    directory entry the rename creates. Now: write tmp -> fsync FILE -> rename ->
+    fsync PARENT DIR, matching the kill-switch / journal / artifacts writers
+    (ar86 / 538b2f6 / 8e69840). Best-effort dir-fsync (warn, never mask the write)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-    tmp.replace(path)  # atomic on POSIX
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2, sort_keys=True))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)  # atomic on POSIX
+    try:
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError as e:  # pragma: no cover - platform/fs dependent
+        logger.warning(
+            "halt_state mirror: parent-dir fsync failed for %s; the rename may not "
+            "survive a crash: %s",
+            path.parent,
+            e,
+        )
 
 
 class HaltStateSQLite:
@@ -165,32 +193,49 @@ class HaltStateSQLite:
         until = halted_until.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if halted_until is not None else None
 
         with self._lock, self._conn() as conn:
-            # Reject if active halt exists at this exact scope
-            row = conn.execute(
-                "SELECT halt_epoch FROM halts "
-                "WHERE account_id=? AND asset_class=? AND asset=? "
-                "AND cleared_at IS NULL",
-                scope,
-            ).fetchone()
-            if row is not None:
-                raise ValueError(
-                    f"active halt already exists at scope {scope} "
-                    f"(epoch {row['halt_epoch']}); resume first or use different scope"
+            # ar04: BEGIN IMMEDIATE acquires the SQLite write lock at transaction
+            # start, eliminating the cross-PROCESS check-then-insert race (the
+            # process-local RLock above only serializes threads). Mirrors the
+            # established pattern at state/portfolio_state.py:910. Without it, two
+            # concurrent add_halt() at the same scope both pass the active-halt
+            # SELECT and the loser's INSERT raises a raw sqlite3.IntegrityError on
+            # the UNIQUE PK — which is NOT a ValueError, so it escapes the CLI's
+            # `except ValueError` and crashes emergency-stop BEFORE the bus signal.
+            # With it, the 5s busy_timeout serializes the loser, which then sees the
+            # winner's committed row and hits the ValueError guard below.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Reject if active halt exists at this exact scope
+                row = conn.execute(
+                    "SELECT halt_epoch FROM halts "
+                    "WHERE account_id=? AND asset_class=? AND asset=? "
+                    "AND cleared_at IS NULL",
+                    scope,
+                ).fetchone()
+                if row is not None:
+                    raise ValueError(
+                        f"active halt already exists at scope {scope} "
+                        f"(epoch {row['halt_epoch']}); resume first or use different scope"
+                    )
+
+                # Compute next epoch (max + 1, default 1)
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(halt_epoch), 0) AS max_e FROM halts "
+                    "WHERE account_id=? AND asset_class=? AND asset=?",
+                    scope,
+                ).fetchone()
+                next_epoch = (row["max_e"] or 0) + 1
+
+                conn.execute(
+                    "INSERT INTO halts (account_id, asset_class, asset, reason, "
+                    "halted_at, halted_until, halt_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (*scope, reason, now, until, next_epoch),
                 )
-
-            # Compute next epoch (max + 1, default 1)
-            row = conn.execute(
-                "SELECT COALESCE(MAX(halt_epoch), 0) AS max_e FROM halts "
-                "WHERE account_id=? AND asset_class=? AND asset=?",
-                scope,
-            ).fetchone()
-            next_epoch = (row["max_e"] or 0) + 1
-
-            conn.execute(
-                "INSERT INTO halts (account_id, asset_class, asset, reason, "
-                "halted_at, halted_until, halt_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (*scope, reason, now, until, next_epoch),
-            )
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            else:
+                conn.execute("COMMIT")
 
         record = HaltRecord(
             account_id=scope[0],

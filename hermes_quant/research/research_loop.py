@@ -51,6 +51,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.research.hypothesis import Hypothesis, HypothesisRegistry
 from hermes_quant.research.orchestrator import HypothesisRunner
 from hermes_quant.research.run_card import RunCard
@@ -61,7 +62,7 @@ logger = logging.getLogger(__name__)
 # Paths
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 RESEARCH_HOME = QUANT_HOME / "research"
 RESEARCH_LOOP_LOG_PATH = RESEARCH_HOME / "research_loop.jsonl"
 

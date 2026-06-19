@@ -1,10 +1,15 @@
-"""Tests for daemon/lock.py + daemon/discovery.py + daemon/portfolio_loader.py."""
+"""Tests for daemon/discovery.py + daemon/portfolio_loader.py.
+
+Vestigial-daemon-spine deletion: this file originally also covered
+``daemon/lock.py`` (TestDaemonLock — the singleton daemon flock). That lock
+only protected the long-lived daemon entry point (``daemon/main.py``), which
+was vestigial; the live spine is cron scripts that call advisor.recommend +
+reactors directly. ``daemon/lock.py`` and ``daemon/main.py`` were removed, and
+TestDaemonLock with them. The discovery + portfolio-reconstruction coverage
+(both KEPT utilities) stays.
+"""
 
 from __future__ import annotations
-
-import multiprocessing
-import os
-import time
 
 import pandas as pd
 import pytest
@@ -17,65 +22,8 @@ from hermes_quant.daemon.discovery import (
     instantiate_analysts,
     instantiate_data_provider,
 )
-from hermes_quant.daemon.lock import DaemonLock
 from hermes_quant.daemon.portfolio_loader import reconstruct_portfolio
 from hermes_quant.daemon.signal_bus import emit_execution_record
-from hermes_quant.protocol import DaemonAlreadyRunning
-
-# ---------------------------------------------------------------------------
-# DaemonLock
-# ---------------------------------------------------------------------------
-
-
-class TestDaemonLock:
-    def test_acquire_and_release(self, tmp_path):
-        lock = DaemonLock(account_id="test", lock_dir=tmp_path)
-        lock.acquire()
-        assert lock.lock_path.exists()
-        # File contains our PID
-        content = lock.lock_path.read_text().strip()
-        pid_str = content.split()[0]
-        assert int(pid_str) == os.getpid()
-        lock.release()
-
-    def test_context_manager(self, tmp_path):
-        with DaemonLock(account_id="test", lock_dir=tmp_path) as lock:
-            assert lock.lock_path.exists()
-        # Released on exit (we can't easily verify the flock state, but no exception)
-
-    def test_open_without_o_trunc_p1_alpha(self, tmp_path):
-        """Per synthesis-v2 §P1-α: open WITHOUT O_TRUNC then flock then truncate.
-
-        We verify by writing a sentinel byte to the lock file BEFORE acquiring;
-        if the implementation used O_TRUNC at open, the sentinel would be
-        gone after the failed-acquire call. (We can't easily test the win path
-        because that DOES truncate by design, so we check the lose path.)
-        """
-        lock_path = tmp_path / "daemon-test.lock"
-        lock_path.write_text("99999 sentinel\n")  # bogus PID
-
-        # Hold the lock from a child process
-        def hold_lock():
-            lock = DaemonLock(account_id="test", lock_dir=tmp_path)
-            lock.acquire()
-            time.sleep(2)
-
-        proc = multiprocessing.Process(target=hold_lock)
-        proc.start()
-        time.sleep(0.5)
-
-        # Now try to acquire from this process; should fail
-        lock = DaemonLock(account_id="test", lock_dir=tmp_path)
-        with pytest.raises(DaemonAlreadyRunning):
-            lock.acquire()
-
-        # The sentinel-replacement done by the child is whatever the child wrote —
-        # we don't enforce the exact content here, but we DO verify that the
-        # file is non-empty (the lock acquisition succeeded for the child;
-        # it would be empty if O_TRUNC had been used and the lock then failed)
-        proc.terminate()
-        proc.join()
-
 
 # ---------------------------------------------------------------------------
 # Discovery
@@ -204,6 +152,30 @@ class TestPortfolioReconstruction:
         assert "BTC/USDT" not in p.positions
         # Realized PnL = 2000 (bought at 60k, sold at 62k)
         assert p.realized_pnl_total == pytest.approx(2_000.0)
+
+    def test_short_then_cover_realizes_positive_pnl(self, tmp_path):
+        """cs00 regression: shorting then covering CHEAPER must realize a POSITIVE
+        P&L. The v0.1.1 full-close formula carried a spurious trailing
+        `* (1 if old_qty > 0 else -1)` factor that INVERTED the short branch
+        (sell 10@100 then buy 10@90 booked -100 instead of +100). A short cover
+        is a full close (new_qty == 0), which the v0.1.1 gate permits, so this
+        stream reaches the fixed branch.
+        """
+        bus = tmp_path / "execs.jsonl"
+        # Sell 10 BTC at 100 (open short), then buy 10 BTC at 90 (cover cheaper).
+        emit_execution_record(self._exec("sell", 10.0, 100.0), path=bus)
+        emit_execution_record(self._exec("buy", 10.0, 90.0), path=bus)
+
+        p = reconstruct_portfolio(
+            "alpaca-paper",
+            "crypto",
+            initial_cash=100_000.0,
+            bus_path=bus,
+        )
+        # Position fully closed.
+        assert "BTC/USDT" not in p.positions
+        # Shorted at 100, covered at 90 => +100 realized profit (was -100 buggy).
+        assert p.realized_pnl_total == pytest.approx(100.0)
 
     def test_open_position_marked_to_market(self, tmp_path):
         bus = tmp_path / "execs.jsonl"

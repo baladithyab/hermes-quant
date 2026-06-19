@@ -93,17 +93,23 @@ detail lives in each [`mcp/optional-mcps/<name>/manifest.yaml`](../../mcp/option
 Capability highlights:
 
 - **alpaca** — ~60 tools / 9 toolsets. READ: account, assets/calendar/clock,
-  stock/crypto/options data, corporate-actions, news. WRITE (the `trading`
-  toolset, **excluded by the shipped `ALPACA_TOOLSETS` allowlist**):
+  stock/crypto/options data, corporate-actions, news. ORDER-AUTHORITY (the
+  `trading` toolset, **excluded by the shipped `ALPACA_TOOLSETS` allowlist**):
   place_stock/crypto/option_order, replace/cancel order, close_position,
-  close_all_positions, exercise_options_position, update_account_config.
-  The repo states verbatim: "This server can place real trades and access your
-  portfolio." The shipped recipe pins `ALPACA_PAPER_TRADE=true` **and**
+  close_all_positions, exercise_options_position. The repo states verbatim:
+  "This server can place real trades and access your portfolio." The shipped
+  recipe pins `ALPACA_PAPER_TRADE=true` **and**
   `ALPACA_TOOLSETS="account,stock-data,crypto-data,options-data,assets,corporate-actions,news"`
   — there is **no internal HITL hook**; excluding the `trading` toolset at launch
   is the only safe boundary. Same Alpaca account/keys the read-only shortability
-  oracle uses — enabling the full toolset would grant order authority over the
-  account Hermes trades through.
+  oracle uses — enabling the `trading` toolset would grant order authority over
+  the account Hermes trades through.
+  **`update_account_config` belongs to the `account` toolset, NOT `trading`**
+  (seed 0fc0, operator decision 2026-06-01): the allowlist INCLUDES `account` (for
+  buying-power / position reads), so `update_account_config` IS exposed. It mutates
+  only paper-account SETTINGS — it is **not an order tool** and moves no capital
+  while `ALPACA_PAPER_TRADE=true`. Its presence is an EXPECTED, operator-accepted
+  trade-off, not a leak. RE-EVALUATE before ever flipping to a live account.
 - **tradingview** — 12 read-only screener/TA tools (screen_*, get_ta_summary,
   rank_by_ta, presets); anonymous public scanner. No order/alert/account write.
 - **robinhood** — 15 get_*/search tools; "read-only by design, cannot execute
@@ -245,10 +251,15 @@ echo 'POLYGON_API_KEY=<your-key>' >> ~/.hermes/.env
 #    (Reload via the gateway's reload path / restart; do NOT pkill from inside
 #    the gateway — self-kill, see HERMES-INTEGRATION.md §1.3.)
 
-# 4. VERIFY the loaded tool surface is read-only. For alpaca/longbridge confirm
-#    NO place_*_order / close_*_position / cancel_* / trade-submit-order /
-#    update_account_config tools appear. If any do, the read-only pin did NOT
-#    apply — STOP, remove the server, do not use.
+# 4. VERIFY the loaded tool surface has NO ORDER AUTHORITY. For alpaca/longbridge
+#    confirm NO place_*_order / close_*_position / close_all_positions / cancel_* /
+#    replace_order / trade-submit-order / exercise_options_position tools appear.
+#    If any do, the `trading` toolset leaked into the pin — STOP, remove the
+#    server, do not use.
+#    NOTE (seed 0fc0): for alpaca, `update_account_config` IS expected to appear —
+#    it ships with the allowlisted `account` toolset and is a paper-account SETTINGS
+#    tool, not an order tool (no capital moves while ALPACA_PAPER_TRADE=true). Do
+#    NOT treat it as a STOP. Re-evaluate before flipping to a live account.
 ```
 
 Rollback is always: delete the `mcp_servers.<name>` block from `config.yaml`,
@@ -318,9 +329,15 @@ All 4 are **read-only data** (`money_write: false`, `underlying_can_write: false
 so safe to enable without the gate/HITL concerns that apply to alpaca/robinhood/longbridge. A gateway
 reload is needed for an already-running gateway to pick them up (`mcp_reload_confirm: true`).
 
-**Still DISABLED (cred-gated, until the operator loads creds):** alpaca (creds on disk; pinned
-read-only via ALPACA_TOOLSETS when enabled), robinhood, longbridge (all 3 have an underlying
-order/money surface — never auto-enabled), polygon, fred (read-only data, need an API key).
+**ENABLED (read-only, paper) — operator ran the enable (verified live 2026-06-16):** alpaca is in
+`~/.hermes/config.yaml` `mcp_servers:` with `ALPACA_PAPER_TRADE='true'` and the read-only
+`ALPACA_TOOLSETS='account,stock-data,crypto-data,options-data,assets,corporate-actions,news'` allowlist
+(no `trading`/`watchlists` toolset, so NO order tools; `update_account_config` is the expected
+account-toolset settings tool, not an order tool — see the §alpaca note above / seed 0fc0). Closes
+58e9/e18b/0fc0. RE-EVALUATE the `account`-included trade-off before ever flipping to a live account.
+
+**Still DISABLED (cred-gated, until the operator loads creds):** robinhood, longbridge (both have an
+underlying order/money surface — never auto-enabled), polygon, fred (read-only data, need an API key).
 
 Rollback any: remove its block from `~/.hermes/config.yaml` `mcp_servers:` (or `cp` the backup) + reload.
 

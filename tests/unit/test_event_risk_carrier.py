@@ -8,8 +8,11 @@ the aggregator->gate seam, so the guard could never fire. This seed adds a
 one-shot, flag-gated copy at three seams:
 
   * advisor.py  : ``_carry_event_risk(agg_signal, ctx)`` after aggregate, before gate.
-  * tick_loop.py: ``_carry_event_risk(signal, ctx)`` before the daemon gate call.
   * options/recipes.py: forwards ``event_risk`` + ``decision_asof`` into options_gate.
+
+(Vestigial-daemon-spine deletion: the parallel ``tick_loop._carry_event_risk``
+seam — the vestigial daemon path — was removed with ``daemon/tick_loop.py``;
+the live carrier is ``advisor._carry_event_risk``, which this file pins.)
 
 All three are DEFAULT-OFF + ADDITIVE, gated on HERMES_QUANT_EVENT_RISK read at
 CALL TIME. Flag absent => no metadata key copied / nothing forwarded => the 743b
@@ -31,7 +34,6 @@ import pytest
 
 from hermes_quant.advisor import _carry_event_risk as advisor_carry
 from hermes_quant.daemon.halt_state import HaltStateSQLite
-from hermes_quant.daemon.tick_loop import _carry_event_risk as daemon_carry
 from hermes_quant.options.data import (
     NetGreeks,
     OptionGreeksSnapshot,
@@ -166,7 +168,7 @@ def halt_state(tmp_path: Path) -> HaltStateSQLite:
 # parametrize the same assertions across both.
 # ---------------------------------------------------------------------------
 
-_CARRIERS = pytest.mark.parametrize("carry", [advisor_carry, daemon_carry])
+_CARRIERS = pytest.mark.parametrize("carry", [advisor_carry])
 
 
 class TestCarrierFlagOff:

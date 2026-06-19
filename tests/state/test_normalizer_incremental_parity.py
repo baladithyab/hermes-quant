@@ -1,0 +1,244 @@
+"""Increment-0 §0.3 follow-up i0a (seed ra01, ADR-0091 Option E): the normalizer
+wired into the INCREMENTAL apply_execution path, in agreement with the rebuild fold.
+
+The reviewer's gap: §0.3 wired only reconstruct_from (rebuild). apply_execution
+(live PaperReactor path) still folded the raw absolute target, so flag-ON would make
+a live session inflate incrementally while a rebuild deflated — live state.db vs a
+rebuild diverging mid-session. i0a closes that: apply_execution derives the same
+carry-forward delta, sourcing the running net from the PERSISTED positions row, so
+the two folds converge by construction.
+
+- Flag OFF: apply_execution is bit-for-bit legacy (still inflates incrementally).
+- Flag ON: incremental apply == rebuild for the same record stream (the parity gate).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hermes_quant.state.fill_delta_normalizer import delta_from_net
+from hermes_quant.state.portfolio_state import PortfolioState
+
+
+def _rec(asset, target, *, pid, asof, price=100.0, acct="paper-default"):
+    return {
+        "proposal_id": pid,
+        "signal_id": None,
+        "asset": asset,
+        "asset_class": "equity",
+        "timeframe": "1d",
+        "asof_decision": asof,
+        "asof_execution": asof,
+        "target_position_pct": target,
+        "decision_price": price,
+        "fill_price": price,
+        "fill_size_pct": target,  # ABSOLUTE target every fire
+        "reactor_name": "paper",
+        "human_in_the_loop": True,
+        "account_id": acct,
+    }
+
+
+# ---- the shared derivation helper (one place computes target - net) ----
+
+def test_delta_from_net_absolute_target():
+    # absolute-target record: delta = target - current_net
+    assert delta_from_net(_rec("AAPL", 0.05, pid="a", asof="t"), 0.0) == 0.05
+    assert abs(delta_from_net(_rec("AAPL", 0.05, pid="b", asof="t"), 0.05)) < 1e-12  # reaffirm
+    assert abs(delta_from_net(_rec("AAPL", 0.07, pid="c", asof="t"), 0.05) - 0.02) < 1e-12  # ADD
+
+
+def test_delta_from_net_quantity_lane():
+    r = _rec("AAPL", 0.05, pid="q", asof="t")
+    r["reactor_metadata"] = {"quantity": 33.33}
+    assert delta_from_net(r, 0.0) == 33.33  # shares lane, derived in shares
+    assert abs(delta_from_net(r, 33.33)) < 1e-12  # reaffirm in shares
+
+
+def test_delta_from_net_true_delta_passthrough():
+    r = _rec("AAPL", 0.05, pid="d", asof="t")
+    r["schema_version"] = "true-delta-v1"
+    assert delta_from_net(r, 0.05) == 0.05  # already a delta — net ignored, passthrough
+
+
+# ---- the parity gate: incremental apply == rebuild, flag ON ----
+
+def _apply_stream(ps, recs):
+    for r in recs:
+        ps.apply_execution(r)
+
+
+def test_incremental_matches_rebuild_flag_on(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
+    recs = [
+        _rec("AAPL", 0.05, pid=f"p{i}", asof=f"2026-06-06T10:{i:02d}:00Z") for i in range(12)
+    ] + [
+        _rec("BA", -0.2, pid=f"b{i}", asof=f"2026-06-06T11:{i:02d}:00Z") for i in range(6)
+    ]
+
+    # Incremental path: apply one record at a time.
+    ps_inc = PortfolioState(state_db_path=tmp_path / "inc.db")
+    _apply_stream(ps_inc, recs)
+    inc = ps_inc.get_positions("paper-default")
+
+    # Rebuild path: write the same stream and reconstruct.
+    import json
+    bus = tmp_path / "executions.jsonl"
+    with open(bus, "w") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+    ps_reb = PortfolioState(state_db_path=tmp_path / "reb.db")
+    ps_reb.reconstruct_from(bus)
+    reb = ps_reb.get_positions("paper-default")
+
+    # Both must agree on the single intended positions (NOT inflated).
+    assert inc[("equity", "AAPL")].quantity == pytest.approx(0.05, rel=1e-9)
+    assert inc[("equity", "BA")].quantity == pytest.approx(-0.2, rel=1e-9)
+    assert inc[("equity", "AAPL")].quantity == pytest.approx(reb[("equity", "AAPL")].quantity, rel=1e-9)
+    assert inc[("equity", "BA")].quantity == pytest.approx(reb[("equity", "BA")].quantity, rel=1e-9)
+
+
+def test_mixed_schema_bucket_incremental_vs_rebuild_parity(tmp_path, monkeypatch):
+    """ms1 RED->GREEN: a single bucket MIXING absolute-target + true-delta fills must
+    fold to the SAME final position via the incremental and rebuild paths.
+
+    The ms1 divergence (now fixed): FillDeltaNormalizer.delta_for() returned a
+    true-delta record's size WITHOUT advancing its in-memory running_net (rebuild),
+    but apply_execution DID advance the persisted state.db qty by that delta and then
+    differenced the NEXT absolute target against it (incremental). So the two folds
+    seeded the next target-difference from different bases and diverged.
+
+    Stream [abs 0.05, true-delta +0.02, abs 0.05]:
+      - incremental: 0.05 -> +0.02 = 0.07 -> (target 0.05 - net 0.07 = -0.02) -> 0.05
+      - rebuild (pre-fix): 0.05 -> +0.02 = 0.07 -> (target 0.05 - STALE net 0.05 =
+        0.0) -> 0.07   [DIVERGENCE: incremental 0.05 vs rebuild 0.07]
+      - rebuild (post-fix): the true-delta advances net_map to 0.07 too, so the second
+        target differences against 0.07 -> -0.02 -> 0.05   [PARITY]
+
+    Dormant today: no producer emits schema_version='true-delta-v1' (every record
+    defaults schema_version=None == absolute-target), so the mixed stream cannot occur
+    in production. This test is the architectural-parity gate the internal state.db
+    split verdict demanded.
+    """
+    import json
+
+    monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
+
+    def _delta_rec(asset, size, *, pid, asof):
+        r = _rec(asset, size, pid=pid, asof=asof)
+        r["schema_version"] = "true-delta-v1"  # NOT absolute-target -> passthrough
+        return r
+
+    recs = [
+        _rec("AAPL", 0.05, pid="m0", asof="2026-06-06T10:00:00Z"),
+        _delta_rec("AAPL", 0.02, pid="m1", asof="2026-06-06T10:01:00Z"),
+        _rec("AAPL", 0.05, pid="m2", asof="2026-06-06T10:02:00Z"),
+    ]
+
+    # Incremental fold.
+    ps_inc = PortfolioState(state_db_path=tmp_path / "inc.db")
+    _apply_stream(ps_inc, recs)
+    inc = ps_inc.get_positions("paper-default")[("equity", "AAPL")].quantity
+
+    # Rebuild fold over the same stream.
+    bus = tmp_path / "executions.jsonl"
+    with open(bus, "w") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+    ps_reb = PortfolioState(state_db_path=tmp_path / "reb.db")
+    ps_reb.reconstruct_from(bus)
+    reb = ps_reb.get_positions("paper-default")[("equity", "AAPL")].quantity
+
+    # The parity gate: the two folds agree, both on the single intended 0.05 target.
+    assert inc == pytest.approx(0.05, rel=1e-9)
+    assert reb == pytest.approx(0.05, rel=1e-9)
+    assert inc == pytest.approx(reb, rel=1e-9)
+
+
+def test_true_delta_advances_running_net_in_normalizer_ms1():
+    """ms1 unit-level: a true-delta record advances the normalizer's in-memory
+    running_net by its delta (mirroring the incremental fold's persisted
+    old_qty + delta), so a SUBSEQUENT absolute-target record differences against the
+    advanced base — NOT the stale pre-delta base.
+
+    RED before the fix: the second delta_for returned 0.0 (target 0.05 - stale net 0.05).
+    GREEN: it returns -0.02 (target 0.05 - advanced net 0.07).
+    """
+    from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
+
+    n = FillDeltaNormalizer()
+    abs_open = _rec("AAPL", 0.05, pid="x0", asof="t0")
+    assert n.delta_for(abs_open) == pytest.approx(0.05)  # net -> 0.05
+
+    delta_rec = _rec("AAPL", 0.02, pid="x1", asof="t1")
+    delta_rec["schema_version"] = "true-delta-v1"
+    assert n.delta_for(delta_rec) == pytest.approx(0.02)  # passthrough, net -> 0.07
+
+    abs_reaffirm = _rec("AAPL", 0.05, pid="x2", asof="t2")
+    # target 0.05 vs ADVANCED net 0.07 -> -0.02 (was 0.0 with the stale net pre-fix).
+    assert n.delta_for(abs_reaffirm) == pytest.approx(-0.02)
+
+
+def test_multi_account_metadata_only_rebuild_matches_incremental_cs64(tmp_path, monkeypatch):
+    """cs64 RED->GREEN: a multi-account book where account_id lives ONLY in
+    reactor_metadata (the PERSISTED log shape — _record_to_dict / alpaca_paper.py:413
+    do NOT write a top-level account_id) folds to the SAME positions via the incremental
+    and rebuild paths.
+
+    Before the fix the rebuild normalizer keyed its running-net on the BARE top-level
+    account_id, collapsing every alpaca-paper fill onto paper-default; a re-affirmed
+    alpaca-paper target was then differenced against paper-default's net (delta 0 ->
+    alpaca-paper booked flat -> position dropped), while the incremental fold kept the
+    per-account net (alpaca-paper == 0.05). The gate-sized NAV diverged. The fix routes
+    _bucket through the same cs52 account resolution the booking fold uses.
+    """
+    import json
+
+    monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
+
+    def _meta_rec(asset, target, *, pid, asof, meta_acct, price=100.0):
+        r = _rec(asset, target, pid=pid, asof=asof, price=price)
+        # PERSISTED shape: drop the top-level account_id, carry it only in metadata.
+        del r["account_id"]
+        r["reactor_metadata"] = {"account_id": meta_acct}
+        return r
+
+    recs = [
+        _meta_rec("AAPL", 0.05, pid="pd0", asof="2026-06-06T10:00:00Z", meta_acct="paper-default"),
+        _meta_rec("AAPL", 0.05, pid="ap0", asof="2026-06-06T10:01:00Z", meta_acct="alpaca-paper"),
+        _meta_rec("AAPL", 0.05, pid="ap1", asof="2026-06-06T10:02:00Z", meta_acct="alpaca-paper"),
+    ]
+
+    # Incremental fold.
+    ps_inc = PortfolioState(state_db_path=tmp_path / "inc.db")
+    _apply_stream(ps_inc, recs)
+    inc_ap = ps_inc.get_positions("alpaca-paper").get(("equity", "AAPL"))
+    inc_pd = ps_inc.get_positions("paper-default").get(("equity", "AAPL"))
+
+    # Rebuild fold over the persisted log.
+    bus = tmp_path / "executions.jsonl"
+    with open(bus, "w") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+    ps_reb = PortfolioState(state_db_path=tmp_path / "reb.db")
+    ps_reb.reconstruct_from(bus)
+    reb_ap = ps_reb.get_positions("alpaca-paper").get(("equity", "AAPL"))
+    reb_pd = ps_reb.get_positions("paper-default").get(("equity", "AAPL"))
+
+    # Both accounts independently hold the single intended 0.05 (NOT collapsed/dropped).
+    assert inc_ap is not None and reb_ap is not None, "alpaca-paper must hold AAPL in both folds"
+    assert inc_ap.quantity == pytest.approx(0.05, rel=1e-9)
+    assert inc_pd.quantity == pytest.approx(0.05, rel=1e-9)
+    # The parity gate: incremental == rebuild for every shared-symbol account.
+    assert inc_ap.quantity == pytest.approx(reb_ap.quantity, rel=1e-9)
+    assert inc_pd.quantity == pytest.approx(reb_pd.quantity, rel=1e-9)
+
+
+def test_incremental_flag_off_is_legacy(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_QUANT_DELTA_NORMALIZER", raising=False)
+    recs = [_rec("AAPL", 0.05, pid=f"p{i}", asof=f"2026-06-06T10:{i:02d}:00Z") for i in range(12)]
+    ps = PortfolioState(state_db_path=tmp_path / "inc.db")
+    _apply_stream(ps, recs)
+    pos = ps.get_positions("paper-default")
+    # Flag OFF = legacy incremental inflation.
+    assert pos[("equity", "AAPL")].quantity == pytest.approx(0.60, rel=1e-9)

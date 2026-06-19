@@ -24,6 +24,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.regime.detector import RegimeState
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ RegimeWeightTable = dict[RegimeState, dict[str, float]]
 
 # Default persistence path
 _DEFAULT_WEIGHTS_PATH = (
-    Path.home() / ".hermes" / "quant" / "regime" / "weights.json"
+    _resolve_quant_home() / "regime" / "weights.json"
 )
 
 # Minimum multiplier value — weights can be suppressed but never zeroed.

@@ -1,7 +1,7 @@
 """hermes_quant.memory.reflector — Layer 2: post-trade reflection (ADR-0042).
 
-Gated by env var HERMES_QUANT_REFLECTION=1. Default OFF — bit-identical
-pre-Wave-4 behavior when the env var is absent.
+Gated by env var HERMES_QUANT_REFLECTION. Default ON (set =0 to opt out) —
+bit-identical pre-Wave-4 behavior when the env var is set to 0.
 
 The Reflector produces a Reflection dataclass from a closed decision + exit
 record. It computes:
@@ -212,7 +212,12 @@ def _stub_reflection_text(
     lesson_category: LessonCategory,
 ) -> str:
     """Deterministic stub reflection text — no LLM call required."""
-    call_correct = "correct" if (alpha_return >= 0) == (direction >= 0) else "wrong"
+    # alpha_return is ALREADY direction-adjusted by reflect_on_close (shorts have
+    # raw_return negated), so a positive alpha_return means the trade made money for
+    # longs AND shorts alike. The correct/wrong label must therefore be
+    # direction-AGNOSTIC, matching _classify_lesson (`alpha_return > 0`). Re-applying
+    # the direction sign here sign-flipped the label for every short trade.
+    call_correct = "correct" if alpha_return >= 0 else "wrong"
     direction_label = "long" if direction > 0 else "short" if direction < 0 else "flat"
     return (
         f"Direction call ({direction_label}, {rating}) was {call_correct}; "

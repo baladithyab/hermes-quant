@@ -1,5 +1,14 @@
 # GO-LIVE CHECKLIST — hermes-quant Monday market-open runbook
 
+> **⚠️ SUPERSEDED-IN-PART (2026-06-14, seed `9048`):** the deploy-drift assessment captured below
+> (`{REPO_ONLY_NEW:16, DRIFT:8, SAME:4}`, exit 1, dated 2026-05-30/06-01) is a **historical
+> snapshot**, not the current state. As of seed `9048` the deploy audit is reconciled to
+> **`{SAME:32}` exit-0** and the daily-interim has migrated to ADR-0079. The B1 "Deploy-sync is
+> DIRTY" blocker and the owed-B04-reconcile line below are **RESOLVED**. The cron count is now
+> ~22 `quant-*` live (16 + the 6 ARIA-registered + the graph-mine row), not 16. For the current
+> operator command set (flips/crons/deploy-sync) use **`docs/operations/2026-06-14-operator-action-packet.md`**.
+> This file is retained as the 2026-06-01 historical runbook.
+
 - **Status:** operator runbook for the Monday 2026-06-01 US equity open (09:30 ET / 06:30 PT).
 - **Audience:** the human operator (Codeseys) + the Hermes gateway agent. The subagent that wrote
   this **cannot** flip `.env` flags (tool-guarded), register crons (no `cronjob` tool), edit
@@ -48,8 +57,8 @@ None is required to open. If the operator does **nothing**, Monday opens safely 
 
 | # | Blocker | Blocks | Why |
 |---|---|---|---|
-| B1 | **Deploy-sync is DIRTY** — `quant-deploy-audit.py` exits 1: `{REPO_ONLY_NEW:16, DRIFT:8, SAME:4, DEPLOYED_ONLY:4}`. | Blocks **registering any owed cron** (§2 Step C/D). Does NOT block the running loop. | A `cronjob create` errors on first tick if the script is absent from `~/.hermes/scripts/`. Owed scripts must be deployed + re-audited first. |
-| B2 | **A blind `cp ops/scripts/* ~/.hermes/scripts/` is DESTRUCTIVE.** | Blocks any naive "redeploy everything". | It would REGRESS the live Wave-1d equity-halt-filter safety fix in deployed `playbook-weekly.py` (cron #12, fires THIS Monday 09:30 ET) + `playbook-quarterly.py`, the deployed tiered-emit formatters in `playbook-tick`/`hourly-tick`/`universe-scan`, and the deployed headline counters in `watchlist-evolve`. Every DRIFT must be a per-script three-way reconciliation (DEPLOY-SYNC §49), never a copy. |
+| B1 | ~~**Deploy-sync is DIRTY** — `quant-deploy-audit.py` exits 1: `{REPO_ONLY_NEW:16, DRIFT:8, SAME:4, DEPLOYED_ONLY:4}`.~~ **RESOLVED (seed `9048`)** — the audit now reports **`{SAME:32}` exit-0** and the daily-interim migrated to ADR-0079. This is no longer a blocker. (Deploying an *owed* script still precedes registering its cron — see §2/§3 — but that is a normal deploy step, not a DIRTY-drift blocker.) | ~~Blocks registering any owed cron~~ — no longer blocking; the per-script reconcile (B2) only applies to the historical DRIFT set, which is now SAME. | A `cronjob create` still errors on first tick if the owed script is absent from `~/.hermes/scripts/`, so deploy-before-register holds; but there is no drift to reconcile. |
+| B2 | **A blind `cp ops/scripts/* ~/.hermes/scripts/` is DESTRUCTIVE.** | Blocks any naive "redeploy everything". | It would REGRESS the live Wave-1d equity-halt-filter safety fix in deployed `playbook-weekly.py` (cron #12, fires THIS Monday 09:30 ET) + `playbook-quarterly.py`, the deployed tiered-emit formatters in `playbook-tick`/`hourly-tick`/`universe-scan`, and the deployed headline counters in `watchlist-evolve`. Every DRIFT must be a per-script three-way reconciliation (DEPLOY-SYNC "Reconciliation procedure"), never a copy. |
 | B3 | **The AXP-SHORT-via-CSP bug is STILL firing in prod** and a script-only redeploy is INERT. | Does NOT block the open (it is a pre-existing, contained behavior; the gate still governs sizing). | Enabling the B04 `DIRECTION_BIAS_GATE` fix is a TWO-step coupled change (DEPLOY-SYNC M04), NOT a copy: reconcile B04 into the deployed `autonomous-tick.py` AND add `export HERMES_QUANT_DIRECTION_BIAS_GATE=1` to the armed wrapper. See §2 Step E. |
 
 ---
@@ -110,7 +119,7 @@ ran `rc=0` SILENT in the assessment, and cannot touch the money path. `calibrato
 (`CALIBRATOR_AUTO_REFIT`) is **default-OFF and stays off the cron** (alert-only — see §3).
 
 ```bash
-# C1. Deploy (REPO_ONLY_NEW → safe to copy; nothing to clobber — DEPLOY-SYNC §49 step 3):
+# C1. Deploy (REPO_ONLY_NEW → safe to copy; nothing to clobber — DEPLOY-SYNC "Reconciliation procedure" step 3):
 cp $REPO/ops/scripts/quant-catalyst-profitability.py ~/.hermes/scripts/quant-catalyst-profitability.py
 cp $REPO/ops/scripts/quant-calibrator-drift.py        ~/.hermes/scripts/quant-calibrator-drift.py
 
@@ -193,7 +202,7 @@ weekend, SKIP this — the bug persists but nothing regresses; the gate still go
 `DIRECTION_BIAS_MISMATCH` abstain — never fires, widens, or flips; FEATURE-ENABLEMENT §2.1).
 
 ```bash
-# E1. RECONCILE (three-way merge, NOT a copy — DEPLOY-SYNC §49 step 2): merge ONLY the repo's
+# E1. RECONCILE (three-way merge, NOT a copy — DEPLOY-SYNC "Reconciliation procedure" step 2): merge ONLY the repo's
 #     B04 direction-bias gate + ADR-0075 admitted_via attribution + corrupt-row guard INTO the
 #     deployed ~/.hermes/scripts/quant-autonomous-tick.py. Do NOT clobber the deployed file
 #     (it carries live wiring). Diff first:
@@ -316,4 +325,4 @@ clear first. **The deterministic gate + HITL remain the final authority regardle
 5. **Live broker order placement is NOT enabled.** Reactor is hardwired to `PaperReactor()`,
    `allow_live=False`. No execution/order MCP is registered. Nothing in this runbook changes that.
 6. **Never run a blind `cp ops/scripts/* ~/.hermes/scripts/`** — every DRIFT is a three-way
-   reconciliation (DEPLOY-SYNC §49). The dangerous action is the blind copy, not leaving drift alone.
+   reconciliation (DEPLOY-SYNC "Reconciliation procedure"). The dangerous action is the blind copy, not leaving drift alone.

@@ -30,9 +30,11 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_AUDIT_LOG_PATH = Path.home() / ".hermes" / "quant" / "governance" / "audit_log.jsonl"
+DEFAULT_AUDIT_LOG_PATH = _resolve_quant_home() / "governance" / "audit_log.jsonl"
 
 
 def is_bma_degenerate(event: dict[str, Any]) -> bool:

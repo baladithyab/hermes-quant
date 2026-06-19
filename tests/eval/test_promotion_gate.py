@@ -22,6 +22,7 @@ import math
 from datetime import date
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 from hermes_quant.eval.promotion_gate import PromotionGate, PromotionDecision
@@ -131,6 +132,32 @@ class TestPromotionGateReject:
         gate = PromotionGate()
         decision = gate.check(_make_result(sortino=float("nan")))
         assert decision.promote is False
+
+    def test_uniform_loss_strategy_does_not_promote(self):
+        """A net-losing strategy with uniform-magnitude stop-loss days must NOT
+        promote.
+
+        Regression for the fail-open Sortino defect: `std(neg)` about the
+        losers' own mean collapsed to ~0 for uniform-magnitude losses, producing
+        a spurious +inf Sortino (the BEST possible) that cleared this gate even
+        though the strategy is a net loser. The RMS-about-MAR=0 downside fix
+        makes the Sortino correctly negative so the gate rejects.
+        """
+        from hermes_quant.eval.stockbench import _compute_sortino
+
+        # Constant -2% stop-loss days dominate small up days → net loser.
+        rets = np.array(
+            [0.01, -0.02, 0.01, -0.02, 0.01, -0.02, 0.01, -0.02, 0.005, -0.02]
+        )
+        sortino = _compute_sortino(rets)
+        assert math.isfinite(sortino) and sortino < 0.0
+
+        gate = PromotionGate()
+        # Feed the computed Sortino through the gate (alpha/dd kept passing so
+        # ONLY the Sortino criterion can fail → isolates the regression).
+        decision = gate.check(_make_result(sortino=sortino))
+        assert decision.promote is False
+        assert any("sortino" in r for r in decision.reasons)
 
     def test_nan_alpha_fails(self):
         gate = PromotionGate()

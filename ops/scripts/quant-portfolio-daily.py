@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,12 @@ QUANT_DIR = Path.home() / ".hermes" / "quant"
 STATE_DB_PATH = QUANT_DIR / "state.db"
 EXECUTIONS_PATH = QUANT_DIR / "executions.jsonl"
 SNAPSHOT_DIR = QUANT_DIR / "daily-portfolio-snapshots"
+
+# US equity-option contract multiplier (shares controlled per contract). Mirrors
+# hermes_quant.state.portfolio_state._CONTRACT_MULTIPLIER (and options.data) so the
+# true-unit (ADR-0088 multi-leg) option valuation here matches the ledger fold; a
+# us_option position's dollar value is mark × contracts × 100.
+_CONTRACT_MULTIPLIER = 100.0
 
 
 def utcnow() -> datetime:
@@ -63,8 +70,8 @@ def load_positions(account: str = "paper-default") -> list[dict]:
     try:
         conn = sqlite3.connect(STATE_DB_PATH)
         rows = conn.execute(
-            "SELECT symbol, quantity, avg_entry_price, last_update_at "
-            "FROM positions WHERE account_id = ? AND quantity != 0",
+            "SELECT asset_class, symbol, quantity, avg_entry_price, last_update_at, "
+            "unit_kind FROM positions WHERE account_id = ? AND quantity != 0",
             (account,),
         ).fetchall()
         conn.close()
@@ -72,11 +79,22 @@ def load_positions(account: str = "paper-default") -> list[dict]:
         print(f"⚠️  state.db read failed: {e}", file=sys.stderr)
         return []
     out = []
-    for sym, qty, avg, ts in rows:
+    for acls, sym, qty, avg, ts, unit_kind in rows:
         try:
             out.append(
                 {
                     "symbol": str(sym),
+                    "asset_class": str(acls) if acls else "equity",
+                    # ar118: the AUTHORITATIVE regime marker is the unit_kind COLUMN
+                    # (portfolio_state.py writes 'true_unit' iff reactor_metadata.quantity
+                    # is present), NOT a re-derivation from asset_class. The old
+                    # asset_class=='us_option' heuristic MISSED the deterministic-equity
+                    # reactor's EQUITY positions, which are ALSO true-unit (real signed
+                    # SHARES, ADR-0086/0088) — reading those as NAV-fractions over-stated
+                    # market value + P&L by ~nav_ref/mark (≈1000×). DETERMINISTIC_EQUITY=1
+                    # is LIVE, so this row class is real. Default 'nav_fraction' matches the
+                    # column default for a legacy row written before the unit_kind column.
+                    "unit_kind": str(unit_kind) if unit_kind else "nav_fraction",
                     "qty": float(qty),
                     "avg_entry": float(avg),
                     "last_update_at": str(ts) if ts else None,
@@ -85,6 +103,37 @@ def load_positions(account: str = "paper-default") -> list[dict]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def load_nav_ref(account: str = "paper-default") -> float | None:
+    """NAV reference for valuing NAV-fraction rows (cash.equity_total).
+
+    Mirrors PortfolioState.get_marked_equity, which sizes each NAV-fraction
+    position against cash.equity_total (cost-basis equity). Returns None when no
+    finite, positive cash row exists so the caller can fail honestly rather than
+    value a NAV-fraction as if it were shares.
+    """
+    if not STATE_DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(STATE_DB_PATH)
+        row = conn.execute(
+            "SELECT equity_total FROM cash WHERE account_id = ?",
+            (account,),
+        ).fetchone()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️  state.db cash read failed: {e}", file=sys.stderr)
+        return None
+    if not row or row[0] is None:
+        return None
+    try:
+        nav = float(row[0])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(nav) or nav <= 0:
+        return None
+    return nav
 
 
 def load_marks(symbols: list[str]) -> tuple[dict[str, float], dict[str, float]]:
@@ -166,17 +215,70 @@ def compute_position_pnl(
     positions: list[dict],
     marks: dict[str, float],
     prev_close: dict[str, float],
+    nav_ref: float | None = None,
 ) -> list[dict]:
+    """Mark-to-market each position, UNIT-AWARE.
+
+    Two stored unit regimes share the positions table and MUST be valued
+    differently — a single share-formula corrupts whichever regime it does not
+    match (the 2026-06-02 unit-confusion class, ADR-0086):
+
+      • TRUE-UNIT rows (asset_class == 'us_option'): Position.quantity is real
+        signed contracts (ADR-0088 multi-leg path). Dollar value is
+        mark × qty × 100 (the contract multiplier); unrealized = (mark-avg)×qty×100.
+      • NAV-FRACTION rows (every other asset_class — the legacy equity path that
+        writes the vast majority of state.db): Position.quantity is a SIGNED
+        FRACTION OF NAV (0.20 = a 20%-of-NAV long). The documented
+        get_marked_equity form (portfolio_state.py:805) is:
+            unrealized = qty × nav_ref × (mark / avg - 1)
+            market_value (signed notional) = qty × nav_ref
+        Treating that 0.20 as 0.20 SHARES — the old (mark-avg)×qty — was off by
+        ~avg×nav_ref/qty and reported meaningless dollar figures to Discord.
+
+    nav_ref (cash.equity_total) is REQUIRED to value NAV-fraction rows. When it is
+    unavailable, a NAV-fraction row's pnl fields are set to None — the report drops
+    the row rather than emitting the share-formula lie (silence-by-default).
+    """
     out = []
     for pos in positions:
         sym, qty, avg = pos["symbol"], pos["qty"], pos["avg_entry"]
+        asset_class = pos.get("asset_class", "equity")
+        # ar118: drive the unit regime off the stored unit_kind COLUMN, not a
+        # re-derivation from asset_class. A 'true_unit' row holds REAL signed units
+        # (option contracts OR det-equity shares); the contract multiplier (×100)
+        # applies ONLY to options. So a true-unit EQUITY (deterministic-equity) row
+        # uses the share formula with mult=1 — the case the old
+        # `true_unit = asset_class=='us_option'` heuristic wrongly sent down the
+        # NAV-fraction branch (≈1000× over-statement). Fall back to the asset_class
+        # heuristic only if unit_kind is absent (older row dict without the field).
+        unit_kind = pos.get("unit_kind")
+        true_unit = (
+            unit_kind == "true_unit"
+            if unit_kind is not None
+            else asset_class == "us_option"
+        )
+        mult = _CONTRACT_MULTIPLIER if asset_class == "us_option" else 1.0
         mark = marks.get(sym)
         pcl = prev_close.get(sym)
         e = dict(pos)
-        if mark is None:
+        # Defense-in-depth: a nav_fraction row with |qty| > 1.0+ε is IMPOSSIBLE
+        # (a NAV-fraction is bounded to ~[-1, 1] = 100% of NAV). A larger value
+        # is a corrupt raw-share count (e.g. the 2026-06-08 AAPL=510.03 incident
+        # that produced a fake +$70,605 unrealized in the 06-16 daily report).
+        # Exclude it entirely and warn loudly — never emit a fabricated dollar figure.
+        # true_unit rows are unaffected (they legitimately have qty>1 as real shares).
+        _CORRUPT_THRESHOLD = 1.0 + 1e-9
+        if not true_unit and abs(qty) > _CORRUPT_THRESHOLD:
+            print(
+                f"WARNING: corrupt state.db row excluded from P&L — "
+                f"symbol={sym!r} unit_kind={pos.get('unit_kind')!r} qty={qty} "
+                f"(nav_fraction qty must be in [-1,1]; this looks like a raw share count). "
+                f"Row excluded to prevent a fabricated dollar figure in the report.",
+                file=sys.stderr,
+            )
             e.update(
                 {
-                    "mark": None,
+                    "mark": mark if mark is not None else None,
                     "market_value": None,
                     "unrealized_pnl": None,
                     "unrealized_pct": None,
@@ -184,10 +286,25 @@ def compute_position_pnl(
                     "today_pct": None,
                 }
             )
-        else:
-            unreal = (mark - avg) * qty
+            out.append(e)
+            continue
+        # NAV-fraction rows need a NAV reference; without one we cannot value them
+        # honestly, so treat them as un-markable (None) rather than emit garbage.
+        if mark is None or (not true_unit and nav_ref is None):
+            e.update(
+                {
+                    "mark": mark if mark is not None else None,
+                    "market_value": None,
+                    "unrealized_pnl": None,
+                    "unrealized_pct": None,
+                    "today_pnl": None,
+                    "today_pct": None,
+                }
+            )
+        elif true_unit:
+            unreal = (mark - avg) * qty * mult
             unreal_pct = (mark - avg) / avg * (1 if qty > 0 else -1) if avg else 0.0
-            today_pnl = (mark - pcl) * qty if pcl is not None else None
+            today_pnl = (mark - pcl) * qty * mult if pcl is not None else None
             today_pct = (
                 (mark - pcl) / pcl * (1 if qty > 0 else -1)
                 if pcl is not None and pcl
@@ -196,7 +313,31 @@ def compute_position_pnl(
             e.update(
                 {
                     "mark": mark,
-                    "market_value": mark * qty,
+                    "market_value": mark * qty * mult,
+                    "unrealized_pnl": unreal,
+                    "unrealized_pct": unreal_pct,
+                    "today_pnl": today_pnl,
+                    "today_pct": today_pct,
+                }
+            )
+        else:
+            # NAV-fraction: the documented get_marked_equity dollar form.
+            unreal = qty * nav_ref * (mark / avg - 1.0) if avg else None
+            unreal_pct = (mark - avg) / avg * (1 if qty > 0 else -1) if avg else 0.0
+            today_pnl = (
+                qty * nav_ref * (mark / pcl - 1.0)
+                if pcl is not None and pcl
+                else None
+            )
+            today_pct = (
+                (mark - pcl) / pcl * (1 if qty > 0 else -1)
+                if pcl is not None and pcl
+                else None
+            )
+            e.update(
+                {
+                    "mark": mark,
+                    "market_value": qty * nav_ref,  # signed notional
                     "unrealized_pnl": unreal,
                     "unrealized_pct": unreal_pct,
                     "today_pnl": today_pnl,
@@ -590,7 +731,8 @@ def main() -> int:
 
     symbols = sorted({p["symbol"] for p in positions})
     marks, prev_close = load_marks(symbols)
-    enriched = compute_position_pnl(positions, marks, prev_close)
+    nav_ref = load_nav_ref(account=args.account)
+    enriched = compute_position_pnl(positions, marks, prev_close, nav_ref)
     summary = summarize(enriched)
     yesterday = load_yesterday_snapshot()
 

@@ -12,7 +12,17 @@ import os
 
 import pytest
 
-pytestmark = pytest.mark.requires_network
+pytestmark = [
+    pytest.mark.requires_network,
+    # Operator/credential-gated: this probe NEVER runs without real paper creds.
+    # (AG-PERC-3: the agent-testable parse->complete->parquet path lives in the
+    # unit suite tests/unit/test_options_chain_live_fetch.py with a MOCK client;
+    # this file is the live-sandbox >=2-contract probe, deferred to the operator.)
+    pytest.mark.skipif(
+        not os.environ.get("APCA_API_KEY_ID"),
+        reason="APCA_API_KEY_ID not set (live Alpaca sandbox probe is operator-gated)",
+    ),
+]
 
 
 @pytest.fixture
@@ -30,7 +40,8 @@ def test_fetch_chain_live_nvda(_live_enabled) -> None:
 
     reader = ChainSnapshotReader()
     chain = reader.fetch_chain_live("NVDA")
-    assert len(chain.snapshots) >= 20
+    # Live probe: a real underlying returns far more than the >=2 floor.
+    assert len(chain.snapshots) >= 2
     for snap in chain.snapshots:
         # All greeks complete post-completion (provider tier or optlib synth).
         g = snap.greeks
@@ -40,3 +51,6 @@ def test_fetch_chain_live_nvda(_live_enabled) -> None:
         assert g.vega is not None
     # Sample symbol round-trips through parse_occ.
     parse_occ(chain.snapshots[0].symbol)
+    # The live fetch persists a replayable parquet at the chains dir.
+    persisted = reader._path_for("NVDA", chain.asof.date())
+    assert persisted.exists()

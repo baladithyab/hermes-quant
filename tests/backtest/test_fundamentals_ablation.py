@@ -67,12 +67,20 @@ def test_b2_covid_stress_synthetic_short_bias(tmp_path) -> None:
     asof = pd.Timestamp("2020-03-31T20:00:00", tz="UTC")
     fetched = asof - pd.Timedelta(hours=2)
 
+    # cs12: stamp a PUBLIC point-in-time period_end on every snapshot. asof is
+    # 2020-03-31; period_end 2019-12-31 (+45d reporting lag = 2020-02-14) was
+    # publicly filed before asof, so the default-ON reporting-lag filter ADMITS
+    # the COVID-stress quarter (it is already public) rather than excluding it
+    # as not-yet-reported lookahead. The filter stays ACTIVE (flag not pinned).
+    public_period_end = pd.Timestamp("2019-12-31", tz="UTC")
+
     # Sector benchmark (Tech) calibrated to early-2020 levels.
     provider.write_snapshot(
         "AAA",
         {
             "as_of_date": fetched.normalize(),
             "fetched_at": fetched,
+            "period_end": public_period_end,
             "source": "yfinance",
             "pe_trailing": 22.0,
             "pe_forward": 22.0,
@@ -95,6 +103,7 @@ def test_b2_covid_stress_synthetic_short_bias(tmp_path) -> None:
         {
             "as_of_date": fetched.normalize(),
             "fetched_at": fetched,
+            "period_end": public_period_end,
             "source": "yfinance",
             "pe_trailing": 24.0,
             "pe_forward": 24.0,
@@ -123,6 +132,7 @@ def test_b2_covid_stress_synthetic_short_bias(tmp_path) -> None:
         {
             "as_of_date": fetched.normalize(),
             "fetched_at": fetched,
+            "period_end": public_period_end,
             "source": "yfinance",
             "pe_trailing": 35.0,  # > 1.30 × sector median 23 → rich
             "pe_forward": 45.0,  # > trailing → deteriorating outlook

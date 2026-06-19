@@ -344,3 +344,109 @@ def test_explicit_str_posterior_store_path_is_normalized(monkeypatch, tmp_path):
     from hermes_quant.calibrators import IdentityCalibrator
 
     assert isinstance(strat._aggregator.calibrator, IdentityCalibrator)
+
+
+# ---------------------------------------------------------------------------
+# cr12: the orphaned-instrument wire-up — _settle_due must feed a realized loss
+# into the strategy's risk gate via DefaultRiskGate.record_loss(), so Rule 4's
+# post-loss cooldown can ever fire. PRE-fix: _cooldowns stays EMPTY no matter
+# how many losing settlements occur (record_loss has zero production callers).
+# ---------------------------------------------------------------------------
+
+
+def _monotone_ohlcv(closes: list[float], start: str = "2024-01-02") -> pd.DataFrame:
+    """Deterministic OHLCV from an explicit close path (no RNG). open[i]=close[i-1]
+    so the settlement close-to-close return is fully controlled by ``closes``."""
+    closes_arr = np.asarray(closes, dtype=float)
+    n = len(closes_arr)
+    dates = pd.bdate_range(start=start, periods=n)
+    opens = np.roll(closes_arr, 1)
+    opens[0] = closes_arr[0]
+    highs = np.maximum(opens, closes_arr) * 1.001
+    lows = np.minimum(opens, closes_arr) * 0.999
+    volumes = np.full(n, 750_000.0)
+    return pd.DataFrame(
+        {"open": opens, "high": highs, "low": lows, "close": closes_arr, "volume": volumes},
+        index=dates,
+    )
+
+
+def _down_leg_ohlcv(n_warmup: int = 40, n_down: int = 20) -> pd.DataFrame:
+    """A flat-ish warmup so analysts emit + history clears min_history_bars,
+    followed by a STRICTLY-DECREASING leg so every settled close-to-close return
+    over the decline is realized<0."""
+    warmup = [100.0 + 0.05 * i for i in range(n_warmup)]  # gentle rise during warmup
+    base = warmup[-1]
+    down = [base * (0.985 ** (i + 1)) for i in range(n_down)]  # ~1.5%/bar decline
+    return _monotone_ohlcv(warmup + down)
+
+
+def _up_leg_ohlcv(n_warmup: int = 40, n_up: int = 20) -> pd.DataFrame:
+    """Warmup + a STRICTLY-INCREASING leg so every settled close-to-close return
+    is realized>=0 — the byte-identical no-loss companion (record_loss is reached
+    ONLY on the realized<0 branch, so this run must leave _cooldowns EMPTY)."""
+    warmup = [100.0 + 0.05 * i for i in range(n_warmup)]
+    base = warmup[-1]
+    up = [base * (1.015 ** (i + 1)) for i in range(n_up)]
+    return _monotone_ohlcv(warmup + up)
+
+
+def test_settle_records_loss_into_persistent_gate():
+    """cr12 RED->GREEN: a losing settlement (_settle_due observes realized<0) must
+    populate the INJECTED gate's cooldown state via record_loss(). The cooldown
+    window is set astronomically large so no real time matters — we only assert the
+    key was created with last_loss_at set.
+
+    PRE-fix this FAILS: _settle_due never calls record_loss, so _cooldowns is {}.
+    """
+    from hermes_quant.risk.gate import DefaultRiskGate, RiskConfig
+
+    ohlcv = _down_leg_ohlcv()
+    gate = DefaultRiskGate(RiskConfig(cooldown_after_loss_minutes=10_000_000))
+    strat = AdvisorStrategy(
+        ["SYN"],
+        analysts=[_DeterministicAnalyst("a", 1), _DeterministicAnalyst("b", 1)],
+        risk_gate=gate,
+        learn_from_fills=True,
+    )
+    # Drive decide() across the whole series so the pending long decisions from the
+    # rise settle against the subsequent DOWN closes (realized<0).
+    for i in range(40, len(ohlcv)):
+        asof = ohlcv.index[i]
+        strat.decide(pd.Timestamp(asof), ohlcv.loc[ohlcv.index <= asof])
+
+    # The gate the strategy actually consults is the injected one.
+    assert strat._risk_gate is gate
+    # POST-fix: at least one losing settle recorded a loss under the SAME tuple the
+    # gate keys on — ('advisor-synthetic', asset_class, symbol).
+    key = ("advisor-synthetic", "equity", "SYN")
+    assert key in gate._cooldowns, (
+        "cr12 unwired: _settle_due observed realized<0 but never called "
+        f"record_loss — gate._cooldowns={gate._cooldowns!r}"
+    )
+    assert gate._cooldowns[key].last_loss_at is not None
+
+
+def test_settle_no_loss_leaves_cooldowns_empty():
+    """cr12 byte-identical no-loss companion: a monotone-UP series whose settled
+    decisions all realize realized>=0 must leave _cooldowns EMPTY — record_loss is
+    reached ONLY on the realized<0 branch, so the no-loss path is untouched by the
+    wire (identical to pre-fix behavior)."""
+    from hermes_quant.risk.gate import DefaultRiskGate, RiskConfig
+
+    ohlcv = _up_leg_ohlcv()
+    gate = DefaultRiskGate(RiskConfig(cooldown_after_loss_minutes=10_000_000))
+    strat = AdvisorStrategy(
+        ["SYN"],
+        analysts=[_DeterministicAnalyst("a", 1), _DeterministicAnalyst("b", 1)],
+        risk_gate=gate,
+        learn_from_fills=True,
+    )
+    for i in range(40, len(ohlcv)):
+        asof = ohlcv.index[i]
+        strat.decide(pd.Timestamp(asof), ohlcv.loc[ohlcv.index <= asof])
+
+    assert gate._cooldowns == {}, (
+        "no realized loss occurred, yet a cooldown was recorded — the wire must "
+        f"only fire on realized<0; gate._cooldowns={gate._cooldowns!r}"
+    )

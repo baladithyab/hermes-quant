@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # --- Hard caps (the silence-only rail; never widened by the loop) -----------
@@ -35,6 +37,15 @@ WEIGHT_CAP: float = 1.0          # a factor's candidate weight is clamped to [0,
 WEIGHT_FLOOR: float = 0.0        # rejected → silence-toward-0.
 MAX_STEP_PER_CYCLE: float = 0.10  # bounded per-cycle change (SkillOpt textual learning-rate analog).
 MIN_OBSERVATIONS: int = 30       # DSR is meaningless below this (dsr.py raises < 30); mirror it here.
+# Absolute promotability floor on the held-out DSR (ADR-0080 §D80.3). The eval gate's
+# checkpoint-fallback baseline is -inf on the first run (load_prior_best_dsr missing -> -inf),
+# so STRICTLY-beats-prior-best alone admits ANY finite DSR — including a consistent LOSER whose
+# n_trials=1 DSR underflows toward 0.0 (Φ of an extreme-negative z) and which is plateau-stable
+# (a consistent loser has low cross-fold Sharpe CV + sign-consistent folds, so the robustness
+# check does NOT reject it). 0.5 is the no-edge midpoint of the n_trials=1 PSR (Φ(0) for a
+# zero-Sharpe set): a POSITIVE-Sharpe edge is required to clear it. Without this floor the cron
+# would write advisory candidates for a guaranteed money-loser and ratchet the baseline to ~0.
+MIN_PROMOTABLE_DSR: float = 0.5
 # Tier → target weight (the proposal direction). premium gets the most headroom; rejected → 0.
 _TIER_TARGET: dict[str, float] = {
     "premium": 1.00,
@@ -43,7 +54,7 @@ _TIER_TARGET: dict[str, float] = {
     "rejected": 0.00,    # silence-toward-0
 }
 
-_DEFAULT_DIR = Path.home() / ".hermes" / "quant" / "factors"
+_DEFAULT_DIR = _resolve_quant_home() / "factors"
 _CANDIDATES_FILE = "weight-candidates.json"
 _REJECTED_BUFFER = "weight-rejected-buffer.jsonl"
 _PRIOR_BEST_FILE = "weight-prior-best.json"
@@ -193,9 +204,11 @@ def propose_weights(
 # --- Held-out OOS scoring (external-truth: realized forward returns from market bars) --------
 # The cron passes the OOS *tail* the proposer never saw, plus a `compute_factor` callable
 # (AlphaZoo.compute). We build the PROPOSED-weight factor composite as a long/short position
-# series, realize it against next-bar returns (signal at t → return t→t+1, no lookahead), score
-# the OOS Sharpe → DSR, and read robustness from cross-fold Sharpe jitter (NOT the in-sample
-# peak — the AMZN-weight lesson). This module performs NO network I/O; bars are supplied.
+# series, realize it against next-bar returns (signal at t → return t→t+1, no lookahead). The
+# per-factor z-score normalization is CAUSAL/expanding (bar t uses only bars <= t — no
+# within-holdout lookahead from a full-window mean/std), then score the OOS Sharpe → DSR, and read
+# robustness from cross-fold Sharpe jitter (NOT the in-sample peak — the AMZN-weight lesson). This
+# module performs NO network I/O; bars are supplied.
 HOLDOUT_FOLDS: int = 4               # contiguous OOS sub-windows for the cross-fold jitter check.
 # plateau_stable iff the RELATIVE cross-fold Sharpe dispersion (coefficient of variation =
 # stdev/|mean|) is bounded AND a majority of folds keep the OOS sign. A relative cap (not an
@@ -213,10 +226,11 @@ def _composite_position(
 ):
     """Build the PROPOSED-weight factor composite as a per-bar long/short position in [-1, 1].
 
-    For each factor with a non-zero proposed weight: z-score its values over the holdout (so
-    factors are comparable), weight by `proposed_weight`, and sum. The composite's sign is the
-    position direction (positive factor predicts positive forward return — the IC convention in
-    ic_panel.py). Returns a pd.Series aligned to holdout_bars, or None if nothing weighted.
+    For each factor with a non-zero proposed weight: z-score its values with a CAUSAL/expanding
+    normalization (bar t uses only bars <= t, never the full window — no within-holdout lookahead),
+    weight by `proposed_weight`, and sum. The composite's sign is the position direction (positive
+    factor predicts positive forward return — the IC convention in ic_panel.py). Returns a pd.Series
+    aligned to holdout_bars, or None if nothing weighted.
     """
     import numpy as np
     import pandas as pd
@@ -232,10 +246,19 @@ def _composite_position(
         except Exception:  # noqa: BLE001 — a single bad factor must not crash the OOS score
             continue
         series = pd.Series(series).astype(float)
-        std = series.std(ddof=0)
-        if not np.isfinite(std) or std == 0.0:
-            continue  # degenerate / constant factor contributes no signal
-        z = (series - series.mean()) / std
+        # CAUSAL (expanding) z-score: bar t is normalized using ONLY bars <= t. A full-window
+        # mean/std would make bar t's z (and hence its np.sign() position at the return below)
+        # depend on bars t+1..T — a within-holdout lookahead that contaminates the realized OOS
+        # Sharpe → DSR → plateau that gate eval_passed. min_periods=2 mirrors the std(ddof=0)
+        # degeneracy guard; bars with a non-finite or zero expanding std contribute 0 (masked),
+        # which preserves the prior "constant/degenerate factor contributes no signal" behaviour
+        # per-bar instead of dropping the whole factor.
+        em = series.expanding(min_periods=2).mean()
+        es = series.expanding(min_periods=2).std(ddof=0)
+        es_valid = es.where(np.isfinite(es) & (es != 0.0))  # NaN where std is non-finite or zero
+        if not es_valid.notna().any():
+            continue  # degenerate / constant factor contributes no signal on any bar
+        z = ((series - em) / es_valid).where(es_valid.notna())
         contribution = z.fillna(0.0) * w
         combined = contribution if combined is None else combined.add(contribution, fill_value=0.0)
         total_w += w
@@ -353,6 +376,11 @@ def evaluate_against_holdout(
       (2) STRICTLY beats prior-best on held-out: holdout_dsr > prior_best_dsr (checkpoint-fallback —
           if not, revert: the returned set keeps proposals but eval_passed=False so the operator
           does NOT promote, and the set is appended to the rejected buffer);
+      (2b) absolute floor: holdout_dsr >= MIN_PROMOTABLE_DSR (the no-edge midpoint). On the FIRST
+          run prior_best is -inf, so (2) alone admits ANY finite DSR — including a consistent
+          LOSER (negative Sharpe -> DSR ~ 0.0) that is plateau-stable. The floor requires a
+          positive-Sharpe edge regardless of the baseline (without it the cron would write
+          advisory candidates for a guaranteed money-loser and ratchet the baseline to ~0);
       (3) robustness-not-peak: plateau_stable is True;
       (4) bounded: every proposed_weight in [FLOOR, CAP] (asserted; a violation is a hard error).
     Propose-only (5) is structural: this function never applies anything; it only annotates.
@@ -372,7 +400,13 @@ def evaluate_against_holdout(
             )
 
     beats_prior_best = holdout_dsr > prior_best_dsr   # (2) STRICT — a tie reverts.
-    eval_passed = bool(beats_prior_best and plateau_stable)   # (3) robustness-not-peak ANDed in.
+    # (2b) absolute floor: a no-edge / losing set must fail even when prior_best is the first-run
+    # -inf baseline. >= is inclusive so a set exactly at the no-edge midpoint is NOT promotable
+    # (it must clear the floor with a positive-Sharpe edge). NaN holdout_dsr fails closed: any
+    # comparison with NaN is False, so beats_prior_best and the floor both reject it.
+    eval_passed = bool(
+        beats_prior_best and plateau_stable and holdout_dsr >= MIN_PROMOTABLE_DSR
+    )   # (3) robustness-not-peak ANDed in.
 
     proposal_set.held_out_dsr = holdout_dsr
     proposal_set.held_out_sharpe_delta = holdout_sharpe_delta

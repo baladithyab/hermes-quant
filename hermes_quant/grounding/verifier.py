@@ -122,10 +122,19 @@ class VerificationResult:
 class ClaimVerifier:
     """Verifies that every numerical claim in an AnalystView is cited.
 
-    A claim is considered cited if EITHER:
-      (a) its normalized form appears as a substring in render_for_prompt(block), OR
-      (b) the rationale contains an explicit citation marker '[gt_SYMBOL_...]'
-          whose ID is present in block.citation_ids.
+    A numerical claim is considered cited iff its normalized value appears as a
+    standalone number in ``render_for_prompt(block)`` (check (a)).
+
+    A nearby valid citation marker is NOT sufficient on its own to credit a number
+    that is absent from the block text. Block citation markers are coarse — one
+    marker per bar close (``gt_SYMBOL_YYYYMMDD_close``) — so the marker
+    ``[gt_AAPL_20260507_close]`` attests to exactly one value (that day's close) and
+    cannot stand in for an arbitrary unrelated number printed beside it. Crediting
+    any number within 80 chars of a valid marker is precisely the
+    "one-citation-covers-all-fabricated-numbers" loophole this module exists to
+    eliminate (F3: LLM-fabricated price levels). Proximity to a valid marker is a
+    NECESSARY-but-not-SUFFICIENT signal; the number itself must be traceable to the
+    block, so the substring check (a) is the sole gate for numeric claims.
 
     Parameters
     ----------
@@ -168,27 +177,22 @@ class ClaimVerifier:
             )
 
         gt_text = render_for_prompt(block)
-        valid_citation_ids = set(block.citation_ids) | {
-            f"gt_{block.symbol}_{block.asof.replace('-', '')}_quote"
-        }
 
         cited: list[str] = []
         uncited: list[str] = []
 
-        # Build a set of explicitly cited IDs from the rationale
-        explicit_citations = extract_citation_markers(rationale)
-        has_valid_explicit_citation = bool(explicit_citations & valid_citation_ids)
-
         for raw_claim in claims:
             norm = _normalize_number(raw_claim)
-            # Check (a): number appears as a standalone value in ground-truth rendered text
-            # (uses word-boundary matching to prevent '0.75' matching inside '170.7500')
+            # A numeric claim is cited IFF its normalized value appears as a
+            # standalone number in the ground-truth rendered text (uses
+            # word-boundary matching to prevent '0.75' matching inside '170.7500').
+            #
+            # A nearby valid citation marker is deliberately NOT sufficient: block
+            # markers are coarse (one per close) and attest to exactly one value, so
+            # crediting any number within 80 chars of a valid marker is the
+            # "one-citation-covers-all-fabricated-numbers" loophole (F3). A number
+            # absent from the block stays UNCITED regardless of an adjacent marker.
             if _number_in_gt_text(norm, gt_text):
-                cited.append(raw_claim)
-                continue
-            # Check (b): explicit citation marker adjacent to this claim (within 80 chars).
-            # Proximity check prevents the "one citation covers all fabricated numbers" loophole.
-            if has_valid_explicit_citation and self._claim_near_citation(raw_claim, rationale):
                 cited.append(raw_claim)
                 continue
             uncited.append(raw_claim)
@@ -212,22 +216,11 @@ class ClaimVerifier:
             reason=reason,
         )
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _claim_near_citation(claim: str, text: str, window: int = 80) -> bool:
-        """Return True if *claim* appears within *window* chars of a citation marker in *text*.
-
-        Proximity check prevents the loophole where one citation marker anywhere
-        in the rationale is used to credit all fabricated numerical claims.
-        """
-        claim_pos = text.find(claim)
-        if claim_pos < 0:
-            return False
-        # Look for any citation marker within window chars before or after the claim
-        search_start = max(0, claim_pos - window)
-        search_end = min(len(text), claim_pos + len(claim) + window)
-        excerpt = text[search_start:search_end]
-        return bool(_CITATION_PATTERN.search(excerpt))
+    # NOTE: there is intentionally NO proximity-to-marker fallback for numeric
+    # claims. Block citation markers are coarse (one per bar close) and attest to a
+    # single value; crediting any number that merely sits near a valid marker is the
+    # "one-citation-covers-all-fabricated-numbers" loophole (F3). A numeric claim is
+    # cited iff its value is traceable in the ground-truth block text (the check
+    # above). This subsumes the earlier ar65 valid-marker-proximity guard, which
+    # still admitted a fabricated number adjacent to a valid marker — proximity
+    # itself was the hole.

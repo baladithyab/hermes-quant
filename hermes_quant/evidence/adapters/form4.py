@@ -44,8 +44,9 @@ import os
 import time
 import urllib.request
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from hermes_quant.evidence.schema import (
     FilingEvidence,
@@ -70,6 +71,16 @@ _FLAG = "HERMES_QUANT_INSIDER_ENABLED"
 
 # Root form "4" matches both "4" and its amendment "4/A" (EDGAR groups them).
 _FORM4_KINDS = frozenset({"4", "4/A"})
+
+# EDGAR clocks its acceptance/filing wall-clocks in US/Eastern. The civil offset
+# is -05:00 in winter (EST, DST off ~Nov-Mar) and -04:00 in summer (EDT). We
+# resolve it PER-DATE from the IANA zone (stdlib zoneinfo, no new dependency)
+# rather than hard-coding one offset: a fixed -04:00 would anchor EST-season
+# filings 1h too EARLY in UTC, fabricating earlier public availability and
+# defeating the no-lookahead gate. -05:00 is the LATER (never-earlier) UTC
+# instant for a given Eastern wall-clock, so the per-date resolution is the
+# conservative, asof-honest choice.
+_ET = ZoneInfo("America/New_York")
 
 
 def insider_enabled() -> bool:
@@ -169,11 +180,11 @@ def _parse_acceptance_dt(s: str) -> datetime | None:
             naive = datetime.strptime(s, "%Y%m%d%H%M%S")
         except ValueError:
             return None
-        # Treat the compact header time as US/Eastern (EDGAR's clock). We do not
-        # depend on zoneinfo: -04:00 is the conservative (later-in-UTC) DST
-        # offset, so the resulting available_at is never EARLIER than the true
-        # public moment.
-        dt = naive.replace(tzinfo=timezone(timedelta(hours=-4)))
+        # Treat the compact header time as US/Eastern (EDGAR's clock). The civil
+        # offset (EST -05:00 / EDT -04:00) is resolved PER-DATE from
+        # America/New_York so a winter (EST) filing is never anchored 1h early —
+        # the resulting available_at is never EARLIER than the true public moment.
+        dt = naive.replace(tzinfo=_ET)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
@@ -184,8 +195,10 @@ def _parse_filing_date_eod(s: str) -> datetime | None:
 
     Used only as a fallback when ``acceptanceDateTime`` is absent. A Form 4 is
     public no earlier than the END of its filing day, so we anchor at
-    end-of-day Eastern (23:59:59 ET ≈ 03:59:59Z next day) — a LATER bound. This
-    guarantees we never claim the filing was public earlier than it actually was
+    end-of-day Eastern (23:59:59 ET). The civil offset is resolved PER-DATE from
+    America/New_York, so this is 04:59:59Z next day in winter (EST) and
+    03:59:59Z next day in summer (EDT) — always a LATER bound. This guarantees
+    we never claim the filing was public earlier than it actually was
     (no-lookahead). Unparseable -> None (caller SKIPS, never now()).
     """
     s = (s or "").strip()
@@ -195,9 +208,7 @@ def _parse_filing_date_eod(s: str) -> datetime | None:
         d = date.fromisoformat(s)
     except ValueError:
         return None
-    eod_et = datetime(
-        d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone(timedelta(hours=-4))
-    )
+    eod_et = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=_ET)
     return eod_et.astimezone(UTC)
 
 
@@ -229,6 +240,12 @@ def parse_submissions(
     ``filed_at >= since``. Never raises: a malformed body -> ``[]``.
     """
     items: list[InsiderFiling] = []
+    # Defensive: filed_at is tz-aware UTC, so a NAIVE `since` (tzinfo=None, e.g.
+    # from a bare-date `datetime.fromisoformat("2025-01-01")`) would make the
+    # `filed_at < since` compare raise TypeError. Anchor a naive cutoff to UTC up
+    # front to uphold the "Never raises" contract regardless of the caller.
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
     try:
         doc = json.loads(raw)
     except (ValueError, TypeError) as e:

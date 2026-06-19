@@ -387,19 +387,60 @@ class AlpacaBackend:
             # 'partially_filled' / 'new' / 'accepted' / 'pending_*' — NON-terminal.
             if time.monotonic() >= deadline:
                 # P1-C: cancel the working parent, then re-read once.
+                cancel_confirmed = True
                 try:
                     client.cancel_order_by_id(parent_id)
                 except Exception as exc:  # noqa: BLE001 — best-effort cancel
+                    cancel_confirmed = False
                     logger.warning(
                         "alpaca-backend: cancel mleg parent %s failed: %s",
                         parent_id,
                         exc,
                     )
                 time.sleep(self._poll_interval_s)
-                final = self._refresh(client, parent_id)
+                # P1-C2 (parity with _alpaca_exec.cancel_and_settle): re-read the
+                # parent. If the cancel was UNCONFIRMED (raised above) AND this
+                # re-read ALSO raises, settlement is UNKNOWN — the parent may still
+                # be WORKING and may yet fill, creating a real LIVE multi-leg
+                # position. Returning (None, 'unfilled_timeout') would orphan it
+                # PERMANENTLY (the no-fill record reconciles no position and is
+                # treated terminally by every consumer). Fail CLOSED — byte-identical
+                # to the active-poll re-read below (L420) and the equity sibling.
+                try:
+                    final = client.get_order_by_id(parent_id)
+                except Exception as exc:  # noqa: BLE001
+                    if not cancel_confirmed:
+                        raise AlpacaSubmitError(
+                            f"mleg parent {parent_id}: cancel was NOT confirmed and "
+                            f"the post-cancel re-read also failed ({exc}) — settlement "
+                            "UNKNOWN, the parent may still be working; refusing to "
+                            "record a clean no-fill"
+                        ) from exc
+                    # Cancel CONFIRMED: the parent is provably no longer working. A
+                    # transient re-read failure is safe to degrade to a clean
+                    # unfilled (no orphan risk).
+                    logger.warning(
+                        "alpaca-backend: post-cancel get_order_by_id(%s) failed "
+                        "after a CONFIRMED cancel: %s (parent provably no longer "
+                        "working — clean unfilled)",
+                        parent_id,
+                        exc,
+                    )
+                    final = None
                 fstatus = str(getattr(final, "status", "") or "").lower()
+                # P3-B (parity with _alpaca_exec.cancel_and_settle): the cancel
+                # only removes the UNfilled remainder, so a cancel-vs-fill race can
+                # leave the parent reading back NON-terminal (e.g.
+                # 'partially_filled') in the brief window before its status settles
+                # — yet its child .legs already carry REAL fills. Record ANY
+                # realized child partial regardless of the (non-terminal) parent
+                # status; never discard a parent that demonstrably moved a position
+                # (else a genuinely-filled mleg is orphaned live). Only a parent
+                # with no child fill at all falls through to unfilled_timeout.
                 if final is not None and (
-                    fstatus == "filled" or fstatus in _alpaca_exec.REJECT_STATUSES
+                    fstatus == "filled"
+                    or fstatus in _alpaca_exec.REJECT_STATUSES
+                    or self._any_child_filled(final)
                 ):
                     return final, fstatus
                 return None, "unfilled_timeout"
@@ -410,6 +451,23 @@ class AlpacaBackend:
                 raise AlpacaSubmitError(
                     f"get_order_by_id({parent_id}) failed during mleg poll: {exc}"
                 ) from exc
+
+    @staticmethod
+    def _any_child_filled(parent: Any) -> bool:
+        """True iff any child ``.leg`` of an mleg parent carries a positive fill.
+
+        Mirrors ``_alpaca_exec.extract_fill``'s positive-fill test (price>0 AND
+        qty>0) but applied to the child legs — an mleg parent carries no single avg
+        price, so a cancel-vs-fill race is detected on the children. Used to decide
+        whether a NON-terminal post-cancel parent re-read still represents a real
+        realized partial that must be recorded (P3-B), not discarded as a no-fill.
+        """
+        for child in list(getattr(parent, "legs", None) or []):
+            price = _alpaca_exec.to_float(getattr(child, "filled_avg_price", None))
+            qty = _alpaca_exec.to_float(getattr(child, "filled_qty", None))
+            if price is not None and price > 0 and qty is not None and qty > 0:
+                return True
+        return False
 
     def _build_leg_fills(
         self, parent: Any, option_legs: tuple[Any, ...]
@@ -441,9 +499,25 @@ class AlpacaBackend:
                 if intent is not None
                 else (getattr(req_leg, "position_intent", None) if req_leg else None)
             )
-            price = _alpaca_exec.to_float(getattr(child, "filled_avg_price", None)) or 0.0
-            abs_qty = _alpaca_exec.to_float(getattr(child, "filled_qty", None)) or 0.0
-            signed = abs_qty if is_buy else -abs_qty
+            # Honesty rail (mirror the single-leg path's ``extract_fill``, which
+            # requires BOTH price>0 AND qty>0 — _alpaca_exec.extract_fill / the
+            # poll_until_filled "keep polling a 'filled' order whose avg price is
+            # not yet populated" branch). A child reporting a signed qty but an
+            # UNPOPULATED / non-positive avg price (None / <=0) is the cancel-vs-fill
+            # / partial-settle window _poll_mleg_parent explicitly tolerates — it is
+            # NOT-YET-SETTLED, not a 0.0-cost fill. Coercing price and qty
+            # INDEPENDENTLY (``price or 0.0`` / ``abs_qty or 0.0``) would book a
+            # phantom zero-cost option position (true-unit path: positions={(...):
+            # (-qty, 0.0)}, delta_cash=0) and bias the ADR-0016 kill-switch NAV.
+            # So emit a ZERO-fill LegFill (qty=0.0 / price=0.0) — a non-position-
+            # moving event the existing is_fill / child guards correctly reject.
+            price = _alpaca_exec.to_float(getattr(child, "filled_avg_price", None))
+            abs_qty = _alpaca_exec.to_float(getattr(child, "filled_qty", None))
+            if price is None or price <= 0.0 or abs_qty is None or abs_qty == 0.0:
+                price = 0.0
+                signed = 0.0
+            else:
+                signed = abs_qty if is_buy else -abs_qty
             status = str(getattr(child, "status", "") or "").lower() or "filled"
             fills.append(
                 FillResult(
@@ -490,14 +564,3 @@ class AlpacaBackend:
             poll_interval_s=self._poll_interval_s,
             logger=logger,
         )
-
-    @staticmethod
-    def _refresh(client: Any, order_id: str) -> Any | None:
-        """Best-effort re-read of an order (for parent .legs after terminal)."""
-        try:
-            return client.get_order_by_id(order_id)
-        except Exception as exc:  # noqa: BLE001 — non-fatal; caller falls back
-            logger.warning(
-                "alpaca-backend: get_order_by_id(%s) refresh failed: %s", order_id, exc
-            )
-            return None

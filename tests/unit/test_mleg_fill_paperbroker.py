@@ -51,6 +51,48 @@ def test_deterministic_mleg_fill_sums_to_net(monkeypatch) -> None:
     assert by_sym["NVDA260626C00160000"].filled_qty == -1
 
 
+def _recon_net(res, outer_qty: int) -> float:
+    """Per-structure net = Sum(sign * per_contract_price * ratio_qty); the per-leg
+    signed contributions MUST reconstruct net_limit_price (ar50)."""
+    return sum(
+        (1.0 if lf.filled_qty > 0 else -1.0)
+        * lf.filled_avg_price
+        * (abs(lf.filled_qty) / outer_qty)
+        for lf in res.legs
+    )
+
+
+def test_unpriced_opposite_side_legs_reconstruct_net(monkeypatch) -> None:
+    # ar50 RED: two UNPRICED opposite-side legs. abs(residual)/outer_qty discarded
+    # the residual sign, so long(+) and short(-) per-leg contributions cancelled to
+    # 0.00 instead of reconstructing the gate-approved net.
+    monkeypatch.delenv("HERMES_QUANT_MULTILEG_REACTOR", raising=False)
+    broker = PaperBroker(paper=True)
+    legs = (
+        _leg("NVDA271217C00120000", "buy", "buy_to_open", price=None),
+        _leg("NVDA260626C00160000", "sell", "sell_to_open", price=None),
+    )
+    res = broker.submit_mleg_order(
+        legs, outer_qty=1, net_limit_price=4.0, tif="day", client_order_id="reconc"
+    )
+    assert _recon_net(res, 1) == pytest.approx(4.0)
+
+
+def test_unpriced_net_credit_reconstructs_signed(monkeypatch) -> None:
+    # ar50 RED: net-CREDIT structure (net_limit_price < 0) with unpriced legs.
+    monkeypatch.delenv("HERMES_QUANT_MULTILEG_REACTOR", raising=False)
+    broker = PaperBroker(paper=True)
+    legs = (
+        _leg("NVDA260626C00160000", "sell", "sell_to_open", price=None),
+        _leg("NVDA271217C00120000", "buy", "buy_to_open", price=None),
+    )
+    res = broker.submit_mleg_order(
+        legs, outer_qty=1, net_limit_price=-3.0, tif="day", client_order_id="credrecon"
+    )
+    assert abs(res.net_fill_price - (-3.0)) < 1e-9
+    assert _recon_net(res, 1) == pytest.approx(-3.0)
+
+
 def test_non_paper_account_raises(monkeypatch) -> None:
     with pytest.raises(LiveMultiLegNotAuthorized):
         PaperBroker(paper=False)

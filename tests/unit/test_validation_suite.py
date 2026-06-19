@@ -147,6 +147,188 @@ def test_excess_return_stats_present_with_bh():
     assert "excess_return" in boot_stats
 
 
+def test_excess_pairs_same_date_bars_under_misaligned_nan():
+    """cs39: a non-finite in ONE series at an index the OTHER series lacks must
+    drop that bar from BOTH (joint mask) so excess pairs SAME-DATE strat/bh
+    bars. The old code compressed each series independently then subtracted
+    positionally — pairing strat[i] with the wrong (shifted) bh bar.
+
+    strat = [.01, .02, .03, .04, .05]
+    bh    = [.01, NaN, .02, .03, .04]
+    The NaN is at index 1 of bh only. Correct same-date pairing drops index 1
+    from BOTH -> excess = [.01-.01, .03-.02, .04-.03, .05-.04] = [0, .01, .01, .01].
+    The buggy independent-compress yields bh_compressed[1:] shifted left, so
+    excess collapses to [0, 0, 0, 0] (strategy looks like it never outperforms).
+    The excess_return bootstrap point is the compounded total return of the
+    PAIRED excess series; assert it matches the same-date-aligned hand value.
+    """
+    strat = np.array([0.01, 0.02, 0.03, 0.04, 0.05])
+    bh = np.array([0.01, np.nan, 0.02, 0.03, 0.04])
+
+    # Hand-computed SAME-DATE-aligned excess (joint mask drops index 1 from both).
+    expected_excess = np.array([0.0, 0.01, 0.01, 0.01])
+    expected_point = float(np.prod(1.0 + expected_excess) - 1.0)
+
+    rep = validate_returns(
+        strat,
+        bars_per_year=252,
+        bh_returns=bh,
+        n_permutations=50,
+        n_resamples=50,
+        seed=42,
+    )
+    excess_ci = next(c for c in rep.bootstrap if c.statistic == "excess_return")
+    # The buggy positional-subtract collapses excess to all-zeros -> point == 0.0;
+    # the same-date pairing yields a strictly positive compounded excess.
+    assert excess_ci.point == pytest.approx(expected_point)
+    assert excess_ci.point > 0.0
+
+
+def test_excess_all_finite_is_byte_identical():
+    """The all-finite common case must be unchanged by the cs39 joint-mask fix
+    (joint mask == all True), so the excess_return point equals the naive
+    positional subtract of the two fully-finite series."""
+    r = _noise(120, drift=0.001, seed=4)
+    bh = _noise(120, drift=0.0002, seed=9)
+    m = min(r.size, bh.size)
+    expected_point = float(np.prod(1.0 + (r[:m] - bh[:m])) - 1.0)
+    rep = validate_returns(
+        r, bars_per_year=252, bh_returns=bh, n_permutations=50, n_resamples=50, seed=42
+    )
+    excess_ci = next(c for c in rep.bootstrap if c.statistic == "excess_return")
+    assert excess_ci.point == pytest.approx(expected_point)
+
+
+# --- cs46: non-finite bootstrap samples must not corrupt the promotion-gate CI
+def test_degenerate_series_yields_finite_ci_low_not_nan():
+    """cs46: a zero-variance (constant) return series makes _sharpe return ±inf
+    on EVERY stationary-bootstrap resample (a single repeated block is still
+    constant). np.nanpercentile drops NaN but KEEPS inf, and the tail
+    interpolation subtract(b, a) on inf yields NaN -> a NaN ci_low.
+
+    sharpe_95ci_lower is the promotion-gate threshold (react/live.py:38,
+    governance/promotion.py:274 require >= 1.0). ``NaN < 1.0`` is False in
+    Python, so a NaN lower bound silently PASSES a gate that must fail-closed.
+    After the fix the lower bound is FINITE and conservative (does not satisfy
+    the >= 1.0 gate)."""
+    r = np.full(42, 0.001)  # perfectly constant -> zero variance, +inf Sharpe
+    rep = validate_returns(r, bars_per_year=252, n_permutations=50, n_resamples=400, seed=42)
+    sharpe_ci = next(c for c in rep.bootstrap if c.statistic == "sharpe")
+    # The bug: ci_low/ci_high == NaN. The fix: a finite conservative bound.
+    assert np.isfinite(sharpe_ci.ci_low), "ci_low must be finite, not NaN (cs46)"
+    assert np.isfinite(sharpe_ci.ci_high), "ci_high must be finite, not NaN (cs46)"
+    # Fail-closed: the conservative lower bound does NOT clear the >=1.0 gate.
+    assert not (sharpe_ci.ci_low >= 1.0)
+    # And it round-trips through json.dumps(allow_nan=False) as a real number,
+    # not the None that a leaked NaN would render as.
+    rep_dict = rep.to_dict()
+    json.dumps(rep_dict, allow_nan=False)  # raises if any NaN/inf leaked
+    sharpe_d = next(b for b in rep_dict["bootstrap"] if b["statistic"] == "sharpe")
+    assert sharpe_d["ci_low"] is not None and np.isfinite(sharpe_d["ci_low"])
+
+
+def test_percentile_ci_filters_inf_samples():
+    """cs46 (unit): _percentile_ci must drop ±inf samples before the percentile
+    so an inf in the tail-interpolation window cannot poison ci_low/ci_high to
+    NaN. A bootstrap distribution mixing finite values with a few +inf samples
+    must yield the SAME finite CI as the all-finite subset."""
+    finite = np.linspace(-2.0, 3.0, 200)
+    contaminated = np.concatenate([finite, np.full(7, np.inf)])
+    lo_c, hi_c = validation_mod._percentile_ci(contaminated, 0.95)
+    lo_f, hi_f = validation_mod._percentile_ci(finite, 0.95)
+    assert np.isfinite(lo_c) and np.isfinite(hi_c)
+    assert lo_c == pytest.approx(lo_f)
+    assert hi_c == pytest.approx(hi_f)
+    # All-non-finite distribution -> conservative finite bound, never NaN.
+    all_inf = np.full(50, np.inf)
+    lo_z, hi_z = validation_mod._percentile_ci(all_inf, 0.95)
+    assert np.isfinite(lo_z) and np.isfinite(hi_z)
+    assert not (lo_z >= 1.0)  # fails-closed against the promotion gate
+
+
+def test_normal_variance_ci_unchanged_by_cs46_filter():
+    """A finite-variance series leaves every bootstrap sample finite, so the
+    finite mask is all-True and the percentile is byte-identical to the old
+    np.nanpercentile path. Asserts _percentile_ci == np.nanpercentile on a
+    fully-finite distribution."""
+    rng = np.random.default_rng(11)
+    samples = rng.standard_normal(5000) * 1.5 + 0.4  # all finite
+    lo, hi = validation_mod._percentile_ci(samples, 0.95)
+    # Equal to the old nanpercentile path to within floating-point (the only
+    # difference is which numpy percentile kernel runs; on all-finite input the
+    # finite mask is all-True so the statistic is the same percentile).
+    assert lo == pytest.approx(float(np.nanpercentile(samples, 2.5)))
+    assert hi == pytest.approx(float(np.nanpercentile(samples, 97.5)))
+
+
+# --- cs48: a non-finite observed Sharpe must not propagate a NaN DSR ---------
+def test_degenerate_series_dsr_is_finite_conservative_not_nan():
+    """cs48 (sibling of cs46): a zero-variance OOS series with n >= 30 makes
+    _sharpe return +inf (positive mean) or -inf (negative mean). The DSR path
+    (dsr.deflated_sharpe) then computes
+    ``variance_term = 1 - skew*SR + (kurt-1)/4*SR**2``; with a constant series
+    skew==0, so ``skew*inf == nan`` -> variance_term is NaN, the
+    ``variance_term <= 0`` guard is NaN<=0 == False, and
+    ``Φ(sr_diff*sqrt(n-1)/sqrt(NaN))`` collapses to NaN. validation.py's
+    try/except only catches ValueError/ZeroDivisionError, so the NaN is NOT
+    caught and NO warning is emitted: the artifact reports deflated_sharpe NaN
+    (-> null in JSON) INDISTINGUISHABLE from the legitimate n<30 low-power
+    omission, silently erasing the false-discovery hedge.
+
+    After the fix the DSR is a FINITE, conservative value that fails any
+    ``dsr >= floor`` gate (mirrors cs46 returning a conservative finite bound),
+    and a warning records the degeneracy."""
+    r = np.full(42, 0.001)  # n>=30, zero variance -> +inf observed Sharpe
+    rep = validate_returns(r, bars_per_year=252, n_permutations=50, n_resamples=200, seed=42)
+    # The bug: deflated_sharpe is NaN. The fix: a finite conservative value.
+    assert np.isfinite(rep.deflated_sharpe), "deflated_sharpe must be finite, not NaN (cs48)"
+    # Conservative = does NOT clear a DSR floor (e.g. dsr_floor 0.5 / 0.95);
+    # a probability of 0.0 is the maximally-conservative "no confidence" value.
+    assert rep.deflated_sharpe == 0.0
+    # n>=30 so the legitimate low-power warning must NOT be the explanation;
+    # instead a DSR-degeneracy warning distinguishes this from a true omission.
+    assert not any("low statistical power" in w for w in rep.warnings)
+    assert any("deflated_sharpe" in w.lower() for w in rep.warnings)
+    # And the JSON artifact now carries a real number, not the null that a NaN
+    # would render as (which masquerades as the n<30 omission).
+    rep_dict = rep.to_dict()
+    json.dumps(rep_dict, allow_nan=False)  # raises if any NaN/inf leaked
+    assert rep_dict["deflated_sharpe"] == 0.0
+
+
+def test_degenerate_negative_mean_series_dsr_is_finite():
+    """cs48: the -inf branch (zero variance, NEGATIVE mean) must also yield a
+    finite conservative DSR, not NaN. A losing constant strategy should report
+    0.0 confidence, never a null that the gate cannot fail-close on."""
+    r = np.full(42, -0.002)  # n>=30, zero variance -> -inf observed Sharpe
+    rep = validate_returns(r, bars_per_year=252, n_permutations=50, n_resamples=200, seed=42)
+    assert np.isfinite(rep.deflated_sharpe)
+    assert rep.deflated_sharpe == 0.0
+
+
+def test_dsr_unchanged_for_finite_variance_series():
+    """cs48: a normal finite-variance series with n>=30 never triggers the
+    non-finite guard, so the DSR is byte-identical to the un-guarded
+    dsr.deflated_sharpe computed directly from the same observed Sharpe / skew /
+    kurtosis. The guard fires ONLY on the degenerate (non-finite) input."""
+    r = _noise(120, drift=0.001, seed=12)
+    rep = validate_returns(r, bars_per_year=252, n_permutations=50, n_resamples=200, seed=42)
+    # Recompute the expected DSR through the exact same inputs validate_returns
+    # feeds dsr.deflated_sharpe.
+    from hermes_quant.evaluation.dsr import deflated_sharpe
+
+    arr = validation_mod._to_array(r)
+    obs = validation_mod._sharpe(arr, bars_per_year=252)
+    skew = validation_mod._sample_skew(arr)
+    kurt = validation_mod._sample_kurtosis(arr)
+    expected = deflated_sharpe(
+        observed_sharpe=obs, n_trials=1, n_observations=arr.size, skew=skew, kurtosis=kurt
+    )
+    assert rep.deflated_sharpe == expected
+    assert np.isfinite(rep.deflated_sharpe)
+    assert 0.0 <= rep.deflated_sharpe <= 1.0
+
+
 # --- scipy-absent fallback ---------------------------------------------------
 def test_scipy_absent_falls_back_to_percentile(monkeypatch):
     """With scipy unavailable: percentile CI from the stationary bootstrap +

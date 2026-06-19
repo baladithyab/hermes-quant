@@ -107,3 +107,73 @@ def test_semantic_analyst_selects_latest_valid_packet():
     view = analyst.analyze(_ctx(extras={"semantic_packets": [old, new]}))
     assert view.direction == 1
     assert view.confidence_raw == 0.7
+
+
+# --- ar50: operator recipe-YAML max_age_minutes (NaN/inf) must NOT silently
+# disable the staleness gate. A non-finite ceiling makes `age_minutes > ceiling`
+# always-False, admitting arbitrarily stale catalyst data into the live
+# committee. Finite-guard the operator-supplied ceiling (threshold-side sibling
+# of ar33 data-side / ar41 governance-side). ---
+
+def _stale_packet():
+    """A 30-day-old packet relative to the 2024-01-02 decision context."""
+    return _packet(asof="2023-12-03T00:00:00Z")
+
+
+def test_validate_rejects_stale_packet_with_nan_ceiling():
+    packet = semantic_packet_from_dict(_stale_packet(), attach_hash=True)
+    ok, reason = validate_semantic_packet(
+        packet,
+        asset="BTC/USDT",
+        asof=pd.Timestamp("2024-01-02T00:00:00Z"),
+        max_age_minutes=float("nan"),
+    )
+    assert ok is False
+    assert reason == "stale_packet"
+
+
+def test_validate_rejects_stale_packet_with_inf_ceiling():
+    packet = semantic_packet_from_dict(_stale_packet(), attach_hash=True)
+    ok, reason = validate_semantic_packet(
+        packet,
+        asset="BTC/USDT",
+        asof=pd.Timestamp("2024-01-02T00:00:00Z"),
+        max_age_minutes=float("inf"),
+    )
+    assert ok is False
+    assert reason == "stale_packet"
+
+
+def test_validate_rejects_stale_packet_with_negative_ceiling():
+    packet = semantic_packet_from_dict(_stale_packet(), attach_hash=True)
+    ok, reason = validate_semantic_packet(
+        packet,
+        asset="BTC/USDT",
+        asof=pd.Timestamp("2024-01-02T00:00:00Z"),
+        max_age_minutes=-1.0,
+    )
+    assert ok is False
+    assert reason == "stale_packet"
+
+
+def test_semantic_analyst_abstains_on_stale_packet_with_nan_ceiling():
+    # End-to-end: operator wrote analyst_config.hermes_semantic.max_age_minutes=.nan
+    analyst = HermesSemanticAnalyst(max_age_minutes=float("nan"))
+    view = analyst.analyze(_ctx(extras={"semantic_packets": [_stale_packet()]}))
+    assert view.direction == 0
+    assert view.confidence == 0.0
+    assert view.metadata["abstain_reason"] == "stale_packet"
+
+
+def test_validate_still_admits_fresh_packet_with_finite_ceiling():
+    # Happy path must stay byte-identical: a fresh packet with the documented
+    # 1-day ceiling is still admitted.
+    packet = semantic_packet_from_dict(_packet(), attach_hash=True)
+    ok, reason = validate_semantic_packet(
+        packet,
+        asset="BTC/USDT",
+        asof=pd.Timestamp("2024-01-02T00:00:00Z"),
+        max_age_minutes=1440.0,
+    )
+    assert ok is True
+    assert reason == "ok"

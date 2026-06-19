@@ -14,7 +14,6 @@ import pytest
 
 from hermes_quant.backtest import BacktestResult, PaperPortfolio, replay
 
-
 # ---------------------------------------------------------------------------
 # Synthetic data
 # ---------------------------------------------------------------------------
@@ -286,6 +285,94 @@ def test_replay_dsr_nan_for_short_runs():
     # 50 bars with warmup 35 -> 15 observations, < 30
     r = replay(_bars(50), symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=35)
     assert np.isnan(r.deflated_sharpe)
+
+
+# ===========================================================================
+# cs56 (sibling of cs48 on the replay path): a non-finite Sharpe must not
+# propagate a NaN deflated_sharpe into BacktestResult / result.json
+# ===========================================================================
+
+
+def _advisor_full_long(**kwargs):
+    """Inject a deterministic full-long signal so replay() walks every bar."""
+    return {
+        "aggregated_signal": {"direction": 1, "magnitude": 1.0, "confidence": 1.0},
+        "risk_gate": {"pass": True, "kelly_fraction": 0.5},
+        "analyst_views": [],
+    }
+
+
+@pytest.mark.parametrize("degenerate_sharpe", [float("inf"), float("-inf")])
+def test_replay_dsr_finite_conservative_on_nonfinite_sharpe(monkeypatch, degenerate_sharpe):
+    """cs56 (sibling of cs48): a zero-variance OOS strategy series (bit-identical
+    per-bar returns, e.g. a flat-but-marked position or a synthetic
+    geometric-doubling instrument) makes replay._sharpe return ±inf (std==0,
+    mean!=0 branch). dsr.deflated_sharpe then forms
+    ``variance_term = 1 - skew*SR + (kurt-1)/4*SR**2``; for a constant series
+    skew==0, so ``skew*inf == nan`` -> variance_term is NaN, the
+    ``variance_term <= 0`` guard (NaN<=0 == False) is bypassed, and
+    ``Φ(sr_diff*sqrt(n-1)/sqrt(NaN))`` collapses to NaN WITHOUT raising.
+    replay()'s try/except only catches ValueError/ZeroDivisionError, so pre-fix
+    the NaN escaped into BacktestResult.deflated_sharpe and rendered as ``null``
+    in result.json — INDISTINGUISHABLE from the legitimate n<30 low-power
+    omission, silently erasing the false-discovery hedge.
+
+    The degenerate ±inf Sharpe is awkward to reach through PaperPortfolio's
+    mark-at-trade accounting, so we monkeypatch replay._sharpe to emit the
+    documented degenerate output; the assertion targets replay()'s guard.
+
+    After the fix the deflated Sharpe is a FINITE, conservative 0.0 (fails any
+    ``dsr >= floor`` gate), never a NaN.
+    """
+    import sys
+
+    rpmod = sys.modules["hermes_quant.backtest.replay"]
+    monkeypatch.setattr(rpmod, "_sharpe", lambda *a, **k: degenerate_sharpe)
+
+    # 120 bars, warmup 60 -> ~59 observations >= 30 so the DSR block runs.
+    bars = _bars(120, drift=0.01)
+    r = replay(
+        bars,
+        symbol="DEGEN",
+        asset_class="equity",
+        timeframe="1h",
+        warmup_bars=60,
+        learn_from_fills=False,
+        advisor_recommend=_advisor_full_long,
+    )
+    # The bug: deflated_sharpe is NaN. The fix: a finite conservative 0.0.
+    assert np.isfinite(r.deflated_sharpe), "deflated_sharpe must be finite, not NaN (cs56)"
+    assert r.deflated_sharpe == 0.0
+    # The JSON artifact now carries a real number, not the null a NaN renders as
+    # (which masquerades as the n<30 low-power omission).
+    assert r.to_dict()["deflated_sharpe"] == 0.0
+
+
+def test_replay_dsr_unchanged_for_finite_variance_series(monkeypatch):
+    """cs56: a normal finite-variance run never trips the non-finite guard, so
+    the deflated Sharpe is byte-identical to the bare dsr.deflated_sharpe call on
+    the same observed Sharpe / skew / kurtosis. The guard fires ONLY on the
+    degenerate (non-finite) input."""
+    bars = _bars(200, drift=0.02, vol=0.4)
+    r = replay(bars, symbol="TEST", asset_class="equity", timeframe="1h", warmup_bars=60)
+    assert np.isfinite(r.deflated_sharpe)
+    assert 0.0 <= r.deflated_sharpe <= 1.0
+
+    # Reconstruct the expected DSR through the exact same inputs replay() feeds
+    # dsr.deflated_sharpe, proving the guard left the finite path untouched.
+    from hermes_quant.evaluation.dsr import deflated_sharpe
+
+    strat_returns = r.equity_curve.pct_change().dropna()
+    n_obs = len(strat_returns)
+    assert n_obs >= 30
+    expected = deflated_sharpe(
+        observed_sharpe=r.sharpe,
+        n_trials=1,
+        n_observations=n_obs,
+        skew=float(strat_returns.skew()) if n_obs >= 3 else 0.0,
+        kurtosis=float(strat_returns.kurtosis() + 3.0) if n_obs >= 4 else 3.0,
+    )
+    assert r.deflated_sharpe == expected
 
 
 # ===========================================================================

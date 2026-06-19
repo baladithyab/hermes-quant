@@ -201,6 +201,12 @@ def autonomous_env(monkeypatch, tmp_path):
     # without this isolation it reads the operator's REAL book and silences the FIRE
     # under test. The rail was wired live AFTER these tests were authored.
     monkeypatch.setattr(auto, "QUANT_HOME", tmp_path)
+    # Isolate from the operator's live ~/.hermes/config.yaml. _read_safety_rails()
+    # reads it; an operator who enables quant.autonomous.require_stop_loss=true would
+    # activate the stop-loss backstop and size-DOWN this test's stopless -0.20 short to
+    # 0.05, failing the size assertion on that machine while passing in clean CI. Force
+    # safety rails to code defaults (require_stop_loss=False = legacy byte-identical).
+    monkeypatch.setattr(auto, "_read_config", lambda: {})
     return monkeypatch
 
 

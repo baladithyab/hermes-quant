@@ -117,6 +117,13 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
     md = dict(signal.metadata or {})
 
     analyst_view_ids: list[str] = []
+    # ar126: per-analyst direction map {analyst_name: "buy"|"sell"|"flat"}. Additive
+    # field (no existing consumer reads it, so byte-identical to those). The ADR-0049
+    # shadow TrendFollowingRule needs the classical-TA analyst's OWN direction to test
+    # the "TA + advisor agree" confluence hypothesis; without this the rule was vacuous
+    # (it had no per-analyst direction to read). Derived from signal.components, the
+    # canonical per-view source (AnalystView.analyst + .direction).
+    per_analyst_directions: dict[str, str] = {}
     for v in components:
         v_md = dict(v.metadata or {})
         # Per-view stable ID — present on Wave-1+ analyst views; falls back
@@ -127,6 +134,15 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
             analyst_view_ids.append(str(vid))
         else:
             analyst_view_ids.append(f"{v.analyst}:{v.horizon}")
+        try:
+            d = int(v.direction)
+        except (TypeError, ValueError):
+            continue
+        # Last-writer-wins per analyst name (a single analyst contributes one view
+        # per tick in practice); map the signed int to the shadow-rule vocabulary.
+        per_analyst_directions[str(v.analyst)] = (
+            "buy" if d > 0 else "sell" if d < 0 else "flat"
+        )
 
     # Discriminative counts. PREFER signal.components (richest source —
     # carries per-view IDs and exact analyst names). When components is
@@ -176,6 +192,7 @@ def _build_signal_provenance(signal: AggregatedSignal) -> dict[str, Any]:
         "bma_weights": md.get("bma_weights"),
         "aggregator_class": signal.aggregator,
         "analyst_view_ids": analyst_view_ids,
+        "per_analyst_directions": per_analyst_directions,  # ar126 (additive)
         "data_quality": dq,
     }
 
@@ -348,6 +365,79 @@ class RiskConfig:
         autonomous loop enforces that invariant before reaching the gate.
     """
 
+    slippage_gate_enabled: bool = False
+    """01f0 (ADR-0097): when True, the LIVE decision gate haircuts the expected
+    signed edge toward silence by ``slippage_penalty_frac`` BEFORE the Rule-5
+    cost gate + Rule-6 sizer, so a thin edge that only clears the cost gate on
+    optimistic paper fills is SILENCED. Default False => byte-identical (edge is
+    never haircut). The haircut may ONLY shrink |edge| (sign preserved); a
+    non-finite penalty/edge fails to 0.0 (silence). Mirrors the pdr_core leaf
+    ``_slippage_haircut_edge`` (single source of truth). Eval-gated:
+    HERMES_QUANT_SLIPPAGE_GATE wires this from the shell."""
+
+    slippage_penalty_frac: float = 0.0
+    """01f0: the PRE-COMPUTED one-way live-vs-paper penalty (NAV-fraction return,
+    same units as the Kelly edge), supplied by the shell via
+    ``slippage_haircut.estimate_live_penalty``. 0.0 => no haircut. Only consulted
+    when ``slippage_gate_enabled`` is True. Fail-closed: the shell floors it to
+    the conservative prior on any estimator error, never 0.0-on-error."""
+
+    def __post_init__(self) -> None:
+        """ar124: fail-CLOSED validation of the money-critical thresholds.
+
+        ``RiskConfig`` is built from operator-editable recipe YAML
+        (``recipes.instantiate_recipe_risk_gate`` → ``RiskConfig(**recipe.risk_gate_config)``)
+        with NO prior validation, and the frozen dataclass had no guard. A non-finite
+        threshold from YAML (``max_drawdown_pct: 1e400`` overflows to ``inf`` with no
+        error; ``.nan`` parses to NaN) silently DISABLES the rail it bounds: the Rule-1
+        drawdown breaker (``drawdown_pct > max_drawdown_pct``) and Rule-2 daily-loss
+        breaker compare ``> inf``/``> nan`` as always-False, so a catastrophic real
+        drawdown never trips/halts (fail-OPEN); ``max_position_pct = inf/nan`` likewise
+        defeats the quarter-Kelly position cap (``min(size, inf) == size``). This is the
+        operator-config seam that bypassed the ar08-12 finite-guard family. We fail LOUD
+        (recipe load already raises on bad config) rather than fail-open with a corrupt
+        rail — a non-finite or non-positive money threshold is a configuration error, not
+        a runtime degrade.
+
+        The breaker/cap thresholds must be finite and in (0, 1] (a fraction of NAV);
+        cost_multiple and min_trade_size must be finite and >= 0. Upper bounds are the
+        100%-of-NAV sanity ceiling, not the specific preset values (aggressive uses
+        max_position_pct=0.40, max_daily_loss_pct=0.10 — all within range).
+        """
+        def _frac_0_1(name: str, value: object, *, allow_zero: bool = False) -> None:
+            try:
+                v = float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise ValueError(f"RiskConfig.{name} must be a number, got {value!r}")
+            if not math.isfinite(v):
+                raise ValueError(
+                    f"RiskConfig.{name} must be finite (a NaN/inf threshold disables the "
+                    f"money rail it bounds — fail-OPEN); got {value!r}"
+                )
+            lo_ok = (v >= 0.0) if allow_zero else (v > 0.0)
+            if not (lo_ok and v <= 1.0):
+                raise ValueError(
+                    f"RiskConfig.{name} must be in "
+                    f"{'[0, 1]' if allow_zero else '(0, 1]'} (fraction of NAV); got {v}"
+                )
+
+        def _nonneg(name: str, value: object) -> None:
+            try:
+                v = float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise ValueError(f"RiskConfig.{name} must be a number, got {value!r}")
+            if not math.isfinite(v) or v < 0.0:
+                raise ValueError(
+                    f"RiskConfig.{name} must be finite and >= 0; got {value!r}"
+                )
+
+        # Rail-bounding fractions: a non-finite/out-of-range value disables the rail.
+        _frac_0_1("max_position_pct", self.max_position_pct)
+        _frac_0_1("max_drawdown_pct", self.max_drawdown_pct)
+        _frac_0_1("max_daily_loss_pct", self.max_daily_loss_pct)
+        _frac_0_1("min_trade_size", self.min_trade_size, allow_zero=True)
+        _nonneg("cost_multiple", self.cost_multiple)
+
     @classmethod
     def conservative(cls) -> RiskConfig:
         return cls(
@@ -411,6 +501,7 @@ class DefaultRiskGate:
         config: RiskConfig | None = None,
         *,
         evidence_store: Any = None,
+        baseline_store: Any = None,
     ):
         """
         Args:
@@ -423,9 +514,27 @@ class DefaultRiskGate:
                 tainted by data the gate could not have seen at `signal.asof`.
                 When None (default), the lookahead check is skipped — preserves
                 backward compatibility with existing tests.
+            baseline_store: Optional DrawdownBaselineStore-like object (must
+                expose `.reconcile(account_id, asset_class, equity_total, asof,
+                tz) -> Baseline(peak_equity, daily_open_equity)`). cs01 fix:
+                when provided, the gate reconciles the DURABLE high-water-mark
+                peak and the session-anchored daily-open BEFORE the Rule-1
+                (drawdown) / Rule-2 (daily-loss) circuit breakers, and recomputes
+                drawdown_pct / daily_loss_pct against those durable baselines
+                instead of the loader's inception-collapsed peak_equity /
+                daily_open_equity (which fail-OPEN on a profitable-from-inception
+                account that suffers a large peak-to-trough fall). The durable
+                baselines are conservative-by-construction (HWM never decreases;
+                daily-open re-anchors only at the session boundary), so the
+                breaker can only trip EARLIER / equally — always the safe
+                direction. When None (default), behavior is BYTE-IDENTICAL to
+                today (reads portfolio.drawdown_pct / portfolio.daily_loss_pct
+                directly) — mirrors the evidence_store=None no-op seam so live
+                wiring is a separate operator-gated step.
         """
         self.config = config or RiskConfig()
         self.evidence_store = evidence_store
+        self.baseline_store = baseline_store
         self._cooldowns: dict[tuple[str, str, str], _AssetCooldownState] = {}
         # Action stats for observability
         self._n_actions = 0
@@ -478,6 +587,82 @@ class DefaultRiskGate:
         self._audit_rejection(signal, reason)
         return None
 
+    @staticmethod
+    def _pct_from_baseline(base: Any, equity: Any) -> float:
+        """Recompute a drawdown/daily-loss fraction from a durable baseline.
+
+        Replicates the EXACT formula in protocol.py drawdown_pct (:308-318) /
+        daily_loss_pct (:320-328), including the `base<=0` and non-finite
+        NaN-fail-CLOSED guards, so the recomputed value behaves identically to
+        the property the gate would otherwise read — only the DENOMINATOR is the
+        durable baseline (HWM peak / session-open) rather than the loader's
+        inception-collapsed value. Returns a sentinel >= any plausible threshold
+        (1.0) on a non-finite numerator/denominator so Rule-1/Rule-2 trip on
+        unknowable state (fail-CLOSED), matching the property exactly.
+        """
+        try:
+            b = float(base)
+            eq = float(equity)
+        except (TypeError, ValueError):
+            return 1.0
+        if not (math.isfinite(b) and math.isfinite(eq)) or b <= 0:
+            return 0.0 if (math.isfinite(b) and b <= 0) else 1.0
+        return max(0.0, (b - eq) / b)
+
+    def _durable_breaker_pcts(
+        self,
+        portfolio: Portfolio,
+        market: MarketState,
+    ) -> tuple[float, float]:
+        """cs01 fix: drawdown_pct / daily_loss_pct against DURABLE baselines.
+
+        Reconciles the durable high-water-mark peak + session-anchored daily-open
+        via the injected baseline_store, then recomputes the two circuit-breaker
+        fractions against those baselines. The store call is wrapped fail-CLOSED:
+        any failure falls back to a baseline AT-LEAST-AS-STRICT as today
+        (max(portfolio.peak_equity, equity) for peak; portfolio.daily_open_equity
+        for the session anchor) and a warning, and NEVER raises out of gate().
+
+        Direction invariant: durable peak >= portfolio.peak_equity and durable
+        daily_open >= portfolio.daily_open_equity whenever the loader collapsed
+        them to inception, so the recomputed fractions are >= the portfolio's
+        reported values — the breaker can only trip EARLIER / equally.
+        """
+        equity = portfolio.equity_total
+        try:
+            baseline = self.baseline_store.reconcile(
+                account_id=portfolio.account_id,
+                asset_class=portfolio.asset_class,
+                equity_total=equity,
+                asof=portfolio.asof,
+                tz=market.tz,
+            )
+            peak = baseline.peak_equity
+            daily_open = baseline.daily_open_equity
+        except Exception as e:  # noqa: BLE001 - store failure must fail CLOSED, never raise
+            logger.warning(
+                "baseline_store.reconcile raised (%s) — failing CLOSED to "
+                "at-least-as-strict portfolio baselines",
+                e,
+            )
+            # Fail-CLOSED: never weaker than today. peak >= reported peak (so
+            # recomputed drawdown >= portfolio.drawdown_pct); daily_open = the
+            # portfolio's own session anchor (so recomputed daily_loss >=
+            # portfolio.daily_loss_pct). A non-finite peak/equity still routes to
+            # _flatten_nonfinite_portfolio via the _is_finite_number guard.
+            try:
+                rep_peak = float(portfolio.peak_equity)
+                eq_f = float(equity)
+                peak = max(rep_peak, eq_f) if (
+                    math.isfinite(rep_peak) and math.isfinite(eq_f)
+                ) else portfolio.peak_equity
+            except (TypeError, ValueError):
+                peak = portfolio.peak_equity
+            daily_open = portfolio.daily_open_equity
+        drawdown_pct = self._pct_from_baseline(peak, equity)
+        daily_loss_pct = self._pct_from_baseline(daily_open, equity)
+        return drawdown_pct, daily_loss_pct
+
     def _flatten_nonfinite_portfolio(
         self,
         signal: AggregatedSignal,
@@ -528,9 +713,24 @@ class DefaultRiskGate:
                         reason=f"lookahead_tainted_{result.violations[0].evidence_id}",
                     )
 
+        # cs01 fix: the Rule-1 (drawdown) / Rule-2 (daily-loss) denominators.
+        # When a durable baseline_store is injected, recompute drawdown_pct /
+        # daily_loss_pct against the DURABLE high-water-mark peak + session-
+        # anchored daily-open instead of portfolio.peak_equity /
+        # portfolio.daily_open_equity (which the loader collapses to the
+        # inception baseline → a profitable-from-inception account that suffers a
+        # large peak-to-trough fall fails OPEN). The durable baselines are
+        # conservative-by-construction so the breaker only trips EARLIER /
+        # equally. When baseline_store is None (default) this is BYTE-IDENTICAL
+        # to today — reads the portfolio properties directly. The store path is
+        # fail-CLOSED (never raises out of gate()); the recomputed values still
+        # run the same _is_finite_number → _flatten_nonfinite_portfolio guard.
         try:
-            drawdown_pct = portfolio.drawdown_pct
-            daily_loss_pct = portfolio.daily_loss_pct
+            if self.baseline_store is not None:
+                drawdown_pct, daily_loss_pct = self._durable_breaker_pcts(portfolio, market)
+            else:
+                drawdown_pct = portfolio.drawdown_pct
+                daily_loss_pct = portfolio.daily_loss_pct
         except Exception:  # noqa: BLE001 - unknowable account state fails closed
             return self._flatten_nonfinite_portfolio(signal, portfolio)
         if not _is_finite_number(drawdown_pct) or not _is_finite_number(daily_loss_pct):
@@ -632,6 +832,19 @@ class DefaultRiskGate:
         ):
             self._n_silenced_cost_gate += 1
             return self._silence(signal, reason="non_finite_risk_input")
+        # 01f0 (ADR-0097): haircut the signed edge toward silence by the conservative
+        # live-vs-paper execution penalty BEFORE the cost gate + sizer, so a thin edge
+        # that only clears the cost gate on optimistic paper fills is SILENCED on the
+        # LIVE decision path (b61c wired the haircut into clean_window EVIDENCE only; the
+        # live admission gate still used raw edge — the orphan this closes). The pure leaf
+        # _slippage_haircut_edge (single source of truth, shared with pdr_core) can ONLY
+        # shrink |edge| (sign preserved); a non-finite penalty/edge -> 0.0 (silence). The
+        # penalty is pre-computed by the shell into config.slippage_penalty_frac. Default-OFF
+        # (slippage_gate_enabled=False) => edge untouched => byte-identical.
+        if self.config.slippage_gate_enabled:
+            from hermes_quant.pdr_core.gate import _slippage_haircut_edge
+
+            edge = _slippage_haircut_edge(edge, self.config.slippage_penalty_frac)
         # PAPER-MODE-ONLY override (per docs/diagnostics/2026-05-26-no-conviction-bimodal-pattern.md):
         # when `paper_zero_costs=True`, the threshold is forced to 0.0
         # INSTEAD of computing `cost_multiple × round_trip_cost` from

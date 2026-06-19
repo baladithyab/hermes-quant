@@ -16,8 +16,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 PDRMode = Literal["advise", "hitl", "autonomous", "backtest"]
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 USER_RECIPE_DIR = QUANT_HOME / "recipes"
 
 
@@ -245,9 +247,14 @@ def instantiate_recipe_analysts(recipe: PDRRecipe):
 
             out.append(MicrostructureLite(**kwargs))
         elif name == "kronos":
-            from hermes_quant.analysts.kronos import KronosAnalyst
+            from hermes_quant.analysts.kronos import KronosAnalyst, KronosConfig
 
-            out.append(KronosAnalyst(**kwargs))
+            # KronosAnalyst takes a KronosConfig object, not flat kwargs (unlike
+            # the dataclass-style analysts above). Bind the recipe's per-analyst
+            # config dict into a KronosConfig so the documented knobs (model,
+            # max_context, pred_len, …) actually reach the analyst. An empty
+            # config yields KronosConfig() — byte-identical to KronosAnalyst().
+            out.append(KronosAnalyst(config=KronosConfig(**kwargs) if kwargs else None))
         elif name == "hermes_semantic":
             from hermes_quant.analysts.semantic import HermesSemanticAnalyst
 
@@ -281,7 +288,17 @@ def instantiate_recipe_aggregator(recipe: PDRRecipe):
 
 def instantiate_recipe_risk_gate(recipe: PDRRecipe):
     if recipe.risk_gate == "default":
-        from hermes_quant.risk.gate import DefaultRiskGate
+        from hermes_quant.risk.gate import DefaultRiskGate, RiskConfig
 
-        return DefaultRiskGate(**recipe.risk_gate_config)
+        # ar91: risk_gate_config is a FIELD-LEVEL dict of RiskConfig fields (e.g.
+        # {"max_position_pct": 0.10, "cost_multiple": 3.0}) — the obvious form, and
+        # symmetric with aggregator_config. But DefaultRiskGate.__init__ takes a
+        # RiskConfig dataclass via `config=`, NOT field kwargs, so the old
+        # `DefaultRiskGate(**recipe.risk_gate_config)` raised TypeError for any
+        # non-empty config (and the nested {"config": {...}} workaround poisoned
+        # gate.config with a raw dict that AttributeError'd on first evaluation) —
+        # i.e. recipe-configured risk caps were UNENFORCEABLE. Coerce the field dict
+        # into RiskConfig and pass it as config=. Empty dict => RiskConfig() => the
+        # moderate default, byte-identical to the builtin recipes.
+        return DefaultRiskGate(config=RiskConfig(**recipe.risk_gate_config))
     raise ValueError(f"recipe {recipe.id}: risk gate {recipe.risk_gate!r} is not available")

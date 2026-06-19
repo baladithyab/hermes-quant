@@ -147,6 +147,134 @@ def test_zero_target_no_slippage() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Trade-delta direction (ADR-0070 / position-reducing fills must pay a COST)
+#
+# Slippage direction must key off the SIGN OF THE TRADED DELTA
+# (target_pct - current_position_pct), NOT the sign of the absolute target.
+# A position-reducing fill is the opposite side from the position it reduces:
+#   * trimming a LONG  (+0.20 -> +0.05)  is a SELL  -> fill_price < decision
+#   * covering a SHORT (-0.20 -> -0.05)  is a BUY   -> fill_price > decision
+# Keying off the target sign credits the exit/trim leg with a FAVORABLE price,
+# which is the opposite of the cost slippage must model (module invariant:
+# "Either way, the trader is the price-taker; slippage is a cost").
+# ---------------------------------------------------------------------------
+
+
+def test_trim_long_is_a_sell_filled_below_decision() -> None:
+    """Trimming a +0.20 long to +0.05 is a SELL (~15% NAV sold); a higher sell
+    price would be FAVORABLE, so slippage must push the fill price BELOW decision."""
+    fp, b = apply_slippage(
+        decision_price=100.0,
+        target_pct=0.05,            # post-fill target (ADR-0091 Option E absolute)
+        current_position_pct=0.20,  # currently +20% NAV long
+        asof_execution="2026-05-28T17:09:00Z",
+        proposal_id="prop_trim_long",
+        asset_class="equity",
+    )
+    assert b["total_bps"] > 0
+    assert fp < 100.0, f"trim of a long must fill BELOW decision (a sell cost), got {fp}"
+
+
+def test_partial_cover_short_is_a_buy_filled_above_decision() -> None:
+    """Partially covering a -0.20 short to -0.05 is a BUY (~15% NAV bought back);
+    slippage must push the fill price ABOVE decision (paying up to buy)."""
+    fp, b = apply_slippage(
+        decision_price=100.0,
+        target_pct=-0.05,            # still short, but smaller
+        current_position_pct=-0.20,  # currently -20% NAV short
+        asof_execution="2026-05-28T17:09:00Z",
+        proposal_id="prop_cover_short",
+        asset_class="equity",
+    )
+    assert b["total_bps"] > 0
+    assert fp > 100.0, f"covering a short must fill ABOVE decision (a buy cost), got {fp}"
+
+
+def test_full_close_long_is_a_sell_filled_below_decision() -> None:
+    """Closing a +0.20 long all the way to flat (0.0) is a SELL."""
+    fp, _ = apply_slippage(
+        decision_price=100.0,
+        target_pct=0.0 + 1e-12,     # ~flat post-fill, but a real sell of 20% NAV
+        current_position_pct=0.20,
+        asof_execution="2026-05-28T17:09:00Z",
+        proposal_id="prop_close_long",
+        asset_class="equity",
+    )
+    assert fp < 100.0, f"closing a long must fill BELOW decision, got {fp}"
+
+
+def test_impact_keyed_off_trade_delta_not_absolute_target() -> None:
+    """A small trim of a large position trades a small delta, so the impact term
+    must reflect the |delta|, not the |target| (which would over-charge impact)."""
+    # Trim +0.20 -> +0.18: a 2% NAV sell. Impact should match a 2% trade, not 18%.
+    _, b = apply_slippage(
+        decision_price=100.0,
+        target_pct=0.18,
+        current_position_pct=0.20,
+        asof_execution="2026-05-28T17:09:00Z",
+        proposal_id="prop_small_trim",
+        asset_class="equity",
+    )
+    cfg = PaperSlippageConfig.equity_default()
+    # impact = impact_bps_per_pct_nav * (|delta| * 100); |delta| = 0.02
+    expected_impact = cfg.impact_bps_per_pct_nav * (0.02 * 100.0)
+    assert math.isclose(b["impact_bps"], expected_impact, abs_tol=1e-9), (
+        f"impact must key off |trade_delta|=0.02, got impact_bps={b['impact_bps']}"
+    )
+
+
+def test_opening_fill_unchanged_default_position_zero() -> None:
+    """REGRESSION: a genuine opening fill (no prior position) is byte-identical to
+    the pre-fix behavior. Omitting current_position_pct defaults to 0.0, so the
+    trade delta equals the target and the direction/impact are exactly as before."""
+    fp_default, b_default = apply_slippage(
+        decision_price=100.0,
+        target_pct=0.20,
+        asof_execution="2026-05-28T17:09:00Z",
+        proposal_id="prop_open",
+        asset_class="equity",
+    )
+    fp_explicit, b_explicit = apply_slippage(
+        decision_price=100.0,
+        target_pct=0.20,
+        current_position_pct=0.0,
+        asof_execution="2026-05-28T17:09:00Z",
+        proposal_id="prop_open",
+        asset_class="equity",
+    )
+    assert fp_default == fp_explicit
+    assert b_default == b_explicit
+    # Opening a long still fills ABOVE decision (a buy pays up).
+    assert fp_default > 100.0
+
+
+def test_adding_to_long_is_a_buy_above_decision() -> None:
+    """Increasing a +0.05 long to +0.20 is a BUY -> fill above decision."""
+    fp, _ = apply_slippage(
+        decision_price=100.0,
+        target_pct=0.20,
+        current_position_pct=0.05,
+        asof_execution="2026-05-28T17:09:00Z",
+        proposal_id="prop_add_long",
+        asset_class="equity",
+    )
+    assert fp > 100.0
+
+
+def test_adding_to_short_is_a_sell_below_decision() -> None:
+    """Increasing a -0.05 short to -0.20 sells more short -> fill below decision."""
+    fp, _ = apply_slippage(
+        decision_price=100.0,
+        target_pct=-0.20,
+        current_position_pct=-0.05,
+        asof_execution="2026-05-28T17:09:00Z",
+        proposal_id="prop_add_short",
+        asset_class="equity",
+    )
+    assert fp < 100.0
+
+
+# ---------------------------------------------------------------------------
 # Cap behavior
 # ---------------------------------------------------------------------------
 

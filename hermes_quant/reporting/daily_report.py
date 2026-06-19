@@ -43,6 +43,8 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +52,7 @@ logger = logging.getLogger(__name__)
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_QUANT_HOME = Path.home() / ".hermes" / "quant"
+DEFAULT_QUANT_HOME = _resolve_quant_home()
 
 # Telegram MarkdownV2 reserved characters (bot API doc).
 _TG_MD_V2_SPECIALS = r"_*[]()~`>#+-=|{}.!"
@@ -409,19 +411,29 @@ def _read_open_proposals(prop_db: Path) -> list[dict[str, Any]]:
 # P&L (approximate v0.1)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_INITIAL_CASH = 100_000.0
-
-
 def _approx_pnl(equity: float | None) -> float | None:
     """Approximate cumulative P&L = equity - initial_cash.
 
     No marking-to-market, no realized vs unrealized split — same v0.1
     approximation as PortfolioState.equity_total. Documented in the
     report's P&L section.
+
+    The initial-cash basis is derived from the SAME env-honoring source
+    (``portfolio_state._default_initial_cash`` reading
+    ``HERMES_QUANT_PAPER_INITIAL_CASH``) that ``state.db``'s ``equity_total``
+    was bootstrapped against, so the report's basis and state.db's basis stay
+    in lockstep. A previous module-local ``_DEFAULT_INITIAL_CASH = 100_000.0``
+    silently ignored the env override and mis-stated cumulative P&L whenever
+    the operator configured a non-default initial cash (e.g. a flat 250k book
+    reported a fictional +150k). The shared source's ar10 finite-guard rejects
+    non-finite / <=0 overrides, so the report inherits the same fail-closed-to-
+    100k semantics; byte-identical at the default (env unset → 100_000.0).
     """
     if equity is None:
         return None
-    return equity - _DEFAULT_INITIAL_CASH
+    from hermes_quant.state.portfolio_state import _default_initial_cash
+
+    return equity - _default_initial_cash()
 
 
 # ---------------------------------------------------------------------------

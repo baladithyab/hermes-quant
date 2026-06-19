@@ -102,6 +102,8 @@ class _FakeClient:
         poll_sequence: list[_FakeOrder] | None = None,
         poll_order: _FakeOrder | None = None,
         post_cancel_order: _FakeOrder | None = None,
+        cancel_raises: Exception | None = None,
+        post_cancel_get_raises: Exception | None = None,
     ) -> None:
         self._account = account if account is not None else _FakeAccount()
         self._account_raises = account_raises
@@ -110,10 +112,13 @@ class _FakeClient:
         self._poll_sequence = list(poll_sequence) if poll_sequence else None
         self._poll_order = poll_order
         self._post_cancel_order = post_cancel_order
+        self._cancel_raises = cancel_raises
+        self._post_cancel_get_raises = post_cancel_get_raises
         self.submitted: list[Any] = []
         self.poll_calls = 0
         self.cancel_calls: list[str] = []
         self._cancelled = False
+        self._post_cancel_get_fired = False
 
     def get_account(self) -> _FakeAccount:
         if self._account_raises is not None:
@@ -129,6 +134,15 @@ class _FakeClient:
 
     def get_order_by_id(self, order_id: str) -> _FakeOrder:
         self.poll_calls += 1
+        # A transient error on the post-cancel re-read (settlement UNKNOWN):
+        # the FIRST get_order_by_id after a cancel raises.
+        if (
+            self._cancelled
+            and self._post_cancel_get_raises is not None
+            and not self._post_cancel_get_fired
+        ):
+            self._post_cancel_get_fired = True
+            raise self._post_cancel_get_raises
         if self._cancelled and self._post_cancel_order is not None:
             return self._post_cancel_order
         if self._poll_sequence:
@@ -141,6 +155,8 @@ class _FakeClient:
     def cancel_order_by_id(self, order_id: str) -> None:
         self.cancel_calls.append(order_id)
         self._cancelled = True
+        if self._cancel_raises is not None:
+            raise self._cancel_raises
 
 
 def _backend(client: _FakeClient) -> AlpacaBackend:
@@ -397,6 +413,141 @@ def test_submit_option_mleg_reject_raises() -> None:
         )
 
 
+def test_submit_option_mleg_post_cancel_partial_records_child_fills() -> None:
+    # Cancel-vs-fill race (P3-B parity with equity cancel_and_settle): the mleg
+    # poll budget elapses with the parent still WORKING; the poll cancels the
+    # parent then re-reads once. The cancel removed the unfilled remainder but the
+    # parent settles to 'partially_filled' (NOT a terminal reject status) while its
+    # child .legs carry REAL positive fills. This partial MUST be recorded — not
+    # discarded as unfilled_timeout — or a genuinely-filled options position is
+    # orphaned live (the equity sibling records ANY positive partial regardless of
+    # the non-terminal parent status).
+    short, long = _vertical_legs()
+    working = _FakeOrder(order_id="parent-race", status="new", legs=[])  # never terminal
+    child_short = _FakeOrder(
+        order_id="leg-s", status="partially_filled", filled_avg_price=1.20, filled_qty=2,
+        side=OrderSide.SELL, position_intent=PositionIntent.SELL_TO_OPEN, symbol=short.symbol,
+    )
+    child_long = _FakeOrder(
+        order_id="leg-l", status="partially_filled", filled_avg_price=0.70, filled_qty=2,
+        side=OrderSide.BUY, position_intent=PositionIntent.BUY_TO_OPEN, symbol=long.symbol,
+    )
+    # Post-cancel re-read: parent is partially_filled (non-terminal, not in
+    # REJECT_STATUSES) with child legs that demonstrably moved.
+    post_cancel = _FakeOrder(
+        order_id="parent-race", status="partially_filled", filled_avg_price=0.50, filled_qty=2,
+        legs=[child_short, child_long],
+    )
+    client = _FakeClient(
+        submit_result=working, poll_order=working, post_cancel_order=post_cancel
+    )
+    res = _backend(client).submit_option_mleg(
+        (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-race"
+    )
+    # The parent was cancelled on timeout (P1-C) ...
+    assert client.cancel_calls == ["parent-race"]
+    # ... but the realized child partial is RECORDED, not collapsed to a no-fill.
+    assert res.status != "unfilled_timeout"
+    assert res.is_fill  # parent moved a position
+    assert res.order_id == "parent-race"
+    assert len(res.legs) == 2
+    fills_by_sym = {f.symbol: f for f in res.legs}
+    assert fills_by_sym[short.symbol].filled_qty == pytest.approx(-2.0)  # sell -> -
+    assert fills_by_sym[long.symbol].filled_qty == pytest.approx(2.0)  # buy -> +
+    assert fills_by_sym[short.symbol].filled_avg_price == pytest.approx(1.20)
+    assert res.net_fill_price == pytest.approx(0.50)
+
+
+def test_submit_option_mleg_post_cancel_clean_unfilled_stays_timeout() -> None:
+    # Non-regression for the genuinely-empty case: a post-cancel parent that is
+    # non-terminal with NO child fills must STILL collapse to unfilled_timeout
+    # (a clean 0-fill — no fabricated position, no orphaned working order).
+    short, long = _vertical_legs()
+    working = _FakeOrder(order_id="parent-clean", status="new", legs=[])
+    # Post-cancel re-read: still non-terminal, child legs present but zero-fill.
+    child_short = _FakeOrder(
+        order_id="leg-s", status="canceled", filled_avg_price=None, filled_qty=0,
+        side=OrderSide.SELL, position_intent=PositionIntent.SELL_TO_OPEN, symbol=short.symbol,
+    )
+    child_long = _FakeOrder(
+        order_id="leg-l", status="canceled", filled_avg_price=None, filled_qty=0,
+        side=OrderSide.BUY, position_intent=PositionIntent.BUY_TO_OPEN, symbol=long.symbol,
+    )
+    post_cancel = _FakeOrder(
+        order_id="parent-clean", status="partially_filled", legs=[child_short, child_long],
+    )
+    client = _FakeClient(
+        submit_result=working, poll_order=working, post_cancel_order=post_cancel
+    )
+    res = _backend(client).submit_option_mleg(
+        (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-clean"
+    )
+    assert client.cancel_calls == ["parent-clean"]
+    assert res.status == "unfilled_timeout"
+    assert res.filled_qty == 0.0
+    assert not res.is_fill
+
+
+def test_submit_option_mleg_cancel_unconfirmed_reread_fails_fails_closed() -> None:
+    """Settlement UNKNOWN on the mleg path must NOT collapse to a clean no-fill.
+
+    P1-C2 parity with the equity/single-option sibling
+    (``_alpaca_exec.cancel_and_settle``): on poll-budget timeout the mleg poll
+    cancels the still-WORKING parent then re-reads once. If (1)
+    ``cancel_order_by_id`` raises a transient broker/network error (the cancel is
+    UNCONFIRMED) AND (2) the post-cancel re-read ALSO raises, the parent may STILL
+    be working at the broker and may yet FILL — creating a real LIVE multi-leg
+    options position. Returning ``(None, 'unfilled_timeout')`` would have
+    ``submit_option_mleg`` report ``is_fill=False`` and the MultiLeg reactor write
+    a no-fill parent that reconciles NO position into state.db and is treated
+    terminally by every consumer — orphaning that position PERMANENTLY. It MUST
+    fail CLOSED, byte-identical to the active-poll re-read (L420) and the equity
+    ``cancel_and_settle`` (which RAISE on the SAME broker condition).
+    """
+    short, long = _vertical_legs()
+    working = _FakeOrder(order_id="parent-unknown", status="new", legs=[])
+    client = _FakeClient(
+        submit_result=working,
+        poll_order=working,
+        cancel_raises=RuntimeError("503 service unavailable (cancel)"),
+        post_cancel_get_raises=RuntimeError("503 service unavailable (re-read)"),
+    )
+    with pytest.raises(AlpacaSubmitError) as ei:
+        _backend(client).submit_option_mleg(
+            (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-unk"
+        )
+    # The cancel WAS attempted (and raised — unconfirmed).
+    assert client.cancel_calls == ["parent-unknown"]
+    # The error surfaces the UNKNOWN settlement, not a fabricated clean no-fill.
+    msg = str(ei.value).lower()
+    assert "parent-unknown" in msg
+    assert "settle" in msg or "unknown" in msg or "working" in msg
+
+
+def test_submit_option_mleg_confirmed_cancel_reread_fails_degrades_to_timeout() -> None:
+    """When the cancel SUCCEEDS (the working parent is provably gone) but the
+    post-cancel re-read raises transiently, there is no working order left to
+    orphan, so degrading to a clean unfilled_timeout no-fill is safe. This keeps
+    the fail-closed change NARROW — it only fires when the parent MIGHT still be
+    working (cancel UNCONFIRMED). Mirrors the equity sibling's confirmed-cancel +
+    re-read-raises degrade path."""
+    short, long = _vertical_legs()
+    working = _FakeOrder(order_id="parent-gone", status="new", legs=[])
+    client = _FakeClient(
+        submit_result=working,
+        poll_order=working,
+        # cancel_raises is None -> the cancel is CONFIRMED.
+        post_cancel_get_raises=RuntimeError("503 service unavailable (re-read)"),
+    )
+    res = _backend(client).submit_option_mleg(
+        (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-gone"
+    )
+    assert client.cancel_calls == ["parent-gone"]
+    assert res.status == "unfilled_timeout"
+    assert res.filled_qty == 0.0
+    assert not res.is_fill
+
+
 def test_submit_option_mleg_requires_two_legs() -> None:
     one = OptionLeg(symbol=_occ("150", "C"), side="buy", position_intent="buy_to_open")
     client = _FakeClient(submit_result=_FakeOrder())
@@ -404,6 +555,51 @@ def test_submit_option_mleg_requires_two_legs() -> None:
         _backend(client).submit_option_mleg(
             (one,), outer_qty=1, net_limit_price=0.5, client_order_id="cid"
         )
+
+
+def test_submit_option_mleg_child_qty_no_price_is_not_a_fill() -> None:
+    """A child leg reporting ``filled_qty>0`` but ``filled_avg_price`` not yet
+    populated (None) is the cancel-vs-fill / partial-settle window
+    ``_poll_mleg_parent`` explicitly tolerates. It must NOT be coerced into a
+    price-0.0 ``FillResult`` (qty decoupled from price via ``or 0.0``) — that
+    books a phantom zero-cost option position (true-unit path:
+    ``positions={(...): (-5.0, 0.0)}``, ``delta_cash=0``) and pollutes the
+    ADR-0016 kill-switch NAV basis. Mirror the single-leg honesty rail
+    (``extract_fill`` requires BOTH price>0 AND qty!=0): a qty-but-no-price child
+    is not-yet-settled and reports ``is_fill is False``.
+    """
+    short, long = _vertical_legs()
+    # The LONG leg is genuinely filled (so _any_child_filled / the multileg child
+    # guard `any(lf.filled_qty != 0.0)` passes); the SHORT leg reports a real
+    # signed qty but its avg price has NOT yet settled (None).
+    child_long = _FakeOrder(
+        order_id="leg-l", status="filled", filled_avg_price=0.70, filled_qty=2,
+        side=OrderSide.BUY, position_intent=PositionIntent.BUY_TO_OPEN, symbol=long.symbol,
+    )
+    child_short = _FakeOrder(
+        order_id="leg-s", status="partially_filled", filled_avg_price=None, filled_qty=5,
+        side=OrderSide.SELL, position_intent=PositionIntent.SELL_TO_OPEN, symbol=short.symbol,
+    )
+    parent = _FakeOrder(
+        order_id="parent-x", status="filled", filled_avg_price=0.50, filled_qty=2,
+        legs=[child_long, child_short],
+    )
+    client = _FakeClient(submit_result=parent, poll_order=parent)
+    res = _backend(client).submit_option_mleg(
+        (short, long), outer_qty=2, net_limit_price=0.50, client_order_id="mleg-x"
+    )
+    fills_by_sym = {f.symbol: f for f in res.legs}
+    # The genuinely-filled leg is recorded normally.
+    assert fills_by_sym[long.symbol].is_fill is True
+    assert fills_by_sym[long.symbol].filled_avg_price == pytest.approx(0.70)
+    # The qty-but-no-price short leg must NOT be a price-0.0 phantom fill.
+    short_fill = fills_by_sym[short.symbol]
+    assert short_fill.is_fill is False, (
+        "qty-but-no-price child coerced into a price-0.0 is_fill=True LegFill -> "
+        "phantom zero-cost option position"
+    )
+    # Honesty rail: never fabricate a non-zero qty at a 0.0 price.
+    assert not (short_fill.filled_qty != 0.0 and short_fill.filled_avg_price <= 0.0)
 
 
 # --------------------------------------------------------------------------- #

@@ -98,6 +98,34 @@ def parse_semantic_packet(payload: SemanticPacket | dict[str, Any]) -> SemanticP
     return SemanticPacket(**data)
 
 
+def packet_asof_key(asof: Any) -> pd.Timestamp:
+    """Return a tz-aware (UTC) ``pd.Timestamp`` recency key for a packet asof.
+
+    ``SemanticPacket.asof`` is a *string* whose format is producer-dependent:
+    synthesize.py emits ``...+00:00`` (catalyst/synthesize.py) while a model- or
+    human-authored packet may use ``Z`` or a non-UTC offset (e.g. ``-06:00``).
+    A LEXICAL compare on those mixed strings mis-orders them (``'T05...-06:00'``
+    sorts before ``'T10...+00:00'`` even though the former is the later instant;
+    a space separator sorts before ``'T'``), so a "freshest packet wins" selection
+    that keyed on the raw string could pick a STALE packet and flip the trading
+    direction. Parse first, normalise to UTC, then compare.
+
+    Unparseable / missing asof sorts to the oldest position (``pd.Timestamp.min``,
+    tz-aware) so a malformed packet never spuriously wins the recency selection.
+    For a SINGLE consistent format this returns the same ordering as a string sort,
+    so single-format callers stay byte-identical.
+    """
+    try:
+        ts = pd.Timestamp(asof)
+    except (ValueError, TypeError):
+        return pd.Timestamp.min.tz_localize("UTC")
+    if ts is None or pd.isna(ts):
+        return pd.Timestamp.min.tz_localize("UTC")
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
 def validate_semantic_packet(
     packet: SemanticPacket,
     *,
@@ -127,6 +155,14 @@ def validate_semantic_packet(
         packet_asof = pd.Timestamp(packet.asof)
     except Exception:
         return False, "invalid_asof"
+    # ar33: pd.Timestamp("") / pd.Timestamp(None) returns NaT WITHOUT raising, so the
+    # except above does not catch an empty/None asof. A NaT then defeats BOTH freshness
+    # gates below — `NaT > ctx_asof` is False (skips future_packet) and
+    # `(ctx_asof - NaT).total_seconds()` is NaN so `NaN > max_age` is False (skips
+    # stale_packet) — admitting an UNKNOWABLE-age semantic signal (fail-open). An
+    # un-timestamped packet must be rejected, not waved through.
+    if pd.isna(packet_asof):
+        return False, "invalid_asof"
     if packet_asof.tzinfo is None:
         packet_asof = packet_asof.tz_localize("UTC")
     else:
@@ -135,7 +171,24 @@ def validate_semantic_packet(
     if packet_asof > ctx_asof:
         return False, "future_packet"
     age_minutes = (ctx_asof - packet_asof).total_seconds() / 60.0
-    if age_minutes > max_age_minutes:
+    # ar50: finite-guard the operator-supplied staleness ceiling at the single
+    # chokepoint both the analyst and any direct caller route through. An
+    # operator recipe YAML (analyst_config.hermes_semantic.max_age_minutes) flows
+    # verbatim into the frozen dataclass and is fed here unchecked; a non-finite
+    # ceiling (.nan -> NaN, 1e400 -> inf) makes `age_minutes > ceiling` always
+    # False, silently DISABLING the freshness gate and admitting arbitrarily
+    # stale catalyst data into the live committee. A negative ceiling is also
+    # nonsensical. Clamp to the documented 1-day default so the abstain-on-stale
+    # behavior is preserved (the analyst's intended no-op default), byte-identical
+    # for any finite, non-negative ceiling. Threshold-side sibling of ar33
+    # (packet asof NaT, data side) and ar41 (governance/promotion thresholds).
+    try:
+        _ceiling = float(max_age_minutes)
+    except (TypeError, ValueError):
+        _ceiling = float("nan")
+    if not math.isfinite(_ceiling) or _ceiling < 0:
+        _ceiling = 24 * 60
+    if age_minutes > _ceiling:
         return False, "stale_packet"
 
     if (

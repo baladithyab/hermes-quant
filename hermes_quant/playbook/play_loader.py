@@ -45,12 +45,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 from .direction_bias import _LONG_OK, _SHORT_OK
 from .profiles import PROFILES, PlayProfile
 
 logger = logging.getLogger(__name__)
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 USER_PLAY_DIR = QUANT_HOME / "plays"
 PLAYS_ENTRY_POINT_GROUP = "hermes_quant.plays"
 

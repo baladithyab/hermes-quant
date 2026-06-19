@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -58,6 +59,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 from .positions import CashState, Position
 
 logger = logging.getLogger(__name__)
@@ -66,7 +69,7 @@ logger = logging.getLogger(__name__)
 # Paths
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 DEFAULT_STATE_DB = QUANT_HOME / "state.db"
 DEFAULT_EXECUTIONS_PATH = QUANT_HOME / "executions.jsonl"
 
@@ -81,24 +84,217 @@ _DEFAULT_INITIAL_CASH = 100_000.0
 # layer dependency-light). ADR-0088 F1.
 _CONTRACT_MULTIPLIER = 100.0
 
+# ---------------------------------------------------------------------------
+# cs44: skip the multi-leg family-PARENT audit record in BOTH folds.
+#
+# react/multileg.py:_write_family appends ONE parent + one child-per-leg to
+# executions.jsonl. The CHILDREN carry the real positions and the FULL real cash
+# (option legs ×premium×contracts×100 via the leg_quantity true-unit path, equity
+# leg ×shares). The PARENT is a pure audit rollup: asset_class=="multi_leg",
+# reactor_metadata.role=="parent", NO reactor_metadata.quantity, fill_price==net_fill.
+# Folding it would (a) create a PHANTOM ("acct","multi_leg",underlying) position whose
+# quantity is the meaningless fill_size_pct NAV fraction, and (b) book a second cash
+# delta (-fill_size_pct*net_fill) ON TOP of the children's real cash — a money-state
+# DOUBLE-BOOK. state.db's equity_total is the gate-SIZED NAV (react/paper.py +
+# autonomous.py _account_nav_usd), so the phantom row + double cash corrupts a LIVE
+# risk-gate input.
+#
+# reconstruct_from() reads EVERY record in executions.jsonl (parents included), so the
+# rebuild fold is where the defect bites. The incremental fold (_reconcile_state feeds
+# only children today) gets the SAME skip for defense-in-depth: a manual replay or a
+# future caller could feed the parent dict to apply_execution directly.
+#
+# The skip discriminator is asset_class=="multi_leg": this value is parent-ONLY on the
+# bus — the multi-leg reactor's parent (multileg.py:531 fill, :667 no-fill) is the only
+# producer of an ExecutionRecord with this asset_class; every child uses "us_option" /
+# "equity". No real position class is "multi_leg" (positions.py / react/base.py impose
+# no such class; the proposals.py "multi_leg" use is on a Proposal store row, never a
+# bus ExecutionRecord). So the skip NEVER drops a child or a real position and an
+# equity/option-only book is byte-identical (the skip never fires).
+_MULTILEG_PARENT_ASSET_CLASS = "multi_leg"
+
+
+def _is_multileg_family_parent(asset_class: str) -> bool:
+    """True for the multi-leg family-PARENT audit record (cs44).
+
+    The parent is the ONLY bus ExecutionRecord with asset_class=="multi_leg"; its
+    children use "us_option"/"equity". Skipping it in both folds prevents a phantom
+    "multi_leg" position + a double-counted cash delta on top of the children.
+    """
+    return asset_class == _MULTILEG_PARENT_ASSET_CLASS
+
+
+def _resolve_account(rec: dict[str, Any]) -> str:
+    """Resolve the partition account for one persisted execution record (cs52).
+
+    Mirrors the cs24 daemon-loader resolution (daemon/portfolio_loader._record_account)
+    EXACTLY: top-level account_id if truthy, else reactor_metadata.account_id if truthy,
+    else the "paper-default" sentinel. This is the SAME seam the live producer uses —
+    the reactors inject a top-level account_id into the dict they hand apply_execution at
+    runtime (react/paper.py:438-441; react/alpaca_paper.py:432) BEFORE the persisted log
+    is written, but react/paper.py:_record_to_dict serializes account_id ONLY inside
+    reactor_metadata. So a record read back from executions.jsonl during a full rebuild
+    carries its account_id ONLY in reactor_metadata; reading just the top-level field
+    re-pools every alpaca-paper fill into paper-default and corrupts the per-account NAV
+    partition. A truthy top-level account_id resolves identically to the old
+    `.get(..., "paper-default")`, so a paper-default-only log is byte-identical.
+    """
+    acct = rec.get("account_id")
+    if acct:
+        return str(acct)
+    meta_acct = (rec.get("reactor_metadata") or {}).get("account_id")
+    if meta_acct:
+        return str(meta_acct)
+    return "paper-default"
+
+
+def _dedup_key(rec: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    """Build the cs51 5-column idempotency key for one execution record (cs57).
+
+    Returns (proposal_id, asof_execution, dedup_asset, dedup_asset_class, dedup_leg) —
+    the EXACT key the incremental fold writes into processed_fills
+    (_apply_execution_unsafe). reconstruct_from uses it to drop a true byte-duplicate
+    (the C2 append-before-apply crash-retry record) from its in-memory accumulator so the
+    rebuild fold agrees with the deduped incremental fold.
+
+    Mirrors the incremental key construction verbatim:
+      * dedup_asset / dedup_asset_class come from the true-unit (leg_quantity) path:
+        the real (asset, asset_class) when reactor_metadata.quantity is present, else the
+        "" / "" legacy sentinel — so a legacy single-leg equity row keys exactly as the
+        4-column form did.
+      * dedup_leg is the per-leg index the option children carry (react/multileg.py:582),
+        "" when absent (NOT the literal "None") — so the cs51 same-OCC legs (leg_index 0
+        and 1) claim DISTINCT keys and are NOT re-collapsed, while a true byte-duplicate
+        (same leg_index) collides and is dropped.
+    """
+    asof = rec.get("asof_execution") or _utc_now_iso()
+    proposal_id = rec.get("proposal_id") or ""
+    rmeta = rec.get("reactor_metadata") or {}
+    leg_quantity = rmeta.get("quantity") if isinstance(rmeta, dict) else None
+    if leg_quantity is not None:
+        dedup_asset = rec.get("asset", "")
+        dedup_asset_class = rec.get("asset_class", "equity")
+    else:
+        dedup_asset = ""
+        dedup_asset_class = ""
+    _leg_index = rmeta.get("leg_index") if isinstance(rmeta, dict) else None
+    dedup_leg = "" if _leg_index is None else str(_leg_index)
+    return (proposal_id, asof, dedup_asset, dedup_asset_class, dedup_leg)
+
+
+# ---------------------------------------------------------------------------
+# cs15 (ADR-0086 Phase 1, missed half): signed net-liquidation equity_total.
+#
+# The cached equity_total folds open positions as cash + Σ qty_factor * avg * mult.
+# Historically qty_factor was abs(quantity), which treats a SHORT (negative qty)
+# as a positive asset. A short fill ALREADY booked its proceeds into cash, so
+# abs() adds the same notional a SECOND time with the wrong sign — inflating a
+# net-short book's equity_total by ~2×|notional|. Net-liquidation value uses the
+# SIGNED quantity: a long is an asset (+qty*price), a short is a liability whose
+# proceeds are in cash and whose close costs |qty|*price (so it contributes
+# -|qty|*price = signed_qty*price). Opening at the fill mark is then NAV-neutral.
+#
+# equity_total is the gate-SIZED NAV consumed by _account_nav_usd (admissibility
+# share-conversion sizing in react/paper.py + autonomous.py), so the corrected
+# value changes a LIVE sizing number for a book holding shorts. The correction is
+# therefore flag-gated default-OFF: flag OFF ⇒ abs(quantity) ⇒ bit-for-bit
+# current behavior on every book; flag ON ⇒ signed net-liq. The live flip of
+# HERMES_QUANT_SIGNED_EQUITY=1 is a separate eval-gated decision.
+_SIGNED_EQUITY_FLAG = "HERMES_QUANT_SIGNED_EQUITY"
+
+
+def _equity_qty_factor(quantity: float) -> float:
+    """Per-position quantity factor for the cached equity_total fold.
+
+    Signed (ADR-0086 net-liq) when HERMES_QUANT_SIGNED_EQUITY=1, else the legacy
+    abs(quantity). Called once per position in BOTH folds (rebuild + incremental)
+    so they stay in parity by construction. For a long (qty>0) the two regimes are
+    identical (abs(qty)==qty), so long books are byte-identical across the flag.
+    """
+    return (
+        quantity
+        if os.environ.get(_SIGNED_EQUITY_FLAG, "0") == "1"
+        else abs(quantity)
+    )
+
+
+# ---------------------------------------------------------------------------
+# ft1 (2026-06-13): delta-normalizer regime stamp.
+#
+# The normalizer fold (ADR-0091 Option E, default-OFF behind
+# HERMES_QUANT_DELTA_NORMALIZER) is consistent ONLY if the rebuild and the
+# incremental applies that touch a given state.db agree on whether they
+# folded raw absolute-targets (flag OFF, inflating) or carry-forward deltas
+# (flag ON, deflating). Flipping the flag ON against a populated state.db that
+# was built with the flag OFF differences NEW absolute targets against an
+# INFLATED running net => phantom sells. We stamp the regime that BUILT the db
+# in PRAGMA user_version (set inside reconstruct_from's BEGIN IMMEDIATE) and
+# HARD-REFUSE an incremental apply whose current flag regime disagrees with a
+# populated db's stamp — refuse + surface, never phantom-sell.
+#
+# Byte-identity rail: a legacy / flag-OFF db has user_version == 0
+# (NEVER_STAMPED == REGIME_OFF == 0), and the default flag regime is also 0, so
+# the guard NEVER fires on the default path. The only way to get a non-zero
+# stamp is to run reconstruct_from under flag ON — itself a flag-ON-only action.
+_NORMALIZER_FLAG = "HERMES_QUANT_DELTA_NORMALIZER"
+# user_version values: 0 doubles as "never stamped" AND "flag OFF" so a legacy
+# db (user_version defaults to 0) matches the default-OFF regime byte-for-bit.
+_REGIME_OFF = 0
+_REGIME_ON = 1
+
+
+def _current_normalizer_regime() -> int:
+    """The delta-normalizer regime implied by the CURRENT flag value.
+
+    1 (ON) when HERMES_QUANT_DELTA_NORMALIZER == "1", else 0 (OFF). Mirrors the
+    exact flag test the two folds use (reconstruct_from / _apply_execution_unsafe),
+    so the stamp and the folds key off the SAME predicate.
+    """
+    return _REGIME_ON if os.environ.get(_NORMALIZER_FLAG, "0") == "1" else _REGIME_OFF
+
 
 def _default_initial_cash() -> float:
     raw = os.environ.get(_INITIAL_CASH_ENV, "")
+    if not raw:
+        return _DEFAULT_INITIAL_CASH
     try:
-        return float(raw) if raw else _DEFAULT_INITIAL_CASH
-    except ValueError:
+        val = float(raw)
+    except (TypeError, ValueError):
+        val = float("nan")
+    # ar10: reject non-finite / <=0. This is the NAV source for every _account_nav_usd;
+    # a non-finite NAV (a `1e400` operator typo silently overflows to inf — NO ValueError)
+    # otherwise CRASHES the tick via math.floor(inf) in the admissibility path, or BYPASSES
+    # the multileg gross cap (gross/inf == 0.0 -> "nothing to cap"). Fail CLOSED to the
+    # documented default + warn. Byte-identical for any finite positive configured value.
+    if not math.isfinite(val) or val <= 0:
         logger.warning(
-            "%s is not a valid float (%r); using default %.2f",
+            "%s is not a finite positive float (%r); using default %.2f",
             _INITIAL_CASH_ENV,
             raw,
             _DEFAULT_INITIAL_CASH,
         )
         return _DEFAULT_INITIAL_CASH
+    return val
 
 
 # ---------------------------------------------------------------------------
 # SQLite schema
 # ---------------------------------------------------------------------------
+
+# Position.quantity unit kinds. A position is one of:
+#   "nav_fraction" — legacy / single-leg equity path: quantity is a SIGNED
+#                    fraction of NAV (e.g. 0.05 = 5% long). avg_entry_price is
+#                    the per-share fill price. This is the v0.1 ADR-0041 proxy.
+#   "true_unit"    — ADR-0086/0088 path (reactor_metadata.quantity present):
+#                    quantity is SIGNED CONTRACTS/SHARES. Gross-exposure
+#                    contribution = abs(quantity × avg_entry_price × multiplier)
+#                    / NAV, NOT abs(quantity).
+# The marker is set from the SAME discriminator the apply/replay paths use to
+# decide the quantity unit (leg_quantity present ⇒ true_unit), so it is exact,
+# not a magnitude heuristic. Legacy rows (and DBs created before this column)
+# default to "nav_fraction" — bit-identical to the pre-marker behavior.
+_UNIT_KIND_NAV_FRACTION = "nav_fraction"
+_UNIT_KIND_TRUE_UNIT = "true_unit"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS positions (
@@ -108,6 +304,7 @@ CREATE TABLE IF NOT EXISTS positions (
     quantity         REAL NOT NULL,
     avg_entry_price  REAL NOT NULL,
     last_update_at   TEXT NOT NULL,
+    unit_kind        TEXT NOT NULL DEFAULT 'nav_fraction',
     PRIMARY KEY (account_id, asset_class, symbol)
 ) WITHOUT ROWID;
 
@@ -137,13 +334,28 @@ CREATE TABLE IF NOT EXISTS executions_replayed (
 -- (proposal_id, asof_execution, "", "")) — bit-identical. Each multi-leg child
 -- claims its OWN (proposal_id, asof_execution, asset, asset_class); re-applying the
 -- same child is still a no-op (idempotency held per leg).
+--
+-- cs51 same-OCC extension: a multi-leg family can ROLL the SAME OCC contract —
+-- e.g. leg 0 sell-to-close + leg 1 buy-to-open resolve to ONE (asset, asset_class)
+-- pair. Those two legs then collide on the 4-column key, so the 2nd leg's
+-- INSERT OR IGNORE is silently dropped on the incremental fold while reconstruct_from
+-- (no dedup table) folds both — a bus/state divergence on equity_total (the
+-- gate-sized NAV). The key is extended with leg_index: the option children already
+-- carry reactor_metadata.leg_index (react/multileg.py:582; 0, 1, ...), so the two
+-- same-OCC legs claim distinct keys. leg_index is "" (sentinel) for any record
+-- WITHOUT a reactor_metadata.leg_index — that is EVERY legacy/single-leg equity row
+-- AND the single covered-call equity child (which carries no leg_index) — so those
+-- paths key (proposal_id, asof_execution, asset, asset_class, "") EXACTLY as the
+-- 4-column form did. A genuine re-apply of the SAME leg has the same leg_index ⇒
+-- still a no-op (idempotency held per leg).
 CREATE TABLE IF NOT EXISTS processed_fills (
     proposal_id    TEXT NOT NULL,
     asof_execution TEXT NOT NULL,
     asset          TEXT NOT NULL DEFAULT '',
     asset_class    TEXT NOT NULL DEFAULT '',
+    leg_index      TEXT NOT NULL DEFAULT '',
     applied_at     TEXT NOT NULL,
-    PRIMARY KEY (proposal_id, asof_execution, asset, asset_class)
+    PRIMARY KEY (proposal_id, asof_execution, asset, asset_class, leg_index)
 );
 """
 
@@ -276,57 +488,198 @@ class PortfolioState:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
             self._migrate_processed_fills(conn)
+            self._migrate_positions_unit_kind(conn)
 
     @staticmethod
     def _migrate_processed_fills(conn: sqlite3.Connection) -> None:
         """Idempotent migration: bring a pre-existing processed_fills table up to the
-        4-column PRIMARY KEY (proposal_id, asof_execution, asset, asset_class) that the
-        ADR-0029 multi-leg per-leg idempotency key requires.
+        5-column PRIMARY KEY (proposal_id, asof_execution, asset, asset_class, leg_index)
+        that the multi-leg per-leg idempotency key requires (cs29 asset/asset_class +
+        cs51 leg_index).
 
-        A DB created before this wave has the old 2-column PK (proposal_id,
-        asof_execution). A bare ``ALTER TABLE ADD COLUMN`` adds the columns but
-        CANNOT change the PRIMARY KEY in SQLite — so the dedup key stays 2-column and
-        a multi-leg family (which shares proposal_id + asof_execution across its legs)
-        collides: the 2nd leg's ``INSERT OR IGNORE`` is treated as a duplicate and the
-        leg is SILENTLY DROPPED from state.db while still landing on executions.jsonl
-        — a bus/state divergence on the money path. So a full PK REBUILD is REQUIRED
-        (caught by the Wave-D adversarial review; the fresh-DB tests never hit the
-        legacy path). We rebuild only when the PK is not already the 4-column form, so
-        this stays idempotent and a no-op on fresh / already-migrated DBs.
+        A DB created before this wave has either the old 2-column PK (proposal_id,
+        asof_execution) or the cs44 4-column PK (+ asset, asset_class). A bare ``ALTER
+        TABLE ADD COLUMN`` adds the columns but CANNOT change the PRIMARY KEY in SQLite —
+        so the dedup key stays narrow and a multi-leg family (which shares proposal_id +
+        asof_execution across its legs) collides: the 2nd leg's ``INSERT OR IGNORE`` is
+        treated as a duplicate and the leg is SILENTLY DROPPED from state.db while still
+        landing on executions.jsonl — a bus/state divergence on the money path. The
+        4-column key still collides when two legs of ONE family resolve to the SAME
+        (asset, asset_class) — a same-OCC roll (cs51). So a full PK REBUILD is REQUIRED
+        (caught by adversarial review; the fresh-DB tests never hit the legacy path). We
+        rebuild only when the PK is not already the 5-column form, so this stays
+        idempotent and a no-op on fresh / already-migrated DBs.
         """
         # PK column names, in order, from PRAGMA (pk>0 marks key membership).
         info = list(conn.execute("PRAGMA table_info(processed_fills)"))
         if not info:
             return  # table not created yet (executescript creates it first; defensive)
         pk_cols = [row[1] for row in sorted((r for r in info if r[5]), key=lambda r: r[5])]
-        if pk_cols == ["proposal_id", "asof_execution", "asset", "asset_class"]:
-            return  # already on the 4-column PK — nothing to do
-        # Legacy table: rebuild with the 4-column PK, preserving every existing row
-        # (legacy rows get '' sentinels for the new key columns — the equity dedup key
-        # is unchanged for those, so historical idempotency is preserved exactly).
-        conn.execute(
-            """
-            CREATE TABLE processed_fills_new (
-                proposal_id    TEXT NOT NULL,
-                asof_execution TEXT NOT NULL,
-                asset          TEXT NOT NULL DEFAULT '',
-                asset_class    TEXT NOT NULL DEFAULT '',
-                applied_at     TEXT NOT NULL,
-                PRIMARY KEY (proposal_id, asof_execution, asset, asset_class)
+        if pk_cols == [
+            "proposal_id",
+            "asof_execution",
+            "asset",
+            "asset_class",
+            "leg_index",
+        ]:
+            return  # already on the 5-column PK — nothing to do
+        # Legacy table (2-col, or cs44 4-col): rebuild with the 5-column PK, preserving
+        # every existing row. The SELECT projects only the prior key columns +
+        # applied_at, so the new leg_index column takes its NOT NULL DEFAULT '' for every
+        # migrated row — the same '' sentinel a non-multi-leg apply uses, so historical
+        # idempotency is preserved exactly (an omitted NOT NULL DEFAULT '' column is
+        # filled with the default on INSERT). asset/asset_class likewise default to '' for
+        # a 2-col legacy source that lacks them.
+        #
+        # ar116 CRASH-SAFETY / IDEMPOTENCY (money-rail): _conn() runs in autocommit
+        # (isolation_level=None), so without an explicit transaction each statement
+        # below commits independently. A crash / SIGKILL / concurrent-process
+        # interleave between CREATE processed_fills_new and the final RENAME would
+        # leave an ORPHAN processed_fills_new table AND the legacy processed_fills
+        # still in place; the NEXT PortfolioState() construction would re-enter this
+        # branch (PK still legacy) and the bare `CREATE TABLE processed_fills_new`
+        # would raise "table already exists" — permanently BRICKING every reactor /
+        # reconcile-cron that constructs PortfolioState (fail-closed: the money path
+        # can no longer initialize, and retries never recover). Two guards make the
+        # re-run safe: (1) DROP any orphan from a prior aborted run before CREATE, so
+        # the recovery path is idempotent; (2) wrap the whole rebuild in one
+        # BEGIN IMMEDIATE / COMMIT so a crash mid-rebuild atomically rolls back to the
+        # legacy table — no orphan, no half-migrated state. ROLLBACK on any failure.
+        # (Ported from agent commit 45a6c2d, adapted to the 5-col cs51 leg_index PK.)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DROP TABLE IF EXISTS processed_fills_new")
+            conn.execute(
+                """
+                CREATE TABLE processed_fills_new (
+                    proposal_id    TEXT NOT NULL,
+                    asof_execution TEXT NOT NULL,
+                    asset          TEXT NOT NULL DEFAULT '',
+                    asset_class    TEXT NOT NULL DEFAULT '',
+                    leg_index      TEXT NOT NULL DEFAULT '',
+                    applied_at     TEXT NOT NULL,
+                    PRIMARY KEY (proposal_id, asof_execution, asset, asset_class, leg_index)
+                )
+                """
             )
-            """
-        )
-        existing = {row[1] for row in info}
-        asset_expr = "asset" if "asset" in existing else "''"
-        class_expr = "asset_class" if "asset_class" in existing else "''"
-        conn.execute(
-            f"INSERT OR IGNORE INTO processed_fills_new "
-            f"(proposal_id, asof_execution, asset, asset_class, applied_at) "
-            f"SELECT proposal_id, asof_execution, {asset_expr}, {class_expr}, applied_at "
-            f"FROM processed_fills"
-        )
-        conn.execute("DROP TABLE processed_fills")
-        conn.execute("ALTER TABLE processed_fills_new RENAME TO processed_fills")
+            existing = {row[1] for row in info}
+            asset_expr = "asset" if "asset" in existing else "''"
+            class_expr = "asset_class" if "asset_class" in existing else "''"
+            conn.execute(
+                f"INSERT OR IGNORE INTO processed_fills_new "
+                f"(proposal_id, asof_execution, asset, asset_class, applied_at) "
+                f"SELECT proposal_id, asof_execution, {asset_expr}, {class_expr}, applied_at "
+                f"FROM processed_fills"
+            )
+            conn.execute("DROP TABLE processed_fills")
+            conn.execute("ALTER TABLE processed_fills_new RENAME TO processed_fills")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migrate_positions_unit_kind(conn: sqlite3.Connection) -> None:
+        """Idempotent migration: add the ``unit_kind`` column to a pre-existing
+        positions table (ar13/ar14 units fix).
+
+        A state.db created before this wave has a positions table WITHOUT the
+        ``unit_kind`` column. SQLite ``ALTER TABLE ADD COLUMN`` with a NOT NULL
+        DEFAULT backfills every existing row with that default, so legacy rows
+        become ``'nav_fraction'`` — exactly the unit they were always stored in
+        (the marker only changes the cap seam's interpretation of TRUE-UNIT
+        rows, which legacy DBs do not have). No PK change, so a plain
+        ADD COLUMN suffices (unlike processed_fills). Idempotent: a no-op once
+        the column exists (fresh DBs already get it from _SCHEMA).
+
+        CRASH-SAFETY / CONCURRENCY (mirrors _migrate_processed_fills / ar116):
+        _conn() opens with isolation_level=None (autocommit), so a bare ALTER
+        TABLE commits immediately. Two concurrent processes that both pass the
+        outer PRAGMA check will BOTH attempt the ALTER — the second raises
+        ``OperationalError: duplicate column name: unit_kind`` and crashes the
+        PortfolioState constructor (bricking the reactor / reconcile-cron for
+        that process). The fix wraps the migration in BEGIN IMMEDIATE so only
+        one process holds the write lock; the other blocks, then re-checks
+        inside the lock and exits cleanly (column already present).
+        """
+        info = list(conn.execute("PRAGMA table_info(positions)"))
+        if not info:
+            return  # table not created yet (defensive; executescript creates it first)
+        cols = {row[1] for row in info}
+        if "unit_kind" in cols:
+            return  # fast path: already present (fresh DB or already migrated), no lock needed
+        # Acquire write lock before ALTER so two concurrent processes cannot both
+        # pass the outer check and race to issue the ALTER — the second would crash
+        # with "duplicate column name: unit_kind" (same pattern as
+        # _migrate_processed_fills / ar116).
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-check inside the lock: another process may have completed the
+            # migration between our outer PRAGMA check and BEGIN IMMEDIATE.
+            info2 = list(conn.execute("PRAGMA table_info(positions)"))
+            cols2 = {row[1] for row in info2}
+            if "unit_kind" not in cols2:
+                conn.execute(
+                    f"ALTER TABLE positions ADD COLUMN unit_kind TEXT NOT NULL "
+                    f"DEFAULT '{_UNIT_KIND_NAV_FRACTION}'"
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    # ------------------------------------------------------------------
+    # ft1: delta-normalizer regime stamp (read / check)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_user_version(conn: sqlite3.Connection) -> int:
+        row = conn.execute("PRAGMA user_version").fetchone()
+        # row may be a sqlite3.Row or a plain tuple depending on row_factory.
+        return int(row[0]) if row is not None else 0
+
+    def _db_is_populated(self, conn: sqlite3.Connection) -> bool:
+        """True if state.db carries any materialized position/cash row.
+
+        A fresh (or fully-flat) db carries no rows; the regime guard only fires
+        against a POPULATED db so a brand-new db can be folded under either flag
+        without a spurious refusal (the first fold under flag ON will stamp it).
+        """
+        for table in ("positions", "cash"):
+            row = conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()  # noqa: S608 — fixed table names
+            if row is not None:
+                return True
+        return False
+
+    def _check_regime_stamp(self) -> None:
+        """HARD-REFUSE an apply whose current flag regime disagrees with a populated
+        db's build regime stamp (ft1).
+
+        - Fresh / empty db (no position or cash rows): no refusal. The first fold
+          stamps the regime (apply stamps via _stamp_regime below; rebuild stamps
+          inside its transaction).
+        - Populated db whose stamped regime == current flag regime: no refusal.
+          A legacy db is stamped 0 and the default flag regime is 0 — byte-identical.
+        - Populated db whose stamped regime != current flag regime: RAISE. Flipping
+          HERMES_QUANT_DELTA_NORMALIZER against a db built under the other regime
+          would phantom-sell (inflated-net vs deflated-net basis mismatch); refuse
+          and surface rather than corrupt the money ledger.
+        """
+        current = _current_normalizer_regime()
+        with self._lock, self._conn() as conn:
+            if not self._db_is_populated(conn):
+                return
+            stamped = self._read_user_version(conn)
+            if stamped != current:
+                raise RuntimeError(
+                    "delta-normalizer regime mismatch: state.db was built under "
+                    f"regime {stamped} (0=OFF/legacy, 1=ON) but the current "
+                    f"{_NORMALIZER_FLAG} flag implies regime {current}. Folding new "
+                    "fills against a db built under the other regime would phantom-"
+                    "sell (the new absolute target would be differenced against an "
+                    "inflated/deflated net). Refusing to apply. Rebuild state.db "
+                    "with reconstruct_from() under the intended flag value first."
+                )
 
     # ------------------------------------------------------------------
     # Full rebuild (idempotent)
@@ -351,33 +704,100 @@ class PortfolioState:
         """
         result = ReconstructionResult()
 
-        # ── 1. Read all records ──────────────────────────────────────────
-        records = _read_all_jsonl(executions_path)
-
-        # ── 2. Replay into in-memory accumulators ────────────────────────
+        # ── 1+2. Read + replay UNDER the write lock ──────────────────────
+        # ar05: the bus read MUST happen inside the BEGIN IMMEDIATE transaction
+        # (below), not here. Reading outside the write lock let a concurrent
+        # reactor apply_execution() interleave between the snapshot and the
+        # rebuild commit — the rebuild then deleted positions/cash and re-wrote
+        # only the STALE snapshot, permanently losing the concurrent fill (and,
+        # because processed_fills survived, blocking its incremental re-apply).
+        # Acquiring the write lock first (BEGIN IMMEDIATE) serializes any
+        # concurrent apply_execution AFTER this rebuild, so the snapshot+rebuild
+        # is atomic. Single-writer reconcile is byte-identical.
         positions: dict[tuple[str, str, str], dict[str, Any]] = {}
         cash_map: dict[str, float] = {}
         last_ts: dict[str, str] = {}  # account_id → latest asof seen
 
         initial_cash = _default_initial_cash()
 
-        for line_no, rec in enumerate(records, start=1):
-            try:
-                _replay_record(rec, positions, cash_map, last_ts, initial_cash)
-                result.executions_processed += 1
-                acct = rec.get("account_id", "paper-default")
-                result.accounts_seen.add(acct)
-            except Exception as e:  # noqa: BLE001
-                result.errors.append((line_no, str(e)))
-                logger.warning("reconstruct_from: skipping record %d: %s", line_no, e)
-
-        # ── 3. Write to state.db atomically ──────────────────────────────
-        latest_asof = _latest_asof(records)
-
         with self._lock, self._conn() as conn:
-            # Cross-model review I2: BEGIN IMMEDIATE for write-lock-on-start.
+            # Cross-model review I2 + ar05: BEGIN IMMEDIATE acquires the write lock
+            # at transaction start, and the bus read + replay now happen INSIDE this
+            # transaction so a concurrent apply_execution() cannot interleave between
+            # the snapshot and the rebuild commit (which would permanently lose the
+            # concurrent fill — see ar05). The replay is pure in-memory; holding the
+            # write lock across it is acceptable for the operator-only reconcile path.
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # ── 1. Read all records (UNDER the write lock, ar05) ─────────
+                records = _read_all_jsonl(executions_path)
+
+                # ── 2. Replay into in-memory accumulators ────────────────────
+                # ADR-0091 Option E (default-OFF behind HERMES_QUANT_DELTA_NORMALIZER):
+                # convert each absolute-target fill into its TRADED DELTA at fold time
+                # via the ONE shared normalizer, so a re-affirmed unchanged target folds
+                # to a no-op instead of inflating (the AAPL-12x / BA-6x defect). Flag OFF
+                # ⇒ override is None ⇒ _replay_record reads the raw field, bit-for-bit legacy.
+                _normalizer = None
+                if os.environ.get("HERMES_QUANT_DELTA_NORMALIZER", "0") == "1":
+                    from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
+
+                    _normalizer = FillDeltaNormalizer()
+                    # i0b no-lookahead/ordering guard: the carry-forward delta =
+                    # target - running_net is ORDER-DEPENDENT, so the normalizer must
+                    # see records in asof order, not raw file/append order. Stable-sort
+                    # by asof_execution (stable ⇒ same-asof ties keep file order, so the
+                    # per-bucket delta stream is deterministic and identical to a
+                    # correctly-appended log). This runs ONLY on the normalizer path;
+                    # flag OFF leaves `records` in raw file order, bit-for-bit legacy.
+                    records = sorted(records, key=lambda r: r.get("asof_execution") or "")
+
+                # cs57: the incremental fold dedups a true byte-duplicate (the C2
+                # append-before-apply crash-retry record) via INSERT OR IGNORE on
+                # processed_fills; reconstruct_from folds EVERY raw record with no dedup,
+                # so a duplicated line double-counts and the rebuild book DIVERGES from
+                # the deduped incremental book. Drop a record whose full cs51 5-col key
+                # was already folded in THIS rebuild pass, mirroring the incremental key.
+                seen_keys: set[tuple[str, str, str, str, str]] = set()
+
+                for line_no, rec in enumerate(records, start=1):
+                    try:
+                        # cs57: dedup BEFORE folding. Skip the cs44 family-parent.
+                        rec_asset_class = rec.get("asset_class", "equity")
+                        if not _is_multileg_family_parent(rec_asset_class):
+                            proposal_id = rec.get("proposal_id") or ""
+                            if proposal_id:
+                                key = _dedup_key(rec)
+                                if key in seen_keys:
+                                    continue
+                                seen_keys.add(key)
+                        _override = (
+                            _normalizer.delta_for(rec) if _normalizer is not None else None
+                        )
+                        _replay_record(
+                            rec, positions, cash_map, last_ts, initial_cash, _override
+                        )
+                        result.executions_processed += 1
+                        # cs52: report the SAME resolved partition the fold booked into.
+                        acct = _resolve_account(rec)
+                        result.accounts_seen.add(acct)
+                    except Exception as e:  # noqa: BLE001
+                        result.errors.append((line_no, str(e)))
+                        logger.warning("reconstruct_from: skipping record %d: %s", line_no, e)
+
+                # ── 3. Write to state.db atomically ──────────────────────────
+                # cs62: derive the watermark from the asofs we actually FOLDED (last_ts
+                # is mutated only by a successful _replay_record), NOT from the raw record
+                # list. A poisoned future-bound asof raises in _replay_record and never
+                # enters last_ts, so it cannot wedge the watermark past real time.
+                latest_asof = max(last_ts.values()) if last_ts else None
+                # ft1: stamp the regime that BUILT this db so a later
+                # incremental apply can hard-refuse a flag-flip mismatch instead
+                # of phantom-selling. PRAGMA user_version takes a literal, not a
+                # bound param; the value is our own 0/1 constant (never user
+                # input). Flag OFF (default) stamps 0 == legacy never-stamped, so
+                # a flag-OFF rebuild leaves user_version byte-identical to today.
+                conn.execute(f"PRAGMA user_version = {int(_current_normalizer_regime())}")
                 # Clear derived tables (not halts!)
                 conn.execute("DELETE FROM positions")
                 conn.execute("DELETE FROM cash")
@@ -397,8 +817,8 @@ class PortfolioState:
                         """
                         INSERT OR REPLACE INTO positions
                             (account_id, asset_class, symbol, quantity,
-                             avg_entry_price, last_update_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                             avg_entry_price, last_update_at, unit_kind)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             acct,
@@ -407,6 +827,7 @@ class PortfolioState:
                             qty,
                             pos["avg_entry_price"],
                             pos["last_update_at"],
+                            pos.get("unit_kind", _UNIT_KIND_NAV_FRACTION),
                         ),
                     )
                     result.positions_written += 1
@@ -414,11 +835,16 @@ class PortfolioState:
                 # Upsert cash
                 for acct, balance in cash_map.items():
                     ts = last_ts.get(acct, _utc_now_iso())
-                    # equity_total: cash + open position notionals. ADR-0088 F1:
-                    # value us_option positions at qty × avg × 100 (the contract
-                    # multiplier; key[1] is the position's asset_class), equity ×1.
+                    # equity_total: cash + open position notionals. The per-position
+                    # quantity factor is SIGNED net-liq (ADR-0086) when
+                    # HERMES_QUANT_SIGNED_EQUITY=1 (a short contributes a negative
+                    # liability term, not a phantom positive asset), else the legacy
+                    # abs() (flag-OFF byte-identity). ADR-0088 F1: value us_option
+                    # positions at factor × avg × 100 (the contract multiplier; key[1]
+                    # is the position's asset_class), equity ×1. The >= 1e-12 filter
+                    # is membership (keeps abs()), not the value term.
                     equity = balance + sum(
-                        abs(p["quantity"])
+                        _equity_qty_factor(p["quantity"])
                         * p["avg_entry_price"]
                         * (_CONTRACT_MULTIPLIER if a_cls == "us_option" else 1.0)
                         for (a, a_cls, _), p in positions.items()
@@ -469,6 +895,11 @@ class PortfolioState:
             record: dict matching ExecutionRecord fields (as produced by
                     paper._record_to_dict).
         """
+        # ft1: BEFORE any fold, refuse a flag-flip regime mismatch against a
+        # populated db (would phantom-sell). Raised OUTSIDE the swallowing
+        # try/except below so the refusal is loud to the caller; the default
+        # flag-OFF path never trips it (legacy db stamp 0 == OFF regime 0).
+        self._check_regime_stamp()
         try:
             self._apply_execution_unsafe(record)
         except Exception as e:  # noqa: BLE001
@@ -500,8 +931,29 @@ class PortfolioState:
 
     def _apply_execution_unsafe(self, record: dict[str, Any]) -> None:
         """Inner implementation — may raise; caller wraps in try/except."""
-        acct = record.get("account_id", "paper-default")
+        # cs52: resolve the partition account via the same fallback as the rebuild fold
+        # (top-level account_id, else reactor_metadata.account_id, else "paper-default").
+        # The LIVE path is unaffected — the reactors pre-inject a top-level account_id
+        # before calling apply_execution (react/paper.py:438-441) — but this keeps the
+        # incremental fold in parity for a manual raw-log replay where account_id lives
+        # only in reactor_metadata. A truthy top-level account_id resolves identically ⇒
+        # byte-identical to the prior .get(...,"paper-default").
+        acct = _resolve_account(record)
         asset_class = record.get("asset_class", "equity")
+        # cs44: skip the multi-leg family-PARENT audit record (asset_class=="multi_leg")
+        # BEFORE any position/cash mutation — its children carry the real book; folding
+        # the parent would phantom a "multi_leg" position + double-count cash. The early
+        # return touches no DB state (no processed_fills claim, no watermark bump), so a
+        # later child apply is unaffected. Fires ONLY on the parent marker ⇒ an
+        # equity/option-only record is byte-identical.
+        if _is_multileg_family_parent(asset_class):
+            logger.debug(
+                "apply_execution: skipping multi-leg family-parent rollup "
+                "(proposal_id=%s asset=%s) — children carry the position+cash",
+                record.get("proposal_id"),
+                record.get("asset"),
+            )
+            return
         symbol = record.get("asset", "")
         fill_size_pct = float(record.get("fill_size_pct", 0.0))
         fill_price = float(record.get("fill_price", 0.0))
@@ -519,10 +971,23 @@ class PortfolioState:
             pos_delta = float(leg_quantity)  # signed contracts/shares
             dedup_asset = symbol
             dedup_asset_class = asset_class
+            unit_kind = _UNIT_KIND_TRUE_UNIT  # ar13/ar14: quantity is true units
         else:
             pos_delta = fill_size_pct  # NAV-fraction proxy (legacy path)
             dedup_asset = ""
             dedup_asset_class = ""
+            unit_kind = _UNIT_KIND_NAV_FRACTION  # ar13/ar14: quantity is a NAV-fraction
+        # cs51: a same-OCC roll resolves two legs of ONE family to the SAME
+        # (proposal_id, asof, asset, asset_class), so the 4-column key collides and the
+        # 2nd leg's INSERT OR IGNORE is silently dropped on the incremental fold (while
+        # reconstruct_from folds both). Disambiguate with the per-leg index the option
+        # children already carry (react/multileg.py:582). A MISSING leg_index maps to the
+        # "" sentinel — NOT the literal string "None" — so every legacy/single-leg row and
+        # the single covered-call equity child (which carries no leg_index) keys exactly
+        # as the 4-column form did (byte-identical, dedup_leg == ""). leg_index 0 and 1 on
+        # the same OCC then claim distinct keys, so both legs apply.
+        _leg_index = rmeta.get("leg_index") if isinstance(rmeta, dict) else None
+        dedup_leg = "" if _leg_index is None else str(_leg_index)
         # Contract multiplier (ADR-0088 F1 fix): a us_option fill_price is the
         # PER-CONTRACT premium, but a contract controls 100 shares, so the cash
         # and equity-valuation impact is premium × contracts × 100. An equity
@@ -537,24 +1002,24 @@ class PortfolioState:
             if (leg_quantity is not None and asset_class == "us_option")
             else 1.0
         )
-        # Cross-model review C2 (Claude Opus): future-bound asof. A crafted
-        # asof of "9999-12-31..." would wedge the watermark and silently
-        # cause future delta-replays to skip every legitimate record.
-        # Reject anything more than 24h in the future of wall-clock-now.
-        now = datetime.now(UTC)
-        try:
-            asof_dt = datetime.fromisoformat(asof.replace("Z", "+00:00"))
-            if asof_dt.tzinfo is None:
-                asof_dt = asof_dt.replace(tzinfo=UTC)
-            if asof_dt > now and (asof_dt - now).total_seconds() > 86400:
-                raise ValueError(
-                    f"asof_execution {asof} is more than 24h in the future "
-                    f"of wall-clock {now.isoformat()}; refusing to apply"
-                )
-        except (TypeError, ValueError) as exc:
-            # Bad ISO format also lands here. We re-raise rather than
-            # silently using _utc_now_iso to avoid masking upstream bugs.
-            raise ValueError(f"unparseable or future-bound asof_execution: {asof!r}") from exc
+        # Cross-model review C2 (Claude Opus): future-bound / unparseable asof rejection.
+        # cs62: the SAME guard the rebuild fold (_replay_record) now applies, factored into
+        # ONE shared helper so the incremental and rebuild folds can never diverge on which
+        # records they drop. Byte-identical to the prior inline block.
+        _validate_asof(asof)
+        # ar62: reject non-finite fill numerics BEFORE touching DB state — mirrors the
+        # asof reject above (raises before the write lock). _read_all_jsonl decodes with
+        # json.loads at DEFAULT settings, which parses Infinity/-Infinity/NaN and the
+        # overflow literal 1e400 into inf/nan WITHOUT raising; producer-side float(...)
+        # coercions pass inf through too. A single non-finite fill_price flows into
+        # delta_cash and then equity, permanently poisoning balance_usd/equity_total with a
+        # sticky inf/nan (an inf even satisfies equity_total>0 in the NAV read). pos_delta
+        # already holds the float-coerced leg_quantity when present.
+        _validate_fill_numerics(
+            fill_price,
+            fill_size_pct,
+            pos_delta if leg_quantity is not None else None,
+        )
 
         initial_cash = _default_initial_cash()
         proposal_id = record.get("proposal_id") or ""
@@ -565,6 +1030,13 @@ class PortfolioState:
             # read-then-write race when two processes apply concurrently.
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # ft1: stamp the current regime on every incremental write so a
+                # flag-ON session marks the db (and a flag-OFF write re-affirms 0,
+                # a no-op on a legacy db => byte-identical). _check_regime_stamp()
+                # at the public entry already refused any populated-db mismatch
+                # before we got here, so this only ever (re)writes the AGREEING
+                # regime; it cannot silently overwrite a conflicting stamp.
+                conn.execute(f"PRAGMA user_version = {int(_current_normalizer_regime())}")
                 # Cross-model review C2: idempotency guard. If this
                 # (proposal_id, asof_execution) has already been applied,
                 # skip — INSERT into processed_fills will fail the UNIQUE,
@@ -572,9 +1044,16 @@ class PortfolioState:
                 if proposal_id:
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO processed_fills "
-                        "(proposal_id, asof_execution, asset, asset_class, applied_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (proposal_id, asof, dedup_asset, dedup_asset_class, _utc_now_iso()),
+                        "(proposal_id, asof_execution, asset, asset_class, leg_index, applied_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            proposal_id,
+                            asof,
+                            dedup_asset,
+                            dedup_asset_class,
+                            dedup_leg,
+                            _utc_now_iso(),
+                        ),
                     )
                     if cur.rowcount == 0:
                         # Already applied — this is the duplicate-apply
@@ -582,11 +1061,12 @@ class PortfolioState:
                         # return cleanly.
                         conn.execute("ROLLBACK")
                         logger.info(
-                            "apply_execution: idempotency hit on (%s, %s, %s, %s); skipping",
+                            "apply_execution: idempotency hit on (%s, %s, %s, %s, %s); skipping",
                             proposal_id,
                             asof,
                             dedup_asset,
                             dedup_asset_class,
+                            dedup_leg,
                         )
                         return
 
@@ -604,6 +1084,25 @@ class PortfolioState:
                     old_qty = 0.0
                     old_avg = 0.0
 
+                # ADR-0091 Option E (i0a) — incremental path, default-OFF behind
+                # HERMES_QUANT_DELTA_NORMALIZER. The persisted old_qty IS this
+                # bucket's carried-forward net (in the record's lane unit), so the
+                # SAME shared derivation the rebuild fold uses — delta = target -
+                # net — applies here with net = old_qty. This makes the incremental
+                # and rebuild folds converge by construction (the i0a parity gate):
+                # a re-affirmed unchanged target yields pos_delta 0 (no-op in
+                # position AND cash). Flag OFF ⇒ pos_delta unchanged, bit-for-bit
+                # legacy. Re-feed the derived delta into BOTH the position fold and
+                # the cash basis (which tracks pos_delta / leg_quantity below).
+                if os.environ.get("HERMES_QUANT_DELTA_NORMALIZER", "0") == "1":
+                    from hermes_quant.state.fill_delta_normalizer import delta_from_net
+
+                    pos_delta = delta_from_net(record, old_qty)
+                    if leg_quantity is not None:
+                        leg_quantity = pos_delta
+                    else:
+                        fill_size_pct = pos_delta
+
                 new_qty, new_avg = _update_position(old_qty, old_avg, pos_delta, fill_price)
 
                 # ── upsert position ──────────────────────────────────────
@@ -620,10 +1119,10 @@ class PortfolioState:
                         """
                         INSERT OR REPLACE INTO positions
                             (account_id, asset_class, symbol, quantity,
-                             avg_entry_price, last_update_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                             avg_entry_price, last_update_at, unit_kind)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (acct, asset_class, symbol, new_qty, new_avg, asof),
+                        (acct, asset_class, symbol, new_qty, new_avg, asof, unit_kind),
                     )
 
                 # ── load / bootstrap cash ────────────────────────────────
@@ -656,18 +1155,23 @@ class PortfolioState:
                 new_cash = cash_balance + delta_cash
 
                 # equity_total: recompute from all positions for this account
-                # (approximation: use avg_entry_price, not mark price). ADR-0088
-                # F1: value each position at qty × avg × its own contract
-                # multiplier (us_option ×100, equity ×1) so an option position is
-                # not undervalued 100×. asof_execution per-position asset_class
-                # drives the multiplier.
+                # (approximation: use avg_entry_price, not mark price). The per-
+                # position quantity factor is SIGNED net-liq (ADR-0086) when
+                # HERMES_QUANT_SIGNED_EQUITY=1 (a short is a negative liability term,
+                # not a phantom positive asset), else the legacy abs() (flag-OFF
+                # byte-identity). ADR-0088 F1: value each position at factor × avg ×
+                # its own contract multiplier (us_option ×100, equity ×1) so an option
+                # position is not undervalued 100×. The SQL ABS(quantity) >= 1e-12
+                # is membership (keeps abs()), not the value term. Both folds call the
+                # same _equity_qty_factor on the same signed qty, so a short-holding
+                # book yields identical equity from rebuild and incremental (parity).
                 all_pos = conn.execute(
                     "SELECT asset_class, quantity, avg_entry_price FROM positions "
                     "WHERE account_id=? AND ABS(quantity) >= 1e-12",
                     (acct,),
                 ).fetchall()
                 equity = new_cash + sum(
-                    abs(float(p["quantity"]))
+                    _equity_qty_factor(float(p["quantity"]))
                     * float(p["avg_entry_price"])
                     * (_CONTRACT_MULTIPLIER if p["asset_class"] == "us_option" else 1.0)
                     for p in all_pos
@@ -714,7 +1218,7 @@ class PortfolioState:
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT account_id, asset_class, symbol, quantity, "
-                "avg_entry_price, last_update_at "
+                "avg_entry_price, last_update_at, unit_kind "
                 "FROM positions "
                 "WHERE account_id=? AND ABS(quantity) >= 1e-12",
                 (account_id,),
@@ -728,6 +1232,7 @@ class PortfolioState:
                 quantity=float(row["quantity"]),
                 avg_entry_price=float(row["avg_entry_price"]),
                 last_update_at=row["last_update_at"],
+                unit_kind=(row["unit_kind"] or _UNIT_KIND_NAV_FRACTION),
             )
             for row in rows
         }
@@ -743,17 +1248,32 @@ class PortfolioState:
 
         if row is None:
             return None
+        # ar62 defense-in-depth: a legacy / externally-mutated state.db could already hold
+        # a poisoned inf/nan cash row (written before the fold guards existed, or by a
+        # manual sqlite edit). Treat a non-finite balance or equity as "no usable cash row"
+        # (return None) rather than propagating inf/nan to every reader — react/paper.py's
+        # NAV read sees None and falls back to bootstrap instead of handing inf back as NAV
+        # (an inf even satisfies equity_total>0 there).
+        balance_usd = float(row["balance_usd"])
+        equity_total = float(row["equity_total"])
+        if not math.isfinite(balance_usd) or not math.isfinite(equity_total):
+            logger.warning(
+                "get_cash: non-finite cash row for account %r (balance_usd=%r, "
+                "equity_total=%r); returning None (bootstrap)",
+                account_id, balance_usd, equity_total,
+            )
+            return None
         return CashState(
             account_id=row["account_id"],
-            balance_usd=float(row["balance_usd"]),
+            balance_usd=balance_usd,
             last_update_at=row["last_update_at"],
-            equity_total=float(row["equity_total"]),
+            equity_total=equity_total,
         )
 
     def get_marked_equity(
         self,
         account_id: str,
-        mark_prices: dict[str, float],
+        mark_prices: dict[str | tuple[str, str], float],
         *,
         nav_ref: float | None = None,
     ) -> MarkedEquity:
@@ -764,19 +1284,31 @@ class PortfolioState:
 
         Args:
             account_id: Account identifier.
-            mark_prices: dict mapping symbol → current mark price. Positions
-                without an entry in this dict fall back to avg_entry_price.
-            nav_ref: NAV reference against which position weights are sized.
-                Defaults to cash.equity_total (cost-basis equity) or
+            mark_prices: dict mapping the position's mark key → current mark price.
+                The key may be the bare ``symbol`` (legacy contract) OR the composite
+                ``(asset_class, symbol)`` tuple — the composite key is tried first and
+                the bare symbol is the fallback, so an equity and a us_option on the
+                SAME underlying (distinct PK rows) can carry distinct marks (cs35).
+                Positions without an entry fall back to avg_entry_price (no P&L).
+            nav_ref: NAV reference against which NAV-fraction position weights are
+                sized. Defaults to cash.equity_total (cost-basis equity) or
                 _default_initial_cash() if no cash record exists yet.
 
         Returns:
             MarkedEquity with marked_equity = cost_basis_equity + total_unrealized.
+            n_positions counts only CONSIDERED rows (avg_entry_price > 0); rows
+            skipped at the avg guard do not inflate the equity_basis denominator
+            (cs32).
 
         Notes:
-            Position.quantity is a SIGNED NAV-FRACTION (e.g., -0.2 = 20% short).
-            unrealized_i = quantity_i * nav_ref * (mark_i / entry_i - 1).
-            Shorts profit when mark < entry (quantity is negative, ratio < 1).
+            For a NAV-FRACTION equity row Position.quantity is a SIGNED weight (e.g.,
+            -0.2 = 20% short) and unrealized_i = quantity_i * nav_ref *
+            (mark_i / entry_i - 1) — shorts profit when mark < entry. A us_option row
+            persists Position.quantity in REAL CONTRACTS, so it is marked on the
+            per-contract premium basis: contracts_i * _CONTRACT_MULTIPLIER *
+            (mark_i - entry_i) — i.e. ×100 shares per contract (cs31). A mark that is
+            None, non-finite, or non-positive is skipped (not marked) so a single bad
+            mark cannot poison the whole-account marked_equity (cs34).
         """
         cash = self.get_cash(account_id)
         cost_basis_equity = cash.equity_total if cash else _default_initial_cash()
@@ -792,24 +1324,51 @@ class PortfolioState:
         positions = self.get_positions(account_id)
         total_unrealized = 0.0
         n_marked = 0
+        # cs32: count only positions actually CONSIDERED (avg_entry_price > 0). A row
+        # skipped at the avg guard below must not inflate the equity_basis denominator
+        # — otherwise a book whose every valid leg is marked reads 'mixed', and a book
+        # with a sole bad-avg row can never read 'mark'.
+        n_considered = 0
 
         for pos in positions.values():
-            # Guard: skip positions with invalid avg_entry_price
+            # Guard: skip positions with invalid avg_entry_price (division by zero).
+            # NOT considered, NOT marked.
             if pos.avg_entry_price <= 0:
                 continue
+            n_considered += 1
 
-            mark = mark_prices.get(pos.symbol)
-            if mark is not None:
-                n_marked += 1
-                # Signed MTM: quantity carries sign, shorts profit when mark < entry
+            # cs35: an equity and a us_option on the SAME underlying persist under
+            # distinct PK rows (asset_class differs). Key the mark lookup on the
+            # composite (asset_class, symbol) first, falling back to the bare symbol so
+            # a legacy symbol-keyed marks dict still resolves byte-identically.
+            mark = mark_prices.get((pos.asset_class, pos.symbol))
+            if mark is None:
+                mark = mark_prices.get(pos.symbol)
+            if mark is None:
+                # No mark → fall back to avg_entry_price → zero unrealized contribution.
+                continue
+            # cs34: a None mark is already handled above; a non-finite (NaN/inf) or
+            # non-positive mark is nonsense — booking it would either poison the whole
+            # account marked_equity to NaN or book a phantom -quantity*nav_ref loss.
+            # Skip it WITHOUT incrementing n_marked (it falls back to entry).
+            if not math.isfinite(mark) or mark <= 0:
+                continue
+            n_marked += 1
+            # cs31: a us_option row's quantity is REAL CONTRACTS (the true-unit fold),
+            # so its MTM is contracts × _CONTRACT_MULTIPLIER × (mark - entry) — the
+            # per-contract premium basis (mirrors the equity_total write fold's ×100).
+            # Every other class is the legacy NAV-fraction signed weight (UNCHANGED):
+            # quantity carries sign, shorts profit when mark < entry.
+            if pos.asset_class == "us_option":
+                unrealized_i = pos.quantity * _CONTRACT_MULTIPLIER * (mark - pos.avg_entry_price)
+            else:
                 unrealized_i = pos.quantity * nav_ref * (mark / pos.avg_entry_price - 1.0)
-                total_unrealized += unrealized_i
-            # else: no mark → fall back to avg_entry_price → zero unrealized contribution
+            total_unrealized += unrealized_i
 
         marked_equity = cost_basis_equity + total_unrealized
 
-        # Determine equity_basis flag
-        n_positions = len(positions)
+        # Determine equity_basis flag (cs32: denominator = considered rows, not raw len)
+        n_positions = n_considered
         if n_positions == 0:
             equity_basis = "entry"  # no positions → no marks needed
         elif n_marked == n_positions:
@@ -860,6 +1419,69 @@ def get_portfolio_state(db_path: Path | None = None) -> PortfolioState:
 
 
 # ---------------------------------------------------------------------------
+# Gross-exposure NAV-fraction conversion (ar13/ar14 units fix)
+# ---------------------------------------------------------------------------
+
+
+def position_gross_fraction(position: Any, *, nav: float | None) -> float:
+    """Signed gross-exposure NAV-fraction contribution of one ``position``.
+
+    The portfolio-cap seam (``risk.portfolio_normalize``) reads a
+    ``symbol -> signed NAV-fraction`` map and sums ``abs(.)`` for gross
+    exposure. ``Position.quantity`` is NOT always a NAV-fraction (ar13/ar14):
+
+      * ``unit_kind == "nav_fraction"`` (legacy / single-leg equity, AND any
+        object that does not expose ``unit_kind`` — older callers, test
+        doubles): ``quantity`` already IS the signed NAV-fraction. Returned
+        verbatim → byte-identical to the pre-fix path.
+      * ``unit_kind == "true_unit"`` (ADR-0086/0088 leg_quantity path):
+        ``quantity`` is signed CONTRACTS/SHARES. The NAV-fraction is
+        ``quantity × avg_entry_price × multiplier / nav`` (us_option ×100,
+        else ×1) — the SAME valuation the ``equity_total`` net-liq fold uses.
+
+    Fail-closed on a true-unit position when NAV or price is unusable: returns
+    the raw ``quantity`` (the pre-fix value) rather than fabricating a fraction.
+    A true-unit position whose magnitude collapses to a fraction is the
+    pathological case the cap would over-count, but with no usable NAV there is
+    no safe conversion, so we preserve the prior behavior rather than silently
+    zeroing the contribution (which would HIDE the position from the gross cap).
+
+    Args:
+        position: anything exposing ``quantity`` (required) and, for the
+            true-unit branch, ``avg_entry_price``, ``asset_class``, and
+            ``unit_kind``. Missing ``unit_kind`` ⇒ treated as nav_fraction.
+        nav: account NAV (USD) for the true-unit conversion. ``None`` or
+            non-positive falls back to the raw quantity (fail-closed).
+
+    Returns:
+        Signed NAV-fraction (sign preserved from ``quantity``).
+    """
+    quantity = float(getattr(position, "quantity", 0.0))
+    unit_kind = getattr(position, "unit_kind", _UNIT_KIND_NAV_FRACTION)
+    if unit_kind != _UNIT_KIND_TRUE_UNIT:
+        # Legacy NAV-fraction (or marker-less object): quantity IS the fraction.
+        return quantity
+
+    avg_entry_price = float(getattr(position, "avg_entry_price", 0.0))
+    asset_class = getattr(position, "asset_class", "equity")
+    multiplier = _CONTRACT_MULTIPLIER if asset_class == "us_option" else 1.0
+
+    if (
+        nav is None
+        or not math.isfinite(nav)
+        or nav <= 0.0
+        or not math.isfinite(avg_entry_price)
+        or avg_entry_price <= 0.0
+        or not math.isfinite(quantity)
+    ):
+        # No safe conversion — fail closed by preserving the raw (pre-fix)
+        # quantity. Do NOT zero it (that would hide the line from the gross cap).
+        return quantity
+
+    return (quantity * avg_entry_price * multiplier) / nav
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -894,6 +1516,71 @@ def _latest_asof(records: list[dict[str, Any]]) -> str | None:
     """Return the most recent asof_execution timestamp among records."""
     asofs: list[str] = [r["asof_execution"] for r in records if r.get("asof_execution")]
     return max(asofs) if asofs else None
+
+
+def _validate_fill_numerics(
+    fill_price: float,
+    fill_size_pct: float,
+    leg_quantity: float | None,
+) -> None:
+    """ar62: reject a fill record whose numeric inputs are non-finite.
+
+    Shared guard for BOTH ledger folds — incremental _apply_execution_unsafe and rebuild
+    _replay_record — factored like the asof reject so the two folds cannot diverge on
+    which records they drop. _read_all_jsonl decodes with json.loads at DEFAULT settings,
+    which parses Infinity/-Infinity/NaN and the overflow literal 1e400 into inf/nan WITHOUT
+    raising; producer-side float(...) coercions pass inf through too. A single non-finite
+    fill_price flows into delta_cash and then equity, permanently poisoning balance_usd /
+    equity_total with a sticky inf/nan (an inf even satisfies equity_total>0 in the NAV
+    read). A non-finite fill_size_pct / leg_quantity similarly makes new_qty nan. Raising
+    REJECTS the poisoned record (the incremental caller swallows + emits the
+    state_reconstruction_failed audit; the rebuild loop records it in errors) WITHOUT
+    touching DB state or the watermark — mirroring the asof reject. Finite -> byte-identical.
+
+    Raises:
+        ValueError: if any of fill_price, fill_size_pct, or (when present) leg_quantity is
+            not finite.
+    """
+    if not math.isfinite(fill_price):
+        raise ValueError(f"non-finite fill_price: {fill_price!r}")
+    if not math.isfinite(fill_size_pct):
+        raise ValueError(f"non-finite fill_size_pct: {fill_size_pct!r}")
+    if leg_quantity is not None and not math.isfinite(leg_quantity):
+        raise ValueError(f"non-finite reactor_metadata.quantity: {leg_quantity!r}")
+
+
+def _validate_asof(asof: str) -> None:
+    """cs62: the SHARED no-lookahead/poison guard for asof_execution.
+
+    Cross-model review C2 (Claude Opus): a future-bound asof of "9999-12-31..." would
+    wedge the watermark and silently cause future delta-replays to skip every legitimate
+    record. A bad ISO format is equally poisonous. Reject anything more than 24h in the
+    future of wall-clock-now, or anything unparseable.
+
+    cs62: BOTH folds (the incremental _apply_execution_unsafe AND the rebuild
+    _replay_record) call this ONE implementation so reconstruct_from drops exactly the
+    records the live incremental book drops — the rebuild can no longer DIVERGE by folding a
+    poisoned record the live book correctly rejected, and a `--apply` can no longer corrupt
+    state.db / wedge the watermark. A clean (valid, non-future, parseable) asof returns None
+    and the caller proceeds bit-for-bit as before.
+
+    Raises:
+        ValueError: if asof is unparseable or more than 24h in the future.
+    """
+    now = datetime.now(UTC)
+    try:
+        asof_dt = datetime.fromisoformat(asof.replace("Z", "+00:00"))
+        if asof_dt.tzinfo is None:
+            asof_dt = asof_dt.replace(tzinfo=UTC)
+        if asof_dt > now and (asof_dt - now).total_seconds() > 86400:
+            raise ValueError(
+                f"asof_execution {asof} is more than 24h in the future "
+                f"of wall-clock {now.isoformat()}; refusing to apply"
+            )
+    except (TypeError, ValueError) as exc:
+        # Bad ISO format also lands here. We re-raise rather than
+        # silently using _utc_now_iso to avoid masking upstream bugs.
+        raise ValueError(f"unparseable or future-bound asof_execution: {asof!r}") from exc
 
 
 def _update_position(
@@ -957,6 +1644,7 @@ def _replay_record(
     cash_map: dict[str, float],
     last_ts: dict[str, str],
     initial_cash: float,
+    pos_delta_override: float | None = None,
 ) -> None:
     """Apply one record to the in-memory accumulators during full rebuild.
 
@@ -968,20 +1656,72 @@ def _replay_record(
         cash_map:     account_id → cash balance
         last_ts:      account_id → most recent asof_execution seen
         initial_cash: bootstrap cash for first-seen accounts
+        pos_delta_override: ADR-0091 Option E — when the
+            HERMES_QUANT_DELTA_NORMALIZER fold is active, reconstruct_from passes
+            the carry-forward-derived TRADED DELTA here (in the record's own size
+            unit), replacing the raw absolute-target size field. None ⇒ legacy
+            behavior (read the raw field), bit-for-bit unchanged.
     """
-    acct = rec.get("account_id", "paper-default")
+    # cs52: resolve the partition account the SAME way the live producer/state-write seam
+    # does — top-level account_id, else reactor_metadata.account_id, else "paper-default"
+    # (mirrors cs24/daemon _record_account). A persisted alpaca-paper fill carries its
+    # account_id ONLY in reactor_metadata (react/paper.py:_record_to_dict emits no
+    # top-level field), so the bare .get(...,"paper-default") re-pooled it into
+    # paper-default on rebuild. A truthy top-level account_id resolves identically ⇒
+    # paper-default-only log byte-identical.
+    acct = _resolve_account(rec)
     asset_class = rec.get("asset_class", "equity")
+    # cs44: skip the multi-leg family-PARENT audit record (asset_class=="multi_leg")
+    # BEFORE touching positions/cash_map/last_ts. reconstruct_from reads EVERY bus
+    # record including the parent that _write_family appends; the children (us_option /
+    # equity, with reactor_metadata.quantity) carry the real positions + full cash. The
+    # parent has no quantity, so folding it phantoms a "multi_leg" position and books a
+    # second cash delta on top of the children (double-book). Skip fires ONLY on the
+    # parent marker ⇒ an equity/option-only rebuild is byte-identical (incl. last_ts,
+    # which the parent shares with its same-asof children, so the watermark is
+    # unchanged).
+    if _is_multileg_family_parent(asset_class):
+        return
     symbol = rec.get("asset", "")
     fill_size_pct = float(rec.get("fill_size_pct", 0.0))
     fill_price = float(rec.get("fill_price", 0.0))
     asof = rec.get("asof_execution") or _utc_now_iso()
+    # cs62: apply the SAME asof poison guard the incremental fold
+    # (_apply_execution_unsafe) applies, BEFORE any positions/cash/last_ts mutation. A
+    # future-bound or unparseable asof raises here; reconstruct_from's per-record
+    # try/except catches it, records the error, and skips the fold (and the
+    # executions_processed/accounts_seen bump) — exactly mirroring the incremental reject.
+    # Without this, the rebuild folded a poisoned record the live book correctly dropped
+    # (divergence), and a `--apply` corrupted state.db + wedged the watermark. A clean
+    # (valid, non-future, parseable) asof passes through untouched ⇒ byte-identical fold.
+    _validate_asof(asof)
 
     # ADR-0029 multi-leg: a child leg with an explicit signed contract/share count
     # tracks position quantity in that true unit (parity with apply_execution).
     # Without it, the legacy NAV-fraction proxy is used (equity path bit-identical).
     rmeta = rec.get("reactor_metadata") or {}
     leg_quantity = rmeta.get("quantity") if isinstance(rmeta, dict) else None
-    pos_delta = float(leg_quantity) if leg_quantity is not None else fill_size_pct
+    if pos_delta_override is not None:
+        # Option E: the normalizer already derived the traded delta from the
+        # absolute target. Use it for BOTH the position fold and the cash basis
+        # below (cash_basis tracks pos_delta), so a re-affirmation (delta 0) is a
+        # true no-op in position AND cash.
+        pos_delta = pos_delta_override
+        fill_size_pct = pos_delta_override if leg_quantity is None else fill_size_pct
+        if leg_quantity is not None:
+            leg_quantity = pos_delta_override
+    else:
+        pos_delta = float(leg_quantity) if leg_quantity is not None else fill_size_pct
+
+    # ar62: reject non-finite fill numerics in the REBUILD fold too (parity with the
+    # incremental _apply_execution_unsafe), so a poisoned inf/nan record the live book
+    # drops cannot be re-folded by a rebuild and corrupt state.db. Raises -> the rebuild
+    # loop records it in ReconstructionResult.errors WITHOUT touching the fold state.
+    _validate_fill_numerics(
+        fill_price,
+        fill_size_pct,
+        pos_delta if leg_quantity is not None else None,
+    )
 
     # Bootstrap cash for new accounts
     if acct not in cash_map:
@@ -1000,6 +1740,12 @@ def _replay_record(
         "quantity": new_qty,
         "avg_entry_price": new_avg,
         "last_update_at": asof,
+        # ar13/ar14: record the unit the running quantity is in. The latest
+        # fill's path determines it (leg_quantity present ⇒ true_unit), parity
+        # with apply_execution. Legacy equity stays "nav_fraction" (unchanged).
+        "unit_kind": (
+            _UNIT_KIND_TRUE_UNIT if leg_quantity is not None else _UNIT_KIND_NAV_FRACTION
+        ),
     }
 
     # Update cash: long fill decreases cash, short fill increases cash.

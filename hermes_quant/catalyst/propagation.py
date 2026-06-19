@@ -25,10 +25,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # Where the operator-editable curated graph lives (overridable for tests).
-_DEFAULT_GRAPH_PATH = Path.home() / ".hermes" / "quant" / "catalyst" / "propagation_graph.yaml"
+_DEFAULT_GRAPH_PATH = _resolve_quant_home() / "catalyst" / "propagation_graph.yaml"
 
 
 @dataclass(frozen=True)
@@ -185,7 +187,36 @@ _SIGN_TO_STANCE = {1: "bullish", -1: "bearish", 0: "neutral"}
 # one (entity→symbol) edge fire with its curated sign/weight + the catalyst sign,
 # so a later job can join against realized forward returns and learn corrected
 # signs/weights without re-deriving the curated graph.
-_DEFAULT_LEARNED_LOG = Path.home() / ".hermes" / "quant" / "catalyst" / "propagation-log.jsonl"
+_DEFAULT_LEARNED_LOG = _resolve_quant_home() / "catalyst" / "propagation-log.jsonl"
+
+
+def _propagation_row_key(row: dict) -> tuple:
+    """Content-identity key for a propagation-log row (ar123 dedup).
+
+    A row is uniquely identified by its (symbol, source, relation, effect_sign, weight,
+    symbol_sign, catalyst_sign, asof, headline_id). Two rows equal on this key are the
+    SAME logical propagation observation (same headline → same edge fire at the same
+    publication time), not two independent data points — so re-ingesting the same news
+    window must not double-count them.
+
+    ar126b: ``headline_id`` (a stable hash of the source headline's link/title, stamped by
+    synthesize_packets) is part of the key so two GENUINELY-DISTINCT headlines for the
+    same edge published in the SAME second (identical ``asof``) are NOT collapsed —
+    without it the dedup would under-count real corroborating evidence (fail-CLOSED, the
+    opposite of the ar123 over-count). Rows lacking headline_id (legacy / a caller that
+    did not stamp it) fall back to asof-only identity (the ar123 behavior).
+    """
+    return (
+        row.get("symbol"),
+        row.get("source"),
+        row.get("relation"),
+        row.get("effect_sign"),
+        row.get("weight"),
+        row.get("symbol_sign"),
+        row.get("catalyst_sign"),
+        row.get("asof"),
+        row.get("headline_id"),
+    )
 
 
 def log_propagations(
@@ -201,12 +232,46 @@ def log_propagations(
     ``asof`` (the headline publication time) is stamped on each row so the corpus is
     join-able against forward returns lookahead-honestly. Returns count written.
     Never raises fatally (silence-by-default; logging must not break the daily run).
+
+    ar123 IDEMPOTENCY: catalyst-ingest is scheduled every 30-60 min in-market; a retry
+    after a transient failure, or two overlapping invocations, re-fetch the SAME news
+    window (Google News ``when:1d`` returns the same items) → identical classify →
+    identical propagate → BYTE-IDENTICAL rows. The append-only consumers
+    (profitability.measure_profitability, graph_mining) count each row as an independent
+    observation, so duplicates inflate ``n_scored`` and prematurely cross ``MIN_SAMPLE``,
+    flipping a relation's verdict on non-independent evidence (which gates the
+    consumer-trend confidence-weight RAISE + graph edge prune/flip). We therefore skip a
+    row whose content key (``_propagation_row_key``) already exists in the log, so a
+    re-run is idempotent. (Best-effort dedup against the existing on-disk log; under a
+    true concurrent double-write a few dupes may still slip, but the common
+    sequential-retry / overlapping-run case is fully deduped. A genuine new headline has
+    a distinct ``asof`` and is preserved.)
     """
     if not entries:
         return 0
     p = path or _DEFAULT_LEARNED_LOG
     p.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load existing content keys so a re-run does not re-append byte-identical rows.
+    existing_keys: set[tuple] = set()
+    if p.exists():
+        try:
+            import json as _json
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    prior = _json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(prior, dict):
+                    existing_keys.add(_propagation_row_key(prior))
+        except OSError as e:  # noqa: BLE001 — dedup is best-effort; never block the write
+            logger.warning("catalyst.propagation: dedup pre-read failed: %s", e)
+
     n = 0
+    seen_this_call: set[tuple] = set()
     try:
         import json
         with p.open("a", encoding="utf-8") as f:
@@ -214,6 +279,11 @@ def log_propagations(
                 row = dict(e)
                 if asof is not None:
                     row["asof"] = asof
+                key = _propagation_row_key(row)
+                # Skip a row already on disk OR an exact duplicate within this batch.
+                if key in existing_keys or key in seen_this_call:
+                    continue
+                seen_this_call.add(key)
                 f.write(json.dumps(row, default=str) + "\n")
                 n += 1
             f.flush()

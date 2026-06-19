@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.memory.decisions import MEMORY_HOME
 
 # Read-site belief-freshness horizon (silence-by-default safety rail). A
@@ -53,7 +54,7 @@ STALE_BELIEF_HALF_LIVES = 2.0
 logger = logging.getLogger(__name__)
 
 REFLECTIONS_PATH = MEMORY_HOME / "reflections.jsonl"
-SECTOR_CACHE_PATH = Path.home() / ".hermes" / "quant" / "cache" / "sector-beta-cache.json"
+SECTOR_CACHE_PATH = _resolve_quant_home() / "cache" / "sector-beta-cache.json"
 
 # ---------------------------------------------------------------------------
 # BM25 availability

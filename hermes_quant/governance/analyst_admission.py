@@ -37,6 +37,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # DSR is meaningless below this (evaluation/dsr.py raises < 30); mirror it here so
@@ -46,8 +48,15 @@ MIN_OBSERVATIONS: int = 30
 # variation). Mirrors factors.weight_proposer.PLATEAU_CV_MAX — a consistently-strong
 # edge has high per-fold Sharpes but LOW CV; a one-window spike has high CV.
 PLATEAU_CV_MAX: float = 1.5
+# Absolute promotability floor on the held-out DSR. Mirrors
+# factors.weight_proposer.MIN_PROMOTABLE_DSR: on the first run prior_best is -inf, so
+# STRICTLY-beats-prior-best alone would admit ANY finite DSR — including a consistent LOSER
+# whose n_trials=1 DSR underflows toward 0.0 and which is plateau-stable (sign-consistent folds).
+# 0.5 is the no-edge midpoint of the n_trials=1 PSR (Φ(0)); a positive-Sharpe edge is required to
+# clear it. Without it a guaranteed-loser analyst would join the committee on the -inf baseline.
+MIN_PROMOTABLE_DSR: float = 0.5
 
-_DEFAULT_DIR = Path.home() / ".hermes" / "quant" / "analysts"
+_DEFAULT_DIR = _resolve_quant_home() / "analysts"
 _PRIOR_BEST_FILE = "admission-prior-best.json"
 # Persisted admission verdicts the committee-build wiring reads when the
 # (default-OFF) admission flag is enabled. Written by the operator/eval path after
@@ -142,9 +151,14 @@ def evaluate_analyst_admission(
 ) -> AnalystAdmissionDecision:
     """Apply the factor eval-gate contract to an analyst (ADR-0080 §D80.3, mirrored).
 
-    ``admitted`` iff BOTH:
+    ``admitted`` iff ALL of:
       (1) STRICTLY beats prior-best on held-out DSR: ``holdout_dsr > prior_best_dsr``
           (a tie reverts — checkpoint-fallback); AND
+      (1b) absolute floor: ``holdout_dsr >= MIN_PROMOTABLE_DSR`` (the no-edge midpoint).
+          On the FIRST run prior_best is -inf, so (1) alone admits ANY finite DSR —
+          including a consistent LOSER (negative-Sharpe analyst -> DSR ~ 0.0) that is
+          plateau-stable. The floor requires a positive-Sharpe edge regardless of the
+          baseline (without it a guaranteed-loser analyst would join the committee); AND
       (2) robustness-not-peak: ``plateau_stable`` is True.
 
     STRUCTURAL external-truth guarantee: the signature takes only floats/bool. There
@@ -153,17 +167,26 @@ def evaluate_analyst_admission(
     invariant for this gate).
     """
     beats_prior_best = holdout_dsr > prior_best_dsr  # STRICT — a tie reverts.
-    admitted = bool(beats_prior_best and plateau_stable)
+    # Absolute floor: a no-edge / losing analyst must be held even when prior_best is the
+    # first-run -inf baseline. >= is inclusive; NaN holdout_dsr fails closed (NaN comparisons
+    # are False, so both beats_prior_best and the floor reject it). Mirrors the factor gate.
+    clears_floor = holdout_dsr >= MIN_PROMOTABLE_DSR
+    admitted = bool(beats_prior_best and clears_floor and plateau_stable)
 
     if admitted:
         reason = (
             f"admitted: holdout_dsr={holdout_dsr:.4f} > prior_best={prior_best_dsr:.4f} "
-            f"AND plateau_stable"
+            f"AND >= floor={MIN_PROMOTABLE_DSR:.4f} AND plateau_stable"
         )
     elif not beats_prior_best:
         reason = (
             f"held: holdout_dsr={holdout_dsr:.4f} <= prior_best={prior_best_dsr:.4f} "
             f"(does not strictly beat the prior-best checkpoint)"
+        )
+    elif not clears_floor:
+        reason = (
+            f"held: holdout_dsr={holdout_dsr:.4f} < floor={MIN_PROMOTABLE_DSR:.4f} "
+            f"(no positive-Sharpe edge — below the no-edge midpoint)"
         )
     else:
         reason = (

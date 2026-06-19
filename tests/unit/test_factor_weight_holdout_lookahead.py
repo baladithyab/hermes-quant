@@ -154,16 +154,99 @@ def test_in_sample_only_winner_is_rejected():
 def test_one_window_spike_fails_plateau():
     n = 280
     rng = np.random.RandomState(5)
+    # The factor predicts returns ONLY in the first quarter; the rest of the window is pure noise
+    # in BOTH the factor AND the price path (the price's edge dies with the factor's edge). With a
+    # CAUSAL per-bar z-score the early edge is not diluted by the noise tail, so the later folds
+    # have no genuine edge and their Sharpe sign flips → fails the majority-sign robustness rail.
     signal = rng.randn(n)
-    bars, fser = _bars_with_signal(signal, seed=5)
-    # Edge present only in the first quarter of the holdout, noise thereafter → high CV, sign flips.
-    spiky = fser.copy()
-    spiky.iloc[n // 4:] = pd.Series(rng.randn(n - n // 4), index=fser.index[n // 4:])
+    signal[n // 4:] = 0.0                          # no predictive content after the first quarter
+    bars, _fser = _bars_with_signal(signal, seed=5)  # price edge dies after the first quarter
+    spiky = pd.Series(rng.randn(n), index=bars.index)  # factor = noise everywhere (mis-fit tail)
+    spiky.iloc[: n // 4] = signal[: n // 4]            # except the genuine first-quarter edge
 
     _dsr, _sharpe, plateau = score_holdout(
         _pset_one("spike", 0.8), bars, lambda fid, b: spiky.reindex(b.index)
     )
     assert plateau is False  # robustness-not-peak: a single-window spike is not a plateau
+
+
+# ---------------------------------------------------------------------------
+# NO LOOKAHEAD (within-holdout): per-bar factor normalization must be CAUSAL.
+#
+# The composite z-scores each factor before taking np.sign() as the position. If that z-score
+# uses the FULL-window mean/std, bar t's z (and hence its sign/position) depends on bars t+1..T —
+# a within-holdout lookahead that contaminates the realized OOS Sharpe → DSR → plateau that gate
+# eval_passed. A causal (expanding) z-score makes bar t depend only on bars <= t, so perturbing
+# ONLY the future tail of the factor series (earlier factor values AND the entire price/return
+# series held byte-identical) cannot change the realized score of the earlier bars.
+# ---------------------------------------------------------------------------
+def _bars_factor_for_causality(n: int, seed: int) -> tuple[pd.DataFrame, pd.Series]:
+    """Price path + a leading factor, both fully determined by ``seed`` (deterministic, no net)."""
+    rng = np.random.RandomState(seed)
+    signal = rng.randn(n)
+    noise = rng.randn(n) * 0.002
+    ret = np.empty(n)
+    ret[0] = 0.0
+    ret[1:] = 0.01 * signal[:-1] + noise[:-1]  # signal[t] leads return over t→t+1
+    price = 100.0 * np.cumprod(1.0 + ret)
+    idx = pd.date_range("2021-01-01", periods=n, freq="D", tz="UTC")
+    bars = pd.DataFrame({"close": price}, index=idx)
+    return bars, pd.Series(signal, index=idx)
+
+
+def test_composite_position_prefix_invariant_to_future_tail():
+    """The per-bar position for bars 0..t MUST NOT change when ONLY bars > t move.
+
+    This is the precise causality invariant: a CAUSAL/expanding z-score computes bar t from bars
+    <= t, so perturbing strictly-LATER factor values cannot alter the realized position of any
+    earlier bar. Under the FULL-window leak, bar t's z uses series.mean()/series.std() over the
+    ENTIRE window, so a future-tail shift moves the global mean and flips earlier np.sign()
+    positions — a within-holdout lookahead.
+
+    RED on current code: bars 0..79's positions change when bars 80..119 are perturbed by +30.0.
+    """
+    n = 120
+    bars, fser = _bars_factor_for_causality(n, seed=0)
+    from hermes_quant.factors.weight_proposer import _composite_position
+
+    pos0 = _composite_position(_pset_one("f", 0.8), bars, lambda fid, b: fser.reindex(b.index))
+
+    perturbed = fser.copy()
+    perturbed.iloc[80:] = perturbed.iloc[80:] + 30.0  # ONLY the future tail moves
+    pos1 = _composite_position(
+        _pset_one("f", 0.8), bars, lambda fid, b: perturbed.reindex(b.index)
+    )
+
+    # The position for the unperturbed prefix (bars 0..79) must be byte-identical: those bars' z
+    # (and sign) depend only on bars <= t < 80, none of which moved.
+    pd.testing.assert_series_equal(pos0.iloc[:80], pos1.iloc[:80])
+
+
+def test_score_holdout_plateau_invariant_to_future_tail_perturbation():
+    """score_holdout's plateau verdict must NOT flip when ONLY the future-tail factor values move.
+
+    Same construction as the prefix-invariance test. The plateau (a robustness verdict over the
+    whole window) is the gate input that authorizes a promotion, so we pin that it does not flip on
+    a future-only perturbation. On current (buggy) full-window code this flips the realized OOS
+    Sharpe ≈20.33 → 2.41 and plateau True → False (seed 0); a causal z-score holds the verdict.
+    """
+    n = 120
+    bars, fser = _bars_factor_for_causality(n, seed=0)
+
+    _dsr0, _sharpe0, plateau0 = score_holdout(
+        _pset_one("f", 0.8), bars, lambda fid, b: fser.reindex(b.index)
+    )
+
+    perturbed = fser.copy()
+    perturbed.iloc[80:] = perturbed.iloc[80:] + 30.0  # ONLY the future tail moves
+    _dsr1, _sharpe1, plateau1 = score_holdout(
+        _pset_one("f", 0.8), bars, lambda fid, b: perturbed.reindex(b.index)
+    )
+
+    assert plateau0 == plateau1, (
+        f"plateau verdict changed ({plateau0}→{plateau1}) when ONLY future-tail factor values "
+        f"moved — within-holdout lookahead in the per-bar normalization"
+    )
 
 
 # ---------------------------------------------------------------------------

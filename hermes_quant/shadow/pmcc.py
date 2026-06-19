@@ -25,9 +25,11 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STORE = Path.home() / ".hermes" / "quant" / "shadow" / "pmcc-positions.jsonl"
+_DEFAULT_STORE = _resolve_quant_home() / "shadow" / "pmcc-positions.jsonl"
 _RISK_FREE = 0.043  # matches the analysis assumption; refresh from a curve later.
 
 
@@ -93,8 +95,20 @@ class PMCCPosition:
     structure: str = "poor_mans_covered_call"
 
     def net_debit(self) -> float:
-        """Capital outlay per contract-set (long premium - short credit) * 100."""
-        return (self.long_leg.entry_premium - self.short_leg.entry_premium) * 100 * self.long_leg.contracts
+        """Capital outlay at open = long cost - short credit, each leg valued by ITS OWN
+        contract count × 100 shares/contract.
+
+        ar26: the prior form ``(long_premium - short_premium) * 100 * long.contracts``
+        scaled the SHORT credit by the LONG leg's contract count, so on a RATIO PMCC
+        (long.contracts != short.contracts) the entry basis disagreed with
+        ``mark_pmcc``, which already values each leg by its own contracts
+        (``short_v`` uses ``short_leg.contracts`` at pmcc.py:151). That mismatch biased
+        ``unrealized_pnl = net_value - net_debit()`` by short_credit×(long_contracts -
+        short_contracts) × 100. Per-leg valuation makes the entry basis consistent with
+        the mark; for the common 1:1 PMCC this is byte-identical."""
+        long_cost = self.long_leg.entry_premium * 100 * self.long_leg.contracts
+        short_credit = self.short_leg.entry_premium * 100 * self.short_leg.contracts
+        return long_cost - short_credit
 
     def to_dict(self) -> dict:
         d = asdict(self)

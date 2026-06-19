@@ -108,6 +108,43 @@ def _isolate_portfolio_state_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.fixture(autouse=True)
+def _isolate_quant_home_and_execution_bus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Redirect QUANT_HOME + the executions/signals bus paths to a per-test
+    tmp_path, so a test that writes a fill can NEVER pollute the live
+    ~/.hermes/quant/executions.jsonl (the authoritative ledger, ADR-0085).
+
+    Increment-0 §0.0 / seed ra03. The sibling fixtures already isolate state.db,
+    governance, evidence, and the kill-switch; executions.jsonl / QUANT_HOME were
+    the remaining gap. Two modules define these symbols independently — `tools`
+    and `daemon.signal_bus` (PaperReactor imports the bus path from the latter) —
+    so both roots are patched, mirroring the existing `_patch_executions_path`
+    test helper. Each is patched only if the module imports cleanly.
+    """
+    quant_home = tmp_path / "quant_home"
+    quant_home.mkdir(parents=True, exist_ok=True)
+    exec_bus = quant_home / "executions.jsonl"
+    signal_bus = quant_home / "signals.jsonl"
+    state_db = quant_home / "state.db"
+
+    for mod_name in ("hermes_quant.tools", "hermes_quant.daemon.signal_bus"):
+        try:
+            mod = __import__(mod_name, fromlist=["_"])
+        except ImportError:
+            continue
+        for attr, value in (
+            ("QUANT_HOME", quant_home),
+            ("EXECUTION_BUS_PATH", exec_bus),
+            ("SIGNAL_BUS_PATH", signal_bus),
+            ("STATE_DB_PATH", state_db),
+        ):
+            if hasattr(mod, attr):
+                monkeypatch.setattr(mod, attr, value, raising=True)
+    return quant_home
+
+
+@pytest.fixture(autouse=True)
 def _autouse_dummy_third_party_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """Inject placeholder env vars for every third-party SDK so CI never
     blocks on missing creds — and, more importantly, so the offline unit

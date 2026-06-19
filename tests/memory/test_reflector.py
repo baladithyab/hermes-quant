@@ -197,6 +197,27 @@ def test_stub_text_short_direction_label() -> None:
     assert "short" in text
 
 
+def test_stub_text_short_correct_label() -> None:
+    # reflect_on_close already direction-adjusts alpha_return (line 418-419:
+    # `if direction < 0: raw_return = -raw_return`), so a positive alpha_return
+    # means the trade made money regardless of direction. The stub text label
+    # must therefore be direction-AGNOSTIC, matching _classify_lesson (line 195).
+    # A *profitable* short (alpha_return > 0) must read "correct", not "wrong".
+    text = _stub_reflection_text(-1, "Underweight", 0.05, 5, LessonCategory.unknown)
+    assert "short" in text
+    assert "correct" in text
+    assert "wrong" not in text
+
+
+def test_stub_text_short_wrong_label() -> None:
+    # A *losing* short (alpha_return < 0) must read "wrong", not "correct".
+    text = _stub_reflection_text(-1, "Underweight", -0.05, 1, LessonCategory.thesis_invalidation_at_earnings)
+    assert "short" in text
+    assert "wrong" in text
+    # guard against the substring "wrong" being absent while "correct" sneaks in
+    assert "was correct" not in text
+
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------

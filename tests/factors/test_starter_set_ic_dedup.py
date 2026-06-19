@@ -21,6 +21,7 @@ from hermes_quant.factors.alpha_zoo import (
 from hermes_quant.factors.ic_dedup import ICDedupGate
 from hermes_quant.factors.starter_set import (
     _STARTER_FACTORS,
+    compute_starter_factor_returns,
     register_starter_set,
 )
 
@@ -146,3 +147,67 @@ def test_flag_on_uses_injected_gate(tmp_path, monkeypatch):
     register_starter_set(z, factor_returns=mapping)
     # The mapped factor's returns were registered into the injected gate.
     assert names[0] in gate.library
+
+
+# ---------------------------------------------------------------------------
+# compute_starter_factor_returns — the production-caller input builder (ar23).
+# Produces the {name: returns} mapping the IC-dedup gate consumes at ingest.
+# ---------------------------------------------------------------------------
+
+
+def _ohlcv(n: int = 100, seed: int = 0):
+    import pandas as pd
+
+    idx = pd.date_range("2020-01-01", periods=n, freq="D")
+    rng = np.random.default_rng(seed)
+    close = 100.0 + np.cumsum(rng.normal(size=n))
+    return pd.DataFrame(
+        {
+            "open": close * 0.99,
+            "high": close * 1.01,
+            "low": close * 0.98,
+            "close": close,
+            "volume": rng.integers(1_000_000, 2_000_000, n).astype(float),
+        },
+        index=idx,
+    )
+
+
+def test_compute_starter_factor_returns_keys_by_name_dropna(monkeypatch, tmp_path):
+    """Returns are keyed by factor NAME (the key register_starter_set looks up),
+    each value is a finite (dropna'd) >=2-length series, and computing the probe
+    set does NOT write to the real registry dir."""
+    import hermes_quant.factors.alpha_zoo as az
+
+    monkeypatch.setattr(az, "_DEFAULT_DIR", tmp_path)
+    mapping = compute_starter_factor_returns(_ohlcv())
+    names = {defn["name"] for defn in _STARTER_FACTORS}
+    assert set(mapping).issubset(names)
+    assert len(mapping) >= 1
+    for name, arr in mapping.items():
+        assert name in names
+        assert np.isfinite(arr).all()
+        assert arr.size >= 2
+
+
+def test_compute_then_register_gates_real_duplicate_starters(monkeypatch, tmp_path):
+    """End-to-end of the production wiring on a duplicate starter set: compute
+    returns -> register with the flag ON -> the near-duplicate is rejected."""
+    import hermes_quant.factors.alpha_zoo as az
+    import hermes_quant.factors.starter_set as ss
+
+    monkeypatch.setattr(az, "_DEFAULT_DIR", tmp_path)
+    monkeypatch.setenv("HERMES_QUANT_IC_DEDUP_AT_INGEST", "1")
+    monkeypatch.setattr(
+        ss,
+        "_STARTER_FACTORS",
+        [
+            {"name": "d_a", "description": "x", "source_code": 'bars["close"] - bars["open"]', "tags": []},
+            {"name": "d_b", "description": "x", "source_code": 'bars["close"] - bars["open"] + 1e-12', "tags": []},
+        ],
+    )
+    bars = _ohlcv()
+    mapping = compute_starter_factor_returns(bars)
+    z = AlphaZoo(base_dir=tmp_path)
+    with pytest.raises(RedundantFactorError):
+        register_starter_set(z, factor_returns=mapping)

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Re-exec under the hermes venv if needed.
@@ -25,9 +26,10 @@ _VENV = Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python3"
 if _VENV.exists() and sys.executable != str(_VENV):
     os.execv(str(_VENV), [str(_VENV), __file__, *sys.argv[1:]])
 
-from hermes_quant.catalyst.ingest import ingest_queries
-from hermes_quant.catalyst.propagation import load_graph, log_propagations
-from hermes_quant.catalyst.synthesize import synthesize_packets, write_packets
+from hermes_quant.catalyst.ingest import ingest_queries  # noqa: E402
+from hermes_quant.catalyst.openbb_news import ingest_openbb_news  # noqa: E402
+from hermes_quant.catalyst.propagation import load_graph, log_propagations  # noqa: E402
+from hermes_quant.catalyst.synthesize import synthesize_packets, write_packets  # noqa: E402
 
 # Query set: per-sector sweeps covering the graph's known entities. Extend as the
 # propagation graph grows. when:1d keeps it fresh; the ingester runs frequently.
@@ -99,6 +101,11 @@ def _social_on() -> bool:
     return os.environ.get("HERMES_QUANT_SOCIAL_INGEST", "0") == "1"
 
 
+def _openbb_news_on() -> bool:
+    """DEFAULT-OFF OpenBB news source. OFF => existing RSS/social path."""
+    return os.environ.get("HERMES_QUANT_OPENBB", "0").lower() in {"1", "true", "yes", "on"}
+
+
 def main() -> int:
     json_mode = "--json" in sys.argv
     graph, aliases = load_graph()
@@ -124,6 +131,19 @@ def main() -> int:
         n_social = len(social_items)
         items = items + social_items
 
+    n_openbb = 0
+    openbb_error: str | None = None
+    if _openbb_news_on():
+        try:
+            openbb_items, _latency = ingest_openbb_news(
+                "openbb_world",
+                as_of=datetime.now(tz=UTC),
+            )
+            n_openbb = len(openbb_items)
+            items = items + openbb_items
+        except Exception as exc:  # noqa: BLE001 - producer is non-fatal
+            openbb_error = f"{type(exc).__name__}: {exc}"[:200]
+
     # RR2 (PDR-3 fix): synthesize the WHOLE item set in ONE call. The per-item loop
     # this replaced fed synthesize_packets([it]) one item at a time, so the
     # PDR-3 convergence pass (validate_convergence) ALWAYS saw a 1-item set per
@@ -148,12 +168,16 @@ def main() -> int:
 
     if json_mode:
         import json
-        print(json.dumps({
+        payload = {
             "event": "catalyst_ingest",
             "items": len(items), "packets": n_written,
             "social_items": n_social,
+            "openbb_items": n_openbb,
             "propagations": len(prop_log),
-        }))
+        }
+        if openbb_error:
+            payload["openbb_error"] = openbb_error
+        print(json.dumps(payload))
         return 0
 
     # Tiered human summary (quant cron standard): loud on fires, silent on nothing.
@@ -166,7 +190,12 @@ def main() -> int:
     for p in packets:
         by_sym.setdefault(p.asset, p.stance)
     lead = ", ".join(f"{s} {st}" for s, st in sorted(by_sym.items())[:6])
-    _src = f" ({n_social} social)" if n_social else ""
+    src_parts = []
+    if n_social:
+        src_parts.append(f"{n_social} social")
+    if n_openbb:
+        src_parts.append(f"{n_openbb} openbb")
+    _src = f" ({', '.join(src_parts)})" if src_parts else ""
     print(f"📰 Catalyst Sense: {n_written} packet(s) from {len(items)} items{_src} — {lead}")
     if not os.environ.get("HERMES_QUANT_SEMANTIC_ENABLED", "0") == "1":
         print("   (advisor consumption OFF — packets staged, flip HERMES_QUANT_SEMANTIC_ENABLED=1 to use)")

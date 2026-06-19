@@ -41,13 +41,15 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
 DEFAULT_ACCOUNT = "alpaca-paper"
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 DEFAULT_EXECUTIONS_PATH = QUANT_HOME / "executions.jsonl"
 
 # Kill-flag for debugging only (ADR-0072 ships default-ON).

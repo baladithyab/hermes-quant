@@ -17,9 +17,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 SIGNAL_BUS_PATH = QUANT_HOME / "signals.jsonl"
 EXECUTION_BUS_PATH = QUANT_HOME / "executions.jsonl"
 STATE_DB_PATH = QUANT_HOME / "state.db"
@@ -286,16 +288,25 @@ def quant_recipes(args: dict, **_kwargs) -> str:
 
 
 def _read_pdr_mode() -> str:
-    """Read quant.pdr.mode from ~/.hermes/config.yaml. Defaults to 'advise'.
+    """Read quant.pdr.mode from the active (profile-aware) Hermes config.
 
     Per ADR-0015 §D7: the mode gate is read at every quant_propose call, NOT
     cached, so an operator can edit config + retry without a daemon restart.
+
+    Per ADR-0013 §D4: resolves the SAME profile-aware path the autonomous
+    engine reads (`~/.hermes/profiles/<name>/config.yaml` when HERMES_PROFILE
+    is set, else the global `~/.hermes/config.yaml`). Reading the global file
+    unconditionally would let a stale pre-migration global config override the
+    active profile's mode — a fail-OPEN at the HITL mode gate. Defaults to
+    'advise'.
     """
     try:
         import yaml
     except ImportError:
         return "advise"
-    cfg_path = Path.home() / ".hermes" / "config.yaml"
+    from hermes_quant.watchlist import get_config_path
+
+    cfg_path = get_config_path()
     if not cfg_path.exists():
         return "advise"
     try:
@@ -308,12 +319,17 @@ def _read_pdr_mode() -> str:
 
 
 def _read_learn_from_rejections() -> bool:
-    """quant.calibration.learn_from_rejections (default True per ADR-0015 §D8)."""
+    """quant.calibration.learn_from_rejections (default True per ADR-0015 §D8).
+
+    Profile-aware per ADR-0013 §D4 — same active-config path as _read_pdr_mode.
+    """
     try:
         import yaml
     except ImportError:
         return True
-    cfg_path = Path.home() / ".hermes" / "config.yaml"
+    from hermes_quant.watchlist import get_config_path
+
+    cfg_path = get_config_path()
     if not cfg_path.exists():
         return True
     try:
@@ -330,7 +346,9 @@ def _hitl_mode_mismatch_response(tool_name: str, mode: str) -> str:
             "success": False,
             "error": "mode_mismatch",
             "message": f"{tool_name} requires quant.pdr.mode=hitl; "
-            f"current mode={mode!r}. Set in ~/.hermes/config.yaml.",
+            f"current mode={mode!r}. Set in the active Hermes config "
+            f"(~/.hermes/profiles/<HERMES_PROFILE>/config.yaml when a profile "
+            f"is active, else ~/.hermes/config.yaml).",
             "current_mode": mode,
         }
     )
@@ -349,7 +367,24 @@ def _json_safe_float(value: Any) -> float | str:
 # ---------------------------------------------------------------------------
 
 
-_MULTI_LEG_STRATEGIES = {"covered_call", "cash_secured_put", "wheel"}
+_MULTI_LEG_STRATEGIES = {
+    "covered_call",
+    "cash_secured_put",
+    "wheel",
+    "bull_put_spread",
+    "bear_call_spread",
+    "iron_condor",  # ADR-0098 Step 5 (neutral 4-leg defined-risk credit condor)
+}
+
+# ADR-0098 Steps 2-3 (bull_put_spread / bear_call_spread): defined-risk credit vertical
+# strategies. Gated by HERMES_QUANT_VERTICAL_SPREADS=1 in the selection seam; the
+# producer and tools path accept them when HERMES_QUANT_OPTIONS_GATE=1 (the universal gate).
+_VERTICAL_SPREAD_STRATEGIES = {"bull_put_spread", "bear_call_spread"}
+
+# ADR-0098 Step 5 (iron_condor): the neutral defined-risk credit condor. Gated by its
+# OWN flag HERMES_QUANT_IRON_CONDOR=1 (independent of the verticals' flag); the producer
+# and tools path build it only when HERMES_QUANT_OPTIONS_GATE=1 (the universal gate).
+_IRON_CONDOR_STRATEGIES = {"iron_condor"}
 
 
 def _maybe_propose_multi_leg(symbol: str, args: dict) -> str | None:
@@ -383,11 +418,30 @@ def _maybe_propose_multi_leg(symbol: str, args: dict) -> str | None:
             }
         )
 
+    # ADR-0098 Step 2: vertical spreads (bull_put_spread) require an additional flag.
+    # DEFAULT-OFF: without HERMES_QUANT_VERTICAL_SPREADS=1 the strategy_kind check
+    # below routes the caller to the equity path (byte-identical to today).
+    if (
+        strategy_kind in _VERTICAL_SPREAD_STRATEGIES
+        and os.environ.get("HERMES_QUANT_VERTICAL_SPREADS", "0") != "1"
+    ):
+        return None  # flag OFF -> equity path; byte-identical.
+
+    # ADR-0098 Step 5: the iron condor requires its OWN flag (independent of the
+    # verticals' flag). DEFAULT-OFF: without HERMES_QUANT_IRON_CONDOR=1 the caller
+    # routes to the equity path (byte-identical to today).
+    if (
+        strategy_kind in _IRON_CONDOR_STRATEGIES
+        and os.environ.get("HERMES_QUANT_IRON_CONDOR", "0") != "1"
+    ):
+        return None  # flag OFF -> equity path; byte-identical.
+
     try:
         from hermes_quant.options.data import ChainSnapshotReader
         from hermes_quant.options.recipes import (
             RecipeBuildError,
             build_and_persist_multi_leg,
+            build_bull_put_spread_proposal,
         )
         from hermes_quant.proposals import get_default_store
         from hermes_quant.risk.options_gate import OptionsGateDisabled
@@ -444,17 +498,53 @@ def _maybe_propose_multi_leg(symbol: str, args: dict) -> str | None:
 
     store = get_default_store()
     try:
-        result, record = build_and_persist_multi_leg(
-            store=store,
-            symbol=symbol,
-            asof=asof,
-            strategy_kind=strategy_kind,  # type: ignore[arg-type]
-            nav=nav,
-            options_buying_power=options_buying_power,
-            held_shares=held_shares,
-            reader=reader,
-            ttl_minutes=int(args.get("ttl_minutes", 15)),
-        )
+        if strategy_kind in ("bull_put_spread", "bear_call_spread", "iron_condor"):
+            # ADR-0098 Steps 2-3 (verticals) + Step 5 (iron condor): route to the
+            # dedicated defined-risk credit producers instead of the CC/CSP/wheel
+            # build_and_persist path. The producers already require
+            # HERMES_QUANT_OPTIONS_GATE=1 (via options_gate). We build + persist
+            # manually here (same pattern as build_and_persist_multi_leg).
+            from hermes_quant.options.recipes import (
+                _default_advisor_result,
+                _result_to_gate,
+                build_bear_call_spread_proposal,
+                build_iron_condor_proposal,
+            )
+            _build_fn = {
+                "bull_put_spread": build_bull_put_spread_proposal,
+                "bear_call_spread": build_bear_call_spread_proposal,
+                "iron_condor": build_iron_condor_proposal,
+            }[strategy_kind]
+            bps_result = _build_fn(
+                symbol=symbol,
+                asof=asof,
+                nav=nav,
+                options_buying_power=options_buying_power,
+                reader=reader,
+            )
+            if bps_result.proposal is None:
+                result, record = bps_result, None
+            else:
+                _advisor = _default_advisor_result(bps_result)
+                _record = store.propose_multi_leg(
+                    proposal=bps_result.proposal,
+                    gate_result=_result_to_gate(bps_result),
+                    advisor_result=_advisor,
+                    ttl_minutes=int(args.get("ttl_minutes", 15)),
+                )
+                result, record = bps_result, _record
+        else:
+            result, record = build_and_persist_multi_leg(
+                store=store,
+                symbol=symbol,
+                asof=asof,
+                strategy_kind=strategy_kind,  # type: ignore[arg-type]
+                nav=nav,
+                options_buying_power=options_buying_power,
+                held_shares=held_shares,
+                reader=reader,
+                ttl_minutes=int(args.get("ttl_minutes", 15)),
+            )
     except OptionsGateDisabled:
         return json.dumps(
             {
@@ -718,11 +808,60 @@ def quant_approve(args: dict, **_kwargs) -> str:
             }
         )
 
-    # Fire the reactor BEFORE state advance — if React fails, the proposal stays
-    # pending and the operator can retry. select_reactor() dispatches on proposal
-    # kind: equity -> PaperReactor, multi-leg -> MultiLegPaperReactor (default-OFF;
-    # a MultiLegReactorDisabled raise leaves the proposal pending and surfaces the
-    # error — never a silent equity fill). HITL/CLI-only money seam.
+    # ar16 — ATOMICALLY claim the proposal out of `pending` BEFORE the fire.
+    # This closes the TOCTOU double-fire window: the old flow read state ==
+    # 'pending' here, fired the reactor, THEN advanced state — so two concurrent
+    # approves of the same proposal_id both passed the read-state gate and both
+    # fired (the reactor stamps a fresh asof_execution per call -> distinct
+    # idempotency keys -> two recorded fills -> capital moved twice). The claim
+    # is a single BEGIN IMMEDIATE compare-and-set (UPDATE ... WHERE state =
+    # 'pending'); exactly ONE caller wins and reaches the fire. A loser raises
+    # ProposalStateError and NEVER fires. Safe-money polarity: the proposal is
+    # left CLAIMED (approved) before the fire — if React then fails, a claimed-
+    # but-unfired proposal that needs operator re-approval is strictly safer
+    # than a double-fire; the execution is attached afterward via
+    # store.record_execution.
+    try:
+        store.claim_for_approval(
+            proposal_id,
+            approver_user_id=_kwargs.get("user_id"),
+            size_override_pct=size_override,
+        )
+    except ProposalExpiredError as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "state_mismatch",
+                "message": str(exc),
+                "proposal_id": proposal_id,
+            }
+        )
+    except ProposalStateError as exc:
+        # Lost the atomic claim (a concurrent approve already won, or the
+        # proposal is no longer pending). Do NOT fire.
+        return json.dumps(
+            {
+                "success": False,
+                "error": "state_mismatch",
+                "message": str(exc),
+                "proposal_id": proposal_id,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"claim failed: {exc}",
+                "proposal_id": proposal_id,
+            }
+        )
+
+    # Fire the reactor AFTER the atomic claim. The proposal is already advanced
+    # out of `pending`, so a re-entrant/concurrent approve cannot fire it again.
+    # select_reactor() dispatches on proposal kind: equity -> PaperReactor,
+    # multi-leg -> MultiLegPaperReactor (default-OFF; a MultiLegReactorDisabled
+    # raise surfaces the error — never a silent equity fill). HITL/CLI-only
+    # money seam.
     reactor = select_reactor(proposal)
     try:
         execution = reactor.execute(
@@ -733,6 +872,10 @@ def quant_approve(args: dict, **_kwargs) -> str:
         )
     except FillSizeInvariantError as exc:
         logger.warning("quant_approve: fill-size invariant rejected %s: %s", proposal_id, exc)
+        # PROVEN no-capital refusal: the reactor raised before any fill landed
+        # on the bus. Roll the ar16 claim back to `pending` so the operator can
+        # revise + retry, exactly as the pre-ar16 flow did. No money moved.
+        store.release_claim(proposal_id)
         return json.dumps(
             {
                 "success": False,
@@ -747,28 +890,37 @@ def quant_approve(args: dict, **_kwargs) -> str:
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("quant_approve: PaperReactor failed: %s", exc, exc_info=True)
+        # The reactor raised. We cannot prove a fill did NOT land, so we keep
+        # the safe-money polarity from the ar16 brief: leave the proposal
+        # CLAIMED (approved) rather than re-pend it — re-pending could let a
+        # second approve re-fire on top of a partial/ambiguous first fire
+        # (double-fire). A claimed-but-maybe-unfired proposal that needs
+        # operator attention is the safe direction. The settlement loop
+        # reconciles via signal_id.
         return json.dumps(
             {
                 "success": False,
                 "error": f"react failed: {exc}",
                 "proposal_id": proposal_id,
+                "state": "approved",
             }
         )
 
     # ADR-0077/0079 admissibility: if the reactor refused the short pre-trade
-    # (a 0-fill no-bus record flagged in reactor_metadata), do NOT advance the
-    # proposal to `approved` and do NOT report success — that would mark a
-    # broker-refused order as a successful approval (operator-facing dishonesty,
-    # found in the Wave-S review). Keep the proposal PENDING and surface the
-    # rejection at the top level so the audit trail is truthful. No capital moved.
+    # (a 0-fill no-bus record flagged in reactor_metadata), do NOT report
+    # success — that would mark a broker-refused order as a successful approval
+    # (operator-facing dishonesty, found in the Wave-S review). This is a PROVEN
+    # no-capital refusal (0-fill, no bus record), so roll the ar16 claim back to
+    # `pending` and surface the rejection — the operator may revise or reject.
     _rmeta = getattr(execution, "reactor_metadata", None) or {}
     if _rmeta.get("admissibility_rejected"):
+        store.release_claim(proposal_id)
         return json.dumps(
             {
                 "success": False,
                 "error": "admissibility_rejected",
                 "proposal_id": proposal_id,
-                "state": "pending",  # NOT advanced — operator may revise or reject
+                "state": "pending",  # rolled back — operator may revise or reject
                 "admissibility_state": _rmeta.get("admissibility_state"),
                 "admissibility_reason": _rmeta.get("admissibility_reason"),
                 "requested_fill_size_pct": fill_size_pct,
@@ -776,6 +928,86 @@ def quant_approve(args: dict, **_kwargs) -> str:
                     "Pre-trade admissibility REJECTED this short (e.g. not "
                     "easy-to-borrow / missing account context); no paper fill was "
                     "placed and the proposal remains pending."
+                ),
+            },
+            default=str,
+        )
+
+    # cs02 cap-silence parity: when the reactor's portfolio-cap clip SILENCED the
+    # fill (0-fill, no bus write, reactor_metadata.silenced=True), mirror the
+    # admissibility branch above — do NOT advance the proposal to `approved` and do
+    # NOT report success with the ORIGINAL requested size (that marks a cap-refused
+    # order as a successful approval and consumes the proposal so it cannot be
+    # re-approved when headroom frees). Keep it PENDING and report realized 0.0.
+    # ar16: this is a PROVEN no-capital outcome (0-fill, no bus write), so roll the
+    # atomic claim back to `pending` — the store state must match the reported
+    # state="pending" (the claim advanced it to `approved` BEFORE the fire).
+    if _rmeta.get("silenced"):
+        store.release_claim(proposal_id)
+        return json.dumps(
+            {
+                "success": False,
+                "error": "portfolio_cap_silenced",
+                "proposal_id": proposal_id,
+                "state": "pending",  # NOT advanced — re-approvable when headroom frees
+                "silence_reason": _rmeta.get("silence_reason"),
+                "requested_fill_size_pct": _json_safe_float(fill_size_pct),
+                "realized_fill_size_pct": _json_safe_float(
+                    getattr(execution, "fill_size_pct", 0.0)
+                ),
+                "message": (
+                    "Portfolio-cap clip SILENCED this fill (no headroom / over a "
+                    "portfolio cap); no capital moved, nothing was written to the "
+                    "bus, and the proposal remains pending so it can be re-approved "
+                    "when headroom frees."
+                ),
+            },
+            default=str,
+        )
+
+    # ar27: broker / backend NO-FILL parity (cs02/ar16 family). The DEFAULT
+    # PaperReactor stamps silenced=True on a no-fill (caught above), but the
+    # flag-gated reactors signal a no-fill DIFFERENTLY and carry NO `silenced`:
+    #   * DeterministicEquityReactor -> reactor_metadata.no_fill=True (+bp_rejected /
+    #     backend_unavailable) when buying power refuses the order (deterministic_equity.py:496)
+    #   * MultiLegPaperReactor._write_nofill_parent -> no_fill=True on a broker
+    #     non-fill terminal (multileg.py:924)
+    #   * AlpacaPaperReactor -> reactor_metadata.unfilled_timeout=True when the live
+    #     paper order does not fill within the poll window (alpaca_paper.py:215)
+    # None match the two guards above, so pre-ar27 they fell through to
+    # record_execution -> state=approved -> success:True echoing the REQUESTED size
+    # for a fill that NEVER happened (operator-facing dishonesty, Wave-S class), AND
+    # the pending proposal was irrecoverably consumed (could not be re-approved when
+    # BP freed). A no-fill is a PROVEN no-capital outcome (fill_size_pct=0, nothing on
+    # the bus), so roll the ar16 claim back to pending and report the rejection.
+    _nofill = (
+        _rmeta.get("no_fill") is True
+        or _rmeta.get("unfilled_timeout") is True
+        or _rmeta.get("bp_rejected") is True
+    )
+    if _nofill:
+        store.release_claim(proposal_id)
+        _reason = (
+            _rmeta.get("no_fill_reason")
+            or _rmeta.get("broker_status")
+            or ("unfilled_timeout" if _rmeta.get("unfilled_timeout") else "no_fill")
+        )
+        return json.dumps(
+            {
+                "success": False,
+                "error": "no_fill",
+                "proposal_id": proposal_id,
+                "state": "pending",  # NOT advanced — re-approvable when conditions change
+                "no_fill_reason": _reason,
+                "requested_fill_size_pct": _json_safe_float(fill_size_pct),
+                "realized_fill_size_pct": _json_safe_float(
+                    getattr(execution, "fill_size_pct", 0.0)
+                ),
+                "message": (
+                    "The reactor did NOT fill this order (e.g. buying-power refusal, "
+                    "broker non-fill, or unfilled-timeout); no capital moved and the "
+                    "proposal remains pending so it can be re-approved when conditions "
+                    "change. This is NOT a successful approval."
                 ),
             },
             default=str,
@@ -797,16 +1029,17 @@ def quant_approve(args: dict, **_kwargs) -> str:
     except Exception as _shadow_exc:  # noqa: BLE001 — shadow must never break approve
         logger.warning("quant_approve: shadow hook failed (non-blocking): %s", _shadow_exc)
 
-    # Now advance state machine. If this fails, we have a paper exec on the
-    # bus without a corresponding approved proposal — we surface a warning
-    # and keep going. The settlement loop reconciles via signal_id.
+    # ar16: state already advanced to `approved` by the atomic claim BEFORE the
+    # fire. Now attach the execution record onto the claimed proposal so the
+    # audit trail carries the fill. The state transition is done; this is a
+    # field-only update (no re-gate on state). If it fails, the fill is already
+    # on the bus and the proposal is already approved; the settlement loop
+    # reconciles via signal_id — surface a warning and keep going.
     try:
         from hermes_quant.react.paper import _record_to_dict
 
-        approved = store.approve(
+        approved = store.record_execution(
             proposal_id,
-            approver_user_id=_kwargs.get("user_id"),
-            size_override_pct=size_override,
             execution=_record_to_dict(execution),
         )
     except (ProposalExpiredError, ProposalStateError) as exc:
@@ -834,13 +1067,40 @@ def quant_approve(args: dict, **_kwargs) -> str:
             exc_info=True,
         )
 
+    # cs02 reporting-honesty: report the REALIZED fill, not the operator's
+    # REQUESTED size. Two live paths reach this success return with a nonzero
+    # PARTIAL fill (realized < requested) that is NOT a full silence and NOT a
+    # no-fill:
+    #   (1) PaperReactor + HERMES_QUANT_PORTFOLIO_CAPS=1 "partial scale" —
+    #       _portfolio_cap_clip clips fill_size_pct down and the reactor books a
+    #       REAL fill at record.fill_size_pct = clipped (paper.py partial-scale
+    #       branch), with cap_metadata carrying cap_scaled_from/to/factor.
+    #   (2) AlpacaPaperReactor on a done_for_day/canceled order with a realized
+    #       partial — record.fill_size_pct = realized_fill_pct (< requested) with
+    #       reactor_metadata alpaca_status/filled_qty/requested_target_pct
+    #       (alpaca_paper.py partial path).
+    # The local `fill_size_pct` here is the operator's REQUESTED size; echoing it
+    # as the prominent `fill_size_pct` OVERSTATES the realized size to the operator
+    # (operator-facing dishonesty, cs02 family). Surface both: keep the back-compat
+    # `fill_size_pct` key but set it to the REALIZED value so the prominent field
+    # is truthful, and add explicit requested/realized fields. A partial IS a
+    # successful approval — no state-machine change (state stays approved).
+    realized_fill_size_pct = getattr(execution, "fill_size_pct", fill_size_pct)
+    partial_fill = (
+        isinstance(realized_fill_size_pct, (int, float))
+        and abs(float(realized_fill_size_pct)) < abs(float(fill_size_pct)) - 1e-9
+    )
     return json.dumps(
         {
             "success": True,
             "proposal_id": proposal_id,
             "state": approved.state,
             "execution": _record_to_dict(execution),
-            "fill_size_pct": fill_size_pct,
+            # Back-compat key, now truthful: REALIZED (clipped/partial) fill.
+            "fill_size_pct": _json_safe_float(realized_fill_size_pct),
+            "requested_fill_size_pct": _json_safe_float(fill_size_pct),
+            "realized_fill_size_pct": _json_safe_float(realized_fill_size_pct),
+            "partial_fill": partial_fill,
         },
         default=str,
     )
@@ -1793,6 +2053,7 @@ def quant_insider(args: dict, **_kwargs) -> str:
     since_raw = args.get("since")
     if since_raw:
         try:
+            from datetime import UTC as _UTC
             from datetime import datetime as _dt
 
             since = _dt.fromisoformat(str(since_raw))
@@ -1800,6 +2061,12 @@ def quant_insider(args: dict, **_kwargs) -> str:
             return json.dumps(
                 {"success": False, "error": f"unparseable since timestamp: {since_raw!r}"}
             )
+        # A bare ISO date (e.g. "2025-01-01") or a no-offset datetime yields a
+        # NAIVE datetime. filed_at in parse_submissions is tz-aware UTC, so a
+        # naive `since` would raise TypeError on the `filed_at < since` compare
+        # and drop EVERY filing behind an opaque error. Anchor naive input to UTC.
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=_UTC)
     do_store = bool(args.get("store", False))
 
     try:

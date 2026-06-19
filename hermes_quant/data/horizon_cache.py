@@ -31,6 +31,8 @@ from typing import Any
 
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -59,7 +61,7 @@ _HORIZON_LOOKBACK_YEARS: dict[str, int] = {
 _OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 # Cache root: ~/.hermes/quant/cache/horizon-history
-_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache" / "horizon-history"
+_CACHE_ROOT = _resolve_quant_home() / "cache" / "horizon-history"
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +240,12 @@ def get_resampled_history(
         try:
             daily = provider.fetch_bars(symbol, "1d", start, end, as_of=asof_ts)
         except TypeError as exc:
-            # Older provider without as_of kwarg
-            if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+            # ar108: require BOTH the bad-signature shape AND the literal `as_of`
+            # token so only a genuine no-as_of legacy provider degrades — the old
+            # `or "unexpected keyword"` swallowed an unrelated TypeError and dropped
+            # the no-lookahead as_of bound (fail-OPEN).
+            _msg = str(exc)
+            if "as_of" in _msg and ("unexpected keyword" in _msg or "got multiple values" in _msg):
                 try:
                     daily = provider.fetch_bars(symbol, "1d", start, end)
                 except Exception as exc2:  # noqa: BLE001
@@ -270,9 +276,37 @@ def get_resampled_history(
 
         _save_to_cache(symbol, asof_date_str, daily)
 
+    # cs05 no-lookahead clip: clip the daily frame to bars at/under the decision
+    # asof BEFORE resampling. This is load-bearing on BOTH paths: (1) the cache
+    # is keyed only by calendar date, so a hit can return a frame populated later
+    # in the day (or by a provider that ignored as_of) containing bars past asof;
+    # (2) resampling an unclipped frame aggregates a partial weekly/monthly/
+    # quarterly bucket whose period-end label is after asof into a
+    # completed-looking bar that contains future daily bars. Clipping the daily
+    # INPUT means partial future buckets never form and the intraday-hit leak is
+    # removed in one place, keeping resample_to_horizon a pure transform.
+    # Rail: asof = publication time always (no look-ahead).
+    if daily is not None and len(daily) > 0:
+        ts = pd.to_datetime(daily["timestamp"], utc=True)
+        daily = daily.loc[ts <= asof_ts]
+        if len(daily) == 0:
+            return pd.DataFrame(columns=_OHLCV_COLUMNS)
+
     # Resample to the target horizon (1d is a passthrough copy)
     try:
-        return resample_to_horizon(daily, timeframe)
+        resampled = resample_to_horizon(daily, timeframe)
+        # cs05 no-lookahead clip (part 2): resample labels each bucket by its
+        # period-END (e.g. W-FRI), so a Mon-Wed partial week clipped correctly at
+        # the daily level still emits a bar labelled the coming Friday — a
+        # STILL-FORMING bucket presented as a completed bar. Drop any bucket whose
+        # period-end label is after asof: a partial week/month/quarter is not a
+        # realized bar (silence-by-default — better no data point than an
+        # incomplete one mislabelled complete). 1d is a passthrough already clipped
+        # above, so this is a no-op there.
+        if len(resampled) > 0:
+            rts = pd.to_datetime(resampled["timestamp"], utc=True)
+            resampled = resampled.loc[rts <= asof_ts].reset_index(drop=True)
+        return resampled
     except ValueError:
         # Unknown horizon — surface to caller
         raise

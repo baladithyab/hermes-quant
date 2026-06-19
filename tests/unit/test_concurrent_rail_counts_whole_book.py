@@ -1,0 +1,185 @@
+"""cs16 — the ADR-0016 §D9 max_concurrent_positions hard rail must count the WHOLE
+open equity book, not just the paper-only slice.
+
+THE BUG (orchestrator-confirmed on the live bus ~/.hermes/quant/executions.jsonl):
+    hermes_quant/autonomous.py:513 counted the open book for the D9 hard rail via
+    a BARE `reconstruct_portfolio_state(QUANT_HOME / "executions.jsonl").positions`,
+    and the portfolio-caps gate at :538 via a BARE `reconstruct_portfolio_state()`.
+    reconstruct_portfolio_state DEFAULTS reactor_filter="paper" (portfolio/state.py:40).
+    But select_reactor (react/dispatch.py) routes equity fills to reactor_name
+    "deterministic-equity" (HERMES_QUANT_DETERMINISTIC_EQUITY=1) and "alpaca_paper"
+    (HERMES_QUANT_ALPACA_PAPER=1), both armed live. So the rail counted 1 where the
+    true open book was 3 — it could open MORE than max_concurrent_positions.
+
+This is a SAFETY RAIL. The conservative direction is fail-CLOSED: counting MORE
+open positions (blocking more fires) is safe; counting FEWER (admitting more) is the
+bug. The fix moves the rail to count the TRUE open book (reactor_filter=None at both
+call sites), never below it.
+
+Same class as cr00/cr01: a det-equity migration shipped + armed, but the safety-rail
+consumer was not updated.
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+from pathlib import Path
+
+from hermes_quant import autonomous as auto
+from hermes_quant.portfolio.state import reconstruct_portfolio_state
+
+
+def _write_jsonl(path: Path, records: list[dict]) -> None:
+    """JSONL builder — same shape as tests/unit/test_portfolio_state.py."""
+    path.write_text(
+        "\n".join(json.dumps(r, separators=(",", ":")) for r in records) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _three_reactor_open_book(path: Path) -> None:
+    """A mixed-reactor bus with THREE distinct OPEN (non-zero) equity positions,
+    one under each reactor_name the live router can emit:
+        BA   under "paper"
+        T    under "alpaca_paper"
+        AAPL under "deterministic-equity"
+    """
+    _write_jsonl(
+        path,
+        [
+            {
+                "asset": "BA",
+                "asof_execution": "2026-06-13T17:00:00Z",
+                "target_position_pct": 0.20,
+                "reactor_name": "paper",
+            },
+            {
+                "asset": "T",
+                "asof_execution": "2026-06-13T17:00:01Z",
+                "target_position_pct": 0.15,
+                "reactor_name": "alpaca_paper",
+            },
+            {
+                "asset": "AAPL",
+                "asof_execution": "2026-06-13T17:00:02Z",
+                "target_position_pct": -0.10,
+                "reactor_name": "deterministic-equity",
+            },
+        ],
+    )
+
+
+def test_default_filter_is_paper_book_family(tmp_path: Path) -> None:
+    """ar97 UPDATE: the default 'paper' filter is now the paper-BOOK FAMILY.
+
+    cs16 (the original premise of this test) moved the D9 rail to reactor_filter=None
+    so it counts the WHOLE book — that fix is intact (see test_d9_rail_counts_all_
+    reactor_names). ar97 ADDITIONALLY corrected the DEFAULT 'paper' filter itself: it
+    now matches the paper-default book FAMILY {paper, deterministic-equity} (both write
+    account_id=paper-default), not the bare literal "paper". So the default sees BA
+    (paper) + AAPL (deterministic-equity) = the true paper-default book; the SEPARATE
+    alpaca_paper shadow partition (T, account_id=alpaca-paper) stays excluded. This
+    closes the latent undercount for any caller relying on the default, while
+    reactor_filter=None still counts the entire cross-account book.
+    """
+    p = tmp_path / "executions.jsonl"
+    _three_reactor_open_book(p)
+
+    # Default filter (reactor_filter="paper") — ar97: the paper-default book FAMILY
+    # {paper, deterministic-equity}. BA (paper) + AAPL (det-equity); alpaca_paper (T)
+    # is a separate shadow partition and stays excluded.
+    paper_only = reconstruct_portfolio_state(p)
+    assert set(paper_only.positions) == {"BA", "AAPL"}, (
+        "ar97: default reactor_filter='paper' is the paper-BOOK FAMILY "
+        "{paper, deterministic-equity}; alpaca_paper stays excluded"
+    )
+    assert "T" not in paper_only.positions, "alpaca_paper shadow must NOT enter the paper-book view"
+
+    # Whole equity book — what the safety rail MUST count (reactor_filter=None).
+    whole_book = reconstruct_portfolio_state(p, reactor_filter=None)
+    assert set(whole_book.positions) == {"BA", "T", "AAPL"}, (
+        "reactor_filter=None must count the WHOLE open equity book across all "
+        "reactor_names (paper + alpaca_paper + deterministic-equity)"
+    )
+    assert len(whole_book.positions) == 3
+
+
+def test_whole_book_no_double_count(tmp_path: Path) -> None:
+    """Guards the over-count concern: asset-keying in reconstruct_portfolio_state
+    already collapses any single symbol to ONE row, so a symbol written under two
+    reactor names (e.g. an older paper fill superseded by a newer det-equity fill)
+    appears exactly once at the LATEST target — no over-count, no de-dup needed.
+    """
+    p = tmp_path / "executions.jsonl"
+    _write_jsonl(
+        p,
+        [
+            # Older paper fill on AAPL ...
+            {
+                "asset": "AAPL",
+                "asof_execution": "2026-06-13T17:00:00Z",
+                "target_position_pct": 0.10,
+                "reactor_name": "paper",
+            },
+            # ... superseded by a newer deterministic-equity fill on the SAME symbol.
+            {
+                "asset": "AAPL",
+                "asof_execution": "2026-06-13T18:00:00Z",
+                "target_position_pct": 0.05,
+                "reactor_name": "deterministic-equity",
+            },
+        ],
+    )
+
+    whole_book = reconstruct_portfolio_state(p, reactor_filter=None)
+    # Exactly ONE AAPL row (not two), at the LATEST target (0.05) — the rail cannot
+    # over-count a single logical position written under two reactor names.
+    assert set(whole_book.positions) == {"AAPL"}
+    assert len(whole_book.positions) == 1
+    assert abs(whole_book.positions["AAPL"] - 0.05) < 1e-9
+
+
+def test_d9_rail_counts_all_reactor_names(tmp_path, monkeypatch) -> None:
+    """The source-bound RED->GREEN guard.
+
+    The D9 COUNT rail must pass reactor_filter=None (count the WHOLE open book — a
+    cardinality rail over-counts safely). The portfolio-caps HEADROOM path must ALSO
+    pass reactor_filter=None BUT scoped to account="paper-default" (ar114): headroom
+    sums GROSS, and reconstruct_portfolio_state collapses each asset to its latest-asof
+    target without summing across books, so an unscoped pool lets a small, late
+    alpaca-shadow target REPLACE a larger real position -> under-count -> over-trade
+    (fail-open). The behavioral wiring proof lives in
+    tests/integration/test_autonomous_headroom_account_scope_ar114.py (a call spy); this
+    arm just pins the two distinct rail SHAPES in source. Whitespace is normalized so
+    the multi-line ar114 call still matches (ar11: keep source-text guards de-brittled).
+    """
+    src = inspect.getsource(auto.tick)
+    norm = " ".join(src.split())  # collapse newlines/indent so multi-line calls match
+
+    # The D9 hard-rail count path (QUANT_HOME bus, explicit path) — whole book.
+    assert "reactor_filter=None).positions" in src, (
+        "the D9 max_concurrent_positions count path in autonomous.tick must pass "
+        "reactor_filter=None so it counts the WHOLE open equity book"
+    )
+    # The portfolio-caps HEADROOM path — whole book by reactor, but account-scoped to
+    # the paper-default book the cap governs (ar114 fail-open fix).
+    assert 'reactor_filter=None, account="paper-default"' in norm, (
+        "ar114: the portfolio-caps headroom path in autonomous.tick must pass "
+        'reactor_filter=None, account="paper-default" so gross is summed over the real '
+        "paper-default book, not a cross-account pool that under-counts via latest-wins"
+    )
+    # And the buggy bare-default forms must be GONE from both rail call sites.
+    assert 'QUANT_HOME / "executions.jsonl").positions' not in src, (
+        "the bare default-filter D9 count must be removed (it undercounts the book)"
+    )
+
+    # Behavioral arm: monkeypatch QUANT_HOME to a tmp bus and assert the rail's exact
+    # expression counts all 3 reactor-name positions.
+    monkeypatch.setattr(auto, "QUANT_HOME", tmp_path)
+    _three_reactor_open_book(tmp_path / "executions.jsonl")
+    open_book = reconstruct_portfolio_state(
+        auto.QUANT_HOME / "executions.jsonl", reactor_filter=None
+    ).positions
+    assert len(open_book) == 3
+    assert set(open_book) == {"BA", "T", "AAPL"}

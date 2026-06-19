@@ -37,16 +37,25 @@ this script's reason for existence), ADR-0029 (multi-leg reactor — pending).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import json
 import logging
 import math
 import os
+import re
 import sys
 import traceback
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+try:  # fcntl is POSIX-only; degrade to a no-op lock on platforms without it.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    _fcntl = None
 
 # Silence noisy third-party loggers up front (yfinance/curl_cffi/urllib3 emit
 # stderr noise that's not actionable from cron POV).
@@ -80,6 +89,12 @@ PER_FIRE_NOTIONAL_FLOOR_USD = 100.0
 GAP_ATR_MULTIPLIER = 1.5
 EARNINGS_LOCKOUT_DAYS = 5  # silence if days_until_earnings < 5
 PLAYBOOK_AGGREGATE_CAP_ENV = "HERMES_QUANT_PLAYBOOK_AGGREGATE_CAP"
+# Canonical paper-account partition in state.db (matches the live producer's
+# default sentinel — react/paper.py + state/portfolio_state.py both default to
+# "paper-default" when no top-level/reactor account_id is present). The playbook
+# fires land on this same Alpaca paper account, so the aggregate cap reads the
+# real open book from this partition.
+PAPER_ACCOUNT_ID = "paper-default"
 
 # ---------- utilities ----------
 def utcnow_iso() -> str:
@@ -102,6 +117,75 @@ def append_journal(record: dict[str, Any]) -> None:
             os.fsync(f.fileno())
     except OSError as e:
         sys.stderr.write(f"playbook-tick journal write failed: {e}\n")
+
+
+# ---------- cross-process fire idempotency (ADR-0078 tick-lock parity) ----------
+def build_client_order_id(today_et: str, symbol: str, play: str) -> str:
+    """Deterministic client_order_id for a (date_et, symbol, play) logical fire.
+
+    The playbook raw-Alpaca fire path does NOT route through the paper-reactor
+    seam and so never acquires the per-symbol tick-lock that the reactor path
+    holds. Two concurrent armed runs (CRON-REGISTRY job #6 daily --armed + job
+    #10 hourly autonomous+armed, or an operator manual --armed run overlapping
+    the cron) can both read an identical `fired_set` lacking the not-yet-
+    journaled (symbol, play) and both POST. A *deterministic* client_order_id
+    makes the broker reject the duplicate: Alpaca enforces client_order_id
+    uniqueness per account, so the second POST of the same logical signal
+    fails server-side even under a fully lockless race.
+
+    Format: hq-playbook-<date>-<SYMBOL>-<play>, slugified to the broker-safe
+    charset and clamped to <=128 chars (Alpaca's client_order_id limit).
+    """
+    raw = f"hq-playbook-{today_et}-{symbol}-{play}"
+    slug = re.sub(r"[^A-Za-z0-9._-]", "-", raw)
+    return slug[:128]
+
+
+@contextlib.contextmanager
+def fire_lock(symbol: str, play: str, *, blocking: bool = True) -> Iterator[bool]:
+    """Per-(symbol, play) advisory flock that serializes the read->POST->journal
+    fire sequence across processes — the same intra-host coordination
+    react/paper.py's symbol_tick_lock provides for the reactor path.
+
+    Mirrors the repo's fcntl idiom (daemon/signal_bus.append_locked,
+    daemon/lock.DaemonLock): open O_RDWR|O_CREAT without O_TRUNC, flock LOCK_EX.
+
+    Yields True if the lock was acquired (caller may proceed), False if it was
+    contended under non-blocking mode (caller must treat as "another run owns
+    this fire" and skip). Fail-open-SAFE: if fcntl is unavailable on the
+    platform, yields True (no worse than the prior lockless behavior, and the
+    deterministic client_order_id still closes the broker-level double-order).
+    """
+    if _fcntl is None:  # pragma: no cover - non-POSIX fallback
+        yield True
+        return
+
+    # Derive the lock dir from PLAYBOOK_DIR at call time (not a frozen module
+    # constant) so the test fixtures' rebind of PLAYBOOK_DIR is honored and
+    # lock files stay inside the isolated fake-home.
+    fire_lock_dir = PLAYBOOK_DIR / "fire-locks"
+    fire_lock_dir.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^A-Za-z0-9._-]", "-", f"{symbol}-{play}")[:120]
+    lock_path = fire_lock_dir / f"{slug}.lock"
+    flags = _fcntl.LOCK_EX | (0 if blocking else _fcntl.LOCK_NB)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    acquired = False
+    try:
+        try:
+            _fcntl.flock(fd, flags)
+            acquired = True
+        except OSError as e:
+            if not blocking and e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                yield False
+                return
+            raise
+        yield True
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 # ---------- halt-state fail-closed gate ----------
@@ -216,11 +300,23 @@ def _load_creds() -> dict[str, str]:
     return out
 
 
-def place_paper_market_order(symbol: str, notional_usd: float, *, side: str = "buy") -> dict[str, Any]:
+def place_paper_market_order(
+    symbol: str,
+    notional_usd: float,
+    *,
+    side: str = "buy",
+    client_order_id: str | None = None,
+) -> dict[str, Any]:
     """Place a paper-account market order for `notional_usd` USD on `symbol`.
 
     Returns Alpaca's order JSON on 200/201, or {"error": ...} on failure.
     Never raises — a routing failure shouldn't crash the whole tick.
+
+    `client_order_id`, when supplied, is sent in the POST body so the broker
+    can enforce order-id uniqueness and reject a duplicate of the same logical
+    fire (see build_client_order_id). This is the broker-level half of the
+    concurrent double-fire guard; the local advisory flock (fire_lock) is the
+    other half.
     """
     import urllib.error
     import urllib.request
@@ -232,13 +328,16 @@ def place_paper_market_order(symbol: str, notional_usd: float, *, side: str = "b
     if not (key and secret and base):
         return {"error": "alpaca_creds_missing", "detail": "alpaca.env incomplete"}
 
-    body = json.dumps({
+    payload: dict[str, Any] = {
         "symbol": symbol,
         "notional": f"{notional_usd:.2f}",
         "side": side,
         "type": "market",
         "time_in_force": "day",
-    }).encode("utf-8")
+    }
+    if client_order_id:
+        payload["client_order_id"] = client_order_id
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(f"{base}/orders", data=body, method="POST")
     req.add_header("APCA-API-KEY-ID", key)
     req.add_header("APCA-API-SECRET-KEY", secret)
@@ -296,6 +395,70 @@ def read_alpaca_account_equity() -> float | None:
     if not math.isfinite(equity) or equity <= 0:
         return None
     return equity
+
+
+def read_real_open_positions_gross_usd(equity_usd: float) -> float | None:
+    """Return the canonical open book's gross exposure in USD, or None on failure.
+
+    Used only when HERMES_QUANT_PLAYBOOK_AGGREGATE_CAP=1. The aggregate cap
+    ceiling is denominated in USD (account equity × gross_headroom). The
+    consumed side must be seeded with the REAL open positions' gross exposure
+    in the SAME USD unit — otherwise the cap counts only this tick's own fires
+    and admits fires that breach the gross ceiling against the true book (cap2).
+
+    UNIT (ar118 — verified against the canonical money-state code):
+        Position.quantity is NOT uniformly a NAV-fraction. A legacy/equity
+        nav_fraction row stores a signed fraction of NAV, but a true_unit row
+        (ADR-0086/0088: any fill with reactor_metadata.quantity — us_option
+        contracts AND the now-LIVE deterministic-equity EQUITY reactor's real
+        SHARES) stores signed UNITS. The positions table carries the regime in
+        its ``unit_kind`` column; the canonical Σ-of-NAV-fraction is therefore
+        ``Σ |position_gross_fraction(pos, nav)|`` (state.portfolio_state, ar14),
+        the SAME seam react/multileg.py (position_gross_fraction) and the
+        ADR-0071 caps read — NOT a bare Σ |quantity|. The prior bare-Σ|quantity|
+        here treated a det-equity 100-share row as a 10000% NAV-fraction
+        (≈667× over-count of gross), blowing the USD ceiling and over-silencing
+        every playbook fire (fail-CLOSED). DETERMINISTIC_EQUITY=1 is live, so the
+        true_unit equity row class is real on the paper-default book.
+
+        So the book's gross NAV-fraction is Σ |position_gross_fraction|, and its
+        USD gross (matching this cap's USD ceiling = equity × gross_headroom) is
+        equity_usd × that sum.
+
+    Args:
+        equity_usd: the SAME validated, finite-positive account equity the cap
+            ceiling is denominated against (build_aggregate_tick_budget passes
+            the already-checked equity), so the consumed side and the ceiling
+            share one NAV reference. Also the NAV used to normalize a true_unit
+            row to its NAV-fraction.
+
+    Returns:
+        0.0 for an empty/absent book (BYTE-IDENTICAL to the prior consumed=0
+        behavior — equity × 0 = 0). The positive gross USD when positions are
+        open. None is a fail-closed input on ANY error (unreadable state.db,
+        schema drift) or a non-finite/negative result: callers silence would-be
+        fires rather than assuming an empty book.
+    """
+    try:
+        from hermes_quant.state.portfolio_state import (
+            get_portfolio_state,
+            position_gross_fraction,
+        )
+
+        positions = get_portfolio_state().get_positions(PAPER_ACCOUNT_ID)
+        # ar118: normalize each line to its signed NAV-fraction via the canonical
+        # unit_kind-aware seam (true_unit shares/contracts -> qty*price*mult/nav;
+        # nav_fraction -> verbatim), then sum |.| — the ADR-0071 gross measure.
+        gross_nav_fraction = sum(
+            abs(position_gross_fraction(pos, nav=equity_usd))
+            for pos in positions.values()
+        )
+        gross = equity_usd * gross_nav_fraction
+    except Exception:
+        return None
+    if not math.isfinite(gross) or gross < 0:
+        return None
+    return gross
 
 
 class AggregateTickBudget:
@@ -430,7 +593,23 @@ def build_aggregate_tick_budget() -> AggregateTickBudget | None:
             failure_reason=f"aggregate_ceiling_non_finite_or_non_positive:{ceiling!r}",
         )
 
-    return AggregateTickBudget(ceiling_usd=ceiling)
+    # cap2: seed consumed_usd from the REAL open book so the gross ceiling is
+    # enforced against the true exposure, not just this tick's own fires. The
+    # ceiling is USD (equity × gross_headroom); the consumed side is the same-unit
+    # USD gross of the open positions = equity × Σ|quantity| (quantity is a
+    # NAV-fraction — see read_real_open_positions_gross_usd). We pass the SAME
+    # validated finite-positive `equity` the ceiling uses so both share one NAV
+    # reference. An empty/absent book yields 0.0 → byte-identical to the prior
+    # consumed=0 behavior. A None (unreadable book) is a fail-closed input:
+    # silence every fire rather than under-count.
+    real_consumed = read_real_open_positions_gross_usd(equity)
+    if real_consumed is None:
+        return AggregateTickBudget(
+            ceiling_usd=None,
+            failure_reason="open_book_unavailable_or_non_finite",
+        )
+
+    return AggregateTickBudget(ceiling_usd=ceiling, consumed_usd=real_consumed)
 
 
 # ---------- snapshot + silence rules ----------
@@ -798,15 +977,43 @@ def _run_committee_safe(
         timeframe = str(sig_d.get("timeframe") or advisor_result.get("timeframe") or "1d")
         asset_class = str(sig_d.get("asset_class") or advisor_result.get("asset_class") or "equity")
         last_close = float(advisor_result.get("last_close") or 0.0)
-        asof = pd.to_datetime(
-            sig_d.get("asof") or advisor_result.get("asof") or pd.Timestamp.utcnow(),
-            utc=True,
-        ).tz_localize(None) if pd.to_datetime(
-            sig_d.get("asof") or advisor_result.get("asof") or pd.Timestamp.utcnow(),
-            utc=True,
-        ).tzinfo is not None else pd.to_datetime(
-            sig_d.get("asof") or advisor_result.get("asof") or pd.Timestamp.utcnow()
+
+        # No-lookahead anchor (ADR-0042 Oracle Fallacy HARD RULE) -------------
+        # The advisor's recommend() dict exposes the DECISION-BAR timestamp under
+        # the top-level keys ``as_of`` (advisor.py to_dict()) and ``bar_ts`` (the
+        # ADR-0068 split alias). The ``aggregated_signal`` sub-dict carries no
+        # asof key at all. There is NO top-level ``asof`` key — looking it up
+        # ALWAYS yields None and would silently fall back to wall-clock now().
+        # That wall-clock value flows into MarketContext.asof, which
+        # build_role_prompt threads into get_past_context(asof=...) +
+        # load_active_beliefs(role, ...); the retriever's Oracle guard excludes
+        # only reflections/beliefs observable >= asof. With asof = now (future
+        # relative to the decision bar), every lesson that became observable
+        # AFTER the bar but BEFORE now leaks into the portfolio_manager prompt.
+        # So we resolve the bar anchor ONLY from the keys the advisor actually
+        # emits and NEVER substitute wall-clock — if no bar anchor exists we
+        # defer the committee rather than inject future-knowledge.
+        _bar_anchor_raw = (
+            advisor_result.get("as_of")
+            or advisor_result.get("bar_ts")
+            or sig_d.get("as_of")
+            or sig_d.get("bar_ts")
+            # Last-resort: an explicit ``asof`` key IS a real bar timestamp when
+            # a caller carries one (it is never wall-clock — the advisor stamps
+            # decision_wall_clock separately). Accepted for forward-compat, but
+            # the wall-clock substitution is gone.
+            or advisor_result.get("asof")
+            or sig_d.get("asof")
         )
+        if _bar_anchor_raw is None:
+            return {
+                "turns": [],
+                "decision": None,
+                "error": None,
+                "deferred_reason": "no_bar_anchor_for_committee",
+            }
+        _asof_ts = pd.to_datetime(_bar_anchor_raw, utc=True)
+        asof = _asof_ts.tz_localize(None) if _asof_ts.tzinfo is not None else _asof_ts
 
         # Minimal stub bars frame so MarketContext(bars=...) constructor
         # validation (if any) doesn't reject. Only last_close is read by
@@ -1051,6 +1258,8 @@ def process_pair(
     # 4. FIRE — place order (or dry-run skip)
     notional = kelly_to_notional(advisor_result)
     if dry_run:
+        # Dry-run never POSTs, so it needs neither the fire-lock nor a
+        # client_order_id — keep this path byte-identical to the prior behavior.
         return {**base,
                 "decision": "fire",
                 "gate": "FIRE",
@@ -1072,26 +1281,46 @@ def process_pair(
                     "notional_usd": journal_notional,
                     **aggregate_budget.journal_fields()}
 
-    order = place_paper_market_order(symbol, notional, side="buy")
-    if "error" in order:
-        return {**base, "decision": "gate_reject",
-                "gate": "FIRE_BUT_ROUTE_FAILED",
-                "confidence": confidence,
-                "reason": f"alpaca route failed: {order.get('error')}: {order.get('detail','')}",
-                "notional_usd": notional}
+    # Cross-process fire serialization (parity with react/paper.py symbol_tick_lock):
+    # acquire a per-(symbol, play) advisory flock, then RE-READ the authoritative
+    # on-disk fired set inside the lock. This closes the read-once-fired_set TOCTOU
+    # — a concurrent armed run that already POSTed + journaled this (symbol, play)
+    # is now visible, so we skip instead of double-firing. The deterministic
+    # client_order_id is the broker-level backstop if flock is unavailable.
+    with fire_lock(symbol, play) as locked:
+        if locked and (symbol, play) in fired_today_pairs():
+            return {**base, "decision": "idempotent_skip",
+                    "reason": "already fired today (concurrent run won the fire-lock)"}
 
-    if aggregate_budget is not None:
-        aggregate_budget.record_placed(notional)
+        client_order_id = build_client_order_id(today_et, symbol, play)
+        order = place_paper_market_order(
+            symbol, notional, side="buy", client_order_id=client_order_id,
+        )
+        if "error" in order:
+            return {**base, "decision": "gate_reject",
+                    "gate": "FIRE_BUT_ROUTE_FAILED",
+                    "confidence": confidence,
+                    "reason": f"alpaca route failed: {order.get('error')}: {order.get('detail','')}",
+                    "notional_usd": notional,
+                    "client_order_id": client_order_id}
 
-    return {**base,
-            "decision": "fire",
-            "gate": "FIRE",
-            "confidence": confidence,
-            "reason": reason,
-            "notional_usd": notional,
-            "order_id": order.get("id"),
-            "client_order_id": order.get("client_order_id"),
-            "submitted_at": order.get("submitted_at")}
+        if aggregate_budget is not None:
+            aggregate_budget.record_placed(notional)
+
+        fire_rec = {**base,
+                    "decision": "fire",
+                    "gate": "FIRE",
+                    "confidence": confidence,
+                    "reason": reason,
+                    "notional_usd": notional,
+                    "order_id": order.get("id"),
+                    "client_order_id": order.get("client_order_id") or client_order_id,
+                    "submitted_at": order.get("submitted_at")}
+        # Journal the fire BEFORE releasing the lock so the NEXT contender's
+        # in-lock fired_today_pairs() re-read sees this slot as claimed. The
+        # _journaled marker tells run_tick not to append a duplicate line.
+        append_journal(fire_rec)
+        return {**fire_rec, "_journaled": True}
 
 
 # ---------- main tick ----------
@@ -1166,7 +1395,13 @@ def run_tick(*, dry_run: bool) -> dict[str, Any]:
                 "trace": traceback.format_exc(),
                 "dry_run": dry_run,
             }
-        append_journal(rec)
+        # A real fire is journaled inside process_pair under the fire-lock (so
+        # the next contender's in-lock re-read sees the claimed slot). The
+        # _journaled marker means "already on disk" — don't double-append it.
+        if rec.pop("_journaled", False):
+            pass
+        else:
+            append_journal(rec)
         d = rec.get("decision")
         if d == "fire":
             summary["fired"] += 1

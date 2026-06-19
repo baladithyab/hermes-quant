@@ -31,7 +31,10 @@ them. That's the rebalancer's job (ADR-0035 wave-4).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
+
+from hermes_quant.pdr_core.portfolio_snapshot import CorePortfolioSnapshot
 
 # ---------------------------------------------------------------------------
 # Config + state
@@ -98,7 +101,7 @@ class PortfolioCaps:
 
 
 @dataclass(frozen=True)
-class PortfolioState:
+class PortfolioState(CorePortfolioSnapshot):
     """Read-only snapshot of current portfolio used by Stage-2 normalization.
 
     `positions` maps symbol -> signed target_position_pct of NAV (the LATEST
@@ -108,26 +111,44 @@ class PortfolioState:
     `cash_pct` is implied: 1 - sum(abs(positions)). May be negative if the
     book is over-leveraged (which is exactly the case ADR-0071 was written to
     catch). Stage-2 fails closed in that case (silences all new picks).
+
+    ra06 (ADR-0092): this is now a THIN SUBCLASS of the canonical host-agnostic
+    :class:`hermes_quant.pdr_core.portfolio_snapshot.CorePortfolioSnapshot`. The
+    single ``positions`` field and the three derived reads
+    (``gross_exposure_pct`` / ``net_exposure_pct`` / ``cash_pct``) are INHERITED
+    unchanged, so every existing consumer is byte-identical — including the frozen
+    field binding and the in-place-mutable inner dict the autonomous tick relies on
+    (``autonomous.py:880``). The host-named subclass is kept (rather than a bare
+    alias) so ``type(x).__name__`` / ``repr`` stay ``PortfolioState`` and the
+    hermes-specific PaperReactor/executions.jsonl semantics stay documented here,
+    while ``isinstance(x, CorePortfolioSnapshot)`` becomes the migration handle for
+    the eventual consumer-migration sequence. Parity is proven in
+    ``tests/pdr_core/test_portfolio_snapshot_parity.py``.
     """
-
-    positions: dict[str, float] = field(default_factory=dict)
-
-    @property
-    def gross_exposure_pct(self) -> float:
-        return sum(abs(p) for p in self.positions.values())
-
-    @property
-    def net_exposure_pct(self) -> float:
-        return sum(self.positions.values())
-
-    @property
-    def cash_pct(self) -> float:
-        return 1.0 - self.gross_exposure_pct
 
 
 # ---------------------------------------------------------------------------
 # Helpers — headroom computation
 # ---------------------------------------------------------------------------
+
+
+def _book_is_finite(state: PortfolioState) -> bool:
+    """ar03: every breach test in this module is a `<= 0` comparison, and EVERY
+    comparison against a NaN is False — so a single non-finite position in the
+    existing book would make the cap-breach guards silently no-op and let every
+    new pick fire at full size (a NaN-into-a-cap fail-OPEN, strictly worse than the
+    over-leverage the module was written to catch). The cap layer therefore must
+    fail CLOSED on a non-finite book, mirroring the gate.py `_is_finite_number`
+    discipline. (An Inf book already fails closed via `g_room = max_gross - inf =
+    -inf <= 0`; this guard is the NaN backstop + makes the intent explicit.)"""
+    return math.isfinite(state.gross_exposure_pct) and math.isfinite(state.net_exposure_pct)
+
+
+def _nonfinite_reason(state: PortfolioState) -> str:
+    return (
+        f"nonfinite_book gross={state.gross_exposure_pct} net={state.net_exposure_pct} "
+        "— a non-finite position defeats the cap breach test; failing CLOSED"
+    )
 
 
 def _headroom(state: PortfolioState, caps: PortfolioCaps) -> tuple[float, float, float]:
@@ -216,6 +237,48 @@ def normalize_targets(
     out: list[NormalizedTarget] = []
     if not per_symbol_targets:
         return out
+
+    # ar03: a non-finite existing book defeats every `<= 0` breach test below
+    # (NaN comparisons are all False) — fail CLOSED before sizing anything.
+    if not _book_is_finite(state):
+        reason = _nonfinite_reason(state)
+        return [
+            NormalizedTarget(
+                asset=asset,
+                per_symbol_target_pct=t,
+                portfolio_target_pct=0.0,
+                scale_factor=0.0,
+                fired=False,
+                silence_reason=reason,
+            )
+            for asset, t in per_symbol_targets
+        ]
+
+    # ar07 (ar03-adjacent, demand axis): a non-finite INCOMING target also defeats
+    # the sizing comparisons (`size > 0` / `size > g_remaining` are all False for
+    # NaN, so the pick would be ACCEPTED at full size AND poison g_remaining for
+    # later picks under priority_rank). Silence each non-finite pick CLOSED here and
+    # size only the finite remainder, so one bad target can neither fire nor corrupt
+    # its batch siblings. A fully-finite batch is byte-identical (nonfinite_out empty).
+    nonfinite_out: list[NormalizedTarget] = [
+        NormalizedTarget(
+            asset=asset,
+            per_symbol_target_pct=t,
+            portfolio_target_pct=0.0,
+            scale_factor=0.0,
+            fired=False,
+            silence_reason="nonfinite_target",
+        )
+        for asset, t in per_symbol_targets
+        if not math.isfinite(t)
+    ]
+    if nonfinite_out:
+        finite_targets = [(asset, t) for asset, t in per_symbol_targets if math.isfinite(t)]
+        if not finite_targets:
+            return nonfinite_out
+        # Size the finite remainder through the normal path, then prepend the
+        # silenced non-finite picks (order within each group preserved).
+        return nonfinite_out + normalize_targets(finite_targets, state, caps)
 
     g_room, n_room, c_room = _headroom(state, caps)
 
@@ -411,6 +474,35 @@ def clip_one_to_remaining_headroom(
             scale_factor=0.0,
             fired=False,
             silence_reason="zero_target",
+        )
+
+    # ar78: fail CLOSED on a non-finite INCOMING target. ar07 partitions non-finite
+    # targets in the BATCH normalize_targets, and ar03 guards the existing book here —
+    # but this single-pick entry point (the autonomous cap path calls it directly) never
+    # guarded its own per_symbol_target_pct argument. A NaN/inf target slips past the
+    # `g_room/c_room <= 0` breach tests below (every NaN/inf comparison is False, and
+    # inf*scale stays inf), so an inf target FIRES unclipped. Silence it (fail-closed),
+    # mirroring ar07's nonfinite_target reason.
+    if not math.isfinite(per_symbol_target_pct):
+        return NormalizedTarget(
+            asset=asset,
+            per_symbol_target_pct=per_symbol_target_pct,
+            portfolio_target_pct=0.0,
+            scale_factor=0.0,
+            fired=False,
+            silence_reason="nonfinite_target",
+        )
+
+    # ar03: fail CLOSED on a non-finite existing book (a NaN defeats the `<= 0`
+    # breach test below — every NaN comparison is False).
+    if not _book_is_finite(state):
+        return NormalizedTarget(
+            asset=asset,
+            per_symbol_target_pct=per_symbol_target_pct,
+            portfolio_target_pct=0.0,
+            scale_factor=0.0,
+            fired=False,
+            silence_reason=_nonfinite_reason(state),
         )
 
     g_room, n_room, c_room = _headroom(state, caps)

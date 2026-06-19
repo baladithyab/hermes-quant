@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 from dataclasses import asdict, dataclass, field
@@ -379,9 +380,39 @@ def decay_and_promote(active: list[Belief], new: list[Belief], *, asof: datetime
     asof = _ensure_utc(asof)
     # Pattern-recurrence unit is (role, lesson_category) — the FINCON per-role,
     # per-category recurrence key. A belief whose pattern recurs in `new` is promoted.
-    new_by_key: dict[tuple[str, str], Belief] = {}
+    #
+    # distill_beliefs groups by (lesson_category, ticker), so a SINGLE week can emit
+    # two same-(role, lesson_category) new beliefs for different tickers (e.g. AAPL
+    # momentum alpha=+0.05 and TSLA momentum alpha<=0, both inside the top-budget set).
+    # The positive-alpha promotion gate below must reflect the WHOLE category's net
+    # evidence, NOT an arbitrary last-iterated survivor: a plain dict keyed on
+    # (role, lesson_category) would be last-writer-wins, letting an unrelated ticker's
+    # alpha sign decide a live belief's weekly->monthly promotion (3x stickier). We
+    # therefore AGGREGATE the recurring new beliefs per (role, lesson_category) by
+    # support-weighted mean alpha — making the gate order-invariant under any
+    # permutation of `new`. Non-finite alpha_evidence is dropped from the weighting
+    # (NaN/inf must never silently flip the gate; cf. the finite-guard family).
+    by_key: dict[tuple[str, str], list[Belief]] = {}
     for nb in new:
-        new_by_key[(nb.role, nb.lesson_category)] = nb
+        by_key.setdefault((nb.role, nb.lesson_category), []).append(nb)
+
+    new_alpha_by_key: dict[tuple[str, str], float] = {}
+    for key, group in by_key.items():
+        finite = [g for g in group if math.isfinite(float(g.alpha_evidence))]
+        if not finite:
+            # All non-finite: cannot establish positive evidence -> do not promote.
+            new_alpha_by_key[key] = 0.0
+            continue
+        total_support = sum(max(0, int(g.support_n)) for g in finite)
+        if total_support > 0:
+            new_alpha_by_key[key] = (
+                sum(float(g.alpha_evidence) * max(0, int(g.support_n)) for g in finite)
+                / total_support
+            )
+        else:
+            # No support weight to differentiate; fall back to the plain mean so the
+            # gate is still order-invariant (never depends on iteration order).
+            new_alpha_by_key[key] = sum(float(g.alpha_evidence) for g in finite) / len(finite)
 
     kept: list[Belief] = []
     expired: list[Belief] = []
@@ -392,17 +423,62 @@ def decay_and_promote(active: list[Belief], new: list[Belief], *, asof: datetime
         decayed = Belief(**asdict(b))
         decayed.recency = round(b.recency * _alpha(b.tier, days), 8)
 
-        recurrence = new_by_key.get((b.role, b.lesson_category))
-        if recurrence is not None:
+        key = (b.role, b.lesson_category)
+        # ar99 idempotency / double-fire guard (ADR-0081 §4): the cron passes
+        # asof=now(), so a duplicate same-week firing (POSIX DOM/DOW OR-fire, manual
+        # re-run, or a retry after partial failure) re-distills the SAME trailing
+        # reflections into a NEW belief_id carrying the SAME backing decisions. Keyed
+        # only on (role, lesson_category), that was treated as a fresh "recurrence"
+        # and double-promoted (access_counter+1, importance+K, weekly->monthly) on
+        # ZERO new evidence.
+        #
+        # The duplicate-run signature is PROVABLE only when BOTH the active belief and
+        # the freshly-distilled beliefs carry decision_ids (the real distill_beliefs
+        # path sets them — :346): a same-week re-run yields fresh decision_ids that are
+        # a SUBSET of the active belief's prior set (no genuinely-new decision). When
+        # the fresh beliefs introduce a decision_id NOT already backing the active
+        # belief, it is genuine new evidence and promotes as before. When decision_ids
+        # are ABSENT on either side (legacy beliefs / un-provenanced fixtures), we
+        # CANNOT prove a duplicate, so we fall back to the prior category-recurrence
+        # behavior (promote) rather than silently suppress a real cross-ticker
+        # recurrence — fail-toward-the-legacy-semantics, not toward over-suppression.
+        recurrence_present = key in new_alpha_by_key
+        recurrence_is_genuine = recurrence_present  # default: legacy (no provenance to prove otherwise)
+        prior_ids: set = set()
+        fresh_ids: set = set()
+        if recurrence_present:
+            prior_ids = set(b.oracle_provenance.get("decision_ids") or [])
+            for nb in by_key.get(key, []):
+                fresh_ids |= set(nb.oracle_provenance.get("decision_ids") or [])
+            # Only when we have provenance on BOTH sides can we distinguish a genuine
+            # recurrence from a same-evidence re-distillation. If we can, require a
+            # truly-new decision_id; otherwise keep the legacy promote.
+            if prior_ids and fresh_ids:
+                recurrence_is_genuine = bool(fresh_ids - prior_ids)
+        if recurrence_is_genuine:
             # PROMOTE on recurrence (FINMEM access-counter promotion).
             decayed.access_counter = b.access_counter + 1
             decayed.recency = 1.0
             decayed.asof_distilled = asof.isoformat()
-            if recurrence.alpha_evidence > 0:
+            if new_alpha_by_key[key] > 0:
                 decayed.importance = b.importance + IMPORTANCE_BONUS_K
                 if decayed.tier == "weekly":
                     decayed.tier = "monthly"
                     decayed.half_life_days = HALF_LIFE_DAYS["monthly"]
+            # ar99 follow-up (idempotency durability): MERGE the genuinely-new
+            # decision_ids into the kept belief's provenance so prior_ids GROWS.
+            # Without this, a genuine recurrence that introduced d3 leaves the kept
+            # belief recording only the OLD {d1,d2}, so the very next same-week
+            # DUPLICATE firing re-distills the same trailing corpus, recomputes
+            # `fresh_ids - prior_ids = {d3}` AGAIN, and double-promotes on zero new
+            # evidence — defeating the new-evidence guard the moment any genuine
+            # recurrence occurs. Only union when BOTH sides carried provenance (the
+            # same precondition the guard uses) so the legacy/un-provenanced path is
+            # byte-identical. sorted() for deterministic on-disk ordering.
+            if prior_ids and fresh_ids and (fresh_ids - prior_ids):
+                merged = dict(decayed.oracle_provenance)
+                merged["decision_ids"] = sorted(prior_ids | fresh_ids)
+                decayed.oracle_provenance = merged
 
         if decayed.recency < RECENCY_EXPIRE_EPSILON:
             decayed.status = "expired"

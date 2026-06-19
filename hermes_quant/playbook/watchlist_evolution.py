@@ -32,17 +32,21 @@ Evict rule (in order of precedence)
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 # Re-export PLAY_NAMES from the scorers registry (PROFILES-derived single source
 # of truth, ADR-0082 Part A). Kept under its historical module-level name so all
@@ -63,9 +67,9 @@ logger = logging.getLogger(__name__)
 # hand-maintained tuple that used to live at this spot is gone, so PLAY_NAMES can
 # no longer drift from PROFILES / score_all.
 
-DEFAULT_WATCHLIST_PATH = Path.home() / ".hermes" / "quant" / "watchlist" / "play-fit.json"
-DEFAULT_JOURNAL_PATH = Path.home() / ".hermes" / "quant" / "watchlist" / "journal.jsonl"
-DEFAULT_UNIVERSE_PATH = Path.home() / ".hermes" / "quant" / "universe" / "alpaca-daily.json"
+DEFAULT_WATCHLIST_PATH = _resolve_quant_home() / "watchlist" / "play-fit.json"
+DEFAULT_JOURNAL_PATH = _resolve_quant_home() / "watchlist" / "journal.jsonl"
+DEFAULT_UNIVERSE_PATH = _resolve_quant_home() / "universe" / "alpaca-daily.json"
 
 # How many consecutive runs below the onboard floor (but above the evict
 # floor) before slow-eviction fires.
@@ -170,6 +174,40 @@ def _watchlist_cap_trim_enabled() -> bool:
 # -----------------------------------------------------------------------------
 # Persistence
 # -----------------------------------------------------------------------------
+
+
+@contextmanager
+def _flocked(path: Path) -> Iterator[None]:
+    """Acquire an exclusive cross-process ``flock`` on a ``.lock`` sidecar.
+
+    ``evolve_watchlist`` is a read-modify-write on the live tradeable-universe
+    state file (``play-fit.json``): it READS the current ranked state, computes
+    onboard/evict transitions against it, then WRITES the WHOLE new state via
+    ``_atomic_write_json``. The atomic write is crash-safe, but without a
+    cross-process lock around the ENTIRE read-modify-write two concurrent
+    ``evolve_watchlist`` processes — a cron tick that overran its (600s) budget
+    while the next tick fires, or an operator manual re-run overlapping the cron
+    — both read the same prior state and the second writer's ``os.replace``
+    clobbers the first writer's transitions (a lost update; a freshly onboarded
+    tradeable symbol silently dropped, or an evict silently reverted).
+
+    This mirrors the sibling operator-watchlist module
+    (``hermes_quant.watchlist._flocked``), which already flocks the same class
+    of state. The lock is keyed on the state file path so two processes writing
+    the SAME ``play-fit.json`` serialize, while tests using distinct ``tmp_path``
+    state files never contend.
+    """
+    lock_path = path.with_suffix(path.suffix + ".evolve.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _read_universe(universe_path: Path) -> list[str]:
@@ -393,11 +431,47 @@ def _evolve_one_play(
                     )
                 )
 
-        # ---- Onboard rule (only if not evicted this run) ----------------
-        # ADR-0075: a catalyst-fast-tracked symbol needs 0 consecutive runs (a
-        # 1-day catalyst must be actionable that day); universe names keep the
-        # configured sticky window.
+        # ---- Catalyst admission priority (ADR-0075 symmetry) ------------
+        # The eviction path already protects a catalyst-admitted name from being
+        # slow-evicted within its horizon (_catalyst_eviction_protected). Without
+        # a symmetric admission priority, a play already at cap whose ordinary
+        # names all re-confirm active keeps active_count pinned at max_per_play,
+        # so a strong out-of-universe catalyst (fast_track + admitted_via=catalyst)
+        # — appended LAST to the scored universe — hits the onboard gate when the
+        # cap is full and is stranded as a candidate. The downstream autonomous
+        # tick only trades state=='active' rows, so the catalyst (the whole point
+        # of onboarding) is silently dropped, and cap-trim cannot rescue it (it
+        # only ever shrinks the already-active set, never promotes a candidate).
+        #
+        # Mirror the eviction-side asymmetry on the admission side: when a
+        # fast_track catalyst would onboard but the play is at cap, displace the
+        # lowest-scored UNPROTECTED active row already accepted this run so the
+        # catalyst takes the slot. Default-OFF (empty fast_track) -> no symbol is
+        # ever in fast_track, so this branch is dead and behavior is bit-identical.
         effective_sticky = 0 if symbol in fast_track else sticky_onboard_days
+        is_catalyst_admission = (
+            symbol in fast_track
+            and (admission_extras.get(symbol) or {}).get("admitted_via") == "catalyst"
+        )
+        if (
+            is_catalyst_admission
+            and row.state != STATE_EVICTED
+            and row.state != STATE_ACTIVE
+            and row.consecutive_days_above_floor >= effective_sticky
+            and active_count >= max_per_play
+            and max_per_play > 0
+        ):
+            displaced = _displace_lowest_active(
+                new_rows,
+                exclude_symbol=symbol,
+                asof=asof,
+                play=play,
+                position_lookup=position_lookup,
+            )
+            if displaced is not None:
+                events.append(displaced)
+                active_count -= 1
+
         if (
             row.state != STATE_EVICTED
             and row.state != STATE_ACTIVE
@@ -534,6 +608,76 @@ def _catalyst_eviction_protected(
         return bool(position_lookup(row.symbol))
     except Exception:  # noqa: BLE001 — missing position feed -> fail-safe hold
         return True
+
+
+def _displace_lowest_active(
+    new_rows: list[WatchlistEntry],
+    *,
+    exclude_symbol: str,
+    asof: pd.Timestamp,
+    play: str,
+    position_lookup: Callable[[str], bool] | None,
+) -> dict[str, Any] | None:
+    """Evict the lowest-scored UNPROTECTED active row in ``new_rows`` in place.
+
+    Used by the catalyst admission-priority branch: when a fast_track catalyst
+    would onboard into a full play, free exactly one slot by evicting the
+    weakest UNPROTECTED active ordinary row. This mirrors the eviction-side
+    ``_catalyst_eviction_protected`` asymmetry on the admission side — a
+    catalyst-admitted name that is within its horizon (and therefore protected)
+    is never the one displaced, so we never cannibalize one catalyst to admit
+    another mid-horizon.
+
+    Determinism: candidates are ranked by ``(-last_score, symbol)`` — descending
+    score, then symbol ascending as a stable tie-break — and the LAST of that
+    ranking (lowest score, then highest symbol) is displaced. NaN scores sort to
+    the tail (treated as lowest score → displaced first), matching
+    ``_enforce_cap_trim``'s NaN-safe ordering.
+
+    Mutates ``new_rows`` in place (the matched row is ``replace``d with an
+    evicted row) and returns the ``ACTION_EVICT`` journal event, or ``None`` if
+    there is no displaceable (unprotected, active) row. ``exclude_symbol`` (the
+    catalyst about to onboard) is never a candidate.
+    """
+
+    def _rank_key(r: WatchlistEntry) -> tuple[int, float, str]:
+        score = r.last_score
+        is_nan = score != score  # True only for NaN
+        return (1 if is_nan else 0, 0.0 if is_nan else -score, r.symbol)
+
+    best_idx: int | None = None
+    best_key: tuple[int, float, str] | None = None
+    for idx, r in enumerate(new_rows):
+        if r.state != STATE_ACTIVE or r.symbol == exclude_symbol:
+            continue
+        if _catalyst_eviction_protected(r, asof, position_lookup):
+            continue
+        # We want the LOWEST-scored row = the LARGEST rank key (NaN/lowest first).
+        key = _rank_key(r)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_idx = idx
+
+    if best_idx is None:
+        return None
+
+    victim = new_rows[best_idx]
+    reason = "displaced_by_catalyst"
+    new_rows[best_idx] = replace(
+        victim,
+        state=STATE_EVICTED,
+        eviction_reason=reason,
+        consecutive_days_above_floor=0,
+    )
+    return _event(
+        asof=asof,
+        play=play,
+        symbol=victim.symbol,
+        action=ACTION_EVICT,
+        reason=reason,
+        score_before=victim.last_score,
+        score_after=victim.last_score,
+    )
 
 
 def _enforce_cap_trim(
@@ -758,71 +902,88 @@ def evolve_watchlist(
         # onboards fire (0.5 < 0.65 default floor).
         scorer = stub_scorer(0.5)
 
-    _, current_state = _read_watchlist(watchlist_path)
+    # Cross-process serialization of the WHOLE read-modify-write (ar-concurrency
+    # family). ``evolve_watchlist`` READs the current ``play-fit.json``, computes
+    # onboard/evict transitions against it, then WRITEs the whole new state. The
+    # ``_atomic_write_json`` is crash-safe but does NOT serialize two concurrent
+    # processes; an flock around the entire read-modify-write does. Without it, a
+    # cron tick that overran its 600s budget (the timeout was bumped to 600s
+    # precisely because this loop runs long) overlapping the next tick — or an
+    # operator manual re-run overlapping the cron — both read the same prior state
+    # and the second writer clobbers the first's transitions (a lost onboard means
+    # a tradeable symbol the watchlist meant to activate is silently dropped; the
+    # downstream autonomous tick only trades state=='active' rows). The lock is
+    # keyed on the state-file path, so two processes writing the SAME play-fit.json
+    # serialize while tests on distinct paths never contend. Mirrors the sibling
+    # operator-watchlist module's flock on the same class of state.
+    with _flocked(watchlist_path):
+        # READ current state INSIDE the lock so a concurrent writer cannot land
+        # a new state between our read and our write.
+        _, current_state = _read_watchlist(watchlist_path)
 
-    new_state: dict[str, list[WatchlistEntry]] = {}
-    all_events: list[dict[str, Any]] = []
-    summary: dict[str, dict[str, Any]] = {}
+        new_state: dict[str, list[WatchlistEntry]] = {}
+        all_events: list[dict[str, Any]] = []
+        summary: dict[str, dict[str, Any]] = {}
 
-    for play in plays:
-        prior = current_state.get(play, [])
-        new_rows, events = _evolve_one_play(
-            play=play,
-            universe=universe,
-            current=prior,
-            scorer=scorer,
-            asof=asof,
-            onboard_floor=onboard_floor,
-            evict_floor=evict_floor,
-            sticky_onboard_days=sticky_onboard_days,
-            max_per_play=max_per_play,
-            eviction_rules=eviction_rules,
-            fast_track_symbols=fast_track_symbols,
-            admission_extras=admission_extras,
-            position_lookup=position_lookup,
-        )
-        new_state[play] = new_rows
-        all_events.extend(events)
+        for play in plays:
+            prior = current_state.get(play, [])
+            new_rows, events = _evolve_one_play(
+                play=play,
+                universe=universe,
+                current=prior,
+                scorer=scorer,
+                asof=asof,
+                onboard_floor=onboard_floor,
+                evict_floor=evict_floor,
+                sticky_onboard_days=sticky_onboard_days,
+                max_per_play=max_per_play,
+                eviction_rules=eviction_rules,
+                fast_track_symbols=fast_track_symbols,
+                admission_extras=admission_extras,
+                position_lookup=position_lookup,
+            )
+            new_state[play] = new_rows
+            all_events.extend(events)
 
-        active = [r for r in new_rows if r.state == STATE_ACTIVE]
-        n_onboarded = sum(1 for ev in events if ev["action"] == ACTION_ONBOARD)
-        n_evicted = sum(1 for ev in events if ev["action"] == ACTION_EVICT)
-        # Top 5 active rows (already sorted by score desc within active).
-        top5 = [(r.symbol, r.last_score) for r in active[:5]]
-        summary[play] = {
-            "n_active": len(active),
-            "n_onboarded_today": n_onboarded,
-            "n_evicted_today": n_evicted,
-            "top5": top5,
+            active = [r for r in new_rows if r.state == STATE_ACTIVE]
+            n_onboarded = sum(1 for ev in events if ev["action"] == ACTION_ONBOARD)
+            n_evicted = sum(1 for ev in events if ev["action"] == ACTION_EVICT)
+            # Top 5 active rows (already sorted by score desc within active).
+            top5 = [(r.symbol, r.last_score) for r in active[:5]]
+            summary[play] = {
+                "n_active": len(active),
+                "n_onboarded_today": n_onboarded,
+                "n_evicted_today": n_evicted,
+                "top5": top5,
+            }
+
+        # Persist new state + journal. B14(a): STATE FIRST, journal second.
+        #
+        # The original ordering wrote the journal first "so a crash leaves an
+        # audit trail". But state is the operational source of truth and the
+        # journal is its append-only audit derivative (per the module contract +
+        # ADR-0010 "markdown is a render derivative"). With journal-first, a crash
+        # between the two writes leaves journal events for transitions that never
+        # landed in play-fit.json; the *next* run then reads the stale pre-crash
+        # state, recomputes the SAME onboard/evict transitions, and re-appends them
+        # -- producing DUPLICATE journal entries (fresh event_id each) for one
+        # logical transition, corrupting the audit trail and any event-counting
+        # consumer.
+        #
+        # State-first closes that window: _atomic_write_json is crash-safe
+        # (tempfile + fsync + os.replace), so after it returns the new state is
+        # durable. If we then crash before appending the journal, the next run
+        # reads the NOW-CURRENT state, sees the transition already happened, and
+        # does NOT re-emit the event. Worst case is a single lost audit line on a
+        # crash in the narrow gap -- strictly safer than a duplicate, because the
+        # operational state stays consistent and self-correcting.
+        payload = {
+            "as_of": asof.isoformat(),
+            "plays": {p: [r.to_dict() for r in rows] for p, rows in new_state.items()},
         }
+        _atomic_write_json(watchlist_path, payload)
 
-    # Persist new state + journal. B14(a): STATE FIRST, journal second.
-    #
-    # The original ordering wrote the journal first "so a crash leaves an
-    # audit trail". But state is the operational source of truth and the
-    # journal is its append-only audit derivative (per the module contract +
-    # ADR-0010 "markdown is a render derivative"). With journal-first, a crash
-    # between the two writes leaves journal events for transitions that never
-    # landed in play-fit.json; the *next* run then reads the stale pre-crash
-    # state, recomputes the SAME onboard/evict transitions, and re-appends them
-    # -- producing DUPLICATE journal entries (fresh event_id each) for one
-    # logical transition, corrupting the audit trail and any event-counting
-    # consumer.
-    #
-    # State-first closes that window: _atomic_write_json is crash-safe
-    # (tempfile + fsync + os.replace), so after it returns the new state is
-    # durable. If we then crash before appending the journal, the next run
-    # reads the NOW-CURRENT state, sees the transition already happened, and
-    # does NOT re-emit the event. Worst case is a single lost audit line on a
-    # crash in the narrow gap -- strictly safer than a duplicate, because the
-    # operational state stays consistent and self-correcting.
-    payload = {
-        "as_of": asof.isoformat(),
-        "plays": {p: [r.to_dict() for r in rows] for p, rows in new_state.items()},
-    }
-    _atomic_write_json(watchlist_path, payload)
-
-    _append_journal(journal_path, all_events)
+        _append_journal(journal_path, all_events)
 
     return {
         "as_of": asof.isoformat(),

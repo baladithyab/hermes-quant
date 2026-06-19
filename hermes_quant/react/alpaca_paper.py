@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -137,6 +138,59 @@ class AlpacaPaperReactor:
         signal_id = self._extract_signal_id(proposal)
         now = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        adv = proposal.advisor_result or {}
+        asof_decision = adv.get("decision_wall_clock") or adv.get("as_of") or now
+        bar_ts = adv.get("bar_ts") or adv.get("as_of")
+
+        # ── precondition 1b: usable decision_price (cr05/ar32 precondition parity) ──
+        # MIRRORS the sibling reactors' fail-closed guard: PaperReactor and
+        # DeterministicEquityReactor refuse to size a fill off a non-finite / <=0
+        # decision_price (det_equity returns a no-fill record at the <=0 price
+        # check). ``_extract_decision_price`` returns the 0.0 sentinel when neither
+        # an advisor ``decision_price`` nor an analyst_views ``last_close`` is
+        # present, and a non-finite top-level value coerces straight through.
+        # A corrupt/missing entry-basis must NOT be submitted to the broker or
+        # recorded verbatim into ExecutionRecord.decision_price — fail closed with a
+        # silence record (no order, no position, no state.db reconcile). We RETURN a
+        # record (never raise) because the live fire loop calls execute() without a
+        # try/except (same rationale as the unfilled-timeout path below).
+        if not math.isfinite(decision_price) or decision_price <= 0.0:
+            logger.warning(
+                "alpaca-react: %s asset=%s has no usable decision_price (%r); "
+                "fail-closed silence (no order submitted)",
+                proposal.proposal_id,
+                proposal.symbol,
+                decision_price,
+            )
+            record = ExecutionRecord(
+                proposal_id=proposal.proposal_id,
+                signal_id=signal_id,
+                asset=proposal.symbol,
+                asset_class=proposal.asset_class,
+                timeframe=proposal.timeframe,
+                asof_decision=asof_decision,
+                asof_execution=now,
+                target_position_pct=fill_size_pct,
+                decision_price=0.0,  # NEVER record a non-finite basis
+                fill_price=0.0,  # NEVER fabricated — nothing was filled
+                fill_size_pct=0.0,
+                reactor_name=self.name,
+                human_in_the_loop=True,
+                approver_user_id=approver_user_id,
+                reactor_metadata={
+                    "alpaca_paper": True,
+                    "account_id": ALPACA_ACCOUNT_ID,
+                    "silenced": True,
+                    "silence_reason": "zero_decision_price",
+                    "requested_target_pct": fill_size_pct,
+                },
+                bar_ts=bar_ts,
+                play_tag=play_tag,
+            )
+            # A silence moves no position — append for audit, do NOT reconcile state.db.
+            self._append_bus(record)
+            return record
+
         # ── precondition 2: short-equity admissibility (ADR-0077/0079) ──────────
         # DEFAULT-OFF behind HERMES_QUANT_ADMISSIBILITY; bit-for-bit no-op when
         # the flag is absent. REJECT-only / fail-closed (can only refuse to fill).
@@ -151,10 +205,7 @@ class AlpacaPaperReactor:
         # natively and will REJECT an over-buying-power order (surfaced below as
         # AlpacaSubmitError). The home-grown HERMES_QUANT_PORTFOLIO_CAPS band-aid
         # is therefore obsolete on this path and deliberately NOT applied.
-
-        adv = proposal.advisor_result or {}
-        asof_decision = adv.get("decision_wall_clock") or adv.get("as_of") or now
-        bar_ts = adv.get("bar_ts") or adv.get("as_of")
+        # (asof_decision / bar_ts were resolved above for the decision_price guard.)
 
         # ── submit to Alpaca + poll for the real fill ───────────────────────────
         client = self._resolve_client()  # raises AlpacaSubmitError if creds absent
@@ -296,7 +347,14 @@ class AlpacaPaperReactor:
         except Exception as exc:  # noqa: BLE001 — surface broker/account errors
             raise AlpacaSubmitError(f"get_account() failed: {exc}") from exc
         equity = _to_float(getattr(account, "equity", None))
-        if equity is None or equity <= 0:
+        # NaN/inf MUST be rejected: ``_to_float`` catches only (TypeError,
+        # ValueError), so float(Decimal('NaN'))/float('inf')/float('1e400')
+        # succeed and return nan/inf. A non-finite NAV defeats BOTH the
+        # ``<= 0`` check here (nan<=0 / inf<=0 are False) AND the downstream
+        # zero-notional guard (nan<1.0 / +inf<1.0 are False), so it would size
+        # a NaN/inf-notional order. Finite-guard the NAV numerator (mirrors the
+        # math.isfinite price guards elsewhere on this path).
+        if equity is None or not math.isfinite(equity) or equity <= 0:
             raise AlpacaSubmitError(
                 f"account equity unavailable or non-positive ({equity!r}); "
                 "refusing to size an order off a bad NAV"

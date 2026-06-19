@@ -36,13 +36,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_QUANT_HOME = Path.home() / ".hermes" / "quant"
+DEFAULT_QUANT_HOME = _resolve_quant_home()
 
 _TAIL_BYTES: int = 256 * 1024  # 256 KiB
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -222,6 +223,26 @@ class _ReplayProvider:
 # ---------------------------------------------------------------------------
 
 
+def _max_drawdown_pct(equity_curve: pd.Series) -> float:
+    """Maximum peak-to-trough drawdown (negative fraction), peak-denominator guarded.
+
+    ar121: mirrors the canonical guarded form in eval/stockbench.py and
+    backtest/engine.py — divides by ``where(peak > 0, peak, 1.0)`` rather than the raw
+    running peak. A signed-position book (``PaperPortfolio.equity = cash + qty*mark``
+    with shorts) can drive NAV through 0 — a short that rallies hard — so the running
+    peak can be <= 0; the bare ``/running_max`` then divides by zero and yields
+    ``-inf``/NaN for the whole-series ``max_dd_pct``. The guard returns the correctly
+    scaled finite drawdown. Positive-NAV books are byte-identical (the guard only
+    rewrites a non-positive peak, which a positive book never has). Empty/degenerate
+    series → 0.0.
+    """
+    if equity_curve is None or len(equity_curve) == 0:
+        return 0.0
+    running_max = equity_curve.cummax()
+    drawdowns = (equity_curve - running_max) / running_max.where(running_max > 0, 1.0)
+    return float(drawdowns.min()) if len(drawdowns) else 0.0
+
+
 def replay(
     bars: pd.DataFrame,
     *,
@@ -307,6 +328,22 @@ def replay(
 
     # Buy-and-hold reference (compute over the same window the strategy sees)
     bh_anchor_close = float(bars["close"].iloc[warmup_bars])
+    # cs80: fail-CLOSED on a non-finite/zero anchor close. The buy-and-hold
+    # leg is divided into `initial_equity`; a 0.0 anchor -> bh_qty=inf and a NaN
+    # anchor -> NaN poison, both of which silently corrupt the honesty metrics
+    # (buy_hold_total_return_pct / buy_hold_sharpe / excess_return_vs_buy_hold_pct)
+    # an operator reads to judge a strategy. A 0/NaN at the very first priced
+    # bar means the price series itself is corrupt at the decision boundary, so
+    # the WHOLE backtest is untrustworthy — raise, consistent with the
+    # insufficient-bars guard above. The operator must never receive a silent
+    # -inf/NaN excess-return.
+    if not math.isfinite(bh_anchor_close) or bh_anchor_close <= 0.0:
+        raise ValueError(
+            "buy-and-hold anchor close at warmup boundary "
+            f"(bar index {warmup_bars}) is non-finite or non-positive: "
+            f"{bh_anchor_close!r}; the price series is corrupt at the decision "
+            "boundary and the backtest cannot be computed honestly"
+        )
     bh_qty = initial_equity / bh_anchor_close
 
     n_decisions = 0
@@ -384,7 +421,15 @@ def replay(
         target_pct = float(rg.get("kelly_fraction", 0.0)) if rg_pass else 0.0
         sig = result.get("aggregated_signal") or {}
         direction = int(sig.get("direction", 0))
-        signed_target = direction * target_pct  # apply direction sign
+        # `kelly_fraction` is ALREADY SIGNED — it is a verbatim copy of
+        # Action.target_position_pct (protocol: "signed; -0.05 = 5% NAV short"),
+        # produced by quarter_kelly_size() which returns a negative target for a
+        # short signal. Multiplying by `direction` again double-applied the sign
+        # and INVERTED every short trade into a long (and back), systematically
+        # mis-scoring short-taking strategies against the ADR-0020 empirical
+        # gate. Use it directly, as every other consumer does (autonomous.py,
+        # tools.py, journal/writer.py).
+        signed_target = target_pct
 
         if rg_pass and abs(signed_target) > 1e-9:
             n_decisions += 1
@@ -483,25 +528,72 @@ def replay(
         else 0.0
     )
 
-    # Max drawdown
-    running_max = equity_curve.cummax()
-    drawdowns = (equity_curve - running_max) / running_max
-    max_dd_pct = float(drawdowns.min()) if len(drawdowns) else 0.0
+    # Max drawdown (ar121: peak-guarded — see _max_drawdown_pct).
+    max_dd_pct = _max_drawdown_pct(equity_curve)
 
     # Deflated Sharpe (PSR with n_trials=1) — only when n_observations >= 30
     if n_observations >= 30:
         from hermes_quant.evaluation.dsr import deflated_sharpe
 
-        try:
-            dsr = deflated_sharpe(
-                observed_sharpe=sharpe,
-                n_trials=1,
-                n_observations=n_observations,
-                skew=float(strat_returns.skew()) if n_observations >= 3 else 0.0,
-                kurtosis=float(strat_returns.kurtosis() + 3.0) if n_observations >= 4 else 3.0,
+        skew = float(strat_returns.skew()) if n_observations >= 3 else 0.0
+        kurtosis = float(strat_returns.kurtosis() + 3.0) if n_observations >= 4 else 3.0
+
+        # cs56 (sibling of cs48 on the replay path): a zero-variance OOS
+        # strategy series (e.g. bit-identical per-bar returns from a flat-but-
+        # marked position, or a synthetic geometric-doubling instrument) makes
+        # `_sharpe` return ±inf (see _sharpe below: std==0, mean!=0 branch).
+        # dsr.deflated_sharpe then forms
+        # ``variance_term = 1 - skew*SR + (kurt-1)/4*SR**2``; for a constant
+        # series skew==0, so ``skew*inf == NaN`` -> variance_term is NaN, the
+        # ``variance_term <= 0`` guard (NaN<=0 == False) is bypassed, and
+        # ``Φ(sr_diff·sqrt(n-1)/sqrt(NaN))`` collapses to NaN WITHOUT raising —
+        # the try/except below only catches ValueError/ZeroDivisionError, so the
+        # NaN escapes into BacktestResult.deflated_sharpe and renders as ``null``
+        # in result.json, INDISTINGUISHABLE from the legitimate
+        # n_observations<30 low-power omission and silently erasing the
+        # false-discovery hedge from the operator's view of a degenerate
+        # backtest. Mirror cs48's validation.py guard EXACTLY: when any DSR input
+        # is non-finite the deflated Sharpe is not estimable; report a
+        # CONSERVATIVE finite 0.0 (zero probability the Sharpe is real — fails any
+        # ``dsr >= floor`` gate) plus a warning. A finite-variance series leaves
+        # every input finite, this guard never fires, and the result is
+        # byte-identical to the bare dsr call.
+        if not (
+            np.isfinite(sharpe) and np.isfinite(skew) and np.isfinite(kurtosis)
+        ):
+            dsr = 0.0
+            logger.warning(
+                "backtest: non-finite Sharpe/skew/kurtosis "
+                "(sharpe=%s, skew=%s, kurtosis=%s); degenerate (likely "
+                "zero-variance) OOS series. Reporting a conservative deflated "
+                "Sharpe of 0.0 (fails the DSR floor) rather than a NaN that "
+                "would render as null and masquerade as a low-power omission.",
+                sharpe,
+                skew,
+                kurtosis,
             )
-        except (ValueError, ZeroDivisionError):
-            dsr = float("nan")
+        else:
+            try:
+                dsr = deflated_sharpe(
+                    observed_sharpe=sharpe,
+                    n_trials=1,
+                    n_observations=n_observations,
+                    skew=skew,
+                    kurtosis=kurtosis,
+                )
+            except (ValueError, ZeroDivisionError):
+                dsr = float("nan")
+            else:
+                # Defensive belt: dsr.deflated_sharpe can in principle return a
+                # non-finite probability if a future input combination escapes
+                # its internal guards. Never let a NaN/inf DSR reach the
+                # artifact; collapse to the conservative 0.0.
+                if not np.isfinite(dsr):
+                    logger.warning(
+                        "backtest: non-finite deflated Sharpe result; reporting "
+                        "a conservative 0.0 (fails the DSR floor)."
+                    )
+                    dsr = 0.0
     else:
         dsr = float("nan")
 

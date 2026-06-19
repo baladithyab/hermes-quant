@@ -28,6 +28,45 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# Gate-local mirror of hermes_quant.aggregators.bma.ABSTAIN_THRESHOLD. The
+# advisor appends EVERY non-None AnalystView to advisor_result['analyst_views']
+# (including KronosAnalyst's zero-confidence weight-load-failure abstain, which
+# is in the DEFAULT 3-analyst committee), and grounding-dropped views REMAIN in
+# that list (only annotated grounding_dropped=True). BMA's abstain filter and
+# grounding enforcement drop those from BMA's LOCAL vote membership — they NEVER
+# mutate advisor_result['analyst_views'], the dict THIS gate reads directly
+# (autonomous.py). So the Dim-3 quorum must apply the SAME membership rule BMA
+# does, or it counts phantom non-voters toward `min_analysts_emitted` and an
+# autonomous order can FIRE on fewer real voices than the operator demanded.
+# PINNED: keep this value identical to bma.ABSTAIN_THRESHOLD (0.10). The two
+# define the SAME notion of "this analyst actually voted"; a drift between them
+# reopens the count-vs-vote-membership gap this constant closes.
+_ABSTAIN_THRESHOLD = 0.10
+
+
+def _is_real_voter(view: dict[str, Any]) -> bool:
+    """A view counts toward the Dim-3 voice quorum iff it actually reached the
+    BMA vote — i.e. it is NOT grounding-dropped AND its confidence clears the
+    abstain threshold (fail-CLOSED on non-finite confidence: NaN >= thr is
+    False).
+
+    The `confidence` key is ALWAYS present on real advisor output
+    (advisor._view_to_dict). A MISSING key is treated as a voter (default
+    `_ABSTAIN_THRESHOLD`) so older/partial view shapes that omit confidence
+    are not silently down-counted — only an EXPLICIT abstain or an EXPLICIT
+    grounding-drop removes a voice."""
+    if not isinstance(view, dict):
+        return False
+    if view.get("grounding_dropped"):
+        return False
+    try:
+        conf = float(view.get("confidence", _ABSTAIN_THRESHOLD))
+    except (TypeError, ValueError):
+        # An unparseable confidence is not a credible vote; fail-CLOSED.
+        return False
+    return math.isfinite(conf) and conf >= _ABSTAIN_THRESHOLD
+
+
 # ---------------------------------------------------------------------------
 # Decision enum
 # ---------------------------------------------------------------------------
@@ -85,6 +124,18 @@ class GateConfig:
     transaction cost + slippage + risk premium. We codify a Sharpe-like
     threshold — edge of half a stdev combined with confidence > 0.65 is
     a meaningful quality bar."""
+
+    min_volatility: float = 0.001
+    """Positive FLOOR on the urgency divisor (10 bps). Without it, a
+    tiny-but-positive atr_relative (a flatlined / illiquid name where
+    atr/last_close ~ 1e-6) makes urgency = edge / vol explode, so the
+    autonomous FIRE gate clears trivially on pure noise — a finite-but-huge
+    urgency passes the `math.isfinite` guard. The floor bounds
+    urgency <= abs(edge) / 0.001 = 1000 * abs(edge): a 0.1% noise edge
+    yields urgency ~0.4 (correctly SILENCED at min_urgency=0.5) while a
+    genuine 1%+ edge still clears. The 10 bps value mirrors the module
+    author's own 'tiny ATR is noise' insight — MicrostructureLite treats
+    atr_rel < 0.005 as quiet/noise for the toxicity sub-signal."""
 
     min_analysts_emitted: int = 2
     """Minimum number of analysts that emitted a view. With 2 analysts
@@ -169,7 +220,16 @@ def silence_bias_gate(
         )
 
     sig = (advisor_result or {}).get("aggregated_signal") or {}
-    views = (advisor_result or {}).get("analyst_views") or []
+    raw_views = (advisor_result or {}).get("analyst_views") or []
+
+    # Count ONLY views that actually reached the BMA vote. The advisor leaves
+    # abstain (confidence < threshold) and grounding-dropped views in
+    # analyst_views for the audit trail; BMA filters them from its local vote
+    # but never from this dict. Counting len(analyst_views) here would let an
+    # autonomous order FIRE on fewer REAL voices than the operator demanded
+    # (e.g. min_analysts_emitted=3 satisfied by 2 real voices + 1 Kronos
+    # abstain). See _is_real_voter / _ABSTAIN_THRESHOLD above.
+    views = [v for v in raw_views if _is_real_voter(v)]
 
     # ---- Dim 3: Compute Budget (number of voices) ----
     # Check first because cheapest and zero-voice -> all other dims meaningless.
@@ -240,6 +300,15 @@ def silence_bias_gate(
 
     if vol <= 0:
         vol = 0.01
+    # Positive FLOOR on the divisor (deep-review 2026-06-16): a tiny-but-positive
+    # vol (e.g. atr_relative ~1e-6 from a flatlined/illiquid name supplied via
+    # analyst metadata above) would otherwise make urgency = edge/vol explode and
+    # the FIRE gate clear trivially on pure noise. The `math.isfinite(urgency)`
+    # check below catches NaN/inf ONLY — a large FINITE urgency slips through. This
+    # is distinct from the NaN-fail-CLOSED family; it is the tiny-positive-finite
+    # gap. Floor justified by MicrostructureLite treating atr_rel<0.005 as noise.
+    if cfg.min_volatility > 0:
+        vol = max(vol, cfg.min_volatility)
     urgency = abs(expected_signed_edge) / vol
 
     # NaN-fail-CLOSED (deep-review 2026-06-07): a non-finite urgency (from a NaN

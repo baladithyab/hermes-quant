@@ -34,8 +34,76 @@ import pandas as pd
 
 from hermes_quant.daemon.signal_bus import EXECUTION_BUS_PATH, read_jsonl_tail
 from hermes_quant.protocol import Portfolio, Position
+from hermes_quant.react.base import is_absolute_target_record
 
 logger = logging.getLogger(__name__)
+
+# cs14 Option B (ADR-0091 Option E / docs/design/2026-06-13-cs14-weekly-exit-reader-fork.md):
+# the LIVE producer (react.paper.PaperReactor -> _record_to_dict) emits a record shape
+# the legacy int-1 `side`/`qty` branch below CANNOT read — it carries
+# schema_version=None (or the "absolute-target-v1" sentinel), a signed NAV-fraction
+# `target_position_pct`, `reactor_name`, `fill_price`, `asof_execution`, and NO
+# top-level qty/side/account_id. The absolute-target reconstruction block (added below)
+# consumes that real shape via LATEST-TARGET semantics (mirroring
+# portfolio.state.reconstruct_portfolio_state) so the weekly-exit reader reconstructs a
+# real book. Only equity-fill reactors are admitted; crypto/other partitions are NOT
+# silently absorbed (they must use the legacy int-1 path or a future per-class seam).
+EQUITY_FILL_REACTORS = frozenset({"paper", "deterministic-equity", "alpaca_paper"})
+
+
+def _abs_record_sign(rec: dict) -> int:
+    """Sign of an absolute-target record's signed NAV fraction: +1 long, -1 short,
+    0 flat (|target| < 1e-12 -> a run boundary). Mirrors the weekly readers."""
+    try:
+        f = float(rec.get("target_position_pct"))
+    except (TypeError, ValueError):
+        return 0
+    if f > 1e-12:
+        return 1
+    if f < -1e-12:
+        return -1
+    return 0
+
+
+def _abs_opening_leg(
+    records: list[dict], asset: str, held_sign: int
+) -> dict | None:
+    """Return the leg that ESTABLISHED the currently-held absolute-target position.
+
+    cs22: the loader analogue of the weekly's ``_establishing_leg`` (cs27/cs28). The
+    absolute-target fold keeps QTY/sign from the LATEST target per symbol, but the cost
+    BASIS (``Position.avg_entry_price``) must anchor on the OPENING leg of the current
+    run — the FIRST same-held-sign fill after the last flat/flip — not the latest add.
+    A same-sign ADD (open then size-up) must NOT silently re-anchor the basis.
+
+    Walk the per-asset records IN FILE ORDER (the list is already oldest-first; do NOT
+    re-sort — preserve the loader's tie/order semantics). Track a candidate (the first
+    held-sign fill of the current run) plus a "boundary seen since the candidate" flag.
+    A boundary (flat target==0, or a flip to the opposite sign) only SETS the flag — it
+    does not erase the candidate; the NEXT held-sign fill after a boundary RE-OPENS the
+    run and becomes the new candidate. So the post-loop candidate is the first held-sign
+    fill after the LAST boundary that was followed by a same-sign re-open.
+
+    Single-fill positions are byte-identical: one held-sign fill, no boundary -> that
+    single fill IS the opening leg (= the abs_latest record), so the derived basis is
+    unchanged.
+    """
+    candidate: dict | None = None
+    boundary_since_candidate = False
+    for rec in records:
+        if rec.get("asset") != asset:
+            continue
+        sign = _abs_record_sign(rec)
+        if sign == held_sign:
+            if candidate is None or boundary_since_candidate:
+                candidate = rec  # opens (or re-opens, post-boundary) the current run
+                boundary_since_candidate = False
+        else:
+            # Boundary: a flat (sign==0) or a flip (opposite sign) closes the run.
+            # Mark it; the next held-sign fill re-opens. A trailing boundary with no
+            # subsequent same-sign fill leaves the prior run's opener intact.
+            boundary_since_candidate = True
+    return candidate
 
 
 def reconstruct_portfolio(
@@ -67,13 +135,58 @@ def reconstruct_portfolio(
     mark_prices = mark_prices or {}
 
     records = read_jsonl_tail(bus_path, n=n_records)
-    # Filter to scope
+    # Filter to scope — LEGACY int-1 path (hand-rolled side/qty records; the crypto
+    # settlement shape). Unchanged: schema_version == 1 is the int sentinel, which is
+    # disjoint from the absolute-target shape (None / "absolute-target-v1") by
+    # construction, so the two lists never overlap.
     matching = [
         r
         for r in records
         if r.get("account_id") == account_id
         and r.get("asset_class") == asset_class
         and r.get("schema_version") == 1
+    ]
+
+    # cs14: ABSOLUTE-TARGET path — the real live producer shape. A record is admitted
+    # iff it is an absolute-target record (schema_version None or the sentinel),
+    # its reactor_name is an equity-fill reactor, its asset_class matches scope, AND
+    # the account resolves to the requested partition the SAME way the live
+    # producer/state-write seam does: top-level account_id (legacy-injected) OR
+    # reactor_metadata.account_id OR the "paper-default" sentinel (react.paper:438-441).
+    # We do NOT silently admit crypto/other partitions — reactor_name must be in the
+    # equity-fill set.
+    def _record_account(r: dict) -> str:
+        acct = r.get("account_id")
+        if acct:
+            return str(acct)
+        meta_acct = (r.get("reactor_metadata") or {}).get("account_id")
+        if meta_acct:
+            return str(meta_acct)
+        return "paper-default"
+
+    # cs24: account-EQUALITY, NOT a set-OR over {account_id, "paper-default"}.
+    #
+    # The prior `_record_account(r) in {account_id, "paper-default"}` was a set-OR
+    # that admitted the ENTIRE synthetic "paper-default" book (PaperReactor +
+    # DeterministicEquityReactor both resolve to "paper-default") into ANY requested
+    # account. Empirically, reconstruct_portfolio("alpaca-paper","equity") returned
+    # the paper-default fills POOLED with the lone real alpaca-paper position — so a
+    # request for the SHADOW book (react.alpaca_paper: a deliberately SEPARATE
+    # partition, default-OFF) silently absorbed the real synthetic managed book.
+    #
+    # This now matches the cs18 sibling reconstruction
+    # (portfolio.state.reconstruct_portfolio_state:138 — `_record_account(rec) !=
+    # account` skip) AND the strict legacy int-1 path above (:90 `== account_id`).
+    # The two reconstructions previously DISAGREED on account semantics (set-OR vs
+    # equality); they now agree. A paper-default request still gets the paper-default
+    # book; an alpaca-paper request gets ONLY the alpaca-paper shadow book — no pool.
+    absolute_matching = [
+        r
+        for r in records
+        if is_absolute_target_record(r)
+        and r.get("reactor_name") in EQUITY_FILL_REACTORS
+        and r.get("asset_class") == asset_class
+        and _record_account(r) == account_id
     ]
 
     cash = initial_cash
@@ -131,9 +244,26 @@ def reconstruct_portfolio(
             )
 
         if is_full_close:
-            # Fully closing position (clean path)
+            # Fully closing position (clean path).
+            #
+            # cs00 sign fix (2026-06-13): the realized P&L of a full close is
+            #   (exit_price - avg_entry) * exit_qty_in_the_direction_of_the_lot
+            # where the lot being closed has signed size -signed_qty (the close
+            # fill is opposite the position). For a LONG (old_qty > 0) the close
+            # fill is a sell (signed_qty < 0) so -signed_qty > 0 and the formula
+            # is (fill - avg_old) * (+qty) — profit when fill > entry. For a SHORT
+            # (old_qty < 0) the close fill is a buy (signed_qty > 0) so
+            # -signed_qty < 0 and the formula is (fill - avg_old) * (-qty) —
+            # profit when fill < entry (covered cheaper than shorted). The
+            # previous trailing `* (1 if old_qty > 0 else -1)` factor INVERTED the
+            # short branch (shorting @100 then covering @90 booked -100 instead of
+            # +100). Dropping it makes the short branch correct; the long branch is
+            # unchanged (the dropped factor was +1 for longs). realized_pnl_total
+            # is report-only / not-yet-gate-wired today (the lone live consumer,
+            # scripts/quant-playbook-weekly.py, reads pf.positions only), so this
+            # is a pure correctness fix to a human-facing number.
             avg_old = (old_cost / old_qty) if old_qty != 0 else 0.0
-            realized = (fill - avg_old) * (-signed_qty) * (1 if old_qty > 0 else -1)
+            realized = (fill - avg_old) * (-signed_qty)
             realized_pnl_total += realized
             positions_qty[asset] = 0.0
             positions_cost[asset] = 0.0
@@ -162,6 +292,105 @@ def reconstruct_portfolio(
             unrealized_pnl=unrealized,
             realized_fees=0.0,
         )
+
+    # ------------------------------------------------------------------------
+    # cs14 ABSOLUTE-TARGET reconstruction (LATEST-TARGET, never delta-summed).
+    #
+    # The real live producer emits one absolute signed NAV-fraction target per
+    # symbol per fill; later fills SUPERSEDE earlier ones (they do NOT cancel /
+    # net out — that is the dual-ledger inflation ADR-0091 forbids). So we keep
+    # the single record with the MAX asof_execution per symbol (mirroring
+    # portfolio.state.reconstruct_portfolio_state:108-113) and derive ONE Position
+    # from it. A latest target of 0.0 means the symbol is closed -> dropped.
+    #
+    # Derivation of share qty/avg_entry from a NAV fraction:
+    #   * reactor_metadata.quantity, when present, is the AUTHORITATIVE signed
+    #     absolute filled share count (the det-equity / live-broker reconciliation
+    #     anchor per react/base.py:50-52) — used verbatim.
+    #   * otherwise qty = target_position_pct * NAV / entry_price, where NAV is the
+    #     loader's `initial_cash` (the daemon passes the account NAV here; in tests
+    #     it is the 100_000 default). entry_price = fill_price (slipped) or, absent
+    #     that, decision_price.
+    # The Position's cost-basis cash leg is folded into `cash` (cash -= qty*entry)
+    # so equity_total = cash + sum(qty*mark) stays coherent with the legacy legs.
+    abs_latest: dict[str, dict] = {}
+    for rec in absolute_matching:
+        asset = rec.get("asset")
+        if asset is None:
+            continue
+        ts = rec.get("asof_execution") or rec.get("asof")
+        if ts is None:
+            continue
+        prior = abs_latest.get(asset)
+        if prior is None or ts >= (prior.get("asof_execution") or prior.get("asof") or ""):
+            abs_latest[asset] = rec
+
+    for asset, rec in abs_latest.items():
+        try:
+            target_pct = float(rec.get("target_position_pct"))
+        except (TypeError, ValueError):
+            logger.warning("absolute-target record missing target_position_pct: %s", rec)
+            continue
+        if abs(target_pct) < 1e-12:
+            # Latest target is flat -> the position is closed. Drop it.
+            continue
+
+        # cs22: the cost BASIS anchors on the OPENING (establishing) leg of the current
+        # run — the first same-held-sign fill after the last flat/flip — NOT the latest
+        # add. QTY/sign stay latest-target (`rec` = abs_latest[asset]); only the entry
+        # price comes from the opening leg. A same-sign size-up must not silently
+        # re-anchor the basis the weekly's sign-aware pnl_pct/drawdown reads against.
+        # Single-fill: the opening leg IS this latest record -> byte-identical.
+        held_sign = 1 if target_pct > 0 else -1
+        basis_rec = _abs_opening_leg(absolute_matching, asset, held_sign) or rec
+
+        # Entry price: slipped fill_price preferred, else decision_price — read from the
+        # OPENING leg (same ladder as before; only the source record changed).
+        try:
+            entry_price = float(basis_rec.get("fill_price"))
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        if entry_price <= 0.0:
+            try:
+                entry_price = float(basis_rec.get("decision_price"))
+            except (TypeError, ValueError):
+                entry_price = 0.0
+        if entry_price <= 0.0:
+            logger.warning(
+                "absolute-target record for %s has no usable entry price; skipped: %s",
+                asset,
+                basis_rec,
+            )
+            continue
+
+        meta = rec.get("reactor_metadata") or {}
+        qty: float
+        meta_qty = meta.get("quantity")
+        if meta_qty is not None:
+            # Authoritative signed absolute backend share count (det-equity / live).
+            try:
+                qty = float(meta_qty)
+            except (TypeError, ValueError):
+                qty = (target_pct * initial_cash) / entry_price
+        else:
+            # NAV-fraction fallback: shares = (fraction-of-NAV * NAV) / price.
+            qty = (target_pct * initial_cash) / entry_price
+
+        if abs(qty) < 1e-12:
+            continue
+
+        mark = mark_prices.get(asset, entry_price)
+        unrealized = (mark - entry_price) * qty
+        positions[asset] = Position(
+            asset=asset,
+            qty=qty,
+            avg_entry_price=entry_price,
+            mark_price=mark,
+            unrealized_pnl=unrealized,
+            realized_fees=0.0,
+        )
+        # Fold the absolute leg's cost basis into cash so equity stays coherent.
+        cash -= qty * entry_price
 
     equity_total = cash + sum(p.qty * p.mark_price for p in positions.values())
     peak_equity = max(peak_equity, equity_total)

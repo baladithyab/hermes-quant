@@ -34,10 +34,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 DRIFT_LOG_PATH = (
-    Path.home() / ".hermes" / "quant" / "calibrators" / "drift-log.jsonl"
+    _resolve_quant_home() / "calibrators" / "drift-log.jsonl"
 )
 
 _DEFAULT_DRIFT_THRESHOLD = 0.05  # 5% predicted-vs-realized gap

@@ -288,8 +288,18 @@ class WalkForwardEngine:
             logger.warning("WalkForwardEngine: no trading days in holdout window.")
             return self._empty_result()
 
-        # Engine state
-        nav = cfg.initial_nav
+        # Engine state.
+        #
+        # Mark-to-market accounting: `cash` and `equity` are tracked separately.
+        # `cash` only moves on fills (a BUY debits the fill notional, a SELL
+        # credits it); `equity = cash + Σ qty * last_known_close` is recomputed
+        # every bar so the NAV series reflects unrealised PnL on held positions,
+        # not just the realised-PnL / cost-drag of trades.  Without per-bar
+        # repricing a buy-and-hold-shaped strategy shows a FLAT NAV and scores
+        # catastrophic negative alpha against the (correctly MTM'd) buy-and-hold
+        # benchmark — a sign-flipped verdict feeding run_flag_ablation().
+        cash = cfg.initial_nav
+        nav = cfg.initial_nav  # current equity; recomputed each bar via MTM
         nav_series: list[float] = [nav]
         gross_pnl_total = 0.0
         cost_pnl_total = 0.0
@@ -300,6 +310,10 @@ class WalkForwardEngine:
 
         # Symbol position book: symbol → {qty, avg_cost, prev_fill_price}
         positions: dict[str, dict[str, float]] = {sym: {"qty": 0.0, "avg_cost": 0.0} for sym in universe}
+
+        # Last finite close seen per symbol, carried forward when a bar is
+        # missing a symbol's price so the MTM does not silently drop the leg.
+        last_px: dict[str, float] = {}
 
         # Apply step_days
         asof_dates = holdout_days[:: max(1, cfg.step_days)]
@@ -345,7 +359,7 @@ class WalkForwardEngine:
                 side = 1 if decision.action == "BUY" else -1
                 fill_px = cm.apply_to_fill(px, side, participation_pct=0.05)
 
-                # Notional traded
+                # Notional traded — size off current equity (NAV).
                 alloc_cash = nav * decision.size_fraction
                 shares = alloc_cash / fill_px if fill_px > 0 else 0.0
 
@@ -358,15 +372,19 @@ class WalkForwardEngine:
                 cost_per_share_frac = abs(fill_px - gross_px) / gross_px
                 cost_pnl_contrib = -shares * px * cost_per_share_frac
 
-                # Update portfolio
+                # Update portfolio + cash.  A BUY debits the fill notional from
+                # cash; a SELL credits it.  Held-position value is captured by
+                # the per-bar mark-to-market below, NOT by mutating cash.
                 pos = positions.setdefault(sym, {"qty": 0.0, "avg_cost": 0.0})
                 if side == 1:
+                    cash -= shares * fill_px
                     new_qty = pos["qty"] + shares
                     if new_qty > 0:
                         pos["avg_cost"] = (pos["qty"] * pos["avg_cost"] + shares * fill_px) / new_qty
                     pos["qty"] = new_qty
                 else:
-                    # Selling: realise PnL
+                    # Selling: realise PnL and credit the proceeds to cash.
+                    cash += shares * fill_px
                     realised = shares * (fill_px - pos["avg_cost"])
                     gross_pnl_total += realised
                     if realised > 0:
@@ -376,7 +394,6 @@ class WalkForwardEngine:
 
                 gross_pnl_total += gross_pnl_contrib
                 cost_pnl_total += cost_pnl_contrib
-                nav += gross_pnl_contrib + cost_pnl_contrib
                 n_trades += 1
 
                 journal.append({
@@ -392,6 +409,30 @@ class WalkForwardEngine:
                     "confidence": decision.confidence,
                 })
 
+            # ----------------------------------------------------------------
+            # Mark-to-market: reprice ALL held positions against this bar's
+            # close.  This is the unrealised-PnL leg the engine previously
+            # omitted — equity = cash + Σ qty * close, carrying forward the
+            # last finite close for any symbol missing a bar so a stale leg is
+            # never silently dropped to zero.
+            # ----------------------------------------------------------------
+            for s, p in close_px.items():
+                if math.isfinite(p) and p > 0:
+                    last_px[s] = p
+
+            mtm_value = 0.0
+            for s, pos in positions.items():
+                qty = pos.get("qty", 0.0)
+                if qty == 0.0:
+                    continue
+                mark = last_px.get(s)
+                if mark is None or not math.isfinite(mark) or mark <= 0:
+                    # No price ever observed for this open position — fall back
+                    # to its average cost so equity stays finite rather than NaN.
+                    mark = pos.get("avg_cost", 0.0)
+                mtm_value += qty * mark
+
+            nav = cash + mtm_value
             nav_series.append(nav)
 
         # ----------------------------------------------------------------
@@ -564,17 +605,36 @@ def _annualised_sharpe(daily_rets: list[float]) -> float:
 
 
 def _annualised_sortino(daily_rets: list[float]) -> float:
-    """Annualised Sortino ratio (rf=0, downside std only)."""
+    """Annualised Sortino ratio (rf=0, downside deviation about MAR=0).
+
+    ar120: downside deviation is the root-mean-square of the below-MAR(=0) returns
+    across ALL days — ``sqrt(mean(min(r,0)²))`` — NOT ``std(neg, ddof=1)`` about the
+    losers' OWN mean. The std-about-own-mean form (the prior code) is a fail-open
+    trap (the ar85 family; the sibling eval.stockbench._compute_sortino was already
+    fixed and its docstring flags this exact form): a strategy whose losing days are
+    all the SAME magnitude (a fixed stop-loss, or steady down-drift at constant size)
+    has ~zero dispersion about its own mean, so std_down collapses to 0 and this
+    returned 0.0 — masking a real net loss from the d_sortino ablation comparison
+    (backtest/ablation.py, cli/ablate.py C2a). RMS-about-MAR keeps the downside
+    deviation proportional to the loss magnitude → a finite, correctly-negative
+    Sortino for a net loser. (This reporting/ablation helper preserves its 0.0
+    sentinel for the no-data and no-downside cases — the ablation consumer differences
+    two finite Sortinos; the legitimate +inf no-downside signal lives in stockbench,
+    which feeds the live promotion gate.)
+    """
     if len(daily_rets) < 2:
         return 0.0
     arr = np.array(daily_rets, dtype=float)
-    downside = arr[arr < 0]
-    if len(downside) < 2:
-        return float(np.mean(arr) * math.sqrt(252)) if np.mean(arr) > 0 else 0.0
-    std_down = float(np.std(downside, ddof=1))
-    if std_down == 0:
-        return 0.0
-    return float(np.mean(arr) / std_down * math.sqrt(252))
+    mean_r = float(np.mean(arr))
+    # RMS of below-MAR(=0) returns about 0, across ALL days (not just losers).
+    downside = np.minimum(arr, 0.0)
+    downside_dev = math.sqrt(float(np.mean(downside ** 2)))
+    if downside_dev < 1e-12:
+        # No negative day → no downside risk. This helper's consumer diffs two finite
+        # Sortinos, so keep the prior finite sentinel: a positive-mean no-downside book
+        # scores its annualised mean; a flat/negative one scores 0.0.
+        return float(mean_r * math.sqrt(252)) if mean_r > 0 else 0.0
+    return float(mean_r / downside_dev * math.sqrt(252))
 
 
 def _max_drawdown(nav_series: list[float]) -> float:

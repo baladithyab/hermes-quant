@@ -30,6 +30,7 @@ Posture: READ-ONLY. No state mutation. Silence-by-default if the trailing
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import sys
 from collections import Counter, defaultdict
@@ -44,6 +45,12 @@ STATE_DB_PATH = QUANT_DIR / "state.db"
 HOURLY_SNAP_DIR = QUANT_DIR / "hourly-snapshots"
 TICK_JOURNAL_PATH = QUANT_DIR / "playbook" / "tick-journal.jsonl"
 AUTONOMOUS_TICK_PATH = QUANT_DIR / "autonomous-tick.jsonl"
+
+# US equity-option contract multiplier (shares controlled per contract). Mirrors
+# hermes_quant.state.portfolio_state._CONTRACT_MULTIPLIER so the true-unit
+# (ADR-0088 multi-leg) option valuation here matches the ledger fold; a us_option
+# position's dollar value is mark × contracts × 100.
+_CONTRACT_MULTIPLIER = 100.0
 
 
 def utcnow() -> datetime:
@@ -95,18 +102,62 @@ def load_reflections() -> list[dict]:
 
 
 def load_positions() -> list[tuple]:
-    """Return current positions from state.db: [(symbol, qty, avg_entry_price), ...]."""
+    """Return current positions from state.db.
+
+    Shape: ``[(symbol, quantity, avg_entry_price, asset_class, unit_kind), ...]``.
+
+    ``unit_kind`` (ar118) is the AUTHORITATIVE per-row unit regime written by
+    portfolio_state.py ('true_unit' iff reactor_metadata.quantity was present, else
+    'nav_fraction'); ``compute_unrealized_pnl`` values rows off it. The prior shape
+    re-derived the regime from ``asset_class=='us_option'``, which MISSED the
+    deterministic-equity reactor's EQUITY positions (also true-unit real SHARES) and
+    over-stated their P&L ~1000×. A missing/empty unit_kind defaults to 'nav_fraction'
+    (the column default). Backward-compatible: callers that unpack the first three
+    elements still work, the in-tree caller now consumes the 4th + 5th.
+    """
     if not STATE_DB_PATH.exists():
         return []
     try:
         conn = sqlite3.connect(STATE_DB_PATH)
         rows = conn.execute(
-            "SELECT symbol, quantity, avg_entry_price FROM positions"
+            "SELECT symbol, quantity, avg_entry_price, asset_class, unit_kind "
+            "FROM positions"
         ).fetchall()
         conn.close()
         return rows
     except Exception:
         return []
+
+
+def load_nav_ref() -> float | None:
+    """NAV reference for valuing NAV-fraction rows (cash.equity_total).
+
+    Mirrors ``PortfolioState.get_marked_equity`` (and the daily sibling
+    quant-portfolio-daily.py), which sizes each NAV-fraction position against
+    cash.equity_total (cost-basis equity). Returns None when no finite, positive
+    cash row exists so the caller can drop NAV-fraction rows rather than value a
+    fraction as if it were shares.
+    """
+    if not STATE_DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(STATE_DB_PATH)
+        row = conn.execute(
+            "SELECT equity_total FROM cash WHERE account_id = ?",
+            ("paper-default",),
+        ).fetchone()
+        conn.close()
+    except Exception:
+        return None
+    if not row or row[0] is None:
+        return None
+    try:
+        nav = float(row[0])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(nav) or nav <= 0:
+        return None
+    return nav
 
 
 def load_latest_marks(symbols: list[str]) -> dict[str, float]:
@@ -198,28 +249,100 @@ def attribute_direction(exec_row: dict) -> str:
 
 
 def compute_unrealized_pnl(
-    positions: list[tuple], marks: dict[str, float]
+    positions: list[tuple], marks: dict[str, float], nav_ref: float | None = None
 ) -> dict[str, dict]:
-    """Per-symbol unrealized P&L from current positions vs latest marks.
+    """Per-symbol unrealized P&L from current positions vs latest marks, UNIT-AWARE.
 
     Returns: {symbol: {qty, avg_entry, mark, unrealized_pnl, unrealized_pct}}
+
+    Two stored unit regimes share the positions table and MUST be valued
+    differently — a single share-formula corrupts whichever regime it does not
+    match (the 2026-06-02 unit-confusion class, ADR-0086; the daily sibling
+    quant-portfolio-daily.py was fixed for this in ar60 but this weekly retro was
+    not, leaving a fictional "Total unrealized" headline on the LIVE Sunday cron):
+
+      • TRUE-UNIT rows (asset_class == 'us_option'): ``quantity`` is real signed
+        contracts (ADR-0088 multi-leg path). Dollar value is
+        mark × qty × 100 (the contract multiplier);
+        unrealized = (mark - avg) × qty × 100.
+      • NAV-FRACTION rows (every other asset_class — the legacy equity path that
+        writes the vast majority of state.db): ``quantity`` is a SIGNED FRACTION
+        OF NAV (0.20 = a 20%-of-NAV long). The documented get_marked_equity form
+        (portfolio_state.py) is:  unrealized = qty × nav_ref × (mark / avg - 1).
+        Treating that 0.20 as 0.20 SHARES — the old (mark-avg)×qty — was off by
+        ~avg×nav_ref/qty and reported a meaningless dollar figure to Discord.
+
+    ``nav_ref`` (cash.equity_total) is REQUIRED to value NAV-fraction rows. When
+    it is unavailable, a NAV-fraction row is dropped rather than emitting the
+    share-formula lie (silence-by-default).
+
+    Accepts the 5-tuple (symbol, qty, avg, asset_class, unit_kind) state.db read
+    shape (ar118), the prior 4-tuple (unit_kind then defaults to nav_fraction), and
+    the legacy 3-tuple (asset_class defaults to the NAV-fraction equity path) for
+    backward compatibility.
     """
     out = {}
-    for sym, qty, avg_entry in positions:
-        sym = str(sym)
+    for row in positions:
+        sym = str(row[0])
+        qty = row[1]
+        avg_entry = row[2]
+        asset_class = str(row[3]) if len(row) > 3 and row[3] else "equity"
+        # ar118: unit regime comes from the stored unit_kind COLUMN (5th element),
+        # not a re-derivation from asset_class. A 'true_unit' row holds REAL signed
+        # units; the option ×100 multiplier applies only to us_option, so a true-unit
+        # EQUITY (deterministic-equity, LIVE) row uses the share formula with mult=1 —
+        # the case the old asset_class=='us_option' heuristic wrongly valued as a
+        # NAV-fraction (~1000× over-statement). Fall back to the heuristic when the
+        # 5th element is absent (legacy caller / pre-unit_kind row).
+        unit_kind = str(row[4]) if len(row) > 4 and row[4] else None
         if not qty or not avg_entry:
             continue
         mark = marks.get(sym)
         if mark is None:
             # No mark — skip; user can verify by symbol later.
             continue
-        # Direction-aware: SHORT positions (qty < 0) profit when mark < avg_entry.
-        unreal = (mark - float(avg_entry)) * float(qty)
-        unreal_pct = (mark - float(avg_entry)) / float(avg_entry) * (1 if qty > 0 else -1)
+        qty_f = float(qty)
+        avg_f = float(avg_entry)
+        mark_f = float(mark)
+        true_unit = (
+            unit_kind == "true_unit"
+            if unit_kind is not None
+            else asset_class == "us_option"
+        )
+        opt_mult = _CONTRACT_MULTIPLIER if asset_class == "us_option" else 1.0
+        # Defense-in-depth: a nav_fraction row with |qty| > 1.0+ε is IMPOSSIBLE
+        # (a NAV-fraction is bounded to ~[-1, 1] = 100% of NAV). A larger value
+        # is a corrupt raw-share count (e.g. the 2026-06-08 AAPL=510.03 incident
+        # that produced a fake +$70,605 unrealized in the 06-16 daily report).
+        # Exclude it and warn loudly — never emit a fabricated dollar figure.
+        # true_unit rows are unaffected (they legitimately have qty>1 as real shares).
+        _CORRUPT_THRESHOLD = 1.0 + 1e-9
+        if not true_unit and abs(qty_f) > _CORRUPT_THRESHOLD:
+            print(
+                f"WARNING: corrupt state.db row excluded from P&L — "
+                f"symbol={sym!r} unit_kind={unit_kind!r} qty={qty_f} "
+                f"(nav_fraction qty must be in [-1,1]; this looks like a raw share count). "
+                f"Row excluded to prevent a fabricated dollar figure in the report.",
+                file=sys.stderr,
+            )
+            continue
+        # NAV-fraction rows need a NAV reference; without one we cannot value them
+        # honestly, so drop them rather than emit a share-formula garbage figure.
+        if not true_unit and nav_ref is None:
+            continue
+        if true_unit:
+            # ar118: real signed units. ×100 only for option contracts; a true-unit
+            # equity (det-equity shares) uses mult=1 (opt_mult resolved above).
+            unreal = (mark_f - avg_f) * qty_f * opt_mult
+        else:
+            # NAV-fraction: the documented get_marked_equity dollar form.
+            unreal = qty_f * nav_ref * (mark_f / avg_f - 1.0)
+        # Direction-aware %: SHORT positions (qty < 0) profit when mark < avg_entry.
+        unreal_pct = (mark_f - avg_f) / avg_f * (1 if qty_f > 0 else -1)
         out[sym] = {
-            "qty": float(qty),
-            "avg_entry": float(avg_entry),
-            "mark": float(mark),
+            "qty": qty_f,
+            "avg_entry": avg_f,
+            "mark": mark_f,
             "unrealized_pnl": unreal,
             "unrealized_pct": unreal_pct,
         }
@@ -407,7 +530,8 @@ def main() -> int:
     positions = load_positions()
     position_symbols = sorted(set(str(r[0]) for r in positions if r[0]))
     marks = load_latest_marks(position_symbols)
-    unrealized = compute_unrealized_pnl(positions, marks)
+    nav_ref = load_nav_ref()
+    unrealized = compute_unrealized_pnl(positions, marks, nav_ref=nav_ref)
 
     # Silence-by-default: if zero fills AND zero open positions, emit nothing.
     if not executions and not positions:

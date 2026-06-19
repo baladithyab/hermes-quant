@@ -22,7 +22,7 @@ import logging
 import math
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
@@ -232,6 +232,32 @@ def _is_covered_short(short: OptionLeg, longs: Sequence[OptionLeg]) -> bool:
 
 def _shares_needed(contracts: int) -> int:
     return 100 * contracts
+
+
+def _scale_cover_to_lots(
+    legs: Sequence[OptionLeg | StockLeg], *, lots: int
+) -> list[OptionLeg | StockLeg]:
+    """Rebuild every ``StockLeg`` cover to the ``lots``-lot footprint (100*lots shares)
+    so a net-greeks aggregation evaluates the structure the order actually establishes.
+
+    ``aggregate_net_greeks`` scales OPTION legs by ``order_qty`` (units = sign *
+    ratio_qty * order_qty * 100) but treats ``StockLeg.qty`` as an ALREADY-scaled
+    absolute share count (NOT scaled by order_qty — data.py). The covered-call recipe
+    builds a ONE-lot cover (``StockLeg(qty=100)``) and hands the gate that 1-lot stock.
+    Aggregating a 1-lot cover against an N-lot option footprint understates the
+    directional exposure (monotonically in N) and can FLIP the net-delta sign for a
+    ratio structure, ADMITTING an over-the-cap covered call (fail-OPEN). We rebuild the
+    cover to ``100 * lots`` (the same share count ``_shares_needed`` requires of the
+    classifier) at every gate aggregation so the net-delta / gamma / vega caps and the
+    reported ``net_greeks`` evaluate the true established position. Scaling here (the
+    gate's known-1-lot recipe seam) rather than inside ``aggregate_net_greeks`` avoids
+    double-scaling a caller that already passes a pre-scaled cover.
+    """
+    cover_shares = 100 * max(int(lots), 1)
+    return [
+        replace(leg, qty=cover_shares) if isinstance(leg, StockLeg) else leg
+        for leg in legs
+    ]
 
 
 def _max_loss(
@@ -475,6 +501,14 @@ def options_gate(
     min_dte: int | None = None,
     open_strategies_on_underlying: int = 0,
     edge: float = 0.0,
+    # ADR-0027 D2/D4 cumulative assignment-cash cap. The sum of ALREADY-reserved
+    # CSP cash collateral (strike*100*contracts) + open CC stock basis for this
+    # account, EXCLUDING this candidate. Default 0.0 => no prior reservations =>
+    # the only binding term is this structure's own incremental cash, so a single
+    # within-budget CSP/CC is byte-identical to today. The cap bounds the
+    # all-CSPs-assign tail (ADR-0027 D4 wheel HARD rule: "Sum of CSP cash
+    # reservations + CC stock basis <= max_assignment_risk_pct_nav").
+    open_assignment_cash: float = 0.0,
     # ADR-0084 O8 (earnings-proximity / IV-crush). ADDITIVE + DEFAULT-OFF at the
     # seam: event_risk=None => O8 never runs => byte-identical to today. The
     # check ALSO requires HERMES_QUANT_EVENT_RISK=1 (master flag), so even a
@@ -486,7 +520,9 @@ def options_gate(
     violation. Rules in order: O-classify -> O1 max-loss/margin -> O2 no-naked
     -> O3 gamma -> O4 theta -> O5 vega -> O6 BPR buffer -> O7 pin-risk ->
     O8 earnings-proximity (long-premium IV-crush) -> sizing -> min-contract
-    guard.
+    guard -> size-scaling re-checks -> cumulative assignment-cash cap (ADR-0027
+    D2/D4: open_assignment_cash + this structure's incremental CSP/CC cash
+    <= max_assignment_risk_pct_nav * nav).
 
     Raises OptionsGateDisabled unless HERMES_QUANT_OPTIONS_GATE=1.
     """
@@ -496,11 +532,76 @@ def options_gate(
             "enable (this wave never sets it live)"
         )
 
+    # ---- Non-finite market-input guard (cr02 fail-closed; cs06 extension). ----
+    # Every spot-/nav-scaled cap below is `value > cfg.x * nav` or
+    # `abs(... * spot) > ...`. A NaN spot or nav makes the comparison always
+    # False (`NaN > x` is False) — the canonical NaN-fail-open class — and a NaN
+    # also propagates into _round_to_step() as an unhandled ValueError. The
+    # equity gate already fails closed on non-finite inputs (gate.py:536); mirror
+    # that here: a NaN/inf spot or nav silences deterministically (reject), never
+    # admits and never aborts the tick.
+    #
+    # cs06 (cr02 P2 follow-up): the same NaN-fail-open class also lives in the
+    # BPR/collateral inputs that cr02 left unguarded.
+    #   * total_bpr — O6 is `if total_bpr + bpr > cfg.bpr_buffer_pct_nav * nav`.
+    #     A NaN total_bpr makes the LHS NaN and `NaN > x` False => the BPR buffer
+    #     ADMITS (fail-open) an under-validated structure.
+    #   * options_buying_power — the CSP cash-collateral gate is
+    #     `options_buying_power >= required`; a NaN drives that comparison False.
+    #   * premium_received — feeds the CSP BPR math (`strike*100*c -
+    #     premium_received`), so a NaN premium poisons the same O6 buffer compare.
+    #     (recipes.py builds this as `float(short.mid or 0.0) * 100`; `or 0.0`
+    #     does NOT catch a NaN mid, so a NaN can reach the gate.)
+    # All are caller-supplied money-state inputs we cannot validate; a non-finite
+    # value silences deterministically (reject), same posture as cr02.
+    if (
+        not math.isfinite(spot)
+        or not math.isfinite(nav)
+        or not math.isfinite(total_bpr)
+        or not math.isfinite(options_buying_power)
+        or not math.isfinite(premium_received)
+    ):
+        return OptionsGateResult.silence(
+            StructureBucket.NAKED,
+            "nonfinite_market_input",
+        )
+
+    # ---- Finite-guard the cumulative-assignment-cash money input (ar88). ----
+    # A NaN/inf open_assignment_cash would defeat the `>` cap comparison below
+    # (nan > x is always False), silently admitting a structure that breaches the
+    # all-CSPs-assign cap — the recurring NaN-defeats-gate fail-open family. Kept
+    # as a SEPARATE guard with its own reason (distinct from the market-input
+    # guard above) so the diagnostic pinpoints the assignment-cash input. Fail
+    # CLOSED (silence), mirroring the math.isfinite guards elsewhere in the gate.
+    if not math.isfinite(open_assignment_cash):
+        return OptionsGateResult.silence(
+            StructureBucket.NAKED,
+            "open_assignment_cash_not_finite",
+        )
+
     # ---- O-classify (D7 composite-intent feeds the classifier sizing). ----
     # Provisional contract count for the share-coverage classification: use the
     # short-call ratio_qty sum as the structural contract count, before sizing.
     shorts = _short_option_legs(legs)
     structural_contracts = sum(leg.ratio_qty for leg in shorts) or 1
+
+    # ADR-0098 Step 5 (iron condor): an iron condor is a SINGLE defined-risk credit
+    # UNIT built from a short put-spread + a short call-spread on the same
+    # underlying/expiry. It carries TWO short legs (one put, one call), so the
+    # generic `sum(short ratio_qty)` would read it as TWO structural contracts and
+    # (a) DOUBLE the closed-form max_loss / BPR (the two wings can NEVER both lose —
+    # only the breached side realizes its width) and (b) DOUBLE the aggregated greek
+    # footprint. Both are wrong for the one-unit condor. A balanced condor's unit
+    # count is the shared per-side ratio_qty (both wings scale together), which is
+    # `sum(short ratio_qty) // number_of_short_legs`. Fail-closed: an UNBALANCED
+    # short-leg count (not exactly 2, or an odd ratio sum) falls back to the generic
+    # sum (conservative over-count), never silently under-counts. This keeps the
+    # `_max_loss` / `_bpr` closed forms (which expect the MAX wing width + the TOTAL
+    # net credit at the unit count) correct for the condor.
+    if strategy_kind == "iron_condor" and len(shorts) == 2:
+        _ratio_sum = sum(leg.ratio_qty for leg in shorts)
+        if _ratio_sum % 2 == 0:
+            structural_contracts = (_ratio_sum // 2) or 1
 
     # Aggregate candidate net greeks first (fail-closed on missing greeks).
     # This MUST come before any per-position check (ADR-0027 D6). Scale by the
@@ -509,8 +610,18 @@ def options_gate(
     # per-lot aggregate would let a multi-lot order slip past O3/O5/net-delta.
     # A leg missing greeks raises GreekComputationError; we convert that to a
     # deterministic silence (reject) rather than aborting the tick (ADR-0027 D6).
+    #
+    # Scale the covered-structure StockLeg cover to the structural lot count too: a
+    # ratio_qty>1 short call has structural_contracts>1, and aggregating the recipe's
+    # 1-lot cover (StockLeg(qty=100)) against the N-lot option footprint understates
+    # (and can sign-flip) the net delta — fail-OPEN on the net-delta cap AND a wrong
+    # reported net_greeks. _scale_cover_to_lots rebuilds the cover to the
+    # 100*structural_contracts shares the classifier already requires (_shares_needed).
+    legs_at_structural = _scale_cover_to_lots(legs, lots=structural_contracts)
     try:
-        candidate_net = aggregate_net_greeks(legs, order_qty=structural_contracts)
+        candidate_net = aggregate_net_greeks(
+            legs_at_structural, order_qty=structural_contracts
+        )
     except GreekComputationError as exc:
         # GENUINELY missing/incomplete greeks => deterministic silence (reject),
         # the intended fail-closed path (ADR-0027 D6).
@@ -601,6 +712,29 @@ def options_gate(
         if max_loss > cfg.max_position_pct * nav:
             return OptionsGateResult.silence(
                 bucket, "max_loss_exceeds_position_cap", net_greeks=candidate_net,
+                bpr_estimate=bpr, max_loss=max_loss,
+            )
+        # 8c66: options-buying-power floor for defined-risk structures. A credit/
+        # debit spread/condor DOES consume margin — the broker reserves the
+        # max_loss (credit: width-net_credit; debit: premium paid; == `bpr` here)
+        # as collateral. The pre-fix O1 block validated ONLY the NAV-based caps
+        # above; only the CSP path checked options_buying_power. So a defined-risk
+        # structure passed every NAV cap against ZERO real broker options BP. The
+        # autonomous originate path passes options_buying_power=0.0 (a placeholder
+        # until a live options-BP read is wired), so an ARMED autonomous spread
+        # would admit against fabricated/zero BP — a fail-OPEN. Mirror the CSP
+        # BP-floor idiom (_classify_structure: admit iff options_buying_power >=
+        # required, else NAKED/silence): a defined-risk structure may only admit
+        # when the available options BP covers its buying-power reduction (`bpr`,
+        # the required margin). Fail CLOSED (silence). options_buying_power is
+        # already finite-guarded at entry (nonfinite_market_input); finite-guard
+        # `bpr` too (derived from width/net_credit/premium_paid, which are NOT all
+        # entry-guarded) so a non-finite required margin can never slip past the
+        # `>=` comparison (NaN >= x is always False; we want a non-finite bpr to
+        # REJECT, not silently admit).
+        if not math.isfinite(bpr) or options_buying_power <= 0 or options_buying_power < bpr:
+            return OptionsGateResult.silence(
+                bucket, "insufficient_options_buying_power", net_greeks=candidate_net,
                 bpr_estimate=bpr, max_loss=max_loss,
             )
 
@@ -781,9 +915,24 @@ def options_gate(
     # re-aggregate at the admitted `contracts` and re-run every size-scaling cap;
     # any breach silences. The admitted-size aggregate is the authoritative
     # net_greeks reported. (Fail-closed on missing greeks, as above.)
+    #
+    # ar106: scale the covered-structure StockLeg cover to the ADMITTED lot count.
+    # `aggregate_net_greeks(legs, order_qty=contracts)` scales OPTION legs by
+    # `contracts` (data.py:295) but treats StockLeg.qty as an ALREADY-scaled absolute
+    # share count (data.py:305 — NOT scaled by order_qty). The CC recipe builds a
+    # 1-lot cover (StockLeg(qty=100), recipes.py:261) and only rebuilds it to
+    # qty=100*contracts AFTER the gate returns. Aggregating the 1-lot stock against
+    # the N-lot option would evaluate the net-delta cap against |100 - 30N| instead
+    # of the TRUE |100N - 30N| — understating exposure (monotonically in N) and
+    # ADMITTING an over-the-cap covered call (fail-OPEN). _scale_cover_to_lots rebuilds
+    # every StockLeg to its admitted cover; same fail-open closed at the first-pass
+    # aggregation above, here at the admitted size. (Scaling at the gate's known-1-lot
+    # recipe seam, not inside aggregate_net_greeks, avoids double-scaling a pre-scaled
+    # caller — which the existing tests and the post-gate recipe path both pass.)
     if contracts != structural_contracts:
+        legs_at_admitted = _scale_cover_to_lots(legs, lots=contracts)
         try:
-            admitted_net = aggregate_net_greeks(legs, order_qty=contracts)
+            admitted_net = aggregate_net_greeks(legs_at_admitted, order_qty=contracts)
         except GreekComputationError as exc:
             return OptionsGateResult.silence(
                 bucket, f"greeks_unavailable: {exc}", bpr_estimate=bpr, max_loss=max_loss,
@@ -862,6 +1011,51 @@ def options_gate(
                     bucket, "csp_collateral_at_size", net_greeks=candidate_net,
                     bpr_estimate=bpr, max_loss=max_loss,
                 )
+        if bucket == StructureBucket.DEFINED_RISK:
+            # 8c66 AT-SIZE fix (review-caught): the structural-size defined-risk BP floor
+            # (the O1 block above) validated options_buying_power >= bpr at
+            # structural_contracts (=1 unit). But `_size_contracts` admits MORE lots and
+            # bpr (the reserved margin) scales LINEARLY — so a spread whose 1-lot bpr is
+            # covered (e.g. BP=1000, 1-lot bpr=700) was admitted at N lots needing N*bpr
+            # (35 lots -> $24,500) of options BP that does not exist. The O1 floor was NOT
+            # re-run at the admitted size (only O6 BPR-buffer + CSP collateral were). Mirror
+            # the CSP at-size collateral re-check: the available options BP must cover the
+            # full at-size required margin. Finite-guard bpr (NaN >= x is always False, so a
+            # non-finite required margin must REJECT, not slip past). Fail-CLOSED (silence).
+            if not math.isfinite(bpr) or options_buying_power <= 0 or options_buying_power < bpr:
+                return OptionsGateResult.silence(
+                    bucket, "defined_risk_insufficient_options_buying_power_at_size",
+                    net_greeks=candidate_net, bpr_estimate=bpr, max_loss=max_loss,
+                )
+
+    # ---- Cumulative assignment-cash cap (ADR-0027 D2/D4 HARD rule). ----
+    # The per-call collateral gate (_classify_structure + the at-size re-check
+    # above) only verifies THIS structure is individually cash-secured — it does
+    # NOT bound the PORTFOLIO-WIDE all-assign tail. ADR-0027 D4 (wheel) makes that
+    # explicit: "Sum of CSP cash reservations + CC stock basis <=
+    # max_assignment_risk_pct_nav". Without this rule N separately-admitted CSPs
+    # (each ~2.5% NAV Kelly-sized) reserve cumulative assignment cash far past the
+    # 20%-NAV cap. Compute THIS structure's incremental assignment cash at the
+    # ADMITTED contract count and silence if open_assignment_cash + incremental
+    # breaches the cap. CSP: strike*100*contracts (full assignment cash, premium
+    # NOT netted — matches the collateral gate). CC: basis_per_share*100*contracts
+    # (the stock basis backing the cover). Defined-risk spreads carry no
+    # assignment-cash obligation (max-loss-bound), so they contribute 0. Reject
+    # only — never a size-up; default open_assignment_cash=0.0 keeps a single
+    # within-budget structure byte-identical.
+    incremental_assignment_cash = 0.0
+    if bucket == StructureBucket.CASH_SECURED_PUT:
+        incremental_assignment_cash = strike * 100 * contracts
+    elif bucket == StructureBucket.COVERED_CALL:
+        incremental_assignment_cash = (basis_per_share or 0.0) * 100 * contracts
+    if (
+        open_assignment_cash + incremental_assignment_cash
+        > cfg.max_assignment_risk_pct_nav * nav
+    ):
+        return OptionsGateResult.silence(
+            bucket, "cumulative_assignment_risk_cap", net_greeks=candidate_net,
+            bpr_estimate=bpr, max_loss=max_loss,
+        )
 
     return OptionsGateResult(
         admitted=True,

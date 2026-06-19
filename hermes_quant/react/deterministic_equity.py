@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -145,6 +146,42 @@ class DeterministicEquityReactor:
         signal_id = self._pre._extract_signal_id(proposal)
         now = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # ar32: REJECT a non-finite / <=0 decision_price BEFORE sizing or slippage —
+        # the cr05 guard the sibling PaperReactor already has (paper.py:198), missing
+        # here on the now-LIVE deterministic-equity path (HERMES_QUANT_DETERMINISTIC_
+        # EQUITY=1). The later price guard (`price_for_qty <= 0`) does NOT catch NaN
+        # (`nan <= 0` is False; `nan > 0` is False so fill_price falls back to a NaN
+        # decision_price), so a NaN price would flow into `shares = notional/NaN = NaN`
+        # and book a NaN-priced, NaN-qty fill that corrupts the P&L ledger (and the
+        # _apply_slippage degrade-to-decision_price path can re-introduce a NaN too).
+        # Fail-closed with a surfaced no-fill (NOT a raise — the live fire loop calls
+        # execute() without try/except).
+        if not math.isfinite(decision_price) or decision_price <= 0.0:
+            logger.warning(
+                "det-equity-react: %s asset=%s REJECTED — decision_price=%r is "
+                "non-finite or <= 0; fail-closed no-fill (no NaN-priced fill booked)",
+                proposal.proposal_id,
+                proposal.symbol,
+                decision_price,
+            )
+            return self._nofill_record(
+                proposal,
+                signal_id=signal_id,
+                asof_decision=(proposal.advisor_result or {}).get("decision_wall_clock")
+                or (proposal.advisor_result or {}).get("as_of")
+                or now,
+                asof_execution=now,
+                decision_price=decision_price,
+                requested_pct=fill_size_pct,
+                bar_ts=(proposal.advisor_result or {}).get("bar_ts")
+                or (proposal.advisor_result or {}).get("as_of"),
+                play_tag=play_tag,
+                approver_user_id=approver_user_id,
+                reason="non_finite_decision_price",
+                reason_key="price_unknown",
+                cap_metadata=None,
+            )
+
         # ── precondition 2: short-equity admissibility (ADR-0077/0079) ──────────
         # DEFAULT-OFF behind HERMES_QUANT_ADMISSIBILITY; bit-for-bit no-op when the
         # flag is absent. REJECT-only / fail-closed.
@@ -175,8 +212,12 @@ class DeterministicEquityReactor:
         # The SLIPPED price is handed to the backend as decision_price so the
         # recorded fill_price AND the BP notional both reflect slippage. Default-OFF
         # passthrough (fill_price = decision_price) unless v0.2 is enabled.
+        # current_position_pct lets the model key cost direction off the traded
+        # delta (target - current), so an exposure-REDUCING fill pays the correct
+        # (opposite-side) slippage instead of a favorable credit.
+        current_position_pct = self._current_position_pct(proposal, decision_price)
         fill_price, slippage_mode, slippage_breakdown = self._apply_slippage(
-            proposal, decision_price, fill_size_pct, now
+            proposal, decision_price, fill_size_pct, now, current_position_pct
         )
 
         # ── NAV-fraction -> signed TRUE shares (MIRRORS AlpacaPaperReactor) ─────
@@ -415,11 +456,55 @@ class DeterministicEquityReactor:
         return record
 
     # ------------------------------------------------------------------
+    # Current position as a NAV fraction (for trade-delta slippage direction)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _current_position_pct(proposal: Any, decision_price: float) -> float:
+        """Signed CURRENT position of proposal.symbol as a NAV fraction (ADR-0070).
+
+        The deterministic-equity book tracks positions in TRUE SHARES (reactor_metadata
+        .quantity), not the NAV-fraction proxy the paper book uses, so we convert
+        shares -> NAV-fraction via ``(shares * decision_price) / account_equity`` to make
+        it directly comparable to the NAV-fraction ``target_pct`` the slippage model
+        keys its trade-delta direction off.
+
+        Silence-by-default: any failure (no db, unknown/zero equity, non-finite,
+        unparsable) returns 0.0, which makes the slippage model fall back to the
+        legacy target-sign behavior rather than blocking the fill. A flat / absent
+        symbol is also 0.0 (a genuine opening fill).
+        """
+        import math
+
+        try:
+            if not (math.isfinite(decision_price) and decision_price > 0):
+                return 0.0
+            from hermes_quant.state.portfolio_state import get_portfolio_state
+
+            positions = get_portfolio_state().get_positions(DETERMINISTIC_EQUITY_ACCOUNT_ID)
+            pos = positions.get((proposal.asset_class, proposal.symbol))
+            if pos is None:
+                return 0.0
+            shares = float(pos.quantity)
+            if not math.isfinite(shares) or shares == 0.0:
+                return 0.0
+            equity = select_backend().account_equity()
+            if equity is None or not math.isfinite(equity) or equity <= 0:
+                return 0.0
+            frac = (shares * decision_price) / equity
+            return frac if math.isfinite(frac) else 0.0
+        except Exception:  # noqa: BLE001 — silence-by-default; never block a fill
+            return 0.0
+
+    # ------------------------------------------------------------------
     # Slippage (ADR-0070) — same logic as PaperReactor.execute inline block
     # ------------------------------------------------------------------
     @staticmethod
     def _apply_slippage(
-        proposal: Any, decision_price: float, fill_size_pct: float, now: str
+        proposal: Any,
+        decision_price: float,
+        fill_size_pct: float,
+        now: str,
+        current_position_pct: float = 0.0,
     ) -> tuple[float, str, dict[str, float] | None]:
         """Return (fill_price, slippage_mode, slippage_breakdown).
 
@@ -428,6 +513,12 @@ class DeterministicEquityReactor:
         set HERMES_QUANT_PAPER_SLIPPAGE_MODEL=v0.1 to opt OUT to the legacy passthrough
         (fill_price = decision_price). A bad input degrades to passthrough with an
         error breakdown (never fails the fill).
+
+        ``current_position_pct`` is the signed CURRENT position as a NAV fraction so
+        the slippage model keys its cost direction off the traded delta (target -
+        current), not the absolute target — a fill that REDUCES exposure is the
+        opposite side from the position it reduces. Defaults to 0.0 (genuine
+        opening fill = legacy behavior).
         """
         slippage_mode = os.environ.get("HERMES_QUANT_PAPER_SLIPPAGE_MODEL", "v0.2")
         slippage_breakdown: dict[str, float] | None = None
@@ -446,6 +537,7 @@ class DeterministicEquityReactor:
             fill_price, slippage_breakdown = apply_slippage(
                 decision_price=decision_price,
                 target_pct=fill_size_pct,
+                current_position_pct=current_position_pct,
                 asof_execution=now,
                 proposal_id=proposal.proposal_id,
                 asset_class=proposal.asset_class,

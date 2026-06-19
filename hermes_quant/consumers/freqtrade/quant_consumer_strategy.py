@@ -31,12 +31,15 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import math
 import os
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 try:
     from freqtrade.strategy import IStrategy
@@ -52,7 +55,7 @@ logger = logging.getLogger(__name__)
 # without hermes-quant installed in the freqtrade environment.
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 SIGNAL_BUS_PATH = QUANT_HOME / "signals.jsonl"
 EXECUTION_BUS_PATH = QUANT_HOME / "executions.jsonl"
 HALT_STATE_MIRROR = QUANT_HOME / "halt_state.json"
@@ -75,6 +78,25 @@ def append_locked(path: Path):
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+
+
+def _parse_asof_utc(value: object) -> pd.Timestamp | None:
+    """Parse an ISO asof string to a UTC pd.Timestamp, or None if absent/unparseable/NaT.
+
+    ar35: used to order signals by CHRONOLOGY, not by lexical string compare (which only
+    sorts correctly when every asof shares one exact format). Naive timestamps are assumed
+    UTC (matching the heartbeat parse above). NaT / errors -> None so the caller can refuse
+    to act on an unorderable timestamp rather than mis-rank it.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except (ValueError, TypeError):
+        return None
+    if pd.isna(ts):
+        return None
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
 def _emit_execution(record: dict) -> None:
@@ -173,6 +195,11 @@ class HermesQuantConsumer(IStrategy):
         self._safe_stop_active = False
         self._safe_stop_reason = ""
         self._signal_cache: dict[str, dict] = {}  # latest signal per pair
+        # Edge-triggered drop-reason latch per pair so a degraded upstream is
+        # logged ONCE on the had-signal -> dropping transition (not every candle).
+        # value is the reason currently latched for the pair, or None when the
+        # pair last produced a usable signal (recovery clears it).
+        self._signal_drop_reason: dict[str, str | None] = {}
 
     # -------------------------------------------------------------------------
     # IStrategy hooks
@@ -231,13 +258,27 @@ class HermesQuantConsumer(IStrategy):
         if signal is None:
             return 0
         target = abs(float(signal.get("target_position_pct", 0.0)))
-        if target <= 0:
+        # ar31: a NON-FINITE target sizes the FULL allowed stake instead of silencing.
+        # float() does not catch nan/inf, and `target <= 0` is False for nan, so the
+        # guard below is bypassed and `min(max_stake, wallet * nan)` returns max_stake
+        # (and `min(max_stake, inf)` likewise) — a sizing fail-OPEN off an externally-
+        # writable signals.jsonl bus. Treat non-finite as a zero-size silence.
+        if not math.isfinite(target) or target <= 0:
             return 0
         try:
             wallet_balance = self.wallets.get_total_stake_amount()
         except Exception:
             wallet_balance = max_stake
-        return min(max_stake, wallet_balance * target)
+        intended = wallet_balance * target
+        # Silence-by-default (ADR-0004): if the quant's intended notional is a positive
+        # value below the exchange minimum, it CANNOT be honored without breaching the
+        # deterministic quarter-Kelly sizing (kelly.py action_step/max_position). Per the
+        # freqtrade contract a returned positive stake < min_stake is silently clamped UP
+        # to min_stake — a dishonest OVER-SIZE. Return 0 (honest no-trade) instead. None
+        # min_stake means the exchange reports no minimum, so no clamp applies.
+        if min_stake is not None and 0 < intended < min_stake:
+            return 0
+        return min(max_stake, intended)
 
     def confirm_trade_entry(
         self, pair, order_type, amount, rate, time_in_force, current_time, entry_tag, side, **kwargs
@@ -328,29 +369,49 @@ class HermesQuantConsumer(IStrategy):
         # Read recent records from bus
         records = _read_jsonl_tail(self.SIGNAL_BUS_PATH, n=200)
 
-        # Update heartbeat
+        # Update heartbeat. ar43: scan newest-first; the first record with a VALID,
+        # parseable asof wins. A null/empty/NaT asof (a garbage-producing daemon) must
+        # NOT poison _last_heartbeat with NaT — that would make the age check below
+        # evaluate `nan > dead_man_switch_seconds` (always False) and silently DISABLE
+        # the dead-man-switch (FAIL-OPEN on a safety rail). Funnel through _parse_asof_utc
+        # and `continue` past unparseable records so an earlier VALID heartbeat is still
+        # found; if none is valid, _last_heartbeat stays None and the
+        # no_heartbeat_observed branch fires after bootstrap.
         for r in reversed(records):
-            if r.get("type") == "heartbeat":
-                try:
-                    asof = pd.Timestamp(r["asof"])
-                    if asof.tzinfo is None:
-                        asof = asof.tz_localize("UTC")
-                    if self._last_heartbeat is None or asof > self._last_heartbeat:
-                        self._last_heartbeat = asof
-                    break
-                except (ValueError, KeyError):
-                    continue
+            if r.get("type") != "heartbeat":
+                continue
+            parsed = _parse_asof_utc(r.get("asof"))
+            if parsed is None:
+                continue
+            if self._last_heartbeat is None or parsed > self._last_heartbeat:
+                self._last_heartbeat = parsed
+            break
 
         # Cache latest signal per pair
         for r in records:
             if r.get("type") == "heartbeat":
                 continue
             asset = r.get("asset")
-            if asset:
-                # Keep most recent per asset
-                cur = self._signal_cache.get(asset)
-                if cur is None or r.get("asof", "") > cur.get("asof", ""):
-                    self._signal_cache[asset] = r
+            if not asset:
+                continue
+            # ar35: keep most recent per asset by PARSED-TIMESTAMP order, not a LEXICAL
+            # string compare. `r["asof"] > cur["asof"]` on raw strings only sorts
+            # correctly when every asof shares one exact format; mixed forms (a trailing
+            # "Z" vs "+00:00", a naive "YYYY-MM-DD HH:MM:SS", differing precision) sort
+            # lexically out of chronological order, so a STALE signal can win the cache and
+            # the consumer then sizes/trades on its (possibly opposite) direction. Parse
+            # both to UTC Timestamps and compare those; an unparseable/NaT candidate is
+            # never allowed to displace an existing cached signal.
+            cur = self._signal_cache.get(asset)
+            if cur is None:
+                self._signal_cache[asset] = r
+                continue
+            new_ts = _parse_asof_utc(r.get("asof"))
+            cur_ts = _parse_asof_utc(cur.get("asof"))
+            if new_ts is None:
+                continue  # can't establish recency -> do not displace
+            if cur_ts is None or new_ts > cur_ts:
+                self._signal_cache[asset] = r
 
         # Dead-man-switch (synthesis-v2 §P0-C)
         bootstrap_age = (now - self._strategy_start_time).total_seconds()
@@ -362,42 +423,126 @@ class HermesQuantConsumer(IStrategy):
             if age > self.dead_man_switch_seconds:
                 self._enter_safe_stop("heartbeat_stale")
 
-        # Halt mirror check
-        try:
-            if self.HALT_STATE_MIRROR.exists():
+        # Halt mirror check — FAIL CLOSED on a corrupt / torn / unreadable mirror.
+        #
+        # The hermes daemon writes halt_state.json as the cross-process mirror of the
+        # durable SQLite halt registry (ADR-0009 / ADR-0016 §D9); this LIVE strategy
+        # reads it in a SEPARATE process to decide safe-stop. The writer docstring
+        # (daemon/halt_state._write_atomic_json) warns a torn/lost write lets a
+        # consumer "trade an asset that is actually halted (fail-OPEN on a halt rail)".
+        # The prior `except (...): pass` did exactly that — a corrupt/partial mirror
+        # was swallowed and the strategy kept trading. An UNREADABLE halt state must
+        # be treated as a HARD HALT (we cannot prove "no active halts"), matching the
+        # sibling ops driver ops/scripts/quant-autonomous-tick.read_active_halts, which
+        # returns a synthetic fail-closed halt on JSONDecodeError. Absent file = cold
+        # start = no halts (benign); empty list = no active halts (keep trading) —
+        # only an EXISTING-but-undecodable / wrong-shape mirror fails closed.
+        if self.HALT_STATE_MIRROR.exists():
+            try:
                 halts = json.loads(self.HALT_STATE_MIRROR.read_text())
-                if halts:
-                    self._enter_safe_stop(f"halt_active: {halts[0].get('reason', 'unknown')}")
-        except (json.JSONDecodeError, OSError):
-            pass
+            except (json.JSONDecodeError, OSError, ValueError) as exc:
+                self._enter_safe_stop(f"halt_mirror_corrupt_fail_closed: {exc}")
+            else:
+                if not isinstance(halts, list):
+                    # Valid JSON but not the expected list shape — structurally
+                    # corrupt; cannot establish 'no active halts' -> fail closed.
+                    self._enter_safe_stop(
+                        f"halt_mirror_bad_shape_fail_closed: {type(halts).__name__}"
+                    )
+                elif halts:
+                    first = halts[0] if isinstance(halts[0], dict) else {}
+                    self._enter_safe_stop(
+                        f"halt_active: {first.get('reason', 'unknown')}"
+                    )
 
     def _latest_signal_for(self, pair: str, current_time) -> dict | None:
-        """Return the most recent valid signal for this pair, or None."""
+        """Return the most recent valid signal for this pair, or None.
+
+        The four fail-CLOSED drop branches below (no cached signal, wrong schema,
+        stale asof, unparseable asof) are correct money-software posture — a
+        degraded upstream must NOT produce a trade. But a bare `return None` makes
+        the halt unobservable: a daemon emitting fresh heartbeats but garbage
+        per-asset signals keeps the heartbeat dead-man-switch satisfied, so the
+        operator sees zero new trades, zero logs, and a live daemon —
+        indistinguishable from a deliberate quiet day (ar28: unobservable silence
+        on a money rail defeats the operator). Each drop therefore logs ONCE on the
+        had-signal -> dropping edge via _note_signal_drop (suppressed on repeats;
+        re-logged after recovery), mirroring the _enter_safe_stop idiom.
+        """
         self._refresh_state(current_time)
 
         sig = self._signal_cache.get(pair)
         if sig is None:
+            # No signal cached yet (startup / quiet pair) is the normal state, not
+            # a degradation of an existing signal — do not log/latch it.
             return None
 
         # Schema version check
         if sig.get("schema_version") != 1:
+            self._note_signal_drop(
+                pair, "bad_schema", f"schema_version={sig.get('schema_version')!r}"
+            )
             return None
 
         # Stale signal guard
+        # ar43: pd.Timestamp returns NaT (WITHOUT raising) for None / "" / nan / JSON-null
+        # asof — only literal-garbage strings raise. A NaT asof makes age_minutes NaN, and
+        # `nan > threshold` is False, so the staleness check would NOT trip and an
+        # unknowable-age signal would be RETURNED (fail-OPEN) to drive an entry + sizing.
+        # An asof we cannot order cannot establish freshness, so refuse to act — fail
+        # CLOSED, matching the documented contract that stale signals are ignored. Reuse
+        # the ar35 _parse_asof_utc helper (NaT/garbage -> None).
+        asof = _parse_asof_utc(sig.get("asof"))
+        if asof is None:
+            # ar43/ar28: an absent/garbage/NaT asof is a fail-CLOSED drop — but it
+            # must be OBSERVABLE. A daemon emitting fresh heartbeats + garbage asof
+            # would otherwise drop every signal silently behind a satisfied dead-man-
+            # switch. _parse_asof_utc already swallowed the DateParseError (NaT/garbage
+            # -> None), so this branch — not the staleness try/except below — is the
+            # only place the unparseable-asof drop can be logged.
+            self._note_signal_drop(pair, "unparseable_asof", f"asof={sig.get('asof')!r}")
+            return None
         try:
-            asof = pd.Timestamp(sig["asof"])
-            if asof.tzinfo is None:
-                asof = asof.tz_localize("UTC")
-            now = pd.Timestamp(current_time) if current_time else pd.Timestamp.utcnow()
-            if now.tzinfo is None:
-                now = now.tz_localize("UTC")
+            now = _parse_asof_utc(current_time) if current_time else pd.Timestamp.utcnow().tz_localize("UTC")
+            if now is None:
+                return None
             age_minutes = (now - asof).total_seconds() / 60.0
             if age_minutes > self.max_signal_age_minutes:
+                self._note_signal_drop(
+                    pair, "stale", f"age_minutes={age_minutes:.1f} > {self.max_signal_age_minutes}"
+                )
                 return None
-        except (ValueError, KeyError):
+        except (ValueError, KeyError) as e:
+            self._note_signal_drop(pair, "unparseable_asof", f"asof={sig.get('asof')!r} ({e})")
             return None
 
+        # Usable signal — clear any latched drop reason so a future drop logs again.
+        self._note_signal_recovery(pair)
         return sig
+
+    def _note_signal_drop(self, pair: str, reason: str, detail: str) -> None:
+        """Edge-triggered drop logging: warn ONCE on the transition into (or between)
+        drop reasons for a pair, then suppress repeats until the pair recovers.
+
+        Runs every candle per pair, so naive per-call logging would spam — we only
+        log when the latched reason for the pair changes (mirrors _enter_safe_stop,
+        which only logs on the not-active -> active edge)."""
+        if self._signal_drop_reason.get(pair) != reason:
+            logger.warning(
+                "signal dropped for %s: %s (%s) — trading halted for this pair "
+                "until a usable signal arrives (no trade emitted)",
+                pair,
+                reason,
+                detail,
+            )
+        self._signal_drop_reason[pair] = reason
+
+    def _note_signal_recovery(self, pair: str) -> None:
+        """Clear a pair's latched drop reason on a usable signal; log the recovery
+        edge so the operator can see WHEN trading resumed."""
+        if self._signal_drop_reason.get(pair) is not None:
+            logger.warning("signal recovered for %s — usable signal observed", pair)
+        self._signal_drop_reason[pair] = None
 
     def _enter_safe_stop(self, reason: str) -> None:
         if not self._safe_stop_active:

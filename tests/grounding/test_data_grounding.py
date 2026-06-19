@@ -240,8 +240,14 @@ def test_groundtruth_block_mismatch_raises():
 def _make_overflow_bars(n: int = 600) -> list[Bar]:
     """Generate enough bars that even the compact render overflows 4 KB,
     forcing the saliency-keep stage. ~600 daily bars renders > 4 KB compact.
+
+    Starts in 2023 so all 600 weekday bars are dated on/before the canonical
+    ``asof="2026-05-27"`` these overflow tests use. The builder enforces the
+    no-lookahead ``<= asof`` window (see ``build_ground_truth_block``); a fixture
+    that ran past asof would (correctly) have its future bars dropped, which would
+    silently shrink the window and defeat the overflow intent of these tests.
     """
-    return _make_bars(n)
+    return _make_bars(n, start_year=2023)
 
 
 def _make_salient_vs_magnitude_bars(
@@ -479,6 +485,77 @@ def test_saliency_uses_only_in_window_bars():
     # every kept date is <= the as-of slice's last date (no future bar referenced)
     last_in_window = prefix[-1].date_str
     assert all(b.date_str <= last_in_window for b in kept_a)
+
+
+def test_builder_drops_bars_dated_after_asof():
+    """No-lookahead boundary: the builder is the designated as-of slice. A bar dated
+    AFTER *asof* must never be laundered into the block (citation_ids / ohlcv_60d) nor
+    into render_for_prompt.
+
+    The builder — not an upstream cache — owns the <= asof window (module header asserts
+    it; OhlcvCache.read() returns the full unsliced frame and the advisor seam passes
+    ohlcv_bars straight through). A future-dated bar in the input must be dropped.
+    """
+    bars = [
+        Bar("2026-05-26", 100.0, 102.0, 99.0, 101.5, 1_000_000),
+        # FUTURE bar: dated strictly after asof — must NOT survive the builder.
+        Bar("2026-05-27", 101.5, 110.0, 101.0, 108.8, 2_000_000),
+    ]
+    block = build_ground_truth_block("AAPL", asof="2026-05-26", ohlcv_bars=bars)
+
+    future_cid = "gt_AAPL_20260527_close"
+    assert future_cid not in block.citation_ids, (
+        "future-dated bar's citation_id leaked into the block — no-lookahead breach"
+    )
+    assert all(
+        b.date_str <= "2026-05-26" for b in block.ohlcv_60d
+    ), "a bar dated after asof survived into ohlcv_60d"
+    # The on-asof bar must remain.
+    assert "gt_AAPL_20260526_close" in block.citation_ids
+
+    rendered = render_for_prompt(block)
+    assert "108.80" not in rendered, (
+        "the future close (108.80) appears in the rendered ground-truth block — "
+        "it could be cited as grounded truth by an analyst"
+    )
+    # current_quote.decision_price must be the on-asof close, not the future close.
+    assert block.current_quote["decision_price"] == 101.5
+
+
+def test_verifier_rejects_claim_citing_future_close():
+    """End-to-end: a rationale citing a future-dated close must NOT verify as grounded
+    once the builder enforces the <= asof window. The future close is absent from the
+    block's render and its citation_id is not a valid citation, so the claim is uncited.
+    """
+    from hermes_quant.grounding.verifier import ClaimVerifier
+    from hermes_quant.protocol import AnalystView
+
+    bars = [
+        Bar("2026-05-26", 100.0, 102.0, 99.0, 101.5, 1_000_000),
+        Bar("2026-05-27", 101.5, 110.0, 101.0, 108.8, 2_000_000),  # future
+    ]
+    block = build_ground_truth_block("AAPL", asof="2026-05-26", ohlcv_bars=bars)
+
+    view = AnalystView(
+        analyst="test",
+        direction="long",
+        magnitude=0.5,
+        confidence=0.7,
+        confidence_raw=0.7,
+        horizon="1d",
+        rationale="",
+    )
+    result = ClaimVerifier().verify(
+        view,
+        block,
+        claim_text="Strong setup, target 108.80 confirmed [gt_AAPL_20260527_close].",
+    )
+    assert not result.accepted, (
+        "a claim citing a future-dated close was accepted as grounded truth"
+    )
+    assert "108.80" in result.uncited_claims, (
+        "the future close should be flagged uncited once the builder drops it"
+    )
 
 
 # --- microcompact render (Layer A) -----------------------------------------

@@ -303,6 +303,34 @@ def test_pnl_today_zero_when_mark_equals_cost(quant_home: Path) -> None:
         assert p["unrealized_pnl"] == 0.0
 
 
+def test_pnl_honors_initial_cash_env_override(
+    quant_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flat book bootstrapped at an env-overridden initial cash must report 0.
+
+    state.db's ``equity_total`` is bootstrapped from
+    ``portfolio_state._default_initial_cash()`` which honors
+    ``HERMES_QUANT_PAPER_INITIAL_CASH``. The report's cumulative-P&L proxy must
+    subtract the SAME basis, otherwise a flat book at a non-default initial cash
+    reports a fictional cumulative P&L (e.g. equity 250k - hardcoded 100k =
+    +150k). Reproduces the daily_report._DEFAULT_INITIAL_CASH divergence.
+    """
+    monkeypatch.setenv("HERMES_QUANT_PAPER_INITIAL_CASH", "250000")
+    today = date(2026, 5, 27)
+    # Flat book: equity_total == the env-overridden initial cash (250k).
+    _seed_state_db(
+        quant_home,
+        positions=[],
+        cash={"balance_usd": 250_000.0, "equity_total": 250_000.0},
+    )
+    r = generate_daily_report(asof=today, quant_home=quant_home)
+    # Flat book at the configured initial cash → cumulative P&L proxy == 0,
+    # NOT +150_000 (which is what a hardcoded 100k basis would produce).
+    assert r.pnl_today == 0.0
+    assert r.pnl_mtd == 0.0
+    assert r.pnl_ytd == 0.0
+
+
 def test_reflections_within_24h_surface(quant_home: Path) -> None:
     today = date(2026, 5, 27)
     asof_dt = datetime(2026, 5, 27, 23, 30, 0, tzinfo=UTC)

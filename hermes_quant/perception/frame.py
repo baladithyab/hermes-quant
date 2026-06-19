@@ -14,9 +14,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from hermes_quant.options.data import OptionChain
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,8 @@ class PerceptionFrame:
     convergence: Mapping[str, Any] | None = None  # GAP-B (HERMES_QUANT_CONVERGENCE) — empty until PDR-3
     saturation: Mapping[str, Any] | None = None  # GAP-C (HERMES_QUANT_SATURATION) — empty until PDR-4
     event_risk: Mapping[str, Any] | None = None  # ADR-0084 (HERMES_QUANT_CALENDAR_ENABLED) — None until ON; outcome-free, asof-honest
+    options_chain: OptionChain | None = None  # agperc2 (HERMES_QUANT_OPTIONS_PERCEIVE + options_eligible) — None until BOTH ON; asof-honest recorded chain
+    iv_rank: float | None = None  # agperc2 — as-of IV-rank [0,100] from compute_iv_rank_asof; None until BOTH ON (abstain)
     provenance: tuple[str, ...] = ()  # evidence_ids / source URLs / fetch run-ids (ADR-0033/0041)
     extras: Mapping[str, Any] = field(default_factory=dict)
     """Forward-compat escape hatch. Carries EXACTLY the non-regime/non-semantic

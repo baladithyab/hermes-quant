@@ -178,9 +178,40 @@ def _clean_floats(obj):
 
 
 def _to_array(returns) -> np.ndarray:
-    """Coerce a pd.Series | np.ndarray | sequence to a 1-D float ndarray."""
+    """Coerce a pd.Series | np.ndarray | sequence to a 1-D float ndarray.
+
+    Drops non-finite ELEMENTS (compresses the array). Correct for the
+    per-series, order-only statistics (Sharpe, DSR, timing permutation) where
+    a dropped bar carries no cross-series pairing. For the PAIRED excess
+    computation use :func:`_paired_finite` instead — independent per-series
+    compression here would shift the two series relative to one another and
+    pair bars from different dates (cs39).
+    """
     arr = np.asarray(getattr(returns, "values", returns), dtype=float).ravel()
     return arr[np.isfinite(arr)]
+
+
+def _paired_finite(a, b) -> tuple[np.ndarray, np.ndarray]:
+    """Coerce two return series and align them on a SHARED finite mask.
+
+    Truncates both to the common length, then keeps only the positions where
+    BOTH series are finite (``isfinite(a) & isfinite(b)`` elementwise). A
+    non-finite element in EITHER series drops that bar from BOTH, so the i-th
+    kept element of ``a`` always pairs the SAME-DATE i-th kept element of
+    ``b`` (cs39). Independently compressing each series (the old ``_to_array``
+    path) shifts them relative to one another when a NaN sits at different
+    indices, silently pairing bars from different dates in the excess subtract.
+
+    When both series are fully finite the mask is all-True and the result is
+    byte-identical to a naive positional ``a[:m] - b[:m]``.
+    """
+    arr_a = np.asarray(getattr(a, "values", a), dtype=float).ravel()
+    arr_b = np.asarray(getattr(b, "values", b), dtype=float).ravel()
+    m = min(arr_a.size, arr_b.size)
+    arr_a = arr_a[:m]
+    arr_b = arr_b[:m]
+    mask = np.isfinite(arr_a) & np.isfinite(arr_b)
+    return arr_a[mask], arr_b[mask]
 
 
 def _sharpe(returns: np.ndarray, *, bars_per_year: float) -> float:
@@ -337,10 +368,40 @@ def _stationary_bootstrap_indices(
 def _percentile_ci(
     samples: np.ndarray, confidence_level: float
 ) -> tuple[float, float]:
-    """Two-sided percentile CI from a bootstrap distribution."""
+    """Two-sided percentile CI from a bootstrap distribution.
+
+    cs46: filter NON-FINITE bootstrap samples (BOTH NaN and ±inf) before the
+    percentile, then percentile only the finite tail. ``np.nanpercentile``
+    drops NaN but KEEPS inf; a single inf in the tail-interpolation window
+    makes numpy's ``subtract(b, a)`` on inf yield NaN, corrupting ci_low /
+    ci_high to NaN. A degenerate / zero-variance resample (a stationary block
+    drawing a single repeated block -> constant series) makes ``_sharpe``
+    return ±inf, so this is reachable on a real low-variance OOS series.
+
+    A NaN lower bound is the worst failure mode for the promotion gate: the
+    gate is ``sharpe_95ci_lower < 1.0`` (governance/promotion.py:274;
+    react/live.py:38), and ``NaN < 1.0`` is ``False`` in Python — a NaN CI
+    silently PASSES a gate that should fail-closed. We therefore (a) drop the
+    non-finite samples, and (b) when NO finite samples remain (a fully
+    degenerate zero-variance distribution), return a CONSERVATIVE finite
+    ``0.0`` lower bound so the gate fails-closed rather than reading a NaN.
+
+    A finite-variance series leaves all samples finite -> the finite mask is
+    all-True and the result is byte-identical to the old percentile.
+    """
+    # Coerce to ndarray first: the production caller (_bootstrap_ci) passes an
+    # np.array, but a list/tuple caller would TypeError on the boolean mask
+    # below. np.nanpercentile used to coerce implicitly; preserve that contract.
+    samples = np.asarray(samples, dtype=float)
+    finite = samples[np.isfinite(samples)]
+    if finite.size == 0:
+        # Fully degenerate (every resample non-finite, e.g. zero-variance
+        # constant series -> ±inf Sharpe). The CI cannot be estimated; return
+        # a conservative finite bound that fails the >=1.0 promotion gate.
+        return 0.0, 0.0
     alpha = 1.0 - confidence_level
-    lo = float(np.nanpercentile(samples, 100.0 * (alpha / 2.0)))
-    hi = float(np.nanpercentile(samples, 100.0 * (1.0 - alpha / 2.0)))
+    lo = float(np.percentile(finite, 100.0 * (alpha / 2.0)))
+    hi = float(np.percentile(finite, 100.0 * (1.0 - alpha / 2.0)))
     return lo, hi
 
 
@@ -533,17 +594,59 @@ def validate_returns(
         # Sample skew / (non-excess) kurtosis via numpy (no scipy required).
         skew = _sample_skew(r)
         kurt = _sample_kurtosis(r)  # non-excess (normal == 3.0)
-        try:
-            deflated = deflated_sharpe(
-                observed_sharpe=observed_sharpe,
-                n_trials=1,
-                n_observations=n,
-                skew=skew,
-                kurtosis=kurt,
+
+        # cs48 (sibling of cs46): a zero-variance OOS series makes _sharpe
+        # return ±inf (see _sharpe above). dsr.deflated_sharpe then forms
+        # ``variance_term = 1 - skew*SR + (kurt-1)/4*SR**2``; for a constant
+        # series skew==0, so ``skew*inf == NaN`` -> variance_term is NaN, the
+        # ``variance_term <= 0`` guard (NaN<=0 == False) is bypassed, and
+        # ``Φ(sr_diff·sqrt(n-1)/sqrt(NaN))`` collapses to NaN WITHOUT raising —
+        # the try/except below only catches ValueError/ZeroDivisionError, so
+        # the NaN escapes and renders as ``null`` in validation.json,
+        # INDISTINGUISHABLE from the legitimate n<_MIN_OBS_FOR_DSR omission and
+        # silently erasing the false-discovery hedge. Mirror cs46's
+        # _percentile_ci guard: when any DSR input is non-finite the deflated
+        # Sharpe is not estimable; report a CONSERVATIVE finite 0.0 (zero
+        # probability the Sharpe is real — fails any ``dsr >= floor`` gate)
+        # plus a warning that distinguishes this from a low-power omission. A
+        # finite-variance series leaves every input finite, this guard never
+        # fires, and the result is byte-identical to the bare dsr call.
+        if not (
+            math.isfinite(observed_sharpe)
+            and math.isfinite(skew)
+            and math.isfinite(kurt)
+        ):
+            deflated = 0.0
+            warnings.append(
+                "deflated_sharpe: non-finite Sharpe/skew/kurtosis "
+                f"(observed_sharpe={observed_sharpe}, skew={skew}, kurtosis={kurt}); "
+                "degenerate (likely zero-variance) OOS series. Reporting a "
+                "conservative 0.0 (fails the DSR floor) rather than a NaN that "
+                "would render as null and masquerade as a low-power omission."
             )
-        except (ValueError, ZeroDivisionError):
-            deflated = float("nan")
-            warnings.append("deflated_sharpe: degenerate inputs; reported as NaN.")
+        else:
+            try:
+                deflated = deflated_sharpe(
+                    observed_sharpe=observed_sharpe,
+                    n_trials=1,
+                    n_observations=n,
+                    skew=skew,
+                    kurtosis=kurt,
+                )
+            except (ValueError, ZeroDivisionError):
+                deflated = float("nan")
+                warnings.append("deflated_sharpe: degenerate inputs; reported as NaN.")
+            else:
+                # Defensive: dsr.deflated_sharpe can in principle return a
+                # non-finite probability if a future input combination escapes
+                # its internal guards. Never let a NaN/inf DSR reach the
+                # artifact; collapse to the conservative 0.0.
+                if not math.isfinite(deflated):
+                    warnings.append(
+                        "deflated_sharpe: non-finite result; reporting a "
+                        "conservative 0.0 (fails the DSR floor)."
+                    )
+                    deflated = 0.0
 
     # ---- Monte-Carlo permutation tests (timing-skill null) ----
     # The permutation statistic is order-sensitive (_timing_pnl); plain
@@ -567,12 +670,17 @@ def validate_returns(
     )
 
     # ---- Excess-return series (optional) ----
+    # cs39: pair strat/bh on a SHARED finite mask BEFORE subtracting so every
+    # excess element pairs SAME-DATE strat/bh bars. We re-coerce strat_returns
+    # here (rather than reuse the independently-compressed `r`) because a
+    # non-finite in EITHER series must drop that bar from BOTH; the per-series
+    # `r` above is still correct for the strat-only Sharpe/DSR/timing stats.
     excess = None
     if bh_returns is not None:
-        bh = _to_array(bh_returns)
-        m = min(r.size, bh.size)
+        r_paired, bh_paired = _paired_finite(strat_returns, bh_returns)
+        m = r_paired.size
         if m >= 2:
-            excess = r[:m] - bh[:m]
+            excess = r_paired - bh_paired
             obs, p, pmean, pstd = _permutation_pvalue(
                 excess, _timing_pnl, n_permutations=n_permutations, rng=perm_rng
             )

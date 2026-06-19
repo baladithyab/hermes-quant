@@ -23,13 +23,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 GOVERNANCE_HOME = QUANT_HOME / "governance"
 AUDIT_LOG_PATH = GOVERNANCE_HOME / "audit_log.jsonl"
 
@@ -45,6 +47,8 @@ EventKind = Literal[
     "retro_amendment_applied",
     "state_reconstruction_failed",
     "research_debate",  # ADR-0065 (v0.6.1, G1): Bull/Bear adversarial stage.
+    "per_position_stop_fired",  # per-position unrealized-loss stop (the 2026-06-04 ASTS fix).
+    "per_position_take_profit_fired",  # AG-EQ-1 per-position take-profit (gain target).
 ]
 
 VALID_KINDS: tuple[str, ...] = (
@@ -57,6 +61,8 @@ VALID_KINDS: tuple[str, ...] = (
     "retro_amendment_applied",
     "state_reconstruction_failed",
     "research_debate",  # ADR-0065 (v0.6.1, G1): Bull/Bear adversarial stage.
+    "per_position_stop_fired",  # per-position unrealized-loss stop (the 2026-06-04 ASTS fix).
+    "per_position_take_profit_fired",  # AG-EQ-1 per-position take-profit (gain target).
 )
 
 
@@ -192,6 +198,20 @@ def read(
 
             row_kind = row.get("kind")
             if kinds is not None and row_kind not in kinds:
+                continue
+
+            # ar56: extension kinds (e.g. the *_llm_call rows written by the LLM
+            # producers via the raw append path that bypasses append()'s VALID_KINDS
+            # gate, ADR-0054) carry the CURRENT schema_version so they survive the
+            # version guard above — but GovernanceEvent.kind is a restricted Literal, so
+            # reconstructing one below raises a pydantic ValidationError. Skip-and-log
+            # them here (mirroring the corrupt-line / non-dict skips) so an UNFILTERED
+            # reader (kinds=None) — e.g. governance.promotion._collect_metrics — does not
+            # become permanently un-evaluable on a log poisoned by extension rows.
+            if row_kind not in VALID_KINDS:
+                logger.warning(
+                    "audit-log: skipping unknown/extension kind %r in %s", row_kind, path
+                )
                 continue
 
             asof_raw = row.get("asof")

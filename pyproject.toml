@@ -48,6 +48,10 @@ alpaca = ["alpaca-py>=0.30"]
 # transitive base dep; this extra is symbolic (mirrors the empty `options`
 # extra) so consumers can opt-in explicitly.
 alphavantage = ["requests>=2.31"]
+# OpenBB perception provider (aegis-ob1, ADR-0100). 2nd OHLCV tier behind
+# yfinance; DEFAULT-OFF (HERMES_QUANT_OPENBB). Heavy/optional — the SDK is
+# lazy-imported only when the flag is on, so the base install never pulls it.
+openbb = ["openbb>=4.3"]
 # Kronos foundation-model analyst (heavy: torch + HF)
 kronos = [
     "torch>=2.0",
@@ -125,6 +129,7 @@ deliberative_committee = "hermes_quant.aggregators.deliberative:DeliberativeComm
 
 [project.entry-points."hermes_quant.data_providers"]
 yfinance = "hermes_quant.data.yfinance_provider:YFinanceProvider"
+openbb = "hermes_quant.data.openbb_provider:OpenBBProvider"
 ccxt = "hermes_quant.data.ccxt_provider:CcxtProvider"
 alphavantage = "hermes_quant.data.alphavantage_provider:AlphaVantageProvider"
 # NOTE (B22, R-B22): the `alpaca` data-provider entry point was removed —
@@ -136,7 +141,13 @@ alphavantage = "hermes_quant.data.alphavantage_provider:AlphaVantageProvider"
 # alpaca-py SDK is used by the execution side).
 
 [project.scripts]
-hermes-quant-daemon = "hermes_quant.daemon.main:main"
+# NOTE (vestigial-daemon-spine deletion): the `hermes-quant-daemon` console
+# script pointed at `hermes_quant.daemon.main:main` — the long-lived
+# signals.jsonl tick loop. That spine is vestigial; the live spine is cron
+# scripts (ops/scripts/quant-*-tick.py, quant-daily-interim.py) that call
+# advisor.recommend + the react reactors directly. `daemon/main.py` was removed,
+# so the entry point is gone with it. Re-add it in the same commit that re-lands
+# a daemon entry module if the long-lived loop is ever resurrected.
 hermes-quant-trainer = "hermes_quant.training.main:main"
 
 [tool.setuptools]

@@ -114,6 +114,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -129,17 +130,18 @@ from hermes_quant.catalyst.propagation import (
     PropagationEdge,
     load_graph,
 )
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 logger = logging.getLogger(__name__)
 
 # The corpus the miner reads back (external market truth via the fetcher); identical
 # to profitability's default log path (propagation.py:188, profitability.py:28).
-_DEFAULT_LOG = Path.home() / ".hermes" / "quant" / "catalyst" / "propagation-log.jsonl"
+_DEFAULT_LOG = _resolve_quant_home() / "catalyst" / "propagation-log.jsonl"
 
 # The ONLY thing W5 writes: the candidate-edge diff for operator review (advisory
 # plane). Path matches the DESIGN doc exactly (graph_mining.py original :64).
 _DEFAULT_CANDIDATES = (
-    Path.home() / ".hermes" / "quant" / "catalyst" / "graph-mine-candidates.json"
+    _resolve_quant_home() / "catalyst" / "graph-mine-candidates.json"
 )
 
 # Verdicts the operator actually reviews (a change is proposed). KEEP is never
@@ -315,8 +317,15 @@ def mine_graph(
             except (ValueError, AttributeError):
                 continue
             fwd = fetcher(sym, asof_date)
-            if fwd is None or fwd == 0:
-                continue  # no realized data or flat — unscored (profitability.py:121)
+            # ar102 family-completeness: finite-guard the realized return BEFORE the
+            # sum, identical to the profitability.py sibling. A non-finite bar
+            # (NaN/inf from a corrupt/delisted/divide-by-near-zero close) passes both
+            # ``is None`` and ``== 0`` (nan==0 / inf==0 are False) and would poison
+            # ``sum_signed_return`` for the WHOLE edge -> the FLIP_SIGN/PRUNE verdict
+            # (mean_signed_return > 0 / < 0, both False for NaN) silently mis-mines.
+            # mine_graph is LIVE (afa4: GRAPH_MINING=1 + cron enabled, propose-only).
+            if fwd is None or not math.isfinite(fwd) or fwd == 0:
+                continue  # no realized data, non-finite, or flat — unscored (profitability.py)
             key: EdgeKey = (source, sym, relation)
             ev = evidence.get(key)
             if ev is None:

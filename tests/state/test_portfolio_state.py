@@ -84,6 +84,31 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             fh.write(json.dumps(rec) + "\n")
 
 
+@pytest.fixture(autouse=True)
+def _legacy_delta_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin HERMES_QUANT_DELTA_NORMALIZER=0 for this legacy fill-fold suite.
+
+    ADR-0091 Option E (the carry-forward normalizer) reinterprets the per-fill
+    size field as an ABSOLUTE target at fold time when the flag is ON. The tests
+    in this file predate that and assert the OLD additive/summing fold semantics:
+    each record's ``fill_size_pct`` is summed as an increment (e.g. +0.10 then
+    -0.05 ⇒ net 0.05). NOTE (seed `rt02`): the records themselves carry
+    ``target_position_pct == fill_size_pct`` (absolute-target shaped, like every
+    real producer record) — it is the LEGACY FOLD that READS them additively, not
+    the records that are "delta-shaped". So under flag-ON the normalizer reads the
+    same records as absolute targets and a genuine multi-tick partial-add toward
+    one target becomes indistinguishable from a re-affirmation (the rt02 semantic
+    gap). These legacy assertions are correct under the production default (flag
+    OFF) and must NOT run under an ambient flag-ON regime, where the assertions
+    would (correctly, per Option E) flip.
+
+    This autouse default is OVERRIDDEN by the one test that explicitly opts into
+    the normalizer (TestMultipleSymbols::...flag-on..., which calls
+    monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1") after this fixture).
+    """
+    monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "0")
+
+
 @pytest.fixture()
 def ps(tmp_path: Path) -> PortfolioState:
     """Fresh PortfolioState backed by isolated tmp_path DB."""
@@ -247,9 +272,15 @@ class TestMultipleSymbols:
         self, ps: PortfolioState, executions_path: Path
     ):
         """Two distinct symbols produce two separate position rows."""
+        # Distinct fills carry distinct proposal_ids — a proposal targets ONE asset,
+        # so two symbols are two proposals. (Sharing the default "prop_test" would
+        # collide the cs51 idempotency key on the legacy NAV-fraction path, exactly
+        # as the incremental fold dedups them; the cs57 rebuild fold now matches that.)
         records = [
-            _make_record(asset="AAPL", fill_size_pct=0.03, fill_price=150.0),
-            _make_record(asset="MSFT", fill_size_pct=0.04, fill_price=300.0),
+            _make_record(asset="AAPL", fill_size_pct=0.03, fill_price=150.0,
+                         proposal_id="prop_aapl"),
+            _make_record(asset="MSFT", fill_size_pct=0.04, fill_price=300.0,
+                         proposal_id="prop_msft"),
         ]
         _write_jsonl(executions_path, records)
         ps.reconstruct_from(executions_path)
@@ -285,11 +316,85 @@ class TestMultipleSymbols:
         expected_avg = (0.05 * 100.0 + 0.05 * 120.0) / 0.10
         assert pos.avg_entry_price == pytest.approx(expected_avg, rel=1e-9)
 
+    def test_reaffirmation_does_not_inflate(
+        self, ps: PortfolioState, executions_path: Path, monkeypatch
+    ):
+        """N re-affirmations of the SAME target fold to ONE intended position.
+
+        Canonical ADR-0091 re-affirmation scenario. Each record carries the SAME
+        absolute target (0.05 for AAPL long, -0.2 for BA short) but a DISTINCT
+        proposal_id — i.e. the advisor re-affirmed an already-held, unchanged
+        target N times.
+
+        CORRECT end state: a single intended position (AAPL 0.05, BA -0.2),
+        because every fire after the first is an effective-delta-0 re-affirmation
+        of the same target. Cost basis stays at the first-fire fill_price; cash
+        moves only once per symbol (the genuine open).
+
+        This was a strict-xfail regression spec (cr09) until the Increment-0
+        Option-E shared fold-time normalizer landed (cr09/ra01). With
+        HERMES_QUANT_DELTA_NORMALIZER=1 it now PASSES: a re-affirmation folds to
+        delta 0 instead of inflating to N*target (AAPL 12 x 0.05 = 0.60;
+        BA 6 x -0.2 = -1.20 under the legacy fold). The flag-OFF legacy inflation
+        is covered separately in tests/state/test_normalizer_wired_fold.py.
+        """
+        monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
+        # AAPL: 12 re-affirmations of the same 0.05 long target (distinct ids).
+        aapl_records = [
+            _make_record(
+                asset="AAPL",
+                fill_size_pct=0.05,
+                fill_price=100.0,
+                asof=f"2026-05-27T10:{minute:02d}:00.000000Z",
+                proposal_id=f"prop_aapl_{minute:02d}",
+            )
+            for minute in range(12)
+        ]
+        # BA: 6 re-affirmations of the same -0.2 short target (distinct ids).
+        ba_records = [
+            _make_record(
+                asset="BA",
+                fill_size_pct=-0.2,
+                fill_price=200.0,
+                asof=f"2026-05-27T11:{minute:02d}:00.000000Z",
+                proposal_id=f"prop_ba_{minute:02d}",
+            )
+            for minute in range(6)
+        ]
+        _write_jsonl(executions_path, [*aapl_records, *ba_records])
+
+        result = ps.reconstruct_from(executions_path)
+        assert result.executions_processed == 18
+
+        positions = ps.get_positions("paper-default")
+
+        # AAPL stays at the single intended 0.05 long (NOT 12 x 0.05 = 0.60).
+        aapl = positions[("equity", "AAPL")]
+        assert aapl.quantity == pytest.approx(0.05, rel=1e-9)
+        assert aapl.avg_entry_price == pytest.approx(100.0, rel=1e-9)
+
+        # BA stays at the single intended -0.2 short (NOT 6 x -0.2 = -1.20).
+        ba = positions[("equity", "BA")]
+        assert ba.quantity == pytest.approx(-0.2, rel=1e-9)
+        assert ba.avg_entry_price == pytest.approx(200.0, rel=1e-9)
+
+        # Cash moves only once per symbol: one genuine open each, the
+        # re-affirmations are delta-0 (no cash impact).
+        #   AAPL long  -> cash -= 0.05 * 100.0 = 5.0
+        #   BA short   -> cash -= (-0.2) * 200.0 = -40.0 (short credits cash)
+        expected_cash = 100_000.0 - (0.05 * 100.0) - (-0.2 * 200.0)
+        cash = ps.get_cash("paper-default")
+        assert cash is not None
+        assert cash.balance_usd == pytest.approx(expected_cash, rel=1e-9)
+
     def test_multi_symbol_cash_sum(self, ps: PortfolioState, executions_path: Path):
         """Cash decremented by sum of all fill costs."""
+        # Distinct fills carry distinct proposal_ids (see test_two_symbols_separate_positions).
         records = [
-            _make_record(asset="AAPL", fill_size_pct=0.02, fill_price=100.0),
-            _make_record(asset="MSFT", fill_size_pct=0.03, fill_price=200.0),
+            _make_record(asset="AAPL", fill_size_pct=0.02, fill_price=100.0,
+                         proposal_id="prop_aapl"),
+            _make_record(asset="MSFT", fill_size_pct=0.03, fill_price=200.0,
+                         proposal_id="prop_msft"),
         ]
         _write_jsonl(executions_path, records)
         ps.reconstruct_from(executions_path)
@@ -334,12 +439,14 @@ class TestIdempotency:
         self, ps: PortfolioState, executions_path: Path
     ):
         """Full rebuild clears positions from a previous different state."""
-        # First write with AAPL + MSFT
+        # First write with AAPL + MSFT (distinct fills => distinct proposal_ids).
         _write_jsonl(
             executions_path,
             [
-                _make_record(asset="AAPL", fill_size_pct=0.05, fill_price=100.0),
-                _make_record(asset="MSFT", fill_size_pct=0.03, fill_price=200.0),
+                _make_record(asset="AAPL", fill_size_pct=0.05, fill_price=100.0,
+                             proposal_id="prop_aapl"),
+                _make_record(asset="MSFT", fill_size_pct=0.03, fill_price=200.0,
+                             proposal_id="prop_msft"),
             ],
         )
         ps.reconstruct_from(executions_path)
@@ -348,7 +455,8 @@ class TestIdempotency:
         # Now overwrite JSONL with only AAPL
         _write_jsonl(
             executions_path,
-            [_make_record(asset="AAPL", fill_size_pct=0.05, fill_price=100.0)],
+            [_make_record(asset="AAPL", fill_size_pct=0.05, fill_price=100.0,
+                          proposal_id="prop_aapl")],
         )
         ps.reconstruct_from(executions_path)
         positions = ps.get_positions("paper-default")
@@ -573,18 +681,22 @@ class TestMultipleAccounts:
         self, ps: PortfolioState, executions_path: Path
     ):
         """Two accounts have independent positions and cash."""
+        # Distinct fills (different account AND asset) carry distinct proposal_ids;
+        # the shared default would collide the cs51 legacy-path idempotency key.
         records = [
             _make_record(
                 account_id="paper-a",
                 asset="AAPL",
                 fill_size_pct=0.05,
                 fill_price=100.0,
+                proposal_id="prop_a",
             ),
             _make_record(
                 account_id="paper-b",
                 asset="MSFT",
                 fill_size_pct=0.10,
                 fill_price=200.0,
+                proposal_id="prop_b",
             ),
         ]
         _write_jsonl(executions_path, records)
@@ -884,10 +996,13 @@ class TestReconstructionResult:
         self, ps: PortfolioState, executions_path: Path
     ):
         """ReconstructionResult.accounts_seen contains all account_ids seen."""
+        # acc-a and acc-b are distinct fills (distinct proposal_ids); the third
+        # record is a true byte-duplicate of the first acc-a fill (same proposal_id),
+        # so the cs57 rebuild dedup folds it once — acc-a is still seen exactly once.
         records = [
-            _make_record(account_id="acc-a"),
-            _make_record(account_id="acc-b"),
-            _make_record(account_id="acc-a"),  # duplicate — counted once
+            _make_record(account_id="acc-a", proposal_id="prop_a"),
+            _make_record(account_id="acc-b", proposal_id="prop_b"),
+            _make_record(account_id="acc-a", proposal_id="prop_a"),  # duplicate
         ]
         _write_jsonl(executions_path, records)
         result = ps.reconstruct_from(executions_path)
@@ -896,8 +1011,10 @@ class TestReconstructionResult:
     def test_executions_processed_count(
         self, ps: PortfolioState, executions_path: Path
     ):
-        """executions_processed matches number of valid records."""
-        records = [_make_record() for _ in range(5)]
+        """executions_processed matches number of valid DISTINCT records."""
+        # Distinct fills carry distinct proposal_ids; 5 byte-identical default records
+        # would be one fill under both the incremental and (post-cs57) rebuild folds.
+        records = [_make_record(proposal_id=f"prop_{i}") for i in range(5)]
         _write_jsonl(executions_path, records)
         result = ps.reconstruct_from(executions_path)
         assert result.executions_processed == 5

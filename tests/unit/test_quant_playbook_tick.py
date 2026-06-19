@@ -26,9 +26,16 @@ from unittest import mock
 import pytest
 
 
-SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "quant-playbook-tick.py"
+SCRIPT_PATH = Path(__file__).resolve().parents[2] / "ops" / "scripts" / "quant-playbook-tick.py"
 if not SCRIPT_PATH.exists():
-    SCRIPT_PATH = Path.home() / ".hermes" / "scripts" / "quant-playbook-tick.py"
+    # Legacy location + the deployed cron copy, in priority order.
+    for _candidate in (
+        Path(__file__).resolve().parents[2] / "scripts" / "quant-playbook-tick.py",
+        Path.home() / ".hermes" / "scripts" / "quant-playbook-tick.py",
+    ):
+        if _candidate.exists():
+            SCRIPT_PATH = _candidate
+            break
 
 pytestmark = pytest.mark.skipif(
     not SCRIPT_PATH.exists(),
@@ -169,8 +176,9 @@ def test_idempotent_same_day_run(tick_module, monkeypatch):
     _write_watchlist(tick_module, [("AAPL", "swing", 0.9)])
     monkeypatch.setattr(
         tick_module, "place_paper_market_order",
-        lambda sym, notional, side="buy": {"id": "fake-order-1", "client_order_id": "c1",
-                                             "submitted_at": "2026-05-26T13:00:00Z"},
+        lambda sym, notional, side="buy", client_order_id=None: {
+            "id": "fake-order-1", "client_order_id": "c1",
+            "submitted_at": "2026-05-26T13:00:00Z"},
     )
 
     s1 = tick_module.run_tick(dry_run=False)
@@ -195,7 +203,8 @@ def test_dry_run_does_not_block_subsequent_real_fire(tick_module, monkeypatch):
 
     monkeypatch.setattr(
         tick_module, "place_paper_market_order",
-        lambda sym, notional, side="buy": {"id": "fake-real-1", "client_order_id": "c1"},
+        lambda sym, notional, side="buy", client_order_id=None: {
+            "id": "fake-real-1", "client_order_id": "c1"},
     )
     s2 = tick_module.run_tick(dry_run=False)
     assert s2["fired"] == 1

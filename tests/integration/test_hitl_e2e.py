@@ -320,6 +320,148 @@ def test_approve_admissibility_rejected_short_stays_pending_and_honest(
     assert not exec_path.exists() or exec_path.read_text().strip() == ""
 
 
+def test_approve_cap_silenced_stays_pending_and_honest(
+    isolated_store, monkeypatch, tmp_path
+):
+    """cs02: when the reactor's portfolio-cap clip SILENCES a fill (0-fill, no bus
+    write, reactor_metadata.silenced=True), quant_approve must NOT report
+    success / advance the proposal to 'approved' with the original size — it must
+    surface the silence, keep the proposal PENDING (so the operator can re-approve
+    when headroom frees), and report realized 0.0. Mirrors the admissibility branch
+    (which already does this); the cap-silence path was missing the same treatment."""
+    _set_hitl_mode(monkeypatch, tmp_path)
+    _patch_default_store(monkeypatch, isolated_store)
+    exec_path = tmp_path / "executions.jsonl"
+    _patch_executions_path(monkeypatch, exec_path)
+
+    from hermes_quant.react.base import ExecutionRecord
+    import hermes_quant.react.dispatch as dispatch_module
+    import hermes_quant.tools as tools_module
+
+    proposal = isolated_store.propose(
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
+        advisor_result=_sample_advisor_result(kelly=0.10),
+    )
+
+    # A reactor whose cap clip fully silences the fire (the react/paper.py:488-501
+    # silence record): 0-fill, not appended to the bus, flagged silenced.
+    def _silenced_record(prop):
+        return ExecutionRecord(
+            proposal_id=prop.proposal_id,
+            signal_id=None,
+            asset=prop.symbol,
+            asset_class=prop.asset_class,
+            timeframe=prop.timeframe,
+            asof_decision="2026-06-13T00:00:00Z",
+            asof_execution="2026-06-13T00:00:00Z",
+            target_position_pct=0.10,
+            decision_price=100.0,
+            fill_price=100.0,
+            fill_size_pct=0.0,
+            reactor_name="paper",
+            human_in_the_loop=True,
+            reactor_metadata={"silenced": True, "silence_reason": "portfolio_cap_no_headroom"},
+        )
+
+    class _SilencingReactor:
+        name = "paper"
+
+        def execute(self, prop, **kwargs):
+            return _silenced_record(prop)
+
+    monkeypatch.setattr(dispatch_module, "select_reactor", lambda prop: _SilencingReactor())
+
+    out = tools_module.quant_approve(
+        {"proposal_id": proposal.proposal_id, "size_override_pct": 0.10}
+    )
+    parsed = json.loads(out)
+
+    # Honest response: NOT a success; the proposal stays pending; no original size.
+    assert parsed["success"] is False, f"cap-silence reported as success: {parsed}"
+    assert "silenc" in (parsed.get("error", "") + parsed.get("silence_reason", "")).lower()
+    assert parsed["state"] == "pending"
+    # The proposal was NOT consumed — operator can re-approve when headroom frees.
+    final = isolated_store.get(proposal.proposal_id)
+    assert final.state == "pending"
+
+
+@pytest.mark.parametrize(
+    "nofill_meta,label",
+    [
+        ({"no_fill": True, "no_fill_reason": "bp_rejected", "bp_rejected": True}, "deterministic_equity_bp_rejected"),
+        ({"no_fill": True, "broker_status": "rejected", "role": "parent"}, "multileg_nofill_parent"),
+        ({"unfilled_timeout": True, "alpaca_order_id": "ord-123"}, "alpaca_unfilled_timeout"),
+    ],
+)
+def test_approve_broker_nofill_stays_pending_and_honest(
+    isolated_store, monkeypatch, tmp_path, nofill_meta, label
+):
+    """ar27 (cs02/ar16 family): the flag-gated reactors signal a no-fill via
+    reactor_metadata.no_fill / unfilled_timeout / bp_rejected (NOT silenced). The
+    DEFAULT PaperReactor uses silenced=True (handled); these flag-gated lanes
+    previously fell through to record_execution -> state=approved -> success:True
+    echoing the REQUESTED size for a fill that never happened, AND irrecoverably
+    consumed the pending proposal. quant_approve must instead report success=False,
+    keep the proposal PENDING, and report realized 0.0 — never claim a no-fill as a
+    successful approval."""
+    _set_hitl_mode(monkeypatch, tmp_path)
+    _patch_default_store(monkeypatch, isolated_store)
+    exec_path = tmp_path / "executions.jsonl"
+    _patch_executions_path(monkeypatch, exec_path)
+
+    from hermes_quant.react.base import ExecutionRecord
+    import hermes_quant.react.dispatch as dispatch_module
+    import hermes_quant.tools as tools_module
+
+    proposal = isolated_store.propose(
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
+        advisor_result=_sample_advisor_result(kelly=0.10),
+    )
+
+    def _nofill_record(prop):
+        return ExecutionRecord(
+            proposal_id=prop.proposal_id,
+            signal_id=None,
+            asset=prop.symbol,
+            asset_class=prop.asset_class,
+            timeframe=prop.timeframe,
+            asof_decision="2026-06-15T00:00:00Z",
+            asof_execution="2026-06-15T00:00:00Z",
+            target_position_pct=0.10,
+            decision_price=100.0,
+            fill_price=100.0,
+            fill_size_pct=0.0,  # NO fill — no capital moved
+            reactor_name="paper",
+            human_in_the_loop=True,
+            reactor_metadata=dict(nofill_meta),
+        )
+
+    class _NoFillReactor:
+        name = "paper"
+
+        def execute(self, prop, **kwargs):
+            return _nofill_record(prop)
+
+    monkeypatch.setattr(dispatch_module, "select_reactor", lambda prop: _NoFillReactor())
+
+    out = tools_module.quant_approve(
+        {"proposal_id": proposal.proposal_id, "size_override_pct": 0.10}
+    )
+    parsed = json.loads(out)
+
+    assert parsed["success"] is False, f"{label}: a broker no-fill was reported as success: {parsed}"
+    assert parsed["state"] == "pending", f"{label}: proposal advanced past pending on a no-fill"
+    assert parsed.get("realized_fill_size_pct", 0.0) == 0.0
+    # The pending proposal was NOT consumed — operator can re-approve.
+    assert isolated_store.get(proposal.proposal_id).state == "pending"
+    # Nothing position-moving was written to the bus.
+    assert not exec_path.exists() or exec_path.read_text().strip() == ""
+
+
 # ---------------------------------------------------------------------------
 # 6: Approve already-approved -> state_mismatch
 # ---------------------------------------------------------------------------
@@ -734,3 +876,104 @@ def test_proposal_id_format_per_adr():
     # last part = 6 hex chars
     assert len(parts[-1]) == 6
     assert all(c in "0123456789abcdef" for c in parts[-1])
+
+
+# ---------------------------------------------------------------------------
+# Profile-aware mode-gate path resolution (ADR-0013 §D4 alignment)
+#
+# The HITL tools' mode gate (_read_pdr_mode in hermes_quant.tools) must read the
+# SAME profile-aware config path the autonomous engine reads. Otherwise a stale
+# pre-migration GLOBAL ~/.hermes/config.yaml (mode=hitl) can override the active
+# profile's ~/.hermes/profiles/<name>/config.yaml (mode=advise) — fail-OPEN: the
+# operator set advise (NO trading) but quant_approve would still fire a fill.
+# ---------------------------------------------------------------------------
+
+
+def _write_config(path: Path, mode: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"quant:\n  pdr:\n    mode: {mode}\n")
+
+
+def test_tools_read_pdr_mode_is_profile_aware(monkeypatch, tmp_path):
+    """RED: when HERMES_PROFILE is set, tools._read_pdr_mode must read the active
+    profile config — not the stale global file. Matches autonomous._read_pdr_mode."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "prod")
+
+    # Global says hitl (stale); active profile says advise (operator intent).
+    _write_config(tmp_path / ".hermes" / "config.yaml", "hitl")
+    _write_config(tmp_path / ".hermes" / "profiles" / "prod" / "config.yaml", "advise")
+
+    import hermes_quant.autonomous as autonomous
+    import hermes_quant.tools as tools
+
+    engine_mode = autonomous._read_pdr_mode()
+    tools_mode = tools._read_pdr_mode()
+
+    # Engine is the canonical reference: it reads the profile (advise).
+    assert engine_mode == "advise"
+    # Tools MUST agree — no precedence split between engine and HITL seams.
+    assert tools_mode == "advise", (
+        f"tools read stale GLOBAL mode={tools_mode!r} but active profile is "
+        f"engine_mode={engine_mode!r} — fail-OPEN at the HITL mode gate"
+    )
+
+
+def test_quant_approve_respects_profile_mode_advise(
+    isolated_store, monkeypatch, tmp_path
+):
+    """RED: with HERMES_PROFILE=prod (profile mode=advise) but a stale global
+    config (mode=hitl), quant_approve must refuse with mode_mismatch and NOT
+    proceed to select_reactor(...).execute(...). Currently it fires."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("HERMES_PROFILE", "prod")
+
+    _write_config(tmp_path / ".hermes" / "config.yaml", "hitl")
+    _write_config(tmp_path / ".hermes" / "profiles" / "prod" / "config.yaml", "advise")
+
+    # Store a REAL pending proposal so that, on the fail-open path, quant_approve
+    # passes the (stale) mode gate AND finds the proposal — reaching reactor
+    # dispatch. With the fix, the mode gate short-circuits before lookup.
+    _patch_default_store(monkeypatch, isolated_store)
+    proposal = isolated_store.propose(
+        symbol="AAPL",
+        asset_class="equity",
+        timeframe="1d",
+        advisor_result=_sample_advisor_result(),
+    )
+
+    # Guard: if the gate is (wrongly) bypassed, the reactor dispatch would be
+    # invoked. quant_approve does `from hermes_quant.react.dispatch import
+    # select_reactor`, so patch the dispatch module's symbol. We assert it is
+    # NEVER reached — the mode_mismatch must short-circuit first.
+    import hermes_quant.react.dispatch as dispatch_module
+    import hermes_quant.tools as tools
+
+    def _boom(*_a, **_k):
+        raise AssertionError(
+            "select_reactor reached in advise-only profile — mode gate failed OPEN"
+        )
+
+    monkeypatch.setattr(dispatch_module, "select_reactor", _boom, raising=False)
+
+    out = tools.quant_approve({"proposal_id": proposal.proposal_id})
+    parsed = json.loads(out)
+    assert parsed["success"] is False
+    assert parsed["error"] == "mode_mismatch"
+    assert parsed["current_mode"] == "advise"
+
+
+def test_tools_read_pdr_mode_global_when_no_profile(monkeypatch, tmp_path):
+    """Byte-identical when HERMES_PROFILE is unset: falls back to the global
+    ~/.hermes/config.yaml exactly as before."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+
+    _write_config(tmp_path / ".hermes" / "config.yaml", "hitl")
+
+    import hermes_quant.tools as tools
+
+    assert tools._read_pdr_mode() == "hitl"

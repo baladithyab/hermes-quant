@@ -50,8 +50,13 @@ return.
 
 from __future__ import annotations
 
+import fcntl
+import json
 import logging
+import math
+import os
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -400,6 +405,15 @@ def dispatch_settlement(
 #   - deterministic: FIFO lot matching over records in bus order; no RNG, no
 #     clock reads.
 
+# ar57: US equity-option contract multiplier (shares controlled per contract). A
+# us_option fill_price is a PER-CONTRACT premium; true notional = premium × contracts
+# × 100. Mirrors portfolio_state._CONTRACT_MULTIPLIER / options.data._CONTRACT_MULTIPLIER;
+# defined locally so the daemon does not import the options package. Used ONLY to weight
+# multi-leg per-leg children by their TRUE per-leg notional fraction of NAV on the
+# kill-switch basis (compute_cumulative_realized_pnl_pct); has no effect on single-leg
+# round-trips (notional_multiplier defaults to 1.0).
+_OPTION_CONTRACT_MULTIPLIER = 100.0
+
 
 @dataclass(frozen=True)
 class SettledRoundTrip:
@@ -438,6 +452,19 @@ class SettledRoundTrip:
     The fee drag (prorated fees / entry notional) is subtracted from gross so
     the sign convention is "positive return == the lot made money".
     """
+    # ar57: multi-leg per-leg true-notional weighting (default None/0.0/1.0 keeps
+    # every single-leg / equity round-trip byte-identical). For a MultiLegPaperReactor
+    # per-leg CHILD, ``qty`` is the WHOLE-family NAV fraction F (the proxy
+    # _build_records writes on every leg), NOT a true per-leg weight. The kill-switch
+    # basis must instead weight each leg by its TRUE per-leg notional fraction of NAV,
+    # derived from the authoritative signed-true-units in reactor_metadata.quantity
+    # (multileg.py docstring declares ``quantity`` authoritative; the fraction a
+    # "proxy"). These carry that true unit count + the contract multiplier so the
+    # rail can compute abs(true_units)·entry_price·multiplier per leg. Non-multileg
+    # records leave multi_leg_id None and stay on the realized_return×qty fast-path.
+    multi_leg_id: str | None = None
+    true_units: float | None = None  # signed reactor_metadata.quantity (matched share)
+    notional_multiplier: float = 1.0  # 100 for us_option, 1 for equity
 
 
 def _coerce_asof(value) -> pd.Timestamp | None:
@@ -512,6 +539,22 @@ def _normalize_exec_record(rec: dict) -> dict | None:
     is not a well-formed fill (no signed size, non-positive price, …). None
     records are skipped by the caller — never fabricated.
     """
+    # ar19: SKIP the multi-leg family-PARENT rollup record, exactly as
+    # state.portfolio_state does in both folds (cs44, _is_multileg_family_parent).
+    # MultiLegPaperReactor._build_records writes a parent ExecutionRecord with
+    # asset_class=="multi_leg", asset=underlying, fill_price=net_fill, and a NONZERO
+    # fill_size_pct (the whole family's NAV fraction) IN ADDITION to the per-leg
+    # children. Without this skip the parent derives its own side/qty from that
+    # nonzero fraction and produces a PHANTOM round-trip in join_exit_fills, on top
+    # of the real per-leg child round-trips — double-counting the family's realized
+    # P&L into compute_cumulative_realized_pnl_pct (the live ADR-0016 kill-switch
+    # basis). A phantom contribution biases the rail (a phantom gain masks a real
+    # loss → the kill-switch fails to trip). asset_class=="multi_leg" is the
+    # parent-ONLY discriminator (no real position class is "multi_leg"; the children
+    # carry "equity"/"us_option"), so this is byte-identical for every real fill.
+    if rec.get("asset_class") == "multi_leg":
+        return None
+
     rmeta = rec.get("reactor_metadata")
     if not isinstance(rmeta, dict):
         rmeta = {}
@@ -544,6 +587,17 @@ def _normalize_exec_record(rec: dict) -> dict | None:
         fill_price = float(rec["fill_price"])
     except (KeyError, TypeError, ValueError):
         return None
+    # iter3: finite-guard BEFORE the <= gate. A NaN qty/fill_price (json.loads
+    # accepts bare NaN/Infinity; an upstream divide can also produce inf) defeats
+    # every comparison below (NaN <= 0 is False), so without this a NaN lot enters
+    # the FIFO queue as a "zombie" — it is never popped (NaN <= 1e-12 is False) and
+    # silently consumes every subsequent real exit for its bucket into matched=NaN,
+    # producing a round-trip with realized_return*NaN that _sum_round_trip_realized_
+    # fraction then drops (its own finite-guard `continue`s), UNDER-stating the
+    # kill-switch basis (fail-OPEN). Drop the record at parse time — byte-identical
+    # for every finite record (the ar08-12 NaN-defeats-the-gate family).
+    if not math.isfinite(qty_f) or not math.isfinite(fill_price):
+        return None
     if qty_f <= 0 or fill_price <= 0:
         return None
 
@@ -569,6 +623,27 @@ def _normalize_exec_record(rec: dict) -> dict | None:
     )
     exec_id = rec.get("exec_id") or rec.get("proposal_id")
 
+    # ar57: capture the multi-leg per-leg true-unit weighting inputs. A
+    # MultiLegPaperReactor child carries reactor_metadata.multi_leg_id + the
+    # authoritative signed TRUE units in reactor_metadata.quantity; its
+    # fill_size_pct (and hence qty above) is the WHOLE-family NAV fraction F (a
+    # proxy), the SAME for every leg. We surface multi_leg_id + true_units +
+    # the contract multiplier so the kill-switch basis can re-weight each leg by
+    # its real per-leg notional fraction of NAV instead of the equal-F proxy.
+    # A record with no multi_leg_id leaves these None/1.0 -> the existing
+    # realized_return × qty fast-path is byte-identical.
+    multi_leg_id = rmeta.get("multi_leg_id")
+    true_units = rmeta.get("quantity") if multi_leg_id is not None else None
+    try:
+        true_units_f = float(true_units) if true_units is not None else None
+    except (TypeError, ValueError):
+        true_units_f = None
+    notional_multiplier = (
+        _OPTION_CONTRACT_MULTIPLIER
+        if rec.get("asset_class") == "us_option"
+        else 1.0
+    )
+
     return {
         "side": side,
         "qty": qty_f,
@@ -580,6 +655,9 @@ def _normalize_exec_record(rec: dict) -> dict | None:
         "exec_id": exec_id,
         "signal_id": rec.get("signal_id"),
         "fees": fees,
+        "multi_leg_id": multi_leg_id,
+        "true_units": true_units_f,
+        "notional_multiplier": notional_multiplier,
         "_idx": rec.get("_idx", 0),
     }
 
@@ -639,16 +717,101 @@ def join_exit_fills(
             Quantity still in open_lots has realized_return = None semantics
             (it is simply absent from round_trips — never a fabricated 0).
     """
+    # Materialize the read-only input once (it may be a one-shot iterable).
+    raw_records = list(execution_records)
+
+    # i0c (ADR-0091 Option E, flag-gated): the production ExecutionRecord schema
+    # writes `fill_size_pct` as the ABSOLUTE post-fill target, but this FIFO reads
+    # it as a traded DELTA. Under HERMES_QUANT_DELTA_NORMALIZER==1 we run the ONE
+    # shared FillDeltaNormalizer as a pre-pass so the FIFO sees the true increment
+    # (re-affirm -> delta 0 -> skipped; flatten-to-0 -> the negative close delta),
+    # exactly mirroring the position fold (portfolio_state.py:621-633,662). Flag
+    # OFF (production default) => no pre-pass => the FIFO reads the raw field =>
+    # byte-identical to legacy. The normalizer's carry-forward delta = target -
+    # running_net is ORDER-DEPENDENT, so it must see records in asof order: we
+    # stable-sort a COPY by asof_execution (mirror portfolio_state.py:633) and
+    # override `fill_size_pct` on a SHALLOW COPY of each record (records are
+    # read-only per the docstring) BEFORE _normalize_exec_record runs.
+    if os.environ.get("HERMES_QUANT_DELTA_NORMALIZER", "0") == "1":
+        from hermes_quant.state.fill_delta_normalizer import FillDeltaNormalizer
+
+        _normalizer = FillDeltaNormalizer()
+        _ordered_for_norm = sorted(
+            raw_records, key=lambda r: r.get("asof_execution") or ""
+        )
+        normalized_records: list[dict] = []
+        for rec in _ordered_for_norm:
+            rec_copy = dict(rec)
+            rec_copy["fill_size_pct"] = _normalizer.delta_for(rec)
+            normalized_records.append(rec_copy)
+        raw_records = normalized_records
+
     # bucket_key -> list of open lots (FIFO; each lot is a mutable dict).
     lots: dict[tuple, list[dict]] = {}
+    # 335e: lots (deferred exits AND the real position lots that share a bucket
+    # with a deferred exit) re-expressed as records and re-fed into THIS call's
+    # matching stream. A deferred exit was previously copied forward verbatim and
+    # NEVER re-matched, so it could never settle even when a valid earlier opening
+    # lot arrived later. Re-feeding both the deferred exit and its bucket's real
+    # lots through the asof-sorted matcher lets the earlier opener settle the
+    # deferred exit; a deferred exit still without an honest opener RE-DEFERS.
+    redrain_records: list[dict] = []
+    # Which real buckets must be re-fed as records (because a deferred exit shares
+    # them) instead of pre-loaded into the FIFO queue — pre-loading would pin the
+    # carry-in lots at the FRONT of the FIFO and block an earlier-arriving opener.
+    deferred_real_buckets: set[tuple] = set()
+    if open_lots:
+        for k in open_lots:
+            if k and k[0] == "_deferred":
+                deferred_real_buckets.add(tuple(k[1:]))
+
     if open_lots:
         # Deep-ish copy so we never mutate the caller's carry-in structure.
         # Review-team-3 defect (4): re-coerce each carried-in lot's asof to UTC
         # tz-aware so a naive carry-in value (from an older record) never mixes
         # with this call's tz-aware exit asof at the asof-honesty comparison.
-        # Namespaced ("_deferred", ...) keys carry still-pending deferred exits
-        # forward verbatim — they are not position lots and are not re-matched.
         for k, v in open_lots.items():
+            is_deferred = bool(k) and k[0] == "_deferred"
+            real_bucket = tuple(k[1:]) if is_deferred else tuple(k)
+            if is_deferred or real_bucket in deferred_real_buckets:
+                # 335e: re-express each lot (deferred exit, OR a real position lot
+                # in a bucket that ALSO has a deferred exit) as a signed record so
+                # it rejoins the asof-sorted matching loop below. Side -> sign:
+                # buy -> +qty (opener), sell -> -qty (exit). The lot keeps its
+                # original asof, so the global re-sort orders the now-earlier
+                # opener before the deferred exit and the round-trip settles.
+                for lot in v:
+                    side = lot.get("side")
+                    qty = abs(float(lot.get("qty", 0.0)))
+                    if qty <= 0.0:
+                        continue
+                    signed = -qty if side == "sell" else qty
+                    asof = lot.get("asof")
+                    fee_per_unit = lot.get("fee_per_unit", 0.0) or 0.0
+                    redrain_records.append(
+                        {
+                            "asset": lot.get("asset"),
+                            "asset_class": lot.get("asset_class"),
+                            "account_id": lot.get("account_id"),
+                            "fill_size_pct": signed,
+                            "fill_price": lot.get("price"),
+                            "asof": asof,
+                            "asof_execution": asof,
+                            "exec_id": lot.get("exec_id"),
+                            "proposal_id": lot.get("exec_id"),
+                            "signal_id": lot.get("signal_id"),
+                            "fees": fee_per_unit * qty,
+                            # A re-drained DEFERRED EXIT must never OPEN a fresh
+                            # position lot — it was a closing intent. If the asof-
+                            # sorted matcher gives it no honest earlier opener to
+                            # close (empty / same-direction queue), it must RE-DEFER,
+                            # not become a phantom opener (which would invent a
+                            # lookahead round-trip). A re-fed REAL position lot has
+                            # no such tag — it is a genuine opener and opens freely.
+                            "_is_deferred_exit": is_deferred,
+                        }
+                    )
+                continue
             copied = []
             for lot in v:
                 lot_copy = dict(lot)
@@ -664,11 +827,31 @@ def join_exit_fills(
     # key on a real fill. The adapter derives them; non-fills return None and
     # are dropped (never fabricated). It also stamps the positional bus index
     # so defect (2)'s deterministic, open-before-close tie-break holds.
+    #
+    # 335e: the re-drained carry-in lots (deferred exits + their bucket's real
+    # lots, re-expressed as records above) are merged with this call's new records
+    # into ONE stream, then re-sorted by the asof-honest key. Each re-drained lot
+    # keeps its original asof, so a NEW opening lot whose asof is earlier than a
+    # deferred exit sorts first and the deferred exit settles against it; the
+    # existing matching loop, defer branch, and one-direction invariant are all
+    # unchanged. When there are no deferred buckets, redrain_records is empty and
+    # this is byte-identical to the legacy carry-in-pre-loaded path.
     indexed = []
-    for i, rec in enumerate(execution_records):
-        norm = _normalize_exec_record({**rec, "_idx": i})
+    next_idx = 0
+    for rec in redrain_records:
+        norm = _normalize_exec_record({**rec, "_idx": next_idx})
+        if norm is not None:
+            # _normalize_exec_record returns a fresh canonical dict and drops
+            # unknown keys; carry the deferred-exit marker forward so the matching
+            # loop can re-defer (not open) an unmatched deferred exit.
+            norm["_is_deferred_exit"] = bool(rec.get("_is_deferred_exit"))
+            indexed.append(norm)
+        next_idx += 1
+    for rec in raw_records:
+        norm = _normalize_exec_record({**rec, "_idx": next_idx})
         if norm is not None:
             indexed.append(norm)
+        next_idx += 1
     ordered = sorted(indexed, key=_exec_sort_key)
 
     round_trips: list[SettledRoundTrip] = []
@@ -704,6 +887,29 @@ def join_exit_fills(
         fee_per_unit = (fees / qty) if qty > 0 else 0.0
 
         if queue_side is None or queue_side == side:
+            # 335e: a re-drained DEFERRED EXIT that reaches the opening branch has
+            # no honest opposing opener earlier in the asof-sorted stream (the
+            # queue is empty or holds its OWN direction). It must NOT open a fresh
+            # position lot — that would invent a phantom opener (a lookahead round-
+            # trip when a later opener closes it). RE-DEFER it idempotently: hold
+            # it still-pending under the namespaced bucket exactly as the original
+            # deferral did, so the next incremental call can retry it.
+            if rec.get("_is_deferred_exit"):
+                deferred.setdefault(bucket, []).append(
+                    {
+                        "asset": rec.get("asset"),
+                        "account_id": rec.get("account_id"),
+                        "asset_class": rec.get("asset_class"),
+                        "side": side,
+                        "qty": qty,
+                        "price": fill_price,
+                        "asof": asof,
+                        "exec_id": rec.get("exec_id"),
+                        "signal_id": rec.get("signal_id"),
+                        "fee_per_unit": fee_per_unit,
+                    }
+                )
+                continue
             # Opening or adding to a same-direction lot — just enqueue.
             queue.append(
                 {
@@ -717,6 +923,11 @@ def join_exit_fills(
                     "exec_id": rec.get("exec_id"),
                     "signal_id": rec.get("signal_id"),
                     "fee_per_unit": fee_per_unit,
+                    # ar57: carry the multi-leg per-leg true-notional weighting inputs
+                    # forward to the round-trip (None/1.0 for non-multileg lots).
+                    "multi_leg_id": rec.get("multi_leg_id"),
+                    "true_units": rec.get("true_units"),
+                    "notional_multiplier": rec.get("notional_multiplier", 1.0),
                 }
             )
             continue
@@ -750,6 +961,19 @@ def join_exit_fills(
             fee_drag = (prorated_fees / entry_notional) if entry_notional > 0 else 0.0
             realized_return = gross - fee_drag
 
+            # ar57: prorate the entry lot's signed TRUE units (reactor_metadata.quantity)
+            # to the matched fraction of this pairing. lot["qty"] here is the PRE-decrement
+            # NAV-fraction (the decrement below happens after this append), so
+            # matched/lot["qty"] is the fraction of the lot settled by this exit. None for
+            # non-multileg lots -> the round-trip's true_units stays None (fast-path).
+            lot_true_units = lot.get("true_units")
+            lot_qty = lot["qty"]
+            matched_true_units = (
+                lot_true_units * (matched / lot_qty)
+                if (lot_true_units is not None and lot_qty > 0)
+                else None
+            )
+
             round_trips.append(
                 SettledRoundTrip(
                     asset=lot["asset"],
@@ -767,6 +991,9 @@ def join_exit_fills(
                     exit_signal_id=rec.get("signal_id"),
                     fees=prorated_fees,
                     realized_return=realized_return,
+                    multi_leg_id=lot.get("multi_leg_id"),
+                    true_units=matched_true_units,
+                    notional_multiplier=lot.get("notional_multiplier", 1.0),
                 )
             )
 
@@ -777,6 +1004,13 @@ def join_exit_fills(
 
         # Residual quantity beyond what the open queue could honestly settle.
         if remaining > 1e-12:
+            # ar57: prorate the residual's true units to the residual NAV-fraction.
+            rec_true_units = rec.get("true_units")
+            residual_true_units = (
+                rec_true_units * (remaining / qty)
+                if (rec_true_units is not None and qty > 0)
+                else None
+            )
             residual_lot = {
                 "asset": rec.get("asset"),
                 "account_id": rec.get("account_id"),
@@ -788,6 +1022,9 @@ def join_exit_fills(
                 "exec_id": rec.get("exec_id"),
                 "signal_id": rec.get("signal_id"),
                 "fee_per_unit": exit_fee_per_unit,
+                "multi_leg_id": rec.get("multi_leg_id"),
+                "true_units": residual_true_units,
+                "notional_multiplier": rec.get("notional_multiplier", 1.0),
             }
             if asof_honest_break:
                 # Defect (3): the queue still holds opposing lots that opened
@@ -885,6 +1122,120 @@ def compute_horizon_return(
     entry_notional = ep * q
     fee_drag = (fees / entry_notional) if (fees and entry_notional > 0) else 0.0
     return gross - fee_drag
+
+
+# ---------------------------------------------------------------------------
+# Loss-cooldown sidecar (HERMES_QUANT_POST_LOSS_COOLDOWN seam)
+#
+# The live autonomous tick constructs a fresh DefaultRiskGate() on every call
+# so Rule 4 (post-loss cooldown, gate.py:608-614) was always dead — _cooldowns
+# is always empty. The fix: persist a small JSON sidecar recording the latest
+# realized-loss timestamp per (account_id, asset_class, asset). The autonomous
+# tick reads it back and pre-seeds the gate's _cooldowns before calling
+# advisor.recommend(). The gate is the final authority (ADR-0004); the sidecar
+# merely restores state the gate already knew how to use.
+#
+# File layout (JSON):
+#   {
+#     "<account_id>|<asset_class>|<asset>": "<ISO-8601 UTC timestamp>",
+#     ...
+#   }
+# A "|"-joined key avoids nested dicts while staying human-readable. Values
+# are UTC ISO strings that round-trip through _coerce_asof.
+# ---------------------------------------------------------------------------
+
+
+def load_loss_cooldown_sidecar(
+    path: Path,
+) -> dict[tuple[str, str, str], pd.Timestamp]:
+    """Read the loss-cooldown sidecar and return a {(acct, ac, asset): ts} dict.
+
+    Returns an empty dict on any read/parse error (cold start or corrupt file
+    is treated as no prior losses — conservative-silent: Rule 4 simply has no
+    data to work from, same as today's always-empty _cooldowns).
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[tuple[str, str, str], pd.Timestamp] = {}
+        for k, v in raw.items():
+            parts = k.split("|", 2)
+            if len(parts) != 3:
+                continue
+            ts = _coerce_asof(v)
+            if ts is None:
+                continue
+            out[tuple(parts)] = ts  # type: ignore[assignment]
+        return out
+    except Exception:  # noqa: BLE001 - always fail-silent (no prior-loss data)
+        return {}
+
+
+@contextmanager
+def _flocked_sidecar(path: Path):  # type: ignore[return]
+    """Acquire an exclusive cross-process flock on a `.lock` sidecar file.
+
+    Mirrors the ``_flocked`` pattern in ``hermes_quant.watchlist``.  The lock
+    file is a small sentinel alongside the sidecar; it is created on first use
+    and never deleted (deletion + recreation is a TOCTOU window that defeats
+    the flock).
+
+    The caller is responsible for ensuring ``path.parent`` exists before
+    invoking this helper.
+    """
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def persist_loss_cooldown_sidecar(
+    losses: dict[tuple[str, str, str], pd.Timestamp],
+    path: Path,
+) -> None:
+    """Atomically write / merge the loss-cooldown sidecar.
+
+    Reads the current sidecar first and MERGES: for each key, keep the LATEST
+    (most-recent) timestamp so the sidecar records the last observed loss per
+    bucket and does not regress on a re-parse. Atomic tmp+fsync+rename;
+    best-effort — a persist failure must never break the healthy compute path.
+
+    Cross-process safety: an exclusive flock on a ``.lock`` sidecar serialises
+    concurrent cron + agent-tool callers so the read-merge-write is atomic
+    (ar24-family lost-update fix).
+    """
+    if not losses:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _flocked_sidecar(path):
+            existing = load_loss_cooldown_sidecar(path)
+            merged: dict[str, str] = {}
+            for k, ts in existing.items():
+                merged["|".join(k)] = ts.isoformat()
+            for k, ts in losses.items():
+                key_str = "|".join(k)
+                existing_ts = existing.get(k)
+                if existing_ts is None or ts > existing_ts:
+                    merged[key_str] = ts.isoformat()
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(merged, sort_keys=True))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 - best-effort; never break the rail
+        logger.warning("settlement_loop: failed to persist loss-cooldown sidecar: %s", exc)
 
 
 def realized_returns_by_signal(

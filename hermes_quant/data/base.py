@@ -101,6 +101,43 @@ def validate_bars(
     return out
 
 
+def _fetch_bars_with_optional_asof(
+    provider,
+    asset: str,
+    timeframe: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    use_cache: bool,
+    as_of: pd.Timestamp | None,
+) -> pd.DataFrame:
+    """Call ``provider.fetch_bars`` with the leaf no-lookahead ``as_of`` cutoff,
+    degrading gracefully for an older provider that predates the ``as_of`` kwarg.
+
+    Pass ``as_of`` first; ONLY retry without it when the TypeError is a genuine
+    "this provider's signature has no ``as_of`` kwarg" error — an
+    unexpected-keyword signature mismatch that NAMES ``as_of``. CPython's own
+    legacy message always names the offending kwarg
+    (``... got an unexpected keyword argument 'as_of'``), so requiring BOTH the
+    unexpected-keyword shape AND the literal ``as_of`` token degrades the real
+    legacy provider while letting an UNRELATED ``TypeError`` raised from inside
+    ``fetch_bars`` (a downstream lib kwarg-typo, a pandas API change, etc.)
+    PROPAGATE. The earlier ``or "unexpected keyword"`` form was fail-OPEN: any
+    unexpected-keyword error from the provider BODY was misclassified as
+    "legacy" and silently retried WITHOUT the cutoff, re-dropping the
+    no-lookahead bound this function exists to enforce.
+    """
+    try:
+        return provider.fetch_bars(
+            asset, timeframe, start, end, use_cache=use_cache, as_of=as_of
+        )
+    except TypeError as exc:
+        msg = str(exc)
+        # Genuine legacy-signature gap: an unexpected-keyword error naming as_of.
+        if ("unexpected keyword" in msg or "got multiple values" in msg) and "as_of" in msg:
+            return provider.fetch_bars(asset, timeframe, start, end, use_cache=use_cache)
+        raise
+
+
 def fetch_with_chain(
     providers: Iterable,
     asset: str,
@@ -110,6 +147,7 @@ def fetch_with_chain(
     *,
     max_retries: int = 2,
     use_cache: bool = True,
+    as_of: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """Try each provider in sequence; fall back on transient failures.
 
@@ -124,6 +162,15 @@ def fetch_with_chain(
         asset, timeframe, start, end: passed through to each provider.
         max_retries: per-provider retry count for transient errors.
         use_cache: forwarded to provider.fetch_bars.
+        as_of: ADR-0005 amendment (Wave C.1) leaf-level no-lookahead cutoff,
+            threaded through to ``provider.fetch_bars`` so the chain enforces
+            the same ``timestamp <= as_of`` bound the single-provider path does.
+            This is load-bearing for fallback tiers (AlphaVantage ``compact``
+            returns the last ~100 bars REGARDLESS of ``start``/``end`` — its
+            ONLY no-lookahead bound is this leaf filter). When omitted, defaults
+            to ``end`` so a backtest/replay that already passes ``end=asof``
+            (e.g. ``daemon.tick_loop.run_one_tick``) cannot leak future bars
+            through a provider that ignores the ``end`` window.
 
     Returns:
         Validated bars from the first successful provider.
@@ -137,10 +184,19 @@ def fetch_with_chain(
     if not providers_list:
         raise DataProviderError("no providers configured")
 
+    # Default the no-lookahead cutoff to ``end``. ``end`` is already the upper
+    # bound the caller intends (e.g. asof in run_one_tick); using it as the leaf
+    # ``as_of`` makes the future bound robust against providers that ignore the
+    # ``end`` window (AlphaVantage compact). Never LOOSENS visibility: end is the
+    # caller's own upper bound.
+    cutoff = as_of if as_of is not None else end
+
     for provider in providers_list:
         for attempt in range(max_retries + 1):
             try:
-                bars = provider.fetch_bars(asset, timeframe, start, end, use_cache=use_cache)
+                bars = _fetch_bars_with_optional_asof(
+                    provider, asset, timeframe, start, end, use_cache, cutoff
+                )
                 # Validate (will raise DataQualityError if bad)
                 validated = validate_bars(bars)
                 return validated

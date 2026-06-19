@@ -187,18 +187,61 @@ class Position:
         return (self.market_value - self.cost_basis) / abs(self.cost_basis)
 
 
+# cs14/cs17 schema-drift family (ar15): the LIVE producer
+# (hermes_quant.react.base.ExecutionRecord -> hermes_quant.react.paper._record_to_dict)
+# emits a record shape the OLD `schema_version == 1` + `side`/`qty` filter CANNOT read.
+# A real record carries NO `schema_version` key at all (so `.get(...)` is None != 1 and
+# every live fill was DROPPED), NO `side`, and NO `qty` — instead it has a signed
+# NAV-fraction `target_position_pct` (and `fill_size_pct`), a `fill_price`, an
+# `asof_execution`, a `reactor_name`, and an optional `reactor_metadata.quantity`
+# (the authoritative signed absolute share count from det-equity / live broker
+# reconciliation). The result was a silently-EMPTY book -> cash-only NAV -> ZERO
+# factor/sector/beta breach proposals: a fail-open risk surface.
+#
+# This mirrors the cs14 weekly-exit loader remediation
+# (hermes_quant.daemon.portfolio_loader.reconstruct_portfolio absolute-target path):
+# reconstruct positions from the signed NAV-fraction target via LATEST-TARGET-per-symbol
+# semantics (later fills SUPERSEDE earlier ones — they do NOT delta-sum, which would
+# dual-ledger inflate per ADR-0091), deriving share qty = target_pct * NAV / fill_price
+# (reactor_metadata.quantity preferred when present), and folding the cost-basis cash
+# leg out of cash so NAV stays coherent. The legacy int-1 side/qty path is preserved
+# for hand-rolled / crypto-settlement records.
+EQUITY_FILL_REACTORS = frozenset({"paper", "deterministic-equity", "alpaca_paper"})
+
+
+def _is_absolute_target_record(rec: dict[str, Any]) -> bool:
+    """True iff `rec` is a live absolute-target ExecutionRecord shape.
+
+    The producer emits no `schema_version` key (reads back as None/absent); some
+    forward-compat writers may stamp an explicit non-int sentinel. The legacy
+    int-1 settlement shape (`schema_version == 1` with explicit side/qty) is
+    DISJOINT and handled by the legacy branch. A record with a signed
+    `target_position_pct` and no explicit int-1 sentinel is an absolute-target
+    record.
+    """
+    sv = rec.get("schema_version")
+    if sv == 1:
+        return False
+    return "target_position_pct" in rec
+
+
 def load_positions_from_executions() -> tuple[float, list[Position]]:
     """Reconstruct positions from executions.jsonl.
 
     Returns (cash, positions). cash defaults to $100k initial - net flows.
-    Filters to schema_version=1 records. Aggregates by symbol.
-    Mark prices and sector/beta are filled in by enrich_positions().
+    Consumes BOTH the legacy int-1 hand-rolled side/qty shape AND the real
+    live producer absolute-target shape (signed target_position_pct). Aggregates
+    legacy records by symbol; reconstructs absolute-target records via
+    latest-target-per-symbol semantics. Mark prices and sector/beta are filled
+    in by enrich_positions().
     """
     initial_cash = 100_000.0
     cash = initial_cash
     qty_by_sym: dict[str, float] = defaultdict(float)
     cost_by_sym: dict[str, float] = defaultdict(float)
     last_fill_by_sym: dict[str, float] = {}
+    # cs14: latest absolute-target record per symbol (max asof_execution wins).
+    abs_latest: dict[str, dict] = {}
 
     if not EXECUTIONS_PATH.exists():
         return cash, []
@@ -213,8 +256,28 @@ def load_positions_from_executions() -> tuple[float, list[Position]]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("schema_version") != 1:
+
+                # ── ABSOLUTE-TARGET path (real live producer shape) ──────────
+                if _is_absolute_target_record(rec):
+                    # Only admit equity-fill reactors; never silently absorb
+                    # crypto / other-class records into the equity review.
+                    if rec.get("reactor_name") not in EQUITY_FILL_REACTORS:
+                        continue
+                    asset = rec.get("asset")
+                    if not asset:
+                        continue
+                    ts = rec.get("asof_execution") or rec.get("asof") or ""
+                    prior = abs_latest.get(asset)
+                    prior_ts = (
+                        (prior.get("asof_execution") or prior.get("asof") or "")
+                        if prior is not None
+                        else None
+                    )
+                    if prior is None or ts >= prior_ts:
+                        abs_latest[asset] = rec
                     continue
+
+                # ── LEGACY int-1 path (hand-rolled side/qty settlement shape) ─
                 try:
                     sym = rec["asset"]
                     side = rec["side"]
@@ -245,6 +308,62 @@ def load_positions_from_executions() -> tuple[float, list[Position]]:
         for sym, q in qty_by_sym.items()
         if abs(q) > 1e-9
     ]
+
+    # cs14: reconstruct one Position per symbol from its LATEST absolute target.
+    # Derivation (mirrors portfolio_loader.reconstruct_portfolio absolute path):
+    #   * reactor_metadata.quantity (authoritative signed share count) when present
+    #   * else qty = target_position_pct * NAV / entry_price (NAV-fraction shares)
+    # entry_price = slipped fill_price, else decision_price. The cost-basis cash
+    # leg is folded out of cash so NAV = cash + sum(qty*mark) stays coherent.
+    for asset, rec in abs_latest.items():
+        try:
+            target_pct = float(rec.get("target_position_pct"))
+        except (TypeError, ValueError):
+            continue
+        if abs(target_pct) < 1e-12:
+            # Latest target is flat -> the position is closed. Drop it.
+            continue
+
+        try:
+            entry_price = float(rec.get("fill_price"))
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        if entry_price <= 0.0:
+            try:
+                entry_price = float(rec.get("decision_price"))
+            except (TypeError, ValueError):
+                entry_price = 0.0
+        if entry_price <= 0.0:
+            sys.stderr.write(
+                f"absolute-target record for {asset} has no usable entry price; "
+                f"skipped\n"
+            )
+            continue
+
+        meta = rec.get("reactor_metadata") or {}
+        meta_qty = meta.get("quantity")
+        if meta_qty is not None:
+            try:
+                qty = float(meta_qty)
+            except (TypeError, ValueError):
+                qty = (target_pct * initial_cash) / entry_price
+        else:
+            qty = (target_pct * initial_cash) / entry_price
+
+        if abs(qty) < 1e-9:
+            continue
+
+        cost = qty * entry_price
+        cash -= cost
+        positions.append(
+            Position(
+                symbol=asset,
+                qty=qty,
+                cost_basis=cost,
+                last_price=entry_price,
+            )
+        )
+
     return cash, positions
 
 

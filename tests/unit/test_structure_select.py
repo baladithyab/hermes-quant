@@ -189,9 +189,13 @@ def test_table_values_are_producible_kinds():
         assert value in _PRODUCIBLE
 
 
-def test_non_producible_intents_always_abstain():
-    # defined-risk credit/debit (verticals) and long_premium (straddle/calendar) have
-    # no producer yet -> they MUST abstain for every (direction, regime).
+def test_non_producible_intents_always_abstain(monkeypatch):
+    # DEFINED_RISK_DEBIT and LONG_PREMIUM have no producer -> MUST abstain for every
+    # (direction, regime) always.
+    # DEFINED_RISK_CREDIT is producible (bull_put_spread / bear_call_spread) BUT only
+    # when HERMES_QUANT_VERTICAL_SPREADS=1; with the flag OFF it abstains for every
+    # combination (byte-identical to today).
+    monkeypatch.delenv("HERMES_QUANT_VERTICAL_SPREADS", raising=False)
     for intent in (
         StructureIntent.DEFINED_RISK_CREDIT,
         StructureIntent.DEFINED_RISK_DEBIT,

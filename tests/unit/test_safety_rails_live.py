@@ -79,13 +79,21 @@ def test_cum_pnl_realized_gain_is_positive(tmp_path, monkeypatch):
     assert auto.compute_cumulative_realized_pnl_pct(bus) > 0.0
 
 
-def test_cum_pnl_fails_open_to_zero_on_bad_nav(tmp_path, monkeypatch):
+def test_cum_pnl_basis_is_nav_independent(tmp_path, monkeypatch):
+    # ar25: the basis is realized_return × qty where qty is ALREADY a NAV-fraction, so
+    # it does NOT read NAV. A 20%-NAV position down 20% = -4% of NAV realized, computed
+    # identically whether NAV is readable or None — NAV can no longer disarm the rail
+    # (this supersedes the old ar20 NAV-None fail-open, which is now structurally moot).
     bus = _write_bus(tmp_path, [
         _fill("ASTS", 0.2, 100.0, "2026-06-01T15:00:00Z", "p1"),
         _fill("ASTS", -0.2, 80.0, "2026-06-02T15:00:00Z", "p2"),
     ])
     monkeypatch.setattr(auto, "_account_nav_usd", lambda: None)  # unknown NAV
-    assert auto.compute_cumulative_realized_pnl_pct(bus) == 0.0
+    frac_none = auto.compute_cumulative_realized_pnl_pct(bus)
+    monkeypatch.setattr(auto, "_account_nav_usd", lambda: 100000.0)
+    frac_known = auto.compute_cumulative_realized_pnl_pct(bus)
+    assert frac_none == pytest.approx(-0.04)
+    assert frac_none == pytest.approx(frac_known)
 
 
 # --------------------------------------------------------------------------- #
@@ -123,6 +131,61 @@ def test_live_kill_switch_dry_run_does_not_persist(monkeypatch, tmp_path):
     assert not (tmp_path / "ks.json").exists()  # NOT persisted on dry run
 
 
+def _arm_for_live_trip(monkeypatch, tmp_path, *, cum_pnl=-0.20):
+    """Arm a non-dry-run autonomous tick that WILL trip the realized-P&L kill-switch,
+    with KILL_SWITCH_PATH + the governance audit log redirected into tmp_path."""
+    from hermes_quant.governance import audit_log
+    monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
+    monkeypatch.setattr(auto, "_read_kill_switch", lambda: auto.KillSwitchState(
+        tripped=False, tripped_at=None, cumulative_pnl_pct=0.0,
+        threshold_pct=0.10, reason=None))
+    monkeypatch.setattr(auto, "_read_safety_rails", lambda: {
+        "max_per_tick_opens": 1, "max_concurrent_positions": 5,
+        "kill_switch_pct": 0.10, "log_silences": False, "allow_live": True})
+    monkeypatch.setattr(auto, "compute_cumulative_realized_pnl_pct", lambda *a, **k: cum_pnl)
+    monkeypatch.setattr(auto, "KILL_SWITCH_PATH", tmp_path / "ks.json")
+    audit_path = tmp_path / "audit_log.jsonl"
+    monkeypatch.setattr(audit_log, "AUDIT_LOG_PATH", audit_path)
+    return audit_log, audit_path
+
+
+def test_ar28_live_trip_emits_kill_switch_fired_audit(monkeypatch, tmp_path):
+    """ar28: a NON-dry-run autonomous trip must write a kill_switch_fired governance
+    audit event (not just the sidecar JSON + a log line) so the trip is visible on the
+    canonical audit log."""
+    audit_log, _ = _arm_for_live_trip(monkeypatch, tmp_path)
+    res = auto.tick(dry_run=False, symbols=[])
+    assert res.kill_switch_state.tripped is True
+    fired = list(audit_log.read(kinds=["kill_switch_fired"]))
+    assert len(fired) == 1, "ar28: live kill-switch trip emitted NO kill_switch_fired audit event"
+    assert fired[0].source == "autonomous_kill_switch"
+    assert fired[0].payload.get("rail") == "cumulative_realized_pnl_pct"
+
+
+def test_ar28_live_trip_flips_promotion_killswitch_in_14d(monkeypatch, tmp_path):
+    """ar28: the emitted kill_switch_fired event must flip PromotionEvaluator's
+    killswitch_in_14d gate — a strategy that tripped the autonomous rail must be BLOCKED
+    from paper->live promotion in the trailing 14 days."""
+    audit_log, _ = _arm_for_live_trip(monkeypatch, tmp_path)
+    auto.tick(dry_run=False, symbols=[])
+    fired = list(audit_log.read(kinds=["kill_switch_fired"]))
+    assert len(fired) == 1
+    # The promotion gate reads kind=='kill_switch_fired' within the trailing-14d window.
+    assert any(e.kind == "kill_switch_fired" for e in fired), (
+        "ar28: promotion.py killswitch_in_14d would stay False -> a tripped strategy "
+        "could still be promoted paper->live within 14 days"
+    )
+
+
+def test_ar28_dry_run_trip_emits_no_audit(monkeypatch, tmp_path):
+    """A DRY-RUN trip persists nothing and emits no kill_switch_fired event (it is a
+    preview, not a real halt) — byte-identical to pre-ar28 on the dry-run path."""
+    audit_log, _ = _arm_for_live_trip(monkeypatch, tmp_path)
+    res = auto.tick(dry_run=True, symbols=[])
+    assert res.kill_switch_state.tripped is True
+    assert list(audit_log.read(kinds=["kill_switch_fired"])) == []
+
+
 def test_live_kill_switch_healthy_pnl_does_not_trip(monkeypatch):
     monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
     monkeypatch.setattr(auto, "_read_kill_switch", lambda: auto.KillSwitchState(
@@ -136,3 +199,67 @@ def test_live_kill_switch_healthy_pnl_does_not_trip(monkeypatch):
     # but kill switch NOT tripped).
     res = auto.tick(dry_run=True, symbols=[])
     assert res.kill_switch_state.tripped is False
+
+
+# ---------------------------------------------------------------------------
+# ar08 — the LIVE kill-switch threshold (kill_switch_pct) is operator-editable
+# YAML; a NaN/inf/negative value must NOT silently disable the ADR-0016 §D9 rail.
+# (`nan > 0` is False, so the pre-fix `_ks_threshold > 0` guard short-circuited
+# and a -50% catastrophic loss did NOT trip — a fail-OPEN with no log/audit.)
+# ---------------------------------------------------------------------------
+
+
+def _rails_with_threshold(val):
+    return lambda: {
+        "max_per_tick_opens": 1,
+        "max_concurrent_positions": 5,
+        "kill_switch_pct": val,
+        "log_silences": False,
+        "allow_live": False,
+    }
+
+
+def test_nan_kill_switch_threshold_still_trips_on_catastrophic_loss(monkeypatch):
+    """A NaN kill_switch_pct must fall back to the 0.10 floor and STILL trip on a -50% loss."""
+    monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
+    monkeypatch.setattr(auto, "_read_kill_switch", lambda: auto.KillSwitchState(
+        tripped=False, tripped_at=None, cumulative_pnl_pct=0.0, threshold_pct=0.10, reason=None))
+    monkeypatch.setattr(auto, "_read_safety_rails", _rails_with_threshold(float("nan")))
+    monkeypatch.setattr(auto, "compute_cumulative_realized_pnl_pct", lambda *a, **k: -0.50)
+    res = auto.tick(dry_run=True, symbols=[])
+    assert res.kill_switch_state.tripped is True, (
+        "a NaN kill_switch_pct must fall back to the 0.10 floor and trip on a -50% loss, "
+        "NOT silently disable the rail (nan > 0 is False)"
+    )
+
+
+def test_negative_kill_switch_threshold_still_trips(monkeypatch):
+    monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
+    monkeypatch.setattr(auto, "_read_kill_switch", lambda: auto.KillSwitchState(
+        tripped=False, tripped_at=None, cumulative_pnl_pct=0.0, threshold_pct=0.10, reason=None))
+    monkeypatch.setattr(auto, "_read_safety_rails", _rails_with_threshold(-0.10))
+    monkeypatch.setattr(auto, "compute_cumulative_realized_pnl_pct", lambda *a, **k: -0.50)
+    res = auto.tick(dry_run=True, symbols=[])
+    assert res.kill_switch_state.tripped is True, "a negative threshold must fall back to 0.10, not disable"
+
+
+def test_inf_kill_switch_threshold_still_trips(monkeypatch):
+    monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
+    monkeypatch.setattr(auto, "_read_kill_switch", lambda: auto.KillSwitchState(
+        tripped=False, tripped_at=None, cumulative_pnl_pct=0.0, threshold_pct=0.10, reason=None))
+    monkeypatch.setattr(auto, "_read_safety_rails", _rails_with_threshold(float("inf")))
+    monkeypatch.setattr(auto, "compute_cumulative_realized_pnl_pct", lambda *a, **k: -0.50)
+    res = auto.tick(dry_run=True, symbols=[])
+    assert res.kill_switch_state.tripped is True, "an inf threshold must fall back to 0.10, not disable"
+
+
+def test_finite_positive_threshold_is_byte_identical(monkeypatch):
+    """The only legal configured shape (finite positive) is unchanged: a healthy -5% loss under a
+    0.10 threshold does NOT trip (byte-identical to pre-fix)."""
+    monkeypatch.setattr(auto, "_read_pdr_mode", lambda: "autonomous")
+    monkeypatch.setattr(auto, "_read_kill_switch", lambda: auto.KillSwitchState(
+        tripped=False, tripped_at=None, cumulative_pnl_pct=0.0, threshold_pct=0.10, reason=None))
+    monkeypatch.setattr(auto, "_read_safety_rails", _rails_with_threshold(0.10))
+    monkeypatch.setattr(auto, "compute_cumulative_realized_pnl_pct", lambda *a, **k: -0.05)
+    res = auto.tick(dry_run=True, symbols=[])
+    assert res.kill_switch_state.tripped is False, "a -5% loss under a 0.10 floor must NOT trip"

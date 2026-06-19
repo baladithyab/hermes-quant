@@ -120,6 +120,23 @@ def test_aggregate_missing_greeks_fail_closed() -> None:
         aggregate_net_greeks([leg])
 
 
+def test_aggregate_nan_greek_fail_closed() -> None:
+    # cr02: a NaN greek (e.g. IV overflow in the GBS kernel, ATM DTE=0) must
+    # fail closed exactly like a None greek. The None-only check let NaN through
+    # into candidate_net, where it propagated past every `NaN > cap` comparison
+    # (always False) — the canonical NaN-fail-open class.
+    leg = _opt("NVDA260612C00150000", "sell", delta=float("nan"))
+    with pytest.raises(GreekComputationError):
+        aggregate_net_greeks([leg])
+
+
+def test_aggregate_inf_greek_fail_closed() -> None:
+    # cr02: +/-inf is equally non-finite and must fail closed.
+    leg = _opt("NVDA260612C00150000", "sell", delta=0.30, gamma=float("inf"))
+    with pytest.raises(GreekComputationError):
+        aggregate_net_greeks([leg])
+
+
 def test_aggregate_ratio_qty_scales() -> None:
     legs = [_opt("NVDA260612C00150000", "buy", delta=0.50, ratio_qty=2)]
     assert aggregate_net_greeks(legs).delta == pytest.approx(100.0)

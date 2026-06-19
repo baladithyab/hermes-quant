@@ -5,10 +5,13 @@ coding agent working on this repository.
 
 ## Project posture
 
-hermes-quant is **money-software**. It runs a daemon that ultimately decides
-where to put real capital. Defects don't just print bad output — they
-subtract from the user's bank account. Every code change should be reviewed
-through that lens.
+hermes-quant is **money-software**. It runs a set of scheduled cron tasks
+(ops/scripts/quant-*-tick.py + quant-daily-interim.py) that call
+advisor.recommend + the react reactors directly to decide where to put real
+capital. (The original long-lived daemon → signals.jsonl → freqtrade spine was
+vestigial and was removed; the daemon/ package now hosts only
+shared utilities.) Defects don't just print bad output — they subtract from
+the user's bank account. Every code change should be reviewed through that lens.
 
 Three discipline principles, in priority order:
 
@@ -29,7 +32,7 @@ Three discipline principles, in priority order:
 
 ## Architecture map
 
-**82 ADRs** in [docs/adr/](docs/adr/) — the full index is [docs/adr/README.md](docs/adr/README.md).
+**90 ADRs** in [docs/adr/](docs/adr/) — the full index is [docs/adr/README.md](docs/adr/README.md).
 Read the index before touching code; it is the authoritative decision record and has grown
 far beyond the foundational eight. The load-bearing foundations to start with:
 
@@ -48,7 +51,7 @@ far beyond the foundational eight. The load-bearing foundations to start with:
 For the rest (governance plane 0031, options 0027/0028/0029, admissibility 0077, etc.) consult
 the index — do NOT assume the eight foundations are the whole picture.
 
-**49 research notes** in [docs/research/](docs/research/) ground the ADR decisions.
+**66 research notes** in [docs/research/](docs/research/) ground the ADR decisions.
 
 ## Repo layout
 
@@ -61,29 +64,37 @@ hermes-quant/
 ├── AGENTS.md                     # this file
 ├── CHANGELOG.md
 ├── docs/
-│   ├── adr/                      # 82 ADRs (see adr/README.md index)
-│   └── research/                 # 49 research lenses
+│   ├── adr/                      # 90 ADRs (see adr/README.md index)
+│   └── research/                 # 66 research lenses
 ├── hermes_quant/
 │   ├── __init__.py               # register(ctx) — Hermes plugin entry point
 │   ├── protocol.py               # MarketContext, AnalystView, Analyst Protocol
 │   ├── analysts/                 # one analyst per file
 │   │   ├── classical_ta.py
 │   │   ├── microstructure.py
-│   │   └── kronos.py             # both KronosAnalyst and KairosAnalyst
+│   │   └── kronos.py             # KronosAnalyst (regime-timing; single class)
 │   ├── aggregators/
 │   │   ├── bma.py
-│   │   └── stacking.py
+│   │   ├── deliberative.py
+│   │   └── llm_committee.py
 │   ├── risk/
 │   │   └── gate.py
 │   ├── data/
 │   │   ├── base.py               # DataProvider Protocol
 │   │   ├── yfinance_provider.py
 │   │   ├── ccxt_provider.py
-│   │   └── alpaca_provider.py
-│   ├── daemon/
-│   │   ├── main.py               # hermes-quant-daemon entry point
-│   │   ├── tick_loop.py
-│   │   └── settlement_loop.py
+│   │   ├── alphavantage_provider.py
+│   │   └── fundamentals_provider.py
+│   ├── daemon/                   # shared utilities only — the long-lived
+│   │   │                         # main.py/tick_loop.py signal loop was
+│   │   │                         # vestigial and removed. The live
+│   │   │                         # spine is the ops/scripts/quant-*-tick.py
+│   │   │                         # crons calling advisor.recommend + reactors.
+│   │   ├── signal_bus.py         # append-only JSONL bus (flock-protected)
+│   │   ├── halt_state.py         # durable halt registry (kill-switch authority)
+│   │   ├── settlement_loop.py    # join_exit_fills = kill-switch realized-PnL basis
+│   │   ├── discovery.py          # entry-point discovery for analysts/aggregators
+│   │   └── portfolio_loader.py   # reconstruct_portfolio from the execution log
 │   ├── consumers/
 │   │   └── freqtrade/
 │   │       ├── quant_consumer_strategy.py    # drop into freqtrade user_data/strategies/
@@ -91,22 +102,22 @@ hermes-quant/
 │   ├── evaluation/
 │   │   ├── cv.py                 # PurgedWalkForward
 │   │   ├── lookahead.py          # shuffle_timestamps_test
-│   │   └── dsr.py                # DeFlated Sharpe (v0.2 placeholder)
+│   │   └── dsr.py                # Deflated Sharpe Ratio — implemented (v0.3 paper-book; v0.4 multi-comparison hook)
 │   ├── cli/
 │   │   ├── __init__.py           # setup_argparse, dispatch
-│   │   ├── setup.py              # hermes quant setup
-│   │   ├── lifecycle.py          # start, stop, restart
 │   │   ├── status.py             # status, signals, doctor
-│   │   └── backtest.py
-│   ├── tools/
-│   │   └── tools.py              # quant_status, quant_show_signals, ...
-│   ├── training/                 # v0.2 RL trainer (stub for now)
-│   │   └── main.py
+│   │   ├── halts.py              # halt-state inspection
+│   │   ├── ablate.py             # analyst ablation runs
+│   │   └── admission_precision.py
+│   ├── tools.py                 # quant_status, quant_show_signals, ...
+│   ├── training/                 # live calibration (read-only, paper bars)
+│   │   ├── bootstrap_calibrator.py  # fit IsotonicCalibrator from history
+│   │   └── calibrator_drift.py      # B11 drift detect + gated auto-refit
 │   └── skills/
 │       └── hermes-quant/
 │           └── SKILL.md
 └── tests/
-    ├── fixtures/bars/            # parquet fixture data
+    ├── fixtures/                 # JSON fixtures grouped by subsystem
     ├── unit/
     ├── integration/
     └── conftest.py
@@ -205,13 +216,17 @@ is auto-detected and surfaced in `quant_doctor`.
 ### Cross-process state
 
 The daemon writes to `~/.hermes/quant/`:
-- `signals.jsonl` (append-only signal bus)
-- `ticks.db` (SQLite WAL — tick metadata, analyst views, realized outcomes)
-- `state.json` (small atomic state file — halt flags, cooldown timers)
+- `executions.jsonl` (append-only, immutable **authoritative event log** of every
+  fill the system decided — HITL/paper/replay; ADR-0085). `EXECUTION_BUS_PATH` in
+  `hermes_quant/tools.py`.
+- `state.db` (SQLite — a *derived projection* of `executions.jsonl`, not authoritative;
+  rebuildable by replay; ADR-0085)
+- `signals.jsonl` (append-only signal bus; deprecated for halt/position truth — see ADR-0085)
+- `halt_state.json` (small atomic JSON mirror — the authoritative halt registry; halt flags)
 
 Plugin tools READ from these. Freqtrade strategy READS from `signals.jsonl`.
 
-When you write to `state.json`, use atomic-rename pattern:
+When you write a small atomic state file (e.g. `halt_state.json`), use atomic-rename pattern:
 ```python
 tmp = path.with_suffix(".json.tmp")
 tmp.write_text(json.dumps(state))
@@ -231,8 +246,9 @@ with open(path, "a", buffering=1) as f:   # line-buffered
 ### Unit tests must be deterministic
 
 No live API calls, no network, no time-of-day-sensitive behavior. Use
-`pd.Timestamp` directly with explicit values. Use the parquet fixtures
-in `tests/fixtures/bars/` for any test that needs market data.
+`pd.Timestamp` directly with explicit values. Construct any market data
+a test needs inline (or from a committed JSON fixture under
+`tests/fixtures/`); there are no parquet bar fixtures.
 
 ### Integration tests gate live providers
 
@@ -242,13 +258,25 @@ Tests that do hit live providers (alpaca paper, yfinance) live in
 
 ### Fixture data
 
-`tests/fixtures/bars/` contains:
-- `BTC-USDT-1h-2024-01-01-2024-12-31.parquet` (8,760 bars)
-- `AAPL-1d-2020-01-01-2026-01-01.parquet` (~1,500 bars)
-- `SPY-1h-2024-01-01-2024-12-31.parquet` (~1,750 bars)
+`tests/fixtures/` contains JSON fixtures grouped by subsystem (not bar
+parquet files):
+- `catalyst_onboarding/` — `admission_episodes.v1.json` (+ README)
+- `pdr4_saturation/` — `exit_set.v1.json`
+- `reflector_faithfulness/` — `golden.json`
+- `socialarb/` — `convergence_items.json`, `interest_series.json`,
+  `camillo_labels.json`, `_pdr3_golden.json` (+ README)
+- `quarterly_mock_portfolio.json`
 
-When adding tests that need market data, USE these fixtures. Don't hit
-live providers from CI.
+There are no `tests/fixtures/bars/*.parquet` files. Tests that need
+market data construct it inline with explicit `pd.Timestamp` values, or
+load from a fixture committed alongside the test. When adding tests that
+need market data, build the data deterministically in-test or commit a
+small fixture — don't hit live providers from CI.
+
+Note: `tests/runs/test_run_card.py` passes a
+`fixtures/bars/AAPL-...parquet` string as `data_sources` test input; it
+is a string round-trip assertion, not a file load, so the missing path
+does not break the test.
 
 ### Property-based tests for the gate
 

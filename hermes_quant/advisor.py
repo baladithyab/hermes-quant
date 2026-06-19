@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -136,6 +137,38 @@ def _synthetic_portfolio(
     """
     return Portfolio(
         account_id="advisor-synthetic",
+        asset_class=asset_class,
+        asof=asof,
+        positions={},
+        cash=equity,
+        equity_total=equity,
+        realized_pnl_total=0.0,
+        realized_fees_total=0.0,
+        peak_equity=equity,
+        daily_open_equity=equity,
+    )
+
+
+def _real_equity_portfolio(
+    account_id: str, asset_class: str, asof: pd.Timestamp, equity: float
+) -> Portfolio:
+    """cs86: a flat portfolio carrying the REAL account identity + REAL equity.
+
+    Mirrors ``_synthetic_portfolio`` in shape (flat, no positions) but uses the
+    REAL ``account_id`` / ``asset_class`` and ``equity_total=equity`` so the
+    store-backed gate reconciles + recomputes the drawdown / daily-loss circuit
+    breakers against the DURABLE high-water-mark peak + session-anchored daily-open
+    for the live partition (cs01 gate seam, gate.py:638-647).
+
+    ``peak_equity`` / ``daily_open_equity`` are seeded to ``equity`` as the
+    per-tick fail-CLOSED floor ONLY — the durable cross-tick HWM and session-open
+    come from ``baseline_store.reconcile`` (baseline_store.py:237-241), which is
+    the value that makes a peak-to-trough trip fire. This helper is only ever
+    reached behind the HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE flag with an injected
+    store; with the flag OFF the producer uses ``_synthetic_portfolio`` unchanged.
+    """
+    return Portfolio(
+        account_id=account_id,
         asset_class=asset_class,
         asof=asof,
         positions={},
@@ -281,17 +314,98 @@ def _action_to_gate_dict(action: Action | None, signal: AggregatedSignal) -> dic
 # Lazy provider construction
 # ---------------------------------------------------------------------------
 
+# c7a9 (ADR-0100): live OHLCV consumer-cutover flag. DEFAULT-OFF. Distinct from
+# HERMES_QUANT_OPENBB (which gates the OpenBB SDK/provider itself): this flag
+# decides whether the LIVE advisor fetch path (_get_default_provider, consumed by
+# recommend + recommend_multi_horizon) consults the openbb tier as a 2nd/fallback
+# OHLCV source BEHIND yfinance. With it unset the provider is a bare
+# YFinanceProvider — byte-identical to the pre-cutover live path. Quoted-literal
+# default so the flag-inventory scanner counts it. Read at call time so an
+# operator .env / cron flip takes effect without re-import.
+OPENBB_LIVE_FLAG = "HERMES_QUANT_OPENBB_LIVE"
+
+
+def _openbb_live_enabled() -> bool:
+    """Whether the openbb OHLCV fallback tier is wired into the live fetch path."""
+    return os.environ.get(OPENBB_LIVE_FLAG, "0") not in ("", "0", "false", "False")
+
+
+class _ChainedProvider:
+    """A DataProvider-shaped wrapper that fans ``fetch_bars`` through an ordered
+    fallback chain via :func:`hermes_quant.data.base.fetch_with_chain`.
+
+    c7a9 (ADR-0100): used ONLY when ``HERMES_QUANT_OPENBB_LIVE`` is set, so the
+    default live path stays a bare ``YFinanceProvider`` (byte-identical). The
+    chain is ``[yfinance, openbb]`` — yfinance PRIMARY, openbb a SILENT no-op
+    fallback tier (its own ``HERMES_QUANT_OPENBB`` gate raises DataProviderError
+    at fetch time when off, which ``fetch_with_chain`` treats as a transient
+    fall-through). yfinance success short-circuits the chain, so openbb is only
+    ever consulted when the primary genuinely fails.
+
+    No-lookahead: the ``as_of`` cutoff is threaded into ``fetch_with_chain``
+    UNCHANGED, so every tier filters ``timestamp <= as_of`` exactly as the
+    single-provider path does (the chain defaults the cutoff to ``end`` when
+    ``as_of`` is omitted — never loosens visibility).
+    """
+
+    name = "yfinance+openbb"
+    # Mirror the primary provider's declared surface so any consumer that
+    # introspects asset_classes/timeframes sees the same contract as yfinance.
+    asset_classes = ["equity", "etf"]
+    timeframes = ["1m", "5m", "15m", "30m", "1h", "1d"]
+
+    def __init__(self, providers: list):
+        # Stored so tests can inject deterministic in-memory tiers; production
+        # builds the real [yfinance, openbb] pair below.
+        self._providers = providers
+
+    def fetch_bars(
+        self,
+        asset: str,
+        timeframe: str,
+        start,
+        end,
+        *,
+        use_cache: bool = True,
+        as_of=None,
+    ):
+        from hermes_quant.data.base import fetch_with_chain
+
+        return fetch_with_chain(
+            self._providers,
+            asset,
+            timeframe,
+            start,
+            end,
+            use_cache=use_cache,
+            as_of=as_of,
+        )
+
 
 def _get_default_provider(asset_class: str):
     """Return a DataProvider for the asset class.
 
     v0.1.2: only yfinance for equity/etf is wired. Crypto/fx will arrive
     when ccxt provider lands (ADR-0005).
+
+    c7a9 (ADR-0100): when ``HERMES_QUANT_OPENBB_LIVE`` is set, equity/etf returns
+    a chained provider ``[yfinance, openbb]`` (yfinance primary, openbb fallback)
+    instead of a bare ``YFinanceProvider``. DEFAULT-OFF -> byte-identical bare
+    yfinance.
     """
     if asset_class in ("equity", "etf"):
         from hermes_quant.data.yfinance_provider import YFinanceProvider
 
-        return YFinanceProvider()
+        if not _openbb_live_enabled():
+            return YFinanceProvider()
+        # Flag ON: yfinance PRIMARY, openbb FALLBACK. OpenBBProvider construction
+        # never imports the openbb SDK (lazy, flag-gated at its `obb` property),
+        # so building it here is import-safe even when openbb is absent / the
+        # vendor flag is off — it simply contributes no bars (raises at fetch
+        # time, treated by the chain as a transient fall-through).
+        from hermes_quant.data.openbb_provider import OpenBBProvider
+
+        return _ChainedProvider([YFinanceProvider(), OpenBBProvider()])
     raise NotImplementedError(
         f"asset_class={asset_class!r} not supported in v0.1.2 advisor "
         f"(crypto/fx require ccxt provider — ADR-0005)"
@@ -364,6 +478,39 @@ def _build_default_analysts() -> list[Any]:
             from hermes_quant.analysts.fundamentals import FundamentalsAnalyst
 
             analysts.append(FundamentalsAnalyst())
+        except ImportError:
+            pass
+    # 2f33 (ADR-0100 ob2): OpenBB forward-estimates analyst — DEFAULT-OFF behind
+    # BOTH HERMES_QUANT_ESTIMATES_ANALYST and HERMES_QUANT_OPENBB (the analyst's
+    # own `analyze` enforces both gates and abstains to None WITHOUT touching the
+    # provider when either is unset). We gate the *registration* on the same two
+    # flags so a build with them off never even constructs the analyst — the
+    # strongest byte-identical guarantee (mirrors FundamentalsAnalyst above; the
+    # estimates docstring's "intentionally not registered while default-OFF" note
+    # is satisfied because the gate keeps it out of the roster until an operator
+    # flips both flags). Gates read at call time so a .env / cron flip takes
+    # effect immediately.
+    if (
+        os.environ.get("HERMES_QUANT_ESTIMATES_ANALYST", "0") == "1"
+        and os.environ.get("HERMES_QUANT_OPENBB", "0") == "1"
+    ):
+        try:
+            from hermes_quant.analysts.estimates import EstimatesAnalyst
+
+            analysts.append(EstimatesAnalyst())
+        except ImportError:
+            pass
+    # 2f33 (ADR-0100 ob3): OpenBB insider + 13-F ownership analyst — DEFAULT-OFF
+    # behind BOTH HERMES_QUANT_INSIDER_ANALYST and HERMES_QUANT_OPENBB (same
+    # two-flag contract as estimates above). Registration gated on both flags.
+    if (
+        os.environ.get("HERMES_QUANT_INSIDER_ANALYST", "0") == "1"
+        and os.environ.get("HERMES_QUANT_OPENBB", "0") == "1"
+    ):
+        try:
+            from hermes_quant.analysts.insider import InsiderAnalyst
+
+            analysts.append(InsiderAnalyst())
         except ImportError:
             pass
     # ADR-0074: Catalyst Sense semantic analyst — default ON; set
@@ -472,8 +619,15 @@ def _fetch_bars_for_horizon(
     try:
         return provider.fetch_bars(symbol, horizon, start, end, as_of=asof_ts)
     except TypeError as exc:
-        # Older provider without as_of kwarg
-        if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+        # ar108: degrade to the no-as_of signature ONLY for a legacy provider that
+        # doesn't accept the as_of kwarg. The old `or "unexpected keyword"` was
+        # over-broad — an unrelated TypeError naming SOME OTHER unexpected keyword
+        # (or raised inside fetch_bars' body) was misclassified as legacy and silently
+        # retried WITHOUT as_of, DROPPING the no-lookahead bound (fail-OPEN). Require
+        # BOTH the bad-signature shape AND the literal `as_of` token; any other
+        # TypeError propagates.
+        msg = str(exc)
+        if "as_of" in msg and ("unexpected keyword" in msg or "got multiple values" in msg):
             return provider.fetch_bars(symbol, horizon, start, end)
         raise
 
@@ -593,6 +747,26 @@ def recommend_multi_horizon(
         if len(bars) == 0:
             continue
 
+        # cs54 no-lookahead: drop the still-forming trailing bar on the NATIVE
+        # provider timeframe path, mirroring single-horizon recommend()
+        # (advisor.py: ADR-0069 / a643). The `bars[bar_ts <= cutoff]` filter
+        # above is a period-OPEN-label filter — for a '1d' horizon read mid-
+        # session it KEEPS today's still-forming daily bar (ts today 00:00 <=
+        # asof), whose close is the latest intraday tick, not a settled close.
+        # Feeding that into every analyst's MarketContext.last_close is a
+        # charter-invariant (NO-LOOKAHEAD) violation. The resampled horizons
+        # (1w/1M/1Q) are already clipped at their period-END inside
+        # get_resampled_history (cs05); calling drop_still_forming_bar on a
+        # resampled frame is a safe no-op (those timeframes are unbounded here
+        # and pass through). A fully-closed-bar history is byte-identical — the
+        # drop removes only a still-forming trailing bar.
+        from hermes_quant.data.bar_alignment import drop_still_forming_bar
+
+        bars, _bar_alignment_info = drop_still_forming_bar(bars, h, asset_class)
+        if _bar_alignment_info["still_forming_dropped"] and len(bars) == 0:
+            # Silence-by-default: the only bar was still-forming → no views
+            continue
+
         last_bar_ts = pd.Timestamp(bars["timestamp"].iloc[-1])
         if last_bar_ts.tzinfo is None:
             last_bar_ts_utc = last_bar_ts.tz_localize("UTC")
@@ -702,6 +876,7 @@ def recommend(
     recipe_id: str | None = None,
     market_extras: Mapping[str, Any] | None = None,
     perception_frame: Any = None,
+    durable_equity_account: tuple[str, str, float] | None = None,
 ) -> dict[str, Any]:
     """Synchronous recommendation for a single symbol. Read-only (ADR-0014).
 
@@ -738,6 +913,24 @@ def recommend(
             branches; M06 ADMIT-before-GATE ordering preserved). When BOTH
             perception_frame and market_extras are passed, the frame wins (it
             already absorbed the semantic slice) and a caveat is appended.
+        durable_equity_account: cs86 OPT-IN seam — a
+            ``(account_id, asset_class, equity_total)`` triple carrying the REAL
+            account NAV the live tick observed. Default ``None``. When ``None``
+            (every caller today, every backtest, and the flag-OFF tick) the
+            producer is BYTE-IDENTICAL to before: ``_synthetic_portfolio`` + a
+            no-store ``DefaultRiskGate``. When provided AND
+            ``HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1`` (read at call time) the
+            producer constructs a durable ``DrawdownBaselineStore`` (cs01) pointed
+            at the live state.db dir, builds a real-equity portfolio for the given
+            partition, and injects the store into the gate so the Rule-1
+            (drawdown) / Rule-2 (daily-loss) circuit breakers measure against the
+            DURABLE high-water-mark peak + session-anchored daily-open instead of
+            the inception-collapsed baselines (which fail-OPEN on a
+            profitable-from-inception account that suffers a large peak-to-trough
+            fall). Fail-CLOSED: a None / non-finite / <=0 equity or a store
+            construct failure returns a GATED result, never a silent
+            synthetic-100k fall-open. The flag absent => the param is ignored =>
+            byte-identical (belt-and-suspenders).
 
     Returns:
         Structured dict per ADR-0014 §D1 return-shape table. Never raises
@@ -866,7 +1059,15 @@ def recommend(
                 # matches a kwarg-related signature mismatch — otherwise
                 # propagate (a provider that genuinely raises TypeError from
                 # its body should not be silently retried).
-                if "as_of" in str(exc) or "unexpected keyword" in str(exc):
+                # ar108: the old `or "unexpected keyword"` did NOT achieve that
+                # stated intent — it swallowed ANY unexpected-keyword TypeError,
+                # dropping the no-lookahead as_of bound for an unrelated kwarg
+                # mismatch (fail-OPEN). Require BOTH the bad-signature shape AND the
+                # literal `as_of` token so only a genuine no-as_of provider degrades.
+                msg = str(exc)
+                if "as_of" in msg and (
+                    "unexpected keyword" in msg or "got multiple values" in msg
+                ):
                     return provider.fetch_bars(symbol, timeframe, start, end)
                 raise
 
@@ -1011,6 +1212,31 @@ def recommend(
                 analysts.append(FundamentalsAnalyst())
             except ImportError:
                 pass
+        # 2f33 (ADR-0100 ob2/ob3): OpenBB estimates + insider analysts — DEFAULT-OFF
+        # behind their per-analyst flag AND HERMES_QUANT_OPENBB. Mirrored from
+        # _build_default_analysts() so the canonical recommend() surface (operator
+        # tool calls + flag ablations through recommend()) exercises the flags too,
+        # not just the recommend_multi_horizon()/backtest helper path.
+        if (
+            os.environ.get("HERMES_QUANT_ESTIMATES_ANALYST", "0") == "1"
+            and os.environ.get("HERMES_QUANT_OPENBB", "0") == "1"
+        ):
+            try:
+                from hermes_quant.analysts.estimates import EstimatesAnalyst
+
+                analysts.append(EstimatesAnalyst())
+            except ImportError:
+                pass
+        if (
+            os.environ.get("HERMES_QUANT_INSIDER_ANALYST", "0") == "1"
+            and os.environ.get("HERMES_QUANT_OPENBB", "0") == "1"
+        ):
+            try:
+                from hermes_quant.analysts.insider import InsiderAnalyst
+
+                analysts.append(InsiderAnalyst())
+            except ImportError:
+                pass
         # ADR-0074: Catalyst Sense semantic analyst — default ON; set
         # HERMES_QUANT_SEMANTIC_ENABLED=0 to opt out.
         # See _build_default_analysts() comment for context.
@@ -1142,14 +1368,100 @@ def recommend(
     result.aggregated_signal = _signal_to_dict(agg_signal)
 
     # ---- Step 7: risk gate ----
-    if risk_gate is None:
+    # cs86 (DEFAULT-OFF): wire cs01's durable drawdown baseline into the LIVE
+    # producer. cs01 left the gate seam (gate.py:414 baseline_store=) INERT twice
+    # over here — the producer builds DefaultRiskGate() with NO store AND feeds a
+    # synthetic flat 100k portfolio (drawdown always 0). When the operator opts in
+    # via HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE=1 (read at call time) AND the live
+    # tick threaded the REAL (account, asset_class, equity) via
+    # `durable_equity_account`, we instead build a durable DrawdownBaselineStore
+    # (cs01) over the live state.db dir + a real-equity portfolio + a store-backed
+    # gate, so the Rule-1/Rule-2 breakers measure against the DURABLE HWM peak +
+    # session-anchored daily-open (conservative-by-construction: the breaker can
+    # only trip EARLIER / equally). Flag OFF (production default) OR no
+    # `durable_equity_account` => byte-identical to before (no store import /
+    # construct / state.db write, synthetic portfolio, no-store gate).
+    durable_on = os.environ.get("HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE", "0") == "1"
+    use_durable = durable_on and durable_equity_account is not None
+
+    if use_durable:
+        acct_id, acct_asset_class, real_equity = durable_equity_account
+        # FAIL-CLOSED: a None / non-finite / <=0 NAV must NOT fall through to the
+        # synthetic 100k (which would re-OPEN the breaker). Gate the signal.
+        try:
+            eq_f = float(real_equity)
+        except (TypeError, ValueError):
+            eq_f = float("nan")
+        if not math.isfinite(eq_f) or eq_f <= 0:
+            return _gated_no_data(result, "durable_baseline_nav_unavailable")
+        # Construct the durable store over the LIVE state.db dir (cs01 default
+        # paths). FAIL-CLOSED on a construct error — never a silent fall-open.
+        try:
+            from hermes_quant.risk.baseline_store import DrawdownBaselineStore
+
+            store = DrawdownBaselineStore()
+        except Exception as exc:  # noqa: BLE001 - store failure must FAIL-CLOSED
+            logger.warning(
+                "advisor: durable baseline store construct failed (%s) — "
+                "failing CLOSED (gating)",
+                exc,
+                exc_info=True,
+            )
+            return _gated_no_data(result, "durable_baseline_store_error")
+        # Build the gate WITH the store, preserving any recipe/injected gate's
+        # RiskConfig (threshold profile) when present; else default RiskConfig
+        # (identical to the no-store fallback). Also carry the injected gate's
+        # _cooldowns forward so a pre-seeded HERMES_QUANT_POST_LOSS_COOLDOWN gate
+        # (which populates _cooldowns before this call) is not silently reset by the
+        # store-attach rebuild — Rule 4 would otherwise be dead when both flags are ON.
         from hermes_quant.risk.gate import DefaultRiskGate
 
-        risk_gate = DefaultRiskGate()
+        _prior_cooldowns = getattr(risk_gate, "_cooldowns", {}) if risk_gate is not None else {}
+        risk_gate = DefaultRiskGate(
+            config=getattr(risk_gate, "config", None), baseline_store=store
+        )
+        # Re-populate from the prior gate's cooldowns (mirror record_loss semantics:
+        # only updates; no key is deleted). This is a no-op when the injected gate
+        # had no cooldowns (the default path today).
+        for (acct, ac, sym), state in _prior_cooldowns.items():
+            if state.last_loss_at is not None:
+                risk_gate.record_loss(acct, ac, sym, state.last_loss_at)
+        portfolio = _real_equity_portfolio(
+            acct_id, acct_asset_class, last_bar_ts_utc, eq_f
+        )
+    else:
+        if risk_gate is None:
+            from hermes_quant.risk.gate import DefaultRiskGate
+
+            risk_gate = DefaultRiskGate()
+        portfolio = _synthetic_portfolio(symbol, asset_class, last_bar_ts_utc)
 
     market = _bootstrap_market_state(symbol, asset_class, last_bar_ts_utc)
-    portfolio = _synthetic_portfolio(symbol, asset_class, last_bar_ts_utc)
     halt_state: HaltState = _EmptyHaltState()  # type: ignore[assignment]
+
+    # 01f0 LIVE cutover (ADR-0097): when HERMES_QUANT_SLIPPAGE_GATE=1, pre-compute the
+    # conservative live-vs-paper penalty for this symbol's asset_class (the shell owns the
+    # estimator; the pure gate only consumes the float) and thread it into the LIVE gate's
+    # RiskConfig so the Rule-5 cost gate + Rule-6 sizer haircut the edge toward silence.
+    # This makes the haircut AUTHORITATIVE on the live decision path (b61c wired it into
+    # clean_window EVIDENCE only; the shadow-gate wiring did not touch the live action).
+    # Default-OFF / estimator-error => slippage_gate_enabled stays False or penalty floors
+    # conservatively (never 0.0-on-error) => byte-identical. Best-effort: never abort the gate.
+    try:
+        from hermes_quant.pdr_core_adapter import (
+            _slippage_penalty_frac_for,
+            slippage_gate_enabled,
+        )
+
+        if slippage_gate_enabled() and risk_gate is not None and risk_gate.config is not None:
+            import dataclasses as _dc
+
+            _pen = _slippage_penalty_frac_for(asset_class)
+            risk_gate.config = _dc.replace(
+                risk_gate.config, slippage_gate_enabled=True, slippage_penalty_frac=_pen
+            )
+    except Exception as _slip_exc:  # noqa: BLE001 — fail-closed: a wiring error must not haircut-bypass
+        logger.warning("advisor: slippage-gate wiring failed (%s) — gate runs without haircut", _slip_exc)
 
     try:
         action = risk_gate.gate(agg_signal, market, portfolio, halt_state)
@@ -1159,6 +1471,33 @@ def recommend(
         return _gated_no_data(result, "risk_gate_error")
 
     result.risk_gate = _action_to_gate_dict(action, agg_signal)
+
+    # ---- Step 7.5: pdr_core SHADOW gate (ADR-0092 Inc-2, DEFAULT-OFF) ----
+    # SHADOW, NOT CUTOVER. The live `action` above and `result.risk_gate` are
+    # already final and UNCHANGED. When HERMES_QUANT_PDR_CORE_SHADOW=1 (read at
+    # call time, mirroring the FUNDAMENTALS/OVERNIGHT_DRIFT flags above) we
+    # ADDITIONALLY run the ported core gate over the SAME inputs, map its verdict
+    # onto an Action, compare field-by-field to the LIVE action, and LOG
+    # divergence — purely to validate the port before any cutover. The shadow
+    # NEVER assigns to `action` or `result.risk_gate`; it only reads them. Any
+    # raise is swallowed (best-effort) so a shadow failure can never reach the
+    # caller. Flag-OFF the branch is not entered, the adapter is not imported,
+    # and the core gate is not constructed — byte-identical to today.
+    if os.environ.get("HERMES_QUANT_PDR_CORE_SHADOW", "0") == "1":
+        try:
+            from hermes_quant.pdr_core_adapter import run_shadow_gate
+
+            run_shadow_gate(
+                agg_signal=agg_signal,
+                market=market,
+                portfolio=portfolio,
+                halt_state=halt_state,
+                live_action=action,
+                live_config=getattr(risk_gate, "config", None),
+                event_risk_enabled=os.environ.get("HERMES_QUANT_EVENT_RISK", "0") == "1",
+            )
+        except Exception as exc:  # noqa: BLE001 — shadow must never affect live
+            logger.warning("advisor: pdr_core shadow seam raised: %s", exc, exc_info=True)
 
     # ---- Step 8: lessons (optional) ----
     if include_lessons:

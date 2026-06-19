@@ -113,6 +113,47 @@ def _put_chain(reader: ChainSnapshotReader) -> None:
     )
 
 
+def _row_priced(
+    symbol: str, *, right: str, delta: float, bid: float, ask: float
+) -> dict:
+    """A chain row with an EXPLICIT bid/ask (so a spread's short/long mids differ)."""
+    r = _row(symbol, right=right, delta=delta)
+    r["bid"] = bid
+    r["ask"] = ask
+    r["last"] = (bid + ask) / 2
+    return r
+
+
+def _bull_put_spread_chain(reader: ChainSnapshotReader) -> None:
+    """Put chain priced so the 0.30-delta short (K=140) sits above a lower-strike
+    long protective put (K=135) with a POSITIVE net credit (short mid > long mid).
+    A bull put spread = SELL K=140 put + BUY K=135 put (both PUTS)."""
+    _write_chain(
+        reader,
+        [
+            # short workhorse: ~0.30 delta put @ K=140, mid ~2.50 (collect)
+            _row_priced("NVDA260626P00140000", right="P", delta=-0.30, bid=2.40, ask=2.60),
+            # long protection: lower-strike put @ K=135, mid ~1.00 (pay)
+            _row_priced("NVDA260626P00135000", right="P", delta=-0.18, bid=0.90, ask=1.10),
+        ],
+    )
+
+
+def _bear_call_spread_chain(reader: ChainSnapshotReader) -> None:
+    """Call chain priced so the 0.30-delta short (K=160) sits below a higher-strike
+    long protective call (K=165) with a POSITIVE net credit (short mid > long mid).
+    A bear call spread = SELL K=160 call + BUY K=165 call (both CALLS)."""
+    _write_chain(
+        reader,
+        [
+            # short workhorse: ~0.30 delta call @ K=160, mid ~2.50 (collect)
+            _row_priced("NVDA260626C00160000", right="C", delta=0.30, bid=2.40, ask=2.60),
+            # long protection: higher-strike call @ K=165, mid ~1.00 (pay)
+            _row_priced("NVDA260626C00165000", right="C", delta=0.18, bid=0.90, ask=1.10),
+        ],
+    )
+
+
 def _store(tmp_path) -> ProposalStore:
     return ProposalStore(bus_path=tmp_path / "p.jsonl", db_path=tmp_path / "p.db")
 
@@ -178,6 +219,33 @@ def test_csp_builds_and_gates(gate_on, tmp_path) -> None:
     assert res.admitted is True
     assert res.bucket.value == "cash_secured_put"
     assert res.proposal.stock_leg is None  # CSP has no equity leg
+
+
+def test_csp_cumulative_assignment_cap_plumbed_through_producer(gate_on, tmp_path) -> None:
+    """ADR-0027 D2/D4: build_multi_leg_proposal forwards open_assignment_cash into
+    options_gate so the cumulative all-CSPs-assign cap is enforced end-to-end.
+
+    The 0.30-delta short put is strike 140 (one lot collateral = 140*100 = 14_000).
+    With nav=1_000_000 the cap is 0.20*nav = 200_000. open_assignment_cash=190_000
+    (prior CSP reservations) -> 190_000 + 14_000 = 204_000 > 200_000 -> the gate
+    must REJECT, no passing proposal is minted. Default (0.0) is byte-identical
+    (the test above admits the same CSP).
+    """
+    reader = ChainSnapshotReader(chains_dir=tmp_path)
+    _put_chain(reader)
+    res = build_multi_leg_proposal(
+        symbol="NVDA",
+        asof=ASOF,
+        strategy_kind="cash_secured_put",
+        reader=reader,
+        nav=1_000_000.0,
+        held_shares=0,
+        options_buying_power=5_000_000.0,
+        open_assignment_cash=190_000.0,
+    )
+    assert res.admitted is False
+    assert res.proposal is None
+    assert res.reason == "cumulative_assignment_risk_cap"
 
 
 # --------------------------------------------------------------------------- #
@@ -674,3 +742,153 @@ def test_quant_approve_multileg_nan_kelly_rejected_before_bus_write(
     assert out["state"] == "pending"
     assert store.get(record.proposal_id).state == "pending"
     assert _execution_records(exec_path) == []
+
+
+# --------------------------------------------------------------------------- #
+# Vertical-spread dispatch: build_multi_leg_proposal must route a bull_put_spread
+# / bear_call_spread to the dedicated spread builders, NOT mis-build them as a
+# covered call. (latent money-defect: before the fix, ANY non-CSP strategy_kind
+# fell through to right="C" and was built as a stock+short-call CC shape with the
+# WRONG legs, WRONG max_loss, and the WRONG strategy_kind persisted.)
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def _vertical_spreads_on(monkeypatch):
+    monkeypatch.setenv("HERMES_QUANT_VERTICAL_SPREADS", "1")
+
+
+def test_build_multi_leg_dispatches_bull_put_spread_not_covered_call(
+    gate_on, _vertical_spreads_on, tmp_path
+) -> None:
+    """RED before the fix: build_multi_leg_proposal(strategy_kind='bull_put_spread')
+    set right='C' (anything != cash_secured_put) and built a STOCK + short-CALL
+    covered-call shape persisted as strategy_kind='covered_call'. AFTER the fix it
+    delegates to build_bull_put_spread_proposal and returns a two-PUT spread.
+    """
+    from hermes_quant.risk.options_gate import StructureBucket
+
+    reader = ChainSnapshotReader(chains_dir=tmp_path)
+    _bull_put_spread_chain(reader)
+    res = build_multi_leg_proposal(
+        symbol="NVDA",
+        asof=ASOF,
+        strategy_kind="bull_put_spread",
+        reader=reader,
+        nav=1_000_000.0,
+        held_shares=0,
+        options_buying_power=500_000.0,
+    )
+    assert res.admitted is True, f"expected admitted, reason={res.reason!r}"
+    assert res.proposal is not None
+    p = res.proposal
+
+    # The strategy_kind is preserved (NOT mis-persisted as covered_call).
+    assert p.strategy_kind == "bull_put_spread"
+
+    # Two PUT legs (short + long protective), NO stock leg — NOT a CC shape.
+    assert p.stock_leg is None
+    assert len(p.option_legs) == 2
+    short_leg, long_leg = p.option_legs
+    assert short_leg.right == "P"
+    assert long_leg.right == "P"
+    assert short_leg.side == "sell"
+    assert long_leg.side == "buy"
+    # Defined-risk bucket (a naked/CC mis-build would NOT be defined_risk).
+    assert res.bucket == StructureBucket.DEFINED_RISK
+    assert p.risk_gate_pass is True
+
+
+def test_build_multi_leg_dispatches_bear_call_spread_not_covered_call(
+    gate_on, _vertical_spreads_on, tmp_path
+) -> None:
+    """RED before the fix: a bear_call_spread fell into the right='C' CC path and was
+    built as a stock + single short-call covered call. AFTER the fix it delegates to
+    build_bear_call_spread_proposal and returns a two-CALL spread.
+    """
+    from hermes_quant.risk.options_gate import StructureBucket
+
+    reader = ChainSnapshotReader(chains_dir=tmp_path)
+    _bear_call_spread_chain(reader)
+    res = build_multi_leg_proposal(
+        symbol="NVDA",
+        asof=ASOF,
+        strategy_kind="bear_call_spread",
+        reader=reader,
+        nav=1_000_000.0,
+        held_shares=0,
+        options_buying_power=500_000.0,
+    )
+    assert res.admitted is True, f"expected admitted, reason={res.reason!r}"
+    assert res.proposal is not None
+    p = res.proposal
+
+    assert p.strategy_kind == "bear_call_spread"
+
+    # Two CALL legs (short + long protective), NO stock leg — NOT a CC shape.
+    assert p.stock_leg is None
+    assert len(p.option_legs) == 2
+    short_leg, long_leg = p.option_legs
+    assert short_leg.right == "C"
+    assert long_leg.right == "C"
+    assert short_leg.side == "sell"
+    assert long_leg.side == "buy"
+    assert res.bucket == StructureBucket.DEFINED_RISK
+    assert p.risk_gate_pass is True
+
+
+def test_build_and_persist_dispatches_bull_put_spread_with_correct_kind(
+    gate_on, _vertical_spreads_on, tmp_path
+) -> None:
+    """The AUTONOMOUS path (build_and_persist_multi_leg -> build_multi_leg_proposal)
+    persists the spread with the CORRECT strategy_kind=='bull_put_spread' and a
+    two-PUT shape — not a covered_call mis-build."""
+    reader = ChainSnapshotReader(chains_dir=tmp_path)
+    _bull_put_spread_chain(reader)
+    store = _store(tmp_path)
+    res, rec = build_and_persist_multi_leg(
+        store=store,
+        symbol="NVDA",
+        asof=ASOF,
+        strategy_kind="bull_put_spread",
+        nav=1_000_000.0,
+        options_buying_power=500_000.0,
+        held_shares=0,
+        reader=reader,
+    )
+    assert rec is not None
+    assert res.proposal is not None and res.proposal.strategy_kind == "bull_put_spread"
+
+    got = store.get(rec.proposal_id)
+    assert isinstance(got, StoredMultiLegProposal)
+    # The PERSISTED record carries the correct kind + two-PUT shape.
+    assert got.strategy_kind == "bull_put_spread"
+    assert got.stock_leg is None
+    assert len(got.option_legs) == 2
+    assert all(leg.right == "P" for leg in got.option_legs)
+    assert isinstance(select_reactor(got), MultiLegPaperReactor)
+
+
+def test_covered_call_path_unchanged_regression(gate_on, tmp_path) -> None:
+    """REGRESSION GUARD: a covered_call still builds the stock + short-CALL shape
+    (the CC/CSP/wheel fall-through path is unchanged by the spread dispatch)."""
+    reader = ChainSnapshotReader(chains_dir=tmp_path)
+    _call_chain(reader)
+    res = build_multi_leg_proposal(
+        symbol="NVDA",
+        asof=ASOF,
+        strategy_kind="covered_call",
+        reader=reader,
+        nav=1_000_000.0,
+        held_shares=1000,
+        options_buying_power=500_000.0,
+    )
+    assert res.admitted is True
+    assert res.proposal is not None
+    p = res.proposal
+    assert p.strategy_kind == "covered_call"
+    # CC shape: a stock leg + a SINGLE short call (NOT a two-leg put spread).
+    assert p.stock_leg is not None
+    assert p.stock_leg.qty == 100 * res.contracts
+    assert len(p.option_legs) == 1
+    assert p.option_legs[0].right == "C"
+    assert p.option_legs[0].side == "sell"
+    assert res.bucket.value == "covered_call"

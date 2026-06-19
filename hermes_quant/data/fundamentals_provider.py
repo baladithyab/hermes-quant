@@ -59,10 +59,10 @@ a Q4 closing 31-Dec is filed ~mid-Feb). Filtering a backtest read on the
 period end (or even on the cache snapshot date) can therefore leak a
 fundamental into the past before it was actually reported.
 
-When ``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG`` is truthy (default OFF), the
-hot-path reads (`read_latest`, `read_sector_median_pe`) require, in addition
-to the existing ``as_of_date <= as_of`` snapshot filter, that the row's
-effective-knowable date satisfies::
+When ``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG`` is truthy (default ON; cs12 /
+no-lookahead), the hot-path reads (`read_latest`, `read_sector_median_pe`)
+require, in addition to the existing ``as_of_date <= as_of`` snapshot filter,
+that the row's effective-knowable date satisfies::
 
     effective_knowable = (report_date or period_end) + reporting_lag_days
     keep row iff effective_knowable <= as_of
@@ -76,13 +76,31 @@ report_date nor period_end fall back to the snapshot ``as_of_date`` (already
 a knowable date — it is when the datum entered the cache), so missing
 backfill never loosens visibility.
 
-The flag is read at call time; with it OFF the read path is byte-identical
-to the pre-B34 behavior.
+The flag is read at call time and is ON by default (cs12). An explicit
+falsey value (``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG=0`` / ``false`` /
+``no`` / ``off`` / empty) reverts the read path to the byte-identical
+pre-B34 ``as_of_date <= as_of`` behavior — the instant operator kill switch
+for this live-analyst-input change.
+
+Operator note — old/stale cache + default-ON
+---------------------------------------------
+Against an OLD-SCHEMA or STALE cache the default-ON filter is intentionally
+conservative to the point of going dark. Parquets that predate the B34
+``period_end`` / ``report_date`` columns (backfilled NaT), or a cache the
+prewarm cron has not yet repopulated, carry no point-in-time stamp, so every
+row falls back to ``as_of_date + reporting_lag_days``. A freshly-cached
+snapshot read at ~``as_of`` is then DROPPED (``as_of_date + 45d > as_of``) and
+``read_latest`` returns None. With the whole universe on that fallback the
+``FundamentalsAnalyst`` abstains across the board (full dark — silence-by-
+default, safety-conservative) until (i) the prewarm cron rewrites new-schema
+rows carrying a real ``period_end`` / ``report_date`` AND (ii) the 45d lag has
+elapsed for those rows. The byte-identical revert / instant kill switch is
+``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG=0`` (or ``false`` / ``no`` / ``off`` /
+empty), which restores the pre-B34 ``as_of_date <= as_of`` read path exactly.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import tempfile
@@ -93,13 +111,15 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache" / "fundamentals"
+DEFAULT_CACHE_ROOT = _resolve_quant_home() / "cache" / "fundamentals"
 
-# B34 reporting-lag-adjusted as_of. Default-OFF; read at call time so the
-# off-state read path is byte-identical to pre-B34 behavior.
+# B34 reporting-lag-adjusted as_of. Default-ON (cs12 / no-lookahead); read at
+# call time so the explicit-OFF revert path is byte-identical to pre-B34.
 REPORTING_LAG_ENV_FLAG = "HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG"
 # Conservative default for quarterly fundamentals: a 10-K/10-Q can land ~40d
 # (large accelerated filer) to ~75d after period end. 45d is a safe, jitter-
@@ -110,16 +130,27 @@ DEFAULT_REPORTING_LAG_DAYS: int = 45
 def _reporting_lag_flag_on() -> bool:
     """True iff the reporting-lag-adjusted as_of filter is enabled.
 
-    Canonical multi-value idiom (mirrors memory/meta_retro.py:_flag_on). Read
-    at call time so flipping the env var takes effect without re-import and the
-    OFF path stays byte-identical.
+    Default-ON (cs12 / no-lookahead): an ``as_of``-bounded read is by
+    definition a point-in-time read, and a fundamental is NOT knowable as of
+    its cache date — only after ``period_end`` (or ``report_date``) plus the
+    typical reporting lag. Filtering only on ``as_of_date <= as_of`` leaks a
+    Q4 datum (period_end 31-Dec, cached mid-Jan) into a backtest deciding in
+    January, ~45d before the 10-K is actually filed. The lag filter closes
+    that leak, so it is ON by default.
+
+    Reversibility: the operator can opt OUT with an explicit falsey value
+    (``HERMES_QUANT_FUNDAMENTALS_REPORTING_LAG=0`` / ``false`` / ``off`` / ...).
+    On that OFF path the read is byte-identical to pre-B34 behavior — the
+    instant kill switch required for a live analyst-input change.
+
+    Read at call time so flipping the env var takes effect without re-import.
     """
-    return os.environ.get(REPORTING_LAG_ENV_FLAG, "0") in (
-        "1",
-        "true",
-        "True",
-        "yes",
-        "on",
+    return os.environ.get(REPORTING_LAG_ENV_FLAG, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
     )
 
 # Per-ticker snapshot schema (column -> dtype)
@@ -189,6 +220,40 @@ def _atomic_write_parquet(df: pd.DataFrame, target: Path) -> None:
     finally:
         if tmp.exists():
             tmp.unlink()
+
+
+def _quarantine_corrupt_parquet(path: Path) -> Path:
+    """Rename a corrupt/unreadable parquet to a timestamped ``.corrupt`` sidecar.
+
+    cs61 (money-software, fail-CLOSED): when ``pd.read_parquet`` RAISES on an
+    existing cache file (transient/torn/genuinely-corrupt read) the write paths
+    used to reset ``existing`` to an EMPTY frame and ``_atomic_write_parquet``
+    the single new row over the file — irrecoverably destroying the ENTIRE
+    historical point-in-time series for that ticker / sector (same write-side
+    PIT-history-mutation class as cs42(b) / cs59, but triggered by a READ ERROR
+    rather than a re-fetch, and a SILENT fail-open data-loss).
+
+    Quarantine instead: MOVE the corrupt bytes aside (so the history is
+    recoverable for a human / a repair job) BEFORE the caller starts fresh, and
+    return the sidecar path so the caller can LOUDLY warn. Preserves forward
+    progress (the new row is still written) AND recoverability, vs. a bare
+    ``raise`` that would also block the cron.
+
+    The sidecar name carries a UTC timestamp + a uniqueness counter so repeated
+    corrupt reads of the same path never clobber an earlier quarantine. On the
+    (unlikely) event the rename itself fails the corrupt bytes are left in place
+    and the original exception path is preserved — we never silently delete.
+    """
+    stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%S")
+    base = path.with_suffix(path.suffix + f".{stamp}.corrupt")
+    sidecar = base
+    counter = 0
+    # Never clobber an earlier quarantine of the same path within the same second.
+    while sidecar.exists():
+        counter += 1
+        sidecar = path.with_suffix(path.suffix + f".{stamp}-{counter}.corrupt")
+    path.replace(sidecar)
+    return sidecar
 
 
 def _coerce_float(x: Any) -> float:
@@ -297,7 +362,7 @@ class FundamentalsProvider:
         return self.sector_medians_dir / f"{_safe_component(sector)}.parquet"
 
     # ------------------------------------------------------------------
-    # B34: reporting-lag-adjusted as_of filter (default-OFF, no-lookahead)
+    # B34: reporting-lag-adjusted as_of filter (default-ON, no-lookahead)
     # ------------------------------------------------------------------
 
     def _apply_reporting_lag_filter(
@@ -387,6 +452,16 @@ class FundamentalsProvider:
             df = self._apply_reporting_lag_filter(df, asof_ts)
             if df.empty:
                 return None
+            # cs42(a): a row whose fetched_at is strictly AFTER as_of was fetched
+            # in the future relative to this point-in-time read — never
+            # legitimate at as_of. The day-normalized as_of_date can pass the
+            # ``as_of_date <= as_of`` snapshot filter for an intraday-future
+            # fetched_at (or a fabricated future timestamp), which would yield a
+            # negative age that defeats the downstream staleness gate. Drop it.
+            # Pure PIT correctness; touches only the as_of-bounded path.
+            df = df[df["fetched_at"] <= asof_ts]
+            if df.empty:
+                return None
 
         # Latest by fetched_at.
         df = df.sort_values("fetched_at")
@@ -437,10 +512,66 @@ class FundamentalsProvider:
         df = df[df["as_of_date"] <= asof_ts]
         if df.empty:
             return None
+        # cs41: ANDed reporting-lag-adjusted as_of, symmetric with read_latest
+        # (no-op when the flag is OFF). The pe_relative DENOMINATOR (sector
+        # median) must obey the same no-lookahead lag as the NUMERATOR
+        # (read_latest); else a backtest sector median embeds not-yet-public
+        # constituent fundamentals. The sector-median schema has no
+        # report_date / period_end, so the filter falls back to
+        # ``as_of_date + reporting_lag_days`` — conservative-tightening,
+        # consistent with the old/stale-cache go-dark behavior. Flag OFF reverts
+        # to the byte-identical pre-cs41 ``as_of_date <= as_of`` read.
+        df = self._apply_reporting_lag_filter(df, asof_ts)
+        if df.empty:
+            return None
+        # cs53: symmetric with read_latest:426 (cs42(a)). A sector-median row
+        # whose fetched_at is strictly AFTER as_of was fetched in the future
+        # relative to this point-in-time read — never legitimate at as_of. The
+        # day-normalized as_of_date can pass the ``as_of_date <= as_of`` snapshot
+        # filter for an intraday-future fetched_at (or a fabricated future
+        # timestamp), which yields a NEGATIVE age_days below; the staleness gate
+        # ``age_days > SECTOR_MEDIAN_STALE_HARD_DAYS`` is then False for any
+        # negative value and the future-fetched median is silently ACCEPTED. The
+        # pe_relative DENOMINATOR (sector median) must obey the same no-lookahead
+        # discipline as the read_latest NUMERATOR. Drop it. Pure PIT correctness;
+        # touches only the as_of-bounded path.
+        if as_of is not None:
+            df = df[df["fetched_at"] <= asof_ts]
+            if df.empty:
+                return None
         df = df.sort_values("fetched_at")
         latest = df.iloc[-1]
         age_days = (asof_ts - pd.Timestamp(latest["fetched_at"])).days
-        if age_days > self.SECTOR_MEDIAN_STALE_HARD_DAYS:
+        # cs68: a NEGATIVE age_days means the surviving median row was fetched in
+        # the FUTURE relative to asof_ts. cs53 drops a future fetched_at on the
+        # as_of-is-not-None POINT-IN-TIME path (so age_days is never negative
+        # there — the clause below is a no-op on that path), but that guard is
+        # scoped ``if as_of is not None``. On the as_of=None LIVE path (asof_ts
+        # defaults to now — the path the LIVE FundamentalsAnalyst uses for the
+        # pe_relative DENOMINATOR) the future-fetch drop is SKIPPED, so a median
+        # stamped as_of_date=today / fetched_at=now+10d survives, yields
+        # age_days < 0, and the bare ``age_days > HARD_DAYS`` gate is False for a
+        # negative value -> the future-fetched median is silently ACCEPTED as
+        # fresh. Clamp it: a negative age is treated as max-stale -> abstain.
+        # Symmetric with the cs67 refresh clamp (``if 0 <= age_h < ttl``) and the
+        # silence-by-default charter (a not-yet-knowable median must go dark, not
+        # be trusted). The as_of!=None PIT path (cs53) is byte-identical.
+        #
+        # cs75: the bare disjunct ``age_days < 0 or age_days > HARD`` is NaN-UNSAFE.
+        # When the surviving latest row has fetched_at = NaT (a corrupt / torn /
+        # hand-built parquet, an old-schema migration, or a backfill omitting the
+        # stamp), ``(asof_ts - pd.Timestamp(NaT)).days`` is float('nan'); ``nan < 0``
+        # and ``nan > HARD`` are BOTH False, so the 30d HARD gate is BYPASSED and a
+        # median with NO knowable fetch time is silently ACCEPTED as fresh ->
+        # fail-OPEN (the gap bit only the as_of=None LIVE path: cs53 above drops a
+        # NaT row upstream on the PIT path). Use a bounded NaN-SAFE membership test
+        # mirroring cs67's ``0 <= age_h < ttl`` and cs69's ``pd.isna(fetched_at)``
+        # skip: a nan / NaT-derived age fails ``0 <= age_days <= HARD`` -> abstain.
+        # The inclusive upper bound ``<= HARD`` preserves the old strictly-greater
+        # ``> HARD`` boundary (age_days == HARD still accepted); a genuinely-fresh
+        # past-stamped median (age_days in [0, HARD]) and the cs68 negative-age
+        # abstain stay byte-identical.
+        if not (0 <= age_days <= self.SECTOR_MEDIAN_STALE_HARD_DAYS):
             return None
         val = _coerce_float(latest.get("median_pe_trailing"))
         if np.isnan(val) or val <= 0:
@@ -468,9 +599,20 @@ class FundamentalsProvider:
             try:
                 existing = pd.read_parquet(path)
             except Exception as exc:  # noqa: BLE001
+                # cs61 (money-software, fail-CLOSED): do NOT silently overwrite a
+                # corrupt/unreadable cache with the single new row — that would
+                # irrecoverably destroy the ticker's entire historical
+                # point-in-time series (same write-side PIT-history-mutation
+                # class as cs42(b) / cs59, here triggered by a READ ERROR).
+                # QUARANTINE the corrupt bytes to a recoverable .corrupt sidecar,
+                # LOUDLY warn, then start fresh so forward progress is preserved.
+                sidecar = _quarantine_corrupt_parquet(path)
                 logger.warning(
-                    "fundamentals: corrupt parquet for %s, overwriting: %s",
+                    "fundamentals: corrupt parquet for %s, QUARANTINED to %s "
+                    "(history preserved for recovery, NOT overwritten); "
+                    "starting fresh: %s",
                     ticker,
+                    sidecar.name,
                     exc,
                 )
                 existing = pd.DataFrame(columns=list(_SNAPSHOT_COLUMNS.keys()))
@@ -479,9 +621,18 @@ class FundamentalsProvider:
 
         merged = pd.concat([existing, new_df], ignore_index=True)
         merged = self._normalize_snapshot_frame(merged)
-        # Dedupe on as_of_date keep latest fetched_at
-        merged = merged.sort_values(["as_of_date", "fetched_at"])
+        # cs42(b): point-in-time-preserving dedupe. A SAME-DAY correction (a
+        # newer fetched_at on the SAME calendar day as the row's as_of_date) is
+        # the legitimate intraday-revision case and still wins. A CROSS-DAY
+        # backfill (fetched_at on a LATER calendar day than as_of_date) must NOT
+        # overwrite a row already recorded same-day-correct for that as_of_date,
+        # else a re-fetch silently rewrites a historical point-in-time value.
+        # Among rows sharing an as_of_date, rank same-day rows above cross-day
+        # ones, then by fetched_at, and keep="last" -> the PIT-correct row.
+        merged["_same_day"] = merged["fetched_at"].dt.normalize() <= merged["as_of_date"]
+        merged = merged.sort_values(["as_of_date", "_same_day", "fetched_at"])
         merged = merged.drop_duplicates(subset=["as_of_date"], keep="last")
+        merged = merged.drop(columns=["_same_day"])
         merged = merged.sort_values("fetched_at").reset_index(drop=True)
         _atomic_write_parquet(merged, path)
         return path
@@ -495,15 +646,46 @@ class FundamentalsProvider:
         if path.exists():
             try:
                 existing = pd.read_parquet(path)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                # cs61 (money-software, fail-CLOSED): symmetric with
+                # write_snapshot. A corrupt-read here used to silently overwrite
+                # the entire historical sector-median series (the pe_relative
+                # DENOMINATOR) with the single new row — and without even a
+                # warning. QUARANTINE the corrupt bytes to a recoverable .corrupt
+                # sidecar, LOUDLY warn, then start fresh.
+                sidecar = _quarantine_corrupt_parquet(path)
+                logger.warning(
+                    "fundamentals: corrupt sector_median parquet for %s, "
+                    "QUARANTINED to %s (history preserved for recovery, NOT "
+                    "overwritten); starting fresh: %s",
+                    sector,
+                    sidecar.name,
+                    exc,
+                )
                 existing = pd.DataFrame(columns=list(_SECTOR_MEDIAN_COLUMNS.keys()))
         else:
             existing = pd.DataFrame(columns=list(_SECTOR_MEDIAN_COLUMNS.keys()))
 
         merged = pd.concat([existing, new_df], ignore_index=True)
         merged = self._normalize_sector_median_frame(merged)
-        merged = merged.sort_values(["as_of_date", "fetched_at"])
+        # cs59: point-in-time-preserving dedupe, mirroring write_snapshot's
+        # cs42(b) guard. The sector median is the pe_relative DENOMINATOR; a
+        # past-as-of read (read_sector_median_pe) must return the SAME value
+        # across re-fetches, else a backtest replayed after a refresh sees a
+        # mutated denominator — the same PIT-integrity class cs42(b) closed on
+        # the per-ticker write side. A SAME-DAY correction (a newer fetched_at on
+        # the SAME calendar day as the row's as_of_date) is the legitimate
+        # intraday-revision case and still wins. A CROSS-DAY backfill (fetched_at
+        # on a LATER calendar day than as_of_date) must NOT overwrite a row
+        # already recorded same-day-correct for that as_of_date, else a re-fetch
+        # silently rewrites a historical point-in-time median. Among rows sharing
+        # an as_of_date, rank same-day rows above cross-day ones, then by
+        # fetched_at, and keep="last" -> the PIT-correct row. A first-write of a
+        # new as_of_date is byte-identical (the guard only fires on a re-write).
+        merged["_same_day"] = merged["fetched_at"].dt.normalize() <= merged["as_of_date"]
+        merged = merged.sort_values(["as_of_date", "_same_day", "fetched_at"])
         merged = merged.drop_duplicates(subset=["as_of_date"], keep="last")
+        merged = merged.drop(columns=["_same_day"])
         merged = merged.sort_values("fetched_at").reset_index(drop=True)
         _atomic_write_parquet(merged, path)
         return path
@@ -531,7 +713,22 @@ class FundamentalsProvider:
                 latest = self.read_latest(ticker)
                 if latest is not None:
                     age_h = (now - pd.Timestamp(latest["fetched_at"])).total_seconds() / 3600.0
-                    if age_h < self.ttl_hours:
+                    # cs67: a FUTURE fetched_at (age_h < 0) must NOT count as
+                    # fresh. read_latest(as_of=None) returns the MAX-fetched_at
+                    # row; a row stamped in the future relative to the cron
+                    # wall-clock (NTP/clock-skew regression, container clock
+                    # jump, a fabricated/corrupt parquet, or a backfill tool
+                    # stamping a future timestamp) makes age_h negative, so the
+                    # legacy ``age_h < ttl_hours`` would skip:fresh FOREVER and
+                    # the ticker's fundamentals silently go stale and are never
+                    # re-fetched (until wall-clock passes that stamp). The
+                    # cs42(a)/cs53 future-fetch guards are scoped to the
+                    # as_of-is-not-None READ path; this cold REFRESH path
+                    # (as_of=None) had no guard. "Is the cache fresh enough to
+                    # SKIP re-fetching?" — a future stamp answers NO: treat it
+                    # max-stale and force-refresh. A genuinely-fresh past stamp
+                    # (0 <= age_h < ttl_hours) still skips:fresh, byte-identical.
+                    if 0 <= age_h < self.ttl_hours:
                         result[ticker] = "skipped:fresh"
                         continue
                 snapshot = self._fetch_yfinance_snapshot(ticker, now)
@@ -559,6 +756,32 @@ class FundamentalsProvider:
         for ticker in universe:
             snap = self.read_latest(ticker)
             if snap is None:
+                continue
+            # cs69: read_latest(as_of=None) returns the MAX-fetched_at constituent
+            # snapshot, but with NO freshness check. A constituent whose only
+            # snapshot is months stale (the prewarm cron stopped covering it, a
+            # delisting, a gap) would still contribute its stale pe to the median,
+            # and the median ROW is then stamped fetched_at=now below — so it
+            # sails through read_sector_median_pe's 30d HARD-staleness gate (that
+            # gate measures the MEDIAN-ROW fetched_at, NOT constituent age), and
+            # the analyst trusts a months-stale DENOMINATOR as fresh. Skip a
+            # constituent whose snapshot fetched_at age exceeds the same
+            # SECTOR_MEDIAN_STALE_HARD_DAYS bound the read gate uses, OR is in the
+            # FUTURE (negative age — clock-skew / fabricated parquet, symmetric
+            # with the cs67 refresh clamp and the cs68 read clamp). Reusing the
+            # 30d sector bound keeps the median's effective freshness consistent
+            # with the gate it must later pass; an all-fresh sector never trips
+            # the skip and is byte-identical. read_latest semantics are unchanged
+            # (the cs42(a) as_of=None latest path is untouched) — we only inspect
+            # the returned snapshot's fetched_at here.
+            fetched_at = snap.get("fetched_at")
+            if fetched_at is None or pd.isna(fetched_at):
+                continue
+            constituent_age_days = (now - pd.Timestamp(fetched_at)).days
+            if (
+                constituent_age_days < 0
+                or constituent_age_days > self.SECTOR_MEDIAN_STALE_HARD_DAYS
+            ):
                 continue
             pe = _coerce_float(snap.get("pe_trailing"))
             sector = snap.get("sector")

@@ -308,7 +308,12 @@ def main(argv: list[str] | None = None) -> int:
         if p is not None:
             end_prices[ticker] = p
     for acct in runner.accounts.values():
-        acct.mark_to_market(end_prices)
+        # Stamp the terminal MTM row to the replay session end date, NOT
+        # wall-clock now. compare_to_real(asof=date_to) only counts history
+        # rows dated <= date_to; a now-stamped row would fall outside the
+        # session for any historical replay and silently zero out every rule's
+        # reported P&L (ADR-0049).
+        acct.mark_to_market(end_prices, asof=date_to)
 
     # Real P&L for the range (sum over all dates)
     total_real_pnl = sum(
