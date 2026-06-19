@@ -286,15 +286,16 @@ def test_per_position_stop_sweep_react_error_is_not_silent(monkeypatch):
     monkeypatch.setattr(auto_mod, "_establishing_avg_entry_price", lambda sym: 110.0)
 
     result = TickResult(asof="2026-06-17T00:00:00Z", mode="autonomous", dry_run=False, watchlist_size=0)
+    # aegis-ageq2: the sweep now consumes a COMPOSITE-keyed book {(asset_class, symbol): frac}.
     stopped = _run_per_position_stop_sweep(
-        open_book={"ASTS": 0.05},
+        open_book={("equity", "ASTS"): 0.05},
         stop_pct=0.08,
         paper_zero_costs=True,
         result=result,
     )
 
     # The position was NOT stopped (reactor raised, so no fill was executed) — correct.
-    assert "ASTS" not in stopped, "a failed _react must not mark the symbol as stopped"
+    assert ("equity", "ASTS") not in stopped, "a failed _react must not mark the symbol as stopped"
 
     # GREEN: result.errors must be 1 and the decision gate must be PER_POSITION_STOP_ERROR.
     # RED (before fix): result.errors == 0 and result.decisions == [] (silent fail-open).

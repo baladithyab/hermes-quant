@@ -225,3 +225,122 @@ def reconstruct_portfolio_state(
         positions[asset] = t
 
     return PortfolioState(positions=positions)
+
+
+def reconstruct_open_book_composite(
+    executions_path: Path | str | None = None,
+    *,
+    asof: str | None = None,
+    drop_zeros: bool = True,
+    reactor_filter: str | None = "paper",
+    account: str | None = None,
+) -> dict[tuple[str, str], float]:
+    """aegis-ageq2: composite ``(asset_class, symbol) -> NAV-fraction`` open-book view.
+
+    A COMPANION to :func:`reconstruct_portfolio_state` that reads the SAME canonical
+    ``executions.jsonl`` source and applies the IDENTICAL record-filtering / no-fill /
+    finite-guard / latest-target-supersede semantics, but keys the result by the
+    ``(asset_class, symbol)`` TUPLE instead of by symbol alone. This lets the per-position
+    stop sweep route an options entry (``asset_class="us_option"``) to the options sweep
+    instead of hardcoding ``"equity"`` at the perception-frame / WatchlistEntry build.
+
+    This is ADDITIVE and ZERO-blast-radius on the existing symbol-keyed signature:
+    :func:`reconstruct_portfolio_state` is UNTOUCHED, so the §D9 concurrent-cap rail,
+    the portfolio-caps headroom path, and ``daemon/portfolio_loader`` keep their exact
+    behavior. We deliberately do NOT switch to the ``state.db`` materialized cache — a
+    stale cache on a safety rail is a fail-open; ``executions.jsonl`` is the truth.
+
+    The ``asset_class`` is read straight off each fill record (the live equity producers
+    + the multileg reactor all stamp it — see ``react/paper.py:_record_to_dict``). A
+    record lacking ``asset_class`` (a legacy/defensive case) keys as ``("equity", symbol)``
+    so the equity path stays byte-identical.
+
+    Supersede semantics: the LATEST fill (by ``asof_execution``) per ``(asset_class,
+    symbol)`` key wins. NOTE the key includes asset_class, so the SAME ticker held as
+    both an equity AND an option are TWO distinct rows (correct — a stock position and an
+    option on it are different instruments). A latest target of ``0.0`` drops the key
+    (``drop_zeros``).
+
+    Args mirror :func:`reconstruct_portfolio_state`. Returns ``{}`` on a missing/empty/
+    unreadable log (fail-soft, same as the symbol-keyed reconstruct).
+    """
+    path = (
+        Path(executions_path).expanduser()
+        if executions_path is not None
+        else _DEFAULT_EXECUTIONS_PATH
+    )
+
+    if not path.exists():
+        return {}
+
+    # (asset_class, symbol) -> (asof_execution, target_position_pct)
+    latest_per_key: dict[tuple[str, str], tuple[str, float]] = {}
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+
+        if reactor_filter is not None:
+            rec_reactor = rec.get("reactor_name")
+            if reactor_filter == "paper":
+                if rec_reactor not in _PAPER_BOOK_REACTOR_NAMES:
+                    continue
+            elif rec_reactor != reactor_filter:
+                continue
+
+        if account is not None and _record_account(rec) != account:
+            continue
+
+        asset = rec.get("asset")
+        target = rec.get("target_position_pct")
+        ts = rec.get("asof_execution")
+        if asset is None or target is None or ts is None:
+            continue
+
+        # ar92: SKIP a no-fill record (would conjure a phantom position).
+        _rmeta = rec.get("reactor_metadata") or {}
+        if _rmeta.get("no_fill") is True:
+            continue
+        _fp = rec.get("fill_price")
+        _fs = rec.get("fill_size_pct")
+        if _fp == 0.0 and _fs == 0.0:
+            continue
+
+        if asof is not None and ts > asof:
+            continue
+
+        # The composite dimension: read asset_class off the record; default "equity"
+        # for any legacy record that omitted it (keeps the equity path byte-identical).
+        asset_class = rec.get("asset_class") or "equity"
+        key = (str(asset_class), str(asset))
+
+        prior = latest_per_key.get(key)
+        if prior is None or ts >= prior[0]:
+            try:
+                t_val = float(target)
+            except (TypeError, ValueError):
+                continue
+            # ar03: drop a non-finite target (fail-closed at the source).
+            if not math.isfinite(t_val):
+                continue
+            latest_per_key[key] = (ts, t_val)
+
+    book: dict[tuple[str, str], float] = {}
+    for key, (_ts, t) in latest_per_key.items():
+        if drop_zeros and t == 0.0:
+            continue
+        book[key] = t
+
+    return book

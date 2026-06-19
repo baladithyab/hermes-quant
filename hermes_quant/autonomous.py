@@ -1671,19 +1671,27 @@ def _originate_mleg_proposal(
 
 def _run_per_position_stop_sweep(
     *,
-    open_book: dict[str, float],
+    open_book: dict[tuple[str, str], float],
     stop_pct: float,
     paper_zero_costs: bool,
     result: TickResult,
-) -> set[str]:
+) -> set[tuple[str, str]]:
     """Force-exit each open position whose unrealized loss breaches the stop threshold.
 
-    Returns the set of symbols that were force-exited this tick (the caller exempts them
-    from the watchlist loop + frees their concurrency slot). Each force-exit reuses the
-    existing ``_react()`` chokepoint with ``fill_size_pct = -held`` so it inherits the
-    SAME routed reactor + no-fill guards as a normal fire. A symbol is HELD (not stopped)
-    on any non-computable input (no mark, no entry basis, non-finite) — silence-by-default:
-    a missing number never fabricates an exit.
+    aegis-ageq2: ``open_book`` is COMPOSITE-keyed by ``(asset_class, symbol)`` (the
+    ``reconstruct_open_book_composite`` view) so an options entry routes to the options
+    path instead of being hardcoded "equity". Returns the set of ``(asset_class, symbol)``
+    tuples force-exited this tick (the caller exempts them from the watchlist loop + frees
+    their concurrency slot). For today's equity-only book this is byte-identical: the
+    equity branch fires exactly as before, just keyed by the tuple. A non-equity entry is
+    HELD here until agmon1 wires the options sweep (silence-by-default — never run an OCC
+    symbol through the equity mark/entry primitives).
+
+    Each force-exit reuses the existing ``_react()`` chokepoint with ``fill_size_pct = 0.0``
+    (the ADR-0091 Option E flat absolute target) so it inherits the SAME routed reactor +
+    no-fill guards as a normal fire. A symbol is HELD (not stopped) on any non-computable
+    input (no mark, no entry basis, non-finite) — silence-by-default: a missing number
+    never fabricates an exit.
     """
     from hermes_quant.perception import build_perception_frame_live
     from hermes_quant.risk.per_position_stop import evaluate_stop, evaluate_take_profit
@@ -1723,13 +1731,18 @@ def _run_per_position_stop_sweep(
             logger.warning("autonomous: WatchRegistry init failed (continuing without it): %s", _wr_exc)
             watch_reg = None
 
-    stopped: set[str] = set()
-    for symbol, held in open_book.items():
+    stopped: set[tuple[str, str]] = set()
+    for (asset_class, symbol), held in open_book.items():
         try:
             if not isinstance(held, (int, float)) or not math.isfinite(held) or held == 0.0:
                 continue
+            # aegis-ageq2: only the EQUITY path is wired here. A non-equity (us_option /
+            # multi_leg) entry is HELD until agmon1 adds the options sweep — never run an
+            # OCC symbol through the equity mark/entry primitives (silence-by-default).
+            if asset_class != "equity":
+                continue
             # Mark to the latest close via the same live-data path the watchlist loop uses.
-            frame = build_perception_frame_live(symbol, asset_class="equity", timeframe="1d")
+            frame = build_perception_frame_live(symbol, asset_class=asset_class, timeframe="1d")
             mark = getattr(frame, "last_close", None) if frame is not None else None
             if mark is None:
                 continue  # no usable mark -> HOLD
@@ -1797,7 +1810,7 @@ def _run_per_position_stop_sweep(
             if exit_kind is None:
                 continue
             # Breach -> force-exit through the existing reactor chokepoint.
-            entry = WatchlistEntry(symbol=symbol, asset_class="equity", timeframe="1d")
+            entry = WatchlistEntry(symbol=symbol, asset_class=asset_class, timeframe="1d")
             _reason = (
                 "autonomous_per_position_stop" if exit_kind == "stop"
                 else "autonomous_per_position_take_profit"
@@ -1817,7 +1830,7 @@ def _run_per_position_stop_sweep(
             _nofill_gate = "PER_POSITION_STOP_NO_FILL" if exit_kind == "stop" else "PER_POSITION_TAKE_PROFIT_NO_FILL"
             sym_decision = SymbolDecision(
                 symbol=symbol,
-                asset_class="equity",
+                asset_class=asset_class,
                 timeframe="1d",
                 gate=_fired_gate,
                 details={
@@ -1842,7 +1855,7 @@ def _run_per_position_stop_sweep(
                 continue
             execution_id, _realized = react_out
             sym_decision.execution_id = execution_id
-            stopped.add(symbol)
+            stopped.add((asset_class, symbol))
             result.fires += 1
             result.decisions.append(sym_decision)
             # AG-EQ-3: the play is fully closed -> drop it from the registry (best-effort).
@@ -1898,7 +1911,7 @@ def _run_per_position_stop_sweep(
             # trail (the per-position stop rail is a safety rail — silence defeats it).
             sym_decision = SymbolDecision(
                 symbol=symbol,
-                asset_class="equity",
+                asset_class=asset_class,
                 timeframe="1d",
                 gate="PER_POSITION_STOP_ERROR",
                 error=f"stop_sweep_error: {exc}",
@@ -2270,9 +2283,17 @@ def tick(
         # behavior — only the EXCEPTION path fails closed.
         open_positions_at_tick_start = 0
         open_symbols_at_tick_start: set[str] = set()
-        open_book_at_tick_start: dict[str, float] = {}  # {symbol: held NAV-fraction}
+        # aegis-ageq2: the per-position stop sweep consumes a COMPOSITE-keyed book
+        # {(asset_class, symbol): held NAV-fraction} so an options entry routes to the
+        # options path instead of being hardcoded "equity". The §D9 concurrent-cap rail
+        # below keeps its EXISTING symbol-keyed count (byte-identical) — only the sweep's
+        # book gains the asset_class dimension.
+        open_book_at_tick_start: dict[tuple[str, str], float] = {}
         rail_read_failed = False
         try:
+            from hermes_quant.portfolio.state import (
+                reconstruct_open_book_composite as _recon_composite,
+            )
             from hermes_quant.portfolio.state import reconstruct_portfolio_state as _recon
 
             # Read from QUANT_HOME's bus explicitly (not the helper's hard-coded
@@ -2282,7 +2303,12 @@ def tick(
             _open = _recon(QUANT_HOME / "executions.jsonl", reactor_filter=None).positions
             open_symbols_at_tick_start = set(_open)
             open_positions_at_tick_start = len(_open)
-            open_book_at_tick_start = dict(_open)  # snapshot for the per-position stop sweep
+            # aegis-ageq2: composite-keyed snapshot from the SAME canonical source for the
+            # per-position stop sweep. For today's equity-only book the equity entries are
+            # byte-identical to dict(_open) projected through ("equity", symbol).
+            open_book_at_tick_start = _recon_composite(
+                QUANT_HOME / "executions.jsonl", reactor_filter=None
+            )
         except Exception as _exc:  # noqa: BLE001 - never block tick on a read error
             # cs19: fail-CLOSED for the HARD rail (was fail-open to count=0/empty-set).
             rail_read_failed = True
@@ -2391,10 +2417,15 @@ def tick(
         # -4%-NAV single position under its 15% threshold). The forced exit REUSES the
         # existing _react() chokepoint (fill_size_pct = -held), so it inherits the same
         # routed reactor + cap-clip + no-fill guards as a normal fire.
+        # aegis-ageq2: _stopped_keys is COMPOSITE (asset_class, symbol). The watchlist
+        # loop + §D9 slot accounting key on the plain SYMBOL (the equity book the watchlist
+        # iterates), so derive _stopped_symbols (plain) from the composite set. For today's
+        # equity-only book the projection is exact (each key is ("equity", symbol)).
+        _stopped_keys: set[tuple[str, str]] = set()
         _stopped_symbols: set[str] = set()
         if not dry_run and os.environ.get("HERMES_QUANT_PER_POSITION_STOP", "0") == "1":
             try:
-                _stopped_symbols = _run_per_position_stop_sweep(
+                _stopped_keys = _run_per_position_stop_sweep(
                     open_book=open_book_at_tick_start,
                     stop_pct=float(rails.get("per_position_stop_loss_pct", 0.08)),
                     paper_zero_costs=bool(rails.get("paper_zero_costs", False)),
@@ -2406,7 +2437,8 @@ def tick(
                     _stop_exc,
                     exc_info=True,
                 )
-                _stopped_symbols = set()
+                _stopped_keys = set()
+            _stopped_symbols = {sym for (_ac, sym) in _stopped_keys}
             # A stop-closed symbol's slot is freed and it must NOT be re-opened or
             # adjusted in the SAME tick (avoid double-action against a position we just
             # flattened). Drop it from the concurrent-cap accounting so the freed slot is
