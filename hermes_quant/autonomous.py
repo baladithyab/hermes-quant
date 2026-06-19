@@ -35,7 +35,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -405,6 +405,12 @@ def _read_safety_rails() -> dict:
         ),
         "per_position_stop_loss_pct": _finite_threshold(
             auto.get("per_position_stop_loss_pct", 0.08), 0.08, "per_position_stop_loss_pct"
+        ),
+        # aegis-agmon2: options take-profit fraction (fraction of a credit structure's
+        # MAX GAIN captured before a structure-aware close). Finite-guarded to 0.50 so a
+        # NaN/inf/<=0 operator value cannot silently disarm / over-fire the rail.
+        "options_take_profit_fraction": _finite_threshold(
+            auto.get("options_take_profit_fraction", 0.50), 0.50, "options_take_profit_fraction"
         ),
     }
 
@@ -1727,11 +1733,17 @@ def _persist_composite_play(
             )
             return
 
-        # net_debit_credit is a signed Decimal (+debit/-credit, the HITL price);
-        # store its absolute magnitude as the net_entry_price (a positive money
-        # number). max_loss is a Decimal | None off the gate.
+        # net_debit_credit is a signed Decimal (+debit paid / -credit received,
+        # the HITL price). aegis-agmon1: store the SIGNED value as net_entry_price
+        # (NOT abs()) — the sign is the ONLY thing that tells the agmon1/agmon2
+        # stop/TP sweep whether this is a CREDIT structure (profits as legs cheapen)
+        # or a DEBIT structure (profits as legs richen). The prior abs() collapsed
+        # both to a positive number, leaving the sweep unable to compute a
+        # sign-correct net P&L vs the real store (the discarded build's tests hid
+        # this by injecting a negative value through a _Store double). The store's
+        # _assert_finite allows a negative net_entry_price. max_loss is Decimal|None.
         _ndc = getattr(mleg, "net_debit_credit", None)
-        net_entry_price = abs(float(_ndc)) if _ndc is not None else 0.0
+        net_entry_price = float(_ndc) if _ndc is not None else 0.0
         _max_loss = getattr(mleg, "max_loss", None)
         max_loss = float(_max_loss) if _max_loss is not None else None
 
@@ -1757,6 +1769,600 @@ def _persist_composite_play(
             "the fire is real, only the lifecycle row is missing): %s",
             execution_id, exc, exc_info=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# aegis-agmon1: options/combo per-position STOP-LOSS sweep (REBUILT, iter-5).
+# ---------------------------------------------------------------------------
+# When the composite open book holds an options position (a multi_leg parent),
+# read its option_legs OFF THE REAL ml00b store row (a list of {symbol, side,
+# position_intent} DICTS — NOT objects), mark each leg via the REAL
+# ChainSnapshotReader.replay_chain parquet, compute the NET multi-leg unrealized
+# P&L vs the SIGNED entry net_entry_price, and fire a CLOSE MultiLegProposal
+# through the SHARED options dispatch tail (the same select_reactor +
+# _apply_fire_accounting chokepoint _originate_mleg_proposal uses) when the stop
+# threshold is breached.
+#
+# POSTURE (money-software): silence-by-default + fail-CLOSED. A missing parquet /
+# missing OCC row / NaN/inf leg mark makes the WHOLE composite unmarkable => HOLD
+# (never partial-mark, never fabricate a close). Gated behind
+# HERMES_QUANT_OPTIONS_MONITOR (source-default OFF) inside the existing
+# HERMES_QUANT_PER_POSITION_STOP guard. Flag OFF => no composite store read =>
+# byte-identical (the equity sweep is untouched). The leg-mark source is the REAL
+# replay_chain reader (resolved per-tick at the composite's underlying + asof);
+# tests inject a mark_leg built over a FIXTURE parquet so the sweep is exercised
+# against a real chain, not a double.
+
+
+def _leg_field(leg: Any, key: str) -> Any:
+    """Read a leg field from EITHER a dict (the real ml00b store shape) OR an
+    object (an OptionLeg). The ml00b store persists legs as
+    ``{symbol, side, position_intent}`` dicts, so the sweep must dict-access them;
+    a defensive object fallback keeps the helper robust if a caller passes
+    OptionLegs directly."""
+    if isinstance(leg, dict):
+        return leg.get(key)
+    return getattr(leg, key, None)
+
+
+def _resolve_options_leg_mark(
+    underlying: str, asof: datetime
+) -> Callable[[str], float | None] | None:
+    """Build the per-leg mark source for one composite, backed by the REAL
+    ``ChainSnapshotReader.replay_chain`` parquet (hermes_quant/options/data.py).
+
+    Returns a callable ``occ_symbol -> mid (USD/share) | None`` that resolves a
+    leg's mark from the recorded chain snapshot at ``(underlying, asof)``. The mark
+    is the snapshot's ``mid = (bid + ask) / 2`` (the same liquidation reference the
+    rest of the options stack uses). FAIL-CLOSED at every layer:
+
+      * no parquet for (underlying, asof.date()) / <2 contracts / a read error =>
+        returns None (the WHOLE sweep then HOLDs this composite — never fabricates).
+      * the OCC symbol not in the chain, or its mid missing / non-finite =>
+        the callable returns None for THAT leg => _net_close_cost_from_legs HOLDs
+        the whole composite (never partial-mark).
+
+    The chains live at ~/.hermes/quant/option_chains/<U>/<YYYY-MM-DD>.parquet; the
+    reader needs no creds, no network, no flag (replay path). asof is the SWEEP
+    time so the no-lookahead filter (fetched_at <= asof) holds.
+    """
+    try:
+        from hermes_quant.options.data import ChainSnapshotReader
+
+        reader = ChainSnapshotReader(chains_dir=QUANT_HOME / "option_chains")
+        chain = reader.replay_chain(underlying, asof)
+    except Exception as exc:  # noqa: BLE001 - a missing/unreadable chain is a HOLD, never a fabricated mark
+        logger.info(
+            "autonomous: no replayable option chain for %s at %s (HOLD composite): %s",
+            underlying, asof, exc,
+        )
+        return None
+
+    by_symbol = {snap.symbol: snap for snap in chain.snapshots}
+
+    def _mark(occ_symbol: str) -> float | None:
+        snap = by_symbol.get(occ_symbol)
+        if snap is None:
+            return None  # OCC not in the recorded chain -> unmarkable leg -> HOLD
+        mid = snap.mid  # None when bid or ask is missing
+        if mid is None or not isinstance(mid, (int, float)) or isinstance(mid, bool):
+            return None
+        mid = float(mid)
+        if not math.isfinite(mid) or mid < 0.0:
+            return None  # NaN/inf/negative mid -> unmarkable -> HOLD
+        return mid
+
+    return _mark
+
+
+def _net_close_cost_from_legs(
+    legs: Any, mark_leg: Callable[[str], float | None] | None
+) -> float | None:
+    """Net DEBIT (USD/share, signed) to CLOSE the composite at current leg marks.
+
+    REUSES the verified sign-math from the iter-3-reviewed build (commit 3e8f121),
+    reconciled to the REAL ml00b store shape: legs are ``{symbol, side,
+    position_intent}`` DICTS (read via _leg_field), and the persisted dict carries
+    NO ratio_qty (defaults to 1 — the composite's outer_qty scales the whole
+    structure uniformly, so the per-spread net is ratio-1 per leg).
+
+    For each option leg, closing REVERSES the open side: a leg opened LONG (side
+    "buy") is SOLD to close (we RECEIVE its mark); a leg opened SHORT (side "sell")
+    is BOUGHT to close (we PAY its mark). So the signed net cost-to-close is:
+
+        sum over legs of   (+mark if leg.side == "sell" else -mark)
+
+    i.e. a positive result = we must PAY to close. FAIL-CLOSED: a None mark source,
+    a leg with no symbol, or any leg whose mark is missing / non-finite returns None
+    (the caller HOLDS the WHOLE composite — never partial-marks, never fabricates).
+    """
+    if mark_leg is None:
+        return None
+    legs_list = list(legs or ())
+    if not legs_list:
+        return None
+    total = 0.0
+    for leg in legs_list:
+        sym = _leg_field(leg, "symbol")
+        if not sym or not isinstance(sym, str):
+            return None
+        try:
+            m = mark_leg(sym)
+        except Exception:  # noqa: BLE001 - a marking error is a HOLD, never a fabricated close
+            return None
+        if m is None or not isinstance(m, (int, float)) or isinstance(m, bool):
+            return None
+        m = float(m)
+        if not math.isfinite(m):
+            return None
+        side = _leg_field(leg, "side")
+        signed = m if side == "sell" else -m
+        total += signed
+    return total
+
+
+def _options_position_loss_pct(
+    *, net_entry_price: float, net_close_cost: float
+) -> float | None:
+    """Unrealized LOSS fraction of a composite vs its entry, sign-correct + finite-guarded.
+
+    REUSES the verified math from commit 3e8f121. ``net_entry_price`` is the SIGNED
+    entry net_debit_credit (the ml00b store now persists the sign: +debit paid /
+    -credit received). ``net_close_cost`` is the signed cost-to-close from
+    :func:`_net_close_cost_from_legs` (positive = must pay to close).
+
+    A CREDIT structure (net_entry_price < 0) received ``credit = -net_entry_price``;
+    the unrealized P&L per spread = ``credit - net_close_cost`` (we keep the credit,
+    minus what we must pay to buy it back). The loss FRACTION (positive = losing) is
+    ``-pnl / credit``.
+
+    A DEBIT structure (net_entry_price > 0) paid ``debit``; its current liquidation
+    value is ``-net_close_cost`` (we RECEIVE when we sell to close a long debit
+    structure). pnl = liquidation - debit; loss fraction = ``-pnl / debit``.
+
+    Returns a positive loss fraction (0.0 if not losing), or None on any non-finite
+    input or a degenerate (zero) basis (fail-CLOSED HOLD).
+    """
+    if not (math.isfinite(net_entry_price) and math.isfinite(net_close_cost)):
+        return None
+    if net_entry_price < 0.0:  # CREDIT structure
+        credit = -net_entry_price
+        if credit <= 0.0:
+            return None
+        pnl = credit - net_close_cost
+        return max(-pnl / credit, 0.0)
+    if net_entry_price > 0.0:  # DEBIT structure
+        debit = net_entry_price
+        liquidation = -net_close_cost
+        pnl = liquidation - debit
+        return max(-pnl / debit, 0.0)
+    return None  # zero basis -> no computable fraction (HOLD)
+
+
+def _build_close_mleg_proposal(row: Any, *, reason: str) -> Any | None:
+    """Reconstruct a CLOSE MultiLegProposal from a stored composite row's legs.
+
+    The ml00b store row carries leg DICTS ``{symbol, side, position_intent}``; this
+    rebuilds real ``OptionLeg`` objects with the open intents REVERSED to the
+    matching ``*_to_close`` intent (sell_to_open -> buy_to_close, buy_to_open ->
+    sell_to_close, and the side flipped accordingly) so the reactor fills an EXIT,
+    not a new position. The proposal is minted through ``from_gate_result`` with a
+    hand-built ADMITTED gate verdict — a CLOSE is always admissible (you must be able
+    to EXIT a position); the reactor's ``risk_gate_pass is True`` lock is satisfied
+    via the blessed mint seam, never a forged direct construction.
+
+    Returns the proposal, or None if a leg is unparseable / has no usable intent
+    (fail-CLOSED: a composite we cannot reconstruct a clean close for is HELD).
+    """
+    try:
+        from decimal import Decimal
+
+        from hermes_quant.options.data import NetGreeks, OptionLeg
+        from hermes_quant.options.multileg import MultiLegProposal
+        from hermes_quant.risk.options_gate import OptionsGateResult, StructureBucket
+
+        _reverse_intent = {
+            "sell_to_open": ("buy", "buy_to_close"),
+            "buy_to_open": ("sell", "sell_to_close"),
+            # tolerate an already-close intent (defensive; re-close is idempotent)
+            "buy_to_close": ("buy", "buy_to_close"),
+            "sell_to_close": ("sell", "sell_to_close"),
+        }
+        close_legs: list[Any] = []
+        for leg in getattr(row, "option_legs", None) or ():
+            sym = _leg_field(leg, "symbol")
+            intent = _leg_field(leg, "position_intent")
+            if not sym or not isinstance(sym, str):
+                return None
+            mapped = _reverse_intent.get(str(intent))
+            if mapped is None:
+                # Fall back to the open SIDE if intent is missing/unknown.
+                side = _leg_field(leg, "side")
+                if side == "sell":
+                    mapped = ("buy", "buy_to_close")
+                elif side == "buy":
+                    mapped = ("sell", "sell_to_close")
+                else:
+                    return None
+            new_side, new_intent = mapped
+            close_legs.append(
+                OptionLeg(symbol=sym, side=new_side, position_intent=new_intent)
+            )
+        if not close_legs:
+            return None
+
+        gate_result = OptionsGateResult(
+            admitted=True,
+            bucket=StructureBucket.DEFINED_RISK,
+            reason=None,
+            net_greeks=NetGreeks.zero(),
+            bpr_estimate=0.0,
+            max_loss=None,
+            contracts=max(int(getattr(row, "outer_qty", 1) or 1), 1),
+            warnings=("autonomous_options_close",),
+        )
+        return MultiLegProposal.from_gate_result(
+            gate_result=gate_result,
+            proposal_id=str(getattr(row, "multi_leg_id", "") or "") + "_close",
+            asof=datetime.now(UTC),
+            strategy_kind=str(getattr(row, "strategy_kind", "") or "close"),
+            underlying=str(getattr(row, "underlying", "") or ""),
+            option_legs=tuple(close_legs),
+            stock_leg=None,
+            outer_qty=max(int(getattr(row, "outer_qty", 1) or 1), 1),
+            # The close is the inverse cash flow of the open; sign is observability
+            # only here (the reactor fills the legs at the live NBBO). Use 0.0 so we
+            # never assert a fabricated close price.
+            net_debit_credit=Decimal("0"),
+            max_gain=None,
+            breakeven_underlying=(),
+            rationale=reason,
+            source_recipe_id="autonomous_options_close",
+        )
+    except Exception as exc:  # noqa: BLE001 - cannot mint a clean close -> HOLD (never fabricate)
+        logger.warning(
+            "autonomous: could not reconstruct a close proposal for composite %s (HOLD): %s",
+            getattr(row, "multi_leg_id", "?"), exc,
+        )
+        return None
+
+
+def _fire_options_close(row: Any, *, reason: str) -> tuple[str, float | None] | None:
+    """Route a CLOSE of an open composite through the SHARED options dispatch tail.
+
+    Reconstructs a close MultiLegProposal off the stored row (:func:`_build_close_mleg_proposal`)
+    then mirrors _originate_mleg_proposal's chokepoint EXACTLY: select_reactor(mleg) ->
+    reactor.execute(...) -> _apply_fire_accounting (the ar38 phantom-fire guard + the
+    uniform append_human_override journal write). The MultiLegPaperReactor self-gates on
+    HERMES_QUANT_MULTILEG_REACTOR (raises MultiLegReactorDisabled when off), so this is
+    fail-closed at the execution layer too: a disabled reactor surfaces as a no-fill (None)
+    and the composite stays open (HOLD). Returns (execution_id, realized) on a fill, else None.
+    """
+    from hermes_quant.react.dispatch import select_reactor
+
+    mleg = _build_close_mleg_proposal(row, reason=reason)
+    if mleg is None:
+        return None  # could not reconstruct a clean close -> HOLD
+    try:
+        reactor = select_reactor(mleg)
+        record = reactor.execute(
+            mleg, fill_size_pct=0.0, approver_user_id="autonomous",
+            play_tag="autonomous_options_close",
+        )
+    except Exception as exc:  # noqa: BLE001 - a disabled/refusing reactor is a no-fill HOLD, never a fabricated close
+        logger.info(
+            "autonomous: options close reactor refused/disabled for composite %s (HOLD): %s",
+            getattr(row, "multi_leg_id", "?"), exc,
+        )
+        return None
+    return _apply_fire_accounting(
+        record, mleg, symbol=str(getattr(row, "underlying", "") or ""), journal_reason=reason
+    )
+
+
+def _run_options_position_stop_sweep(
+    *,
+    store: Any,
+    stop_pct: float,
+    mark_leg_for: Callable[[str, datetime], Callable[[str], float | None] | None],
+    asof: datetime,
+    result: TickResult,
+) -> set[str]:
+    """Force-CLOSE each OPEN composite whose net unrealized loss breaches ``stop_pct``.
+
+    Enumerates ``store.list_open()`` (the REAL CompositePlaysStore open composites),
+    reads each row's ``option_legs`` (the ml00b leg dicts), marks them via
+    ``mark_leg_for(underlying, asof)`` (the REAL replay-chain mark source, resolved
+    per composite at its underlying + the sweep asof), computes the sign-correct loss
+    fraction vs the SIGNED net_entry_price, and fires a CLOSE through
+    :func:`_fire_options_close` when the loss breaches ``stop_pct``.
+
+    Returns the set of ``multi_leg_id`` closed this tick. FAIL-CLOSED: an unresolvable
+    mark source / any missing / non-finite leg mark HOLDS that composite
+    (silence-by-default). One composite's failure never aborts the sweep (mirrors the
+    equity sweep's BLE001 guard).
+    """
+    closed: set[str] = set()
+    try:
+        open_rows = store.list_open()
+    except Exception as exc:  # noqa: BLE001 - a store read failure is a HOLD-all, never a fabricated close
+        logger.warning("autonomous: options stop sweep could not read open composites (HOLD): %s", exc)
+        return closed
+
+    for row in open_rows:
+        mlid = getattr(row, "multi_leg_id", None)
+        try:
+            if not mlid:
+                continue
+            net_entry_price = getattr(row, "net_entry_price", None)
+            if net_entry_price is None or not math.isfinite(float(net_entry_price)):
+                continue  # no usable entry basis -> HOLD
+            legs = getattr(row, "option_legs", None)
+            if not legs:
+                continue  # legless row (legacy / pre-ml00b) -> HOLD
+            underlying = str(getattr(row, "underlying", "") or "")
+            if not underlying:
+                continue
+            mark_leg = mark_leg_for(underlying, asof)
+            net_close_cost = _net_close_cost_from_legs(legs, mark_leg)
+            if net_close_cost is None:
+                continue  # a leg mark is missing / non-finite -> HOLD (silence-by-default)
+            loss_pct = _options_position_loss_pct(
+                net_entry_price=float(net_entry_price), net_close_cost=net_close_cost
+            )
+            if loss_pct is None:
+                continue  # non-computable -> HOLD
+            if loss_pct < abs(stop_pct):
+                continue  # not past the stop
+            # Breach -> fire a close through the shared options dispatch tail.
+            fired = _fire_options_close(row, reason="autonomous_options_per_position_stop")
+            sym_decision = SymbolDecision(
+                symbol=underlying or str(mlid),
+                asset_class="multi_leg",
+                timeframe="",
+                gate="OPTIONS_PER_POSITION_STOP_FIRED",
+                details={
+                    "multi_leg_id": mlid,
+                    "strategy_kind": getattr(row, "strategy_kind", None),
+                    "net_entry_price": float(net_entry_price),
+                    "net_close_cost": net_close_cost,
+                    "loss_pct": loss_pct,
+                    "threshold_pct": abs(stop_pct),
+                },
+            )
+            if fired is None:
+                # no-fill / disabled reactor -> the composite was NOT closed; record a silence.
+                sym_decision.gate = "OPTIONS_PER_POSITION_STOP_NO_FILL"
+                sym_decision.details["no_fill"] = True
+                result.silences += 1
+                result.decisions.append(sym_decision)
+                continue
+            execution_id, _realized = fired
+            sym_decision.execution_id = execution_id
+            closed.add(mlid)
+            result.fires += 1
+            result.decisions.append(sym_decision)
+            logger.info(
+                "autonomous: OPTIONS PER-POSITION STOP fired on composite %s (%s) "
+                "loss %.2f%% >= %.2f%%; closed via %s",
+                mlid, underlying, loss_pct * 100, abs(stop_pct) * 100, execution_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - one composite's failure must not abort the sweep
+            logger.warning(
+                "autonomous: options stop sweep error on composite %s (HOLD): %s",
+                mlid, exc, exc_info=True,
+            )
+            sym_decision = SymbolDecision(
+                symbol=str(mlid or "UNKNOWN"),
+                asset_class="multi_leg",
+                timeframe="",
+                gate="OPTIONS_PER_POSITION_STOP_ERROR",
+                error=f"options_stop_sweep_error: {exc}",
+            )
+            result.errors += 1
+            result.decisions.append(sym_decision)
+            continue
+    return closed
+
+
+# ---------------------------------------------------------------------------
+# aegis-agmon2: options-aware TAKE-PROFIT sweep (REBUILT, iter-5).
+# ---------------------------------------------------------------------------
+# Same real-store + replay-chain wiring as the stop sweep, on the GAIN side. For an
+# OPTIONS position, mark the legs, compute the premium-recovery / fraction of MAX
+# GAIN captured, and fire a structure-aware CLOSE when >= tp_fraction (default 0.50)
+# of max gain is captured. STOP PRECEDENCE: a composite the STOP sweep already closed
+# this tick is SKIPPED (never double-acted). Same fail-CLOSED / silence-by-default
+# posture. A DEBIT structure with no bounded max-gain source returns None (HOLD —
+# acceptable deferred; the stop sweep owns the loss side either way).
+
+
+def _options_position_gain_pct(
+    *, net_entry_price: float, net_close_cost: float
+) -> float | None:
+    """Fraction of MAX GAIN captured on a composite, sign-correct + finite-guarded.
+
+    REUSES the verified math from commit ed0c314. For a CREDIT structure
+    (net_entry_price < 0) the max gain is the full credit received
+    (``credit = -net_entry_price``); the realized P&L per spread is
+    ``credit - net_close_cost`` (we keep the credit minus the buy-back cost), so the
+    fraction of max gain captured = ``pnl / credit``.
+
+    For a DEBIT structure (net_entry_price > 0) the max gain is NOT bounded by the
+    debit (it depends on the wing widths), and the caller does not supply it here, so
+    this CONSERVATIVELY returns None for debit structures (no fabricated TP on an
+    unbounded-gain estimate) — deferred until a max_gain source is wired. Returns
+    None on any non-finite input or zero basis. The returned fraction is clamped at
+    >= 0 (a losing position has captured 0 of its max gain — never a TP candidate).
+    """
+    if not (math.isfinite(net_entry_price) and math.isfinite(net_close_cost)):
+        return None
+    if net_entry_price < 0.0:  # CREDIT structure: max gain = credit received
+        credit = -net_entry_price
+        if credit <= 0.0:
+            return None
+        pnl = credit - net_close_cost
+        return max(pnl / credit, 0.0)
+    # DEBIT structure (or zero basis): no bounded max-gain source here -> HOLD.
+    return None
+
+
+def _sort_legs_short_first(legs: Any) -> list[Any]:
+    """Order legs so SHORT legs (side == "sell") close FIRST (BUY_TO_CLOSE the short
+    legs before SELL_TO_CLOSE the longs). agmon2 structure-aware close: buying back the
+    short leg first removes the undefined-risk side before the protective long is sold,
+    so the structure is never momentarily naked during the unwind."""
+    legs_list = list(legs or ())
+    return sorted(legs_list, key=lambda leg: 0 if _leg_field(leg, "side") == "sell" else 1)
+
+
+def _run_options_position_tp_sweep(
+    *,
+    store: Any,
+    tp_fraction: float,
+    mark_leg_for: Callable[[str, datetime], Callable[[str], float | None] | None],
+    asof: datetime,
+    result: TickResult,
+    already_closed: set[str],
+) -> set[str]:
+    """Force-CLOSE each OPEN composite that has captured >= ``tp_fraction`` of max gain.
+
+    STOP PRECEDENCE: a composite in ``already_closed`` (the stop sweep closed it THIS
+    tick) is SKIPPED — never double-acted. Same enumerate / mark / fire chain as the
+    stop sweep, but on the GAIN side, and the close is structure-aware (short legs
+    BUY_TO_CLOSE first). FAIL-CLOSED: a missing/non-finite leg mark or a non-computable
+    gain HOLDS (silence-by-default). Returns the set of multi_leg_id closed for
+    take-profit this tick.
+    """
+    closed: set[str] = set()
+    try:
+        open_rows = store.list_open()
+    except Exception as exc:  # noqa: BLE001 - a store read failure is a HOLD-all
+        logger.warning("autonomous: options TP sweep could not read open composites (HOLD): %s", exc)
+        return closed
+
+    for row in open_rows:
+        mlid = getattr(row, "multi_leg_id", None)
+        try:
+            if not mlid or mlid in already_closed:
+                continue  # STOP PRECEDENCE: already closed this tick -> skip
+            net_entry_price = getattr(row, "net_entry_price", None)
+            if net_entry_price is None or not math.isfinite(float(net_entry_price)):
+                continue
+            legs = getattr(row, "option_legs", None)
+            if not legs:
+                continue
+            underlying = str(getattr(row, "underlying", "") or "")
+            if not underlying:
+                continue
+            mark_leg = mark_leg_for(underlying, asof)
+            # Structure-aware order: BUY_TO_CLOSE the short legs first. The net cost is
+            # order-independent (a sum), but we surface the close order on the decision.
+            ordered_legs = _sort_legs_short_first(legs)
+            net_close_cost = _net_close_cost_from_legs(ordered_legs, mark_leg)
+            if net_close_cost is None:
+                continue  # missing/non-finite leg mark -> HOLD
+            gain_pct = _options_position_gain_pct(
+                net_entry_price=float(net_entry_price), net_close_cost=net_close_cost
+            )
+            if gain_pct is None:
+                continue  # debit / non-computable -> HOLD (deferred)
+            if gain_pct < abs(tp_fraction):
+                continue  # not yet at the TP threshold
+            fired = _fire_options_close(row, reason="autonomous_options_per_position_take_profit")
+            sym_decision = SymbolDecision(
+                symbol=underlying or str(mlid),
+                asset_class="multi_leg",
+                timeframe="",
+                gate="OPTIONS_PER_POSITION_TAKE_PROFIT_FIRED",
+                details={
+                    "multi_leg_id": mlid,
+                    "strategy_kind": getattr(row, "strategy_kind", None),
+                    "net_entry_price": float(net_entry_price),
+                    "net_close_cost": net_close_cost,
+                    "gain_pct": gain_pct,
+                    "threshold_pct": abs(tp_fraction),
+                    "exit_kind": "take_profit",
+                    "close_order": [_leg_field(leg, "symbol") for leg in ordered_legs],
+                },
+            )
+            if fired is None:
+                sym_decision.gate = "OPTIONS_PER_POSITION_TAKE_PROFIT_NO_FILL"
+                sym_decision.details["no_fill"] = True
+                result.silences += 1
+                result.decisions.append(sym_decision)
+                continue
+            execution_id, _realized = fired
+            sym_decision.execution_id = execution_id
+            closed.add(mlid)
+            result.fires += 1
+            result.decisions.append(sym_decision)
+            logger.info(
+                "autonomous: OPTIONS PER-POSITION TAKE-PROFIT fired on composite %s (%s) "
+                "captured %.2f%% of max gain >= %.2f%%; closed via %s",
+                mlid, underlying, gain_pct * 100, abs(tp_fraction) * 100, execution_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - one composite's failure must not abort the sweep
+            logger.warning(
+                "autonomous: options TP sweep error on composite %s (HOLD): %s",
+                mlid, exc, exc_info=True,
+            )
+            sym_decision = SymbolDecision(
+                symbol=str(mlid or "UNKNOWN"),
+                asset_class="multi_leg",
+                timeframe="",
+                gate="OPTIONS_PER_POSITION_TAKE_PROFIT_ERROR",
+                error=f"options_tp_sweep_error: {exc}",
+            )
+            result.errors += 1
+            result.decisions.append(sym_decision)
+            continue
+    return closed
+
+
+def _options_monitor_enabled() -> bool:
+    """True iff HERMES_QUANT_OPTIONS_MONITOR=1 (NEW, source-default OFF; read at call time)."""
+    return os.environ.get("HERMES_QUANT_OPTIONS_MONITOR", "0") == "1"
+
+
+def _maybe_run_options_stop_sweep(
+    *, stop_pct: float, asof: datetime, result: TickResult
+) -> set[str]:
+    """Run the options STOP (+ TP, agmon2) sweeps iff HERMES_QUANT_OPTIONS_MONITOR=1.
+
+    Default-OFF: the flag absent => returns an empty set without reading the composite
+    store (byte-identical inert). Runs the STOP sweep first, then — when
+    HERMES_QUANT_TAKE_PROFIT_SWEEP=1 (agmon2) — the TP sweep with STOP PRECEDENCE (a
+    composite the stop already closed this tick is skipped). Returns the UNION of closed
+    composite ids (stop ∪ take-profit). Best-effort: any failure is a logged HOLD-all,
+    never a tick-abort. The mark source is the REAL replay-chain reader (resolved per
+    composite at its underlying + asof).
+    """
+    if not _options_monitor_enabled():
+        return set()
+    try:
+        from hermes_quant.state.composite_plays import CompositePlaysStore
+
+        store = CompositePlaysStore(db_path=QUANT_HOME / "state.db")
+        stopped = _run_options_position_stop_sweep(
+            store=store, stop_pct=stop_pct, mark_leg_for=_resolve_options_leg_mark,
+            asof=asof, result=result,
+        )
+        # agmon2: options TP, gated on HERMES_QUANT_TAKE_PROFIT_SWEEP (the SAME flag the
+        # equity TP uses) so the equity-TP-OFF path stays byte-identical. STOP precedence:
+        # the stopped set is passed as already_closed so a stopped composite is skipped.
+        closed = set(stopped)
+        if os.environ.get("HERMES_QUANT_TAKE_PROFIT_SWEEP", "0") == "1":
+            tp_fraction = float(_read_safety_rails().get("options_take_profit_fraction", 0.50))
+            tp_closed = _run_options_position_tp_sweep(
+                store=store, tp_fraction=tp_fraction, mark_leg_for=_resolve_options_leg_mark,
+                asof=asof, result=result, already_closed=stopped,
+            )
+            closed |= tp_closed
+        return closed
+    except Exception as exc:  # noqa: BLE001 - never block the tick on the options sweep
+        logger.warning("autonomous: options stop/TP sweep failed (HOLD-all): %s", exc, exc_info=True)
+        return set()
 
 
 def _run_per_position_stop_sweep(
@@ -2009,6 +2615,21 @@ def _run_per_position_stop_sweep(
             result.errors += 1
             result.decisions.append(sym_decision)
             continue
+
+    # aegis-agmon1: options/combo per-position STOP-LOSS (+ agmon2 TP). Gated behind
+    # HERMES_QUANT_OPTIONS_MONITOR (source-default OFF) INSIDE this existing
+    # PER_POSITION_STOP guard. Flag OFF (production default) => no composite store read
+    # => byte-identical (the equity sweep above is untouched). When ON, force-close each
+    # OPEN composite whose net unrealized loss breaches the SAME stop_pct (and, when
+    # HERMES_QUANT_TAKE_PROFIT_SWEEP=1, capture take-profit). A closed composite joins
+    # `stopped` as a ("multi_leg", multi_leg_id) tuple so the caller's watchlist
+    # exemption / slot accounting can see it under the composite-key contract (ageq2).
+    # asof = the sweep wall-clock (the no-lookahead replay filter is fetched_at <= asof).
+    for _mlid in _maybe_run_options_stop_sweep(
+        stop_pct=stop_pct, asof=datetime.now(UTC), result=result
+    ):
+        stopped.add(("multi_leg", _mlid))
+
     return stopped
 
 
