@@ -73,6 +73,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # Default lock-acquire timeout. Deliberately short: a tick that cannot win the
@@ -117,7 +119,7 @@ def _quant_home() -> Path:
     override = os.environ.get("HERMES_QUANT_HOME")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".hermes" / "quant"
+    return _resolve_quant_home()
 
 
 def locks_dir() -> Path:

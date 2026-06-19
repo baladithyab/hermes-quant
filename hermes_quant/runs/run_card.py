@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 SCHEMA_VERSION = "0.2"
 RUN_SUMMARY_KEYS = (
@@ -47,7 +48,7 @@ def _hierarchical_pooling_enabled() -> bool:
 
 def default_quant_home() -> Path:
     """Return the hermes-quant cross-process state root."""
-    return Path.home() / ".hermes" / "quant"
+    return _resolve_quant_home()
 
 
 def run_dir_for(run_id: str, *, quant_home: Path | None = None) -> Path:

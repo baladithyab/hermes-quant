@@ -27,11 +27,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # Default cache path for the yield-curve daily series (set by the data layer).
 _DEFAULT_YIELD_CACHE_PATH = (
-    Path.home() / ".hermes" / "quant" / "cache" / "yield-curve-cache.json"
+    _resolve_quant_home() / "cache" / "yield-curve-cache.json"
 )
 
 # Minimum bars required to compute realized vol (60-day window).

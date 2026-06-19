@@ -30,6 +30,8 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from hermes_quant.home import hermes_home as _hermes_home
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,8 +90,8 @@ def get_config_path() -> Path:
     """
     profile = os.environ.get("HERMES_PROFILE", "")
     if profile:
-        return Path.home() / ".hermes" / "profiles" / profile / "config.yaml"
-    return Path.home() / ".hermes" / "config.yaml"
+        return _hermes_home() / "profiles" / profile / "config.yaml"
+    return _hermes_home() / "config.yaml"
 
 
 # ---------------------------------------------------------------------------

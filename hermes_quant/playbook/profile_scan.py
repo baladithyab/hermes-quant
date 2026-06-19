@@ -64,6 +64,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.universe.point_in_time import filter_listed_at_asof
 
 # Parallel snapshot prewarm + per-symbol enrich live in scorers. Bound at module
@@ -96,10 +97,10 @@ def _profile_scan_enabled() -> bool:
 # Default output path for the SINGLE profile-fit watchlist. NEW path — it never
 # clobbers the legacy per-play ``play-fit.json``.
 DEFAULT_PROFILE_WATCHLIST_PATH = (
-    Path.home() / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
+    _resolve_quant_home() / "watchlist" / "profile-fit.json"
 )
 DEFAULT_UNIVERSE_PATH = (
-    Path.home() / ".hermes" / "quant" / "universe" / "alpaca-daily.json"
+    _resolve_quant_home() / "universe" / "alpaca-daily.json"
 )
 
 # Default global cap on the single watchlist (replaces per-play caps).

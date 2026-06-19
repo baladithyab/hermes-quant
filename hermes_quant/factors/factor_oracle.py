@@ -46,6 +46,7 @@ import pandas as pd
 from pydantic import BaseModel, Field
 
 from hermes_quant.factors.ic_panel import ICPanel, compute_ic_panel
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 if TYPE_CHECKING:
     from hermes_quant.factors.alpha_zoo import AlphaZoo
@@ -59,7 +60,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DIR = Path(
     os.environ.get(
         "HERMES_QUANT_ALPHA_ZOO_DIR",
-        Path.home() / ".hermes" / "quant" / "factors",
+        _resolve_quant_home() / "factors",
     )
 )
 

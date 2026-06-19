@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.regime.state_variables import StateVariables
 
 if TYPE_CHECKING:
@@ -59,7 +60,7 @@ N_FEATURES: int = 4
 
 #: Default model persistence path (XDG-ish under ~/.hermes)
 DEFAULT_MODEL_PATH: Path = (
-    Path.home() / ".hermes" / "quant" / "regime" / "hmm-model.pkl"
+    _resolve_quant_home() / "regime" / "hmm-model.pkl"
 )
 
 # State-index → RegimeState mapping (set after RegimeState import to avoid circular)

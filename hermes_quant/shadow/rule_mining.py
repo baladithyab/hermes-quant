@@ -107,7 +107,7 @@ _DEFAULT_JOURNAL = _resolve_quant_home() / "journal.md"
 # The ONLY thing this module writes: the candidate-rule diff for operator review
 # (advisory plane). Mirrors graph_mining's graph-mine-candidates.json contract.
 _DEFAULT_CANDIDATES = (
-    Path.home() / ".hermes" / "quant" / "shadow" / "shadow-rule-candidates.json"
+    _resolve_quant_home() / "shadow" / "shadow-rule-candidates.json"
 )
 
 # GT-Score "minimally stable" tier (note §1c): a rule is only "confident" (and only then

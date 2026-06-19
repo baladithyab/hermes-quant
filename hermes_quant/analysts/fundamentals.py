@@ -42,6 +42,7 @@ import pandas as pd
 
 from hermes_quant.calibrators import ColdStartCalibrator
 from hermes_quant.data.fundamentals_provider import FundamentalsProvider
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.pdr_core import is_option_asset_class
 from hermes_quant.playbook.scorers import NON_EQUITY_QUOTE_TYPES
 from hermes_quant.protocol import (
@@ -165,7 +166,7 @@ class FundamentalsAnalyst:
         self.horizon = horizon
         self.provider = provider or FundamentalsProvider(
             cache_root=cache_root
-            or (Path.home() / ".hermes" / "quant" / "cache" / "fundamentals")
+            or (_resolve_quant_home() / "cache" / "fundamentals")
         )
         self._openbb_provider = openbb_provider
         self.calibrator = ColdStartCalibrator()

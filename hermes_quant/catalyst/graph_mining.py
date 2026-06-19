@@ -141,7 +141,7 @@ _DEFAULT_LOG = _resolve_quant_home() / "catalyst" / "propagation-log.jsonl"
 # The ONLY thing W5 writes: the candidate-edge diff for operator review (advisory
 # plane). Path matches the DESIGN doc exactly (graph_mining.py original :64).
 _DEFAULT_CANDIDATES = (
-    Path.home() / ".hermes" / "quant" / "catalyst" / "graph-mine-candidates.json"
+    _resolve_quant_home() / "catalyst" / "graph-mine-candidates.json"
 )
 
 # Verdicts the operator actually reviews (a change is proposed). KEEP is never

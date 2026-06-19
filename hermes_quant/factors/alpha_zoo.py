@@ -40,6 +40,7 @@ from hermes_quant.factors.lookahead_sentinel import (
     LookaheadDetected,
     check_no_lookahead,
 )
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 if TYPE_CHECKING:
     from hermes_quant.factors.ic_dedup import ICDedupGate, ICDedupResult
@@ -62,7 +63,7 @@ import os as _os
 _DEFAULT_DIR = Path(
     _os.environ.get(
         "HERMES_QUANT_ALPHA_ZOO_DIR",
-        Path.home() / ".hermes" / "quant" / "factors",
+        _resolve_quant_home() / "factors",
     )
 )
 

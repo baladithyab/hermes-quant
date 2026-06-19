@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 from .models import AnalystComponent, Reflection, SettlementEntry
 from .reader import parse_journal
 from .render import ENTRY_DELIM, JOURNAL_HEADER, render_journal
@@ -32,7 +34,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_JOURNAL_PATH = (
     Path(os.environ.get("HERMES_QUANT_JOURNAL_PATH", ""))
     if os.environ.get("HERMES_QUANT_JOURNAL_PATH")
-    else Path.home() / ".hermes" / "quant" / "journal.md"
+    else _resolve_quant_home() / "journal.md"
 )
 
 

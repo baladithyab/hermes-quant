@@ -39,6 +39,8 @@ from __future__ import annotations
 import argparse
 import json
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 PROFILES = ["conservative", "moderate", "aggressive"]
 
 
@@ -1439,9 +1441,7 @@ def _dispatch_backtest(args) -> int:
     out_dir = (
         _Path(args.output_dir).expanduser()
         if args.output_dir
-        else _Path.home()
-        / ".hermes"
-        / "quant"
+        else _resolve_quant_home()
         / "backtests"
         / f"{args.symbol.replace('/', '_')}-{args.timeframe}-{_uuid.uuid4().hex[:8]}"
     )
@@ -1762,7 +1762,7 @@ def _fetch_bars_via_provider(
         symbol=symbol,
         timeframe=timeframe,
         lookback_bars=lookback,
-        cache_root=root if root is not None else _Path.home() / ".hermes" / "quant" / "cache",
+        cache_root=root if root is not None else _resolve_quant_home() / "cache",
         # NO-LOOKAHEAD (cs38): the cache file accumulates bars up to each prior
         # fetch's wall-clock; without this anchor a warm HIT would serve bars
         # that post-date a backtest --end. as_of is derived from --end above
