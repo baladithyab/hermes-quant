@@ -1656,6 +1656,15 @@ def _originate_mleg_proposal(
         if not execution_id:  # the record carried no usable id — fall back to the persisted one
             execution_id = str(getattr(persisted, "proposal_id", "") or "")
         result.fires += 1
+        # ml00b: persist the composite-play lifecycle row WITH its option_legs so the
+        # agmon1/agmon2 sweep can enumerate the open composite (multi_leg_id) and mark +
+        # sign its net P&L by leg (OCC symbol + side). The fire above is already CONFIRMED
+        # and accounted; this row is OBSERVABILITY for the sweep, so a store-write failure
+        # is logged + swallowed and NEVER aborts the real fire (best-effort). A write that
+        # IS attempted is correct (legs validated by open_composite — a legless row raises,
+        # never silently re-creating the agmon1 dead-path). This whole helper is inside the
+        # HERMES_QUANT_AUTONOMOUS_OPTIONS gate, so it is unreached + byte-identical when off.
+        _persist_composite_play(mleg, persisted=persisted, execution_id=execution_id)
         result.decisions.append(SymbolDecision(
             symbol=symbol, asset_class="us_option", timeframe="1d",
             gate="AUTONOMOUS_OPTIONS_FIRED", execution_id=execution_id,
@@ -1667,6 +1676,87 @@ def _originate_mleg_proposal(
         logger.warning("autonomous: options origination failed for %s (abstain): %s",
                         symbol, exc, exc_info=True)
         return None
+
+
+def _persist_composite_play(
+    mleg: Any,
+    *,
+    persisted: Any,
+    execution_id: str,
+) -> None:
+    """ml00b: persist the composite-play lifecycle row + its option_legs after a
+    CONFIRMED options fire (the agmon1/agmon2 unblock).
+
+    The legs stored are ``[{symbol, side, position_intent} for leg in
+    mleg.option_legs]`` — the OCC symbol + side agmon1/agmon2 need to mark and
+    sign the net P&L of the open composite. The composite is keyed on its
+    multi_leg proposal id (``mleg.proposal_id`` -> ``persisted.proposal_id`` ->
+    ``execution_id``) so the sweep can re-find it.
+
+    BEST-EFFORT: the fire is already real + accounted. A store-write failure
+    (bad path, locked db, duplicate id, a malformed leg) is logged and swallowed
+    so it never rolls back a real fire. The write that IS attempted goes through
+    ``open_composite`` (legs validated; a legless leg raises inside and is caught
+    here) — so we never silently persist a legless row that would re-create the
+    agmon1 dead-path; instead we log loudly and leave NO row (fail-CLOSED on the
+    row, fail-OPEN on the fire that already happened).
+    """
+    try:
+        from hermes_quant.state.composite_plays import CompositePlaysStore
+
+        legs = list(getattr(mleg, "option_legs", ()) or ())
+        option_legs = [
+            {
+                "symbol": str(getattr(leg, "symbol", "") or ""),
+                "side": str(getattr(leg, "side", "") or ""),
+                "position_intent": str(getattr(leg, "position_intent", "") or ""),
+            }
+            for leg in legs
+        ]
+
+        multi_leg_id = str(
+            getattr(mleg, "proposal_id", None)
+            or getattr(persisted, "proposal_id", None)
+            or execution_id
+            or ""
+        )
+        if not multi_leg_id:
+            logger.warning(
+                "autonomous: ml00b composite persist skipped — no multi_leg_id "
+                "(fire %s still real)", execution_id,
+            )
+            return
+
+        # net_debit_credit is a signed Decimal (+debit/-credit, the HITL price);
+        # store its absolute magnitude as the net_entry_price (a positive money
+        # number). max_loss is a Decimal | None off the gate.
+        _ndc = getattr(mleg, "net_debit_credit", None)
+        net_entry_price = abs(float(_ndc)) if _ndc is not None else 0.0
+        _max_loss = getattr(mleg, "max_loss", None)
+        max_loss = float(_max_loss) if _max_loss is not None else None
+
+        store = CompositePlaysStore(db_path=QUANT_HOME / "state.db")
+        store.open_composite(
+            multi_leg_id=multi_leg_id,
+            underlying=str(getattr(mleg, "underlying", "") or ""),
+            strategy_kind=str(getattr(mleg, "strategy_kind", "") or ""),
+            outer_qty=int(getattr(mleg, "outer_qty", 0) or 0),
+            net_entry_price=net_entry_price,
+            fill_size_pct=0.0,  # options size by contracts, not NAV fraction (0aa6)
+            expected_leg_count=len(option_legs),
+            max_loss=max_loss,
+            option_legs=option_legs,
+        )
+        logger.info(
+            "autonomous: ml00b persisted composite %s with %d legs",
+            multi_leg_id, len(option_legs),
+        )
+    except Exception as exc:  # noqa: BLE001 - observability row, never abort a real fire
+        logger.warning(
+            "autonomous: ml00b composite persist failed for fire %s (continuing — "
+            "the fire is real, only the lifecycle row is missing): %s",
+            execution_id, exc, exc_info=True,
+        )
 
 
 def _run_per_position_stop_sweep(

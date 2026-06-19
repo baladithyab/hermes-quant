@@ -40,13 +40,14 @@ ADR-0098 Part B (docs/adr/ADR-0098-options-strategy-taxonomy-and-two-level-multi
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -103,9 +104,17 @@ CREATE TABLE IF NOT EXISTS composite_plays (
     net_fill_price       REAL,
     fill_size_pct        REAL NOT NULL,
     expected_leg_count   INTEGER NOT NULL,
-    max_loss             REAL
+    max_loss             REAL,
+    option_legs_json     TEXT NOT NULL DEFAULT '[]'
 );
 """
+
+# ml00b: ADDITIVE migration for EXISTING composite_plays tables (DBs created
+# before option_legs_json existed). A fresh DB gets the column from _SCHEMA
+# above; an existing one gets it via ALTER TABLE guarded by a PRAGMA
+# table_info check. Pre-existing rows take the DEFAULT '[]' (no destructive
+# rewrite, no NULL crash — _decode_legs treats NULL/'' as []).
+_OPTION_LEGS_COLUMN = "option_legs_json"
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -149,6 +158,10 @@ class CompositePlayRow:
     fill_size_pct: float
     expected_leg_count: int
     max_loss: float | None
+    # ml00b: the option legs of this composite (each a dict with at least an OCC
+    # `symbol`, typically {symbol, side, position_intent}). [] for a legacy /
+    # pre-migration row. agmon1/agmon2 read this to mark + sign the net P&L.
+    option_legs: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +226,23 @@ class CompositePlaysStore:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate_option_legs_column(conn)
+
+    @staticmethod
+    def _migrate_option_legs_column(conn: sqlite3.Connection) -> None:
+        """ml00b: additively add option_legs_json to an EXISTING table.
+
+        For a fresh DB the column already exists (it is in _SCHEMA); this is a
+        no-op. For a DB created before this column, ALTER TABLE adds it with the
+        '[]' default so every pre-existing row reads back option_legs == []
+        (backward-compatible, no destructive migration, no NULL crash).
+        """
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(composite_plays)")}
+        if _OPTION_LEGS_COLUMN not in cols:
+            conn.execute(
+                f"ALTER TABLE composite_plays "
+                f"ADD COLUMN {_OPTION_LEGS_COLUMN} TEXT NOT NULL DEFAULT '[]'"
+            )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -244,6 +274,54 @@ class CompositePlaysStore:
                 f"must be one of {sorted(_ALL_STATES)}"
             )
 
+    @staticmethod
+    def _encode_legs(option_legs: list[dict] | None) -> str:
+        """Validate + JSON-serialize the option legs (ml00b, fail-CLOSED).
+
+        agmon1/agmon2 read each leg's OCC ``symbol`` + ``side`` to mark and sign
+        the net P&L. A leg with NO usable symbol would re-create the agmon1
+        dead-path (a legless composite row), so we RAISE rather than silently
+        store one. The whole list must also be JSON-serializable — a leg that
+        cannot round-trip is rejected at write time, never persisted as an
+        un-readable row.
+
+        None / [] both serialize to '[]'.
+        """
+        if not option_legs:
+            return "[]"
+        for i, leg in enumerate(option_legs):
+            if not isinstance(leg, dict):
+                raise ValueError(
+                    f"composite_plays: option_legs[{i}] must be a dict, "
+                    f"got {type(leg).__name__}"
+                )
+            symbol = leg.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise ValueError(
+                    f"composite_plays: option_legs[{i}] must carry a non-empty "
+                    f"string 'symbol' (OCC); got {symbol!r}"
+                )
+        # json.dumps raises TypeError on a non-serializable value — fail-CLOSED
+        # (the caller's BEGIN IMMEDIATE/ROLLBACK guard rolls back, no row lands).
+        return json.dumps(option_legs)
+
+    @staticmethod
+    def _decode_legs(raw: str | None) -> list[dict]:
+        """Decode the stored JSON back into a list of leg dicts.
+
+        A NULL / empty / pre-migration value reads back as [] (backward-compat).
+        A corrupt blob fails CLOSED to [] (observability layer — a malformed
+        legs blob must never crash the sweep that reads open composites).
+        """
+        if not raw:
+            return []
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, TypeError):
+            logger.warning("composite_plays: corrupt option_legs_json (%r) -> []", raw)
+            return []
+        return decoded if isinstance(decoded, list) else []
+
     # ------------------------------------------------------------------
     # Write operations
     # ------------------------------------------------------------------
@@ -262,13 +340,26 @@ class CompositePlaysStore:
         expected_leg_count: int,
         net_fill_price: float | None = None,
         max_loss: float | None = None,
+        option_legs: list[dict] | None = None,
     ) -> None:
         """Insert a new composite play with state='open'.
+
+        Parameters
+        ----------
+        option_legs : list[dict] | None
+            ml00b: the option legs of this composite, each a dict carrying at
+            least ``symbol`` (OCC-21) — typically ``{symbol, side,
+            position_intent}``. Stored as JSON in option_legs_json. None / []
+            store as '[]'. agmon1/agmon2 read these back to mark + sign the
+            net P&L of the open composite. A leg with no symbol raises
+            (fail-CLOSED): a legless row would re-create the agmon1 dead-path.
 
         Raises
         ------
         ValueError
-            If any numeric input is non-finite.
+            If any numeric input is non-finite, OR a leg has no usable symbol.
+        TypeError
+            If a leg is not JSON-serializable.
         sqlite3.IntegrityError
             If multi_leg_id already exists (PRIMARY KEY conflict).
         """
@@ -281,6 +372,10 @@ class CompositePlaysStore:
         self._assert_finite("net_fill_price", net_fill_price)
         self._assert_finite("max_loss", max_loss)
 
+        # ml00b: validate + serialize legs BEFORE the write (fail-CLOSED — a
+        # malformed/non-serializable leg raises here and no row is inserted).
+        option_legs_json = self._encode_legs(option_legs)
+
         with self._lock, self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -289,8 +384,9 @@ class CompositePlaysStore:
                     INSERT INTO composite_plays
                         (multi_leg_id, account_id, underlying, strategy_kind,
                          state, opened_at, closed_at, outer_qty, net_entry_price,
-                         net_fill_price, fill_size_pct, expected_leg_count, max_loss)
-                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                         net_fill_price, fill_size_pct, expected_leg_count, max_loss,
+                         option_legs_json)
+                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         multi_leg_id,
@@ -305,6 +401,7 @@ class CompositePlaysStore:
                         fill_size_pct,
                         expected_leg_count,
                         max_loss,
+                        option_legs_json,
                     ),
                 )
                 conn.execute("COMMIT")
@@ -650,6 +747,10 @@ def _compute_target_state(
 
 
 def _row_to_dataclass(row: sqlite3.Row) -> CompositePlayRow:
+    # ml00b: option_legs_json may be absent on a row from a connection that
+    # predates the migration (defensive — the migration always runs on init,
+    # but a NULL/empty value also decodes to []).
+    raw_legs = row["option_legs_json"] if _OPTION_LEGS_COLUMN in row.keys() else None
     return CompositePlayRow(
         multi_leg_id=row["multi_leg_id"],
         account_id=row["account_id"],
@@ -664,4 +765,5 @@ def _row_to_dataclass(row: sqlite3.Row) -> CompositePlayRow:
         fill_size_pct=float(row["fill_size_pct"]),
         expected_leg_count=int(row["expected_leg_count"]),
         max_loss=(float(row["max_loss"]) if row["max_loss"] is not None else None),
+        option_legs=CompositePlaysStore._decode_legs(raw_legs),
     )

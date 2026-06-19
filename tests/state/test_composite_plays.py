@@ -505,3 +505,219 @@ def test_closed_at_set_on_closed_none_on_partial(tmp_path: Path) -> None:
     assert row_b2 is not None
     assert row_b2.state == STATE_CLOSED
     assert row_b2.closed_at is not None
+
+
+# ---------------------------------------------------------------------------
+# 25. option_legs round-trip (ml00b): legs persist through open_composite ->
+#     get() -> CompositePlayRow.option_legs (the EXACT field agmon1/agmon2 read
+#     to mark + sign the net P&L). RED-prove: without the column, the field is
+#     absent / not a populated list of {symbol, side, position_intent} dicts.
+# ---------------------------------------------------------------------------
+
+
+def test_option_legs_round_trip_through_get(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    legs = [
+        {"symbol": "AAPL260116C00190000", "side": "sell", "position_intent": "sell_to_open"},
+        {"symbol": "AAPL260116C00200000", "side": "buy", "position_intent": "buy_to_open"},
+    ]
+    store.open_composite(
+        multi_leg_id="prop_025",
+        underlying="AAPL",
+        strategy_kind="vertical_spread",
+        opened_at="2026-06-17T10:00:00.000000Z",
+        outer_qty=1,
+        net_entry_price=1.50,
+        fill_size_pct=0.05,
+        expected_leg_count=2,
+        option_legs=legs,
+    )
+    row = store.get("prop_025")
+    assert row is not None
+    # The field agmon1/agmon2 read: a list of leg dicts with OCC symbol + side.
+    assert row.option_legs == legs
+    assert [leg["symbol"] for leg in row.option_legs] == [
+        "AAPL260116C00190000",
+        "AAPL260116C00200000",
+    ]
+    assert [leg["side"] for leg in row.option_legs] == ["sell", "buy"]
+
+
+# ---------------------------------------------------------------------------
+# 26. backward-compat: a legless open (option_legs omitted / None) reads back
+#     option_legs == [] (no crash). Existing rows written before this column
+#     (simulated NULL) must ALSO read back as [].
+# ---------------------------------------------------------------------------
+
+
+def test_legless_open_reads_back_empty_list(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    _open(store, "prop_026")  # the legacy helper does NOT pass option_legs
+    row = store.get("prop_026")
+    assert row is not None
+    assert row.option_legs == []
+
+
+def test_existing_pre_migration_db_migrates_and_reads_back_empty_list(
+    tmp_path: Path,
+) -> None:
+    """A REAL pre-migration DB: a composite_plays table created WITHOUT the
+    option_legs_json column, with a row already in it. Opening a CompositePlaysStore
+    on that DB runs the additive ALTER TABLE migration; the pre-existing row reads
+    back option_legs == [] (backfilled to the '[]' default — additive, no crash, no
+    destructive rewrite)."""
+    import sqlite3 as _sqlite3
+
+    db_path = tmp_path / "pre_migration.db"
+    # Build the OLD schema (no option_legs_json column) + insert one legacy row.
+    conn = _sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE composite_plays (
+            multi_leg_id         TEXT PRIMARY KEY,
+            account_id           TEXT NOT NULL DEFAULT 'paper-default',
+            underlying           TEXT NOT NULL,
+            strategy_kind        TEXT NOT NULL,
+            state                TEXT NOT NULL DEFAULT 'open',
+            opened_at            TEXT NOT NULL,
+            closed_at            TEXT,
+            outer_qty            INTEGER NOT NULL,
+            net_entry_price      REAL NOT NULL,
+            net_fill_price       REAL,
+            fill_size_pct        REAL NOT NULL,
+            expected_leg_count   INTEGER NOT NULL,
+            max_loss             REAL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO composite_plays "
+        "(multi_leg_id, underlying, strategy_kind, opened_at, outer_qty, "
+        " net_entry_price, fill_size_pct, expected_leg_count) "
+        "VALUES ('prop_legacy', 'AAPL', 'covered_call', "
+        "'2026-06-17T10:00:00.000000Z', 1, 1.50, 0.05, 2)"
+    )
+    conn.commit()
+    conn.close()
+
+    # Opening the store runs the additive migration on this existing DB.
+    store = CompositePlaysStore(db_path=db_path)
+    row = store.get("prop_legacy")
+    assert row is not None
+    assert row.option_legs == []
+    assert row.underlying == "AAPL"  # the legacy row's data is intact
+
+
+def test_decode_legs_tolerates_null_and_corrupt(tmp_path: Path) -> None:
+    """The decode helper itself is fail-CLOSED to []: NULL/empty/corrupt blobs
+    never crash the sweep that reads open composites (defense-in-depth — even
+    though the NOT NULL DEFAULT '[]' schema prevents NULL in practice)."""
+    store = _make_store(tmp_path)
+    assert store._decode_legs(None) == []  # noqa: SLF001
+    assert store._decode_legs("") == []  # noqa: SLF001
+    assert store._decode_legs("not json{{{") == []  # noqa: SLF001 - corrupt -> []
+    assert store._decode_legs('{"not": "a list"}') == []  # noqa: SLF001 - wrong type -> []
+
+
+# ---------------------------------------------------------------------------
+# 27. option_legs survive list_open() — the read path agmon1/agmon2 actually
+#     use to enumerate open composites for the stop/monitor sweep.
+# ---------------------------------------------------------------------------
+
+
+def test_option_legs_survive_list_open(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    legs = [
+        {"symbol": "SPY260116P00500000", "side": "buy", "position_intent": "buy_to_open"},
+        {"symbol": "SPY260116P00490000", "side": "sell", "position_intent": "sell_to_open"},
+    ]
+    store.open_composite(
+        multi_leg_id="prop_027",
+        underlying="SPY",
+        strategy_kind="vertical_spread",
+        opened_at="2026-06-17T10:00:00.000000Z",
+        outer_qty=2,
+        net_entry_price=1.10,
+        fill_size_pct=0.05,
+        expected_leg_count=2,
+        option_legs=legs,
+    )
+    open_rows = store.list_open()
+    assert len(open_rows) == 1
+    assert open_rows[0].multi_leg_id == "prop_027"
+    assert open_rows[0].option_legs == legs
+
+
+# ---------------------------------------------------------------------------
+# 28. fail-CLOSED: a malformed leg (no 'symbol') raises at open_composite and
+#     leaves NO row — never silently stores a legless row that would re-create
+#     the agmon1 dead-path.
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_leg_without_symbol_raises_and_stores_nothing(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    with pytest.raises(ValueError, match="symbol"):
+        store.open_composite(
+            multi_leg_id="prop_028",
+            underlying="AAPL",
+            strategy_kind="vertical_spread",
+            opened_at="2026-06-17T10:00:00.000000Z",
+            outer_qty=1,
+            net_entry_price=1.50,
+            fill_size_pct=0.05,
+            expected_leg_count=2,
+            option_legs=[{"side": "sell", "position_intent": "sell_to_open"}],
+        )
+    # fail-CLOSED: the malformed write must not have persisted a row.
+    assert store.get("prop_028") is None
+
+
+def test_non_serializable_leg_raises_and_stores_nothing(tmp_path: Path) -> None:
+    """A leg that is not JSON-serializable (e.g. carries an object value) raises —
+    never silently stores a row whose legs cannot be read back."""
+    store = _make_store(tmp_path)
+    with pytest.raises((ValueError, TypeError)):
+        store.open_composite(
+            multi_leg_id="prop_028b",
+            underlying="AAPL",
+            strategy_kind="vertical_spread",
+            opened_at="2026-06-17T10:00:00.000000Z",
+            outer_qty=1,
+            net_entry_price=1.50,
+            fill_size_pct=0.05,
+            expected_leg_count=2,
+            option_legs=[{"symbol": "AAPL260116C00190000", "obj": object()}],
+        )
+    assert store.get("prop_028b") is None
+
+
+# ---------------------------------------------------------------------------
+# 29. legacy callers (no option_legs kwarg) keep working — open_composite gains
+#     an OPTIONAL keyword-only param. record_leg_close / transition_state must
+#     not perturb the persisted legs (lifecycle is orthogonal to leg identity).
+# ---------------------------------------------------------------------------
+
+
+def test_legs_preserved_across_state_transition(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    legs = [
+        {"symbol": "AAPL260116C00190000", "side": "sell", "position_intent": "sell_to_open"},
+        {"symbol": "AAPL260116C00200000", "side": "buy", "position_intent": "buy_to_open"},
+    ]
+    store.open_composite(
+        multi_leg_id="prop_029",
+        underlying="AAPL",
+        strategy_kind="vertical_spread",
+        opened_at="2026-06-17T10:00:00.000000Z",
+        outer_qty=1,
+        net_entry_price=1.50,
+        fill_size_pct=0.05,
+        expected_leg_count=2,
+        option_legs=legs,
+    )
+    store.record_leg_close("prop_029", is_decompose=True)  # open -> partial
+    row = store.get("prop_029")
+    assert row is not None
+    assert row.state == STATE_PARTIAL
+    assert row.option_legs == legs  # legs survive the lifecycle transition
