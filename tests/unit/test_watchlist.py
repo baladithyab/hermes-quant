@@ -17,6 +17,7 @@ from hermes_quant.watchlist import (
     add_to_watchlist,
     clear_watchlist,
     list_watchlist,
+    materialize_profile_fit_entries,
     remove_from_watchlist,
 )
 
@@ -213,3 +214,187 @@ def test_concurrent_adds_serialize(tmp_config: Path):
     # AAPL + 8 SYM* = 9
     assert len(entries) == 9
     assert symbols == {"AAPL"} | {f"SYM{i}" for i in range(8)}
+
+
+# ---------------------------------------------------------------------------
+# W4: horizon_set add-only field (mirrors agperc1 options_eligible pattern)
+# ---------------------------------------------------------------------------
+
+
+def test_horizon_set_defaults_none_and_round_trips_byte_identical():
+    """ADD-ONLY: an entry with no horizon_set keeps the field None and the
+    to_dict round-trip is byte-identical to the pre-W4 schema plus the new
+    nullable key — exactly the agperc1 options_eligible contract."""
+    entry = WatchlistEntry("AAPL", "equity", "1d")
+    assert entry.horizon_set is None
+    d = entry.to_dict()
+    # The new key is present and null — never silently picks up a horizon set.
+    assert d["horizon_set"] is None
+    assert d == {
+        "symbol": "AAPL",
+        "asset_class": "equity",
+        "timeframe": "1d",
+        "options_eligible": False,
+        "horizon_set": None,
+    }
+
+
+def test_horizon_set_round_trips_through_list_watchlist(tmp_config: Path):
+    """A config watchlist row carrying horizon_set loads back with the list
+    intact; an existing row WITHOUT the key loads back as None (byte-identical)."""
+    tmp_config.write_text(
+        "quant:\n"
+        "  autonomous:\n"
+        "    watchlist:\n"
+        "      - symbol: AAPL\n"
+        "        asset_class: equity\n"
+        "        timeframe: 1d\n"
+        "        horizon_set: [\"1D\", \"7D\", \"14D\", \"30D\"]\n"
+        "      - symbol: MSFT\n"
+        "        asset_class: equity\n"
+        "        timeframe: 1d\n",
+        encoding="utf-8",
+    )
+    entries = {e.symbol: e for e in list_watchlist(path=tmp_config)}
+    assert entries["AAPL"].horizon_set == ["1D", "7D", "14D", "30D"]
+    # Existing row with no horizon_set → None (byte-identical to pre-W4).
+    assert entries["MSFT"].horizon_set is None
+
+
+def test_existing_add_path_unchanged_horizon_set_none(tmp_config: Path):
+    """The existing add/list path never writes a horizon_set (the operator
+    watchlist add does not pick horizons) — default-OFF byte-identical."""
+    add_to_watchlist("AAPL", "equity", path=tmp_config)
+    [entry] = list_watchlist(path=tmp_config)
+    assert entry.horizon_set is None
+    # The persisted dict carries the nullable key but no list.
+    import yaml
+
+    cfg = yaml.safe_load(tmp_config.read_text(encoding="utf-8"))
+    row = cfg["quant"]["autonomous"]["watchlist"][0]
+    assert row.get("horizon_set") is None
+
+
+# ---------------------------------------------------------------------------
+# W4: profile-fit.json -> WatchlistEntry materialization adapter
+# ---------------------------------------------------------------------------
+
+
+def _profile_fit_payload() -> dict:
+    """A profile-fit.json shape (the single watchlist W3 emits): active rows
+    each carrying symbol / asset_class / options_eligible / shortable /
+    horizon_set / fit_score / asof. NO per-play bucketing."""
+    return {
+        "asof": "2026-06-17T00:00:00+00:00",
+        "active": [
+            {
+                "symbol": "AAPL",
+                "asset_class": "equity",
+                "options_eligible": True,
+                "shortable": True,
+                "horizon_set": ["1D", "7D", "14D", "30D"],
+                "fit_score": 0.87,
+                "asof": "2026-06-17T00:00:00+00:00",
+            },
+            {
+                "symbol": "MSFT",
+                "asset_class": "equity",
+                "options_eligible": False,
+                "shortable": False,
+                "horizon_set": ["1D", "7D", "14D", "30D"],
+                "fit_score": 0.71,
+                "asof": "2026-06-17T00:00:00+00:00",
+            },
+        ],
+    }
+
+
+def test_materialize_profile_fit_rows_to_watchlist_entries():
+    """The adapter materializes profile-fit active rows into config-watchlist
+    WatchlistEntry objects carrying symbol/asset_class/options_eligible +
+    horizon_set. The watchlist entry NEVER names a strategy."""
+    entries = materialize_profile_fit_entries(_profile_fit_payload())
+    by_sym = {e.symbol: e for e in entries}
+    assert set(by_sym) == {"AAPL", "MSFT"}
+
+    aapl = by_sym["AAPL"]
+    assert aapl.asset_class == "equity"
+    assert aapl.options_eligible is True
+    assert aapl.horizon_set == ["1D", "7D", "14D", "30D"]
+    # timeframe defaults from the asset_class map (equity -> 1d); the row never
+    # pre-picks a strategy — only profile-fit + horizons.
+    assert aapl.timeframe == "1d"
+
+    msft = by_sym["MSFT"]
+    assert msft.options_eligible is False
+    assert msft.horizon_set == ["1D", "7D", "14D", "30D"]
+
+
+def test_materialize_empty_when_no_active_rows():
+    """Silence-by-default: a payload with no active rows yields no entries."""
+    assert materialize_profile_fit_entries({"asof": "2026-06-17T00:00:00+00:00"}) == []
+    assert materialize_profile_fit_entries({"active": []}) == []
+
+
+def test_materialize_skips_rows_missing_required_keys():
+    """A malformed active row (no symbol or no asset_class) is dropped, not
+    crashed on — matches list_watchlist's defensive loader."""
+    payload = {
+        "active": [
+            {"asset_class": "equity", "horizon_set": ["1D"]},  # no symbol
+            {"symbol": "NOCLASS", "horizon_set": ["1D"]},  # no asset_class
+            {"symbol": "GOOD", "asset_class": "equity", "horizon_set": ["1D"]},
+        ]
+    }
+    entries = materialize_profile_fit_entries(payload)
+    assert [e.symbol for e in entries] == ["GOOD"]
+
+
+def test_materialize_rejects_unknown_horizon_label():
+    """Validation: a horizon label not in the known W2 rungs is rejected.
+    Money-software fail-closed — an unknown rung must not silently flow to the
+    decision layer's DTE resolver."""
+    payload = {
+        "active": [
+            {
+                "symbol": "AAPL",
+                "asset_class": "equity",
+                "horizon_set": ["1D", "BOGUS"],
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="horizon"):
+        materialize_profile_fit_entries(payload)
+
+
+def test_materialize_accepts_known_rungs_including_0d():
+    """The canonical W2 rungs are 0D/1D/7D/14D/30D; all are accepted labels
+    (0D membership is itself flag-gated upstream, but the LABEL is valid)."""
+    payload = {
+        "active": [
+            {
+                "symbol": "AAPL",
+                "asset_class": "equity",
+                "horizon_set": ["0D", "1D", "7D", "14D", "30D"],
+            }
+        ]
+    }
+    [entry] = materialize_profile_fit_entries(payload)
+    assert entry.horizon_set == ["0D", "1D", "7D", "14D", "30D"]
+
+
+def test_materialize_known_rungs_injectable_composes_with_w2():
+    """W4 must COMPOSE with W2's HORIZONS keys without duplicating its module:
+    the adapter accepts an injectable known-rung set so the caller (the cron
+    integration) can pass horizons.HORIZONS.keys() verbatim."""
+    payload = {
+        "active": [
+            {"symbol": "AAPL", "asset_class": "equity", "horizon_set": ["W1"]}
+        ]
+    }
+    # With a custom rung set, "W1" is valid.
+    [entry] = materialize_profile_fit_entries(payload, known_rungs={"W1", "W2"})
+    assert entry.horizon_set == ["W1"]
+    # And the default canonical set would reject it.
+    with pytest.raises(ValueError, match="horizon"):
+        materialize_profile_fit_entries(payload)

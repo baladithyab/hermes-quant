@@ -68,6 +68,15 @@ _LOSS_COOLDOWN_SIDECAR_PATH = QUANT_HOME / "loss_cooldown_state.json"
 # keyed the same way: one in-flight rail-region per account.
 _AUTONOMOUS_ACCOUNT_ID = "paper-default"
 
+# W5 / ADR-0036: gates threading entry.horizon_set -> recommend_multi_horizon
+# (the multi-horizon fan-out) AND the chosen rung's DTE window into the options
+# producer. DEFAULT-OFF rail. Bound to a module constant (the `_FLAG` form) so
+# the flag-inventory scanner's _CONST + _VIA_CONST regexes pick it up and a typo
+# never silently enables the new scan/fan-out path. Read via `== "1"` (fail-
+# closed: anything but the literal "1" leaves the tick byte-identical to today —
+# the single advisor_recommend(timeframe=entry.timeframe) call, fixed-DTE options).
+_MULTI_HORIZON_TICK_FLAG = "HERMES_QUANT_MULTI_HORIZON_TICK"
+
 # Max wall-clock a second overlapping tick waits to acquire the §D9 rail lock
 # before giving up and SKIPPING this tick (silence-by-default; recoverable next
 # tick). A tick's rail-sensitive region is short (one watchlist pass), so this
@@ -1505,9 +1514,21 @@ def _originate_mleg_proposal(
     structure_intent: Any = None,
     paper_zero_costs: bool = False,
     result: TickResult,
+    horizon_rung: str | None = None,
 ) -> str | None:
     """Originate an OPTIONS (multi-leg) play for a symbol (agdec1/agreact1). Returns the
     execution_id of a filled mleg proposal, or None (abstain) at any missing precondition.
+
+    W5 (HERMES_QUANT_MULTI_HORIZON_TICK seam): ``horizon_rung`` is the decision rung
+    chosen for this symbol this tick (a HORIZONS label like "30D"). When provided, the
+    rung's DTE window (``dte_bucket_for_horizon`` in playbook/horizons.py) is threaded
+    into ``build_and_persist_multi_leg(dte_min=, dte_max=)`` so structure_select's KIND
+    and the horizon's DTE both flow to the producer. The 30D rung resolves to (25, 45)
+    == the producer's fixed ``_DEFAULT_DTE_MIN/MAX``, so a 30D-only path is byte-identical
+    to today. When ``horizon_rung`` is None (the production default and every flag-OFF
+    tick), NO dte kwargs are injected and the producer keeps its own fixed default —
+    byte-identical. The decision gate stays final: structure_select picks the kind, the
+    horizon picks the DTE window, the options_gate admits/rejects.
 
     DEFAULT-OFF + FAIL-CLOSED chain — abstains (None, no side effect) unless ALL hold:
       * HERMES_QUANT_AUTONOMOUS_OPTIONS=1 (the master autonomous-origination flag), AND
@@ -1564,6 +1585,29 @@ def _originate_mleg_proposal(
         if strategy_kind is None:
             return None  # abstain -> the equity path stands (byte-identical to today)
 
+        # W5: resolve the chosen rung's DTE window and thread it into the producer.
+        # structure_select above already picked the KIND (it stays the FINAL kind
+        # authority); the horizon only picks the DTE WINDOW. When horizon_rung is None
+        # (flag-OFF / no rung) we inject NOTHING and the producer keeps its fixed
+        # _DEFAULT_DTE_MIN/MAX (25/45) — byte-identical. A 30D rung also resolves to
+        # (25, 45), so 30D-only is byte-identical too. Best-effort: a missing horizons
+        # module / unknown rung is a logged no-op (no dte kwargs) — never a tick-abort.
+        _dte_kwargs: dict[str, int] = {}
+        if horizon_rung is not None:
+            try:
+                from hermes_quant.playbook.horizons import dte_bucket_for_horizon
+
+                _dte_min, _dte_max = dte_bucket_for_horizon(horizon_rung)
+                _dte_kwargs = {"dte_min": int(_dte_min), "dte_max": int(_dte_max)}
+            except Exception as _h_exc:  # noqa: BLE001 — fail-soft to the fixed default
+                logger.warning(
+                    "autonomous: horizon DTE resolve failed for rung %r (%s) — "
+                    "using the producer's fixed default DTE window",
+                    horizon_rung,
+                    _h_exc,
+                )
+                _dte_kwargs = {}
+
         # 2) Build + gate + persist (options_gate runs inside; rejects persist nothing fillable).
         store = get_default_store()
         build_result, persisted = build_and_persist_multi_leg(
@@ -1574,6 +1618,7 @@ def _originate_mleg_proposal(
             nav=float(nav),
             options_buying_power=float(options_buying_power),
             advisor_result=advisor_result,
+            **_dte_kwargs,
         )
         if persisted is None:
             # Gate rejected the structure (inadmissible/over-cap/non-finite) -> abstain.
@@ -1933,6 +1978,103 @@ class TickResult:
         if self.next_run_at:
             out["next_run_at"] = self.next_run_at
         return out
+
+
+# --------------------------------------------------------------------------- #
+# W5 — multi-horizon tick wiring (HERMES_QUANT_MULTI_HORIZON_TICK, default-OFF)
+# --------------------------------------------------------------------------- #
+
+
+def _multi_horizon_enabled(entry: Any) -> bool:
+    """True iff the W5 fan-out should run for this entry.
+
+    Requires BOTH (a) HERMES_QUANT_MULTI_HORIZON_TICK=1 (read at call time) AND
+    (b) a non-empty ``entry.horizon_set`` (a W4 add-only field; absent/None on a
+    pre-W4 entry -> fall back to the single-timeframe path). Read via ``getattr``
+    so the seam composes without hard-importing W4's field. FAIL-CLOSED: anything
+    but the literal "1" / a missing horizon_set -> False -> byte-identical."""
+    if os.environ.get(_MULTI_HORIZON_TICK_FLAG, "0") != "1":
+        return False
+    hs = getattr(entry, "horizon_set", None)
+    return bool(hs)
+
+
+def _horizon_timeframes(entry: Any) -> list[str]:
+    """Resolve ``entry.horizon_set`` -> the ordered rung timeframes for the fan-out.
+
+    Maps each rung label through ``HORIZONS[rung].timeframe`` (playbook/horizons.py,
+    W2). Order-preserving (recommend_multi_horizon dedupes internally). An unknown
+    rung is skipped (best-effort). Empty/unresolvable -> [] (the caller falls back
+    to the single entry.timeframe)."""
+    hs = getattr(entry, "horizon_set", None) or []
+    try:
+        from hermes_quant.playbook.horizons import HORIZONS
+    except Exception as exc:  # noqa: BLE001 — no horizons module yet -> single-tf fallback
+        logger.warning(
+            "autonomous: playbook.horizons unavailable (%s) — single-timeframe fallback",
+            exc,
+        )
+        return []
+    out: list[str] = []
+    for rung in hs:
+        rung_def = HORIZONS.get(rung)
+        if rung_def is None:
+            continue
+        tf = getattr(rung_def, "timeframe", None)
+        if tf:
+            out.append(str(tf))
+    return out
+
+
+def _decision_rung(entry: Any) -> str | None:
+    """Pick the rung whose DTE window drives the options producer for this tick.
+
+    The decision layer (structure_select + the gate) picks WHICH structure trades;
+    the horizon picks the DTE WINDOW. We choose the LAST rung in the set as the
+    decision rung — by the W2 contract the set is ordered short->long and the longest
+    present rung resolves to the producer's fixed (25, 45) default (30D), so a
+    default 1D..30D set keeps the options path byte-identical (last==30D==(25,45)).
+    Returns None when the fan-out is not enabled (-> no DTE thread -> fixed default)."""
+    if not _multi_horizon_enabled(entry):
+        return None
+    hs = getattr(entry, "horizon_set", None) or []
+    return str(hs[-1]) if hs else None
+
+
+def _run_multi_horizon_fanout(
+    *,
+    entry: Any,
+    asof: str,
+) -> None:
+    """Fan the analyst views out across the entry's rung timeframes (ADR-0036).
+
+    Calls ``advisor.recommend_multi_horizon(symbol, horizons=[rung timeframes])`` so
+    every rung produces a (analyst, horizon) view. This is the literal W5 thread:
+    ``entry.horizon_set -> [HORIZONS[r].timeframe for r in set] ->
+    recommend_multi_horizon``. The function already dedupes + fail-softs per horizon.
+    Best-effort: a provider/import error is a logged no-op (never a tick-abort) — the
+    single-timeframe ``recommend()`` spine above already produced the gate-ready
+    advisor_result, so a failed fan-out leaves the decision intact. The returned views
+    are not yet consumed by the gate (the single-tf spine remains the decision input);
+    this seam establishes the fan-out so a downstream increment can blend the rungs."""
+    timeframes = _horizon_timeframes(entry)
+    if not timeframes:
+        return
+    try:
+        from hermes_quant.advisor import recommend_multi_horizon
+
+        recommend_multi_horizon(
+            entry.symbol,
+            horizons=timeframes,
+            asset_class=getattr(entry, "asset_class", "equity"),
+            as_of=asof,
+        )
+    except Exception as exc:  # noqa: BLE001 — fan-out is best-effort, never aborts the tick
+        logger.warning(
+            "autonomous: multi-horizon fan-out failed for %s (continuing single-tf): %s",
+            getattr(entry, "symbol", "?"),
+            exc,
+        )
 
 
 def tick(
@@ -2315,6 +2457,17 @@ def tick(
                     durable_equity_account=_durable_equity_account,
                     risk_gate=_seeded_gate,
                 )
+                # W5 (HERMES_QUANT_MULTI_HORIZON_TICK, default-OFF): when ON AND the
+                # entry carries a horizon_set, fan the analyst views out across the
+                # rung timeframes via recommend_multi_horizon (ADR-0036). This threads
+                # [HORIZONS[r].timeframe for r in set] into the multi-horizon entry
+                # point — the literal W5 thread. Flag OFF / no horizon_set => this is a
+                # no-op and the single advisor_recommend() above is the sole call
+                # (byte-identical). The fan-out is best-effort + additive: the single-tf
+                # spine remains the gate's decision input, so a failed/empty fan-out
+                # never changes the decision (silence-by-default preserved).
+                if _multi_horizon_enabled(entry):
+                    _run_multi_horizon_fanout(entry=entry, asof=asof)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "autonomous: advisor failed for %s: %s",
@@ -2411,6 +2564,11 @@ def tick(
                     structure_intent=advisor_result.get("structure_intent"),
                     paper_zero_costs=bool(rails.get("paper_zero_costs", False)),
                     result=result,
+                    # W5: thread the decision rung so the horizon's DTE window flows to
+                    # the producer (structure_select still picks the KIND). None when
+                    # the multi-horizon flag is OFF / no horizon_set => fixed-DTE default
+                    # => byte-identical. 30D resolves to (25, 45) == today's default too.
+                    horizon_rung=_decision_rung(entry),
                 )
                 if _opts_exec is not None:
                     # agreact1: a fired options play consumes a concurrency slot exactly
