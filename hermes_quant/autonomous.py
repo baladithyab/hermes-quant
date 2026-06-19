@@ -48,11 +48,21 @@ from hermes_quant.gates.silence_bias import (
 )
 from hermes_quant.react.paper import FillSizeInvariantError
 from hermes_quant.watchlist import WatchlistEntry, list_watchlist
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 logger = logging.getLogger(__name__)
 
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+# ADR-0092 ph3: resolve the quant state root via the single env-honoring
+# resolver instead of binding ``Path.home() / ".hermes" / "quant"`` directly.
+# Byte-identical in production (no env -> same default), but a cron/standalone
+# process that exports HERMES_QUANT_HOME / HERMES_HOME BEFORE importing this
+# module now gets an isolated home — the coupling the operator reproduced where
+# the tick ignored the override because the constant was bound to ~/.hermes at
+# import. The symbol stays a MODULE GLOBAL (not a function) so the existing
+# monkeypatch surface (tests setattr autonomous.QUANT_HOME / .KILL_SWITCH_PATH)
+# is preserved unchanged.
+QUANT_HOME = _resolve_quant_home()
 KILL_SWITCH_PATH = QUANT_HOME / "autonomous_kill_switch.json"
 # HERMES_QUANT_POST_LOSS_COOLDOWN seam: durable sidecar recording the latest
 # realized-loss timestamp per (account_id, asset_class, asset) so Rule 4 of

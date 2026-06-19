@@ -607,3 +607,67 @@ def test_triad_round_trip_smoke() -> None:
     assert 0.0 <= av.confidence <= 1.0
     assert _make_proposal().asset_class == "equity"
     assert _make_fill().fill_size_pct == 0.10
+
+
+# ---------------------------------------------------------------------------
+# Gate 1c (ADR-0092 ph2) — the GENERAL host-import invariant, strictly stronger
+# than the enumerated FORBIDDEN_HERMES_SUBMODULES list above.
+#
+# WHY this exists in addition to Gate 1b's static walk:
+#   The static walk (1b) only flags imports that hit the ENUMERATED forbidden
+#   list. That list (daemon/react/advisor/governance/evidence/state/...) was
+#   curated by hand and is necessarily incomplete: the ADR-0092 handoff named
+#   ``hermes_quant.risk`` and ``hermes_quant.protocol`` as the two leaks to
+#   break, yet NEITHER is in the enumerated list — so a regression that did
+#   ``from hermes_quant.protocol import Direction`` inside a pdr_core source
+#   file would sail through Gate 1b. The real invariant the core's extraction
+#   contract needs is ABSOLUTE: a pdr_core source file may import NOTHING from
+#   ``hermes_quant.*`` except ``hermes_quant.pdr_core.*`` (its own siblings).
+#   That is what makes the eventual extraction a mechanical ``git mv`` — the
+#   core, lifted out as a top-level package, must have zero dangling
+#   ``hermes_quant`` references in its own source.
+#
+# This is a SOURCE-level (static AST) gate, deliberately NOT a runtime
+# sys.modules gate: importing ``hermes_quant.pdr_core`` necessarily runs the
+# PARENT package ``hermes_quant/__init__.py`` first (Python package semantics),
+# and that parent eagerly imports ``hermes_quant.protocol``. So at runtime
+# ``hermes_quant.protocol`` IS in sys.modules — but that is an artifact of the
+# nesting, not a leak in the core's own source, and it vanishes by construction
+# the moment pdr_core becomes its own top-level package. Asserting the SOURCE is
+# clean is the invariant that actually tracks "extractable by git mv"; asserting
+# runtime sys.modules has no hermes_quant.* would be a false RED (it would fail
+# today for a reason that is not the core's fault and that extraction fixes for
+# free). See the ADR-0092 ph2 note in docs/adr for the full rationale.
+# ---------------------------------------------------------------------------
+
+
+def test_pdr_core_source_imports_nothing_from_hermes_quant_except_self() -> None:
+    """ABSOLUTE host-import invariant: every ``hermes_quant.*`` import in the
+    pdr_core source tree must target ``hermes_quant.pdr_core.*`` (own siblings).
+
+    Strictly stronger than the enumerated FORBIDDEN_HERMES_SUBMODULES walk:
+    this catches a leak to ANY hermes_quant subpackage — including the two the
+    ADR-0092 handoff named (``hermes_quant.risk`` / ``hermes_quant.protocol``),
+    which are absent from the curated list. This is the gate that pins down
+    "the core imports its host nowhere in its own source" — the precondition
+    for a mechanical ``git mv`` extraction.
+    """
+    src_dir = _pdr_core_source_dir()
+    offenders: list[str] = []
+    for py in sorted(src_dir.rglob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for imported in _iter_imported_names(tree):
+            # Only absolute hermes_quant.* imports are candidates; relative
+            # imports (level>0) are already skipped by _iter_imported_names and
+            # are always own-package by definition.
+            if imported == "hermes_quant" or imported.startswith("hermes_quant."):
+                if not (
+                    imported == "hermes_quant.pdr_core"
+                    or imported.startswith("hermes_quant.pdr_core.")
+                ):
+                    offenders.append(f"{py.name}: import {imported}")
+    assert not offenders, (
+        "pdr_core source imports a hermes_quant host module other than its own "
+        "pdr_core siblings (ADR-0092 extraction contract violated): "
+        + "; ".join(offenders)
+    )
