@@ -33,26 +33,30 @@ _NOW = dt.datetime(2026, 6, 17, 18, 0, 0, tzinfo=dt.UTC)
 # canned agent-reach CLI payloads (the shape the injected fetcher returns)
 # --------------------------------------------------------------------------- #
 def _twitter_payload() -> bytes:
-    """3 tweets with real ISO-8601 created_at, $AAPL cashtag in two of them."""
+    """3 tweets in the REAL twitter-cli serialization shape (codex P2 fix): the
+    timestamp lands under camelCase ``createdAt`` / ``createdAtISO`` (see
+    twitter_cli/serialization.py::tweet_to_dict), NOT snake_case ``created_at``.
+    The fixture used to use ``created_at`` which masked that the live backend
+    would drop every post — the test now exercises the real field names."""
     return json.dumps(
         {
             "results": [
                 {
                     "id": "1",
                     "text": "$AAPL ripping today, calls printing",
-                    "created_at": "2026-06-17T15:30:00+00:00",
+                    "createdAtISO": "2026-06-17T15:30:00+00:00",
                     "url": "https://x.com/u/status/1",
                 },
                 {
                     "id": "2",
                     "text": "loading up on $AAPL again",
-                    "created_at": "2026-06-17T16:00:00Z",
+                    "createdAt": "2026-06-17T16:00:00Z",
                     "url": "https://x.com/u/status/2",
                 },
                 {
                     "id": "3",
                     "text": "market-wide bounce, $AAPL leading",
-                    "created_at": "2026-06-17T16:45:00+00:00",
+                    "createdAtISO": "2026-06-17T16:45:00+00:00",
                     "url": "https://x.com/u/status/3",
                 },
             ]
@@ -104,6 +108,33 @@ def test_twitter_three_posts_real_timestamps():
     assert latency >= 0.0
 
 
+def test_twitter_reads_camelcase_createdat_fields_codex_p2():
+    """codex P2 regression: the REAL twitter-cli backend serializes the timestamp
+    as camelCase ``createdAt`` / ``createdAtISO`` (twitter_cli/serialization.py),
+    NOT snake_case ``created_at``. The first cut read only created_at/created, so
+    EVERY real tweet dropped (pub=None -> skipped). Pin both camelCase forms.
+    RED-proof: revert _reach_created_at to read only created_at/created -> 0 items."""
+    payload = json.dumps(
+        {
+            "results": [
+                {"id": "1", "text": "$AAPL a", "createdAt": "2026-06-17T15:30:00Z"},
+                {"id": "2", "text": "$AAPL b", "createdAtISO": "2026-06-17T16:00:00+00:00"},
+            ]
+        }
+    ).encode("utf-8")
+
+    def fake_fetch(args, timeout):  # noqa: ARG001
+        return payload
+
+    items, _lat = ingest_twitter("AAPL", limit=10, fetcher=fake_fetch)
+    # BOTH camelCase forms parse -> 2 items survive (0 if the reader only knew snake_case).
+    assert len(items) == 2
+    assert {it.published_at for it in items} == {
+        dt.datetime(2026, 6, 17, 15, 30, tzinfo=dt.UTC),
+        dt.datetime(2026, 6, 17, 16, 0, tzinfo=dt.UTC),
+    }
+
+
 def test_stocktwits_real_timestamps():
     payload = _stocktwits_payload()
 
@@ -125,9 +156,9 @@ def test_twitter_skips_post_with_no_timestamp():
     payload = json.dumps(
         {
             "results": [
-                {"id": "1", "text": "$AAPL good", "created_at": "2026-06-17T15:30:00Z"},
-                {"id": "2", "text": "$AAPL no ts"},  # MISSING created_at
-                {"id": "3", "text": "$AAPL garbage ts", "created_at": "not-a-date"},
+                {"id": "1", "text": "$AAPL good", "createdAt": "2026-06-17T15:30:00Z"},
+                {"id": "2", "text": "$AAPL no ts"},  # MISSING timestamp entirely
+                {"id": "3", "text": "$AAPL garbage ts", "createdAt": "not-a-date"},
             ]
         }
     ).encode("utf-8")
@@ -311,31 +342,35 @@ def test_social_reach_ingesters_not_called_when_flag_off(monkeypatch):
 
     monkeypatch.setattr(social, "ingest_twitter", tripwire)
     monkeypatch.setattr(social, "ingest_stocktwits", tripwire)
-    items = social.ingest_social_reach({"AAPL"}, fetcher=lambda *a, **k: b"{}")
+    items = social.ingest_social_reach({"AAPL"})
     assert items == []
     assert called["n"] == 0
 
 
 def test_social_reach_ingesters_called_when_flag_on(monkeypatch):
-    """With the flag ON, ingest_social_reach pulls twitter + stocktwits per symbol."""
+    """With the flag ON, ingest_social_reach pulls twitter + stocktwits per symbol.
+
+    Twitter + StockTwits have DIFFERENT fetcher shapes (CLI argv vs HTTP url) and
+    DIFFERENT real field names (twitter createdAt camelCase; stocktwits messages/
+    created_at), so the orchestrator takes separate injectable fetchers. Each
+    fixture uses its REAL backend shape (codex P2 fix)."""
     import hermes_quant.catalyst.social as social
 
     monkeypatch.setenv("HERMES_QUANT_SOCIAL_REACH", "1")
 
-    def fake_fetch(args, timeout):  # noqa: ARG001
-        # return twitter-shaped payload for any call (both ingesters tolerate it)
+    def fake_twitter(argv, timeout):  # noqa: ARG001 — CLI-shaped: (argv, timeout)
         return json.dumps(
-            {
-                "results": [
-                    {"id": "1", "text": "$AAPL up", "created_at": "2026-06-17T15:30:00Z"}
-                ],
-                "messages": [
-                    {"id": 1, "body": "AAPL up", "created_at": "2026-06-17T15:31:00Z"}
-                ],
-            }
+            {"results": [{"id": "1", "text": "$AAPL up", "createdAt": "2026-06-17T15:30:00Z"}]}
         ).encode("utf-8")
 
-    items = social.ingest_social_reach({"AAPL"}, fetcher=fake_fetch)
+    def fake_stocktwits(url, timeout):  # noqa: ARG001 — HTTP-shaped: (url, timeout)
+        return json.dumps(
+            {"messages": [{"id": 1, "body": "AAPL up", "created_at": "2026-06-17T15:31:00Z"}]}
+        ).encode("utf-8")
+
+    items = social.ingest_social_reach(
+        {"AAPL"}, twitter_fetcher=fake_twitter, stocktwits_fetcher=fake_stocktwits
+    )
     srcs = {it.source for it in items}
     assert "twitter/AAPL" in srcs
     assert "stocktwits/AAPL" in srcs

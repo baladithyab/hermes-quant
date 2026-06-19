@@ -462,6 +462,27 @@ def _reach_records(raw: bytes, *, keys: tuple[str, ...]) -> list[dict]:
     return []
 
 
+def _reach_created_at(rec: dict) -> datetime | None:
+    """Extract a post's REAL creation timestamp from any backend field name.
+
+    The agent-reach backends serialize the timestamp under different keys: the
+    documented Twitter backend (``twitter-cli``) emits ``createdAt`` /
+    ``createdAtISO`` (camelCase — see twitter_cli/serialization.py); the
+    StockTwits public stream API emits ``created_at`` (RFC form); generic CLIs
+    sometimes emit ``created`` or a numeric epoch. Reading ONLY ``created_at`` /
+    ``created`` (as the first cut did) silently dropped every real twitter-cli
+    post (codex P2). Probe all known names IN ORDER and parse the first present
+    value; missing/unparseable across all of them -> None so the caller SKIPS
+    the post (never fabricates a now() asof — the no-lookahead anchor).
+    """
+    for k in ("createdAtISO", "createdAt", "created_at", "created_at_iso", "created", "timestamp"):
+        if k in rec:
+            pub = _parse_reach_created_at(rec.get(k))
+            if pub is not None:
+                return pub
+    return None
+
+
 def _reach_text(rec: dict) -> str:
     """Pull the post body from any of the common field names."""
     for k in ("text", "body", "title", "content", "message"):
@@ -514,7 +535,7 @@ def ingest_twitter(
     items: list[CatalystItem] = []
     for rec in _reach_records(raw, keys=("results", "tweets", "data", "posts")):
         title = _reach_text(rec)
-        pub = _parse_reach_created_at(rec.get("created_at") or rec.get("created"))
+        pub = _reach_created_at(rec)  # camelCase (twitter-cli createdAt/createdAtISO) + snake_case + epoch
         if not title or pub is None:
             continue  # no body, or no parseable timestamp to anchor packet.asof
         items.append(CatalystItem(
@@ -529,6 +550,16 @@ def ingest_twitter(
     return items, latency
 
 
+# StockTwits public streams JSON endpoint. codex P2: Agent-Reach ships NO
+# stocktwits channel (its documented channels are web/twitter/reddit/rss/youtube/
+# bilibili/xiaohongshu/linkedin/v2ex/xueqiu/...), so a `stocktwits ...` CLI would
+# always FileNotFoundError and silently yield nothing. Use the documented public
+# stream API directly (an HTTP GET, like the reddit RSS path), so the StockTwits
+# half of the independent-origin convergence evidence can actually appear when
+# armed. No API key for the public symbol stream; rate-limited (fail-soft on 429).
+_STOCKTWITS_STREAM = "https://api.stocktwits.com/api/2/streams/symbol/{sym}.json"
+
+
 def ingest_stocktwits(
     symbol: str,
     *,
@@ -537,28 +568,33 @@ def ingest_stocktwits(
     fetcher=None,
     dedupe: bool = True,
 ) -> tuple[list[CatalystItem], float]:
-    """Ingest recent StockTwits messages for a symbol via the agent-reach CLI.
+    """Ingest recent StockTwits messages for a symbol via the public stream API.
 
-    Mirrors ``ingest_twitter`` exactly. ``fetcher`` default shells out to
-    ``stocktwits symbol <SYM> -n <limit> --json``. source = ``"stocktwits/<SYM>"``;
-    published_at = the message's REAL ``created_at`` (tz-aware UTC); a message with
-    no parseable timestamp is SKIPPED (never now()). NEVER raises.
+    Mirrors ``ingest_reddit`` (HTTP GET), NOT a CLI — Agent-Reach has no
+    stocktwits channel. ``fetcher`` is injectable (``fetcher(url, timeout) ->
+    bytes``) for offline tests; the default ``_fetch_raw`` GETs the public
+    ``streams/symbol/<SYM>.json`` endpoint. source = ``"stocktwits/<SYM>"``;
+    published_at = the message's REAL ``created_at`` (tz-aware UTC) — StockTwits
+    nests messages under ``messages`` with a top-level ``created_at`` RFC form. A
+    message with no parseable timestamp is SKIPPED (never now()). NEVER raises
+    (a 429 / dead endpoint -> ([], latency), silence-by-default).
     """
     sym = _norm_cashtag(symbol)
-    argv = ["stocktwits", "symbol", sym, "-n", str(int(limit)), "--json"]
-    fetch = fetcher or _reach_cli
+    url = _STOCKTWITS_STREAM.format(sym=urllib.parse.quote(sym))
+    fetch = fetcher or _fetch_raw
     t0 = time.monotonic()
     try:
-        raw = fetch(argv, timeout)
-    except Exception as e:  # noqa: BLE001 — absent/dead CLI is non-fatal
-        logger.warning("catalyst.social: stocktwits agent-reach failed for %s: %s", sym, e)
+        raw = fetch(url, timeout)
+    except Exception as e:  # noqa: BLE001 — rate-limit / dead endpoint is non-fatal
+        logger.warning("catalyst.social: stocktwits stream failed for %s: %s", sym, e)
         return [], time.monotonic() - t0
     latency = time.monotonic() - t0
     src = f"stocktwits/{sym}"
     items: list[CatalystItem] = []
-    for rec in _reach_records(raw, keys=("messages", "results", "data", "posts")):
+    # StockTwits stream nests posts under "messages"; tolerate the generic shapes too.
+    for rec in _reach_records(raw, keys=("messages", "results", "data", "posts"))[: int(limit)]:
         title = _reach_text(rec)
-        pub = _parse_reach_created_at(rec.get("created_at") or rec.get("created"))
+        pub = _reach_created_at(rec)
         if not title or pub is None:
             continue
         items.append(CatalystItem(
@@ -578,7 +614,8 @@ def ingest_social_reach(
     *,
     limit: int = 50,
     timeout: float = _REACH_TIMEOUT,
-    fetcher=None,
+    twitter_fetcher=None,
+    stocktwits_fetcher=None,
     max_age_days: float | None = None,
     now: datetime | None = None,
 ) -> list[CatalystItem]:
@@ -592,8 +629,11 @@ def ingest_social_reach(
     (asof honesty: filters by each item's real published_at, never shifts one),
     and cross-source dedupes. Never raises (each producer fails soft to []).
 
-    The producers run ``shell=False`` with a fixed argv vector (no string
-    interpolation) — see ``_reach_cli``.
+    The two producers have DIFFERENT fetcher shapes — Twitter shells out to the
+    agent-reach CLI (``fetcher(argv, timeout)``) while StockTwits HTTP-GETs the
+    public stream (``fetcher(url, timeout)``) — so they take SEPARATE injectable
+    fetchers (default None => each picks its own correct default). The Twitter
+    CLI runs ``shell=False`` with a fixed argv vector (no string interpolation).
     """
     if not _social_reach_on():
         return []
@@ -602,8 +642,8 @@ def ingest_social_reach(
         sym = _norm_cashtag(raw_sym)
         if not sym:
             continue
-        tw, lat_tw = ingest_twitter(sym, limit=limit, timeout=timeout, fetcher=fetcher, dedupe=True)
-        st, lat_st = ingest_stocktwits(sym, limit=limit, timeout=timeout, fetcher=fetcher, dedupe=True)
+        tw, lat_tw = ingest_twitter(sym, limit=limit, timeout=timeout, fetcher=twitter_fetcher, dedupe=True)
+        st, lat_st = ingest_stocktwits(sym, limit=limit, timeout=timeout, fetcher=stocktwits_fetcher, dedupe=True)
         logger.info(
             "catalyst.social: agent-reach %s -> %d twitter (%.2fs) + %d stocktwits (%.2fs)",
             sym, len(tw), lat_tw, len(st), lat_st,
