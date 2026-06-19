@@ -608,7 +608,16 @@ def build_profile_watchlist(
         scored.append(
             {
                 "symbol": symbol,
-                "asset_class": "us_equity",
+                # rt05: emit the CANONICAL watchlist class, not the Alpaca
+                # universe FILTER token. The universe artifact's own
+                # ``filters.asset_class == "us_equity"`` is the Alpaca scanner
+                # contract (see universe.alpaca_scanner) and stays "us_equity";
+                # but the autonomous/advisor tick + watchlist key on the
+                # canonical "equity" (watchlist._VALID_ASSET_CLASSES), so the
+                # EMITTED row must carry "equity" to route correctly once W4 is
+                # wired into the live tick. materialize_profile_fit_entries also
+                # validates this fail-closed (defense in depth).
+                "asset_class": "equity",
                 "options_eligible": bool(is_equity and artifact_row.get("tradable", True)),
                 "shortable": bool(artifact_row.get("shortable", False)),
                 "horizon_set": list(horizon_set),

@@ -316,6 +316,15 @@ def materialize_profile_fit_entries(
     pass ``horizons.HORIZONS.keys()`` verbatim and keep a single source of
     truth. An unknown label raises ``ValueError`` so it can never silently flow
     to the decision layer's DTE resolver.
+
+    rt05: ``asset_class`` is likewise validated fail-CLOSED against
+    ``_VALID_ASSET_CLASSES``. The producer (``profile_scan``) emits the
+    canonical ``"equity"``, but the Alpaca universe FILTER token ``"us_equity"``
+    (or any other non-canonical class) must NEVER silently materialize — it
+    would break the autonomous/advisor tick's asset-class routing, which keys on
+    the canonical classes. An unknown class raises ``ValueError`` here (defense
+    in depth at the W3->W4 seam), mirroring the horizon-rung guard and
+    ``add_to_watchlist``'s own asset_class check.
     """
     rungs = frozenset(known_rungs) if known_rungs is not None else _CANONICAL_HORIZON_RUNGS
     rows = payload.get("active") or []
@@ -328,6 +337,13 @@ def materialize_profile_fit_entries(
         if not symbol or not asset_class:
             continue
         asset_class = str(asset_class)
+        if asset_class not in _VALID_ASSET_CLASSES:
+            raise ValueError(
+                f"profile-fit row {symbol!r} has unknown asset_class "
+                f"{asset_class!r}; valid classes are {sorted(_VALID_ASSET_CLASSES)} "
+                "(the universe filter token, e.g. 'us_equity', must be normalized "
+                "to the canonical class before materialization)"
+            )
         timeframe = row.get("timeframe") or _DEFAULT_TF_BY_ASSET_CLASS.get(asset_class, "1d")
         horizon_set = _coerce_horizon_set(row.get("horizon_set"))
         if horizon_set is not None:

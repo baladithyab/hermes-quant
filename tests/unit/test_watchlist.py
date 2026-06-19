@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from hermes_quant.watchlist import (
+    _VALID_ASSET_CLASSES,
     WatchlistEntry,
     add_to_watchlist,
     clear_watchlist,
@@ -398,3 +399,97 @@ def test_materialize_known_rungs_injectable_composes_with_w2():
     # And the default canonical set would reject it.
     with pytest.raises(ValueError, match="horizon"):
         materialize_profile_fit_entries(payload)
+
+
+# ---------------------------------------------------------------------------
+# rt05 — asset_class W3->W4 seam: the materialized entry's asset_class MUST be
+# a canonical watchlist class, never the Alpaca universe filter token.
+# ---------------------------------------------------------------------------
+
+
+def test_materialize_real_producer_value_yields_canonical_asset_class(tmp_path: Path):
+    """rt05 integration: feed the payload the REAL producer (profile_scan)
+    emits and assert every materialized entry's asset_class is a class the
+    consumer accepts (``_VALID_ASSET_CLASSES``).
+
+    The materialize tests above hand-rolled ``"equity"`` in their fixture, which
+    masked that the live producer emits the Alpaca universe filter token. This
+    test runs the actual producer so the seam is validated end-to-end.
+    """
+    from hermes_quant.playbook import profile_scan
+
+    uni = tmp_path / "universe.json"
+    payload = {
+        "asof": "2026-06-18T10:15:55+00:00",
+        "count": 1,
+        "filters": {"asset_class": "us_equity", "max_price": 500.0, "min_price": 5.0},
+        "symbols": [
+            {
+                "symbol": "AAA",
+                "avg_dollar_volume_30d": 50_000_000.0,
+                "last_close": 100.0,
+                "tradable": True,
+                "shortable": True,
+            }
+        ],
+    }
+    uni.parent.mkdir(parents=True, exist_ok=True)
+    uni.write_text(__import__("json").dumps(payload), encoding="utf-8")
+    out = tmp_path / "profile-fit.json"
+    produced = profile_scan.build_profile_watchlist(
+        uni, asof="2026-06-18T10:15:55+00:00", fetch=False, out_path=out
+    )
+    assert produced["active"], "AAA should be eligible"
+
+    entries = materialize_profile_fit_entries(produced)
+    assert entries, "the real producer payload must materialize at least one entry"
+    for e in entries:
+        assert e.asset_class in _VALID_ASSET_CLASSES, (
+            f"materialized asset_class {e.asset_class!r} is not a valid watchlist "
+            f"class {sorted(_VALID_ASSET_CLASSES)}"
+        )
+
+
+def test_materialize_rejects_invalid_asset_class():
+    """rt05 defense-in-depth: the seam fail-CLOSED rejects an unknown
+    asset_class rather than silently passing it.
+
+    Mirrors the existing horizon_set rung validation: an asset_class outside
+    ``_VALID_ASSET_CLASSES`` (e.g. the Alpaca universe filter token
+    ``us_equity``) must raise so it can never silently flow to the decision
+    layer's asset-class routing.
+    """
+    payload = {
+        "active": [
+            {
+                "symbol": "AAPL",
+                "asset_class": "us_equity",  # the universe filter token, not canonical
+                "horizon_set": ["1D"],
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="asset_class"):
+        materialize_profile_fit_entries(payload)
+
+
+def test_materialize_rejects_arbitrary_unknown_asset_class():
+    """A made-up asset_class is also fail-closed rejected (not just us_equity)."""
+    payload = {
+        "active": [
+            {"symbol": "X", "asset_class": "bogus_class", "horizon_set": ["1D"]}
+        ]
+    }
+    with pytest.raises(ValueError, match="asset_class"):
+        materialize_profile_fit_entries(payload)
+
+
+def test_materialize_accepts_all_canonical_asset_classes():
+    """Every canonical class round-trips (no over-tight guard)."""
+    payload = {
+        "active": [
+            {"symbol": f"S_{ac}", "asset_class": ac, "horizon_set": ["1D"]}
+            for ac in sorted(_VALID_ASSET_CLASSES)
+        ]
+    }
+    entries = materialize_profile_fit_entries(payload)
+    assert {e.asset_class for e in entries} == _VALID_ASSET_CLASSES

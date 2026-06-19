@@ -282,6 +282,37 @@ def test_active_rows_carry_horizon_set_and_fit_fields(tmp_path: Path):
     assert row["shortable"] is True
 
 
+def test_active_rows_emit_canonical_asset_class(tmp_path: Path):
+    """rt05: an equity row must emit the CANONICAL watchlist asset_class.
+
+    ``us_equity`` is the Alpaca universe FILTER token (the scanner contract,
+    e.g. ``filters.asset_class`` in the artifact + alpaca_scanner's only
+    supported class). But the autonomous/advisor tick and ``watchlist`` key on
+    the canonical ``"equity"`` (``watchlist._VALID_ASSET_CLASSES``). The EMITTED
+    watchlist row must carry the canonical class so it round-trips through
+    ``materialize_profile_fit_entries`` into a routable WatchlistEntry — not the
+    universe filter token that would break asset-class routing once W4 is wired
+    into the live tick.
+    """
+    from hermes_quant.watchlist import _VALID_ASSET_CLASSES
+
+    uni = tmp_path / "universe.json"
+    _write_universe(uni, _ASOF, [_sym("AAA")])
+    out = tmp_path / "profile-fit.json"
+    result = profile_scan.build_profile_watchlist(
+        uni, asof=_ASOF, fetch=False, out_path=out
+    )
+    assert result["active"], "AAA should be eligible"
+    for row in result["active"]:
+        assert row["asset_class"] == "equity", (
+            f"emitted asset_class must be the canonical watchlist token, "
+            f"got {row['asset_class']!r} (the Alpaca universe filter token "
+            "us_equity must not leak into the emitted watchlist row)"
+        )
+        # The emitted class must be one the consumer accepts.
+        assert row["asset_class"] in _VALID_ASSET_CLASSES
+
+
 def test_pit_filter_runs_first_no_lookahead(tmp_path: Path):
     """filter_listed_at_asof runs FIRST; a not-yet-listed name is excluded.
 
