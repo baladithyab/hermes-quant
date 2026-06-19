@@ -34,6 +34,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.protocol import HaltRecord
 
 logger = logging.getLogger(__name__)
@@ -41,8 +42,8 @@ logger = logging.getLogger(__name__)
 # Wildcard sentinel — used instead of NULL for ANY-scope halts.
 WILDCARD = "*"
 
-DEFAULT_STATE_DB = Path.home() / ".hermes" / "quant" / "state.db"
-DEFAULT_HALT_JSON_MIRROR = Path.home() / ".hermes" / "quant" / "halt_state.json"
+DEFAULT_STATE_DB = _resolve_quant_home() / "state.db"
+DEFAULT_HALT_JSON_MIRROR = _resolve_quant_home() / "halt_state.json"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS halts (

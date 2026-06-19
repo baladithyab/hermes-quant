@@ -23,13 +23,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 GOVERNANCE_HOME = QUANT_HOME / "governance"
 AUDIT_LOG_PATH = GOVERNANCE_HOME / "audit_log.jsonl"
 

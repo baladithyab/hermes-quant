@@ -111,10 +111,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache" / "fundamentals"
+DEFAULT_CACHE_ROOT = _resolve_quant_home() / "cache" / "fundamentals"
 
 # B34 reporting-lag-adjusted as_of. Default-ON (cs12 / no-lookahead); read at
 # call time so the explicit-OFF revert path is byte-identical to pre-B34.

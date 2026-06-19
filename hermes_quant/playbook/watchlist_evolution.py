@@ -46,6 +46,8 @@ from typing import Any
 
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 # Re-export PLAY_NAMES from the scorers registry (PROFILES-derived single source
 # of truth, ADR-0082 Part A). Kept under its historical module-level name so all
 # existing callers (`from ...watchlist_evolution import PLAY_NAMES`) keep working.
@@ -65,9 +67,9 @@ logger = logging.getLogger(__name__)
 # hand-maintained tuple that used to live at this spot is gone, so PLAY_NAMES can
 # no longer drift from PROFILES / score_all.
 
-DEFAULT_WATCHLIST_PATH = Path.home() / ".hermes" / "quant" / "watchlist" / "play-fit.json"
-DEFAULT_JOURNAL_PATH = Path.home() / ".hermes" / "quant" / "watchlist" / "journal.jsonl"
-DEFAULT_UNIVERSE_PATH = Path.home() / ".hermes" / "quant" / "universe" / "alpaca-daily.json"
+DEFAULT_WATCHLIST_PATH = _resolve_quant_home() / "watchlist" / "play-fit.json"
+DEFAULT_JOURNAL_PATH = _resolve_quant_home() / "watchlist" / "journal.jsonl"
+DEFAULT_UNIVERSE_PATH = _resolve_quant_home() / "universe" / "alpaca-daily.json"
 
 # How many consecutive runs below the onboard floor (but above the evict
 # floor) before slow-eviction fires.

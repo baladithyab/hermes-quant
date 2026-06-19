@@ -39,6 +39,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 try:
     from freqtrade.strategy import IStrategy
 except ImportError:
@@ -53,7 +55,7 @@ logger = logging.getLogger(__name__)
 # without hermes-quant installed in the freqtrade environment.
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 SIGNAL_BUS_PATH = QUANT_HOME / "signals.jsonl"
 EXECUTION_BUS_PATH = QUANT_HOME / "executions.jsonl"
 HALT_STATE_MIRROR = QUANT_HOME / "halt_state.json"

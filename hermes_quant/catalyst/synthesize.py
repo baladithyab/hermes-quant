@@ -32,6 +32,7 @@ from hermes_quant.catalyst.propagation import (
     load_graph,
     propagate,
 )
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.perception.convergence import (
     CONVERGENCE_MIN_FAMILIES,
     ConvergenceResult,
@@ -45,7 +46,7 @@ from hermes_quant.semantic import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STORE = Path.home() / ".hermes" / "quant" / "catalyst" / "packets.jsonl"
+_DEFAULT_STORE = _resolve_quant_home() / "catalyst" / "packets.jsonl"
 
 # "Properly size" the social-arbitrage signal: consumer-trend (brand_self) edges
 # passed the D74.7 gate at exactly 0.60 hit-rate on n=5 (TPR/NWL were false

@@ -27,9 +27,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 SHADOW_DIVERGENCE_PATH = QUANT_HOME / "alpaca-shadow-divergence.jsonl"
 
 _SHADOW_FLAG = "HERMES_QUANT_ALPACA_SHADOW"

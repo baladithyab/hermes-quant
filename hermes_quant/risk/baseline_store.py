@@ -49,11 +49,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # Same durable state.db as the halt registry (daemon/halt_state.py:43-44).
-DEFAULT_STATE_DB = Path.home() / ".hermes" / "quant" / "state.db"
-DEFAULT_BASELINE_JSON_MIRROR = Path.home() / ".hermes" / "quant" / "drawdown_baselines.json"
+DEFAULT_STATE_DB = _resolve_quant_home() / "state.db"
+DEFAULT_BASELINE_JSON_MIRROR = _resolve_quant_home() / "drawdown_baselines.json"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS drawdown_baselines (

@@ -61,6 +61,7 @@ import numpy as np
 import pandas as pd
 
 from hermes_quant.calibrators import ColdStartCalibrator, IsotonicCalibrator
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.protocol import (
     AggregatedSignal,
     AnalystView,
@@ -83,7 +84,9 @@ except ImportError:  # pragma: no cover
 try:
     from hermes_quant.regime.detector import RegimeDetector as _RegimeDetector
     from hermes_quant.regime.per_regime_weights import apply_regime_weights as _apply_regime_weights
-    from hermes_quant.regime.state_variables import compute_state_variables as _compute_state_variables
+    from hermes_quant.regime.state_variables import (
+        compute_state_variables as _compute_state_variables,
+    )
 except ImportError:  # pragma: no cover
     _RegimeDetector = None  # type: ignore[assignment,misc]
     _apply_regime_weights = None  # type: ignore[assignment,misc]
@@ -152,7 +155,7 @@ class BMAConfig:
 # Canonical persistence location for the bootstrapped IsotonicCalibrator.
 # Mirrors hermes_quant.training.bootstrap_calibrator.DEFAULT_CALIBRATOR_PATH;
 # we don't import that module here to keep the BMA dependency surface clean.
-_DEFAULT_CALIBRATOR_PATH = Path.home() / ".hermes" / "quant" / "calibrators" / "isotonic.pkl"
+_DEFAULT_CALIBRATOR_PATH = _resolve_quant_home() / "calibrators" / "isotonic.pkl"
 
 logger = logging.getLogger(__name__)
 

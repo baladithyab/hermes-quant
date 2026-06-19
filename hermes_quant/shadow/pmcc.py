@@ -25,9 +25,11 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STORE = Path.home() / ".hermes" / "quant" / "shadow" / "pmcc-positions.jsonl"
+_DEFAULT_STORE = _resolve_quant_home() / "shadow" / "pmcc-positions.jsonl"
 _RISK_FREE = 0.043  # matches the analysis assumption; refresh from a curve later.
 
 

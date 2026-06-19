@@ -51,13 +51,15 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 DEFAULT_COMPOSITE_DB = QUANT_HOME / "state.db"
 
 # ---------------------------------------------------------------------------

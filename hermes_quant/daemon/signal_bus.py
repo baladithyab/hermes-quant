@@ -27,10 +27,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.protocol import SignalTooLarge
 
 # Default bus paths. Test code overrides via env or explicit path arg.
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 SIGNAL_BUS_PATH = QUANT_HOME / "signals.jsonl"
 EXECUTION_BUS_PATH = QUANT_HOME / "executions.jsonl"
 

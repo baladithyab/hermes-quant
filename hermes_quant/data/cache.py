@@ -18,7 +18,9 @@ from pathlib import Path
 
 import pandas as pd
 
-DEFAULT_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache"
+from hermes_quant.home import quant_home as _resolve_quant_home
+
+DEFAULT_CACHE_ROOT = _resolve_quant_home() / "cache"
 
 # cs72: the filesystem-safe character class for a cache path component. A char
 # OUTSIDE this class is percent-escaped per UTF-8 byte (see ``_safe_component``)

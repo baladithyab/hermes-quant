@@ -43,6 +43,8 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +52,7 @@ logger = logging.getLogger(__name__)
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_QUANT_HOME = Path.home() / ".hermes" / "quant"
+DEFAULT_QUANT_HOME = _resolve_quant_home()
 
 # Telegram MarkdownV2 reserved characters (bot API doc).
 _TG_MD_V2_SPECIALS = r"_*[]()~`>#+-=|{}.!"

@@ -59,6 +59,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 from .positions import CashState, Position
 
 logger = logging.getLogger(__name__)
@@ -67,7 +69,7 @@ logger = logging.getLogger(__name__)
 # Paths
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 DEFAULT_STATE_DB = QUANT_HOME / "state.db"
 DEFAULT_EXECUTIONS_PATH = QUANT_HOME / "executions.jsonl"
 

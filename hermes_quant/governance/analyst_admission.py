@@ -37,6 +37,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # DSR is meaningless below this (evaluation/dsr.py raises < 30); mirror it here so
@@ -54,7 +56,7 @@ PLATEAU_CV_MAX: float = 1.5
 # clear it. Without it a guaranteed-loser analyst would join the committee on the -inf baseline.
 MIN_PROMOTABLE_DSR: float = 0.5
 
-_DEFAULT_DIR = Path.home() / ".hermes" / "quant" / "analysts"
+_DEFAULT_DIR = _resolve_quant_home() / "analysts"
 _PRIOR_BEST_FILE = "admission-prior-best.json"
 # Persisted admission verdicts the committee-build wiring reads when the
 # (default-OFF) admission flag is enabled. Written by the operator/eval path after

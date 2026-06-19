@@ -26,6 +26,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 from .occ import parse_occ
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -312,7 +314,7 @@ def aggregate_net_greeks(
 # Read-only chain reader
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CHAINS_DIR = Path.home() / ".hermes" / "quant" / "option_chains"
+_DEFAULT_CHAINS_DIR = _resolve_quant_home() / "option_chains"
 
 # Risk-free rate stamped on a live snapshot. The replay path reads rfr back from
 # the parquet; the live writer needs ONE value to record (ADR-0028 D3 greek

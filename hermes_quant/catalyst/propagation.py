@@ -25,10 +25,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # Where the operator-editable curated graph lives (overridable for tests).
-_DEFAULT_GRAPH_PATH = Path.home() / ".hermes" / "quant" / "catalyst" / "propagation_graph.yaml"
+_DEFAULT_GRAPH_PATH = _resolve_quant_home() / "catalyst" / "propagation_graph.yaml"
 
 
 @dataclass(frozen=True)
@@ -185,7 +187,7 @@ _SIGN_TO_STANCE = {1: "bullish", -1: "bearish", 0: "neutral"}
 # one (entity→symbol) edge fire with its curated sign/weight + the catalyst sign,
 # so a later job can join against realized forward returns and learn corrected
 # signs/weights without re-deriving the curated graph.
-_DEFAULT_LEARNED_LOG = Path.home() / ".hermes" / "quant" / "catalyst" / "propagation-log.jsonl"
+_DEFAULT_LEARNED_LOG = _resolve_quant_home() / "catalyst" / "propagation-log.jsonl"
 
 
 def _propagation_row_key(row: dict) -> tuple:

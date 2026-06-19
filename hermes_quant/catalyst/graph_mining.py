@@ -130,12 +130,13 @@ from hermes_quant.catalyst.propagation import (
     PropagationEdge,
     load_graph,
 )
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 logger = logging.getLogger(__name__)
 
 # The corpus the miner reads back (external market truth via the fetcher); identical
 # to profitability's default log path (propagation.py:188, profitability.py:28).
-_DEFAULT_LOG = Path.home() / ".hermes" / "quant" / "catalyst" / "propagation-log.jsonl"
+_DEFAULT_LOG = _resolve_quant_home() / "catalyst" / "propagation-log.jsonl"
 
 # The ONLY thing W5 writes: the candidate-edge diff for operator review (advisory
 # plane). Path matches the DESIGN doc exactly (graph_mining.py original :64).

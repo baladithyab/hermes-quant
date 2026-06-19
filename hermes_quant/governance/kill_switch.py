@@ -15,11 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from hermes_quant.governance import approvals, audit_log
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 logger = logging.getLogger(__name__)
 
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 STATE_JSON_PATH = QUANT_HOME / "state.json"
 
 

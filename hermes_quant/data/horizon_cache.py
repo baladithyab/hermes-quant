@@ -31,6 +31,8 @@ from typing import Any
 
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -59,7 +61,7 @@ _HORIZON_LOOKBACK_YEARS: dict[str, int] = {
 _OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 # Cache root: ~/.hermes/quant/cache/horizon-history
-_CACHE_ROOT = Path.home() / ".hermes" / "quant" / "cache" / "horizon-history"
+_CACHE_ROOT = _resolve_quant_home() / "cache" / "horizon-history"
 
 
 # ---------------------------------------------------------------------------

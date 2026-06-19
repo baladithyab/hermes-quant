@@ -37,11 +37,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # Co-locate with baseline_store in the same durable state.db.
-DEFAULT_STATE_DB = Path.home() / ".hermes" / "quant" / "state.db"
-DEFAULT_WATCH_JSON_MIRROR = Path.home() / ".hermes" / "quant" / "watch_registry.json"
+DEFAULT_STATE_DB = _resolve_quant_home() / "state.db"
+DEFAULT_WATCH_JSON_MIRROR = _resolve_quant_home() / "watch_registry.json"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS watch_registry (

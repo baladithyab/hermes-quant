@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # --- Hard caps (the silence-only rail; never widened by the loop) -----------
@@ -52,7 +54,7 @@ _TIER_TARGET: dict[str, float] = {
     "rejected": 0.00,    # silence-toward-0
 }
 
-_DEFAULT_DIR = Path.home() / ".hermes" / "quant" / "factors"
+_DEFAULT_DIR = _resolve_quant_home() / "factors"
 _CANDIDATES_FILE = "weight-candidates.json"
 _REJECTED_BUFFER = "weight-rejected-buffer.jsonl"
 _PRIOR_BEST_FILE = "weight-prior-best.json"

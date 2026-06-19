@@ -25,13 +25,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 MEMORY_HOME = QUANT_HOME / "memory"
 DECISIONS_PATH = MEMORY_HOME / "decisions.jsonl"
 

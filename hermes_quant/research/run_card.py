@@ -32,13 +32,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 RESEARCH_HOME = QUANT_HOME / "research"
 RUN_CARDS_PATH = RESEARCH_HOME / "run_cards.jsonl"
 

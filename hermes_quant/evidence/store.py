@@ -29,8 +29,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from hermes_quant.evidence.schema import EvidenceRecord
+from hermes_quant.home import quant_home as _resolve_quant_home
 
-DEFAULT_EVIDENCE_DIR = Path.home() / ".hermes" / "quant" / "evidence_store"
+DEFAULT_EVIDENCE_DIR = _resolve_quant_home() / "evidence_store"
 DEFAULT_SIZE_CAP_BYTES = 50 * 1024 * 1024 * 1024  # 50 GB
 
 

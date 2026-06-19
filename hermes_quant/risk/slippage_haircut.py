@@ -34,6 +34,8 @@ import statistics
 from dataclasses import dataclass
 from pathlib import Path
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 # Conservative LIVE-VS-PAPER priors, as a one-way penalty on the trade's NAV-fraction
 # return (a fraction: 0.0010 = 10 bps of round-trip execution cost beyond what paper shows).
 # These are STARTING POINTS to be eval-gated once real live fills accrue — NOT ground truth.
@@ -62,7 +64,7 @@ _MIN_SHADOW_SAMPLES = 20
 
 _FLAG = "HERMES_QUANT_SLIPPAGE_HAIRCUT"
 
-SHADOW_DIVERGENCE_PATH = Path.home() / ".hermes" / "quant" / "alpaca-shadow-divergence.jsonl"
+SHADOW_DIVERGENCE_PATH = _resolve_quant_home() / "alpaca-shadow-divergence.jsonl"
 
 
 def haircut_enabled() -> bool:

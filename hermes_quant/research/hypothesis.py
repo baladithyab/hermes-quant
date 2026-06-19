@@ -38,13 +38,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 RESEARCH_HOME = QUANT_HOME / "research"
 HYPOTHESES_PATH = RESEARCH_HOME / "hypotheses.jsonl"
 
@@ -214,8 +216,8 @@ class Hypothesis(BaseModel):
         """
         try:
             from hermes_quant.factors.ast_purity import (
-                check_factor_purity,
                 PurityViolation,
+                check_factor_purity,
             )
         except ImportError:
             # If the purity module isn't available, fail closed.

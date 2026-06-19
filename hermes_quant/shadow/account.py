@@ -27,6 +27,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.shadow.rules import ShadowDecision, ShadowRule
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Default paths
 # ---------------------------------------------------------------------------
 
-_SHADOW_HOME = Path.home() / ".hermes" / "quant" / "shadow"
+_SHADOW_HOME = _resolve_quant_home() / "shadow"
 
 # ---------------------------------------------------------------------------
 # SQLite schema

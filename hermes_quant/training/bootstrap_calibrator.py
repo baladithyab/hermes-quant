@@ -42,6 +42,7 @@ import numpy as np
 import pandas as pd
 
 from hermes_quant.calibrators import IsotonicCalibrator
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.protocol import AnalystView, MarketContext
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 # Default canonical persistence location. BMAAggregator reads from the same
 # path on init.
-DEFAULT_CALIBRATOR_PATH = Path.home() / ".hermes" / "quant" / "calibrators" / "isotonic.pkl"
+DEFAULT_CALIBRATOR_PATH = _resolve_quant_home() / "calibrators" / "isotonic.pkl"
 
 # Minimum bars an analyst needs before it will emit. ClassicalTAAnalyst's
 # slowest indicator is the SMA50 (50 bars); we use 200 to give all analysts

@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field
 
 from hermes_quant.eval.promotion_gate import PromotionDecision, PromotionGate
 from hermes_quant.eval.stockbench import STOCKBENCHHarness, STOCKBENCHResult
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.research.hypothesis import AppendOnlyViolation
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ logger = logging.getLogger(__name__)
 # Paths
 # ---------------------------------------------------------------------------
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 RESEARCH_HOME = QUANT_HOME / "research"
 PROMOTION_LOG_PATH = RESEARCH_HOME / "promotion_decisions.jsonl"
 

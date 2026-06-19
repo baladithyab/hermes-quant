@@ -24,9 +24,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_LOG = Path.home() / ".hermes" / "quant" / "catalyst" / "propagation-log.jsonl"
+_DEFAULT_LOG = _resolve_quant_home() / "catalyst" / "propagation-log.jsonl"
 
 # A relation class must clear this directional hit-rate on accumulated live data to
 # justify carrying (or raising) its confidence weight. Mirrors the D74.7 precision bar.

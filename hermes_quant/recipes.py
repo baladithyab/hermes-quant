@@ -16,8 +16,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from hermes_quant.home import quant_home as _resolve_quant_home
+
 PDRMode = Literal["advise", "hitl", "autonomous", "backtest"]
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 USER_RECIPE_DIR = QUANT_HOME / "recipes"
 
 

@@ -16,6 +16,7 @@ from typing import Any, Literal
 import pandas as pd
 
 from hermes_quant.aggregators.deliberative import CommitteeTurn
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.semantic import (
     SemanticPacket,
     parse_semantic_packet,
@@ -23,7 +24,7 @@ from hermes_quant.semantic import (
     validate_semantic_packet,
 )
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 SEMANTIC_PACKET_DIR = QUANT_HOME / "semantic_packets"
 COMMITTEE_TURN_DIR = QUANT_HOME / "committee_turns"
 

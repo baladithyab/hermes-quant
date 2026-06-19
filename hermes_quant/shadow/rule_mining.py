@@ -94,6 +94,7 @@ from typing import Literal
 
 # Reuse the repo's existing floor — do NOT redefine (note §2b; same as graph_mining).
 from hermes_quant.catalyst.profitability import MIN_SAMPLE
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.journal.models import SettlementEntry
 from hermes_quant.journal.reader import parse_journal
 
@@ -101,7 +102,7 @@ logger = logging.getLogger(__name__)
 
 # The corpus the miner reads back (external realized outcomes): the resolved entries of
 # the settlement journal. Identical default to journal.writer.DEFAULT_JOURNAL_PATH.
-_DEFAULT_JOURNAL = Path.home() / ".hermes" / "quant" / "journal.md"
+_DEFAULT_JOURNAL = _resolve_quant_home() / "journal.md"
 
 # The ONLY thing this module writes: the candidate-rule diff for operator review
 # (advisory plane). Mirrors graph_mining's graph-mine-candidates.json contract.

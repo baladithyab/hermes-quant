@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from hermes_quant.daemon.signal_bus import append_locked
+from hermes_quant.home import quant_home as _resolve_quant_home
 
 if TYPE_CHECKING:  # pragma: no cover - typing only (avoid import cost/cycles)
     from hermes_quant.options.multileg import MultiLegProposal
@@ -39,7 +40,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only (avoid import cost/cycles)
 logger = logging.getLogger(__name__)
 
 
-QUANT_HOME = Path.home() / ".hermes" / "quant"
+QUANT_HOME = _resolve_quant_home()
 PROPOSAL_BUS_PATH = QUANT_HOME / "proposals.jsonl"
 PROPOSAL_DB_PATH = QUANT_HOME / "proposals.db"
 
