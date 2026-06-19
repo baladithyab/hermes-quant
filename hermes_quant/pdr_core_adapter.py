@@ -39,9 +39,12 @@ core boundary intact (dropping it would be a money-safety regression).
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from hermes_quant.pdr_core.gate import DefaultRiskGate as CoreDefaultRiskGate
@@ -60,6 +63,87 @@ from hermes_quant.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ADR-0092 Phase-4 (parity proof): the shadow gate's per-tick divergence report
+# is APPENDED here so the operator can drive divergences to zero before the
+# cutover (HERMES_QUANT_PDR_CORE_LIVE). Mirrors react/alpaca_shadow.py's
+# divergence-log pattern (append-only JSONL, line-buffered, fail-closed). The
+# path is resolved at CALL TIME via hermes_quant.home (ADR-0092 ph3 home
+# decouple) so HERMES_HOME / HERMES_QUANT_HOME overrides are honored. The
+# offline report harness (ops/scripts/quant-pdr-core-parity-report.py) READS
+# this log; it is never written outside the SHADOW path (flag-OFF => no write).
+_SHADOW_DIVERGENCE_FILE = "pdr-core-shadow-divergence.jsonl"
+
+
+def _shadow_divergence_path() -> Path:
+    """Resolve the shadow-divergence log path at call time (home-decouple honest).
+
+    Uses the ADR-0092 ph3 resolver so an injected HERMES_QUANT_HOME / HERMES_HOME
+    lands the log in the same quant home the live gate writes to. Imported lazily
+    to keep this module's import graph minimal (and to never fail the SHADOW path
+    on a home-resolver import hiccup — the caller swallows any raise).
+    """
+    from hermes_quant.home import quant_home as _resolve_quant_home
+
+    return _resolve_quant_home() / _SHADOW_DIVERGENCE_FILE
+
+
+def _persist_divergence_report(report: dict[str, Any], *, path: Path | None = None) -> None:
+    """Append one shadow divergence report to the JSONL log (best-effort).
+
+    NEVER raises: a persistence failure must not affect the (already-final) live
+    decision — the caller runs this inside the shadow seam's try/except, but we
+    also swallow here so a write error can't even surface a warning into the
+    live path's exception handler. Line-buffered + flush so an interrupted run
+    still leaves complete prior lines (the parity harness reads line-by-line).
+
+    The persisted record is a FLATTENED, JSON-serializable view of the report:
+    the live/shadow Action objects are reduced to their primitive fields (an
+    Action is not JSON-serializable as-is). asof stamps the wall-clock so the
+    operator can window the divergence sample (clean-window aligned).
+    """
+    try:
+        out = path or _shadow_divergence_path()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        live = report.get("live")
+        shadow = report.get("shadow")
+        record = {
+            "asof": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "diverged": bool(report.get("diverged")),
+            "fields": list(report.get("fields") or []),
+            "live": _action_primitives(live),
+            "shadow": _action_primitives(shadow),
+        }
+        line = json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
+        with out.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+    except Exception as exc:  # noqa: BLE001 — persistence is strictly best-effort
+        logger.warning("pdr_core shadow: divergence persistence failed (non-blocking): %s", exc)
+
+
+def _action_primitives(action: Action | None) -> dict[str, Any] | None:
+    """Reduce a protocol.Action to a JSON-serializable dict (None passes through).
+
+    halt_until may be a pd.Timestamp; isoformat() it (or str()) so the log line
+    is serializable and the harness can compare halt windows.
+    """
+    if action is None:
+        return None
+    halt_until = action.halt_until
+    if halt_until is not None and not isinstance(halt_until, str):
+        try:
+            halt_until = halt_until.isoformat()
+        except Exception:  # noqa: BLE001 — fall back to str() for any exotic type
+            halt_until = str(halt_until)
+    return {
+        "target_position_pct": action.target_position_pct,
+        "reason": action.reason,
+        "signal_id": action.signal_id,
+        "halt": action.halt,
+        "halt_scope": action.halt_scope,
+        "halt_until": halt_until,
+    }
 
 # cut/01f0 (ADR-0097): the operator flag the SHELL reads to wire the slippage
 # haircut into the LIVE decision gate (Rule-5 cost gate + Rule-6 sizer). The pure
@@ -308,6 +392,8 @@ def run_shadow_gate(
     live_action: Action | None,
     live_config: Any,
     event_risk_enabled: bool = False,
+    persist: bool = True,
+    divergence_path: Path | None = None,
 ) -> dict[str, Any] | None:
     """Run the ported core gate in SHADOW over the live inputs and compare.
 
@@ -323,6 +409,15 @@ def run_shadow_gate(
     Logs at WARNING on any divergence (INFO on agreement). On ANY exception it
     swallows the error (logging at WARNING, best-effort) and returns ``None`` —
     a shadow failure must NEVER affect the live decision.
+
+    ADR-0092 Phase-4 (parity proof): when ``persist`` is True (the default for
+    the live shadow seam) the report is APPENDED to the shadow-divergence JSONL
+    (``pdr-core-shadow-divergence.jsonl`` under the resolved quant home) so the
+    operator can accumulate the parity sample and drive divergences to zero
+    before building the cutover. Persistence is strictly best-effort — a write
+    failure is swallowed and never affects the (already-final) live decision.
+    Tests pass ``persist=False`` (or a throwaway ``divergence_path``) to avoid
+    touching real operator state.
     """
     try:
         # cut/01f0 (ADR-0097): read the DEFAULT-OFF slippage-gate flag ONCE and
@@ -364,6 +459,10 @@ def run_shadow_gate(
             )
         else:
             logger.info("pdr_core shadow agreed with live gate")
+        # ADR-0092 Phase-4: accumulate the parity sample (best-effort; never
+        # affects the live decision — persistence swallows its own errors).
+        if persist:
+            _persist_divergence_report(report, path=divergence_path)
         return report
     except Exception as exc:  # noqa: BLE001 — best-effort shadow; never affects live
         logger.warning("pdr_core shadow failed: %s", exc, exc_info=True)
