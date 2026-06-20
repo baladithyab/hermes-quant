@@ -174,14 +174,18 @@ def _exec_record(asset: str, fill_size_pct: float, fill_price: float, asof_exec:
 
 
 def _write_real_clearing_book(home: Path, t0: datetime) -> None:
-    """Write a REAL executions.jsonl under ``home/quant/`` that clears GATE-2.
+    """Write a REAL executions.jsonl under ``home/quant/`` that clears GATE-2."""
+    _write_real_clearing_book_at(home / _QUANT_EXECUTIONS, t0)
+
+
+def _write_real_clearing_book_at(bus: Path, t0: datetime) -> None:
+    """Write a REAL clearing executions.jsonl at the EXACT path ``bus``.
 
     54 round trips over ~64 days, 66% winners (+3% via 100->103) / losers (-1% via
     100->99), losers never adjacent. Same return profile as the monkeypatched
     ``_clearing_book`` above, but produced through the real FIFO matcher
     (settlement_loop.join_exit_fills): each trip is a BUY fill (open) + SELL fill
     (close), realized_return = (exit-entry)/entry with zero fees."""
-    bus = home / _QUANT_EXECUTIONS
     bus.parent.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
     for i in range(54):
@@ -264,3 +268,33 @@ def test_empty_home_book_stays_locked_even_if_process_default_clears(tmp_path: P
     payload = writer.evaluate_gate2(home, asof=now)
     assert payload["n"] == 0, f"read the WRONG (process-default) home's book: {payload}"
     assert payload["gate2_cleared"] is False, f"unlocked off the wrong home's book: {payload}"
+
+
+def test_env_hermes_quant_home_book_read_matches_tick_write(tmp_path: Path, monkeypatch):
+    """cx2-followup (p6-cx-wave-review): under HERMES_QUANT_HOME-only with home=None
+    (the env-driven path the cron uses), evaluate_gate2 must read the book the autonomous
+    tick WROTE — quant_home()/executions.jsonl (HERMES_QUANT_HOME-first), NOT the
+    HERMES_HOME-only ~/.hermes path. Pre-fix the local _home_path diverged: the tick wrote
+    $HERMES_QUANT_HOME/executions.jsonl while gate2-eval read ~/.hermes (a stale book there
+    could UNLOCK the wrong home). RED-proof: revert to _home_path(None)/quant/... and this
+    reads zero trips (LOCKED) despite the HQH book clearing."""
+    hqh = tmp_path / "hqh_quant_root"  # quant_home() returns this directly (no /quant)
+    hqh.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(hqh))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    now = datetime(2026, 6, 18, tzinfo=UTC)
+    t0 = now - timedelta(days=65)
+    # GATE-0 anchor lives under the quant root the writer reads for read_clean_window_start;
+    # pass home=hqh-as-hermes is wrong here — the env path uses home=None, and the anchor is
+    # read via clean_window _home_path(None) (HERMES_HOME or ~/.hermes). Seed the anchor where
+    # read_clean_window_start(None) looks, and the BOOK where quant_home() looks.
+    from hermes_quant.eval.clean_window import _home_path as _cw_home
+    _seed_t0(_cw_home(None), t0)  # anchor at the clean_window-resolved home
+    # write the real clearing book at quant_home()/executions.jsonl (= hqh/executions.jsonl)
+    _write_real_clearing_book_at(hqh / "executions.jsonl", t0)
+
+    writer = _load_writer()
+    payload = writer.evaluate_gate2(None, asof=now)  # home=None => env-driven (the cron path)
+    assert payload["n"] == 54, f"env HERMES_QUANT_HOME book not read (tick-write vs gate-read divergence): {payload}"
+    assert payload["gate2_cleared"] is True

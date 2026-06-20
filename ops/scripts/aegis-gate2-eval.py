@@ -104,8 +104,27 @@ def evaluate_gate2(home: str | Path | None, *, asof: datetime | None = None) -> 
     # ``home/quant/executions.jsonl`` (signal_bus EXECUTION_BUS_PATH = QUANT_HOME /
     # "executions.jsonl"). Pass that exact home-scoped path so the verdict reflects
     # THIS home's own book.
-    home_path = _home_path(home)
-    executions_path = home_path / "quant" / "executions.jsonl"
+    # cx2-followup (p6-cx-wave-review): resolve the book with the SAME resolver the
+    # autonomous tick + signal_bus.EXECUTION_BUS_PATH use to WRITE it. quant_home()'s
+    # precedence is override > HERMES_QUANT_HOME > HERMES_HOME/quant > ~/.hermes/quant.
+    # Using the local HERMES_HOME-only _home_path here diverged under a
+    # HERMES_QUANT_HOME-only home (tick wrote $HQH/executions.jsonl; gate2-eval read
+    # ~/.hermes) -> a stale book at the default path could then UNLOCK the wrong home.
+    # An explicit --home is threaded as the override (quant_home expands it directly);
+    # the marker write below uses the same root, keeping marker + book co-located.
+    if home is not None:
+        # Explicit --home is the HERMES home (as for the marker/anchor via _home_path);
+        # the book lives at <home>/quant/executions.jsonl, co-located with the marker.
+        executions_path = _home_path(home) / "quant" / "executions.jsonl"
+    else:
+        # Env-driven (home=None): resolve with the SAME resolver the autonomous tick +
+        # signal_bus.EXECUTION_BUS_PATH use to WRITE the book — quant_home() is
+        # HERMES_QUANT_HOME-first, so a HERMES_QUANT_HOME-only run reads the book the
+        # tick actually wrote (the local HERMES_HOME-only _home_path diverged -> a stale
+        # default-path book could UNLOCK the wrong home). quant_home() returns the quant
+        # root directly (no /quant suffix).
+        from hermes_quant.home import quant_home as _quant_home
+        executions_path = _quant_home() / "executions.jsonl"
     try:
         from hermes_quant.governance.promotion import _settle_paper_round_trips_in_window
 
