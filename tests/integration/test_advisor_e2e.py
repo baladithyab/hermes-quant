@@ -24,6 +24,16 @@ from hermes_quant.protocol import (
     DataProviderError,
 )
 
+# aegis-ci-hang: the no-``analysts=`` tests here build the canonical default
+# loadout, which includes a REAL KronosAnalyst that lazy-loads weights from
+# HuggingFace on first analyze(). The autouse offline guard in
+# tests/integration/conftest.py keeps that fetch off the live network; this
+# per-module timeout is a second rail so any residual hang (e.g. a future
+# analyst that ignores the offline flag) fail-fasts instead of stalling the
+# whole pytest sweep near the end. Generous: the offline cache-or-abstain path
+# is sub-5s, but model-init / first torch import can take a while cold.
+pytestmark = pytest.mark.timeout(120)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures: synthetic OHLCV bars + a fake DataProvider
