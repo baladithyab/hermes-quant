@@ -252,6 +252,77 @@ def test_run_shadow_aggregate_not_comparable_when_fitted_calibrator_active(tmp_p
     assert report["diverged"] is False
 
 
+def test_run_shadow_aggregate_not_comparable_when_hierarchical_pooling_set(
+    tmp_path, monkeypatch, caplog
+):
+    """REGRESSION (review P1 false-divergence): HERMES_QUANT_HIERARCHICAL_POOLING is
+    a vote-branching flag the live BMA reads (bma.py:296) — when set on a SETTLED
+    aggregator it replaces per-analyst weights with pooled skill, so the live signal
+    diverges from the cold-start core port BY DESIGN. The first cut OMITTED this flag
+    from _AGG_LEARNING_FLAGS, so a pooling-on tick was wrongly COMPARED and logged a
+    FALSE magnitude/weights divergence. After the fix the flag is in the set => the
+    tick is not-comparable, NO divergence flagged.
+
+    RED-PROOF: this fixture exercises the exact hole — with the flag missing from the
+    set, run_shadow_aggregate would return comparable=True (and, on a settled
+    aggregator, diverged=True). Pinning reason==learning_flag_active + flag-name
+    proves the flag is now in the gate."""
+    monkeypatch.setenv("HERMES_QUANT_HIERARCHICAL_POOLING", "1")
+    assert "HERMES_QUANT_HIERARCHICAL_POOLING" in _AGG_LEARNING_FLAGS, (
+        "pooling flag must be in the comparability gate (review P1)"
+    )
+    agg = _live_aggregator(tmp_path)
+    rows = FIXTURES["two_unanimous_long"]
+    views = [_live_view(*r) for r in rows]
+    ctx = _live_ctx()
+    live_sig = agg.aggregate(views, ctx)
+
+    with caplog.at_level(logging.WARNING, logger="hermes_quant.pdr_core_adapter"):
+        report = run_shadow_aggregate(
+            views=views, ctx=ctx, aggregator=agg, live_signal=live_sig, persist=False
+        )
+    assert report is not None
+    assert report["comparable"] is False
+    assert report["reason"] == "learning_flag_active"
+    assert report["flag"] == "HERMES_QUANT_HIERARCHICAL_POOLING"
+    assert report["diverged"] is False
+    # No WARNING — a by-design skip is not a divergence.
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_l2_stacking_phantom_flag_not_in_gate():
+    """REGRESSION (review nit): the live BMA reads HERMES_QUANT_STACKING, NOT
+    HERMES_QUANT_L2_STACKING. The phantom L2_STACKING (carried by the static test's
+    set) would over-conservatively skip an otherwise-comparable tick — it must NOT
+    be in the runtime gate."""
+    assert "HERMES_QUANT_STACKING" in _AGG_LEARNING_FLAGS
+    assert "HERMES_QUANT_L2_STACKING" not in _AGG_LEARNING_FLAGS
+
+
+def test_run_shadow_aggregate_out_of_core_bounds_view_is_not_comparable(tmp_path):
+    """REGRESSION (review P3 observability): a live AnalystView with magnitude > 1.0
+    is accepted by protocol.AnalystView but REJECTED by the core CoreView
+    (__post_init__ bounds). The projection raises; instead of the outer try/except
+    swallowing it to a SILENT None (a tick dropped from the parity sample with no
+    record), the shadow records a not-comparable report with reason
+    view_out_of_core_bounds so the operator's coverage stays honest."""
+    agg = _live_aggregator(tmp_path)
+    ctx = _live_ctx()
+    # magnitude 1.5 > 1.0: live accepts, core CoreView rejects.
+    bad_view = _live_view("k", 1, 1.5, 0.7, 0.6, "1d")
+    # the live aggregator tolerates it (its own bounds are looser); build a live sig
+    live_sig = agg.aggregate([_live_view("a", 1, 0.5, 0.7, 0.6, "1d")], ctx)
+
+    report = run_shadow_aggregate(
+        views=[bad_view], ctx=ctx, aggregator=agg, live_signal=live_sig, persist=False
+    )
+    assert report is not None, "must record a not-comparable report, not silently drop"
+    assert report["comparable"] is False
+    assert report["reason"] == "view_out_of_core_bounds"
+    assert report["diverged"] is False
+    assert "detail" in report  # the ValueError text is surfaced for the operator
+
+
 def test_run_shadow_aggregate_swallows_exceptions_and_returns_none(caplog):
     """If anything inside the shadow raises, run_shadow_aggregate swallows it and
     returns None — never re-raises. aggregator=None makes the calibrator probe and

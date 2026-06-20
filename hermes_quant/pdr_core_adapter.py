@@ -499,18 +499,30 @@ def run_shadow_gate(
 # SHADOW path (flag-OFF => no write).
 _SHADOW_AGGREGATE_DIVERGENCE_FILE = "pdr-core-shadow-aggregate-divergence.jsonl"
 
-# The 7 default-OFF learning flags that, when ANY is set, make the live BMA
-# diverge from the cold-start core port BY DESIGN. Lifted VERBATIM from the
-# static parity test's ``_FLAGS`` (tests/pdr_core/test_aggregate_parity.py) — the
-# proven set the parity oracle requires unset. A drift here would silently flag
-# expected (learning-on) divergence as a port bug.
+# The default-OFF learning flags that, when ANY is set, make the live BMA diverge
+# from the cold-start core port BY DESIGN — so a tick under any of them is NOT
+# parity-comparable (recording it as diverged would slander a faithful port).
+#
+# This MUST be exactly the set of vote-branching flags ``BMAAggregator`` actually
+# reads at call time — DERIVED from the live ``aggregators/bma.py`` env reads, NOT
+# copied from the static parity test's ``_FLAGS`` (the static test only DELETES
+# these before running the oracle, so an omission there is harmless; an omission
+# HERE causes a FALSE divergence the operator would chase as a port bug). The live
+# reads (bma.py): L2_POSTERIOR_DECAY (:234), L2_PER_ANALYST_CALIB (:249),
+# L2_LESSON_HAIRCUT (:262), STACKING (:280), HIERARCHICAL_POOLING (:296 — the
+# aegis-ag03 / ADR-0096 Gate-3 pooled-weights path; OMITTED in the first cut, which
+# let a pooling-on settled aggregator log a FALSE magnitude/weights divergence),
+# L2_POSTERIOR_PERSIST (:308), DISSENT_CAP (:1246). NOTE: ``HERMES_QUANT_L2_STACKING``
+# is NOT here — the live BMA reads ``HERMES_QUANT_STACKING`` only; an L2_STACKING
+# entry (carried by the static test's set) is a phantom that would over-conservatively
+# skip an otherwise-comparable tick.
 _AGG_LEARNING_FLAGS: tuple[str, ...] = (
     "HERMES_QUANT_L2_POSTERIOR_DECAY",
     "HERMES_QUANT_L2_PER_ANALYST_CALIB",
     "HERMES_QUANT_L2_LESSON_HAIRCUT",
     "HERMES_QUANT_L2_POSTERIOR_PERSIST",
-    "HERMES_QUANT_L2_STACKING",
     "HERMES_QUANT_STACKING",
+    "HERMES_QUANT_HIERARCHICAL_POOLING",
     "HERMES_QUANT_DISSENT_CAP",
 )
 
@@ -843,21 +855,47 @@ def run_shadow_aggregate(
         # asof_decision / bar_ts come from ctx (the core view needs them; the live
         # view does not carry them) — replicates the static test's _core_view
         # construction faithfully.
-        core_views = [
-            CoreView(
-                analyst=v.analyst,
-                asset=ctx.asset,
-                asset_class=ctx.asset_class,
-                direction=v.direction,
-                magnitude=v.magnitude,
-                confidence=v.confidence,
-                confidence_raw=v.confidence_raw,
-                horizon=v.horizon,
-                asof_decision=ctx.asof,
-                bar_ts=ctx.asof,
+        #
+        # The core CoreView.__post_init__ rejects magnitude / confidence_raw > 1.0,
+        # but the live protocol.AnalystView accepts them. A live view that exceeds the
+        # core bounds would make this projection raise; without a guard the outer
+        # try/except would swallow it and return None, SILENTLY dropping the tick from
+        # the parity sample with no record of why. Record it as not-comparable instead
+        # so the operator's coverage stays honest (the live decision is untouched).
+        try:
+            core_views = [
+                CoreView(
+                    analyst=v.analyst,
+                    asset=ctx.asset,
+                    asset_class=ctx.asset_class,
+                    direction=v.direction,
+                    magnitude=v.magnitude,
+                    confidence=v.confidence,
+                    confidence_raw=v.confidence_raw,
+                    horizon=v.horizon,
+                    asof_decision=ctx.asof,
+                    bar_ts=ctx.asof,
+                )
+                for v in (views or [])
+            ]
+        except (ValueError, TypeError) as proj_exc:
+            report = {
+                "comparable": False,
+                "reason": "view_out_of_core_bounds",
+                "detail": str(proj_exc),
+                "diverged": False,
+                "fields": [],
+                "live": live_signal,
+                "shadow": None,
+            }
+            logger.info(
+                "pdr_core aggregate shadow: not comparable (live view outside core "
+                "bounds: %s)",
+                proj_exc,
             )
-            for v in (views or [])
-        ]
+            if persist:
+                _persist_aggregate_divergence_report(report, path=divergence_path)
+            return report
 
         # Thread the LIVE aggregator's config so the core matches it (don't
         # hardcode defaults). cold_start=True matches the CalibratorNotReady arm
