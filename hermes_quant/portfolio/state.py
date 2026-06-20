@@ -27,9 +27,37 @@ import json
 import math
 from pathlib import Path
 
+from hermes_quant.home import quant_home as _resolve_quant_home
 from hermes_quant.risk.portfolio_normalize import PortfolioState
 
-_DEFAULT_EXECUTIONS_PATH = Path("~/.hermes/quant/executions.jsonl").expanduser()
+# aegis-ra-home2 (ADR-0092 home-decouple residue): a None-SENTINEL module symbol,
+# NOT a Path bound at import. The legacy
+# ``_DEFAULT_EXECUTIONS_PATH = Path("~/.hermes/quant/executions.jsonl").expanduser()``
+# expanded the home at IMPORT time, so a ``HERMES_HOME`` / ``HERMES_QUANT_HOME``
+# override set AFTER import (the cron / test-isolation case) was silently ignored
+# and every default-path read fell back to the real ~/.hermes book.
+#
+# We KEEP the module symbol (it is a documented test/consumer override seam —
+# tests monkeypatch ``hermes_quant.portfolio.state._DEFAULT_EXECUTIONS_PATH`` to a
+# tmp bus, and ops/scripts/quant-daily-interim.py reads it for its fail-closed
+# headroom probe). When it is the ``None`` sentinel (production default), the path
+# is resolved AT CALL TIME via :func:`hermes_quant.home.quant_home`. An explicit
+# override (any non-None value a test/consumer assigns) STILL wins — so the
+# existing monkeypatch seam is byte-identical.
+_DEFAULT_EXECUTIONS_PATH: Path | None = None
+
+
+def _default_executions_path() -> Path:
+    """Resolve the canonical executions.jsonl bus path AT CALL TIME.
+
+    Precedence: an explicit ``_DEFAULT_EXECUTIONS_PATH`` override (the documented
+    monkeypatch seam) wins; otherwise resolve via
+    :func:`hermes_quant.home.quant_home` (env-aware, call-time). Byte-identical in
+    production (no env / no override -> ``Path.home()/".hermes"/"quant"/"executions.jsonl"``).
+    """
+    if _DEFAULT_EXECUTIONS_PATH is not None:
+        return _DEFAULT_EXECUTIONS_PATH
+    return _resolve_quant_home() / "executions.jsonl"
 
 # The synthetic ``paper-default`` book is written by MORE THAN ONE reactor name.
 # The legacy ``PaperReactor`` stamps ``reactor_name="paper"``; the now-LIVE
@@ -128,7 +156,7 @@ def reconstruct_portfolio_state(
     path = (
         Path(executions_path).expanduser()
         if executions_path is not None
-        else _DEFAULT_EXECUTIONS_PATH
+        else _default_executions_path()
     )
 
     if not path.exists():
@@ -267,7 +295,7 @@ def reconstruct_open_book_composite(
     path = (
         Path(executions_path).expanduser()
         if executions_path is not None
-        else _DEFAULT_EXECUTIONS_PATH
+        else _default_executions_path()
     )
 
     if not path.exists():

@@ -116,6 +116,47 @@ def test_profile_scan_enabled_only_on_literal_one(cron, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# aegis-ra-home2 (ADR-0092 home-decouple residue): the profile-fit watchlist
+# output path must honor HERMES_QUANT_HOME / HERMES_HOME via hermes_quant.home,
+# not a raw Path.home()/".hermes"/"quant" literal. RED-proof: pre-fix the helper
+# returned Path.home() / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
+# which ignored both env overrides (it honored only a Path.home monkeypatch).
+# ---------------------------------------------------------------------------
+
+
+def test_profile_watchlist_path_honors_hermes_quant_home(cron, monkeypatch, tmp_path):
+    """An injected HERMES_QUANT_HOME redirects the resolved profile-fit.json
+    target into the injected quant root, NOT ~/.hermes."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    inj = tmp_path / "injected_quant_root"
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(inj))
+
+    resolved = cron._resolve_profile_watchlist_path()
+    assert resolved == inj / "watchlist" / "profile-fit.json"
+    assert (Path.home() / ".hermes") not in resolved.parents
+
+
+def test_profile_watchlist_path_honors_hermes_home(cron, monkeypatch, tmp_path):
+    """HERMES_HOME points at the hermes home; the quant root (and the watchlist
+    output) is <HERMES_HOME>/quant/watchlist/profile-fit.json."""
+    monkeypatch.delenv("HERMES_QUANT_HOME", raising=False)
+    hhome = tmp_path / "hermes_home"
+    monkeypatch.setenv("HERMES_HOME", str(hhome))
+
+    resolved = cron._resolve_profile_watchlist_path()
+    assert resolved == hhome / "quant" / "watchlist" / "profile-fit.json"
+
+
+def test_profile_watchlist_path_byte_identical_without_env(cron, monkeypatch):
+    """Parity: no env -> EXACTLY the legacy ~/.hermes/quant/watchlist literal."""
+    monkeypatch.delenv("HERMES_QUANT_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    assert cron._resolve_profile_watchlist_path() == (
+        Path.home() / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
+    )
+
+
+# ---------------------------------------------------------------------------
 # OFF (default) — byte-identical: evolve_watchlist runs; build_profile_watchlist
 # is never imported/called; no profile-fit.json is written.
 # ---------------------------------------------------------------------------

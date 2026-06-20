@@ -186,17 +186,27 @@ def _resolve_profile_watchlist_path() -> Path:
     asked the builder to write, and can surface the TRUE destination in the
     breadcrumb instead of guessing.
 
-    rt06-fix (test-isolation): resolve from ``Path.home()`` at CALL time rather
+    rt06-fix (test-isolation): resolve from the runtime home at CALL time rather
     than importing ``profile_scan.DEFAULT_PROFILE_WATCHLIST_PATH``. That constant
-    is frozen at the W3 module's IMPORT time, so a later ``Path.home`` redirect
+    is frozen at the W3 module's IMPORT time, so a later home redirect
     (the standard test-isolation idiom, and any future home reconfiguration) would
     not take effect and the cron would surface a stale real-home path. Computing
     the same literal here is byte-identical in production (home is stable) AND
     honors a redirected home — closing an import-order test-isolation leak that
     made test_on_calls_build_profile_watchlist fail only when a sibling test
     imported profile_scan first.
+
+    aegis-ra-home2 (ADR-0092 home-decouple residue): route through
+    ``hermes_quant.home.quant_home`` so an injected ``HERMES_QUANT_HOME`` /
+    ``HERMES_HOME`` redirects the watchlist output to the SAME quant root every
+    other shell module resolves — the prior ``Path.home() / ".hermes" / "quant"``
+    literal honored only a ``Path.home`` redirect and silently ignored both env
+    overrides. Byte-identical in production (no env -> ``quant_home()`` is exactly
+    ``Path.home()/".hermes"/"quant"``).
     """
-    return Path.home() / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
+    from hermes_quant.home import quant_home
+
+    return quant_home() / "watchlist" / "profile-fit.json"
 
 
 def _run_profile_scan(universe_path: Path) -> dict | None:
