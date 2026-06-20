@@ -94,10 +94,22 @@ def evaluate_gate2(home: str | Path | None, *, asof: datetime | None = None) -> 
     # Reuse the canonical settled-book loader (same FIFO matcher as the kill-switch
     # + promotion gate — no basis drift). Best-effort: a read failure => empty book
     # => thin => LOCKED.
+    #
+    # cx2 [P1]: thread the HOME-SCOPED executions book. Without executions_path the
+    # loader defaults to the process-default EXECUTION_BUS_PATH (the real ~/.hermes
+    # home), so in a multi-home / operator run gate2-eval would UNLOCK gate-2 for THIS
+    # --home off a DIFFERENT home's settled book. The marker is written under
+    # ``home/quant/options_unlock.json`` and the GATE-0 anchor read from
+    # ``home/quant/clean_window_start.json``; the book lives alongside them at
+    # ``home/quant/executions.jsonl`` (signal_bus EXECUTION_BUS_PATH = QUANT_HOME /
+    # "executions.jsonl"). Pass that exact home-scoped path so the verdict reflects
+    # THIS home's own book.
+    home_path = _home_path(home)
+    executions_path = home_path / "quant" / "executions.jsonl"
     try:
         from hermes_quant.governance.promotion import _settle_paper_round_trips_in_window
 
-        settled = _settle_paper_round_trips_in_window(t0, now)
+        settled = _settle_paper_round_trips_in_window(t0, now, executions_path=executions_path)
     except Exception as exc:  # noqa: BLE001 — fail-CLOSED: unreadable book => LOCKED
         return {
             "gate2_cleared": False,
