@@ -1694,6 +1694,49 @@ def _originate_mleg_proposal(
         return None
 
 
+def _options_evidence_gate_ok() -> bool:
+    """cx0 [HIGH]: the GATE-2 evidence gate for autonomous options origination.
+
+    ADR-0029 evidence-before-live + EQUITY-EDGE-FIRST require that options NEVER
+    originate until the clean-window evidence gate (GATE-2: N>=50 settled round-trips
+    over >=60 calendar days) has actually CLEARED — a verdict persisted by the eval
+    cron as ``quant/options_unlock.json`` (read via ``read_options_unlocked``).
+
+    The PRIOR design consulted ``read_options_unlocked()`` ONLY when
+    ``HERMES_QUANT_OPTIONS_EVIDENCE_GATE=1`` — so arming ``HERMES_QUANT_AUTONOMOUS_OPTIONS=1``
+    WITHOUT that flag let options originate with ZERO GATE-2 enforcement. That inverted
+    the gate (the flag was the on/off switch for WHETHER the gate ran). cx0 makes the
+    gate MANDATORY: whenever autonomous options are armed this is ALWAYS consulted and
+    must return True.
+
+    FAIL-CLOSED: an absent / unreadable / not-cleared marker, OR any read error, returns
+    False (LOCKED). Arming the options flags alone NEVER unlocks origination.
+
+    EMERGENCY BYPASS (dangerous, default-OFF): ``HERMES_QUANT_OPTIONS_EVIDENCE_OVERRIDE=1``
+    is the ONLY escape — it skips the marker read and returns True. This is a separately
+    named, explicitly-dangerous operator flag (NOT the prior gate-flag), documented as a
+    deliberate evidence-gate bypass. Default-OFF => the gate is enforced.
+    """
+    # The explicit, separately-named emergency override (default-OFF, dangerous).
+    if os.environ.get("HERMES_QUANT_OPTIONS_EVIDENCE_OVERRIDE", "0") == "1":
+        logger.warning(
+            "autonomous: HERMES_QUANT_OPTIONS_EVIDENCE_OVERRIDE=1 — BYPASSING the GATE-2 "
+            "options evidence gate (DANGEROUS: options may originate before the clean-window "
+            "evidence gate has cleared)"
+        )
+        return True
+    try:
+        from hermes_quant.eval.clean_window import read_options_unlocked
+
+        return bool(read_options_unlocked())
+    except Exception as _ev_exc:  # noqa: BLE001 — fail-CLOSED: any error => locked
+        logger.warning(
+            "autonomous: options evidence-gate read failed (%s) — LOCKING options",
+            _ev_exc,
+        )
+        return False
+
+
 def _persist_composite_play(
     mleg: Any,
     *,
@@ -1711,16 +1754,34 @@ def _persist_composite_play(
 
     BEST-EFFORT: the fire is already real + accounted. A store-write failure
     (bad path, locked db, duplicate id, a malformed leg) is logged and swallowed
-    so it never rolls back a real fire. The write that IS attempted goes through
-    ``open_composite`` (legs validated; a legless leg raises inside and is caught
-    here) — so we never silently persist a legless row that would re-create the
-    agmon1 dead-path; instead we log loudly and leave NO row (fail-CLOSED on the
-    row, fail-OPEN on the fire that already happened).
+    so it never rolls back a real fire.
+
+    cx3-legless [P2]: a mleg with NO option_legs is SKIPPED outright (logged, no
+    row). ``open_composite`` does NOT raise on an empty leg-set (``_encode_legs([])``
+    serializes to '[]' without error — it only rejects a leg that is present but has
+    no symbol), so without this skip a legless [] row WOULD be persisted and then
+    skipped forever by the agmon1/agmon2 sweep. We leave NO row instead (fail-CLOSED
+    on the malformed row, fail-OPEN on the fire that already happened).
     """
     try:
         from hermes_quant.state.composite_plays import CompositePlaysStore
 
         legs = list(getattr(mleg, "option_legs", ()) or ())
+        # cx3-legless [P2]: a legless mleg must NEVER persist a durable composite row.
+        # _encode_legs([]) serializes [] to '[]' WITHOUT raising (it only rejects a leg
+        # that IS present but has no symbol), so open_composite would silently write a
+        # legless [] row with expected_leg_count=0. agmon1/agmon2 then skip that row every
+        # sweep FOREVER (no legs to mark) — exactly the dead-path the persist is meant to
+        # prevent. SKIP (log loudly, write nothing) — fail-CLOSED on the malformed row, the
+        # already-confirmed fire stays real (the caller swallows this best-effort helper).
+        if not legs:
+            logger.warning(
+                "autonomous: ml00b composite persist SKIPPED for fire %s — the mleg "
+                "has NO option_legs (a legless [] row would be skipped forever by the "
+                "agmon1/agmon2 sweep; the fire is still real)",
+                execution_id,
+            )
+            return
         option_legs = [
             {
                 "symbol": str(getattr(leg, "symbol", "") or ""),
@@ -2408,7 +2469,11 @@ def _legs_as_option_objects(legs: Any) -> list[Any]:
 
 
 def _build_live_leg_mleg_executor(
-    *, underlying: str, play_tag: str
+    *,
+    underlying: str,
+    play_tag: str,
+    outer_qty: int = 1,
+    multi_leg_id: str = "",
 ) -> Callable[[list[Any]], None]:
     """Return a LIVE executor that fires a leg-set as an MLEG order through the reactor.
 
@@ -2421,6 +2486,16 @@ def _build_live_leg_mleg_executor(
     naked leg is stranded). The leg-set is wrapped in a close MultiLegProposal minted
     via the blessed gate seam so it routes to the multi-leg reactor (self-gating on
     HERMES_QUANT_MULTILEG_REACTOR — no-fills / raises when off).
+
+    cx1 [P1]: the leg-op order carries the composite's REAL ``outer_qty`` (and the gate
+    result's ``contracts``) so a >1-wide composite submits a leg-op for ALL contracts
+    rather than ONE spread (which left the residual contracts unmanaged after the whole
+    composite was marked decomposed). And the ``proposal_id`` is keyed on the composite's
+    ``multi_leg_id`` (when supplied) so two stopped composites on the SAME underlying mint
+    DISTINCT proposal_ids — without this, the reactor idempotency returned the prior
+    parent for the second composite and never sent a new order. ``outer_qty`` defaults to
+    1 and ``multi_leg_id`` to "" so callers without a composite row keep the prior
+    behavior (the underlying+play_tag id) — byte-identical for those callers.
     """
     from decimal import Decimal
 
@@ -2428,6 +2503,23 @@ def _build_live_leg_mleg_executor(
     from hermes_quant.options.multileg import MultiLegProposal
     from hermes_quant.react.dispatch import select_reactor
     from hermes_quant.risk.options_gate import OptionsGateResult, StructureBucket
+
+    # cx1: a composite carries outer_qty>=1 spreads; the leg-op must move them ALL. Guard
+    # a non-positive / non-int outer_qty back to 1 (fail toward the prior single-spread
+    # behavior, never zero — a 0-contract order is meaningless).
+    try:
+        _qty = int(outer_qty)
+    except (TypeError, ValueError):
+        _qty = 1
+    if _qty < 1:
+        _qty = 1
+    # cx1: key the leg-op proposal_id on the composite's multi_leg_id so two same-underlying
+    # composites are DISTINCT. The play_tag stays in the id so a convert's add/remove halves
+    # (which share an mlid) remain distinct ids. No multi_leg_id (orphan callers) => the prior
+    # id (byte-identical to the pre-cx1 f"legop_{underlying}_{play_tag}").
+    _proposal_id = (
+        f"legop_{multi_leg_id}_{play_tag}" if multi_leg_id else f"legop_{underlying}_{play_tag}"
+    )
 
     def _executor(legs: list[Any]) -> None:
         if not legs:
@@ -2439,18 +2531,18 @@ def _build_live_leg_mleg_executor(
             net_greeks=NetGreeks.zero(),
             bpr_estimate=0.0,
             max_loss=None,
-            contracts=1,
+            contracts=_qty,
             warnings=(play_tag,),
         )
         order = MultiLegProposal.from_gate_result(
             gate_result=gate_result,
-            proposal_id=f"legop_{underlying}_{play_tag}",
+            proposal_id=_proposal_id,
             asof=datetime.now(UTC),
             strategy_kind="leg_op",
             underlying=underlying,
             option_legs=tuple(legs),
             stock_leg=None,
-            outer_qty=1,
+            outer_qty=_qty,
             net_debit_credit=Decimal("0"),
             max_gain=None,
             breakeven_underlying=(),
@@ -2480,6 +2572,7 @@ def _apply_decompose_live(
     decision: dict[str, Any],
     legs_remaining_after: int,
     legs_to_close: list[Any] | None = None,
+    outer_qty: int = 1,
 ) -> str:
     """Route a decompose decision through apply_decompose with the LIVE executor wired.
 
@@ -2496,7 +2589,10 @@ def _apply_decompose_live(
     if leg_ops_enabled() and decision.get("decompose") and legs_to_close:
         try:
             executor = _build_live_leg_mleg_executor(
-                underlying=underlying, play_tag="autonomous_leg_decompose"
+                underlying=underlying,
+                play_tag="autonomous_leg_decompose",
+                outer_qty=outer_qty,  # cx1: carry the composite's REAL outer_qty
+                multi_leg_id=multi_leg_id,  # cx1: unique proposal_id per composite
             )
             executor(legs_to_close)
         except Exception as exc:  # noqa: BLE001 - a broker reject leaves the composite managed-whole
@@ -2521,6 +2617,7 @@ def _apply_convert_live(
     underlying: str,
     decision: dict[str, Any],
     current_legs: list[Any],
+    outer_qty: int = 1,
 ) -> str:
     """Route a convert decision through apply_convert with the LIVE add/remove executors.
 
@@ -2532,10 +2629,16 @@ def _apply_convert_live(
     from hermes_quant.options.leg_ops import apply_convert
 
     add_executor = _build_live_leg_mleg_executor(
-        underlying=underlying, play_tag="autonomous_leg_convert_add"
+        underlying=underlying,
+        play_tag="autonomous_leg_convert_add",
+        outer_qty=outer_qty,  # cx1: carry the composite's REAL outer_qty
+        multi_leg_id=multi_leg_id,  # cx1: unique proposal_id per composite
     )
     remove_executor = _build_live_leg_mleg_executor(
-        underlying=underlying, play_tag="autonomous_leg_convert_remove"
+        underlying=underlying,
+        play_tag="autonomous_leg_convert_remove",
+        outer_qty=outer_qty,
+        multi_leg_id=multi_leg_id,
     )
     return apply_convert(
         store=store,
@@ -2572,6 +2675,15 @@ def _maybe_decompose_on_close(
         legs = _legs_as_option_objects(getattr(row, "option_legs", None))
         if not mlid or not legs:
             return None
+        # cx1: carry the composite's REAL outer_qty into the leg-op order so a >1-wide
+        # composite decomposes ALL contracts (not just one spread). Guard back to 1 on a
+        # missing / non-positive value (fail toward the prior single-spread behavior).
+        try:
+            _outer_qty = int(getattr(row, "outer_qty", 1) or 1)
+        except (TypeError, ValueError):
+            _outer_qty = 1
+        if _outer_qty < 1:
+            _outer_qty = 1
         # A stop/TP breach invalidates the composite thesis -> decompose ALL legs (the
         # structure is no longer wanted as a combo). decompose_decision is deterministic
         # and self-gates on the flag (returns no_action when off — but we already gated).
@@ -2587,6 +2699,7 @@ def _maybe_decompose_on_close(
             decision=decision,
             legs_remaining_after=0,  # thesis invalidated -> ALL legs independent
             legs_to_close=legs,
+            outer_qty=_outer_qty,  # cx1: carry the composite's REAL outer_qty
         )
         logger.info(
             "autonomous: ml01b LIVE decompose on composite %s (%s) -> state=%s (reason=%s)",
@@ -3656,29 +3769,20 @@ def tick(
             # per symbol per tick). Abstains (returns None) at every missing precondition.
             # Byte-identical when the flag is unset (the helper returns None on the first
             # guard, never touching the equity path). Best-effort inside the helper.
-            # bf76: the EXECUTABLE GATE-2 evidence guard. When HERMES_QUANT_OPTIONS_EVIDENCE_GATE
-            # is ON, options origination ALSO requires the persisted clean-window unlock marker
-            # (read_options_unlocked = GATE-2 cleared: N>=50 over >=60d). FAIL-CLOSED: an absent/
-            # unreadable marker => LOCKED, so arming the options flags ALONE does NOT unlock
-            # origination — the evidence gate must have actually cleared. Default-OFF for THIS
-            # guard flag => byte-identical (the guard is not consulted; the inner flags are the
-            # only gate, as today). Account-wide state, so checked once here (not per-symbol).
-            _options_evidence_ok = True
-            if os.environ.get("HERMES_QUANT_OPTIONS_EVIDENCE_GATE", "0") == "1":
-                try:
-                    from hermes_quant.eval.clean_window import read_options_unlocked
-
-                    _options_evidence_ok = read_options_unlocked()
-                except Exception as _ev_exc:  # noqa: BLE001 — fail-CLOSED: any error => locked
-                    logger.warning(
-                        "autonomous: options evidence-gate read failed (%s) — LOCKING options",
-                        _ev_exc,
-                    )
-                    _options_evidence_ok = False
+            # cx0 [HIGH]: the GATE-2 evidence guard is now MANDATORY whenever autonomous
+            # options are armed (NOT gated behind a separate on/off flag). _options_evidence_gate_ok()
+            # ALWAYS consults the persisted clean-window unlock marker (read_options_unlocked =
+            # GATE-2 cleared: N>=50 over >=60d) and FAILS-CLOSED (absent/unreadable/not-cleared =>
+            # LOCKED). So arming HERMES_QUANT_AUTONOMOUS_OPTIONS ALONE does NOT unlock origination —
+            # the evidence gate must have actually cleared (ADR-0029 evidence-before-live +
+            # EQUITY-EDGE-FIRST). The ONLY escape is the explicit, separately-named, default-OFF
+            # HERMES_QUANT_OPTIONS_EVIDENCE_OVERRIDE (dangerous). The gate is only evaluated when
+            # options are armed (short-circuit && below), so the equity-only path is byte-identical
+            # (no extra marker read on a tick that never originates options). Account-wide state.
             if (
                 not dry_run
                 and os.environ.get("HERMES_QUANT_AUTONOMOUS_OPTIONS", "0") == "1"
-                and _options_evidence_ok  # bf76: GATE-2 evidence guard (default-OFF => always True)
+                and _options_evidence_gate_ok()  # cx0: MANDATORY GATE-2 evidence guard (fail-CLOSED)
                 # agreact1: the §D9 max_per_tick_opens cap binds options origination too —
                 # check it BEFORE firing (the equity path checks the same cap below). Without
                 # this, an options play could fire past the per-tick cap because the hook runs
