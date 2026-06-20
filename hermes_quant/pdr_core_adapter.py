@@ -467,3 +467,433 @@ def run_shadow_gate(
     except Exception as exc:  # noqa: BLE001 — best-effort shadow; never affects live
         logger.warning("pdr_core shadow failed: %s", exc, exc_info=True)
         return None
+
+
+# ===========================================================================
+# ADR-0092 Phase-4 (parity proof) — the AGGREGATE-layer runtime SHADOW.
+#
+# This extends the DECIDE-layer shadow above (run_shadow_gate) one seam UP the
+# pipeline, to the PERCEIVE/AGGREGATE layer. ``hermes_quant.pdr_core.aggregate.
+# core_aggregate`` is the host-blind port of the FLAGS-OFF, COLD-START path of
+# the live ``BMAAggregator.aggregate`` (ADR-0003 vote fusion). It has a STATIC
+# parity test (tests/pdr_core/test_aggregate_parity.py) but ZERO live exercise.
+# :func:`run_shadow_aggregate` is the analogous RUNTIME SHADOW: it runs the core
+# aggregator over the SAME views the live aggregator just consumed, compares the
+# fused-signal surface field-by-field, and LOGS divergence — purely to validate
+# the port before any cutover, exactly like run_shadow_gate does for the gate.
+#
+# THE CRITICAL CORRECTNESS RAIL (parity-valid path only): core_aggregate ports
+# ONLY the FLAGS-OFF / COLD-START arm. When a FITTED isotonic calibrator is
+# active, OR any of the 7 learning flags is set, OR the live aggregator has had
+# ``update()`` calls (non-uniform posteriors), the live BMA diverges from
+# core_aggregate BY DESIGN — that is NOT a port bug. So the shadow DETECTS that
+# precondition and records an ``{"comparable": false, "reason": ...}`` report
+# rather than flagging a FALSE divergence. The two comparability gates mirror the
+# static test's parity driver (cold-start calibrator + every learning flag unset).
+# ===========================================================================
+
+# The aggregate-layer shadow divergence log (sibling to the gate log). Resolved
+# at CALL TIME via hermes_quant.home so HERMES_HOME / HERMES_QUANT_HOME overrides
+# land it in the same quant home the live aggregator writes to. An offline parity
+# harness can READ this (line-by-line JSONL); it is never written outside the
+# SHADOW path (flag-OFF => no write).
+_SHADOW_AGGREGATE_DIVERGENCE_FILE = "pdr-core-shadow-aggregate-divergence.jsonl"
+
+# The 7 default-OFF learning flags that, when ANY is set, make the live BMA
+# diverge from the cold-start core port BY DESIGN. Lifted VERBATIM from the
+# static parity test's ``_FLAGS`` (tests/pdr_core/test_aggregate_parity.py) — the
+# proven set the parity oracle requires unset. A drift here would silently flag
+# expected (learning-on) divergence as a port bug.
+_AGG_LEARNING_FLAGS: tuple[str, ...] = (
+    "HERMES_QUANT_L2_POSTERIOR_DECAY",
+    "HERMES_QUANT_L2_PER_ANALYST_CALIB",
+    "HERMES_QUANT_L2_LESSON_HAIRCUT",
+    "HERMES_QUANT_L2_POSTERIOR_PERSIST",
+    "HERMES_QUANT_L2_STACKING",
+    "HERMES_QUANT_STACKING",
+    "HERMES_QUANT_DISSENT_CAP",
+)
+
+# The operator flag the SHELL reads to wire the aggregate shadow into the LIVE
+# advisor path. DEFAULT-OFF => the seam is dark, byte-identical to today.
+PDR_CORE_AGG_SHADOW_FLAG = "HERMES_QUANT_PDR_CORE_AGG_SHADOW"
+
+# The metadata audit keys the static parity test compares (the byte-identical
+# OFF-path surface). The 4 flag-gated metadata injections (stacking / per-analyst
+# calib / lesson-haircut / hierarchical-pooling) and the ADR-0084 ``event_risk``
+# carrier key are DELIBERATELY NOT in this set: when a learning flag is on the
+# shadow is already short-circuited as not-comparable, and the event_risk carrier
+# is an additive advisory key the core never produces — comparing only these
+# proven keys avoids a false divergence on a key that is expected to differ.
+_AGG_METADATA_AUDIT_KEYS: tuple[str, ...] = (
+    "vote_share",
+    "n_contributing",
+    "n_views",
+    "horizons_present",
+    "horizon_agreement",
+    "ic_dedup_excluded_analysts",
+    "regime_state",
+    "regime_weight_multipliers",
+)
+
+# Float tolerance for the scalar vote surface — matches the static parity test's
+# ``pytest.approx(abs=1e-12)``. The arithmetic is the SAME ordering so the values
+# should be near-exact; 1e-12 absorbs benign float-op-ordering noise. A real port
+# bug is orders of magnitude larger.
+_AGG_FLOAT_ATOL: float = 1e-12
+
+
+def _shadow_aggregate_divergence_path() -> Path:
+    """Resolve the aggregate-shadow divergence log path at call time.
+
+    Mirror of :func:`_shadow_divergence_path` — uses the ADR-0092 ph3 home
+    resolver so an injected HERMES_QUANT_HOME / HERMES_HOME lands the log in the
+    same quant home the live aggregator writes to. Imported lazily to keep the
+    import graph minimal and to never fail the SHADOW path on a resolver hiccup
+    (the caller swallows any raise).
+    """
+    from hermes_quant.home import quant_home as _resolve_quant_home
+
+    return _resolve_quant_home() / _SHADOW_AGGREGATE_DIVERGENCE_FILE
+
+
+def _agg_learning_flag_active() -> str | None:
+    """Return the name of the first set learning flag, else None.
+
+    A learning flag being set means the live BMA path diverges from the
+    cold-start core port BY DESIGN (ADR-0092 Inc-1 step 6) — the shadow records
+    this as not-comparable rather than a port bug.
+    """
+    for name in _AGG_LEARNING_FLAGS:
+        if os.environ.get(name, "0") == "1":
+            return name
+    return None
+
+
+def _signal_primitives(signal: Any | None) -> dict[str, Any] | None:
+    """Reduce a fused signal to a JSON-serializable comparable primitive dict.
+
+    Accepts EITHER a live ``protocol.AggregatedSignal`` OR a core
+    ``pdr_core.aggregate.CoreAggregatedSignal`` (they share the same scalar vote
+    surface + metadata audit keys, which is the whole point of the parity port).
+    None passes through (a defensive guard — the live aggregate path never
+    returns None, but the comparator stays None-safe like _compare_actions).
+
+    The scalar surface (direction / magnitude / confidence / confidence_raw /
+    horizon / aggregator) is copied straight across. ``asof`` is isoformat()'d
+    like :func:`_action_primitives` does for halt_until, so the persisted line is
+    serializable. The metadata is FLATTENED to ONLY the proven OFF-path audit
+    keys (``_AGG_METADATA_AUDIT_KEYS``) plus the per-analyst ``weights`` map; the
+    flag-gated injections and the ADR-0084 ``event_risk`` carrier are excluded so
+    a comparison never trips on a key that is expected to differ. On the silence
+    path the live/core metadata carries only ``{"reason": ...}`` — that reason is
+    surfaced so the comparator can match the silence reason too.
+    """
+    if signal is None:
+        return None
+    asof = signal.asof
+    if asof is not None and not isinstance(asof, str):
+        try:
+            asof = asof.isoformat()
+        except Exception:  # noqa: BLE001 — fall back to str() for any exotic type
+            asof = str(asof)
+    meta = signal.metadata or {}
+    flat: dict[str, Any] = {}
+    # Silence / flat path: metadata carries only the reason.
+    if "reason" in meta:
+        flat["reason"] = meta.get("reason")
+    else:
+        for k in _AGG_METADATA_AUDIT_KEYS:
+            flat[k] = meta.get(k)
+        # weights keyed by analyst name -> float (compared with float tolerance).
+        weights = meta.get("weights")
+        if isinstance(weights, dict):
+            flat["weights"] = {str(a): float(w) for a, w in weights.items()}
+        else:
+            flat["weights"] = weights
+    return {
+        "direction": signal.direction,
+        "magnitude": signal.magnitude,
+        "confidence": signal.confidence,
+        "confidence_raw": signal.confidence_raw,
+        "horizon": signal.horizon,
+        "aggregator": signal.aggregator,
+        "asof": asof,
+        "metadata": flat,
+    }
+
+
+def _floats_close(a: Any, b: Any) -> bool:
+    """True iff a and b are both finite and within ``_AGG_FLOAT_ATOL`` (abs).
+
+    Non-finite or non-numeric inputs compare by exact equality so a NaN-vs-NaN
+    (or None-vs-None) does not silently pass the tolerance window.
+    """
+    try:
+        fa, fb = float(a), float(b)
+    except (TypeError, ValueError):
+        return a == b
+    if not (math.isfinite(fa) and math.isfinite(fb)):
+        return a == b
+    return abs(fa - fb) <= _AGG_FLOAT_ATOL
+
+
+def _compare_signals(live: Any | None, shadow: Any | None) -> list[str]:
+    """Return the list of field names on which live and shadow fused signals diverge.
+
+    Empty list == agreement. EXACT equality for direction / horizon / aggregator
+    and the metadata ints / lists; ``_AGG_FLOAT_ATOL`` (1e-12) tolerance for the
+    floats (magnitude / confidence / confidence_raw / vote_share / weights) — the
+    SAME-ordering arithmetic of the port, so near-exact (a real port bug is far
+    larger). Mirrors the static parity test's assertion set, including the
+    silence-path ``reason`` match and the None-vs-signal presence check.
+
+    Both inputs are first reduced via :func:`_signal_primitives`, so this also
+    accepts a live AggregatedSignal vs a core CoreAggregatedSignal directly.
+    """
+    lp = _signal_primitives(live)
+    sp = _signal_primitives(shadow)
+    # Presence asymmetry: one silenced-to-None, the other a signal.
+    if (lp is None) != (sp is None):
+        return ["presence"]
+    if lp is None and sp is None:
+        return []
+
+    diverged: list[str] = []
+    # Exact-equality scalar fields.
+    if sp["direction"] != lp["direction"]:
+        diverged.append("direction")
+    if sp["horizon"] != lp["horizon"]:
+        diverged.append("horizon")
+    if sp["aggregator"] != lp["aggregator"]:
+        diverged.append("aggregator")
+    # Float scalar fields (1e-12 tolerance).
+    if not _floats_close(sp["magnitude"], lp["magnitude"]):
+        diverged.append("magnitude")
+    if not _floats_close(sp["confidence"], lp["confidence"]):
+        diverged.append("confidence")
+    if not _floats_close(sp["confidence_raw"], lp["confidence_raw"]):
+        diverged.append("confidence_raw")
+
+    lm, sm = lp["metadata"], sp["metadata"]
+    # Silence / flat path: both carry only a reason.
+    if "reason" in lm or "reason" in sm:
+        if lm.get("reason") != sm.get("reason"):
+            diverged.append("metadata.reason")
+        return diverged
+
+    # Full audit-dict parity.
+    if not _floats_close(sm.get("vote_share"), lm.get("vote_share")):
+        diverged.append("metadata.vote_share")
+    for k in ("n_contributing", "n_views", "horizons_present", "horizon_agreement",
+              "ic_dedup_excluded_analysts", "regime_state", "regime_weight_multipliers"):
+        if sm.get(k) != lm.get(k):
+            diverged.append(f"metadata.{k}")
+    # weights: same analyst key set + value-identical (float tolerance).
+    lw = lm.get("weights") or {}
+    sw = sm.get("weights") or {}
+    if not isinstance(lw, dict) or not isinstance(sw, dict) or set(lw) != set(sw):
+        diverged.append("metadata.weights")
+    else:
+        for analyst, w in lw.items():
+            if not _floats_close(sw.get(analyst), w):
+                diverged.append("metadata.weights")
+                break
+    return diverged
+
+
+def _persist_aggregate_divergence_report(
+    report: dict[str, Any], *, path: Path | None = None
+) -> None:
+    """Append one aggregate-shadow report to the JSONL log (best-effort).
+
+    NEVER raises (mirror of :func:`_persist_divergence_report`): a persistence
+    failure must not affect the already-final live decision. The live/shadow
+    signals are reduced to their primitive dicts so the line is JSON-serializable.
+    Line-buffered + flushed so an interrupted run still leaves complete prior
+    lines. A not-comparable report (``comparable: False``) is still persisted so
+    the operator can see WHY a tick was skipped (fitted calibrator / learning
+    flag) when driving the parity sample.
+    """
+    try:
+        out = path or _shadow_aggregate_divergence_path()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "asof": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "comparable": bool(report.get("comparable", True)),
+            "diverged": bool(report.get("diverged")),
+            "reason": report.get("reason"),
+            "fields": list(report.get("fields") or []),
+            "live": _signal_primitives(report.get("live")),
+            "shadow": _signal_primitives(report.get("shadow")),
+        }
+        line = json.dumps(record, separators=(",", ":"), sort_keys=True, default=str) + "\n"
+        with out.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+    except Exception as exc:  # noqa: BLE001 — persistence is strictly best-effort
+        logger.warning(
+            "pdr_core aggregate shadow: divergence persistence failed (non-blocking): %s",
+            exc,
+        )
+
+
+def run_shadow_aggregate(
+    *,
+    views: Any,
+    ctx: Any,
+    aggregator: Any,
+    live_signal: Any,
+    persist: bool = True,
+    divergence_path: Path | None = None,
+) -> dict[str, Any] | None:
+    """Run the ported core aggregator in SHADOW over the live views and compare.
+
+    The LIVE ``live_signal`` is the ORACLE — this function NEVER mutates it and
+    NEVER returns it as the decision. It builds a :class:`CoreAggregateContext`
+    from ``ctx``, projects each live ``protocol.AnalystView`` onto the host-blind
+    ``pdr_core.contracts.AnalystView`` (the projection is lifted from the static
+    parity test's ``_core_view``, reading the scalar fields off the LIVE view and
+    sourcing asset / asset_class / asof_decision / bar_ts from ``ctx`` since the
+    core AnalystView needs them and the live view does not carry them), threads
+    the LIVE aggregator's config (require_ensemble / agreement_bonus /
+    horizon_weights) into ``core_aggregate``, maps the result onto a comparable
+    primitive dict, and compares field-by-field via :func:`_compare_signals`.
+
+    Returns a report dict on success::
+
+        {"comparable": True,  "diverged": bool, "fields": [..], "live": <sig>, "shadow": <sig>}
+        {"comparable": False, "reason": "fitted_calibrator_active" | "learning_flag_active", ...}
+
+    THE PARITY-VALID-PATH RAIL: core_aggregate ports ONLY the FLAGS-OFF /
+    COLD-START arm. If the live aggregator's calibrator is NOT a
+    ``ColdStartCalibrator`` (a fitted isotonic is active) OR any of the 7 learning
+    flags is set, the live BMA diverges from the core BY DESIGN — so the report is
+    ``{"comparable": False, ...}`` and NO divergence is flagged (avoids a FALSE
+    port-bug signal). Non-uniform posteriors (from ``update()`` calls) are also
+    a learning-on state, but the cold-start-calibrator gate is the proxy the
+    static parity oracle uses (a fresh aggregator has no fitted calibrator); a
+    posterior-bearing aggregator that still reports cold-start would surface as a
+    real weights divergence, which is the honest signal.
+
+    Logs at WARNING on divergence (INFO on agreement / not-comparable). On ANY
+    exception it swallows the error (WARNING, best-effort) and returns ``None`` —
+    a shadow failure must NEVER affect the live decision. When ``persist`` is True
+    the report is APPENDED to the aggregate-shadow JSONL (best-effort). Tests pass
+    ``persist=False`` or a throwaway ``divergence_path`` to avoid touching real
+    operator state.
+    """
+    try:
+        # COMPARABILITY GATE 1: a fitted (non-cold-start) calibrator means the
+        # live confidence is NOT the pure (raw+2)/8 cold-start arithmetic the core
+        # reproduces — the divergence is BY DESIGN, not a port bug.
+        calibrator = getattr(aggregator, "calibrator", None)
+        if type(calibrator).__name__ != "ColdStartCalibrator":
+            report = {
+                "comparable": False,
+                "reason": "fitted_calibrator_active",
+                "diverged": False,
+                "fields": [],
+                "live": live_signal,
+                "shadow": None,
+            }
+            logger.info(
+                "pdr_core aggregate shadow: not comparable (fitted calibrator %r active)",
+                type(calibrator).__name__,
+            )
+            if persist:
+                _persist_aggregate_divergence_report(report, path=divergence_path)
+            return report
+
+        # COMPARABILITY GATE 2: any learning flag set => the live path diverges
+        # from the cold-start core port BY DESIGN.
+        flag = _agg_learning_flag_active()
+        if flag is not None:
+            report = {
+                "comparable": False,
+                "reason": "learning_flag_active",
+                "flag": flag,
+                "diverged": False,
+                "fields": [],
+                "live": live_signal,
+                "shadow": None,
+            }
+            logger.info("pdr_core aggregate shadow: not comparable (learning flag %s set)", flag)
+            if persist:
+                _persist_aggregate_divergence_report(report, path=divergence_path)
+            return report
+
+        # Lazy import: keep the import paid only when the shadow actually runs
+        # (the flag-off advisor path never reaches here). core_aggregate is
+        # stdlib-only and lives in pdr_core, which this SHELL module may import
+        # freely (same as the top-level pdr_core.gate import).
+        from hermes_quant.pdr_core.aggregate import CoreAggregateContext, core_aggregate
+        from hermes_quant.pdr_core.contracts import AnalystView as CoreView
+
+        # Build the core context from the live ctx (the 4 scalars the vote stamps).
+        core_ctx = CoreAggregateContext(
+            asset=ctx.asset,
+            timeframe=ctx.timeframe,
+            asset_class=ctx.asset_class,
+            asof=ctx.asof,
+        )
+
+        # Project each live protocol.AnalystView -> pdr_core.contracts.AnalystView.
+        # The scalar vote fields come off the LIVE view; asset / asset_class /
+        # asof_decision / bar_ts come from ctx (the core view needs them; the live
+        # view does not carry them) — replicates the static test's _core_view
+        # construction faithfully.
+        core_views = [
+            CoreView(
+                analyst=v.analyst,
+                asset=ctx.asset,
+                asset_class=ctx.asset_class,
+                direction=v.direction,
+                magnitude=v.magnitude,
+                confidence=v.confidence,
+                confidence_raw=v.confidence_raw,
+                horizon=v.horizon,
+                asof_decision=ctx.asof,
+                bar_ts=ctx.asof,
+            )
+            for v in (views or [])
+        ]
+
+        # Thread the LIVE aggregator's config so the core matches it (don't
+        # hardcode defaults). cold_start=True matches the CalibratorNotReady arm
+        # the comparison requires (gate 1 already proved the live calibrator is
+        # cold-start). Defaults stand in if an attribute is absent.
+        shadow_signal = core_aggregate(
+            core_views,
+            core_ctx,
+            require_ensemble=getattr(aggregator, "require_ensemble", True),
+            agreement_bonus=getattr(aggregator, "agreement_bonus", 0.10),
+            horizon_weights=getattr(
+                aggregator, "horizon_weights", None
+            ) or {"1d": 1.00, "1w": 1.20, "1M": 0.80, "1Q": 0.60},
+            cold_start=True,
+        )
+
+        diverged_fields = _compare_signals(live_signal, shadow_signal)
+        report = {
+            "comparable": True,
+            "diverged": bool(diverged_fields),
+            "fields": diverged_fields,
+            "live": live_signal,
+            "shadow": shadow_signal,
+        }
+        if diverged_fields:
+            logger.warning(
+                "pdr_core aggregate shadow DIVERGED on %s: live=%r shadow=%r",
+                diverged_fields,
+                live_signal,
+                shadow_signal,
+            )
+        else:
+            logger.info("pdr_core aggregate shadow agreed with live aggregator")
+        if persist:
+            _persist_aggregate_divergence_report(report, path=divergence_path)
+        return report
+    except Exception as exc:  # noqa: BLE001 — best-effort shadow; never affects live
+        logger.warning("pdr_core aggregate shadow failed: %s", exc, exc_info=True)
+        return None

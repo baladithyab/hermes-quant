@@ -7,7 +7,7 @@
 > defaults so the docs can't silently drift. Empty default = required/path-style (not a
 > boolean capability toggle). Every capability flag defaults `'0'` (default-OFF rail).
 
-**92 flags** (resolvable default).
+**93 flags** (resolvable default).
 
 | Flag | Code default | Source |
 |---|---|---|
@@ -28,9 +28,9 @@
 | `HERMES_QUANT_DELTA_NORMALIZER` | `0` | `hermes_quant/autonomous.py:743` |
 | `HERMES_QUANT_DETERMINISTIC_EQUITY` | `0` | `hermes_quant/react/dispatch.py:80` |
 | `HERMES_QUANT_DISSENT_CAP` | `` | `hermes_quant/aggregators/bma.py:1246` |
-| `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1384` |
+| `HERMES_QUANT_DURABLE_DRAWDOWN_BASELINE` | `0` | `hermes_quant/advisor.py:1413` |
 | `HERMES_QUANT_ESTIMATES_ANALYST` | `0` | `hermes_quant/advisor.py:494` |
-| `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1497` |
+| `HERMES_QUANT_EVENT_RISK` | `0` | `hermes_quant/advisor.py:1526` |
 | `HERMES_QUANT_EVIDENCE_DIR` | `` | `hermes_quant/evidence/store.py:61` |
 | `HERMES_QUANT_FRED_MACRO` | `0` | `hermes_quant/data/fred_macro.py:146` |
 | `HERMES_QUANT_FUNDAMENTALS_ENABLED` | `0` | `hermes_quant/advisor.py:476` |
@@ -66,7 +66,8 @@
 | `HERMES_QUANT_OVERNIGHT_DRIFT` | `0` | `hermes_quant/advisor.py:544` |
 | `HERMES_QUANT_PAPER_INITIAL_CASH` | `` | `hermes_quant/state/portfolio_state.py:257` |
 | `HERMES_QUANT_PAPER_SLIPPAGE_MODEL` | `v0.2` | `hermes_quant/react/deterministic_equity.py:523` |
-| `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1486` |
+| `HERMES_QUANT_PDR_CORE_AGG_SHADOW` | `0` | `hermes_quant/advisor.py:1384` |
+| `HERMES_QUANT_PDR_CORE_SHADOW` | `0` | `hermes_quant/advisor.py:1515` |
 | `HERMES_QUANT_PER_POSITION_STOP` | `0` | `hermes_quant/autonomous.py:3462` |
 | `HERMES_QUANT_PIT_UNIVERSE` | `0` | `hermes_quant/universe/point_in_time.py:54` |
 | `HERMES_QUANT_PLAYS_OPEN` | `0` | `hermes_quant/playbook/play_loader.py:208` |

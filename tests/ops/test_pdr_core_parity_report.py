@@ -257,3 +257,125 @@ def test_main_explicit_home_overrides_env(tmp_path, capsys, monkeypatch):
     payload = json.loads(capsys.readouterr().out)
     assert payload["total"] == 2
     assert payload["agreement_rate"] == 1.0
+
+
+# ===========================================================================
+# AGGREGATE (PERCEIVE) layer — the comparable / not-comparable split.
+#
+# The aggregate-layer shadow (run_shadow_aggregate) marks a tick
+# ``comparable: false`` when the live BMA diverges from the cold-start core port
+# BY DESIGN (a fitted isotonic calibrator or a set learning flag). Those ticks
+# must be EXCLUDED from the agreement rate — counting them as diverged would
+# slander a faithful port. The gate log carries no ``comparable`` key, so every
+# gate record defaults comparable (the prior gate-only behavior is byte-identical).
+# ===========================================================================
+
+_AGG_LOG_NAME = "pdr-core-shadow-aggregate-divergence.jsonl"
+
+
+def _agg_rec(asof, *, comparable=True, diverged=False, fields=None, reason=None) -> dict:
+    rec = {"asof": asof, "comparable": comparable, "diverged": diverged,
+           "fields": fields or []}
+    if reason is not None:
+        rec["reason"] = reason
+    return rec
+
+
+def _write_agg_log(home: Path, records: list[dict]) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    log = home / _AGG_LOG_NAME
+    with log.open("w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    return log
+
+
+def test_aggregate_agreement_rate_excludes_not_comparable(tmp_path):
+    """5 records: 2 comparable-agree, 1 comparable-diverge, 2 not-comparable
+    (by-design skip). Agreement rate is 2/3 over the COMPARABLE ticks only —
+    the 2 skips do NOT drag the rate down.
+
+    RED-PROOF: if not-comparable ticks were counted as diverged, the rate would
+    be 2/5 (0.40) not 2/3 (0.667) — this assertion flips and fails."""
+    log = _write_agg_log(
+        tmp_path,
+        [
+            _agg_rec("t1", comparable=True, diverged=False),
+            _agg_rec("t2", comparable=True, diverged=False),
+            _agg_rec("t3", comparable=True, diverged=True, fields=["direction"]),
+            _agg_rec("t4", comparable=False, reason="learning_flag_active"),
+            _agg_rec("t5", comparable=False, reason="fitted_calibrator_active"),
+        ],
+    )
+    summary = H.summarize_log(log)
+    assert summary["total"] == 5
+    assert summary["comparable"] == 3
+    assert summary["not_comparable"] == 2
+    assert summary["diverged"] == 1
+    assert summary["agreed"] == 2
+    assert summary["agreement_rate"] == round(2 / 3, 6)
+    assert summary["field_tally"] == {"direction": 1}
+    assert summary["not_comparable_reasons"] == {
+        "fitted_calibrator_active": 1,
+        "learning_flag_active": 1,
+    }
+
+
+def test_gate_log_back_compat_all_comparable(tmp_path):
+    """A gate-layer record has NO ``comparable`` key => it defaults comparable, so
+    the gate report is byte-identical to the prior gate-only behavior."""
+    log = _write_log(  # the gate-shaped _rec has no `comparable` key
+        tmp_path,
+        [
+            _rec("t1", False, []),
+            _rec("t2", True, ["reason"]),
+        ],
+    )
+    summary = H.summarize_log(log)
+    assert summary["total"] == 2
+    assert summary["comparable"] == 2
+    assert summary["not_comparable"] == 0
+    assert summary["agreement_rate"] == 0.5
+
+
+def test_all_not_comparable_yields_none_rate(tmp_path):
+    """Every tick skipped by-design => zero comparable => agreement_rate None
+    (undefined), NOT 0.0 — the operator sees 'no comparable sample yet'."""
+    log = _write_agg_log(
+        tmp_path,
+        [
+            _agg_rec("t1", comparable=False, reason="fitted_calibrator_active"),
+            _agg_rec("t2", comparable=False, reason="fitted_calibrator_active"),
+        ],
+    )
+    summary = H.summarize_log(log)
+    assert summary["total"] == 2
+    assert summary["comparable"] == 0
+    assert summary["agreement_rate"] is None
+    assert summary["not_comparable_reasons"] == {"fitted_calibrator_active": 2}
+
+
+def test_main_layer_aggregate_reads_the_aggregate_log(tmp_path, capsys, monkeypatch):
+    """--layer aggregate resolves the aggregate log (not the gate log)."""
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(tmp_path))
+    _write_agg_log(tmp_path, [_agg_rec("t1", comparable=True, diverged=False)])
+    # a gate log with a divergence — must NOT be read when --layer aggregate
+    _write_log(tmp_path, [_rec("t1", True, ["reason"])])
+    rc = H.main(["--layer", "aggregate", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["log_path"].endswith(_AGG_LOG_NAME)
+    assert payload["total"] == 1
+    assert payload["diverged"] == 0  # read the aggregate log, not the gate's divergence
+
+
+def test_main_layer_defaults_to_gate(tmp_path, capsys, monkeypatch):
+    """--layer defaults to gate (back-compat: the prior CLI had no --layer)."""
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(tmp_path))
+    _write_log(tmp_path, [_rec("t1", True, ["reason"])])
+    rc = H.main(["--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["log_path"].endswith(_LOG_NAME)
+    assert payload["total"] == 1
+    assert payload["diverged"] == 1

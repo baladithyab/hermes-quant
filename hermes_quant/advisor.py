@@ -1367,6 +1367,35 @@ def recommend(
 
     result.aggregated_signal = _signal_to_dict(agg_signal)
 
+    # ---- Step 6.6: pdr_core AGGREGATE shadow (ADR-0092 Phase-4, DEFAULT-OFF) ----
+    # SHADOW, NOT CUTOVER. The live `agg_signal` above (and result.aggregated_signal)
+    # is already FINAL and UNCHANGED. When HERMES_QUANT_PDR_CORE_AGG_SHADOW=1 (read
+    # at call time, mirroring the Step 7.5 gate shadow) we ADDITIONALLY run the
+    # ported core aggregator (pdr_core.aggregate.core_aggregate) over the SAME
+    # `views` the live aggregator just consumed, compare the fused-signal surface
+    # field-by-field to the LIVE `agg_signal`, and LOG divergence — purely to
+    # validate the PERCEIVE-layer port before any cutover. The shadow NEVER assigns
+    # to `agg_signal` / `result`; it only reads them. core_aggregate ports ONLY the
+    # FLAGS-OFF / COLD-START arm, so the adapter detects a fitted calibrator OR a
+    # set learning flag and records a not-comparable report rather than a FALSE
+    # divergence. Any raise is swallowed (best-effort) so a shadow failure can never
+    # reach the caller. Flag-OFF the branch is not entered, the adapter is not
+    # imported, and the core aggregator is not constructed — byte-identical to today.
+    if os.environ.get("HERMES_QUANT_PDR_CORE_AGG_SHADOW", "0") == "1":
+        try:
+            from hermes_quant.pdr_core_adapter import run_shadow_aggregate
+
+            run_shadow_aggregate(
+                views=views,
+                ctx=ctx,
+                aggregator=aggregator,
+                live_signal=agg_signal,
+            )
+        except Exception as exc:  # noqa: BLE001 — shadow must never affect live
+            logger.warning(
+                "advisor: pdr_core aggregate shadow seam raised: %s", exc, exc_info=True
+            )
+
     # ---- Step 7: risk gate ----
     # cs86 (DEFAULT-OFF): wire cs01's durable drawdown baseline into the LIVE
     # producer. cs01 left the gate seam (gate.py:414 baseline_store=) INERT twice
