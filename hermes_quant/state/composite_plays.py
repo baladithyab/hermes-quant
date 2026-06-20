@@ -238,13 +238,36 @@ class CompositePlaysStore:
         no-op. For a DB created before this column, ALTER TABLE adds it with the
         '[]' default so every pre-existing row reads back option_legs == []
         (backward-compatible, no destructive migration, no NULL crash).
+
+        CONCURRENCY (cx3a): _conn() opens with isolation_level=None (autocommit),
+        so this check-then-ALTER is NOT atomic. Two cron PROCESSES can both
+        PRAGMA-check the column as missing; the first ALTER commits (instantly
+        visible under autocommit), and the loser's ALTER then raises
+        ``OperationalError: duplicate column name: option_legs_json``. On the live
+        path that error is swallowed inside _persist_composite_play AFTER a real
+        options fire, leaving NO composite row (the agmon1/agmon2 unblock silently
+        fails). The migration must be IDEMPOTENT: the loser's duplicate-column
+        ALTER is caught and treated as a no-op (the column ends up present either
+        way — the laziest race-safe fix, mirroring portfolio_state's intent).
         """
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(composite_plays)")}
         if _OPTION_LEGS_COLUMN not in cols:
-            conn.execute(
-                f"ALTER TABLE composite_plays "
-                f"ADD COLUMN {_OPTION_LEGS_COLUMN} TEXT NOT NULL DEFAULT '[]'"
-            )
+            try:
+                conn.execute(
+                    f"ALTER TABLE composite_plays "
+                    f"ADD COLUMN {_OPTION_LEGS_COLUMN} TEXT NOT NULL DEFAULT '[]'"
+                )
+            except sqlite3.OperationalError as exc:
+                # Another process won the migration race between our PRAGMA check
+                # and this ALTER. The column is now present -> idempotent no-op.
+                # Any OTHER OperationalError (e.g. the table genuinely missing) is
+                # a real failure and re-raised.
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+                logger.debug(
+                    "composite_plays: option_legs_json migration lost the race "
+                    "(another process already added it) -> no-op"
+                )
 
     # ------------------------------------------------------------------
     # Helpers

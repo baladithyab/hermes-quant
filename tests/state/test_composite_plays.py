@@ -608,6 +608,109 @@ def test_existing_pre_migration_db_migrates_and_reads_back_empty_list(
     assert row.underlying == "AAPL"  # the legacy row's data is intact
 
 
+def _make_pre_migration_db(db_path: Path) -> None:
+    """Create a composite_plays table WITHOUT the option_legs_json column (the
+    pre-ml00b schema), so the additive ALTER-TABLE migration is exercised."""
+    import sqlite3 as _sqlite3
+
+    conn = _sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE composite_plays (
+            multi_leg_id         TEXT PRIMARY KEY,
+            account_id           TEXT NOT NULL DEFAULT 'paper-default',
+            underlying           TEXT NOT NULL,
+            strategy_kind        TEXT NOT NULL,
+            state                TEXT NOT NULL DEFAULT 'open',
+            opened_at            TEXT NOT NULL,
+            closed_at            TEXT,
+            outer_qty            INTEGER NOT NULL,
+            net_entry_price      REAL NOT NULL,
+            net_fill_price       REAL,
+            fill_size_pct        REAL NOT NULL,
+            expected_leg_count   INTEGER NOT NULL,
+            max_loss             REAL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_concurrent_migration_loser_is_a_noop_not_a_raise(tmp_path: Path) -> None:
+    """[cx3a] RACE: two cron PROCESSES open a CompositePlaysStore on the SAME
+    pre-ml00b state.db at the same time. The migration runs in AUTOCOMMIT
+    (isolation_level=None): process B's check-then-ALTER is NOT atomic, so B can
+    PRAGMA-check the column as MISSING, then process A's ALTER commits (instantly
+    visible under autocommit), then B's own ALTER fires and hits
+    ``OperationalError: duplicate column name: option_legs_json``.
+
+    On the live path that OperationalError is swallowed inside
+    _persist_composite_play AFTER a REAL options fire -> NO composite row is
+    written, silently breaking the agmon1/agmon2 stop/TP unblock. The migration
+    MUST be idempotent: the loser's duplicate-column ALTER is a NO-OP, not a raise.
+
+    We reproduce the race DETERMINISTICALLY: process B enters
+    _migrate_option_legs_column; the instant its internal PRAGMA check returns
+    (still "missing"), we let process A's ALTER commit BEFORE B's own ALTER runs.
+    That is the exact interleave the autocommit window allows.
+
+    RED-proof: against the bare check-then-ALTER (no re-check inside a lock, no
+    duplicate-column catch), B's ALTER raises OperationalError. The fix (catch the
+    duplicate-column OperationalError, or BEGIN IMMEDIATE + re-check) makes B a
+    clean no-op.
+    """
+    db_path = tmp_path / "race.db"
+    _make_pre_migration_db(db_path)
+
+    # Mirror the production connection setup (CompositePlaysStore._conn sets
+    # row_factory = sqlite3.Row + autocommit isolation_level=None).
+    conn_a = sqlite3.connect(str(db_path), isolation_level=None)
+    conn_a.row_factory = sqlite3.Row
+    conn_b = sqlite3.connect(str(db_path), isolation_level=None)
+    conn_b.row_factory = sqlite3.Row
+
+    state = {"a_altered": False}
+
+    class _RacingConn:
+        """A thin proxy that delegates to conn_b but opens the autocommit race
+        window on B's ALTER: the instant B issues its ALTER for option_legs_json,
+        A's ALTER commits FIRST (once). sqlite3.Connection.execute is read-only
+        and cannot be monkeypatched directly, so we wrap it."""
+
+        def __init__(self, real: sqlite3.Connection) -> None:
+            self._real = real
+
+        def execute(self, sql: str, *args: Any):
+            if (
+                not state["a_altered"]
+                and "ALTER TABLE composite_plays" in sql
+                and "option_legs_json" in sql
+            ):
+                state["a_altered"] = True
+                conn_a.execute(
+                    "ALTER TABLE composite_plays "
+                    "ADD COLUMN option_legs_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            return self._real.execute(sql, *args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real, name)
+
+    try:
+        # B saw the column missing in its PRAGMA check; A wins the ALTER race in
+        # the window above; B's ALTER must NOT raise duplicate-column.
+        CompositePlaysStore._migrate_option_legs_column(_RacingConn(conn_b))  # noqa: SLF001
+
+        # The column ends up present either way (idempotent).
+        cols_final = {r[1] for r in conn_b.execute("PRAGMA table_info(composite_plays)")}
+        assert "option_legs_json" in cols_final
+        assert state["a_altered"], "the race window must have actually fired A's ALTER"
+    finally:
+        conn_a.close()
+        conn_b.close()
+
+
 def test_decode_legs_tolerates_null_and_corrupt(tmp_path: Path) -> None:
     """The decode helper itself is fail-CLOSED to []: NULL/empty/corrupt blobs
     never crash the sweep that reads open composites (defense-in-depth — even
