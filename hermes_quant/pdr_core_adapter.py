@@ -582,6 +582,41 @@ def _agg_learning_flag_active() -> str | None:
     return None
 
 
+def _agg_uncomparable_state(aggregator: Any) -> str | None:
+    """Return a not-comparable reason if the live aggregator is in a state the
+    cold-start core port does NOT reproduce, else None (codex-review findings D+E).
+
+    The core ports only the FRESH, uniform-0.5-weight, no-collaborator cold-start
+    vote. Two live states diverge BY DESIGN even with a cold-start calibrator and no
+    env flag set — comparing against them would log a FALSE port-bug:
+
+      * LEARNED posteriors: once any analyst has accumulated >= n_min_observations
+        settled outcomes, the live ``_weight_for`` returns the learned posterior
+        accuracy instead of 0.5 (bma.py: ``if stats.n_observations < n_min: return 0.5``).
+        We detect a settled aggregator via its ``_stats`` map + ``n_min_observations``.
+      * INJECTED collaborators: an ``ic_dedup_gate`` or ``regime_detector`` is consulted
+        whenever PRESENT (bma.py:940/988), adjusting the vote independent of its env flag.
+
+    All reads are getattr-guarded so a non-BMA / minimally-stubbed aggregator (or a
+    missing attribute) is treated as comparable (the caller's broad try/except is the
+    final backstop). Returns the FIRST reason found.
+    """
+    # (E) injected collaborators that adjust the live vote when merely present.
+    if getattr(aggregator, "ic_dedup_gate", None) is not None:
+        return "ic_dedup_gate_injected"
+    if getattr(aggregator, "regime_detector", None) is not None:
+        return "regime_detector_injected"
+    # (D) a reused aggregator that has accumulated learned per-analyst posteriors.
+    stats = getattr(aggregator, "_stats", None)
+    n_min = getattr(aggregator, "n_min_observations", None)
+    if isinstance(stats, dict) and isinstance(n_min, int):
+        for s in stats.values():
+            n_obs = getattr(s, "n_observations", 0)
+            if isinstance(n_obs, int) and n_obs >= n_min:
+                return "learned_posteriors_active"
+    return None
+
+
 def _signal_primitives(signal: Any | None) -> dict[str, Any] | None:
     """Reduce a fused signal to a JSON-serializable comparable primitive dict.
 
@@ -592,14 +627,25 @@ def _signal_primitives(signal: Any | None) -> dict[str, Any] | None:
     returns None, but the comparator stays None-safe like _compare_actions).
 
     The scalar surface (direction / magnitude / confidence / confidence_raw /
-    horizon / aggregator) is copied straight across. ``asof`` is isoformat()'d
-    like :func:`_action_primitives` does for halt_until, so the persisted line is
+    horizon / aggregator) is copied straight across, plus the IDENTITY fields
+    (asset / timeframe / asset_class / asof) and the ``components`` tuple reduced
+    to its scalar vote fields. ``asof`` is isoformat()'d like
+    :func:`_action_primitives` does for halt_until, so the persisted line is
     serializable. The metadata is FLATTENED to ONLY the proven OFF-path audit
     keys (``_AGG_METADATA_AUDIT_KEYS``) plus the per-analyst ``weights`` map; the
     flag-gated injections and the ADR-0084 ``event_risk`` carrier are excluded so
     a comparison never trips on a key that is expected to differ. On the silence
     path the live/core metadata carries only ``{"reason": ...}`` — that reason is
     surfaced so the comparator can match the silence reason too.
+
+    codex-review-2026-06-20 finding C: ``components`` + the identity fields
+    (asset/timeframe/asof) are LOAD-BEARING (the static parity test asserts
+    component scalar parity; downstream reads signal identity/asof/components for
+    halt/event-risk/outcome-credit). Dropping them let a runtime projection/core
+    bug in those fields log as AGREEMENT (a missed divergence). They are now in the
+    compared surface. ``components`` is reduced to the cross-shape scalar fields
+    (analyst/direction/magnitude/confidence/confidence_raw/horizon) so a live
+    ``protocol.AnalystView`` and a core ``contracts.AnalystView`` compare 1:1.
     """
     if signal is None:
         return None
@@ -623,7 +669,23 @@ def _signal_primitives(signal: Any | None) -> dict[str, Any] | None:
             flat["weights"] = {str(a): float(w) for a, w in weights.items()}
         else:
             flat["weights"] = weights
+    # components reduced to the cross-shape scalar vote fields (the static parity
+    # test's component-parity surface). Tuple-of-tuples so order is preserved.
+    components = tuple(
+        (
+            getattr(c, "analyst", None),
+            getattr(c, "direction", None),
+            getattr(c, "magnitude", None),
+            getattr(c, "confidence", None),
+            getattr(c, "confidence_raw", None),
+            getattr(c, "horizon", None),
+        )
+        for c in (getattr(signal, "components", ()) or ())
+    )
     return {
+        "asset": getattr(signal, "asset", None),
+        "timeframe": getattr(signal, "timeframe", None),
+        "asset_class": getattr(signal, "asset_class", None),
         "direction": signal.direction,
         "magnitude": signal.magnitude,
         "confidence": signal.confidence,
@@ -631,6 +693,7 @@ def _signal_primitives(signal: Any | None) -> dict[str, Any] | None:
         "horizon": signal.horizon,
         "aggregator": signal.aggregator,
         "asof": asof,
+        "components": components,
         "metadata": flat,
     }
 
@@ -672,13 +735,13 @@ def _compare_signals(live: Any | None, shadow: Any | None) -> list[str]:
         return []
 
     diverged: list[str] = []
-    # Exact-equality scalar fields.
-    if sp["direction"] != lp["direction"]:
-        diverged.append("direction")
-    if sp["horizon"] != lp["horizon"]:
-        diverged.append("horizon")
-    if sp["aggregator"] != lp["aggregator"]:
-        diverged.append("aggregator")
+    # Exact-equality scalar + identity fields (codex-review finding C: identity
+    # fields asset/timeframe/asset_class/asof are load-bearing for downstream
+    # halt/event-risk/replay; a projection bug there must surface as a divergence).
+    for field in ("direction", "horizon", "aggregator", "asset", "timeframe",
+                  "asset_class", "asof"):
+        if sp.get(field) != lp.get(field):
+            diverged.append(field)
     # Float scalar fields (1e-12 tolerance).
     if not _floats_close(sp["magnitude"], lp["magnitude"]):
         diverged.append("magnitude")
@@ -686,6 +749,27 @@ def _compare_signals(live: Any | None, shadow: Any | None) -> list[str]:
         diverged.append("confidence")
     if not _floats_close(sp["confidence_raw"], lp["confidence_raw"]):
         diverged.append("confidence_raw")
+
+    # components: same length + scalar-field parity (the static parity test's
+    # component surface; drives outcome crediting / joint-state replay). The
+    # magnitude/confidence/confidence_raw within each component get float tolerance;
+    # analyst/direction/horizon exact.
+    lc, sc = lp["components"], sp["components"]
+    if len(lc) != len(sc):
+        diverged.append("components")
+    else:
+        for lcomp, scomp in zip(lc, sc, strict=False):
+            # tuple = (analyst, direction, magnitude, confidence, confidence_raw, horizon)
+            if (
+                scomp[0] != lcomp[0]  # analyst
+                or scomp[1] != lcomp[1]  # direction
+                or scomp[5] != lcomp[5]  # horizon
+                or not _floats_close(scomp[2], lcomp[2])  # magnitude
+                or not _floats_close(scomp[3], lcomp[3])  # confidence
+                or not _floats_close(scomp[4], lcomp[4])  # confidence_raw
+            ):
+                diverged.append("components")
+                break
 
     lm, sm = lp["metadata"], sp["metadata"]
     # Silence / flat path: both carry only a reason.
@@ -735,6 +819,11 @@ def _persist_aggregate_divergence_report(
             "comparable": bool(report.get("comparable", True)),
             "diverged": bool(report.get("diverged")),
             "reason": report.get("reason"),
+            # codex-review finding H: surface WHICH flag / detail blocked a
+            # not-comparable tick so the operator can see why coverage was skipped
+            # (e.g. learning_flag_active -> which flag) when driving the sample.
+            "flag": report.get("flag"),
+            "detail": report.get("detail"),
             "fields": list(report.get("fields") or []),
             "live": _signal_primitives(report.get("live")),
             "shadow": _signal_primitives(report.get("shadow")),
@@ -835,10 +924,42 @@ def run_shadow_aggregate(
                 _persist_aggregate_divergence_report(report, path=divergence_path)
             return report
 
+        # COMPARABILITY GATE 3 (codex-review-2026-06-20, findings D + E): the gate-1/2
+        # checks (calibrator type + env flags) are NECESSARY but not SUFFICIENT. The
+        # core ports ONLY the FRESH (uniform-0.5-weight) cold-start vote, so two more
+        # live states diverge from it BY DESIGN even with no fitted calibrator + no env
+        # flag set:
+        #   (D) a REUSED aggregator that has accumulated settled outcomes — once any
+        #       analyst's _AnalystStats.n_observations >= n_min_observations, the live
+        #       _weight_for returns the LEARNED posterior accuracy, not 0.5. The core's
+        #       fixed uniform weight then diverges -> a FALSE port-bug signal.
+        #   (E) an INJECTED ic_dedup_gate or regime_detector adjusts the live vote
+        #       inputs/weights even when its env flag is unset (the collaborator is
+        #       consulted whenever it is present, see bma.py:940/988); the core runs the
+        #       unadjusted off-path vote -> FALSE divergence.
+        # Detect both and record not-comparable (the live decision is untouched either way).
+        reason3 = _agg_uncomparable_state(aggregator)
+        if reason3 is not None:
+            report = {
+                "comparable": False,
+                "reason": reason3,
+                "diverged": False,
+                "fields": [],
+                "live": live_signal,
+                "shadow": None,
+            }
+            logger.info("pdr_core aggregate shadow: not comparable (%s)", reason3)
+            if persist:
+                _persist_aggregate_divergence_report(report, path=divergence_path)
+            return report
+
         # Lazy import: keep the import paid only when the shadow actually runs
         # (the flag-off advisor path never reaches here). core_aggregate is
         # stdlib-only and lives in pdr_core, which this SHELL module may import
         # freely (same as the top-level pdr_core.gate import).
+        from hermes_quant.pdr_core.aggregate import (
+            DEFAULT_AGREEMENT_BONUS as _CORE_DEFAULT_AGREEMENT_BONUS,
+        )
         from hermes_quant.pdr_core.aggregate import CoreAggregateContext, core_aggregate
         from hermes_quant.pdr_core.contracts import AnalystView as CoreView
 
@@ -900,17 +1021,32 @@ def run_shadow_aggregate(
         # Thread the LIVE aggregator's config so the core matches it (don't
         # hardcode defaults). cold_start=True matches the CalibratorNotReady arm
         # the comparison requires (gate 1 already proved the live calibrator is
-        # cold-start). Defaults stand in if an attribute is absent.
-        shadow_signal = core_aggregate(
-            core_views,
-            core_ctx,
+        # cold-start). Defaults stand in only when an attribute is genuinely ABSENT.
+        #
+        # codex-review-2026-06-20 finding B: the live BMA also reads the multi-horizon
+        # multipliers off self.config (bma.py:1314/1319) — thread them so a recipe with
+        # custom horizon_agreement_bonus / horizon_disagreement_penalty does not log a
+        # FALSE divergence. And pass horizon_weights FAITHFULLY: the live _horizon_weight
+        # does ``self.horizon_weights.get(h, 1.0)``, so a PRESENT-but-empty dict means
+        # "every horizon -> 1.0" — replacing a falsy (empty) dict with the non-uniform
+        # default table (the prior ``or {...}``) was itself a false-divergence source.
+        # Use a sentinel so we fall back to the core default ONLY when the attr is missing.
+        _MISSING = object()
+        live_hw = getattr(aggregator, "horizon_weights", _MISSING)
+        cfg = getattr(aggregator, "config", None)
+        core_kwargs: dict[str, Any] = dict(
             require_ensemble=getattr(aggregator, "require_ensemble", True),
-            agreement_bonus=getattr(aggregator, "agreement_bonus", 0.10),
-            horizon_weights=getattr(
-                aggregator, "horizon_weights", None
-            ) or {"1d": 1.00, "1w": 1.20, "1M": 0.80, "1Q": 0.60},
+            agreement_bonus=getattr(aggregator, "agreement_bonus", _CORE_DEFAULT_AGREEMENT_BONUS),
             cold_start=True,
         )
+        if live_hw is not _MISSING and live_hw is not None:
+            core_kwargs["horizon_weights"] = live_hw  # verbatim (incl. an empty dict)
+        if cfg is not None:
+            if hasattr(cfg, "horizon_agreement_bonus"):
+                core_kwargs["horizon_agreement_bonus"] = cfg.horizon_agreement_bonus
+            if hasattr(cfg, "horizon_disagreement_penalty"):
+                core_kwargs["horizon_disagreement_penalty"] = cfg.horizon_disagreement_penalty
+        shadow_signal = core_aggregate(core_views, core_ctx, **core_kwargs)
 
         diverged_fields = _compare_signals(live_signal, shadow_signal)
         report = {
@@ -921,11 +1057,18 @@ def run_shadow_aggregate(
             "shadow": shadow_signal,
         }
         if diverged_fields:
+            # codex-review-2026-06-20 finding F: log ONLY the diverged field names,
+            # NOT the full signal repr. A live AggregatedSignal.components carries the
+            # original AnalystView objects incl. rationale / metadata / evidence_ids —
+            # a shadow-only diagnostic must not leak proprietary/semantic analyst
+            # payloads to the logs (the JSONL persist path already reduces to
+            # primitives). The full reduced signals are in the persisted report for
+            # offline analysis; the WARNING names only what diverged.
             logger.warning(
-                "pdr_core aggregate shadow DIVERGED on %s: live=%r shadow=%r",
+                "pdr_core aggregate shadow DIVERGED on %s (see %s for the reduced "
+                "live/shadow primitives)",
                 diverged_fields,
-                live_signal,
-                shadow_signal,
+                _SHADOW_AGGREGATE_DIVERGENCE_FILE,
             )
         else:
             logger.info("pdr_core aggregate shadow agreed with live aggregator")

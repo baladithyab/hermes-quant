@@ -467,6 +467,42 @@ class _CannedProvider:
         return out
 
 
+class _LightAnalyst:
+    """A minimal deterministic analyst (no torch / no HF / no network).
+
+    codex-review-2026-06-20 finding A (CI-hang): the live recommend() seam tests
+    MUST pass an explicit lightweight loadout. Calling recommend() with no
+    ``analysts=`` builds the DEFAULT roster, which includes KronosAnalyst ->
+    a live HuggingFace fetch / torch inference that HANGS the full sweep on an
+    [all,dev] box (the aegis-ci-hang family; tests/pdr_core/ has no HF-offline
+    conftest guard). Two of these form a genuine ensemble so BMA's
+    require_ensemble guard is satisfied without any heavy analyst.
+    """
+
+    def __init__(self, name: str, direction: int, *, conf: float = 0.6) -> None:
+        self.name = name
+        self.timeframes = ["1d"]
+        self.asset_classes = ["equity"]
+        self.enabled = True
+        self._direction = direction
+        self._conf = conf
+
+    def analyze(self, ctx: MarketContext) -> LiveView | None:
+        if len(ctx.bars["close"]) < 5:
+            return None
+        return LiveView(
+            analyst=self.name,
+            direction=self._direction,
+            magnitude=0.02,
+            confidence=self._conf,
+            confidence_raw=self._conf,
+            horizon="1d",
+        )
+
+    def health(self) -> dict:
+        return {"n_views_emitted": 0, "last_view_at": None, "error_count": 0}
+
+
 def _recommend_kwargs(provider):
     return dict(
         symbol="TEST",
@@ -474,6 +510,10 @@ def _recommend_kwargs(provider):
         as_of="2026-03-15T00:00:00Z",
         provider=provider,
         include_lessons=False,
+        # finding A: explicit lightweight loadout — never build the default roster
+        # (KronosAnalyst -> HF/torch hang). A 2-analyst ensemble clears
+        # require_ensemble so the live BMA emits a non-silenced signal.
+        analysts=[_LightAnalyst("a", 1), _LightAnalyst("b", 1)],
     )
 
 
@@ -548,3 +588,185 @@ def test_recommend_flag_on_does_not_change_aggregated_signal(monkeypatch):
 
     assert off["aggregated_signal"] == on["aggregated_signal"]
     assert off["risk_gate"] == on["risk_gate"]
+
+
+# ===========================================================================
+# SECTION 4 — codex-review-2026-06-20 regressions (comparability + comparison
+# completeness). Each pins a confirmed review finding.
+# ===========================================================================
+import json  # noqa: E402 — local to the review-regression section
+
+
+def test_not_comparable_learned_posteriors_no_false_divergence(tmp_path):
+    """Finding D: a REUSED aggregator with accumulated settled outcomes (a learned
+    posterior past n_min_observations) returns a learned weight != core's fixed 0.5
+    -> the shadow must mark it NOT-comparable, not log a false divergence."""
+    agg = _live_aggregator(tmp_path)
+    ctx = _live_ctx()
+    views = [_live_view(*r) for r in FIXTURES["two_unanimous_long"]]
+    live_sig = agg.aggregate(views, ctx)
+
+    # Force a settled posterior on one analyst past the n_min threshold.
+    stats = agg._get_or_create_stats("a")
+    stats.n_observations = agg.n_min_observations + 5
+
+    report = run_shadow_aggregate(
+        views=views, ctx=ctx, aggregator=agg, live_signal=live_sig, persist=False
+    )
+    assert report is not None
+    assert report["comparable"] is False
+    assert report["reason"] == "learned_posteriors_active"
+    assert report["diverged"] is False
+
+
+def test_not_comparable_injected_collaborators(tmp_path):
+    """Finding E: an injected ic_dedup_gate / regime_detector adjusts the live vote
+    even with its env flag unset -> not-comparable (no false divergence).
+
+    The comparability gate fires on PRESENCE alone, BEFORE the live signal is read,
+    so we build the live signal on a clean aggregator and then attach the collaborator
+    (a sentinel object suffices — the gate checks `is not None`, not the collaborator's
+    behavior)."""
+    ctx = _live_ctx()
+    views = [_live_view(*r) for r in FIXTURES["two_unanimous_long"]]
+
+    # ic_dedup_gate present.
+    agg1 = _live_aggregator(tmp_path)
+    live_sig = agg1.aggregate(views, ctx)  # built BEFORE attaching the collaborator
+    agg1.ic_dedup_gate = object()
+    r1 = run_shadow_aggregate(
+        views=views, ctx=ctx, aggregator=agg1, live_signal=live_sig, persist=False
+    )
+    assert r1 is not None and r1["comparable"] is False
+    assert r1["reason"] == "ic_dedup_gate_injected"
+
+    # regime_detector present.
+    agg2 = _live_aggregator(tmp_path)
+    live_sig2 = agg2.aggregate(views, ctx)
+    agg2.regime_detector = object()
+    r2 = run_shadow_aggregate(
+        views=views, ctx=ctx, aggregator=agg2, live_signal=live_sig2, persist=False
+    )
+    assert r2 is not None and r2["comparable"] is False
+    assert r2["reason"] == "regime_detector_injected"
+
+
+def test_custom_horizon_config_threaded_no_false_divergence(tmp_path):
+    """Finding B: a BMAAggregator built with non-default horizon multipliers must NOT
+    log a false divergence — the shadow threads config.horizon_agreement_bonus /
+    horizon_disagreement_penalty into core_aggregate.
+
+    RED-PROOF: with the config NOT threaded (the pre-fix behavior), the multi-horizon
+    fixture's confidence diverges (live uses the custom multiplier, core the default)."""
+    from hermes_quant.aggregators.bma import BMAConfig
+
+    cfg = BMAConfig(horizon_agreement_bonus=1.25, horizon_disagreement_penalty=0.70)
+    agg = _live_aggregator(tmp_path, config=cfg, require_ensemble=False)
+    ctx = _live_ctx()
+    views = [_live_view(*r) for r in FIXTURES["multi_horizon_all_agree"]]
+    live_sig = agg.aggregate(views, ctx)
+
+    report = run_shadow_aggregate(
+        views=views, ctx=ctx, aggregator=agg, live_signal=live_sig, persist=False
+    )
+    assert report is not None
+    assert report["comparable"] is True
+    assert report["diverged"] is False, f"custom horizon config not threaded: {report['fields']}"
+
+
+def test_compare_signals_catches_component_divergence(tmp_path):
+    """Finding C (RED-PROOF): a port bug that changes the components tuple while
+    leaving the scalar surface equal MUST be flagged. Proves components are compared."""
+    from dataclasses import replace
+
+    agg = _live_aggregator(tmp_path)
+    ctx = _live_ctx()
+    views = [_live_view(*r) for r in FIXTURES["two_unanimous_long"]]
+    live_sig = agg.aggregate(views, ctx)
+
+    # Drop one component from the shadow — scalars unchanged, components differ.
+    bogus = replace(live_sig, components=live_sig.components[:-1])
+    diverged = _compare_signals(live_sig, bogus)
+    assert "components" in diverged, diverged
+
+
+def test_compare_signals_catches_identity_divergence(tmp_path):
+    """Finding C (RED-PROOF): a divergence in an identity field (asset) MUST be
+    flagged (downstream halt/event-risk/replay read identity)."""
+    from dataclasses import replace
+
+    agg = _live_aggregator(tmp_path)
+    ctx = _live_ctx()
+    views = [_live_view(*r) for r in FIXTURES["two_unanimous_long"]]
+    live_sig = agg.aggregate(views, ctx)
+
+    bogus = replace(live_sig, asset="WRONG")
+    diverged = _compare_signals(live_sig, bogus)
+    assert "asset" in diverged, diverged
+
+
+def test_compare_signals_presence_asymmetry_and_reason_mismatch():
+    """Facet-4 LOW: pin the presence-asymmetry + silence-reason RED cases."""
+    # Build two real silence-path signals with different reasons.
+    from hermes_quant.pdr_core.aggregate import CoreAggregateContext, _flat_signal
+
+    ctx = CoreAggregateContext(asset="AAPL", timeframe="1d", asset_class="equity", asof=ASOF)
+    s1 = _flat_signal(ctx, reason="flat_or_no_views")
+    s2 = _flat_signal(ctx, reason="silenced_single_source")
+    diverged = _compare_signals(s1, s2)
+    assert "metadata.reason" in diverged, diverged
+    # presence asymmetry: a real signal vs None.
+    assert _compare_signals(s1, None) == ["presence"]
+
+
+def test_real_divergence_is_persisted_end_to_end(tmp_path, monkeypatch):
+    """Finding G: a REAL divergent report is logged AND PERSISTED (the prior tests
+    persisted only an agreement line; a serialization bug in a divergent record
+    could slip). Monkeypatch core to flip direction, persist=True to a tmp path."""
+    import hermes_quant.pdr_core.aggregate as core_agg_mod
+    from dataclasses import replace
+
+    agg = _live_aggregator(tmp_path)
+    ctx = _live_ctx()
+    views = [_live_view(*r) for r in FIXTURES["two_unanimous_long"]]
+    live_sig = agg.aggregate(views, ctx)
+
+    real_core = core_agg_mod.core_aggregate
+
+    def _flip(core_views, core_ctx, **kwargs):
+        sig = real_core(core_views, core_ctx, **kwargs)
+        return replace(sig, direction=(-1 if sig.direction >= 0 else 1))
+
+    monkeypatch.setattr(core_agg_mod, "core_aggregate", _flip)
+
+    log_path = tmp_path / "agg-div.jsonl"
+    report = run_shadow_aggregate(
+        views=views, ctx=ctx, aggregator=agg, live_signal=live_sig,
+        persist=True, divergence_path=log_path,
+    )
+    assert report is not None and report["diverged"] is True
+    assert log_path.exists(), "divergent report must be persisted"
+    line = json.loads(log_path.read_text().strip().splitlines()[-1])
+    assert line["comparable"] is True
+    assert line["diverged"] is True
+    assert "direction" in line["fields"]
+    # the reduced primitives serialized without error (no full-repr leak)
+    assert line["live"] is not None and line["shadow"] is not None
+    assert "components" in line["live"]  # the new compared field is in the record
+
+
+def test_not_comparable_record_persists_flag(tmp_path):
+    """Finding H: a not-comparable record persists WHICH flag blocked it."""
+    agg = _live_aggregator(tmp_path)
+    ctx = _live_ctx()
+    views = [_live_view(*r) for r in FIXTURES["two_unanimous_long"]]
+    live_sig = agg.aggregate(views, ctx)  # before attaching the collaborator
+    agg.regime_detector = object()
+    log_path = tmp_path / "nc.jsonl"
+    run_shadow_aggregate(
+        views=views, ctx=ctx, aggregator=agg, live_signal=live_sig,
+        persist=True, divergence_path=log_path,
+    )
+    line = json.loads(log_path.read_text().strip().splitlines()[-1])
+    assert line["comparable"] is False
+    assert line["reason"] == "regime_detector_injected"
