@@ -87,7 +87,7 @@
 | `HERMES_QUANT_SEMANTIC_ENABLED` | `1` | `hermes_quant/advisor.py:526` |
 | `HERMES_QUANT_SHADOW_RULE_MINING` | `0` | `hermes_quant/shadow/rule_mining.py:163` |
 | `HERMES_QUANT_SIGNED_EQUITY` | `0` | `hermes_quant/state/portfolio_state.py:216` |
-| `HERMES_QUANT_SLIPPAGE_GATE` | `0` | `hermes_quant/pdr_core_adapter.py:75` |
+| `HERMES_QUANT_SLIPPAGE_GATE` | `0` | `hermes_quant/pdr_core_adapter.py:159` |
 | `HERMES_QUANT_SLIPPAGE_HAIRCUT` | `0` | `hermes_quant/risk/slippage_haircut.py:72` |
 | `HERMES_QUANT_SOCIAL_REACH` | `0` | `hermes_quant/catalyst/social.py:381` |
 | `HERMES_QUANT_STACKING` | `0` | `hermes_quant/aggregators/bma.py:280` |
