@@ -33,8 +33,16 @@ loadout is free to reach the live Hub.
 
 from __future__ import annotations
 
-import huggingface_hub.constants as hf_constants
 import pandas as pd
+import pytest
+
+# cx-advisor-hf-import (codex PR#91 P2): huggingface_hub is an OPTIONAL dep (the
+# KronosAnalyst is the only consumer, and the analyst degrades to an abstain path
+# when it's absent). Importing it at module scope crashed COLLECTION on any env
+# without it (a collection error fails the whole run, not just this module). Skip
+# the module cleanly when HF is unavailable — the OFFLINE-guard contract it asserts
+# only has meaning when huggingface_hub is installed in the first place.
+hf_constants = pytest.importorskip("huggingface_hub.constants")
 
 from hermes_quant.advisor import _build_default_analysts, recommend
 

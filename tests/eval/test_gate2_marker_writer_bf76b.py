@@ -271,13 +271,20 @@ def test_empty_home_book_stays_locked_even_if_process_default_clears(tmp_path: P
 
 
 def test_env_hermes_quant_home_book_read_matches_tick_write(tmp_path: Path, monkeypatch):
-    """cx2-followup (p6-cx-wave-review): under HERMES_QUANT_HOME-only with home=None
-    (the env-driven path the cron uses), evaluate_gate2 must read the book the autonomous
-    tick WROTE — quant_home()/executions.jsonl (HERMES_QUANT_HOME-first), NOT the
-    HERMES_HOME-only ~/.hermes path. Pre-fix the local _home_path diverged: the tick wrote
-    $HERMES_QUANT_HOME/executions.jsonl while gate2-eval read ~/.hermes (a stale book there
-    could UNLOCK the wrong home). RED-proof: revert to _home_path(None)/quant/... and this
-    reads zero trips (LOCKED) despite the HQH book clearing."""
+    """cx2-P1 (codex PR#91): under HERMES_QUANT_HOME-only with home=None (the env-driven
+    path the cron uses), the GATE-0 ANCHOR, the settled BOOK, and the unlock MARKER must
+    ALL resolve to the SAME quant root the autonomous tick uses — quant_home() (=
+    $HERMES_QUANT_HOME), which is also signal_bus.EXECUTION_BUS_PATH's root and where the
+    tick's read_options_unlocked() reads the marker.
+
+    Pre-fix clean_window resolved the anchor + marker via a HERMES_HOME-only _home_path,
+    while the tick wrote the book (and read the marker) under $HERMES_QUANT_HOME -> a
+    three-way home SPLIT: anchor at ~/.hermes, book at $HQH, marker written to ~/.hermes
+    but read from $HQH. The marker the cron wrote was at a home the tick never reads, so
+    options could stay PERMANENTLY LOCKED (or a stale ~/.hermes marker unlock the wrong
+    home). RED-proof: revert clean_window._quant_root to _home_path(home).parent.parent-
+    style HERMES_HOME-only and read_clean_window_start(None) reads ~/.hermes -> no anchor
+    -> LOCKED despite the $HQH book clearing, AND the marker lands at the wrong root."""
     hqh = tmp_path / "hqh_quant_root"  # quant_home() returns this directly (no /quant)
     hqh.mkdir(parents=True)
     monkeypatch.setenv("HERMES_QUANT_HOME", str(hqh))
@@ -285,16 +292,20 @@ def test_env_hermes_quant_home_book_read_matches_tick_write(tmp_path: Path, monk
 
     now = datetime(2026, 6, 18, tzinfo=UTC)
     t0 = now - timedelta(days=65)
-    # GATE-0 anchor lives under the quant root the writer reads for read_clean_window_start;
-    # pass home=hqh-as-hermes is wrong here — the env path uses home=None, and the anchor is
-    # read via clean_window _home_path(None) (HERMES_HOME or ~/.hermes). Seed the anchor where
-    # read_clean_window_start(None) looks, and the BOOK where quant_home() looks.
-    from hermes_quant.eval.clean_window import _home_path as _cw_home
-    _seed_t0(_cw_home(None), t0)  # anchor at the clean_window-resolved home
-    # write the real clearing book at quant_home()/executions.jsonl (= hqh/executions.jsonl)
+    # Seed the anchor + the book where the UNIFIED resolver looks: the quant root
+    # quant_home() == hqh. home=None routes write_clean_window_start through _quant_root,
+    # so the anchor lands at hqh/clean_window_start.json — exactly where
+    # read_clean_window_start(None) reads it.
+    _seed_t0(None, t0)  # home=None => anchor at quant_home() = hqh
     _write_real_clearing_book_at(hqh / "executions.jsonl", t0)
 
     writer = _load_writer()
     payload = writer.evaluate_gate2(None, asof=now)  # home=None => env-driven (the cron path)
     assert payload["n"] == 54, f"env HERMES_QUANT_HOME book not read (tick-write vs gate-read divergence): {payload}"
     assert payload["gate2_cleared"] is True
+
+    # End-to-end: main() writes the marker to the SAME quant root the tick reads.
+    rc = writer.main([])  # home=None => env-driven; marker -> hqh/options_unlock.json
+    assert rc == 0
+    assert (hqh / "options_unlock.json").exists(), "marker not co-located with the book the tick reads"
+    assert read_options_unlocked(None) is True  # the tick's own read path now sees UNLOCKED

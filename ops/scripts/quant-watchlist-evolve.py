@@ -263,7 +263,15 @@ def main() -> int:
     # Full Alpaca liquid universe — ~500 symbols by default. The library
     # prewarm + 600s cron timeout absorbs the wall time; do NOT silently
     # narrow this without an explicit policy decision.
-    universe_path = Path.home() / ".hermes" / "quant" / "universe" / "alpaca-daily.json"
+    #
+    # cx-watchlist-home (codex PR#91 P2): resolve the universe READ through the SAME
+    # quant_home() the watchlist OUTPUT uses (_profile_fit_out_path). Pre-fix the read
+    # was hardcoded to Path.home()/.hermes/quant while the output honored an injected
+    # HERMES_QUANT_HOME / HERMES_HOME -> under an override the script read the universe
+    # from one home and wrote the watchlist to another (input/output home split).
+    # Byte-identical in production (no env -> quant_home() == Path.home()/.hermes/quant).
+    from hermes_quant.home import quant_home
+    universe_path = quant_home() / "universe" / "alpaca-daily.json"
 
     # Wall-clock budget guard (added 2026-05-28). The cron's
     # script_timeout_seconds is 600s. If this script approaches that

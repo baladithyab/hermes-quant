@@ -38,15 +38,16 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-_OPTIONS_UNLOCK_FILE = "quant/options_unlock.json"
+# cx2-P1 (codex PR#91): the ONE resolver. The GATE-0 anchor, the settled BOOK, and
+# the unlock MARKER must all live in the SAME quant root — the one the autonomous
+# tick reads via read_options_unlocked() and signal_bus writes the book to. Importing
+# clean_window._quant_root (which routes through quant_home(): override >
+# HERMES_QUANT_HOME > HERMES_HOME/quant > ~/.hermes/quant) keeps this script and the
+# live tick on one resolver, so a multi-home / HERMES_QUANT_HOME-only run can never
+# write the marker to a home the tick doesn't read. The bare file name lives here.
+from hermes_quant.eval.clean_window import _quant_root
 
-
-def _home_path(home: str | Path | None) -> Path:
-    """Resolve the operator home the same way clean_window._home_path does."""
-    if home is not None:
-        return Path(home)
-    env = os.environ.get("HERMES_HOME")
-    return Path(env) if env else Path.home() / ".hermes"
+_OPTIONS_UNLOCK_FILE = "options_unlock.json"
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -95,36 +96,13 @@ def evaluate_gate2(home: str | Path | None, *, asof: datetime | None = None) -> 
     # + promotion gate — no basis drift). Best-effort: a read failure => empty book
     # => thin => LOCKED.
     #
-    # cx2 [P1]: thread the HOME-SCOPED executions book. Without executions_path the
-    # loader defaults to the process-default EXECUTION_BUS_PATH (the real ~/.hermes
-    # home), so in a multi-home / operator run gate2-eval would UNLOCK gate-2 for THIS
-    # --home off a DIFFERENT home's settled book. The marker is written under
-    # ``home/quant/options_unlock.json`` and the GATE-0 anchor read from
-    # ``home/quant/clean_window_start.json``; the book lives alongside them at
-    # ``home/quant/executions.jsonl`` (signal_bus EXECUTION_BUS_PATH = QUANT_HOME /
-    # "executions.jsonl"). Pass that exact home-scoped path so the verdict reflects
-    # THIS home's own book.
-    # cx2-followup (p6-cx-wave-review): resolve the book with the SAME resolver the
-    # autonomous tick + signal_bus.EXECUTION_BUS_PATH use to WRITE it. quant_home()'s
-    # precedence is override > HERMES_QUANT_HOME > HERMES_HOME/quant > ~/.hermes/quant.
-    # Using the local HERMES_HOME-only _home_path here diverged under a
-    # HERMES_QUANT_HOME-only home (tick wrote $HQH/executions.jsonl; gate2-eval read
-    # ~/.hermes) -> a stale book at the default path could then UNLOCK the wrong home.
-    # An explicit --home is threaded as the override (quant_home expands it directly);
-    # the marker write below uses the same root, keeping marker + book co-located.
-    if home is not None:
-        # Explicit --home is the HERMES home (as for the marker/anchor via _home_path);
-        # the book lives at <home>/quant/executions.jsonl, co-located with the marker.
-        executions_path = _home_path(home) / "quant" / "executions.jsonl"
-    else:
-        # Env-driven (home=None): resolve with the SAME resolver the autonomous tick +
-        # signal_bus.EXECUTION_BUS_PATH use to WRITE the book — quant_home() is
-        # HERMES_QUANT_HOME-first, so a HERMES_QUANT_HOME-only run reads the book the
-        # tick actually wrote (the local HERMES_HOME-only _home_path diverged -> a stale
-        # default-path book could UNLOCK the wrong home). quant_home() returns the quant
-        # root directly (no /quant suffix).
-        from hermes_quant.home import quant_home as _quant_home
-        executions_path = _quant_home() / "executions.jsonl"
+    # cx2-P1 (codex PR#91): thread the HOME-SCOPED book via the ONE shared resolver.
+    # _quant_root routes through quant_home() (= signal_bus.EXECUTION_BUS_PATH's root),
+    # so the GATE-0 anchor, the settled BOOK, and the unlock MARKER all co-locate in
+    # the SAME quant root the autonomous tick reads — in every home case (default,
+    # HERMES_QUANT_HOME-only, HERMES_HOME, explicit --home). Without it the loader would
+    # default to the process EXECUTION_BUS_PATH and could unlock THIS home off another.
+    executions_path = _quant_root(home) / "executions.jsonl"
     try:
         from hermes_quant.governance.promotion import _settle_paper_round_trips_in_window
 
@@ -167,11 +145,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="print the verdict, write nothing")
     args = ap.parse_args(argv)
 
-    home = _home_path(args.home)
+    quant_root = _quant_root(args.home)
     payload = evaluate_gate2(args.home)
 
     print("AEGIS GATE-2 — options-origination evidence gate")
-    print(f"  home: {home}")
+    print(f"  quant root: {quant_root}")
     print(f"  n={payload.get('n')}  calendar_days={payload.get('calendar_days', 'n/a')}")
     print(f"  verdict: {'UNLOCKED (gate2_cleared)' if payload['gate2_cleared'] else 'LOCKED'}")
     print(f"  reason: {payload.get('reason')}")
@@ -180,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nDRY-RUN: would write the marker. Nothing written.")
         return 0
 
-    marker = home / _OPTIONS_UNLOCK_FILE
+    marker = quant_root / _OPTIONS_UNLOCK_FILE
     _atomic_write_json(marker, payload)
     print(f"\nGATE-2 marker written: {marker}")
     print(
