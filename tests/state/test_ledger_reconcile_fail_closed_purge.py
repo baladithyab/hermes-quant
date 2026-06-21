@@ -120,7 +120,7 @@ def test_apply_fails_closed_when_it_would_purge(tmp_path, monkeypatch, capsys):
     assert after == before == 2, "state.db must be UNCHANGED — no broker-confirmed position purged"
     err = capsys.readouterr().err
     assert "refusing --apply" in err
-    assert "PURGE" in err
+    assert "purge" in err.lower()
 
 
 def test_allow_purge_override_permits_apply(tmp_path, monkeypatch):
@@ -140,6 +140,93 @@ def test_allow_purge_override_permits_apply(tmp_path, monkeypatch):
     rc = mod.main()
     # rc 0 (applied) — the override deliberately permits the purge the operator inspected.
     assert rc == 0, f"--allow-purge must permit the apply, got {rc}"
+
+
+def test_apply_fails_closed_on_partial_reduction(tmp_path, monkeypatch, capsys):
+    """wave-2 Q1a: --apply must FAIL-CLOSED (exit 4, no mutation) when the rebuild would
+    REDUCE a live position's |qty| (a partial purge), not just when it fully zeroes it.
+
+    A reset/incomplete log more often shrinks a position than deletes it (NVDA 600sh ->
+    log backs 100sh); that lands in `changed`, which an unguarded --apply 'corrects'
+    600 -> 100, destroying 500 broker-confirmed shares with exit 0.
+
+    RED-PROOF: with the destructive-reduction guard removed, --apply proceeds (rc 0) and
+    rewrites the qty down."""
+    mod = _load()
+    state_db = tmp_path / "state.db"
+    execs = tmp_path / "executions.jsonl"
+    # live: AAPL 600sh; the log backs only 100sh (a real partial-reset shape)
+    _seed_state_db(state_db, [("paper-default", "equity", "AAPL", 600.0, 150.0)])
+    rec = {
+        "proposal_id": "p1", "signal_id": "s1", "asset": "AAPL", "asset_class": "equity",
+        "timeframe": "1d", "asof_decision": "2026-06-18T00:00:00Z",
+        "asof_execution": "2026-06-18T00:00:00Z", "target_position_pct": 100.0,
+        "decision_price": 150.0, "fill_price": 150.0, "fill_size_pct": 100.0,
+        "reactor_name": "paper", "human_in_the_loop": False, "approver_user_id": None,
+        "reactor_metadata": {"account_id": "paper-default", "quantity": 100.0},
+        "bar_ts": "2026-06-18T00:00:00Z", "play_tag": None, "schema_version": None,
+    }
+    execs.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(mod, "DEFAULT_STATE_DB", state_db, raising=False)
+    monkeypatch.setattr(mod, "DEFAULT_EXECUTIONS_PATH", execs, raising=False)
+    monkeypatch.setattr(mod.sys, "argv", ["quant-ledger-reconcile.py", "--apply"])
+
+    live_before = mod._positions(state_db, "paper-default")
+    rc = mod.main()
+    live_after = mod._positions(state_db, "paper-default")
+
+    assert rc == 4, f"--apply must fail-CLOSED on a qty reduction, got {rc}"
+    assert live_after == live_before, "state.db must be UNCHANGED — no real shares reduced away"
+    assert "refusing --apply" in capsys.readouterr().err
+
+
+def test_apply_fails_closed_on_cross_account_purge(tmp_path, monkeypatch, capsys):
+    """wave-2 Q1b: reconcile's apply does an account-UNSCOPED DELETE FROM positions, so
+    reconciling account A would DELETE a broker-confirmed position in account B. The guard
+    must see ALL accounts and fail-CLOSED.
+
+    RED-PROOF: with the cross-account check removed, --account=paper-default reports
+    'PHANTOM: 0' for its own account and returns 0, silently purging paper-alt's row."""
+    mod = _load()
+    state_db = tmp_path / "state.db"
+    execs = tmp_path / "executions.jsonl"
+    # account A (paper-default): a position the log WILL back; account B (paper-alt): a
+    # broker-confirmed position with NO log backing.
+    _seed_state_db(
+        state_db,
+        [
+            ("paper-default", "equity", "AAPL", 100.0, 150.0),
+            ("paper-alt", "equity", "TSLA", 300.0, 200.0),
+        ],
+    )
+    rec = {
+        "proposal_id": "p1", "signal_id": "s1", "asset": "AAPL", "asset_class": "equity",
+        "timeframe": "1d", "asof_decision": "2026-06-18T00:00:00Z",
+        "asof_execution": "2026-06-18T00:00:00Z", "target_position_pct": 100.0,
+        "decision_price": 150.0, "fill_price": 150.0, "fill_size_pct": 100.0,
+        "reactor_name": "paper", "human_in_the_loop": False, "approver_user_id": None,
+        "reactor_metadata": {"account_id": "paper-default", "quantity": 100.0},
+        "bar_ts": "2026-06-18T00:00:00Z", "play_tag": None, "schema_version": None,
+    }
+    execs.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(mod, "DEFAULT_STATE_DB", state_db, raising=False)
+    monkeypatch.setattr(mod, "DEFAULT_EXECUTIONS_PATH", execs, raising=False)
+    # reconcile ONLY paper-default — paper-alt's TSLA must NOT be silently purged.
+    monkeypatch.setattr(
+        mod.sys, "argv", ["quant-ledger-reconcile.py", "--apply", "--account", "paper-default"]
+    )
+
+    tsla_before = mod._all_positions(state_db).get(("paper-alt", "equity", "TSLA"))
+    assert tsla_before is not None
+    rc = mod.main()
+    tsla_after = mod._all_positions(state_db).get(("paper-alt", "equity", "TSLA"))
+
+    assert rc == 4, f"--apply must fail-CLOSED on a cross-account purge, got {rc}"
+    assert tsla_after == tsla_before, "paper-alt TSLA must survive — cross-account purge blocked"
+    err = capsys.readouterr().err
+    assert "refusing --apply" in err
 
 
 def test_dry_run_default_never_mutates(tmp_path, monkeypatch):

@@ -60,11 +60,53 @@ def _positions(db_path: Path, account: str) -> dict[tuple[str, str], tuple[float
     return {(ac, s): (round(q, 6), round(p, 4)) for ac, s, q, p in rows}
 
 
+def _all_positions(db_path: Path) -> dict[tuple[str, str, str], tuple[float, float]]:
+    """ALL live positions across EVERY account, keyed by (account, asset_class, symbol).
+
+    statedb-nvda-orphan clause (3b) / wave-2 Q1b: reconstruct_from() does an
+    account-UNSCOPED ``DELETE FROM positions`` then re-inserts the full-log fold for
+    ALL accounts (portfolio_state.py). So an --apply that reconciles ONE --account
+    still DELETES every other account's positions that lack a log backing. The
+    account-scoped guard was blind to that. This whole-table read lets the
+    fail-closed check see EVERY account's destructive change, not just the named one.
+    """
+    if not db_path.exists():
+        return {}
+    con = sqlite3.connect(str(db_path))
+    try:
+        rows = con.execute(
+            "SELECT account_id, asset_class, symbol, quantity, avg_entry_price FROM positions "
+            "WHERE abs(quantity) > 1e-9"
+        ).fetchall()
+    finally:
+        con.close()
+    return {(a, ac, s): (round(q, 6), round(p, 4)) for a, ac, s, q, p in rows}
+
+
 def _diff(live: dict, rebuilt: dict) -> tuple[list, list, list]:
     phantom = sorted(set(live) - set(rebuilt))  # in live, no backing execution -> purge
     new = sorted(set(rebuilt) - set(live))  # in log, missing from live -> add
     changed = sorted(s for s in (set(live) & set(rebuilt)) if live[s] != rebuilt[s])
     return phantom, changed, new
+
+
+def _destructive_changes(live: dict, rebuilt: dict) -> list:
+    """Keys whose rebuilt |quantity| is SMALLER than live (a partial purge).
+
+    wave-2 Q1a: the fail-closed guard originally checked only ``phantom`` (a position
+    fully ABSENT from the rebuild). But a reset/incomplete log more often REDUCES a
+    position than zeroes it (NVDA 600sh -> log backs 100sh). That lands in ``changed``,
+    which --apply happily "corrects" 600 -> 100, destroying 500 broker-confirmed shares
+    with exit 0. A reduction in |qty| is a partial purge and MUST trip the same guard.
+    An INCREASE (log shows more than live) is additive and safe.
+    """
+    out = []
+    for k in set(live) & set(rebuilt):
+        live_qty = abs(live[k][0])
+        rebuilt_qty = abs(rebuilt[k][0])
+        if rebuilt_qty < live_qty - 1e-9:
+            out.append(k)
+    return sorted(out)
 
 
 def _is_options(key: tuple[str, str]) -> bool:
@@ -100,14 +142,24 @@ def main() -> int:
         return 2
 
     live = _positions(live_db, args.account)
+    live_all = _all_positions(live_db)  # Q1b: every account (the apply DELETEs all)
 
     # Rebuild into a scratch DB first (never touch live during the diff).
     scratch_dir = Path(tempfile.mkdtemp())
     scratch = scratch_dir / "reconcile_state.db"
     res = PortfolioState(state_db_path=scratch).reconstruct_from(execs)
     rebuilt = _positions(scratch, args.account)
+    rebuilt_all = _all_positions(scratch)  # Q1b: rebuilt truth for every account
 
     phantom, changed, new = _diff(live, rebuilt)
+    reductions = _destructive_changes(live, rebuilt)  # Q1a: |qty| shrunk in named acct
+    # Q1b: every account's destructive change (purge OR reduction) the apply would do.
+    all_phantom = sorted(set(live_all) - set(rebuilt_all))
+    all_reductions = _destructive_changes(live_all, rebuilt_all)
+    # Cross-account destructive rows OUTSIDE the named account (the blind spot).
+    other_acct_destructive = sorted(
+        k for k in (set(all_phantom) | set(all_reductions)) if k[0] != args.account
+    )
 
     print(f"=== ledger reconcile (account={args.account}) — ADR-0085 ===")
     print(f"executions.jsonl: {res.executions_processed} records, {len(res.errors)} replay errors")
@@ -124,10 +176,17 @@ def main() -> int:
         print(f"   - {_k(s)}: live={live[s]}{flag}")
     print(f"\nINFLATED/CHANGED — live qty/price != execution-backed (will be CORRECTED): {len(changed)}")
     for s in changed:
-        print(f"   ~ {_k(s)}: live={live[s]} -> truth={rebuilt[s]}")
+        red = "  ⚠️ REDUCES |qty| — partial purge (destroys real shares if the log was reset)" if s in reductions else ""
+        print(f"   ~ {_k(s)}: live={live[s]} -> truth={rebuilt[s]}{red}")
     print(f"\nMISSING — in log, absent from live (will be ADDED): {len(new)}")
     for s in new:
         print(f"   + {_k(s)}: truth={rebuilt[s]}")
+    if other_acct_destructive:
+        print(f"\n⚠️  CROSS-ACCOUNT — {len(other_acct_destructive)} destructive change(s) OUTSIDE "
+              f"--account={args.account} (the apply DELETEs ALL accounts):")
+        for k in other_acct_destructive:
+            print(f"   ! {k[0]}/{k[2]} [{k[1]}]: live={live_all[k]} -> "
+                  f"{'PURGED' if k not in rebuilt_all else rebuilt_all[k]}")
 
     if res.errors:
         print(f"\n⚠️  {len(res.errors)} replay errors (records skipped) — review before --apply:")
@@ -144,25 +203,37 @@ def main() -> int:
         shutil.rmtree(scratch_dir, ignore_errors=True)
         return 3
 
-    # statedb-nvda-orphan clause (3b): FAIL-CLOSED on purge. A rebuild that would DELETE
-    # a live position is the dangerous direction — the reconstructor is options-blind and
-    # the log may have been RESET after a real fill (the NVDA orphan: 600sh +$30k lifetime,
-    # broker-confirmed, ZERO backing rows after a Jun-17 executions.jsonl reset). Silently
-    # purging to match an incomplete log deletes real money-state. So --apply REFUSES to
-    # purge anything unless --allow-purge is explicitly passed after a dry-run inspection.
-    if phantom and not args.allow_purge:
+    # statedb-nvda-orphan clause (3b) + wave-2 Q1a/Q1b: FAIL-CLOSED on ANY destructive
+    # change, ACROSS ALL ACCOUNTS. A rebuild that DELETES or REDUCES a live position is the
+    # dangerous direction — the reconstructor is options-blind and the log may have been
+    # RESET after a real fill (NVDA orphan: 600sh +$30k, broker-confirmed, zero backing rows).
+    # Three destructive shapes, each money-destroying with exit 0 if unguarded:
+    #   * phantom        — position fully ABSENT from the rebuild (the original guard)
+    #   * reductions     — |qty| SHRUNK (Q1a: 600sh -> 100sh after a partial reset; lands in
+    #                      `changed`, which --apply "corrects" -> 500 real shares gone)
+    #   * cross-account  — the apply's DELETE FROM positions is account-UNSCOPED (Q1b), so a
+    #                      broker-confirmed row in ANY OTHER account with no log backing is
+    #                      purged while reconciling THIS one.
+    # --apply REFUSES all three unless --allow-purge is explicitly passed after a dry-run.
+    destructive_named = sorted(set(phantom) | set(reductions))
+    if (destructive_named or other_acct_destructive) and not args.allow_purge:
         opt_note = (
-            f" {len(phantom_options)} of these are OPTIONS/MULTI-LEG legs the reconstructor "
-            "cannot rebuild — almost certainly REAL, not phantom." if phantom_options else ""
+            f" {len(phantom_options)} are OPTIONS/MULTI-LEG legs the reconstructor cannot "
+            "rebuild — almost certainly REAL, not phantom." if phantom_options else ""
+        )
+        xacct = (
+            f" Plus {len(other_acct_destructive)} destructive change(s) in OTHER accounts "
+            "(the rebuild's DELETE is account-unscoped)." if other_acct_destructive else ""
         )
         print(
-            f"\n❌ refusing --apply: it would PURGE {len(phantom)} live position(s) with no "
-            f"backing execution.{opt_note}\n"
-            "   A 'phantom' can be a real broker-confirmed position whose log was reset "
+            f"\n❌ refusing --apply: it would DESTROY live position state — "
+            f"{len(phantom)} purge(s) + {len(reductions)} qty-reduction(s) in "
+            f"--account={args.account}.{opt_note}{xacct}\n"
+            "   A purge/reduction can be a real broker-confirmed position whose log was reset "
             "(statedb-nvda-orphan), or an options leg the equity-only reconstructor is blind "
-            "to. Deleting it to match an incomplete log destroys real state.\n"
+            "to. Rewriting it to match an incomplete log destroys real state with exit 0.\n"
             "   If you have inspected the dry-run and these ARE fixture pollution, re-run with "
-            "--allow-purge. Otherwise resolve the log/state divergence first (NEVER purge a "
+            "--allow-purge. Otherwise resolve the log/state divergence first (NEVER destroy a "
             "broker-confirmed position).",
             file=sys.stderr,
         )

@@ -81,28 +81,9 @@ class _AlwaysVolatileDetector(RegimeDetector):
         return RegimeState.VOLATILE, "stub_always_volatile"
 
 
-@pytest.fixture(autouse=True)
-def _isolate_pooling_store(tmp_path_factory, monkeypatch):
-    """Isolate the ag03 pooling-store directory for EVERY test in this module.
-
-    pool-test-isolation-leak: several tests build a BMAAggregator with
-    HERMES_QUANT_HIERARCHICAL_POOLING=1 and NO injected store path, so the flag-ON
-    save/load resolves ``pooling_store.POOLING_DIR`` — which is bound at IMPORT time
-    from ``artifacts.QUANT_HOME`` (a Path.home() constant). A mid-test
-    ``monkeypatch.setenv("HERMES_QUANT_HOME", ...)`` is too late (the constant is
-    already bound), so without this the flag-ON tests wrote/read the operator's REAL
-    ``~/.hermes/quant/ag03_hierarchical_pooling/default.json`` -> a prior run's
-    persisted cells failed ``test_warmup_surfaced_in_bma_status``'s "every fresh cell
-    is warm-up" assertion. The documented test seam (pooling_store docstring) is to
-    monkeypatch POOLING_DIR; point it at a throwaway tmp dir. State-db-test-isolation
-    family — keep test storage out of the real home.
-    """
-    from hermes_quant.learning import pooling_store
-
-    monkeypatch.setattr(
-        pooling_store, "POOLING_DIR", tmp_path_factory.mktemp("ag03_pool_store")
-    )
-    yield
+# NOTE: ag03 POOLING_DIR + L2 POSTERIOR_DIR storage isolation is now provided by the
+# package-level tests/aggregators/conftest.py (autouse, mirrors tests/learning/conftest.py)
+# — pool-test-isolation-leak. No per-file fixture needed.
 
 
 # ===========================================================================
