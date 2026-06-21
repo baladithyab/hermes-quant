@@ -60,6 +60,50 @@ def _positions(db_path: Path, account: str) -> dict[tuple[str, str], tuple[float
     return {(ac, s): (round(q, 6), round(p, 4)) for ac, s, q, p in rows}
 
 
+def _cash(db_path: Path) -> dict[str, tuple[float, float]]:
+    """Cash row per account: account_id -> (balance_usd, equity_total).
+
+    statedb-nvda-orphan / wave-3: the fail-closed guard protected only the POSITIONS
+    table's quantity. But reconstruct_from also does an account-UNSCOPED ``DELETE FROM
+    cash`` then re-bootstraps every account from ``_default_initial_cash()`` + replayed
+    deltas. The incremental apply_execution path mutates live cash FORWARD, so live cash
+    legitimately diverges from a from-scratch replay — an --apply can therefore DESTROY
+    real broker-confirmed cash (the NVDA-orphan shape on the cash axis: cash booked, log
+    reset re-bootstraps to initial_cash) even when the position diff is clean. This read
+    lets the guard compare live-vs-rebuilt cash and refuse a balance DECREASE.
+    """
+    if not db_path.exists():
+        return {}
+    con = sqlite3.connect(str(db_path))
+    try:
+        try:
+            rows = con.execute("SELECT account_id, balance_usd, equity_total FROM cash").fetchall()
+        except sqlite3.OperationalError:
+            return {}  # no cash table (a bare/empty db) — nothing to compare
+    finally:
+        con.close()
+    return {a: (round(b, 4), round(e, 4)) for a, b, e in rows}
+
+
+def _cash_destruction(live_cash: dict, rebuilt_cash: dict) -> list[str]:
+    """Accounts whose rebuilt balance_usd OR equity_total would DECREASE (or vanish).
+
+    A decrease destroys broker-confirmed money-state. An increase (the log shows more
+    than live) is additive/safe. An absent rebuilt row = the account vanishes = a full
+    cash purge (treated as a decrease from its live balance to 0).
+    """
+    out = []
+    for acct, (live_bal, live_eq) in live_cash.items():
+        reb = rebuilt_cash.get(acct)
+        if reb is None:
+            out.append(acct)  # account's cash row would be purged entirely
+            continue
+        reb_bal, reb_eq = reb
+        if reb_bal < live_bal - 1e-6 or reb_eq < live_eq - 1e-6:
+            out.append(acct)
+    return sorted(out)
+
+
 def _all_positions(db_path: Path) -> dict[tuple[str, str, str], tuple[float, float]]:
     """ALL live positions across EVERY account, keyed by (account, asset_class, symbol).
 
@@ -91,21 +135,28 @@ def _diff(live: dict, rebuilt: dict) -> tuple[list, list, list]:
 
 
 def _destructive_changes(live: dict, rebuilt: dict) -> list:
-    """Keys whose rebuilt |quantity| is SMALLER than live (a partial purge).
+    """Keys whose rebuilt value DESTROYS live money-state: a |quantity| REDUCTION
+    (wave-2 Q1a) OR an avg_entry_price (cost-basis) REWRITE (wave-3).
 
-    wave-2 Q1a: the fail-closed guard originally checked only ``phantom`` (a position
-    fully ABSENT from the rebuild). But a reset/incomplete log more often REDUCES a
-    position than zeroes it (NVDA 600sh -> log backs 100sh). That lands in ``changed``,
-    which --apply happily "corrects" 600 -> 100, destroying 500 broker-confirmed shares
-    with exit 0. A reduction in |qty| is a partial purge and MUST trip the same guard.
-    An INCREASE (log shows more than live) is additive and safe.
+    wave-2 Q1a: the guard originally checked only ``phantom`` (a position fully ABSENT
+    from the rebuild). But a reset/incomplete log more often REDUCES a position than
+    zeroes it (NVDA 600sh -> log backs 100sh) — that lands in ``changed``, which --apply
+    "corrects" 600 -> 100, destroying 500 broker-confirmed shares with exit 0. A |qty|
+    reduction is a partial purge. An INCREASE is additive and safe.
+
+    wave-3: a position with IDENTICAL |qty| but a different rebuilt avg_entry_price also
+    rewrites money-state — cost basis drives unrealized P&L + the equity_total/kill-switch
+    notional, so a silent rewrite (e.g. a reset re-bootstrapping basis) mis-states the
+    live book. Any cost-basis move beyond a cent-level tolerance is destructive.
     """
     out = []
     for k in set(live) & set(rebuilt):
-        live_qty = abs(live[k][0])
-        rebuilt_qty = abs(rebuilt[k][0])
+        live_qty, live_px = abs(live[k][0]), live[k][1]
+        rebuilt_qty, rebuilt_px = abs(rebuilt[k][0]), rebuilt[k][1]
         if rebuilt_qty < live_qty - 1e-9:
             out.append(k)
+        elif abs(rebuilt_px - live_px) > 1e-4:
+            out.append(k)  # cost-basis rewrite (P&L / kill-switch basis mis-stated)
     return sorted(out)
 
 
@@ -160,6 +211,12 @@ def main() -> int:
     other_acct_destructive = sorted(
         k for k in (set(all_phantom) | set(all_reductions)) if k[0] != args.account
     )
+    # wave-3: the CASH axis — reconstruct_from DELETEs cash account-unscoped + re-bootstraps
+    # to initial_cash, so an --apply can destroy broker-confirmed cash even on a clean
+    # position diff. Compare live-vs-rebuilt cash for ALL accounts.
+    live_cash = _cash(live_db)
+    rebuilt_cash = _cash(scratch)
+    cash_destruction = _cash_destruction(live_cash, rebuilt_cash)
 
     print(f"=== ledger reconcile (account={args.account}) — ADR-0085 ===")
     print(f"executions.jsonl: {res.executions_processed} records, {len(res.errors)} replay errors")
@@ -187,6 +244,12 @@ def main() -> int:
         for k in other_acct_destructive:
             print(f"   ! {k[0]}/{k[2]} [{k[1]}]: live={live_all[k]} -> "
                   f"{'PURGED' if k not in rebuilt_all else rebuilt_all[k]}")
+    if cash_destruction:
+        print(f"\n⚠️  CASH — {len(cash_destruction)} account(s) whose balance/equity would "
+              f"DECREASE (the apply re-bootstraps cash from initial_cash):")
+        for acct in cash_destruction:
+            reb = rebuilt_cash.get(acct, "PURGED")
+            print(f"   $ {acct}: live(bal,eq)={live_cash[acct]} -> {reb}")
 
     if res.errors:
         print(f"\n⚠️  {len(res.errors)} replay errors (records skipped) — review before --apply:")
@@ -207,16 +270,17 @@ def main() -> int:
     # change, ACROSS ALL ACCOUNTS. A rebuild that DELETES or REDUCES a live position is the
     # dangerous direction — the reconstructor is options-blind and the log may have been
     # RESET after a real fill (NVDA orphan: 600sh +$30k, broker-confirmed, zero backing rows).
-    # Three destructive shapes, each money-destroying with exit 0 if unguarded:
+    # FIVE destructive shapes, each money-destroying with exit 0 if unguarded:
     #   * phantom        — position fully ABSENT from the rebuild (the original guard)
-    #   * reductions     — |qty| SHRUNK (Q1a: 600sh -> 100sh after a partial reset; lands in
-    #                      `changed`, which --apply "corrects" -> 500 real shares gone)
+    #   * reductions     — |qty| SHRUNK or avg_entry_price REWRITTEN (Q1a + wave-3 cost-basis;
+    #                      lands in `changed`, which --apply "corrects" -> real shares / P&L gone)
     #   * cross-account  — the apply's DELETE FROM positions is account-UNSCOPED (Q1b), so a
-    #                      broker-confirmed row in ANY OTHER account with no log backing is
-    #                      purged while reconciling THIS one.
-    # --apply REFUSES all three unless --allow-purge is explicitly passed after a dry-run.
+    #                      broker-confirmed row in ANY OTHER account is purged while reconciling THIS one.
+    #   * cash           — reconstruct_from DELETEs cash account-unscoped + re-bootstraps to
+    #                      initial_cash (wave-3); a clean position diff can still DESTROY real cash.
+    # --apply REFUSES all unless --allow-purge is explicitly passed after a dry-run.
     destructive_named = sorted(set(phantom) | set(reductions))
-    if (destructive_named or other_acct_destructive) and not args.allow_purge:
+    if (destructive_named or other_acct_destructive or cash_destruction) and not args.allow_purge:
         opt_note = (
             f" {len(phantom_options)} are OPTIONS/MULTI-LEG legs the reconstructor cannot "
             "rebuild — almost certainly REAL, not phantom." if phantom_options else ""
@@ -225,16 +289,21 @@ def main() -> int:
             f" Plus {len(other_acct_destructive)} destructive change(s) in OTHER accounts "
             "(the rebuild's DELETE is account-unscoped)." if other_acct_destructive else ""
         )
+        cash_note = (
+            f" Plus {len(cash_destruction)} account(s) whose CASH balance/equity would "
+            "DECREASE (the rebuild re-bootstraps cash from initial_cash)." if cash_destruction else ""
+        )
         print(
-            f"\n❌ refusing --apply: it would DESTROY live position state — "
-            f"{len(phantom)} purge(s) + {len(reductions)} qty-reduction(s) in "
-            f"--account={args.account}.{opt_note}{xacct}\n"
-            "   A purge/reduction can be a real broker-confirmed position whose log was reset "
-            "(statedb-nvda-orphan), or an options leg the equity-only reconstructor is blind "
-            "to. Rewriting it to match an incomplete log destroys real state with exit 0.\n"
+            f"\n❌ refusing --apply: it would DESTROY live money-state — "
+            f"{len(phantom)} purge(s) + {len(reductions)} qty/cost-basis change(s) in "
+            f"--account={args.account}.{opt_note}{xacct}{cash_note}\n"
+            "   A purge/reduction/cash-decrease can be a real broker-confirmed position or cash "
+            "balance whose log was reset (statedb-nvda-orphan), or an options leg the equity-only "
+            "reconstructor is blind to. Rewriting it to match an incomplete log destroys real "
+            "state with exit 0.\n"
             "   If you have inspected the dry-run and these ARE fixture pollution, re-run with "
-            "--allow-purge. Otherwise resolve the log/state divergence first (NEVER destroy a "
-            "broker-confirmed position).",
+            "--allow-purge. Otherwise resolve the log/state divergence first (NEVER destroy "
+            "broker-confirmed money-state).",
             file=sys.stderr,
         )
         shutil.rmtree(scratch_dir, ignore_errors=True)

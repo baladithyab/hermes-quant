@@ -66,6 +66,34 @@ def _count_positions(db_path: Path) -> int:
         con.close()
 
 
+def _seed_cash(db_path: Path, rows: list[tuple]) -> None:
+    """Seed the cash table. rows: (account_id, balance_usd, equity_total)."""
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS cash (
+                   account_id TEXT PRIMARY KEY, balance_usd REAL NOT NULL,
+                   last_update_at TEXT NOT NULL, equity_total REAL NOT NULL) WITHOUT ROWID"""
+        )
+        con.executemany(
+            "INSERT OR REPLACE INTO cash (account_id, balance_usd, last_update_at, equity_total) "
+            "VALUES (?,?, '2026-06-18T08:35:35Z', ?)",
+            rows,
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _cash_balance(db_path: Path, account: str) -> float | None:
+    con = sqlite3.connect(str(db_path))
+    try:
+        r = con.execute("SELECT balance_usd FROM cash WHERE account_id=?", (account,)).fetchone()
+        return r[0] if r else None
+    finally:
+        con.close()
+
+
 def test_positions_keyed_by_asset_class_and_symbol(tmp_path):
     """(3a) an equity NVDA and a us_option NVDA leg are DISTINCT positions, not collapsed.
 
@@ -227,6 +255,57 @@ def test_apply_fails_closed_on_cross_account_purge(tmp_path, monkeypatch, capsys
     assert tsla_after == tsla_before, "paper-alt TSLA must survive — cross-account purge blocked"
     err = capsys.readouterr().err
     assert "refusing --apply" in err
+
+
+def test_apply_fails_closed_on_cash_destruction(tmp_path, monkeypatch, capsys):
+    """wave-3 (HIGH): --apply must FAIL-CLOSED when the rebuild would DECREASE a live cash
+    balance — even when the position diff is CLEAN. reconstruct_from DELETEs cash account-
+    unscoped + re-bootstraps to initial_cash, so a real out-of-band cash balance (the
+    NVDA-orphan shape on the cash axis) is silently destroyed with exit 0 otherwise.
+
+    RED-PROOF: with the cash_destruction term removed from the guard, --apply returns 0 and
+    cash is rewritten down."""
+    mod = _load()
+    state_db = tmp_path / "state.db"
+    execs = tmp_path / "executions.jsonl"
+    # position fully backed by the log (clean position diff)...
+    _seed_state_db(state_db, [("paper-default", "equity", "AAPL", 100.0, 150.0)])
+    # ...but live cash carries a real out-of-band balance ABOVE what the log replays to.
+    _seed_cash(state_db, [("paper-default", 130000.0, 145000.0)])
+    rec = {
+        "proposal_id": "p1", "signal_id": "s1", "asset": "AAPL", "asset_class": "equity",
+        "timeframe": "1d", "asof_decision": "2026-06-18T00:00:00Z",
+        "asof_execution": "2026-06-18T00:00:00Z", "target_position_pct": 100.0,
+        "decision_price": 150.0, "fill_price": 150.0, "fill_size_pct": 100.0,
+        "reactor_name": "paper", "human_in_the_loop": False, "approver_user_id": None,
+        "reactor_metadata": {"account_id": "paper-default", "quantity": 100.0},
+        "bar_ts": "2026-06-18T00:00:00Z", "play_tag": None, "schema_version": None,
+    }
+    execs.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(mod, "DEFAULT_STATE_DB", state_db, raising=False)
+    monkeypatch.setattr(mod, "DEFAULT_EXECUTIONS_PATH", execs, raising=False)
+    monkeypatch.setattr(mod.sys, "argv", ["quant-ledger-reconcile.py", "--apply"])
+
+    bal_before = _cash_balance(state_db, "paper-default")
+    rc = mod.main()
+    bal_after = _cash_balance(state_db, "paper-default")
+
+    assert rc == 4, f"--apply must fail-CLOSED on a cash decrease, got {rc}"
+    assert bal_after == bal_before == 130000.0, "broker-confirmed cash must be UNCHANGED"
+    assert "refusing --apply" in capsys.readouterr().err
+
+
+def test_destructive_changes_flags_cost_basis_rewrite():
+    """wave-3 (MED): _destructive_changes flags a key whose |qty| is identical but whose
+    avg_entry_price (cost basis, tuple index 1) is rewritten — it drives P&L + the
+    kill-switch basis. RED-PROOF: with only the qty check, this returns []."""
+    mod = _load()
+    live = {("equity", "AAPL"): (100.0, 150.0)}
+    rebuilt = {("equity", "AAPL"): (100.0, 999.0)}  # same qty, cost basis rewritten
+    assert mod._destructive_changes(live, rebuilt) == [("equity", "AAPL")]
+    # a tiny (sub-cent) price drift is NOT flagged (tolerance)
+    assert mod._destructive_changes(live, {("equity", "AAPL"): (100.0, 150.00005)}) == []
 
 
 def test_dry_run_default_never_mutates(tmp_path, monkeypatch):
