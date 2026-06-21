@@ -36,19 +36,28 @@ from hermes_quant.state.portfolio_state import (
 )
 
 
-def _positions(db_path: Path, account: str) -> dict[str, tuple[float, float]]:
+def _positions(db_path: Path, account: str) -> dict[tuple[str, str], tuple[float, float]]:
+    """Live positions keyed by (asset_class, symbol) — the positions PRIMARY KEY.
+
+    statedb-nvda-orphan clause (3a): keying by ``symbol`` ALONE collapsed an equity
+    NVDA and a us_option NVDA260626C00160000 into one key, and made the diff blind to
+    asset_class. The positions table PK is (account_id, asset_class, symbol), so an
+    options leg and its underlying equity are DISTINCT positions; key on the real
+    composite so each is visible (and so an options leg is not silently merged into,
+    or mistaken for, the equity row).
+    """
     if not db_path.exists():
         return {}
     con = sqlite3.connect(str(db_path))
     try:
         rows = con.execute(
-            "SELECT symbol, quantity, avg_entry_price FROM positions "
+            "SELECT asset_class, symbol, quantity, avg_entry_price FROM positions "
             "WHERE account_id = ? AND abs(quantity) > 1e-9",
             (account,),
         ).fetchall()
     finally:
         con.close()
-    return {s: (round(q, 6), round(p, 4)) for s, q, p in rows}
+    return {(ac, s): (round(q, 6), round(p, 4)) for ac, s, q, p in rows}
 
 
 def _diff(live: dict, rebuilt: dict) -> tuple[list, list, list]:
@@ -58,10 +67,30 @@ def _diff(live: dict, rebuilt: dict) -> tuple[list, list, list]:
     return phantom, changed, new
 
 
+def _is_options(key: tuple[str, str]) -> bool:
+    """True if a (asset_class, symbol) key is an options/multi-leg position.
+
+    reconstruct_from() is options-blind (it folds only equity NAV-fractions), so EVERY
+    options leg in state.db has no backing in the rebuilt projection and would look
+    'phantom'. Purging those = deleting real, broker-confirmed legs to match an
+    incomplete log. This predicate lets --apply fail-CLOSED on them specifically.
+    """
+    return key[0] in ("us_option", "option", "multi_leg")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--apply", action="store_true", help="rebuild state.db in place (backs up first)")
     ap.add_argument("--account", default="paper-default", help="state.db account_id to reconcile")
+    ap.add_argument(
+        "--allow-purge",
+        action="store_true",
+        help="REQUIRED to apply when the rebuild would PURGE any live position. Without it, "
+        "--apply fails-CLOSED on any phantom (statedb-nvda-orphan): the reconstructor is "
+        "options-blind + the log may have been reset, so a 'phantom' can be a real broker-"
+        "confirmed position. Only pass this for a KNOWN fixture-pollution cleanup you have "
+        "inspected in dry-run.",
+    )
     args = ap.parse_args()
 
     live_db = DEFAULT_STATE_DB
@@ -84,15 +113,21 @@ def main() -> int:
     print(f"executions.jsonl: {res.executions_processed} records, {len(res.errors)} replay errors")
     print(f"live positions: {len(live)}  |  execution-backed truth: {len(rebuilt)}")
     print()
-    print(f"PHANTOM — in live, NO backing execution (will be PURGED): {len(phantom)}")
+    def _k(key: tuple[str, str]) -> str:
+        return f"{key[1]} [{key[0]}]"
+
+    phantom_options = [s for s in phantom if _is_options(s)]
+    print(f"PHANTOM — in live, NO backing execution (would be PURGED): {len(phantom)}"
+          f"  (of which options/multi-leg: {len(phantom_options)})")
     for s in phantom:
-        print(f"   - {s}: live={live[s]}")
+        flag = "  ⚠️ OPTIONS — reconstructor is options-blind; likely REAL, not phantom" if _is_options(s) else ""
+        print(f"   - {_k(s)}: live={live[s]}{flag}")
     print(f"\nINFLATED/CHANGED — live qty/price != execution-backed (will be CORRECTED): {len(changed)}")
     for s in changed:
-        print(f"   ~ {s}: live={live[s]} -> truth={rebuilt[s]}")
+        print(f"   ~ {_k(s)}: live={live[s]} -> truth={rebuilt[s]}")
     print(f"\nMISSING — in log, absent from live (will be ADDED): {len(new)}")
     for s in new:
-        print(f"   + {s}: truth={rebuilt[s]}")
+        print(f"   + {_k(s)}: truth={rebuilt[s]}")
 
     if res.errors:
         print(f"\n⚠️  {len(res.errors)} replay errors (records skipped) — review before --apply:")
@@ -108,6 +143,31 @@ def main() -> int:
         print("\n❌ refusing --apply with replay errors present (fail-closed). Fix the log first.", file=sys.stderr)
         shutil.rmtree(scratch_dir, ignore_errors=True)
         return 3
+
+    # statedb-nvda-orphan clause (3b): FAIL-CLOSED on purge. A rebuild that would DELETE
+    # a live position is the dangerous direction — the reconstructor is options-blind and
+    # the log may have been RESET after a real fill (the NVDA orphan: 600sh +$30k lifetime,
+    # broker-confirmed, ZERO backing rows after a Jun-17 executions.jsonl reset). Silently
+    # purging to match an incomplete log deletes real money-state. So --apply REFUSES to
+    # purge anything unless --allow-purge is explicitly passed after a dry-run inspection.
+    if phantom and not args.allow_purge:
+        opt_note = (
+            f" {len(phantom_options)} of these are OPTIONS/MULTI-LEG legs the reconstructor "
+            "cannot rebuild — almost certainly REAL, not phantom." if phantom_options else ""
+        )
+        print(
+            f"\n❌ refusing --apply: it would PURGE {len(phantom)} live position(s) with no "
+            f"backing execution.{opt_note}\n"
+            "   A 'phantom' can be a real broker-confirmed position whose log was reset "
+            "(statedb-nvda-orphan), or an options leg the equity-only reconstructor is blind "
+            "to. Deleting it to match an incomplete log destroys real state.\n"
+            "   If you have inspected the dry-run and these ARE fixture pollution, re-run with "
+            "--allow-purge. Otherwise resolve the log/state divergence first (NEVER purge a "
+            "broker-confirmed position).",
+            file=sys.stderr,
+        )
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+        return 4
 
     # APPLY: back up the live DB, then rebuild it in place via the same idempotent fold.
     from datetime import datetime, timezone
