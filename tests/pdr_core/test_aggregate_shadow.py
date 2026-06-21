@@ -57,6 +57,22 @@ def _flags_off(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path_factory, monkeypatch):
+    """Isolate HERMES_QUANT_HOME for EVERY test in this module.
+
+    The flag-ON recommend() seam tests (and any test that lets run_shadow_aggregate
+    persist with divergence_path=None) resolve the divergence-log path via
+    quant_home() -> WITHOUT this, they would APPEND parity records to the operator's
+    real ~/.hermes/quant/pdr-core-shadow-aggregate-divergence.jsonl, polluting a future
+    real parity sample (the state-db-test-isolation-leak family). Pin a throwaway home.
+    """
+    home = tmp_path_factory.mktemp("agg_shadow_home")
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(home))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    yield
+
+
 def _live_aggregator(tmp_path, **kwargs) -> BMAAggregator:
     """A FRESH BMAAggregator forced onto ColdStartCalibrator (no update() calls)."""
     nonexistent = tmp_path / "no_such_isotonic.pkl"
