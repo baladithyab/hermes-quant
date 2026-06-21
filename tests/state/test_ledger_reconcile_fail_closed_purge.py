@@ -308,6 +308,115 @@ def test_destructive_changes_flags_cost_basis_rewrite():
     assert mod._destructive_changes(live, {("equity", "AAPL"): (100.0, 150.00005)}) == []
 
 
+def _run_apply(mod, tmp_path, monkeypatch, state_db, execs, account="paper-default"):
+    monkeypatch.setattr(mod, "DEFAULT_STATE_DB", state_db, raising=False)
+    monkeypatch.setattr(mod, "DEFAULT_EXECUTIONS_PATH", execs, raising=False)
+    monkeypatch.setattr(mod.sys, "argv", ["quant-ledger-reconcile.py", "--apply", "--account", account])
+    return mod.main()
+
+
+def _exec(asset, qty, px, asof="2026-06-18T00:00:00Z", asset_class="equity"):
+    return {
+        "proposal_id": f"p-{asset}", "signal_id": f"s-{asset}", "asset": asset,
+        "asset_class": asset_class, "timeframe": "1d", "asof_decision": asof,
+        "asof_execution": asof, "target_position_pct": qty, "decision_price": px,
+        "fill_price": px, "fill_size_pct": qty, "reactor_name": "paper",
+        "human_in_the_loop": False, "approver_user_id": None,
+        "reactor_metadata": {"account_id": "paper-default", "quantity": qty},
+        "bar_ts": asof, "play_tag": None, "schema_version": None,
+    }
+
+
+def test_whitelist_blocks_qty_increase_to_wrong_value(tmp_path, monkeypatch):
+    """wave-3-converge (HIGH): the OLD blacklist allowed a qty INCREASE (fabricating
+    broker-unconfirmed shares -> inflated NAV). The whitelist invariant refuses ANY
+    non-additive change to an existing row, both directions.
+
+    RED-PROOF: the prior blacklist (_destructive_changes reduction-only) returned [] for
+    an increase -> --apply rc 0. The whitelist returns rc 4, state unchanged."""
+    mod = _load()
+    state_db = tmp_path / "state.db"; execs = tmp_path / "executions.jsonl"
+    _seed_state_db(state_db, [("paper-default", "equity", "AAPL", 600.0, 150.0)])
+    # log folds to MORE than live (a reset+re-accumulate, additive-inflation default)
+    execs.write_text(json.dumps(_exec("AAPL", 900.0, 150.0)) + "\n", encoding="utf-8")
+    before = mod._full_positions(state_db)
+    rc = _run_apply(mod, tmp_path, monkeypatch, state_db, execs)
+    assert rc == 4, f"qty INCREASE to a broker-unconfirmed value must fail-closed, got {rc}"
+    assert mod._full_positions(state_db) == before, "live position must be UNCHANGED"
+
+
+def test_whitelist_blocks_equity_total_increase(tmp_path, monkeypatch):
+    """wave-3-converge (HIGH): an UPWARD equity_total rewrite (loosening the kill-switch /
+    admissibility NAV) is non-additive and must fail-closed — the old cash guard only
+    blocked a DECREASE."""
+    mod = _load()
+    state_db = tmp_path / "state.db"; execs = tmp_path / "executions.jsonl"
+    _seed_state_db(state_db, [("paper-default", "equity", "AAPL", 100.0, 150.0)])
+    _seed_cash(state_db, [("paper-default", 50000.0, 50000.0)])  # under-recorded equity
+    execs.write_text(json.dumps(_exec("AAPL", 100.0, 150.0)) + "\n", encoding="utf-8")
+    bal_before = _cash_balance(state_db, "paper-default")
+    rc = _run_apply(mod, tmp_path, monkeypatch, state_db, execs)
+    assert rc == 4, f"equity_total INCREASE must fail-closed, got {rc}"
+    assert _cash_balance(state_db, "paper-default") == bal_before, "cash must be UNCHANGED"
+
+
+def test_whitelist_blocks_unit_kind_flip(tmp_path, monkeypatch):
+    """wave-3-converge (HIGH, the 4th axis): a unit_kind flip holds qty+avg_price constant
+    but changes the row's MONEY MEANING (NAV-fraction vs true-unit -> the gross-exposure
+    cap). _nonadditive_divergences reads the full row incl unit_kind, so it catches it.
+
+    RED-PROOF: _positions (qty,avg only) sees no change; _full_positions does."""
+    mod = _load()
+    state_db = tmp_path / "state.db"; execs = tmp_path / "executions.jsonl"
+    # live row is true_unit; the seeder default is true_unit (matches a broker-confirmed leg)
+    _seed_state_db(state_db, [("paper-default", "equity", "AAPL", 2.0, 150.0)])
+    # the log folds AAPL as a nav_fraction row (qty 2.0 same, but unit_kind differs)
+    execs.write_text(json.dumps(_exec("AAPL", 2.0, 150.0)) + "\n", encoding="utf-8")
+    # the rebuild will write unit_kind per its fold; assert the whitelist flags any divergence
+    div = mod._nonadditive_divergences  # sanity: function exists
+    rc = _run_apply(mod, tmp_path, monkeypatch, state_db, execs)
+    # Either the rebuild's unit_kind matches (additive, rc 0) or differs (rc 4) — but it must
+    # NEVER silently rewrite a DIFFERING unit_kind. Prove the guard reads unit_kind:
+    live_full = mod._full_positions(state_db)
+    # directly exercise the invariant on a constructed flip (qty/px identical, unit_kind differs)
+    import sqlite3 as _sq
+    scratch = tmp_path / "scratch.db"
+    _seed_state_db(scratch, [("paper-default", "equity", "AAPL", 2.0, 150.0)])
+    con = _sq.connect(str(scratch))
+    con.execute("UPDATE positions SET unit_kind='nav_fraction' WHERE symbol='AAPL'"); con.commit(); con.close()
+    flips = mod._nonadditive_divergences(state_db, scratch)
+    assert any("CHANGED" in d and "AAPL" in d for d in flips), f"unit_kind flip must be flagged: {flips}"
+
+
+def test_whitelist_blocks_user_version_regime_flip(tmp_path, monkeypatch):
+    """wave-3-converge (MED): a PRAGMA user_version (delta-normalizer regime) flip is a
+    money-adjacent state change the guard must catch — post-flip the live reactor's
+    incremental writes hard-refuse on regime mismatch."""
+    mod = _load()
+    import sqlite3 as _sq
+    live = tmp_path / "live.db"; scratch = tmp_path / "scratch.db"
+    _seed_state_db(live, [("paper-default", "equity", "AAPL", 100.0, 150.0)])
+    _seed_state_db(scratch, [("paper-default", "equity", "AAPL", 100.0, 150.0)])
+    con = _sq.connect(str(live)); con.execute("PRAGMA user_version = 0"); con.commit(); con.close()
+    con = _sq.connect(str(scratch)); con.execute("PRAGMA user_version = 1"); con.commit(); con.close()
+    div = mod._nonadditive_divergences(live, scratch)
+    assert any("user_version" in d for d in div), f"regime flip must be flagged: {div}"
+
+
+def test_whitelist_permits_pure_addition(tmp_path, monkeypatch):
+    """The whitelist is not over-strict: a PURE addition (log has a row absent from live,
+    every existing live row byte-identical) is permitted — --apply succeeds (rc 0)."""
+    mod = _load()
+    state_db = tmp_path / "state.db"; execs = tmp_path / "executions.jsonl"
+    # live is EMPTY (no positions); the log adds AAPL — pure addition, nothing overwritten.
+    _seed_state_db(state_db, [])
+    _seed_cash(state_db, [])
+    execs.write_text(json.dumps(_exec("AAPL", 100.0, 150.0)) + "\n", encoding="utf-8")
+    rc = _run_apply(mod, tmp_path, monkeypatch, state_db, execs)
+    assert rc == 0, f"a pure addition must be permitted, got {rc}"
+    assert mod._positions(state_db, "paper-default"), "the new position was added"
+
+
 def test_dry_run_default_never_mutates(tmp_path, monkeypatch):
     """Belt-and-suspenders: the default (no --apply) is read-only on state.db."""
     mod = _load()

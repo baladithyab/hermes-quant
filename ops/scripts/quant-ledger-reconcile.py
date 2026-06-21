@@ -160,6 +160,84 @@ def _destructive_changes(live: dict, rebuilt: dict) -> list:
     return sorted(out)
 
 
+def _full_positions(db_path: Path) -> dict[tuple[str, str, str], tuple[float, float, str]]:
+    """EVERY live position, ALL accounts, FULL money-bearing row:
+    (account, asset_class, symbol) -> (quantity, avg_entry_price, unit_kind).
+
+    Includes ``unit_kind`` — a wave-3-converge HIGH: unit_kind decides whether ``quantity``
+    means a NAV-fraction or a true unit count (position_gross_fraction reads it), so a
+    rebuild that holds qty+avg_price constant but flips unit_kind silently changes the
+    row's MONEY MEANING and the live gross-exposure cap. The whitelist guard compares the
+    full tuple so that reinterpretation cannot slip through as 'unchanged'.
+    """
+    if not db_path.exists():
+        return {}
+    con = sqlite3.connect(str(db_path))
+    try:
+        try:
+            rows = con.execute(
+                "SELECT account_id, asset_class, symbol, quantity, avg_entry_price, unit_kind "
+                "FROM positions WHERE abs(quantity) > 1e-9"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+    finally:
+        con.close()
+    return {(a, ac, s): (round(q, 6), round(p, 4), uk) for a, ac, s, q, p, uk in rows}
+
+
+def _user_version(db_path: Path) -> int | None:
+    """The PRAGMA user_version regime stamp (ft1 delta-normalizer), or None if absent."""
+    if not db_path.exists():
+        return None
+    con = sqlite3.connect(str(db_path))
+    try:
+        return con.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        con.close()
+
+
+def _nonadditive_divergences(live_db: Path, scratch_db: Path) -> list[str]:
+    """THE authoritative fail-closed invariant (wave-3-converge): return human-readable
+    descriptions of every way the rebuild is NOT a pure ADDITION to live money-state.
+
+    WHY a whitelist, not a blacklist: each prior wave patched one destructive DIRECTION
+    (qty-down, cost-basis, cash-down, cross-account) and the next adversarial pass found
+    its mirror (qty-UP fabricating shares, equity-UP loosening the kill-switch, unit_kind
+    reinterpretation, user_version regime flip). Enumerating destructive axes never
+    converges. So invert: --apply (without --allow-purge) is permitted ONLY when the
+    rebuild ADDS rows and leaves every existing live money-bearing value byte-identical.
+    ANY removal, reduction, increase, reinterpretation, cash change, or regime-stamp flip
+    is non-additive and fails-closed. This subsumes every known axis AND every unknown one.
+
+    Covers: positions (qty / avg_entry_price / unit_kind, all accounts), cash
+    (balance_usd / equity_total, all accounts), and the user_version regime stamp.
+    (executions_replayed watermark + processed_fills are O(delta) bookkeeping the next
+    incremental fold self-heals via its MAX-merge — not broker-confirmed value, so they
+    are intentionally not gated here; see the seed for the rationale.)
+    """
+    div: list[str] = []
+    live_p, reb_p = _full_positions(live_db), _full_positions(scratch_db)
+    for key, lv in live_p.items():
+        rv = reb_p.get(key)
+        a, ac, s = key
+        if rv is None:
+            div.append(f"position PURGED: {a}/{s} [{ac}] live={lv}")
+        elif rv != lv:
+            div.append(f"position CHANGED: {a}/{s} [{ac}] live={lv} -> rebuilt={rv}")
+    live_c, reb_c = _cash(live_db), _cash(scratch_db)
+    for acct, lv in live_c.items():
+        rv = reb_c.get(acct)
+        if rv is None:
+            div.append(f"cash PURGED: {acct} live(bal,eq)={lv}")
+        elif rv != lv:
+            div.append(f"cash CHANGED: {acct} live(bal,eq)={lv} -> rebuilt={rv}")
+    lver, rver = _user_version(live_db), _user_version(scratch_db)
+    if lver is not None and rver is not None and lver != rver:
+        div.append(f"user_version (normalizer regime) FLIP: live={lver} -> rebuilt={rver}")
+    return div
+
+
 def _is_options(key: tuple[str, str]) -> bool:
     """True if a (asset_class, symbol) key is an options/multi-leg position.
 
@@ -217,6 +295,10 @@ def main() -> int:
     live_cash = _cash(live_db)
     rebuilt_cash = _cash(scratch)
     cash_destruction = _cash_destruction(live_cash, rebuilt_cash)
+    # wave-3-converge: THE authoritative fail-closed invariant — any NON-ADDITIVE
+    # divergence (the per-axis lists above are an informative subset; this is the
+    # whitelist that also catches qty-UP / equity-UP / unit_kind / regime-flip).
+    nonadditive = _nonadditive_divergences(live_db, scratch)
 
     print(f"=== ledger reconcile (account={args.account}) — ADR-0085 ===")
     print(f"executions.jsonl: {res.executions_processed} records, {len(res.errors)} replay errors")
@@ -250,6 +332,11 @@ def main() -> int:
         for acct in cash_destruction:
             reb = rebuilt_cash.get(acct, "PURGED")
             print(f"   $ {acct}: live(bal,eq)={live_cash[acct]} -> {reb}")
+    if nonadditive:
+        print(f"\n⛔ NON-ADDITIVE — {len(nonadditive)} change(s) that are NOT a pure addition "
+              f"to live money-state (the authoritative --apply blocker):")
+        for d in nonadditive[:50]:
+            print(f"   ⛔ {d}")
 
     if res.errors:
         print(f"\n⚠️  {len(res.errors)} replay errors (records skipped) — review before --apply:")
@@ -279,31 +366,28 @@ def main() -> int:
     #   * cash           — reconstruct_from DELETEs cash account-unscoped + re-bootstraps to
     #                      initial_cash (wave-3); a clean position diff can still DESTROY real cash.
     # --apply REFUSES all unless --allow-purge is explicitly passed after a dry-run.
-    destructive_named = sorted(set(phantom) | set(reductions))
-    if (destructive_named or other_acct_destructive or cash_destruction) and not args.allow_purge:
+    # AUTHORITATIVE FAIL-CLOSED INVARIANT (wave-3-converge): --apply is permitted without
+    # --allow-purge ONLY when the rebuild is a PURE ADDITION to live money-state. Any
+    # non-additive divergence (purge / reduction / increase / cost-basis or unit_kind
+    # reinterpretation / cash change / regime-stamp flip — across ALL accounts) refuses.
+    # This whitelist subsumes the per-axis blacklist above AND axes not yet enumerated:
+    # enumerating destructive directions never converged (each patch surfaced its mirror).
+    if nonadditive and not args.allow_purge:
         opt_note = (
-            f" {len(phantom_options)} are OPTIONS/MULTI-LEG legs the reconstructor cannot "
-            "rebuild — almost certainly REAL, not phantom." if phantom_options else ""
-        )
-        xacct = (
-            f" Plus {len(other_acct_destructive)} destructive change(s) in OTHER accounts "
-            "(the rebuild's DELETE is account-unscoped)." if other_acct_destructive else ""
-        )
-        cash_note = (
-            f" Plus {len(cash_destruction)} account(s) whose CASH balance/equity would "
-            "DECREASE (the rebuild re-bootstraps cash from initial_cash)." if cash_destruction else ""
+            f"\n   {len(phantom_options)} of the purged rows are OPTIONS/MULTI-LEG legs the "
+            "reconstructor cannot rebuild — almost certainly REAL, not phantom." if phantom_options else ""
         )
         print(
-            f"\n❌ refusing --apply: it would DESTROY live money-state — "
-            f"{len(phantom)} purge(s) + {len(reductions)} qty/cost-basis change(s) in "
-            f"--account={args.account}.{opt_note}{xacct}{cash_note}\n"
-            "   A purge/reduction/cash-decrease can be a real broker-confirmed position or cash "
-            "balance whose log was reset (statedb-nvda-orphan), or an options leg the equity-only "
-            "reconstructor is blind to. Rewriting it to match an incomplete log destroys real "
-            "state with exit 0.\n"
-            "   If you have inspected the dry-run and these ARE fixture pollution, re-run with "
-            "--allow-purge. Otherwise resolve the log/state divergence first (NEVER destroy "
-            "broker-confirmed money-state).",
+            f"\n❌ refusing --apply: the rebuild is NOT a pure addition to live money-state — "
+            f"{len(nonadditive)} non-additive change(s) (positions/cash/regime across all "
+            f"accounts) that would OVERWRITE broker-confirmed state with exit 0.{opt_note}\n"
+            "   A change/purge/reduction/increase can be a real broker-confirmed position, cash "
+            "balance, or unit-kind whose log was reset (statedb-nvda-orphan), or an options leg "
+            "the equity-only reconstructor is blind to. The reconcile only SAFELY heals by ADDING "
+            "missing rows; any alteration of existing money-state must be inspected.\n"
+            "   If you have inspected the dry-run and these ARE fixture pollution / an intended "
+            "correction, re-run with --allow-purge. Otherwise resolve the log/state divergence "
+            "first (NEVER overwrite broker-confirmed money-state).",
             file=sys.stderr,
         )
         shutil.rmtree(scratch_dir, ignore_errors=True)
