@@ -52,7 +52,7 @@ def _positions(db_path: Path, account: str) -> dict[tuple[str, str], tuple[float
     try:
         rows = con.execute(
             "SELECT asset_class, symbol, quantity, avg_entry_price FROM positions "
-            "WHERE account_id = ? AND abs(quantity) > 1e-9",
+            "WHERE account_id = ? AND abs(quantity) > 1e-12",
             (account,),
         ).fetchall()
     finally:
@@ -120,7 +120,7 @@ def _all_positions(db_path: Path) -> dict[tuple[str, str, str], tuple[float, flo
     try:
         rows = con.execute(
             "SELECT account_id, asset_class, symbol, quantity, avg_entry_price FROM positions "
-            "WHERE abs(quantity) > 1e-9"
+            "WHERE abs(quantity) > 1e-12"
         ).fetchall()
     finally:
         con.close()
@@ -177,7 +177,7 @@ def _full_positions(db_path: Path) -> dict[tuple[str, str, str], tuple[float, fl
         try:
             rows = con.execute(
                 "SELECT account_id, asset_class, symbol, quantity, avg_entry_price, unit_kind "
-                "FROM positions WHERE abs(quantity) > 1e-9"
+                "FROM positions WHERE abs(quantity) > 1e-12"
             ).fetchall()
         except sqlite3.OperationalError:
             return {}

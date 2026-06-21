@@ -417,6 +417,24 @@ def test_whitelist_permits_pure_addition(tmp_path, monkeypatch):
     assert mod._positions(state_db, "paper-default"), "the new position was added"
 
 
+def test_dust_band_position_is_visible_to_guard(tmp_path):
+    """reconcile-dust-band: the guard read-filter (abs(qty)>1e-12) now matches the rebuild
+    close-threshold (abs(qty)<1e-12 dropped), so a (1e-12,1e-9] dust row is NOT invisible.
+
+    RED-PROOF: with the old >1e-9 filter, a live qty=5e-10... actually 5e-10 < 1e-12? no:
+    use 5e-11 which is in (1e-12, 1e-9]; old filter hid it, new filter sees it."""
+    mod = _load()
+    live = tmp_path / "live.db"
+    scratch = tmp_path / "scratch.db"
+    # a dust-band live row (5e-11 is in (1e-12, 1e-9]) that the rebuild would PURGE
+    _seed_state_db(live, [("paper-default", "equity", "DUST", 5e-11, 1.0)])
+    _seed_state_db(scratch, [])  # rebuild drops it -> purge
+    div = mod._nonadditive_divergences(live, scratch)
+    assert any("DUST" in d and "PURGED" in d for d in div), (
+        f"dust-band row must be visible to the guard now: {div}"
+    )
+
+
 def test_dry_run_default_never_mutates(tmp_path, monkeypatch):
     """Belt-and-suspenders: the default (no --apply) is read-only on state.db."""
     mod = _load()
