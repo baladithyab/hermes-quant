@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from hermes_quant.pdr_core.aegis_contract_bridge import (
+    CONFIG_ENV,
     ENABLE_ENV,
     SRC_ENV,
     probe_aegis_contracts,
@@ -22,7 +23,7 @@ def test_aegis_contract_bridge_default_off_does_not_import(monkeypatch) -> None:
 
     assert status.enabled is False
     assert status.loaded is False
-    assert "not enabled" in status.reason
+    assert status.reason == "aegis bridge disabled"
     assert "aegis.contracts" not in sys.modules
 
 
@@ -64,6 +65,68 @@ def test_aegis_contract_bridge_can_load_explicit_source_checkout(tmp_path) -> No
     assert status.module == "aegis.contracts"
     assert status.source and str(package_root) in status.source
     assert status.errors == ()
+
+
+def test_aegis_contract_bridge_loads_from_yaml_config(tmp_path) -> None:
+    package_root = tmp_path / "src"
+    package = package_root / "aegis"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    source_contracts = Path(__file__).resolve().parents[2] / "hermes_quant" / "pdr_core" / "contracts.py"
+    shutil.copy2(source_contracts, package / "contracts.py")
+    config_path = tmp_path / "aegis.yaml"
+    config_path.write_text(
+        f"hermes_bridge:\n  contracts_shadow: true\n  source_path: {package_root}\n",
+        encoding="utf-8",
+    )
+    sys.modules.pop("aegis", None)
+    sys.modules.pop("aegis.contracts", None)
+
+    status = probe_aegis_contracts({}, config_path=config_path)
+
+    assert status.enabled is True
+    assert status.loaded is True
+    assert status.reason == "ok"
+
+
+def test_aegis_contract_bridge_reads_yaml_path_from_env(tmp_path) -> None:
+    package_root = tmp_path / "src"
+    package = package_root / "aegis"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    source_contracts = Path(__file__).resolve().parents[2] / "hermes_quant" / "pdr_core" / "contracts.py"
+    shutil.copy2(source_contracts, package / "contracts.py")
+    config_path = tmp_path / "aegis.yaml"
+    config_path.write_text(
+        f"hermes_bridge:\n  contracts_shadow: true\n  source_path: {package_root}\n",
+        encoding="utf-8",
+    )
+    sys.modules.pop("aegis", None)
+    sys.modules.pop("aegis.contracts", None)
+
+    status = probe_aegis_contracts({CONFIG_ENV: str(config_path)})
+
+    assert status.enabled is True
+    assert status.loaded is True
+    assert status.reason == "ok"
+
+
+def test_aegis_contract_bridge_env_overrides_yaml_disable(tmp_path) -> None:
+    package_root = tmp_path / "src"
+    config_path = tmp_path / "aegis.yaml"
+    config_path.write_text(
+        f"hermes_bridge:\n  contracts_shadow: true\n  source_path: {package_root}\n",
+        encoding="utf-8",
+    )
+    sys.modules.pop("aegis", None)
+    sys.modules.pop("aegis.contracts", None)
+
+    status = probe_aegis_contracts({ENABLE_ENV: "0"}, config_path=config_path)
+
+    assert status.enabled is False
+    assert status.loaded is False
+    assert status.reason == "aegis bridge disabled"
+    assert "aegis.contracts" not in sys.modules
 
 
 def test_aegis_contract_bridge_detects_contract_drift(tmp_path) -> None:
