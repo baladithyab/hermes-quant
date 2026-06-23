@@ -81,6 +81,11 @@ class _AlwaysVolatileDetector(RegimeDetector):
         return RegimeState.VOLATILE, "stub_always_volatile"
 
 
+# NOTE: ag03 POOLING_DIR + L2 POSTERIOR_DIR storage isolation is now provided by the
+# package-level tests/aggregators/conftest.py (autouse, mirrors tests/learning/conftest.py)
+# — pool-test-isolation-leak. No per-file fixture needed.
+
+
 # ===========================================================================
 # 1. POOLING DIVERGENCE (load-bearing, non-vacuous)
 #    A thin (n=2, 2/2 correct) cell must NOT get a near-1.0 weight.

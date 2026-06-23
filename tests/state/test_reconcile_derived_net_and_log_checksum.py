@@ -123,10 +123,12 @@ def test_reconcile_reads_derived_net_not_raw_fill_size(tmp_path, monkeypatch):
     rebuilt = reconcile._positions(rebuilt_db, "paper-default")
 
     # The reconcile's DERIVED net is the single intended 0.05.
-    assert rebuilt["AAPL"][0] == pytest.approx(0.05, rel=1e-9)
+    # statedb-nvda-orphan (3a): _positions now keys by (asset_class, symbol).
+    aapl = ("equity", "AAPL")
+    assert rebuilt[aapl][0] == pytest.approx(0.05, rel=1e-9)
     # ... and that is NOT the raw fill_size_pct sum (which would be the inflated 0.60).
     assert _raw_size_sum(bus, "AAPL") == pytest.approx(0.60, rel=1e-9)
-    assert rebuilt["AAPL"][0] != pytest.approx(_raw_size_sum(bus, "AAPL"), rel=1e-3)
+    assert rebuilt[aapl][0] != pytest.approx(_raw_size_sum(bus, "AAPL"), rel=1e-3)
 
 
 def test_old_fold_vs_new_fold_reports_nonzero_divergence(tmp_path, monkeypatch):
@@ -142,18 +144,19 @@ def test_old_fold_vs_new_fold_reports_nonzero_divergence(tmp_path, monkeypatch):
     live_db = tmp_path / "live_old.db"
     PortfolioState(state_db_path=live_db).reconstruct_from(bus)
     live = reconcile._positions(live_db, "paper-default")
-    assert live["AAPL"][0] == pytest.approx(0.60, rel=1e-9), "OLD fold must be inflated"
+    aapl = ("equity", "AAPL")  # statedb-nvda-orphan (3a): (asset_class, symbol) key
+    assert live[aapl][0] == pytest.approx(0.60, rel=1e-9), "OLD fold must be inflated"
 
     # NEW fold: rebuild a scratch db flag-ON (corrected to 0.05).
     monkeypatch.setenv("HERMES_QUANT_DELTA_NORMALIZER", "1")
     new_db = tmp_path / "new.db"
     PortfolioState(state_db_path=new_db).reconstruct_from(bus)
     rebuilt = reconcile._positions(new_db, "paper-default")
-    assert rebuilt["AAPL"][0] == pytest.approx(0.05, rel=1e-9), "NEW fold must be corrected"
+    assert rebuilt[aapl][0] == pytest.approx(0.05, rel=1e-9), "NEW fold must be corrected"
 
     # The reconcile diff reports a NON-ZERO CHANGED divergence (AAPL moved 0.60 -> 0.05).
     phantom, changed, new = reconcile._diff(live, rebuilt)
-    assert "AAPL" in changed, (
+    assert aapl in changed, (
         "reconcile must report AAPL as CHANGED (0.60 -> 0.05); a raw-fill_size_pct "
         "comparison would have reported 0 divergence (both logs identical)"
     )

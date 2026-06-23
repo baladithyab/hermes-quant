@@ -241,3 +241,100 @@ def test_reconstructs_43_position_book_correctly(tmp_path: Path) -> None:
     assert math.isclose(state.gross_exposure_pct, 8.6)
     assert math.isclose(state.net_exposure_pct, -38 * 0.20 + 5 * 0.20)
     assert state.cash_pct < 0  # over-leveraged
+
+
+# ---------------------------------------------------------------------------
+# aegis-ra-home2 (ADR-0092 home-decouple residue): the executions DEFAULT path
+# must honor HERMES_QUANT_HOME / HERMES_HOME, resolved AT CALL TIME — not bound
+# to ~/.hermes at IMPORT. RED-proof: pre-fix the module-level constant
+# _DEFAULT_EXECUTIONS_PATH was Path("~/.hermes/quant/executions.jsonl") expanded
+# at import, so an injected home was silently ignored and the read fell back to
+# the real ~/.hermes book.
+# ---------------------------------------------------------------------------
+
+
+def test_default_executions_path_honors_hermes_quant_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """HERMES_QUANT_HOME redirects the DEFAULT executions path to the injected
+    quant root (NOT ~/.hermes). Proven by writing a fill into <inj>/executions.jsonl
+    and reading it back with NO explicit executions_path."""
+    from hermes_quant.portfolio.state import _default_executions_path
+
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    inj = tmp_path / "injected_quant_root"
+    inj.mkdir()
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(inj))
+
+    # The resolved default lands UNDER the injected home, never ~/.hermes.
+    resolved = _default_executions_path()
+    assert resolved == inj / "executions.jsonl"
+    assert (Path.home() / ".hermes") not in resolved.parents
+
+    _write_jsonl(
+        inj / "executions.jsonl",
+        [
+            {
+                "asset": "TSLA",
+                "asof_execution": "2026-06-19T17:00:00Z",
+                "target_position_pct": 0.12,
+                "reactor_name": "paper",
+            }
+        ],
+    )
+    # No explicit path -> resolves the injected-home default at CALL time.
+    state = reconstruct_portfolio_state()
+    assert math.isclose(state.positions["TSLA"], 0.12)
+
+
+def test_default_executions_path_honors_hermes_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """HERMES_HOME points at the hermes home; the quant root (and thus the
+    executions default) is <HERMES_HOME>/quant/executions.jsonl."""
+    from hermes_quant.portfolio.state import _default_executions_path
+
+    monkeypatch.delenv("HERMES_QUANT_HOME", raising=False)
+    hhome = tmp_path / "hermes_home"
+    monkeypatch.setenv("HERMES_HOME", str(hhome))
+
+    resolved = _default_executions_path()
+    assert resolved == hhome / "quant" / "executions.jsonl"
+
+
+def test_default_executions_path_byte_identical_without_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parity: no env -> EXACTLY the legacy ~/.hermes/quant/executions.jsonl form."""
+    from hermes_quant.portfolio.state import _default_executions_path
+
+    monkeypatch.delenv("HERMES_QUANT_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    assert _default_executions_path() == Path.home() / ".hermes" / "quant" / "executions.jsonl"
+
+
+def test_composite_default_path_honors_hermes_quant_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The companion composite reconstruct shares the SAME call-time default
+    resolution (it also fell back to the import-bound constant)."""
+    from hermes_quant.portfolio.state import reconstruct_open_book_composite
+
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    inj = tmp_path / "inj2"
+    inj.mkdir()
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(inj))
+    _write_jsonl(
+        inj / "executions.jsonl",
+        [
+            {
+                "asset": "NVDA",
+                "asset_class": "us_equity",
+                "asof_execution": "2026-06-19T18:00:00Z",
+                "target_position_pct": 0.25,
+                "reactor_name": "paper",
+            }
+        ],
+    )
+    book = reconstruct_open_book_composite()
+    assert math.isclose(book[("us_equity", "NVDA")], 0.25)

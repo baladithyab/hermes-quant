@@ -674,6 +674,10 @@ def test_agreact1_options_fire_consumes_concurrency_slot(isolate_config, isolate
     play was invisible to the cap -> the 2nd symbol would ALSO fire (cap not enforced)."""
     _set_mode_autonomous(isolate_config)  # max_per_tick_opens=1
     monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
+    # cx0: the GATE-2 evidence gate is now mandatory when options are armed; this test
+    # exercises concurrency-slot accounting (not the gate), so use the emergency override
+    # to let origination proceed to the code under test.
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_EVIDENCE_OVERRIDE", "1")
 
     from hermes_quant.react.base import ExecutionRecord
 
@@ -745,6 +749,9 @@ def test_78b3_frame_iv_rank_used_without_direct_fallback(isolate_config, isolate
     _set_mode_autonomous(isolate_config)
     monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
     monkeypatch.setenv("HERMES_QUANT_OPTIONS_PERCEIVE", "1")
+    # cx0: evidence gate now mandatory when armed; this test exercises iv_rank threading
+    # (not the gate), so override so origination reaches the hook under test.
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_EVIDENCE_OVERRIDE", "1")
 
     # A frame that carries a perceived iv_rank.
     class _Frame:
@@ -804,11 +811,16 @@ def test_bf76_evidence_gate_locks_options_without_unlock_marker(isolate_config, 
 
 
 def test_bf76_evidence_gate_off_is_byte_identical(isolate_config, isolate_quant_home, monkeypatch):
-    """bf76 default-OFF: with HERMES_QUANT_OPTIONS_EVIDENCE_GATE unset, the guard is NOT
-    consulted — origination proceeds on the inner flags alone (byte-identical to pre-bf76)."""
+    """cx0 [HIGH] CONTRACT CHANGE: the GATE-2 evidence gate is now MANDATORY whenever
+    autonomous options are armed. It used to be opt-in behind HERMES_QUANT_OPTIONS_EVIDENCE_GATE
+    — which let armed options originate with ZERO evidence enforcement (the bypass cx0 closes).
+    With AUTONOMOUS_OPTIONS=1, no unlock marker, no override => origination must LOCK (orig==0).
+    The ONLY escape is the separately-named, default-OFF, dangerous
+    HERMES_QUANT_OPTIONS_EVIDENCE_OVERRIDE=1."""
     _set_mode_autonomous(isolate_config)
     monkeypatch.setenv("HERMES_QUANT_AUTONOMOUS_OPTIONS", "1")
     monkeypatch.delenv("HERMES_QUANT_OPTIONS_EVIDENCE_GATE", raising=False)
+    monkeypatch.delenv("HERMES_QUANT_OPTIONS_EVIDENCE_OVERRIDE", raising=False)
     calls = {"orig": 0}
     import hermes_quant.autonomous as auto_mod
     monkeypatch.setattr(auto_mod, "_originate_mleg_proposal", lambda *a, **k: calls.__setitem__("orig", calls["orig"] + 1) or None)
@@ -818,7 +830,9 @@ def test_bf76_evidence_gate_off_is_byte_identical(isolate_config, isolate_quant_
         "risk_gate": {"pass": True, "kelly_fraction": 0.05, "reason": "ok", "gated_reason": None},
         "analyst_views": [{"analyst": "A0", "metadata": {"atr_relative": 0.05}}], "lessons": [],
     }
-    auto.tick(dry_run=False,
-              symbols=[WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d", options_eligible=True)],
-              advisor_recommend=lambda **kw: _ar)
-    assert calls["orig"] == 1, "evidence-gate OFF: origination must proceed on the inner flags (byte-identical)"
+    _wl = [WatchlistEntry(symbol="AAPL", asset_class="equity", timeframe="1d", options_eligible=True)]
+    auto.tick(dry_run=False, symbols=_wl, advisor_recommend=lambda **kw: _ar)
+    assert calls["orig"] == 0, "cx0: armed options + NO unlock marker + NO override => evidence gate LOCKS origination"
+    monkeypatch.setenv("HERMES_QUANT_OPTIONS_EVIDENCE_OVERRIDE", "1")
+    auto.tick(dry_run=False, symbols=_wl, advisor_recommend=lambda **kw: _ar)
+    assert calls["orig"] == 1, "cx0: the dangerous emergency OVERRIDE=1 is the ONLY escape — origination proceeds"

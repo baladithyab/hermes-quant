@@ -49,14 +49,21 @@ _LEGS = (
 def _fake_mleg() -> SimpleNamespace:
     """A stand-in carrier exposing the attributes the wire reads off a real
     MultiLegProposal (option_legs / underlying / strategy_kind / outer_qty /
-    net_debit_credit / max_loss / proposal_id)."""
+    net_debit_credit / max_loss / proposal_id).
+
+    _LEGS is a CREDIT vertical (sell the nearer 190 call, buy the farther 200
+    call) so net_debit_credit is NEGATIVE — real producers store a credit
+    received as a SIGNED negative value, and the agmon1/agmon2 stop/TP math
+    (autonomous._composite_unrealized_pnl / _composite_realized_at_close) keys
+    the CREDIT vs DEBIT branch on net_entry_price < 0. A positive value here
+    would mis-classify the structure as a debit and compute the wrong side."""
     return SimpleNamespace(
         proposal_id="prop_ml00b_001",
         underlying="AAPL",
         strategy_kind="vertical_spread",
         option_legs=_LEGS,
         outer_qty=1,
-        net_debit_credit=Decimal("1.50"),
+        net_debit_credit=Decimal("-1.50"),  # CREDIT received -> SIGNED negative
         max_loss=Decimal("50.0"),
     )
 
@@ -152,6 +159,16 @@ def test_origination_persists_composite_with_legs(
     assert row.multi_leg_id == "prop_ml00b_001"
     assert row.underlying == "AAPL"
     assert row.strategy_kind == "vertical_spread"
+    # SIGN PRESERVED (agmon1/agmon2 keystone): _fake_mleg is a CREDIT vertical
+    # with net_debit_credit=-1.50. _persist_composite_play must store the SIGNED
+    # value as net_entry_price (NOT abs()) — the negative sign is the ONLY thing
+    # that tells the stop/TP sweep this is a CREDIT structure (profits as legs
+    # cheapen). An abs()/sign-loss regression in _persist would collapse it to
+    # +1.50 and the sweep would compute the wrong side.
+    assert row.net_entry_price == pytest.approx(-1.50), (
+        "a CREDIT structure must persist a NEGATIVE net_entry_price (signed); "
+        "abs()/sign-loss would re-create the agmon1 wrong-side bug"
+    )
     # The leg data agmon1/agmon2 mark + sign:
     assert len(row.option_legs) == 2
     assert [leg["symbol"] for leg in row.option_legs] == [

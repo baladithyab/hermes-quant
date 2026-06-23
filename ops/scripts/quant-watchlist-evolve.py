@@ -186,17 +186,27 @@ def _resolve_profile_watchlist_path() -> Path:
     asked the builder to write, and can surface the TRUE destination in the
     breadcrumb instead of guessing.
 
-    rt06-fix (test-isolation): resolve from ``Path.home()`` at CALL time rather
+    rt06-fix (test-isolation): resolve from the runtime home at CALL time rather
     than importing ``profile_scan.DEFAULT_PROFILE_WATCHLIST_PATH``. That constant
-    is frozen at the W3 module's IMPORT time, so a later ``Path.home`` redirect
+    is frozen at the W3 module's IMPORT time, so a later home redirect
     (the standard test-isolation idiom, and any future home reconfiguration) would
     not take effect and the cron would surface a stale real-home path. Computing
     the same literal here is byte-identical in production (home is stable) AND
     honors a redirected home — closing an import-order test-isolation leak that
     made test_on_calls_build_profile_watchlist fail only when a sibling test
     imported profile_scan first.
+
+    aegis-ra-home2 (ADR-0092 home-decouple residue): route through
+    ``hermes_quant.home.quant_home`` so an injected ``HERMES_QUANT_HOME`` /
+    ``HERMES_HOME`` redirects the watchlist output to the SAME quant root every
+    other shell module resolves — the prior ``Path.home() / ".hermes" / "quant"``
+    literal honored only a ``Path.home`` redirect and silently ignored both env
+    overrides. Byte-identical in production (no env -> ``quant_home()`` is exactly
+    ``Path.home()/".hermes"/"quant"``).
     """
-    return Path.home() / ".hermes" / "quant" / "watchlist" / "profile-fit.json"
+    from hermes_quant.home import quant_home
+
+    return quant_home() / "watchlist" / "profile-fit.json"
 
 
 def _run_profile_scan(universe_path: Path) -> dict | None:
@@ -253,7 +263,15 @@ def main() -> int:
     # Full Alpaca liquid universe — ~500 symbols by default. The library
     # prewarm + 600s cron timeout absorbs the wall time; do NOT silently
     # narrow this without an explicit policy decision.
-    universe_path = Path.home() / ".hermes" / "quant" / "universe" / "alpaca-daily.json"
+    #
+    # cx-watchlist-home (codex PR#91 P2): resolve the universe READ through the SAME
+    # quant_home() the watchlist OUTPUT uses (_profile_fit_out_path). Pre-fix the read
+    # was hardcoded to Path.home()/.hermes/quant while the output honored an injected
+    # HERMES_QUANT_HOME / HERMES_HOME -> under an override the script read the universe
+    # from one home and wrote the watchlist to another (input/output home split).
+    # Byte-identical in production (no env -> quant_home() == Path.home()/.hermes/quant).
+    from hermes_quant.home import quant_home
+    universe_path = quant_home() / "universe" / "alpaca-daily.json"
 
     # Wall-clock budget guard (added 2026-05-28). The cron's
     # script_timeout_seconds is 600s. If this script approaches that

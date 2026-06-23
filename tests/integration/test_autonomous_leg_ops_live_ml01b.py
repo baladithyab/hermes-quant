@@ -224,7 +224,8 @@ def test_apply_convert_live_add_failure_is_atomic(
         removed["called"] = True
 
     # Inject a failing add + a spy remove via the builder (add raises -> remove must NOT run).
-    def _builder(*, underlying, play_tag):  # noqa: ANN001, ANN003
+    # cx1: the production caller now also passes outer_qty + multi_leg_id -> accept **kwargs.
+    def _builder(*, underlying, play_tag, **kwargs):  # noqa: ANN001, ANN003
         return _failing_add if play_tag == "autonomous_leg_convert_add" else _spy_remove
 
     monkeypatch.setattr(auto, "_build_live_leg_mleg_executor", _builder)
@@ -266,7 +267,8 @@ def test_apply_convert_live_success_runs_both_halves(
 
     order = []
 
-    def _builder(*, underlying, play_tag):  # noqa: ANN001, ANN003
+    # cx1: the production caller now also passes outer_qty + multi_leg_id -> accept **kwargs.
+    def _builder(*, underlying, play_tag, **kwargs):  # noqa: ANN001, ANN003
         def _exec(legs):  # noqa: ANN001
             order.append(play_tag)
         return _exec

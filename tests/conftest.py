@@ -117,10 +117,21 @@ def _isolate_quant_home_and_execution_bus(
 
     Increment-0 §0.0 / seed ra03. The sibling fixtures already isolate state.db,
     governance, evidence, and the kill-switch; executions.jsonl / QUANT_HOME were
-    the remaining gap. Two modules define these symbols independently — `tools`
-    and `daemon.signal_bus` (PaperReactor imports the bus path from the latter) —
-    so both roots are patched, mirroring the existing `_patch_executions_path`
-    test helper. Each is patched only if the module imports cleanly.
+    the remaining gap.
+
+    The bus path is referenced two ways. ``tools`` and ``daemon.signal_bus`` define
+    it; the four ``react/*`` reactors each take a PRIVATE copy via
+    ``from daemon.signal_bus import EXECUTION_BUS_PATH`` AT IMPORT TIME. Patching the
+    attribute on ``signal_bus`` does NOT rebind those copies — they freeze to whatever
+    the value was the first time each reactor module was imported, making isolation
+    order-dependent. That gap leaked 22 phantom AAPL@200 fixture fills into the live
+    ledger (found 2026-06-22 by the 6bb9 audit): with the operator's
+    ``HERMES_QUANT_DETERMINISTIC_EQUITY=1`` inherited into the pytest process,
+    ``select_reactor()`` returned ``DeterministicEquityReactor``, whose unpatched
+    ``EXECUTION_BUS_PATH`` copy still pointed at ``~/.hermes/quant/executions.jsonl``.
+    So we patch the symbol on EVERY module that holds a copy, every test.
+    Each is patched only if the module imports cleanly (react.multileg may pull an
+    optional torch-stub chain).
     """
     quant_home = tmp_path / "quant_home"
     quant_home.mkdir(parents=True, exist_ok=True)
@@ -128,7 +139,16 @@ def _isolate_quant_home_and_execution_bus(
     signal_bus = quant_home / "signals.jsonl"
     state_db = quant_home / "state.db"
 
-    for mod_name in ("hermes_quant.tools", "hermes_quant.daemon.signal_bus"):
+    bus_modules = (
+        "hermes_quant.tools",
+        "hermes_quant.daemon.signal_bus",
+        # The four reactors hold from-import private copies of EXECUTION_BUS_PATH:
+        "hermes_quant.react.paper",
+        "hermes_quant.react.deterministic_equity",
+        "hermes_quant.react.alpaca_paper",
+        "hermes_quant.react.multileg",
+    )
+    for mod_name in bus_modules:
         try:
             mod = __import__(mod_name, fromlist=["_"])
         except ImportError:
@@ -141,6 +161,13 @@ def _isolate_quant_home_and_execution_bus(
         ):
             if hasattr(mod, attr):
                 monkeypatch.setattr(mod, attr, value, raising=True)
+
+    # Scrub the reactor-ROUTING flags so an operator value inherited from the
+    # environment (~/.hermes/.env sets HERMES_QUANT_DETERMINISTIC_EQUITY=1) cannot
+    # silently re-route a test's equity fill to a reactor the test didn't patch.
+    # A test that needs a specific reactor opts in via its own monkeypatch.setenv.
+    for flag in ("HERMES_QUANT_DETERMINISTIC_EQUITY", "HERMES_QUANT_ALPACA_PAPER"):
+        monkeypatch.delenv(flag, raising=False)
     return quant_home
 
 

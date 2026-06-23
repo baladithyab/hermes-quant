@@ -364,7 +364,7 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
             # INCIDENT-2026-06-10-advisor-cap-phantom-gross.md.
             from hermes_quant.portfolio.state import (
                 reconstruct_portfolio_state,
-                _DEFAULT_EXECUTIONS_PATH,
+                _default_executions_path,
             )
             # FAIL-CLOSED STRICTNESS (Codex P1, 2026-06-10):
             # reconstruct_portfolio_state is fail-SOFT — a missing, mis-mounted, or
@@ -380,7 +380,11 @@ def auto_approve_actionables(actionables: list[dict]) -> list[dict]:
             # running book. A system that has never recorded a paper fill blocking its
             # advisor auto-fire is the safe default; the autonomous tick / any prior
             # fill creates the bus.
-            _bus_path = _DEFAULT_EXECUTIONS_PATH
+            # aegis-ra-home2: resolve the bus path AT CALL TIME via the home-aware
+            # helper (honors HERMES_HOME / HERMES_QUANT_HOME and the documented
+            # _DEFAULT_EXECUTIONS_PATH monkeypatch override). The old direct read of
+            # the import-bound constant ignored both env overrides.
+            _bus_path = _default_executions_path()
             if not _bus_path.exists():
                 raise FileNotFoundError(
                     f"paper execution bus not found at {_bus_path}; cannot "

@@ -12,6 +12,7 @@ shape, and the reader are all exercised for real.
 from __future__ import annotations
 
 import importlib.util
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -130,3 +131,181 @@ def test_unreadable_book_fails_closed(tmp_path: Path, monkeypatch):
     payload = writer.evaluate_gate2(home)
     assert payload["gate2_cleared"] is False
     assert "settled_book_read_failed" in payload["reason"]
+
+
+# ---------------------------------------------------------------------------
+# cx2 [P1]: HOME-SCOPED BOOK. The settled-book loader MUST read the --home's own
+# executions.jsonl, NOT the process-default EXECUTION_BUS_PATH (a DIFFERENT home).
+# These two tests DO NOT monkeypatch _settle_paper_round_trips_in_window — they
+# write a REAL executions.jsonl under the tmp --home and exercise the FIFO matcher
+# end-to-end, so they catch the missing executions_path thread (test-vacuity in
+# the monkeypatched tests above).
+# ---------------------------------------------------------------------------
+
+_QUANT_EXECUTIONS = "quant/executions.jsonl"
+
+
+def _exec_record(asset: str, fill_size_pct: float, fill_price: float, asof_exec: str) -> dict:
+    """Minimal real-bus ExecutionRecord (PaperReactor._record_to_dict shape), paper-default.
+
+    Mirrors tests/governance/test_promotion_ar125_settlement_derived._make_exec_record
+    (the canonical FIFO-matcher fixture). asset_class=us_option so RoundTrip.is_options
+    is True (GATE-2 does not filter on it, but keeps the book options-honest)."""
+    return {
+        "proposal_id": f"p-{asset}-{asof_exec[:10]}",
+        "signal_id": f"s-{asset}-{asof_exec[:10]}",
+        "asset": asset,
+        "asset_class": "us_option",
+        "timeframe": "1d",
+        "asof_decision": asof_exec,
+        "asof_execution": asof_exec,
+        "target_position_pct": fill_size_pct,
+        "decision_price": fill_price,
+        "fill_price": fill_price,
+        "fill_size_pct": fill_size_pct,
+        "reactor_name": "paper",
+        "human_in_the_loop": False,
+        "approver_user_id": None,
+        "reactor_metadata": {"account_id": "paper-default"},
+        "bar_ts": asof_exec,
+        "play_tag": None,
+        "schema_version": None,
+    }
+
+
+def _write_real_clearing_book(home: Path, t0: datetime) -> None:
+    """Write a REAL executions.jsonl under ``home/quant/`` that clears GATE-2."""
+    _write_real_clearing_book_at(home / _QUANT_EXECUTIONS, t0)
+
+
+def _write_real_clearing_book_at(bus: Path, t0: datetime) -> None:
+    """Write a REAL clearing executions.jsonl at the EXACT path ``bus``.
+
+    54 round trips over ~64 days, 66% winners (+3% via 100->103) / losers (-1% via
+    100->99), losers never adjacent. Same return profile as the monkeypatched
+    ``_clearing_book`` above, but produced through the real FIFO matcher
+    (settlement_loop.join_exit_fills): each trip is a BUY fill (open) + SELL fill
+    (close), realized_return = (exit-entry)/entry with zero fees."""
+    bus.parent.mkdir(parents=True, exist_ok=True)
+    records: list[dict] = []
+    for i in range(54):
+        exit_day = t0 + timedelta(days=1 + (i * 66) // 54)  # spread across ~64 days
+        entry_day = exit_day - timedelta(hours=12)  # entry strictly before exit, same trip
+        is_win = (i % 3) != 2  # lose every 3rd -> 66% win, losers never adjacent
+        exit_price = 103.0 if is_win else 99.0  # +3% / -1% off 100.0
+        asset = f"OPT{i}"
+        records.append(_exec_record(asset, +0.01, 100.0, entry_day.isoformat()))
+        records.append(_exec_record(asset, -0.01, exit_price, exit_day.isoformat()))
+    with bus.open("w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec) + "\n")
+
+
+def test_clearing_book_under_home_unlocks_not_process_default(tmp_path: Path, monkeypatch):
+    """cx2: the verdict reflects the --home's OWN book, NOT the process-default bus.
+
+    RED before the fix: evaluate_gate2 calls _settle_paper_round_trips_in_window
+    WITHOUT executions_path -> the function defaults to EXECUTION_BUS_PATH (here a
+    DIFFERENT, EMPTY decoy home) -> reads zero round-trips -> thin -> LOCKED, even
+    though the --home's own book clears GATE-2. After the fix (executions_path threaded
+    to home/quant/executions.jsonl) the verdict is UNLOCKED."""
+    home = tmp_path / "operator_a"
+    home.mkdir(parents=True)
+    decoy_home = tmp_path / "operator_b"  # the process-default points HERE (empty)
+    decoy_bus = decoy_home / _QUANT_EXECUTIONS
+    decoy_bus.parent.mkdir(parents=True, exist_ok=True)
+    decoy_bus.write_text("")  # empty -> process-default read yields zero trips
+
+    now = datetime(2026, 6, 18, tzinfo=UTC)
+    t0 = now - timedelta(days=65)
+    _seed_t0(home, t0)
+    _write_real_clearing_book(home, t0)
+
+    # Point the PROCESS-DEFAULT bus at operator_b (the WRONG home). The loader reads
+    # EXECUTION_BUS_PATH at call time (imports it inside the function), so this binds.
+    monkeypatch.setattr(
+        "hermes_quant.daemon.signal_bus.EXECUTION_BUS_PATH", decoy_bus, raising=True
+    )
+
+    writer = _load_writer()
+    payload = writer.evaluate_gate2(home, asof=now)
+
+    # The verdict MUST reflect operator_a's own clearing book (n==54, UNLOCKED),
+    # not the empty operator_b default (which would be n==0, LOCKED).
+    assert payload["n"] == 54, f"read the wrong home's book: {payload}"
+    assert payload["gate2_cleared"] is True, f"home-scoped clearing book did not unlock: {payload}"
+
+    rc = writer.main(["--home", str(home)])
+    assert rc == 0
+    assert read_options_unlocked(home) is True
+    # The decoy home was never unlocked.
+    assert read_options_unlocked(decoy_home) is False
+
+
+def test_empty_home_book_stays_locked_even_if_process_default_clears(tmp_path: Path, monkeypatch):
+    """cx2 inverse: an EMPTY --home book stays LOCKED even when the process-default
+    bus (a DIFFERENT home) holds a clearing book — never unlock home A off home B's book."""
+    home = tmp_path / "operator_a"  # empty book
+    home.mkdir(parents=True)
+    (home / _QUANT_EXECUTIONS).parent.mkdir(parents=True, exist_ok=True)
+    (home / _QUANT_EXECUTIONS).write_text("")
+
+    decoy_home = tmp_path / "operator_b"  # holds a clearing book at the process default
+    decoy_home.mkdir(parents=True)
+
+    now = datetime(2026, 6, 18, tzinfo=UTC)
+    t0 = now - timedelta(days=65)
+    _seed_t0(home, t0)
+    _write_real_clearing_book(decoy_home, t0)
+
+    monkeypatch.setattr(
+        "hermes_quant.daemon.signal_bus.EXECUTION_BUS_PATH",
+        decoy_home / _QUANT_EXECUTIONS,
+        raising=True,
+    )
+
+    writer = _load_writer()
+    payload = writer.evaluate_gate2(home, asof=now)
+    assert payload["n"] == 0, f"read the WRONG (process-default) home's book: {payload}"
+    assert payload["gate2_cleared"] is False, f"unlocked off the wrong home's book: {payload}"
+
+
+def test_env_hermes_quant_home_book_read_matches_tick_write(tmp_path: Path, monkeypatch):
+    """cx2-P1 (codex PR#91): under HERMES_QUANT_HOME-only with home=None (the env-driven
+    path the cron uses), the GATE-0 ANCHOR, the settled BOOK, and the unlock MARKER must
+    ALL resolve to the SAME quant root the autonomous tick uses — quant_home() (=
+    $HERMES_QUANT_HOME), which is also signal_bus.EXECUTION_BUS_PATH's root and where the
+    tick's read_options_unlocked() reads the marker.
+
+    Pre-fix clean_window resolved the anchor + marker via a HERMES_HOME-only _home_path,
+    while the tick wrote the book (and read the marker) under $HERMES_QUANT_HOME -> a
+    three-way home SPLIT: anchor at ~/.hermes, book at $HQH, marker written to ~/.hermes
+    but read from $HQH. The marker the cron wrote was at a home the tick never reads, so
+    options could stay PERMANENTLY LOCKED (or a stale ~/.hermes marker unlock the wrong
+    home). RED-proof: revert clean_window._quant_root to _home_path(home).parent.parent-
+    style HERMES_HOME-only and read_clean_window_start(None) reads ~/.hermes -> no anchor
+    -> LOCKED despite the $HQH book clearing, AND the marker lands at the wrong root."""
+    hqh = tmp_path / "hqh_quant_root"  # quant_home() returns this directly (no /quant)
+    hqh.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(hqh))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    now = datetime(2026, 6, 18, tzinfo=UTC)
+    t0 = now - timedelta(days=65)
+    # Seed the anchor + the book where the UNIFIED resolver looks: the quant root
+    # quant_home() == hqh. home=None routes write_clean_window_start through _quant_root,
+    # so the anchor lands at hqh/clean_window_start.json — exactly where
+    # read_clean_window_start(None) reads it.
+    _seed_t0(None, t0)  # home=None => anchor at quant_home() = hqh
+    _write_real_clearing_book_at(hqh / "executions.jsonl", t0)
+
+    writer = _load_writer()
+    payload = writer.evaluate_gate2(None, asof=now)  # home=None => env-driven (the cron path)
+    assert payload["n"] == 54, f"env HERMES_QUANT_HOME book not read (tick-write vs gate-read divergence): {payload}"
+    assert payload["gate2_cleared"] is True
+
+    # End-to-end: main() writes the marker to the SAME quant root the tick reads.
+    rc = writer.main([])  # home=None => env-driven; marker -> hqh/options_unlock.json
+    assert rc == 0
+    assert (hqh / "options_unlock.json").exists(), "marker not co-located with the book the tick reads"
+    assert read_options_unlocked(None) is True  # the tick's own read path now sees UNLOCKED

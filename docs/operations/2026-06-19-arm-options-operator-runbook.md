@@ -46,15 +46,19 @@ export HERMES_QUANT_OPTIONS_LIVE_CHAIN=1         # enables fetch_chain_live (nee
 export HERMES_QUANT_OPTIONS_PERCEIVE=1           # iv_rank into the perception frame
 export HERMES_QUANT_STRUCTURE_SELECT=1           # stance x IV-regime -> structure
 export HERMES_QUANT_OPTIONS_GATE=1               # the options risk gate (BP floor etc.)
-export HERMES_QUANT_AUTONOMOUS_OPTIONS=1         # MASTER origination switch — arm LAST
-
-# Optional: keep the evidence gate ON so origination still requires GATE-2 cleared.
-# Leave UNSET to let origination fire immediately (your "arm everything" choice);
-# SET to require the aegis-gate2-eval marker first (the more conservative path):
-# export HERMES_QUANT_OPTIONS_EVIDENCE_GATE=1
+# REQUIRED — arm the evidence gate TOGETHER with AUTONOMOUS_OPTIONS, never without it.
+export HERMES_QUANT_OPTIONS_EVIDENCE_GATE=1       # GATE-2 evidence-before-live enforcement
+export HERMES_QUANT_AUTONOMOUS_OPTIONS=1          # MASTER origination switch — arm LAST
 ```
 
-> Note: with `OPTIONS_EVIDENCE_GATE` **unset** (your choice), origination fires as soon as `AUTONOMOUS_OPTIONS=1` + a usable IV rank + an admissible structure. The `bf76b` GATE-2 marker then becomes an *observability* signal rather than a hard pre-gate.
+> ⚠️ **CORRECTION (2026-06-19, Codex critique Facet-1 P1 / seed `hermes-quant-cx0-evidence-gate-optional`):**
+> An earlier version of this runbook listed `OPTIONS_EVIDENCE_GATE` as *optional*. **That was dangerous guidance.**
+> The code's evidence gate is currently **opt-in** (`autonomous.py:~3654`: `_options_evidence_ok = True` by default;
+> `read_options_unlocked()` is consulted ONLY when `OPTIONS_EVIDENCE_GATE=1`). So arming `AUTONOMOUS_OPTIONS=1`
+> **without** `OPTIONS_EVIDENCE_GATE=1` lets options originate with **zero GATE-2 enforcement** — bypassing
+> ADR-0029 evidence-before-live + EQUITY-EDGE-FIRST entirely. **Always arm both together** until seed
+> `cx0` makes the evidence gate mandatory-by-construction (the proper fix). Do NOT arm options at all until
+> the GATE-2 clean-window marker (`aegis-gate2-eval.py`) has actually cleared (N≥50 over ≥60d) — see Step 5.
 
 ## Step 3 — register the two new cron scripts
 

@@ -6,6 +6,15 @@ options-eligible watchlist symbol, so the autonomous tick's options PERCEIVE
 (iv_rank) and the agmon1/agmon2 SL/TP sweeps have a same-day chain to mark
 against (they read ChainSnapshotReader.replay_chain off these parquets).
 
+aegis-ra-home2 (ADR-0092 home-decouple residue): the prefetch MUST write to the
+SAME directory the replay reads. ``ChainSnapshotReader``'s default chains_dir is
+``hermes_quant.home.quant_home() / "option_chains"`` (= ``<home>/quant/option_chains``).
+The prior ``_home_path`` returned ``<home>/.hermes`` (or a bare ``$HERMES_HOME``)
+and appended ``option_chains``, writing to ``<home>/.hermes/option_chains`` (or
+``$HERMES_HOME/option_chains``) — a DIFFERENT dir the monitor sweeps never read,
+so a "successful" prefetch was invisible. We now resolve the chains dir through
+``quant_home`` too, so writer and reader agree byte-for-byte under any home.
+
 This is the WRITER half of agopt3; analogous to aegis-gate2-eval.py (bf76b) — a
 thin in-repo orchestration script over an already-built primitive. It REUSES
 ChainSnapshotReader.fetch_chain_live (agperc3), which itself stamps fetched_at and
@@ -25,16 +34,23 @@ no orders.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
 
-def _home_path(home: str | Path | None) -> Path:
-    if home is not None:
-        return Path(home)
-    env = os.environ.get("HERMES_HOME")
-    return Path(env) if env else Path.home() / ".hermes"
+def _chains_dir(home: str | Path | None) -> Path:
+    """The option_chains dir the replay reads — resolved via the shared home resolver.
+
+    aegis-ra-home2: ``ChainSnapshotReader`` defaults its chains_dir to
+    ``quant_home() / "option_chains"``. Routing the prefetch through the SAME
+    resolver guarantees the writer and reader land in the identical directory
+    under any home (an injected ``--home`` is threaded as the explicit quant-root
+    override; ``HERMES_QUANT_HOME`` / ``HERMES_HOME`` are honored otherwise). The
+    legacy ``<home>/.hermes/option_chains`` form wrote where nothing reads.
+    """
+    from hermes_quant.home import quant_home
+
+    return quant_home(home) / "option_chains"
 
 
 def prefetch_chains(
@@ -52,8 +68,8 @@ def prefetch_chains(
     """
     from hermes_quant.options.data import ChainSnapshotReader, LiveChainDisabled
 
-    qhome = _home_path(home)
-    rdr = reader if reader is not None else ChainSnapshotReader(chains_dir=qhome / "option_chains")
+    chains_dir = _chains_dir(home)
+    rdr = reader if reader is not None else ChainSnapshotReader(chains_dir=chains_dir)
 
     # Enumerate the optionable watchlist symbols (the perceive/monitor candidate set).
     if symbols is None:
@@ -84,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--home", default=None, help="operator home (default HERMES_HOME or ~/.hermes)")
+    ap.add_argument("--home", default=None, help="explicit quant root (default: HERMES_QUANT_HOME / HERMES_HOME / ~/.hermes/quant)")
     ap.add_argument("--symbols", default=None, help="comma-separated override (default: optionable watchlist)")
     args = ap.parse_args(argv)
 

@@ -38,15 +38,16 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-_OPTIONS_UNLOCK_FILE = "quant/options_unlock.json"
+# cx2-P1 (codex PR#91): the ONE resolver. The GATE-0 anchor, the settled BOOK, and
+# the unlock MARKER must all live in the SAME quant root — the one the autonomous
+# tick reads via read_options_unlocked() and signal_bus writes the book to. Importing
+# clean_window._quant_root (which routes through quant_home(): override >
+# HERMES_QUANT_HOME > HERMES_HOME/quant > ~/.hermes/quant) keeps this script and the
+# live tick on one resolver, so a multi-home / HERMES_QUANT_HOME-only run can never
+# write the marker to a home the tick doesn't read. The bare file name lives here.
+from hermes_quant.eval.clean_window import _quant_root
 
-
-def _home_path(home: str | Path | None) -> Path:
-    """Resolve the operator home the same way clean_window._home_path does."""
-    if home is not None:
-        return Path(home)
-    env = os.environ.get("HERMES_HOME")
-    return Path(env) if env else Path.home() / ".hermes"
+_OPTIONS_UNLOCK_FILE = "options_unlock.json"
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -94,10 +95,18 @@ def evaluate_gate2(home: str | Path | None, *, asof: datetime | None = None) -> 
     # Reuse the canonical settled-book loader (same FIFO matcher as the kill-switch
     # + promotion gate — no basis drift). Best-effort: a read failure => empty book
     # => thin => LOCKED.
+    #
+    # cx2-P1 (codex PR#91): thread the HOME-SCOPED book via the ONE shared resolver.
+    # _quant_root routes through quant_home() (= signal_bus.EXECUTION_BUS_PATH's root),
+    # so the GATE-0 anchor, the settled BOOK, and the unlock MARKER all co-locate in
+    # the SAME quant root the autonomous tick reads — in every home case (default,
+    # HERMES_QUANT_HOME-only, HERMES_HOME, explicit --home). Without it the loader would
+    # default to the process EXECUTION_BUS_PATH and could unlock THIS home off another.
+    executions_path = _quant_root(home) / "executions.jsonl"
     try:
         from hermes_quant.governance.promotion import _settle_paper_round_trips_in_window
 
-        settled = _settle_paper_round_trips_in_window(t0, now)
+        settled = _settle_paper_round_trips_in_window(t0, now, executions_path=executions_path)
     except Exception as exc:  # noqa: BLE001 — fail-CLOSED: unreadable book => LOCKED
         return {
             "gate2_cleared": False,
@@ -136,11 +145,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="print the verdict, write nothing")
     args = ap.parse_args(argv)
 
-    home = _home_path(args.home)
+    quant_root = _quant_root(args.home)
     payload = evaluate_gate2(args.home)
 
     print("AEGIS GATE-2 — options-origination evidence gate")
-    print(f"  home: {home}")
+    print(f"  quant root: {quant_root}")
     print(f"  n={payload.get('n')}  calendar_days={payload.get('calendar_days', 'n/a')}")
     print(f"  verdict: {'UNLOCKED (gate2_cleared)' if payload['gate2_cleared'] else 'LOCKED'}")
     print(f"  reason: {payload.get('reason')}")
@@ -149,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nDRY-RUN: would write the marker. Nothing written.")
         return 0
 
-    marker = home / _OPTIONS_UNLOCK_FILE
+    marker = quant_root / _OPTIONS_UNLOCK_FILE
     _atomic_write_json(marker, payload)
     print(f"\nGATE-2 marker written: {marker}")
     print(

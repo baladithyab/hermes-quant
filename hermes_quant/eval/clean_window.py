@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -140,17 +139,41 @@ _BOOTSTRAP_SEED: int = 42
 # ---------------------------------------------------------------------------
 # Clean-window anchor: read / write
 # ---------------------------------------------------------------------------
-_CW_FILE = "quant/clean_window_start.json"
+_CW_FILE = "clean_window_start.json"
+
+
+def _quant_root(home: str | Path | None) -> Path:
+    """Resolve the QUANT ROOT where the gate-2 anchor/marker live.
+
+    cx2-P1 (codex PR#91): these files (clean_window_start.json, options_unlock.json)
+    MUST sit in the SAME quant root the autonomous tick writes the executions BOOK to
+    (signal_bus EXECUTION_BUS_PATH = quant_home()/executions.jsonl). The old resolver
+    honored only HERMES_HOME, so under a HERMES_QUANT_HOME-only run the marker/anchor
+    landed at ~/.hermes/quant while the book lived at $HERMES_QUANT_HOME -> a stale
+    default-home anchor could unlock/lock options for an isolated book. Route through
+    quant_home() (the single source of truth: explicit override > HERMES_QUANT_HOME >
+    HERMES_HOME/quant > ~/.hermes/quant) so the WHOLE round-trip (anchor + book +
+    marker, read by both aegis-gate2-eval AND the tick's read_options_unlocked) shares
+    ONE quant root. Byte-identical at default. An explicit ``home`` is the HERMES home
+    (test/injection seam) -> its quant root is ``home/quant`` (legacy layout preserved).
+    """
+    from hermes_quant.home import quant_home as _quant_home
+
+    if home is not None:
+        return Path(home) / "quant"
+    return _quant_home()
 
 
 def _home_path(home: str | Path | None) -> Path:
-    """Resolve the operator home directory (injectable for tests)."""
-    if home is not None:
-        return Path(home)
-    return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    """Back-compat shim: the legacy HERMES-home resolver some callers/tests import.
+
+    Returns the hermes home (quant root's parent). Prefer ``_quant_root`` for new
+    code — the file constants are now bare names joined onto ``_quant_root``.
+    """
+    return _quant_root(home).parent
 
 
-_OPTIONS_UNLOCK_FILE = "quant/options_unlock.json"
+_OPTIONS_UNLOCK_FILE = "options_unlock.json"
 
 
 def read_options_unlocked(home: str | Path | None = None) -> bool:
@@ -170,7 +193,7 @@ def read_options_unlocked(home: str | Path | None = None) -> bool:
     exists the marker is absent => options origination stays LOCKED behind the evidence
     gate (the conservative, honest direction).
     """
-    path = _home_path(home) / _OPTIONS_UNLOCK_FILE
+    path = _quant_root(home) / _OPTIONS_UNLOCK_FILE
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, json.JSONDecodeError, OSError):
@@ -188,7 +211,7 @@ def read_clean_window_start(home: str | Path | None = None) -> datetime | None:
         home: Override operator home directory (default: HERMES_HOME or ~/.hermes).
               Injected in tests so no real filesystem state is needed.
     """
-    path = _home_path(home) / _CW_FILE
+    path = _quant_root(home) / _CW_FILE
     try:
         raw = path.read_text(encoding="utf-8")
         data = json.loads(raw)
@@ -223,7 +246,7 @@ def write_clean_window_start(
     Returns:
         The Path that was written.
     """
-    path = _home_path(home) / _CW_FILE
+    path = _quant_root(home) / _CW_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     # Normalise to UTC-aware.
     if asof.tzinfo is None:

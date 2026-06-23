@@ -50,6 +50,72 @@ class _FlakyReader:
         return object()
 
 
+# ---------------------------------------------------------------------------
+# aegis-ra-home2 (ADR-0092 home-decouple residue): the prefetch WRITER must
+# target the SAME option_chains dir the replay READER reads. The reader defaults
+# its chains_dir to hermes_quant.home.quant_home() / "option_chains"
+# (= <home>/quant/option_chains). Pre-fix, the prefetch's _home_path returned
+# <home>/.hermes (or a bare $HERMES_HOME) and appended option_chains, writing to
+# a DIFFERENT dir the monitor sweeps never read. RED-proof: under an injected
+# HERMES_QUANT_HOME the writer dir resolved to ~/.hermes/option_chains, NOT the
+# injected <home>/option_chains the reader uses.
+# ---------------------------------------------------------------------------
+
+
+def test_prefetch_chains_dir_honors_hermes_quant_home(monkeypatch, tmp_path):
+    """An injected HERMES_QUANT_HOME redirects the writer's chains dir to the
+    SAME quant root the replay reader resolves, NOT ~/.hermes."""
+    from hermes_quant.home import quant_home
+
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    inj = tmp_path / "injected_quant_root"
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(inj))
+
+    mod = _load()
+    writer_dir = mod._chains_dir(None)
+    assert writer_dir == inj / "option_chains"
+    assert (Path.home() / ".hermes") not in writer_dir.parents
+
+
+def test_prefetch_writer_dir_equals_reader_default_formula(monkeypatch, tmp_path):
+    """The whole point of the fix: the writer dir equals the reader's DOCUMENTED
+    default formula (quant_home() / "option_chains") under the SAME home, so a
+    successful prefetch is visible to the replay/monitor sweeps. We compare the
+    writer dir against the live quant_home() formula the reader's default uses
+    (data.py binds its default at import, so a fresh process gives both the same
+    env-resolved root — this asserts the FORMULAS match, not a stale instance)."""
+    from hermes_quant.home import quant_home
+
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    inj = tmp_path / "shared_root"
+    monkeypatch.setenv("HERMES_QUANT_HOME", str(inj))
+
+    mod = _load()
+    writer_dir = mod._chains_dir(None)
+    reader_default_formula = quant_home() / "option_chains"
+    assert writer_dir == reader_default_formula
+    assert writer_dir == inj / "option_chains"
+
+
+def test_prefetch_chains_dir_honors_hermes_home(monkeypatch, tmp_path):
+    """HERMES_HOME points at the hermes home; the chains dir is
+    <HERMES_HOME>/quant/option_chains (quant root under the hermes home)."""
+    monkeypatch.delenv("HERMES_QUANT_HOME", raising=False)
+    hhome = tmp_path / "hermes_home"
+    monkeypatch.setenv("HERMES_HOME", str(hhome))
+
+    mod = _load()
+    assert mod._chains_dir(None) == hhome / "quant" / "option_chains"
+
+
+def test_prefetch_chains_dir_byte_identical_without_env(monkeypatch):
+    """Parity: no env -> EXACTLY ~/.hermes/quant/option_chains."""
+    monkeypatch.delenv("HERMES_QUANT_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    mod = _load()
+    assert mod._chains_dir(None) == Path.home() / ".hermes" / "quant" / "option_chains"
+
+
 def test_prefetch_drives_fetch_per_symbol(tmp_path):
     mod = _load()
     reader = _OkReader()
